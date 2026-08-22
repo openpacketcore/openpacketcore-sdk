@@ -13,12 +13,84 @@
 use std::ffi::{c_void, CStr, CString};
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd as _;
+#[cfg(feature = "test-vfs")]
+use std::sync::OnceLock;
 
 use rusqlite::{ffi, Connection};
 
 /// Failure from the SQLite main-file movement probe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileControlError;
+
+/// The name of the test-only VFS that fails SQLite unnamed temporary opens.
+///
+/// This is available only with the `test-vfs` feature.  It is deliberately a
+/// separate VFS rather than a process-wide temporary-directory setting, so a
+/// caller opts in by selecting this name in a SQLite URI.
+#[cfg(feature = "test-vfs")]
+pub const TEST_TEMP_PATH_FAILURE_VFS_NAME: &str = "opc-test-fail-temp-vfs";
+
+#[cfg(feature = "test-vfs")]
+const TEST_TEMP_PATH_FAILURE_VFS_CSTR: &CStr = c"opc-test-fail-temp-vfs";
+
+/// Register a test-only VFS that returns `SQLITE_IOERR_GETTEMPPATH` for an
+/// unnamed SQLite temporary-file open while delegating every named open to the
+/// bundled default VFS.
+///
+/// This feature-gated helper is intended only for an isolated test process.
+/// It never becomes the SQLite default VFS and therefore cannot alter a
+/// production process's temporary-directory behavior.
+#[cfg(feature = "test-vfs")]
+pub fn install_test_temp_path_failure_vfs() -> Result<(), FileControlError> {
+    static REGISTER: OnceLock<Result<(), FileControlError>> = OnceLock::new();
+    *REGISTER.get_or_init(|| {
+        // SAFETY: SQLite owns the returned default VFS for the process.  We
+        // copy its stable callback table, replace only `xOpen`, leak that
+        // table for SQLite's registration lifetime, and never make it the
+        // process default.  The callback delegates named opens to the
+        // original VFS pointer without retaining caller-owned arguments.
+        unsafe {
+            let default_vfs = ffi::sqlite3_vfs_find(std::ptr::null());
+            if default_vfs.is_null() {
+                return Err(FileControlError);
+            }
+            let mut vfs = *default_vfs;
+            vfs.zName = TEST_TEMP_PATH_FAILURE_VFS_CSTR.as_ptr();
+            vfs.xOpen = Some(test_temp_path_failure_vfs_open);
+            let vfs = Box::leak(Box::new(vfs));
+            if ffi::sqlite3_vfs_register(vfs, 0) != ffi::SQLITE_OK {
+                return Err(FileControlError);
+            }
+        }
+        Ok(())
+    })
+}
+
+#[cfg(feature = "test-vfs")]
+unsafe extern "C" fn test_temp_path_failure_vfs_open(
+    _vfs: *mut ffi::sqlite3_vfs,
+    name: ffi::sqlite3_filename,
+    file: *mut ffi::sqlite3_file,
+    flags: libc::c_int,
+    out_flags: *mut libc::c_int,
+) -> libc::c_int {
+    // SQLite uses either a null filename or the empty string for the unnamed
+    // `ATTACH ''` artifact behind ordinary `VACUUM`.
+    if name.is_null() || unsafe { *name } == 0 {
+        return ffi::SQLITE_IOERR_GETTEMPPATH;
+    }
+    // SAFETY: registration above preserves the original default VFS as the
+    // process default.  SQLite provides the callback arguments for this
+    // invocation, and the original xOpen accepts the same ABI and file size.
+    let default_vfs = unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) };
+    if default_vfs.is_null() {
+        return ffi::SQLITE_IOERR;
+    }
+    let Some(open) = (unsafe { (*default_vfs).xOpen }) else {
+        return ffi::SQLITE_IOERR;
+    };
+    unsafe { open(default_vfs, name, file, flags, out_flags) }
+}
 
 /// The unix VFS prefix used by the bundled SQLite build on Linux.
 ///

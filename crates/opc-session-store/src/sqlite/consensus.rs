@@ -81,6 +81,8 @@ const CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES: i64 = 16 * 1024;
 static ACTIVATED_CONSENSUS_IDENTITY_SCHEMA_FORMS: OnceLock<BTreeSet<String>> = OnceLock::new();
 const OPERATOR_RECOVERY_LATCH_MAGIC: &[u8; 8] = b"OPCRL001";
 const OPERATOR_RECOVERY_LATCH_BYTES: usize = 8 + 32 + 32 + 8 + 8 + 32 + 1;
+#[cfg(test)]
+static SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OperatorRecoveryLatch {
@@ -11283,10 +11285,31 @@ fn pinned_snapshot_uri(
 ) -> String {
     let mode = if read_only { "ro" } else { "rw" };
     format!(
-        "file:/proc/self/fd/{}?mode={mode}&cache=private{}",
+        "file:/proc/self/fd/{}?mode={mode}&cache=private{}{}",
         pinned.raw_fd(),
-        if read_only { "&immutable=1" } else { "" }
+        if read_only { "&immutable=1" } else { "" },
+        snapshot_test_vfs_uri_parameter(),
     )
+}
+
+// A child unit-test process enables the feature-gated safe VFS registration in
+// `opc-sqlite-file-control-sys` and flips this local selector.  Production
+// never builds or selects that VFS.
+#[cfg(test)]
+fn snapshot_test_vfs_uri_parameter() -> String {
+    if SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS.load(Ordering::Acquire) {
+        format!(
+            "&vfs={}",
+            opc_sqlite_file_control_sys::TEST_TEMP_PATH_FAILURE_VFS_NAME
+        )
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(not(test))]
+fn snapshot_test_vfs_uri_parameter() -> String {
+    String::new()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -11745,11 +11768,25 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
 }
 
 /// Finish a raw snapshot only after its reader has been released.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize_captured_snapshot_database_sync(
     identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
     expected_cut: &ConsensusAppliedMembership,
-    mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    vacuum_path: &Path,
 ) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
+    // `VACUUM` asks SQLite's VFS for a process-global temporary directory.
+    // The stateful image deliberately has no writable root or `/tmp`, while
+    // this UUID-named sibling is in the durable snapshot directory.  Create
+    // and retain its descriptor before SQLite sees it: a bare pathname would
+    // leave a replacement window and does not guarantee O_EXCL/O_NOFOLLOW.
+    let mut compacted = create_pinned_snapshot_database(vacuum_path)?;
+    compacted.verify_linked_identity()?;
+    let vacuum_uri = pinned_snapshot_uri(&compacted, false);
     let destination = open_pinned_snapshot_database(&pinned)?;
     destination
         .execute_batch(
@@ -11759,8 +11796,6 @@ pub(crate) fn finalize_captured_snapshot_database_sync(
         DELETE FROM consensus_purged;
         DELETE FROM consensus_log;
         DELETE FROM consensus_snapshot;
-        PRAGMA journal_mode = OFF;
-        VACUUM;
         "#,
         )
         .map_err(db_error)?;
@@ -11775,10 +11810,57 @@ pub(crate) fn finalize_captured_snapshot_database_sync(
             "session consensus snapshot metadata differs from its captured cut",
         ));
     }
-    pinned = refresh_pinned_snapshot_database(pinned)?;
     verify_pinned_snapshot_descriptor(&pinned, &destination)?;
     drop(destination);
-    Ok(pinned)
+
+    // The URI resolves this process's already-pinned descriptor.  SQLite
+    // accepts the pre-created empty output, and cannot create or redirect a
+    // pathname outside that descriptor binding.
+    let source = open_pinned_snapshot_database(&pinned)?;
+    source
+        .execute("VACUUM INTO ?1", params![vacuum_uri])
+        .map_err(db_error)?;
+    verify_pinned_snapshot_descriptor(&pinned, &source)?;
+    drop(source);
+
+    compacted.verify_linked_identity()?;
+    compacted.file().sync_all()?;
+    sync_snapshot_parent_directory(vacuum_path)?;
+    let compacted_connection = open_pinned_snapshot_database(&compacted)?;
+    validate_durable_authority_for_raw_access(
+        &compacted_connection,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+    )?;
+    validate_existing_schema(&compacted_connection, identity).map_err(|_| {
+        invalid_data("built session consensus compacted snapshot failed validation")
+    })?;
+    validate_sealed_state_sync(&compacted_connection)?;
+    let observed_cut = snapshot_applied_membership_sync(&compacted_connection, identity)?;
+    if &observed_cut != expected_cut {
+        return Err(invalid_data(
+            "session consensus compacted snapshot metadata differs from its captured cut",
+        ));
+    }
+    compacted = refresh_pinned_snapshot_database(compacted)?;
+    verify_pinned_snapshot_descriptor(&compacted, &compacted_connection)?;
+    if !compacted.path_matches_identity(vacuum_path)? {
+        return Err(invalid_data(
+            "session consensus compacted snapshot path was replaced",
+        ));
+    }
+    drop(compacted_connection);
+    Ok(compacted)
+}
+
+fn sync_snapshot_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_data("session consensus vacuum snapshot has no parent"))?;
+    File::open(parent)?.sync_all()
 }
 
 /// Capture the source image while the caller holds the SQLite transaction that
@@ -13342,6 +13424,224 @@ mod tests {
     fn snapshot_source_wal_bound_rejects_small_overflow() {
         assert!(enforce_snapshot_source_wal_bound(1, 1).is_ok());
         assert!(enforce_snapshot_source_wal_bound(2, 1).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_vacuum_into_finalization_survives_temp_path_failure_and_preserves_authority_and_receipts(
+    ) {
+        const CHILD: &str = "OPC_SESSION_STORE_TEST_FAIL_TEMP_VFS";
+        const TEST_NAME: &str = "sqlite::consensus::tests::pinned_vacuum_into_finalization_survives_temp_path_failure_and_preserves_authority_and_receipts";
+
+        // The VFS registry is process-global.  Re-exec exactly this test so
+        // no parallel unit test can observe its deliberate fault injection.
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current unit-test executable"),
+            )
+            .args(["--exact", TEST_NAME])
+            .env(CHILD, "1")
+            .status()
+            .expect("run isolated temporary-path failure regression");
+            assert!(status.success(), "isolated regression succeeds");
+            return;
+        }
+
+        opc_sqlite_file_control_sys::install_test_temp_path_failure_vfs()
+            .expect("register temporary-path failure VFS");
+        SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS.store(true, Ordering::Release);
+
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let legacy_path = directory.path().join("legacy-vacuum.sqlite");
+        let legacy = Connection::open_with_flags_and_vfs(
+            &legacy_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            "opc-test-fail-temp-vfs",
+        )
+        .expect("open legacy vacuum fixture through failure VFS");
+        legacy
+            .execute_batch(
+                "PRAGMA page_size = 4096; \
+                 PRAGMA cache_size = 1; \
+                 CREATE TABLE retained(value BLOB); \
+                 WITH RECURSIVE rows(value) AS ( \
+                     VALUES(1) UNION ALL SELECT value + 1 FROM rows WHERE value < 256 \
+                 ) \
+                 INSERT INTO retained SELECT zeroblob(4096) FROM rows;",
+            )
+            .expect("seed legacy vacuum fixture");
+        let legacy_error = legacy
+            .execute_batch("VACUUM")
+            .expect_err("ordinary VACUUM must require a global temporary path");
+        assert!(matches!(
+            legacy_error,
+            rusqlite::Error::SqliteFailure(error, _)
+                if error.extended_code == rusqlite::ffi::SQLITE_IOERR_GETTEMPPATH
+        ));
+        drop(legacy);
+
+        // All descriptor-backed snapshot opens below use the same failure VFS.
+        // `VACUUM INTO` must nevertheless succeed because it writes the
+        // pre-created sibling descriptor rather than requesting an unnamed
+        // SQLite temporary file.
+        let source_path = directory.path().join("source.sqlite");
+        let backend = SqliteSessionBackend::open(&source_path).expect("open source backend");
+        let source = backend.conn.blocking_lock();
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &source,
+            identity(),
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed source authority");
+        // Keep the retained source larger than the one-page fixture that can
+        // stay entirely in SQLite's cache.  This models the retained-state
+        // compaction boundary while remaining at the accepted payload cap.
+        let request =
+            fenced_transition_request_with_payload(0xD4, "vacuum-into-owner", 256 * 4_096);
+        apply_entries_with_authority_sync(
+            &source,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![
+                membership_entry_at(0, vec![members.clone()], members.clone()),
+                fenced_transition_entry_for_voters(1, request.clone(), timestamp(1), &members),
+            ],
+        )
+        .expect("seed authority and fenced receipt");
+        assert!(matches!(
+            read_fenced_transition_status_sync(&source, identity(), identity(), &request),
+            Ok(FencedTransitionStatus::Recorded(_))
+        ));
+        let source_file = PinnedSqliteFile::from_file(
+            opc_sqlite_file_control_sys::main_file_descriptor(&source)
+                .expect("duplicate live source descriptor"),
+            source_path.clone(),
+        )
+        .expect("pin source descriptor");
+        let reader = open_snapshot_read_connection(&source_file).expect("open snapshot reader");
+        let source_cut = begin_snapshot_read_sync(&reader, identity()).expect("begin source cut");
+        let raw_path = directory.path().join("build-vacuum-test.sqlite");
+        let (_, raw_snapshot, _) = capture_snapshot_database_from_reader_sync(
+            &reader,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &source_cut,
+            &raw_path,
+        )
+        .expect("capture descriptor-bound source");
+        release_snapshot_read_sync(&reader).expect("release source reader before finalization");
+
+        let collision = directory.path().join("vacuum-collision.sqlite");
+        std::fs::write(&collision, b"pre-existing").expect("seed collision artifact");
+        let raw_before_collision =
+            std::fs::read(&raw_path).expect("read raw snapshot before collision");
+        let collision_error = finalize_captured_snapshot_database_sync(
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &source_cut,
+            raw_snapshot
+                .try_clone()
+                .expect("clone raw descriptor for collision check"),
+            &collision,
+        )
+        .expect_err("pre-existing vacuum artifact must fail O_EXCL before mutating the raw image");
+        assert_eq!(io::ErrorKind::AlreadyExists, collision_error.kind());
+        assert_eq!(
+            std::fs::read(&collision).expect("collision artifact is untouched"),
+            b"pre-existing",
+        );
+        assert_eq!(
+            raw_before_collision,
+            std::fs::read(&raw_path).expect("read raw snapshot after collision"),
+            "collision rejection leaves the raw snapshot unmodified",
+        );
+
+        let compact_path = directory.path().join("vacuum-result.sqlite");
+        let compacted = finalize_captured_snapshot_database_sync(
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &source_cut,
+            raw_snapshot,
+            &compact_path,
+        )
+        .expect("pinned VACUUM INTO finalization succeeds without a temp path");
+        compacted
+            .verify_linked_identity()
+            .expect("compacted descriptor remains singly linked");
+        assert!(
+            compacted
+                .path_matches_identity(&compact_path)
+                .expect("compare compacted descriptor and name"),
+            "VACUUM INTO retains the pre-created pinned inode"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            0o600,
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&compact_path)
+                    .expect("compacted artifact metadata")
+                    .permissions(),
+            ) & 0o777,
+            "compacted artifact retains the private creation mode"
+        );
+
+        let compacted_connection =
+            open_pinned_snapshot_database(&compacted).expect("open compacted pinned descriptor");
+        assert_eq!(
+            ConsensusAuthorityProfile::FixedImmutable,
+            read_consensus_authority_profile_sync(&compacted_connection)
+                .expect("compacted authority profile")
+        );
+        assert!(matches!(
+            read_fenced_transition_status_sync(
+                &compacted_connection,
+                identity(),
+                identity(),
+                &request,
+            ),
+            Ok(FencedTransitionStatus::Recorded(_))
+        ));
+        for table in [
+            "consensus_vote",
+            "consensus_committed",
+            "consensus_purged",
+            "consensus_log",
+            "consensus_snapshot",
+        ] {
+            let count: i64 = compacted_connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("read compacted transient table");
+            assert_eq!(0, count, "{table} is removed from the compacted image");
+        }
+        let retained_records: i64 = compacted_connection
+            .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
+            .expect("read retained state");
+        assert_eq!(
+            1, retained_records,
+            "fenced transition state survives compaction"
+        );
+        drop(compacted_connection);
+        SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS.store(false, Ordering::Release);
     }
 
     #[test]

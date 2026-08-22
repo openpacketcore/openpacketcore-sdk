@@ -466,7 +466,7 @@ async fn validate_and_clean_snapshot_directory(
         ]
         .iter()
         .any(|(prefix, suffix)| file_name.starts_with(prefix) && file_name.ends_with(suffix));
-        let sqlite_staging = ["install-", "build-"]
+        let sqlite_staging = ["install-", "build-", "vacuum-"]
             .iter()
             .any(|prefix| file_name.starts_with(prefix))
             && [".sqlite", ".sqlite-journal", ".sqlite-wal", ".sqlite-shm"]
@@ -1277,6 +1277,7 @@ async fn wait_until_applied(
 async fn build_file_backed_snapshot_database(
     core: &SqliteConsensusCore,
     raw_artifact: SnapshotArtifact,
+    vacuum_artifact: SnapshotArtifact,
     snapshot_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<
     (
@@ -1290,11 +1291,12 @@ async fn build_file_backed_snapshot_database(
             u64,
         )>,
         SnapshotArtifact,
+        Option<SnapshotArtifact>,
     ),
     StorageError<SessionConsensusNodeId>,
 > {
     let Some(database_file) = &core.database_file else {
-        return Ok((snapshot_guard, None, raw_artifact));
+        return Ok((snapshot_guard, None, raw_artifact, None));
     };
     let reader = consensus::open_snapshot_read_connection(database_file)
         .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
@@ -1362,6 +1364,7 @@ async fn build_file_backed_snapshot_database(
     let expected_bindings = core.expected_bindings.clone();
     let fixed_placement_policy = core.fixed_placement_policy;
     let raw_path = raw_artifact.path().to_path_buf();
+    let vacuum_path = vacuum_artifact.path().to_path_buf();
     #[cfg(test)]
     let snapshot_capture_gate = Arc::clone(&core.snapshot_capture_gate);
     // The owned guard moves into the worker and comes back with its result.
@@ -1369,6 +1372,7 @@ async fn build_file_backed_snapshot_database(
     // second WAL-pinning reader for this consensus core.
     let (snapshot_guard, captured) = tokio::task::spawn_blocking(move || {
         let raw_artifact = raw_artifact;
+        let vacuum_artifact = vacuum_artifact;
         #[cfg(test)]
         snapshot_capture_gate.block_after_capture();
         let captured = consensus::capture_snapshot_database_from_reader_sync(
@@ -1389,10 +1393,27 @@ async fn build_file_backed_snapshot_database(
                 let (captured_cut, raw_snapshot, wal_bytes) = captured;
                 consensus::finalize_captured_snapshot_database_sync(
                     storage_identity,
+                    authority_profile,
+                    &expected_members,
+                    &expected_bindings,
+                    fixed_placement_policy,
                     &captured_cut,
                     raw_snapshot,
+                    &vacuum_path,
                 )
-                .map(|raw_snapshot| (captured_cut, raw_snapshot, wal_bytes, raw_artifact))
+                // Keep both guards through sealing and publication.  The raw
+                // source is explicitly removed only after metadata commits;
+                // only the independently verified `VACUUM INTO` descriptor
+                // may proceed to sealing.
+                .map(|raw_snapshot| {
+                    (
+                        captured_cut,
+                        raw_snapshot,
+                        wal_bytes,
+                        raw_artifact,
+                        vacuum_artifact,
+                    )
+                })
             }
             (Err(_), Err(release_error)) | (Ok(_), Err(release_error)) => Err(release_error),
             (Err(error), Ok(())) => Err(error),
@@ -1407,12 +1428,13 @@ async fn build_file_backed_snapshot_database(
             io::Error::other("session consensus snapshot worker is unavailable"),
         )
     })?;
-    let (captured_cut, raw_snapshot, wal_bytes, raw_artifact) = captured
+    let (captured_cut, raw_snapshot, wal_bytes, raw_artifact, vacuum_artifact) = captured
         .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?;
     Ok((
         snapshot_guard,
         Some((captured_cut, raw_snapshot, wal_bytes)),
         raw_artifact,
+        Some(vacuum_artifact),
     ))
 }
 
@@ -1445,6 +1467,12 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             raw_path.clone(),
             Arc::clone(&self.core.snapshot_cleanup_failed),
         );
+        let vacuum_path = self
+            .core
+            .snapshot_dir
+            .join(format!("vacuum-{}.sqlite", uuid::Uuid::new_v4()));
+        let vacuum_artifact =
+            SnapshotArtifact::new(vacuum_path, Arc::clone(&self.core.snapshot_cleanup_failed));
         let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
         let final_path = self.core.snapshot_dir.join(&file_name);
         let final_artifact = SnapshotArtifact::new(
@@ -1459,8 +1487,14 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             temporary_path.clone(),
             Arc::clone(&self.core.snapshot_cleanup_failed),
         );
-        let (_snapshot_guard, file_backed, raw_artifact) =
-            build_file_backed_snapshot_database(&self.core, raw_artifact, snapshot_guard).await?;
+        let (_snapshot_guard, file_backed, raw_artifact, vacuum_artifact) =
+            build_file_backed_snapshot_database(
+                &self.core,
+                raw_artifact,
+                vacuum_artifact,
+                snapshot_guard,
+            )
+            .await?;
         let (
             (last_log_id, last_membership),
             (mut snapshot, checksum, byte_length),
@@ -1620,6 +1654,15 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 error,
             )
         })?;
+        if let Some(vacuum_artifact) = vacuum_artifact {
+            vacuum_artifact.remove().await.map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    error,
+                )
+            })?;
+        }
         remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name)
             .await
             .map_err(|error| {
@@ -2386,6 +2429,8 @@ mod tests {
         let cancelled_receive = snapshots.join("incoming-cancelled.part");
         let interrupted_build = snapshots.join("build-interrupted.sqlite");
         let interrupted_install_wal = snapshots.join("install-interrupted.sqlite-wal");
+        let interrupted_vacuum = snapshots.join("vacuum-interrupted.sqlite");
+        let interrupted_vacuum_wal = snapshots.join("vacuum-interrupted.sqlite-wal");
         let orphan_promoted = snapshots.join("snapshot-orphan.opc");
         tokio::fs::write(&cancelled_receive, b"partial authenticated stream")
             .await
@@ -2396,6 +2441,12 @@ mod tests {
         tokio::fs::write(&interrupted_install_wal, b"partial SQLite WAL")
             .await
             .expect("write interrupted install WAL artifact");
+        tokio::fs::write(&interrupted_vacuum, b"partial compacted SQLite snapshot")
+            .await
+            .expect("write interrupted vacuum artifact");
+        tokio::fs::write(&interrupted_vacuum_wal, b"partial compacted SQLite WAL")
+            .await
+            .expect("write interrupted vacuum WAL artifact");
         tokio::fs::write(&orphan_promoted, b"promoted before metadata commit")
             .await
             .expect("write orphan promoted artifact");
@@ -2405,6 +2456,8 @@ mod tests {
         assert!(!cancelled_receive.exists());
         assert!(!interrupted_build.exists());
         assert!(!interrupted_install_wal.exists());
+        assert!(!interrupted_vacuum.exists());
+        assert!(!interrupted_vacuum_wal.exists());
         assert!(!orphan_promoted.exists());
         let error = match open(&backend, &snapshots, identity(2), expected_members()).await {
             Ok(_) => panic!("different configuration must fail"),
