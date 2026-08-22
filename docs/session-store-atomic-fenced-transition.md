@@ -615,18 +615,18 @@ commit, and an operator MUST NOT manufacture a later expected generation.
 
 ### Capacity and operational sizing
 
-At most 135,168 receipt bindings coexist: V1's fixed 4,096 plus one V2 active
-epoch's fixed 131,072. For qualification accounting, a maximum retained V2
-row is a 17,408-byte persisted response allowance plus 206 bytes of fixed
-logical metadata: 56-byte full ID; 8-byte history epoch; 8-byte ordered epoch
-ordinal; 8-byte storage configuration epoch; 32-byte canonical body digest; 30-byte
-canonical retention timestamp; 32-byte binding digest; and 32-byte response
-digest. Therefore one maximum V2 row is 17,614 logical bytes and an all-V2
-maximum is 2,308,702,208 bytes (2.150 GiB). The V1 row remains 17,558 logical
-bytes (the same 17,408-byte persisted response allowance, plus 16-byte ID,
-8-byte configuration epoch, 32-byte body digest, 30-byte deadline, and two
-32-byte digests); the combined V1+V2 maximum is 2,380,619,776 bytes
-(2.217 GiB).
+At most 1,052,672 receipt bindings coexist: V1's fixed 4,096 plus V2's eight
+retained epochs of 131,072 bindings each. For qualification accounting, a
+maximum retained V2 row is a 17,408-byte persisted response allowance plus
+206 bytes of fixed logical metadata: 56-byte full ID; 8-byte history epoch;
+8-byte ordered epoch ordinal; 8-byte storage configuration epoch; 32-byte
+canonical body digest; 30-byte canonical retention timestamp; 32-byte binding
+digest; and 32-byte response digest. Therefore one maximum V2 row is 17,614
+logical bytes and the all-V2 maximum is 18,469,617,664 bytes (17.201 GiB).
+The V1 row remains 17,558 logical bytes (the same 17,408-byte persisted
+response allowance, plus 16-byte ID, 8-byte configuration epoch, 32-byte body
+digest, 30-byte deadline, and two 32-byte digests); the combined V1+V2 maximum
+is 18,541,535,232 bytes (17.268 GiB).
 These figures deliberately exclude SQLite B-tree, index, page, WAL, snapshot
 envelope, and filesystem allocation overhead; deployment capacity must add
 those measured overheads rather than treating the logical total as a disk
