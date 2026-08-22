@@ -1437,7 +1437,6 @@ impl SqliteConsensusCore {
         let canonical_snapshot_dir = tokio::fs::canonicalize(&snapshot_dir)
             .await
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-
         let (storage_identity, applied, database_file) = {
             let conn = backend.conn.lock().await;
             let storage_identity = initialize_schema_with_storage_anchor_and_pending_and_bindings(
@@ -17778,6 +17777,12 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn snapshot_source_wal_bound_rejects_small_overflow() {
+        assert!(enforce_snapshot_source_wal_bound(1, 1).is_ok());
+        assert!(enforce_snapshot_source_wal_bound(2, 1).is_err());
+    }
 
     #[test]
     fn fenced_transition_v2_closed_epoch_integrity_is_fail_closed() {
