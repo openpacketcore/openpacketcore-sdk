@@ -811,6 +811,38 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read one ordinary consumer lease-mutation receipt after the caller has
+    /// completed its leader-linearizable barrier.  This opens a SQLite read
+    /// transaction only; it does not advance logical time or submit a
+    /// consensus command.
+    pub(crate) async fn consensus_consumer_lease_mutation_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        authority_identity: crate::consensus::SessionConsensusIdentity,
+        binding_request_id: crate::consensus::SessionConsensusRequestId,
+        operation_request_id: crate::consensus::SessionConsensusRequestId,
+        request: &crate::consumer::SessionConsumerRequest,
+    ) -> Result<crate::consumer::SessionConsumerLeaseMutationStatus, StoreError> {
+        let request = request.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let status = consensus::read_consumer_lease_mutation_status_sync(
+                &tx,
+                storage_identity,
+                authority_identity,
+                binding_request_id,
+                operation_request_id,
+                &request,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(status)
+        })
+        .await
+    }
+
     /// Restore scan at one persisted consensus logical timestamp.
     pub(crate) async fn consensus_scan_restore_records_at(
         &self,

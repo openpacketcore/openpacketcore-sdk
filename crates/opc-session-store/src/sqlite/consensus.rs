@@ -7579,14 +7579,36 @@ fn payload_digest(
             authority_identity,
             mutation,
             ..
-        } => encode_json(&(
-            command.schema_version,
-            command.identity,
-            authority_identity,
-            mutation.as_ref(),
-        ))?,
+        } => {
+            return authorized_mutation_payload_digest(
+                storage_identity,
+                *authority_identity,
+                mutation.as_ref(),
+            )
+        }
         intent => encode_json(&(command.schema_version, command.identity, intent))?,
     };
+    let mut hasher = Sha256::new();
+    hasher.update(OUTCOME_DIGEST_DOMAIN);
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
+/// Calculate the durable payload digest for the authenticated application
+/// envelope without reconstructing a leader-owned command.  Receipt status
+/// uses this for an already-authorized exact scope; it deliberately accepts
+/// neither a client-supplied internal request ID nor an unbound digest.
+fn authorized_mutation_payload_digest(
+    storage_identity: SessionConsensusIdentity,
+    authority_identity: SessionConsensusIdentity,
+    mutation: &SessionMutationIntent,
+) -> io::Result<[u8; 32]> {
+    let encoded = encode_json(&(
+        SESSION_CONSENSUS_SCHEMA_VERSION,
+        storage_identity,
+        authority_identity,
+        mutation,
+    ))?;
     let mut hasher = Sha256::new();
     hasher.update(OUTCOME_DIGEST_DOMAIN);
     hasher.update(encoded);
@@ -8390,6 +8412,270 @@ pub(crate) fn read_fenced_transition_status_sync(
         return Ok(FencedTransitionStatus::RetentionExhausted);
     }
     Ok(FencedTransitionStatus::NotFound)
+}
+
+/// Read the exact binding and operation outcomes for an ordinary consumer
+/// lease mutation without applying a consensus command or evaluating current
+/// lease state.
+///
+/// The caller supplies only IDs derived at the authenticated server boundary.
+/// The complete original consumer request is still required here to rebuild
+/// both expected commitments.  A matching public ID with a changed body is a
+/// conflict; an absent row is merely an observation at the caller's completed
+/// linearizable read barrier.
+pub(crate) fn read_consumer_lease_mutation_status_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    authority_identity: SessionConsensusIdentity,
+    binding_request_id: SessionConsensusRequestId,
+    operation_request_id: SessionConsensusRequestId,
+    request: &crate::consumer::SessionConsumerRequest,
+) -> Result<crate::consumer::SessionConsumerLeaseMutationStatus, StoreError> {
+    use crate::consumer::{
+        SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationStatus,
+        SessionConsumerOperation,
+    };
+
+    request.validate().map_err(|_| {
+        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+    })?;
+    if request.scope().consensus_identity() != authority_identity {
+        return Err(StoreError::BackendUnavailable(
+            "consumer lease receipt status is unavailable".into(),
+        ));
+    }
+    let lease_operation = match request.operation() {
+        SessionConsumerOperation::AcquireLease { key, owner, ttl } => {
+            SessionConsumerLeaseMutationOperation::Acquire {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl: *ttl,
+            }
+        }
+        SessionConsumerOperation::RenewLease { lease, ttl } => {
+            SessionConsumerLeaseMutationOperation::Renew {
+                lease: lease.clone(),
+                ttl: *ttl,
+            }
+        }
+        SessionConsumerOperation::ReleaseLease { lease } => {
+            SessionConsumerLeaseMutationOperation::Release {
+                lease: lease.clone(),
+            }
+        }
+        _ => {
+            return Err(StoreError::BackendUnavailable(
+                "consumer lease receipt status is unavailable".into(),
+            ));
+        }
+    };
+    let commitment = crate::consumer::consumer_request_commitment(request).map_err(|_| {
+        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+    })?;
+    let binding_digest = authorized_mutation_payload_digest(
+        storage_identity,
+        authority_identity,
+        &SessionMutationIntent::BindConsumerRequest {
+            request_commitment: commitment,
+        },
+    )
+    .map_err(|_| {
+        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+    })?;
+    let operation_intent = match &lease_operation {
+        SessionConsumerLeaseMutationOperation::Acquire { key, owner, ttl } => {
+            SessionMutationIntent::AcquireLease {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl: *ttl,
+            }
+        }
+        SessionConsumerLeaseMutationOperation::Renew { lease, ttl } => {
+            SessionMutationIntent::RenewLease {
+                lease: lease.clone(),
+                ttl: *ttl,
+            }
+        }
+        SessionConsumerLeaseMutationOperation::Release { lease } => {
+            SessionMutationIntent::ReleaseLease(lease.clone())
+        }
+    };
+    let operation_digest =
+        authorized_mutation_payload_digest(storage_identity, authority_identity, &operation_intent)
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "consumer lease receipt status is unavailable".into(),
+                )
+            })?;
+
+    let binding = read_outcome_sync(conn, storage_identity, binding_request_id).map_err(|_| {
+        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+    })?;
+    let binding_matches = match binding {
+        Some((digest, response)) if digest == binding_digest => {
+            matches!(response.result, Ok(SessionMutationOutcome::Unit))
+        }
+        Some(_) => return Ok(SessionConsumerLeaseMutationStatus::RequestConflict),
+        None => false,
+    };
+    if !binding_matches {
+        if request_id_is_occupied_sync(conn, storage_identity, binding_request_id)?
+            || request_id_is_occupied_sync(conn, storage_identity, operation_request_id)?
+        {
+            return Ok(SessionConsumerLeaseMutationStatus::RequestConflict);
+        }
+        return Ok(SessionConsumerLeaseMutationStatus::NotFound);
+    }
+
+    let Some((digest, response)) = read_outcome_sync(conn, storage_identity, operation_request_id)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+        })?
+    else {
+        if request_id_is_occupied_sync(conn, storage_identity, operation_request_id)? {
+            return Ok(SessionConsumerLeaseMutationStatus::RequestConflict);
+        }
+        return Ok(SessionConsumerLeaseMutationStatus::NotFound);
+    };
+    if digest != operation_digest {
+        return Ok(SessionConsumerLeaseMutationStatus::RequestConflict);
+    }
+    let recorded = consumer_lease_mutation_result_from_response(&lease_operation, &response)?;
+    Ok(SessionConsumerLeaseMutationStatus::Recorded(Box::new(
+        recorded,
+    )))
+}
+
+fn request_id_is_occupied_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: SessionConsensusRequestId,
+) -> Result<bool, StoreError> {
+    if read_outcome_sync(conn, identity, request_id)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+        })?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    read_fenced_transition_receipt_sync(conn, identity, request_id)
+        .map(|receipt| receipt.is_some())
+        .map_err(|_| {
+            StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+        })
+}
+
+fn consumer_lease_mutation_result_from_response(
+    operation: &crate::consumer::SessionConsumerLeaseMutationOperation,
+    response: &SessionConsensusResponse,
+) -> Result<
+    Result<
+        crate::consumer::SessionConsumerLeaseMutationResult,
+        crate::consumer::SessionConsumerLeaseError,
+    >,
+    StoreError,
+> {
+    use crate::consumer::{
+        SessionConsumerLeaseError, SessionConsumerLeaseMutationOperation,
+        SessionConsumerLeaseMutationResult,
+    };
+
+    let unavailable =
+        || StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into());
+    let deterministic_error = |error: &StoreError, permits: &[SessionConsumerLeaseError]| {
+        let projected = match error {
+            StoreError::LeaseHeld => SessionConsumerLeaseError::AlreadyHeld,
+            StoreError::LeaseExpired => SessionConsumerLeaseError::Expired,
+            StoreError::StaleFence | StoreError::TopologyAuthorityRevoked => {
+                SessionConsumerLeaseError::StaleFence
+            }
+            StoreError::NotFound => SessionConsumerLeaseError::NotFound,
+            StoreError::InvalidSessionTtl => SessionConsumerLeaseError::InvalidTtl,
+            _ => return None,
+        };
+        permits.contains(&projected).then_some(projected)
+    };
+    match operation {
+        SessionConsumerLeaseMutationOperation::Acquire { key, owner, ttl } => {
+            match &response.result {
+                Ok(SessionMutationOutcome::Lease(guard)) => {
+                    guard.validate_profile().map_err(|_| unavailable())?;
+                    if guard.key() != key
+                        || guard.owner() != owner
+                        || guard.acquired_at() != response.logical_time.ok_or_else(unavailable)?
+                        || guard.expires_at()
+                            != crate::ttl::checked_session_deadline(
+                                response.logical_time.ok_or_else(unavailable)?,
+                                *ttl,
+                            )
+                            .map_err(|_| unavailable())?
+                    {
+                        return Err(unavailable());
+                    }
+                    Ok(Ok(SessionConsumerLeaseMutationResult::Acquire(
+                        guard.clone(),
+                    )))
+                }
+                Err(error) => deterministic_error(
+                    error,
+                    &[
+                        SessionConsumerLeaseError::AlreadyHeld,
+                        SessionConsumerLeaseError::InvalidTtl,
+                    ],
+                )
+                .map(Err)
+                .ok_or_else(unavailable),
+                Ok(_) => Err(unavailable()),
+            }
+        }
+        SessionConsumerLeaseMutationOperation::Renew { lease, ttl } => match &response.result {
+            Ok(SessionMutationOutcome::Lease(guard)) => {
+                guard.validate_profile().map_err(|_| unavailable())?;
+                if guard.key() != lease.key()
+                    || guard.owner() != lease.owner()
+                    || guard.fence() != lease.fence()
+                    || guard.credential_id() != lease.credential_id()
+                    || guard.acquired_at() != lease.acquired_at()
+                    || guard.expires_at()
+                        != crate::ttl::checked_session_deadline(
+                            response.logical_time.ok_or_else(unavailable)?,
+                            *ttl,
+                        )
+                        .map_err(|_| unavailable())?
+                {
+                    return Err(unavailable());
+                }
+                Ok(Ok(SessionConsumerLeaseMutationResult::Renew(guard.clone())))
+            }
+            Err(error) => deterministic_error(
+                error,
+                &[
+                    SessionConsumerLeaseError::Expired,
+                    SessionConsumerLeaseError::StaleFence,
+                    SessionConsumerLeaseError::NotFound,
+                    SessionConsumerLeaseError::InvalidTtl,
+                ],
+            )
+            .map(Err)
+            .ok_or_else(unavailable),
+            Ok(_) => Err(unavailable()),
+        },
+        SessionConsumerLeaseMutationOperation::Release { lease: _ } => match &response.result {
+            Ok(SessionMutationOutcome::Unit) => Ok(Ok(SessionConsumerLeaseMutationResult::Release)),
+            Err(error) => deterministic_error(
+                error,
+                &[
+                    SessionConsumerLeaseError::Expired,
+                    SessionConsumerLeaseError::StaleFence,
+                    SessionConsumerLeaseError::NotFound,
+                ],
+            )
+            .map(Err)
+            .ok_or_else(unavailable),
+            Ok(_) => Err(unavailable()),
+        },
+    }
 }
 
 fn replay_conflict_response(

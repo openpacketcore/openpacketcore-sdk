@@ -38,9 +38,11 @@ use opc_session_store::{
     ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
     SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
     SessionConsensusWireRequest, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerOperation, SessionConsumerRequest,
+    SessionConsumerFencedTransitionStatus, SessionConsumerLeaseMutationOperation,
+    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
+    SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerRequest,
     SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope, SessionKey,
-    SessionKeyType, StateClass, StateType, StoredSessionRecord,
+    SessionKeyType, StateClass, StateType, StoreError, StoredSessionRecord,
 };
 use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
@@ -8257,6 +8259,16 @@ impl QualificationConsumerClient {
         }
     }
 
+    async fn lease_mutation_status(
+        &self,
+        request: &SessionConsumerLeaseMutationRequest,
+    ) -> Result<SessionConsumerLeaseMutationStatus, StoreError> {
+        match self {
+            Self::Stateless(client) => client.lease_mutation_status(request).await,
+            Self::Persistent(client) => client.lease_mutation_status(request).await,
+        }
+    }
+
     async fn prewarm(&self) -> Result<bool, SessionConsumerClientError> {
         match self {
             Self::Stateless(_) => Ok(true),
@@ -8986,25 +8998,46 @@ fn run_consumer_multiprocess_qualification(
     let ambiguous_key = stateless_consumer_key(1);
     let ambiguous_owner =
         OwnerId::new("qualification-ambiguous-owner").expect("ambiguous consumer owner");
+    let ambiguous_ttl = Duration::from_secs(30);
     assert!(matches!(
         runtime.block_on(healthy_client.acquire_with_id(
             ambiguous_request_id,
             ambiguous_key.clone(),
             ambiguous_owner.clone(),
-            Duration::from_secs(30),
+            ambiguous_ttl,
         )),
         Err(SessionConsumerLeaseMutationError::OutcomeUnknown { request_id }) if request_id == ambiguous_request_id
     ));
+    let retained = SessionConsumerLeaseMutationRequest::new(
+        ambiguous_request_id,
+        SessionConsumerLeaseMutationOperation::Acquire {
+            key: ambiguous_key.clone(),
+            owner: ambiguous_owner.clone(),
+            ttl: ambiguous_ttl,
+        },
+    );
+    let status_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    let recovered = loop {
+        match runtime.block_on(healthy_client.lease_mutation_status(&retained)) {
+            Ok(SessionConsumerLeaseMutationStatus::Recorded(result)) => match *result {
+                Ok(SessionConsumerLeaseMutationResult::Acquire(guard)) => break guard,
+                other => panic!("lease receipt returned an unexpected recorded result: {other:?}"),
+            },
+            Ok(SessionConsumerLeaseMutationStatus::NotFound) => {
+                assert!(
+                    Instant::now() < status_deadline,
+                    "read-only receipt did not converge after the delayed acquire"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            other => panic!("lease receipt recovery failed closed: {other:?}"),
+        }
+    };
+    assert_eq!(recovered.key(), &ambiguous_key);
+    assert_eq!(recovered.owner(), &ambiguous_owner);
     assert!(
-        runtime
-            .block_on(healthy_client.acquire_with_id(
-                ambiguous_request_id,
-                ambiguous_key,
-                ambiguous_owner,
-                Duration::from_secs(30),
-            ))
-            .is_ok(),
-        "only the caller's retained request ID may recover a durable ambiguous mutation"
+        recovered.expires_at() > recovered.acquired_at(),
+        "receipt recovery returns the persisted guard, not a fresh acquisition"
     );
     assert!(runtime.block_on(healthy_client.capabilities()).is_ok());
 

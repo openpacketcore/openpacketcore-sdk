@@ -260,6 +260,16 @@ pub enum SessionConsumerOperation {
         /// Requested bounded TTL.
         ttl: Duration,
     },
+    /// Recover the exact durable receipt for one ordinary lease mutation.
+    ///
+    /// This is a leader-linearizable, read-only operation.  The complete
+    /// original public request identity and lease body are retained by the
+    /// caller and rebuilt by the server under its authenticated identity; it
+    /// never accepts a derived consensus ID or submits a lease mutation.
+    LeaseMutationStatus {
+        /// Complete original lease request retained by the caller.
+        request: Box<SessionConsumerLeaseMutationRequest>,
+    },
     /// Prove the exact atomic fenced-transition capability across the current
     /// admitted voter set.
     FencedTransitionCapability,
@@ -299,6 +309,7 @@ impl fmt::Debug for SessionConsumerOperation {
             Self::Watch { .. } => "Watch",
             Self::AcquireLease { .. } => "AcquireLease",
             Self::RenewLease { .. } => "RenewLease",
+            Self::LeaseMutationStatus { .. } => "LeaseMutationStatus",
             Self::ReleaseLease { .. } => "ReleaseLease",
             Self::FencedTransitionCapability => "FencedTransitionCapability",
             Self::ObserveFencedTransition { .. } => "ObserveFencedTransition",
@@ -341,6 +352,7 @@ impl SessionConsumerOperation {
             }
             Self::AcquireLease { ttl, .. } => crate::validate_session_ttl(*ttl)
                 .map_err(|_| SessionConsumerRejection::MalformedRequest),
+            Self::LeaseMutationStatus { request } => request.validate(),
             Self::FencedTransition { request } | Self::FencedTransitionStatus { request } => {
                 request
                     .validate()
@@ -403,8 +415,154 @@ impl SessionConsumerRequest {
             {
                 Err(SessionConsumerRejection::MalformedRequest)
             }
+            SessionConsumerOperation::LeaseMutationStatus { request }
+                if request.request_id().as_bytes() != self.request_id.as_bytes() =>
+            {
+                Err(SessionConsumerRejection::MalformedRequest)
+            }
             _ => Ok(()),
         }
+    }
+}
+
+/// One ordinary lease operation whose complete original body is retained for
+/// exact receipt recovery.
+///
+/// This type deliberately contains the public request ID and original body,
+/// rather than an internal consensus request ID or digest.  The server derives
+/// every internal binding from the authenticated consumer identity and exact
+/// consumer scope at the read boundary.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "lease_operation",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerLeaseMutationOperation {
+    /// Original acquire-lease body.
+    Acquire {
+        /// Session key to lease.
+        key: SessionKey,
+        /// Requested owner.
+        owner: OwnerId,
+        /// Requested bounded TTL.
+        ttl: Duration,
+    },
+    /// Original renew-lease body.
+    Renew {
+        /// Existing lease credential.
+        lease: LeaseGuard,
+        /// Requested bounded TTL.
+        ttl: Duration,
+    },
+    /// Original release-lease body.
+    Release {
+        /// Existing lease credential.
+        lease: LeaseGuard,
+    },
+}
+
+impl fmt::Debug for SessionConsumerLeaseMutationOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Acquire { .. } => "Acquire",
+            Self::Renew { .. } => "Renew",
+            Self::Release { .. } => "Release",
+        };
+        formatter.write_str(name)
+    }
+}
+
+impl SessionConsumerLeaseMutationOperation {
+    fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        let validate_lease = |lease: &LeaseGuard| {
+            lease
+                .validate_profile()
+                .map_err(|_| SessionConsumerRejection::MalformedRequest)
+        };
+        match self {
+            Self::Acquire { ttl, .. } => crate::validate_session_ttl(*ttl)
+                .map_err(|_| SessionConsumerRejection::MalformedRequest),
+            Self::Renew { lease, ttl } => {
+                validate_lease(lease)?;
+                crate::validate_session_ttl(*ttl)
+                    .map_err(|_| SessionConsumerRejection::MalformedRequest)
+            }
+            Self::Release { lease } => validate_lease(lease),
+        }
+    }
+
+    fn as_consumer_operation(&self) -> SessionConsumerOperation {
+        match self {
+            Self::Acquire { key, owner, ttl } => SessionConsumerOperation::AcquireLease {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl: *ttl,
+            },
+            Self::Renew { lease, ttl } => SessionConsumerOperation::RenewLease {
+                lease: lease.clone(),
+                ttl: *ttl,
+            },
+            Self::Release { lease } => SessionConsumerOperation::ReleaseLease {
+                lease: lease.clone(),
+            },
+        }
+    }
+}
+
+/// Complete original public lease request used only for read-only receipt
+/// recovery.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerLeaseMutationRequest {
+    request_id: SessionConsumerRequestId,
+    operation: SessionConsumerLeaseMutationOperation,
+}
+
+impl SessionConsumerLeaseMutationRequest {
+    /// Construct a retained ordinary lease request from its original public
+    /// request ID and complete mutation body.
+    pub const fn new(
+        request_id: SessionConsumerRequestId,
+        operation: SessionConsumerLeaseMutationOperation,
+    ) -> Self {
+        Self {
+            request_id,
+            operation,
+        }
+    }
+
+    /// Return the original caller-owned public request identity.
+    pub const fn request_id(&self) -> SessionConsumerRequestId {
+        self.request_id
+    }
+
+    /// Return the exact original lease body.
+    pub const fn operation(&self) -> &SessionConsumerLeaseMutationOperation {
+        &self.operation
+    }
+
+    /// Validate the retained body before it reaches the receipt lookup.
+    pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        self.operation.validate()
+    }
+
+    pub(crate) fn original_consumer_request(
+        &self,
+        scope: SessionConsumerScope,
+    ) -> SessionConsumerRequest {
+        SessionConsumerRequest::new(
+            scope,
+            self.request_id,
+            self.operation.as_consumer_operation(),
+        )
+    }
+}
+
+impl fmt::Debug for SessionConsumerLeaseMutationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerLeaseMutationRequest(<redacted>)")
     }
 }
 
@@ -584,6 +742,41 @@ impl SessionConsumerLeaseError {
             Self::Unavailable => LeaseError::Backend("consumer quorum unavailable".into()),
         }
     }
+}
+
+/// Exact persisted result for one ordinary lease mutation receipt.
+///
+/// This is distinct from a current lease observation.  A successful acquire
+/// or renew is returned only from the matching durable consensus outcome, so
+/// a later holder, expiry, or TTL change cannot be mistaken for the original
+/// mutation result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionConsumerLeaseMutationResult {
+    /// Exact guard persisted by the original acquire request.
+    Acquire(LeaseGuard),
+    /// Exact guard persisted by the original renew request.
+    Renew(LeaseGuard),
+    /// Exact successful release receipt.
+    Release,
+}
+
+/// Exact read-only receipt status for an ordinary lease mutation.
+///
+/// `NotFound`, transport timeout, and quorum unavailability do not establish
+/// that the original mutation was never transmitted.  Callers must therefore
+/// keep the original request identity and body and remain fail-closed until a
+/// matching [`Self::Recorded`] result is observed or their own ambiguity
+/// fence expires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionConsumerLeaseMutationStatus {
+    /// The exact persisted success or deterministic lease error.
+    Recorded(Box<Result<SessionConsumerLeaseMutationResult, SessionConsumerLeaseError>>),
+    /// The public request identity is durably bound to another exact body.
+    RequestConflict,
+    /// No matching receipt existed at the completed linearizable read barrier.
+    NotFound,
 }
 
 /// Explicit classification for a request that might have crossed its effect
@@ -882,6 +1075,8 @@ pub enum SessionConsumerResponse {
     RenewLease(Result<LeaseGuard, SessionConsumerLeaseError>),
     /// Lease release result.
     ReleaseLease(Result<(), SessionConsumerLeaseError>),
+    /// Exact read-only receipt status for an ordinary lease mutation.
+    LeaseMutationStatus(Result<SessionConsumerLeaseMutationStatus, SessionConsumerStoreError>),
     /// Exact unanimous atomic-transition capability result.
     FencedTransitionCapability(Result<AtomicFencedTransitionCapability, SessionConsumerStoreError>),
     /// Exact-key record and fence-floor observation.
@@ -913,6 +1108,7 @@ impl fmt::Debug for SessionConsumerResponse {
             Self::AcquireLease(_) => "AcquireLease",
             Self::RenewLease(_) => "RenewLease",
             Self::ReleaseLease(_) => "ReleaseLease",
+            Self::LeaseMutationStatus(_) => "LeaseMutationStatus",
             Self::FencedTransitionCapability(_) => "FencedTransitionCapability",
             Self::ObserveFencedTransition(_) => "ObserveFencedTransition",
             Self::FencedTransition(_) => "FencedTransition",

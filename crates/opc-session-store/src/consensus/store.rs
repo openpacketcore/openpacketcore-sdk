@@ -55,10 +55,11 @@ use crate::consumer::{
     consumer_request_commitment, derive_consumer_consensus_request_id,
     derive_consumer_fenced_transition_request, derive_consumer_request_binding_id,
     SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
-    SessionConsumerFencedTransitionError, SessionConsumerIdentity, SessionConsumerOperation,
-    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
-    SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    SessionConsumerFencedTransitionError, SessionConsumerIdentity,
+    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationStatus,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionQuorumConsumer, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_transition::{
@@ -3469,6 +3470,61 @@ impl ConsensusSessionStore {
         Ok(status)
     }
 
+    /// Resolve one ordinary consumer lease receipt through a leader-linearized
+    /// read-only path.  The binding and operation IDs are already derived from
+    /// the authenticated consumer identity by the service; this method never
+    /// submits `BindConsumerRequest`, a lease operation, or logical-time work.
+    async fn consumer_lease_mutation_status(
+        &self,
+        scope: SessionConsumerScope,
+        binding_request_id: SessionConsensusRequestId,
+        operation_request_id: SessionConsensusRequestId,
+        request: &SessionConsumerRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsumerLeaseMutationStatus, StoreError> {
+        request
+            .validate()
+            .map_err(|_| StoreError::InvalidKey("consumer request rejected".into()))?;
+        if request.scope() != scope {
+            return Err(StoreError::TopologyAuthorityRevoked);
+        }
+        let admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        drop(admission);
+        self.linearizable_barrier_before(deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        // Retain exact-scope admission across the local SQLite receipt read
+        // and final authority proof.  A topology writer therefore cannot
+        // turn an old-scope receipt into a successful current response.
+        let _admission = self
+            .admit_consumer_scope(scope, deadline)
+            .await
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+        let status = self
+            .inner
+            .backend
+            .consensus_consumer_lease_mutation_status(
+                self.inner.storage_identity,
+                scope.consensus_identity(),
+                binding_request_id,
+                operation_request_id,
+                request,
+            )
+            .await?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        Ok(status)
+    }
+
     async fn consumer_scan_restore_records(
         &self,
         scope: SessionConsumerScope,
@@ -4168,6 +4224,34 @@ impl ConsensusSessionConsumerService {
         )
     }
 
+    async fn lease_mutation_status(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: &SessionConsumerRequest,
+        retained: SessionConsumerLeaseMutationRequest,
+        deadline: tokio::time::Instant,
+    ) -> SessionConsumerResponse {
+        let original = retained.original_consumer_request(request.scope());
+        let operation_request_id =
+            match derive_consumer_consensus_request_id(identity, &original, 0) {
+                Ok(request_id) => request_id,
+                Err(rejection) => return SessionConsumerResponse::Rejected(rejection),
+            };
+        let binding_request_id = derive_consumer_request_binding_id(identity, &original);
+        SessionConsumerResponse::LeaseMutationStatus(
+            self.store
+                .consumer_lease_mutation_status(
+                    request.scope(),
+                    binding_request_id,
+                    operation_request_id,
+                    &original,
+                    deadline,
+                )
+                .await
+                .map_err(SessionConsumerStoreError::from),
+        )
+    }
+
     fn operation_deadline(&self) -> Result<tokio::time::Instant, SessionConsumerRejection> {
         tokio::time::Instant::now()
             .checked_add(self.store.inner.operation_timeout)
@@ -4260,6 +4344,7 @@ impl ConsensusSessionConsumerService {
             | SessionConsumerOperation::Watch { .. }
             | SessionConsumerOperation::FencedTransitionCapability
             | SessionConsumerOperation::ObserveFencedTransition { .. }
+            | SessionConsumerOperation::LeaseMutationStatus { .. }
             | SessionConsumerOperation::FencedTransitionStatus { .. } => {
                 SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
             }
@@ -4310,6 +4395,7 @@ impl ConsensusSessionConsumerService {
             | SessionConsumerOperation::Watch { .. }
             | SessionConsumerOperation::FencedTransitionCapability
             | SessionConsumerOperation::ObserveFencedTransition { .. }
+            | SessionConsumerOperation::LeaseMutationStatus { .. }
             | SessionConsumerOperation::FencedTransitionStatus { .. } => false,
             SessionConsumerOperation::Batch { ops } => ops
                 .iter()
@@ -4785,6 +4871,11 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
             } => {
                 drop(admission);
                 self.fenced_transition_status(identity, &request, *transition, deadline)
+                    .await
+            }
+            SessionConsumerOperation::LeaseMutationStatus { request: retained } => {
+                drop(admission);
+                self.lease_mutation_status(identity, &request, *retained, deadline)
                     .await
             }
             SessionConsumerOperation::Get { key } => {
