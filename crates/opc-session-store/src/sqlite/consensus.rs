@@ -16276,6 +16276,70 @@ pub(crate) fn managed_provider_job_status_sync(
     Ok((result.mode, result.phase))
 }
 
+/// Read only the immutable protocol claim for a managed-provider roster.
+///
+/// This deliberately precedes any member-owner lookup on the public status
+/// path.  A predecessor mode-three terminal predates V5 authority/job rows,
+/// so attempting to validate those rows first would turn a durable frozen
+/// terminal into an availability failure.
+pub(crate) fn managed_provider_protocol_mode_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: [u8; FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+) -> Result<u8, StoreError> {
+    read_storage_identity_sync(conn)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("managed provider status is unavailable".into())
+        })?
+        .eq(&identity)
+        .then_some(())
+        .ok_or_else(|| {
+            StoreError::BackendUnavailable("managed provider status is unavailable".into())
+        })?;
+    let mode: i64 = conn
+        .query_row(
+            "SELECT mode FROM consensus_fenced_mutation_roster_protocol_claims WHERE request_id = ?1",
+            [request_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StoreError::BackendUnavailable("managed provider status is unavailable".into()))?
+        .ok_or_else(|| fenced_mutation_roster_invalid("managed_provider_not_admitted"))?;
+    u8::try_from(mode).map_err(|_| fenced_mutation_roster_invalid("managed_provider_mode_invalid"))
+}
+
+/// Report whether a mode-three roster contains any V5 authority commitment.
+///
+/// A predecessor/migrated terminal has none.  Conversely, a partially
+/// damaged or mismatched V5 terminal must remain unavailable rather than be
+/// reclassified as frozen just because its complete-origin proof fails.
+pub(crate) fn managed_provider_has_v5_authority_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: [u8; FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+) -> Result<bool, StoreError> {
+    if read_storage_identity_sync(conn).map_err(|_| {
+        StoreError::BackendUnavailable("managed provider terminal origin is unavailable".into())
+    })? != identity
+    {
+        return Err(StoreError::BackendUnavailable(
+            "managed provider terminal origin is unavailable".into(),
+        ));
+    }
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM consensus_fenced_mutation_roster_managed_provider_authorities
+            WHERE request_id = ?1
+        )",
+        [request_id.as_slice()],
+        |row| row.get(0),
+    )
+    .map_err(|_| {
+        StoreError::BackendUnavailable("managed provider terminal origin is unavailable".into())
+    })
+}
+
 /// Prove that a mode-3 terminal belongs to the managed V5 protocol rather
 /// than the frozen predecessor terminalization path.  Mode alone is shared
 /// by both paths, so every component of the V5 authority and every member
@@ -24346,6 +24410,36 @@ mod tests {
         assert_eq!(
             mode, 3,
             "the migrated predecessor terminal retains mode three"
+        );
+        assert_eq!(
+            managed_provider_protocol_mode_sync(
+                &conn,
+                identity(),
+                admission.request_id().to_bytes(),
+            )
+            .expect("migrated predecessor mode lookup"),
+            3,
+            "the reopened format-seven image exposes the frozen claim before V5 owner lookup"
+        );
+        assert!(
+            managed_provider_job_status_sync(
+                &conn,
+                identity(),
+                admission.request_id().to_bytes(),
+                0,
+                [0x61; 32],
+            )
+            .is_err(),
+            "a migrated predecessor deliberately has no V5 worker ownership to validate"
+        );
+        assert!(
+            !managed_provider_has_v5_authority_sync(
+                &conn,
+                identity(),
+                admission.request_id().to_bytes(),
+            )
+            .expect("migrated predecessor V5 authority lookup"),
+            "the migrated terminal has no partial V5 authority to confuse frozen classification"
         );
         assert!(
             !managed_provider_terminal_is_managed_sync(
@@ -35486,6 +35580,15 @@ BEGIN IMMEDIATE;
             )
             .expect("matching managed terminal origin"),
             "the persisted authority plus every terminal job proves V5 origin"
+        );
+        assert!(
+            managed_provider_has_v5_authority_sync(
+                &conn,
+                identity(),
+                compensated_admission.request_id().to_bytes(),
+            )
+            .expect("managed V5 authority lookup"),
+            "a true V5 terminal remains distinguishable from a predecessor terminal"
         );
         assert!(
             !managed_provider_terminal_is_managed_sync(

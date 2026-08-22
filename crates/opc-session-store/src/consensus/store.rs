@@ -988,8 +988,42 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
-        self.logical_read_time_before(Some(scope.consensus_identity()), deadline)
+        // The following SQLite origin/status reads are local.  In particular,
+        // a follower may have forwarded the immediately preceding mutation,
+        // so do not classify that local image until the exact same deadline's
+        // logical read has committed and this replica has applied its index.
+        self.managed_provider_status_barrier_before(scope, deadline)
             .await?;
+        let claimed_mode = self
+            .inner
+            .backend
+            .consensus_managed_provider_protocol_mode(
+                self.inner.storage_identity,
+                id.roster().to_bytes(),
+            )
+            .await?;
+        if claimed_mode == 3 {
+            if self
+                .managed_provider_terminal_is_managed(id.roster(), authority)
+                .await?
+            {
+                // Continue to the exact member-status lookup below.  A
+                // managed V5 terminal is recognized only after its complete
+                // authority/member proof, never from mode alone.
+            } else if !self.managed_provider_has_v5_authority(id.roster()).await? {
+                // Ordinary predecessor and migrated format-seven terminals
+                // share mode three but have no V5 authority or owner
+                // commitment. Their immutable mode is sufficient to report
+                // the frozen terminal; never let a missing V5 row turn that
+                // into Unavailable.
+                return managed_provider_status(3, 4, false);
+            } else {
+                // A V5 authority exists but the full terminal proof does not.
+                // Treat this as unavailable rather than downgrade a damaged
+                // or mismatched V5 terminal to the predecessor protocol.
+                return Err(consensus_unavailable());
+            }
+        }
         let (mode, phase) = self
             .inner
             .backend
@@ -1287,6 +1321,18 @@ impl ConsensusSessionStore {
         Ok(admission)
     }
 
+    /// Establish a leader-ordered logical read and apply its exact index
+    /// locally before reading managed-provider status from SQLite.
+    async fn managed_provider_status_barrier_before(
+        &self,
+        scope: SessionConsumerScope,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        self.logical_read_time_before(Some(scope.consensus_identity()), deadline)
+            .await
+            .map(|_| ())
+    }
+
     async fn managed_provider_terminal_is_managed(
         &self,
         request_id: FencedMutationRosterRequestId,
@@ -1299,6 +1345,19 @@ impl ConsensusSessionStore {
                 request_id.to_bytes(),
                 authority.worker_identity_commitment(),
                 authority.verifier_identity_commitment(),
+            )
+            .await
+    }
+
+    async fn managed_provider_has_v5_authority(
+        &self,
+        request_id: FencedMutationRosterRequestId,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .backend
+            .consensus_managed_provider_has_v5_authority(
+                self.inner.storage_identity,
+                request_id.to_bytes(),
             )
             .await
     }

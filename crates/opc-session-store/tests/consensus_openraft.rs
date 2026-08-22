@@ -5948,6 +5948,7 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         ManagedProviderJobMode::FrozenV4Terminal,
         "ordinary mode-three terminals classify before absent V5 job ownership is rejected"
     );
+    assert_no_provider_io(&predecessor_provider);
     assert_eq!(
         predecessor
             .run_member(predecessor_admission.clone(), Box::new([0xe3]), ordinal,)
@@ -5978,6 +5979,7 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         ManagedProviderJobMode::FrozenV4Terminal,
         "a follower classifies the replicated ordinary terminal without a local V5 authority row"
     );
+    assert_no_provider_io(&reopened_provider);
     assert_eq!(
         reopened
             .run_member(predecessor_admission, Box::new([0xe3]), ordinal)

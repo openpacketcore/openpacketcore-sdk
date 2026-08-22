@@ -945,6 +945,30 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read the immutable protocol mode before any V5-specific member lookup.
+    pub(crate) async fn consensus_managed_provider_protocol_mode(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        request_id: [u8; crate::FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+    ) -> Result<u8, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::managed_provider_protocol_mode_sync(conn, identity, request_id)
+        })
+        .await
+    }
+
+    /// Determine whether a mode-three claim has begun V5 authority binding.
+    pub(crate) async fn consensus_managed_provider_has_v5_authority(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        request_id: [u8; crate::FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::managed_provider_has_v5_authority_sync(conn, identity, request_id)
+        })
+        .await
+    }
+
     pub(crate) async fn consensus_managed_provider_terminal_is_managed(
         &self,
         identity: crate::consensus::SessionConsensusIdentity,
