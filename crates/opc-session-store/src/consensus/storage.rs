@@ -1748,16 +1748,18 @@ async fn notify_watchers(core: &SqliteConsensusCore, notifications: &[Replicatio
     }
 }
 
-fn secure_snapshot_create_options(read: bool) -> tokio::fs::OpenOptions {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.create_new(true).read(read).write(true);
+fn secure_snapshot_create_file(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).read(true).write(true);
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         options
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    options
+    options.open(path)
 }
 
 fn create_unpublished_snapshot_output(
@@ -1928,12 +1930,14 @@ where
     source.seek(io::SeekFrom::Start(0)).await?;
     let mut source = source.take(length);
     let destination_path = destination.to_path_buf();
-    // `PinnedSqliteFile` takes ownership of this descriptor so later snapshot
-    // verification can establish identity from the live file, rather than a
-    // pathname that an attacker or concurrent cleanup could replace.
-    let mut destination = secure_snapshot_create_options(true)
-        .open(destination)
-        .await?;
+    // `PinnedSqliteFile` owns the new descriptor before the first await, so a
+    // cancelled extraction can clean only this exact artifact while later
+    // verification retains descriptor identity.
+    let mut raw_snapshot = PinnedSqliteFile::from_new_file(
+        secure_snapshot_create_file(destination)?,
+        destination_path,
+    )?;
+    let mut destination = tokio::fs::File::from_std(raw_snapshot.file().try_clone()?);
     let copied = tokio::io::copy(&mut source, &mut destination).await?;
     if copied != length {
         return Err(consensus::invalid_data(
@@ -1942,7 +1946,10 @@ where
     }
     destination.flush().await?;
     destination.sync_all().await?;
-    PinnedSqliteFile::from_new_file(destination.into_std().await, destination_path)?.pin_immutable()
+    drop(destination);
+    raw_snapshot = raw_snapshot.refresh_identity()?;
+    raw_snapshot.capture_created_sidecars();
+    raw_snapshot.pin_immutable()
 }
 
 async fn copy_and_promote_from_reader<R>(
@@ -1992,12 +1999,12 @@ where
     output.flush().await?;
     output.sync_all().await?;
     drop(output);
-    tokio::fs::rename(temporary, final_path).await?;
+    std::fs::rename(temporary, final_path)?;
+    cleanup.rebind_path(final_path.to_path_buf());
     #[cfg(test)]
     if let Some(after_rename) = after_rename {
         after_rename.block_if_armed().await;
     }
-    cleanup.rebind_path(final_path.to_path_buf());
     let parent = final_path
         .parent()
         .ok_or_else(|| consensus::invalid_data("session consensus snapshot has no parent"))?;
