@@ -4058,7 +4058,7 @@ impl StatelessSessionConsumerClient {
             poll_persistent_consumer_setup_io((self.resolve)(), shutdown_io.as_ref()),
         )
         .await
-        .map_err(|_| SessionConsumerClientError::Unavailable)?
+        .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
         .map_err(|_| SessionConsumerClientError::Unavailable)?;
         resolve_attempt.complete();
         let generation = self.reauthentication.generation();
@@ -9143,18 +9143,22 @@ impl PersistentSessionConsumerPool {
 
     async fn connect(
         self: &Arc<Self>,
-        operation_deadline: tokio::time::Instant,
+        inherited_deadline: tokio::time::Instant,
+        inherited_budget_active: bool,
     ) -> Result<ConsumerConnection, SessionConsumerClientError> {
         let setup_started = tokio::time::Instant::now();
-        let mut setup_deadline = setup_started
+        let configured_setup_deadline = setup_started
             .checked_add(self.config.setup_timeout)
-            .map(|deadline| deadline.min(operation_deadline))
             .ok_or(SessionConsumerClientError::Deadline)?;
+        let mut setup_budget_active =
+            inherited_budget_active || configured_setup_deadline < inherited_deadline;
+        let mut setup_deadline = configured_setup_deadline.min(inherited_deadline);
         if let Some(inherited_deadline) = self
             .client
             .pre_request_connection_timeout
             .and_then(|timeout| setup_started.checked_add(timeout))
         {
+            setup_budget_active |= inherited_deadline < setup_deadline;
             setup_deadline = setup_deadline.min(inherited_deadline);
         }
         let setup_attempt = PersistentSetupAttempt::begin(&self.counters);
@@ -9162,7 +9166,7 @@ impl PersistentSessionConsumerPool {
             .client
             .connect(
                 setup_deadline,
-                true,
+                setup_budget_active,
                 Some(&self.counters),
                 false,
                 Some(Arc::clone(&self.shutdown_io)),
@@ -9175,7 +9179,7 @@ impl PersistentSessionConsumerPool {
             complete_before_deadline(
                 connection,
                 setup_deadline,
-                SessionConsumerClientError::Unavailable,
+                pre_request_timeout_error(setup_budget_active),
             )
         }) {
             Ok(mut connection) => {
@@ -10034,7 +10038,10 @@ impl PersistentSessionConsumerClient {
                     _ = wait_for_forced_shutdown(&mut shutdown, &self.pool.shutdown_phase) => {
                         Err(SessionConsumerClientError::ShuttingDown)
                     }
-                    result = self.pool.connect(pre_request_deadline) => result,
+                    result = self.pool.connect(
+                        pre_request_deadline,
+                        pre_request_budget_active,
+                    ) => result,
                 },
             };
             let connection = match connection {
@@ -10230,7 +10237,7 @@ impl PersistentSessionConsumerClient {
                 return Err(SessionConsumerClientError::ShuttingDown);
             }
             established = futures_util::future::try_join_all(
-                (0..deficit).map(|_| self.pool.connect(deadline)),
+                (0..deficit).map(|_| self.pool.connect(deadline, true)),
             ) => established?,
         };
         for connection in established {
@@ -10966,6 +10973,34 @@ struct ConsumerV2ServerConnectionContext {
     expire_at_final_ack_boundary: bool,
 }
 
+enum ConsumerV2DispatchResult<T> {
+    Completed(T),
+    DeadlineClose,
+}
+
+async fn await_consumer_v2_dispatch_until<F>(
+    mut execute: Pin<&mut F>,
+    deadline: tokio::time::Instant,
+) -> ConsumerV2DispatchResult<F::Output>
+where
+    F: std::future::Future,
+{
+    if tokio::time::Instant::now() >= deadline {
+        return ConsumerV2DispatchResult::DeadlineClose;
+    }
+    tokio::select! {
+        biased;
+        response = execute.as_mut() => {
+            if tokio::time::Instant::now() >= deadline {
+                ConsumerV2DispatchResult::DeadlineClose
+            } else {
+                ConsumerV2DispatchResult::Completed(response)
+            }
+        }
+        _ = tokio::time::sleep_until(deadline) => ConsumerV2DispatchResult::DeadlineClose,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn write_consumer_v2_response_supervised<W>(
     writer: &mut W,
@@ -11437,31 +11472,29 @@ async fn handle_server_connection_v2(
                     .hard_deadline()
                     .map_err(|_| ProtocolError::InvalidWireValue)?;
                 let admitted_deadline = request_deadline.min(hard_deadline);
-                if cancellation.is_cancelled() || tokio::time::Instant::now() >= admitted_deadline {
-                    if hard_deadline <= request_deadline {
-                        record_consumer_hard_overrun(&lifecycle);
-                    }
-                    // `execute_v2` has been dispatched. A deadline or lifecycle
-                    // cutover is ambiguous, never a safe pre-dispatch rejection.
+                if cancellation.is_cancelled() {
                     return Ok(());
                 }
+                let dispatched =
+                    await_consumer_v2_dispatch_until(execute.as_mut(), admitted_deadline);
+                tokio::pin!(dispatched);
                 let response = tokio::select! {
                     biased;
-                    response = &mut execute => {
-                        if tokio::time::Instant::now() >= admitted_deadline {
-                            if hard_deadline <= request_deadline {
-                                record_consumer_hard_overrun(&lifecycle);
+                    response = &mut dispatched => {
+                        match response {
+                            ConsumerV2DispatchResult::Completed(response) => Some(response),
+                            ConsumerV2DispatchResult::DeadlineClose => {
+                                // `execute_v2` crossed the transport ambiguity
+                                // boundary even if its future had not received
+                                // a first service poll before this deadline.
+                                // Closing is never a safe rejection.
+                                if hard_deadline <= request_deadline {
+                                    record_consumer_hard_overrun(&lifecycle);
+                                }
+                                return Ok(());
                             }
-                            return Ok(());
                         }
-                        Some(response)
                     },
-                    _ = tokio::time::sleep_until(admitted_deadline) => {
-                        if hard_deadline <= request_deadline {
-                            record_consumer_hard_overrun(&lifecycle);
-                        }
-                        return Ok(());
-                    }
                     _ = cancellation.cancelled() => return Ok(()),
                     _ = reauthentication_changes.changed() => {
                         observe_consumer_rotation(
@@ -12598,11 +12631,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        authenticated_consumer_binding, classify_call_write_error, complete_before_deadline,
-        consumer_connection_current, consumer_execute_into_fenced_transition,
-        consumer_fresh_admission_is_current, consumer_payload_fragments_exceed_frame,
-        consumer_request_has_exact_fenced_transition_id, consumer_response_fits,
-        consumer_watch_error_is_legal, consumer_wire_response_from_public,
+        authenticated_consumer_binding, await_consumer_v2_dispatch_until,
+        classify_call_write_error, complete_before_deadline, consumer_connection_current,
+        consumer_execute_into_fenced_transition, consumer_fresh_admission_is_current,
+        consumer_payload_fragments_exceed_frame, consumer_request_has_exact_fenced_transition_id,
+        consumer_response_fits, consumer_watch_error_is_legal, consumer_wire_response_from_public,
         decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
         fenced_transition_response, lease_error_matches_operation, lease_response,
         mutation_response, persistent_execute_error, poll_persistent_consumer_setup_io,
@@ -12617,17 +12650,17 @@ mod tests {
         ConsumerHelloAck, ConsumerLeaseWireContext, ConsumerOperationKind,
         ConsumerServerCancellation, ConsumerServerSetupTestHooks, ConsumerSessionResponseWire,
         ConsumerSetupPhase, ConsumerSetupPhaseAttempt, ConsumerV2Call, ConsumerV2CallResponse,
-        ConsumerV2WireRequest, ConsumerV2WireResponse, ConsumerWatchTerminal,
-        ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
-        PersistentCheckedOutConnection, PersistentConsumerCounters, PersistentConsumerIoBarrier,
-        PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
-        PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-        PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
-        PersistentSessionConsumerV2ExecuteError, PersistentSessionConsumerV2Pool,
-        PersistentSetupAttempt, PersistentShutdownPhase, PersistentV2Activity,
-        PersistentV2ActivityKind, PersistentV2Connection, PersistentV2LaneActor,
-        PersistentV2LaneCall, PersistentV2LaneLifetime, PersistentV2LaneState,
-        PersistentV2PoisonAccountingHook, PersistentV2PoolEntry,
+        ConsumerV2DispatchResult, ConsumerV2WireRequest, ConsumerV2WireResponse,
+        ConsumerWatchTerminal, ConsumerWatchTerminalSlot, ConsumerWireRequest,
+        ConsumerWireResponse, PersistentCheckedOutConnection, PersistentConsumerCounters,
+        PersistentConsumerIoBarrier, PersistentConsumerShutdownReader,
+        PersistentConsumerShutdownWriter, PersistentSessionConsumerClient,
+        PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
+        PersistentSessionConsumerExecuteError, PersistentSessionConsumerV2ExecuteError,
+        PersistentSessionConsumerV2Pool, PersistentSetupAttempt, PersistentShutdownPhase,
+        PersistentV2Activity, PersistentV2ActivityKind, PersistentV2Connection,
+        PersistentV2LaneActor, PersistentV2LaneCall, PersistentV2LaneLifetime,
+        PersistentV2LaneState, PersistentV2PoisonAccountingHook, PersistentV2PoolEntry,
         PersistentV2PositiveReadReservationHook, PersistentV2PrewarmFinalPublicationHook,
         PersistentWatchRecovery, QueuedConsumerWatchItem, SessionConsumerAuthorizationError,
         SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
@@ -15897,56 +15930,36 @@ mod tests {
         server.abort_and_wait().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn v2_slow_effectful_dispatch_deadline_closes_without_unavailable_rejection() {
-        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
-            .lock()
-            .await;
-        let client_identity = material_spiffe("v2-deadline-client");
-        let server_identity = material_spiffe("v2-deadline-server");
-        let material = RotatableClientMaterial::new(client_identity.as_str());
         let entered = Arc::new(Notify::new());
         let service = Arc::new(V2BlockingTestConsumer {
             entered: Arc::clone(&entered),
         });
-        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
-            scope(),
-            [client_identity.clone()],
-            std::iter::empty(),
-        )
-        .expect("V2 deadline authorizer");
-        let (server, address) = SessionQuorumConsumerServer::new(
-            service,
-            material.trusted_server_config(server_identity.as_str()),
-            authorizer,
-        )
-        .with_operation_timeout(Duration::from_millis(20))
-        .listen("127.0.0.1:0".parse().expect("loopback address"))
-        .await
-        .expect("listen for V2 deadline test");
-        let client = StatelessSessionConsumerClient::new(
-            address,
-            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-            server_identity,
-            scope(),
-            material.config(),
-        )
-        .with_operation_timeout(Duration::from_secs(5));
         let request = v2_effectful_request(0x82);
         let request_id = request.request_id().expect("V2 call has a full ID");
-        let call = tokio::spawn(async move { client.execute_v2(request).await });
-        tokio::time::timeout(Duration::from_secs(1), entered.notified())
-            .await
-            .expect("slow effectful V2 call was dispatched");
-        let result = tokio::time::timeout(Duration::from_secs(1), call)
-            .await
-            .expect("server deadline closes the dispatched V2 lane")
-            .expect("join V2 caller");
-        assert_eq!(
-            result,
-            Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id })
+        let identity = SessionConsumerIdentity::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/v2-deadline",
+        )
+        .expect("valid redaction-safe V2 deadline identity");
+        let entered_call = entered.notified();
+        tokio::pin!(entered_call);
+        entered_call.as_mut().enable();
+        let execute = service.execute_v2(&identity, request.clone());
+        tokio::pin!(execute);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        let (dispatch, ()) = tokio::join!(
+            await_consumer_v2_dispatch_until(execute.as_mut(), deadline),
+            async {
+                entered_call.await;
+                tokio::time::advance(Duration::from_millis(20)).await;
+            }
         );
-        server.abort_and_wait().await;
+        assert!(matches!(dispatch, ConsumerV2DispatchResult::DeadlineClose));
+        assert_eq!(
+            v2_persistent_error(&request, true, SessionConsumerClientError::Unavailable,),
+            PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id }
+        );
     }
 
     #[tokio::test]
@@ -16828,6 +16841,91 @@ mod tests {
         ));
         assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_admission_consumes_the_original_complete_operation_deadline() {
+        let control = SessionReauthenticationControl::new();
+        let (mut stateless, _material) = stateless_test_client(control);
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        stateless.resolve = Arc::new({
+            let resolver_calls = Arc::clone(&resolver_calls);
+            move || {
+                let resolver_calls = Arc::clone(&resolver_calls);
+                Box::pin(async move {
+                    resolver_calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<io::Result<std::net::SocketAddr>>().await
+                })
+            }
+        });
+        stateless.operation_timeout = Duration::from_millis(240);
+        let config = PersistentSessionConsumerConfig::try_new(
+            1,
+            1,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+            1,
+            Duration::from_secs(1),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("one-lane admission-deadline test config");
+        let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config)
+            .expect("valid admission-deadline client");
+        let _active_pending = Arc::clone(&client.pool.pending)
+            .try_acquire_owned()
+            .expect("hold one active-call admission");
+        let active_lane = Arc::clone(&client.pool.lanes)
+            .try_acquire_owned()
+            .expect("hold the sole request lane");
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(240);
+        let request = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::from_bytes([3; 16]),
+            SessionConsumerOperation::Capabilities,
+        );
+        let queued = client.execute(&request);
+        tokio::pin!(queued);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(queued.as_mut(), context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            client.pool.pending.available_permits(),
+            0,
+            "the queued call owns exactly one bounded pending admission"
+        );
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+
+        tokio::time::advance(Duration::from_millis(120)).await;
+        drop(active_lane);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(queued.as_mut(), context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_millis(120)).await;
+        assert_eq!(
+            queued.await,
+            Err(PersistentSessionConsumerExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Deadline,
+            })
+        );
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        let diagnostics = client.diagnostics().await;
+        assert_eq!(diagnostics.setup_attempts, 1);
+        assert_eq!(diagnostics.setup_failures, 1);
+        assert_eq!(diagnostics.setup_successes, 0);
+        assert_eq!(diagnostics.not_transmitted, 1);
+        assert_eq!(diagnostics.deadline, 1);
+        assert_eq!(diagnostics.overload, 0);
+        assert_eq!(diagnostics.reconnects, 0);
+        client.shutdown().await;
     }
 
     #[tokio::test]
