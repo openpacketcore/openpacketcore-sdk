@@ -1,10 +1,11 @@
-//! Narrow safe access to SQLite's main-file movement probe.
+//! Narrow safe access to the SQLite file controls needed for pinned snapshots.
 //!
 //! SQLite owns the VFS file handle behind a [`rusqlite::Connection`].  This
-//! crate contains the sole audited raw-handle call required to ask that VFS
-//! whether its main database file has moved.  It exposes neither the handle
-//! nor any file name, and fails closed when the pinned SQLite build does not
-//! implement the opcode.
+//! crate contains the sole audited raw-handle calls used to check file
+//! movement and, on Linux, duplicate the main, named-database, or journal
+//! descriptor after authenticating the bundled Unix VFS.  It exposes neither
+//! SQLite's borrowed handles nor file names, and fails closed when the pinned
+//! SQLite build or platform cannot provide the required authority.
 
 #![allow(unsafe_code)]
 #![deny(missing_docs)]
@@ -20,7 +21,7 @@ use std::sync::OnceLock;
 
 use rusqlite::{ffi, Connection};
 
-/// Failure from the SQLite main-file movement probe.
+/// Failure from the bounded SQLite file-control boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileControlError;
 
