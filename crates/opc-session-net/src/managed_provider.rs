@@ -9,6 +9,8 @@ use std::fmt;
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
@@ -28,7 +30,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::consensus::RemoteAddrResolver;
@@ -87,6 +89,14 @@ pub const MAX_MANAGED_PROVIDER_POOL_SETUP_TIMEOUT: Duration = MANAGED_PROVIDER_S
 pub const MAX_MANAGED_PROVIDER_POOL_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 const PROFILE_DOMAIN: &[u8] = b"opc-session-net/managed-provider/5/profile\0";
+// The server identity is authenticated by the TLS peer certificate and bound
+// to the endpoint before Hello is sent.  Echoing it in HelloAck was redundant
+// and made a legal 2048-byte canonical SPIFFE identity exceed the fixed public
+// response profile.
+const PROFILE_ACK_OMITS_VOTER_IDENTITY: u8 = 1;
+// Kept equal to `opc_identity::MAX_SPIFFE_ID_URI_LEN`; this crate does not
+// depend on identity reload machinery at runtime solely for its profile bound.
+const PROFILE_MAX_SPIFFE_ID_BYTES: usize = 2_048;
 
 fn profile_digest() -> [u8; 32] {
     let mut hash = Sha256::new();
@@ -95,6 +105,8 @@ fn profile_digest() -> [u8; 32] {
     hash.update(MANAGED_PROVIDER_JOB_SEMANTIC_REVISION.to_be_bytes());
     hash.update((MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES as u64).to_be_bytes());
     hash.update((MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u64).to_be_bytes());
+    hash.update([PROFILE_ACK_OMITS_VOTER_IDENTITY]);
+    hash.update((PROFILE_MAX_SPIFFE_ID_BYTES as u64).to_be_bytes());
     hash.finalize().into()
 }
 
@@ -310,8 +322,9 @@ pub struct ManagedProviderPoolDiagnostics {
     pub outcome_unknown: u64,
 }
 
-/// Aggregate listener state. Active and retained completed connection tasks
-/// share the listener permit and are bounded by configured `max_connections`.
+/// Aggregate listener state. `connection_tasks` counts live task futures;
+/// their retained completed outputs still hold the same bounded listener
+/// permits until the registry reaps them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagedProviderServerDiagnostics {
     pub connections: u64,
@@ -375,13 +388,11 @@ struct Counters {
     shutdown_forced: AtomicU64,
 }
 
-struct ConnectionCounterGuard<'a> {
-    counters: &'a Counters,
-}
+struct ConnectionCounterGuard(Arc<Counters>);
 
-impl Drop for ConnectionCounterGuard<'_> {
+impl Drop for ConnectionCounterGuard {
     fn drop(&mut self) {
-        self.counters.connections.fetch_sub(1, Ordering::Relaxed);
+        self.0.connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -409,6 +420,22 @@ enum Phase {
 #[derive(Clone)]
 pub struct PersistentManagedProviderJobClient {
     pool: Arc<Pool>,
+    // Public-client ownership is intentionally separate from task ownership.
+    // The last clone synchronously aborts the bounded registry even when it is
+    // dropped outside a Tokio runtime.
+    _owner: Arc<ClientOwner>,
+}
+
+struct ClientOwner {
+    pool: Weak<Pool>,
+}
+
+impl Drop for ClientOwner {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.close_from_last_client();
+        }
+    }
 }
 
 struct Pool {
@@ -492,6 +519,8 @@ enum ManagedProviderTestPause {
     AdmissionAfterPermits,
     AdmissionAfterAccounting,
     AdmissionBeforeSend,
+    #[cfg(test)]
+    WorkerAfterInflight,
     StartupBeforeRegistry,
     StartupAfterRegistry,
 }
@@ -561,6 +590,7 @@ struct ManagedProviderTestHooks {
     admission_after_permits: ManagedProviderTestPauseHook,
     admission_after_accounting: ManagedProviderTestPauseHook,
     admission_before_send: ManagedProviderTestPauseHook,
+    worker_after_inflight: ManagedProviderTestPauseHook,
     startup_before_registry: ManagedProviderTestPauseHook,
     startup_after_registry: ManagedProviderTestPauseHook,
 }
@@ -573,6 +603,7 @@ impl ManagedProviderTestHooks {
             admission_after_permits: ManagedProviderTestPauseHook::new(),
             admission_after_accounting: ManagedProviderTestPauseHook::new(),
             admission_before_send: ManagedProviderTestPauseHook::new(),
+            worker_after_inflight: ManagedProviderTestPauseHook::new(),
             startup_before_registry: ManagedProviderTestPauseHook::new(),
             startup_after_registry: ManagedProviderTestPauseHook::new(),
         }
@@ -592,6 +623,9 @@ impl ManagedProviderTestHooks {
             ManagedProviderTestPause::AdmissionBeforeSend => {
                 self.admission_before_send.pause().await
             }
+            ManagedProviderTestPause::WorkerAfterInflight => {
+                self.worker_after_inflight.pause().await
+            }
             ManagedProviderTestPause::StartupBeforeRegistry => {
                 self.startup_before_registry.pause().await
             }
@@ -607,6 +641,7 @@ impl ManagedProviderTestHooks {
             ManagedProviderTestPause::AdmissionAfterPermits => &self.admission_after_permits,
             ManagedProviderTestPause::AdmissionAfterAccounting => &self.admission_after_accounting,
             ManagedProviderTestPause::AdmissionBeforeSend => &self.admission_before_send,
+            ManagedProviderTestPause::WorkerAfterInflight => &self.worker_after_inflight,
             ManagedProviderTestPause::StartupBeforeRegistry => &self.startup_before_registry,
             ManagedProviderTestPause::StartupAfterRegistry => &self.startup_after_registry,
         }
@@ -628,34 +663,44 @@ impl PersistentManagedProviderJobClient {
         }) {
             return Err(ManagedProviderPoolConfigError);
         }
-        Ok(Self {
-            pool: Arc::new(Pool {
-                authority,
-                endpoints,
-                config,
-                readiness: AtomicU8::new(0),
-                warm: std::array::from_fn(|_| AtomicUsize::new(0)),
-                pending: Arc::new(Semaphore::new(config.queued_and_inflight)),
-                bytes: Arc::new(Semaphore::new(config.request_bytes)),
-                cells: Arc::new(Semaphore::new(config.queued_and_inflight)),
-                counters: Arc::new(Counters::default()),
-                lifecycle: StdMutex::new(LifecycleState {
-                    phase: Phase::Running,
-                    started: false,
-                    starting: false,
-                    shutdown_driver_started: false,
-                    active_admissions: 0,
-                    scheduler: None,
-                    tasks: Vec::new(),
-                }),
-                startup_changed: Notify::new(),
-                shutdown_report: StdMutex::new(None),
-                shutdown_complete: Notify::new(),
-                readiness_changed: Notify::new(),
-                admissions_changed: Notify::new(),
-                #[cfg(test)]
-                test_hooks: ManagedProviderTestHooks::new(),
+        if endpoints
+            .iter()
+            .any(|endpoint| endpoint.identity.as_str().len() > PROFILE_MAX_SPIFFE_ID_BYTES)
+        {
+            return Err(ManagedProviderPoolConfigError);
+        }
+        let pool = Arc::new(Pool {
+            authority,
+            endpoints,
+            config,
+            readiness: AtomicU8::new(0),
+            warm: std::array::from_fn(|_| AtomicUsize::new(0)),
+            pending: Arc::new(Semaphore::new(config.queued_and_inflight)),
+            bytes: Arc::new(Semaphore::new(config.request_bytes)),
+            cells: Arc::new(Semaphore::new(config.queued_and_inflight)),
+            counters: Arc::new(Counters::default()),
+            lifecycle: StdMutex::new(LifecycleState {
+                phase: Phase::Running,
+                started: false,
+                starting: false,
+                shutdown_driver_started: false,
+                active_admissions: 0,
+                scheduler: None,
+                tasks: Vec::new(),
             }),
+            startup_changed: Notify::new(),
+            shutdown_report: StdMutex::new(None),
+            shutdown_complete: Notify::new(),
+            readiness_changed: Notify::new(),
+            admissions_changed: Notify::new(),
+            #[cfg(test)]
+            test_hooks: ManagedProviderTestHooks::new(),
+        });
+        Ok(Self {
+            _owner: Arc::new(ClientOwner {
+                pool: Arc::downgrade(&pool),
+            }),
+            pool,
         })
     }
     pub fn config(&self) -> ManagedProviderPoolConfig {
@@ -792,6 +837,9 @@ impl PersistentManagedProviderJobClient {
                 .checked_add(self.pool.config.queue_deadline)
                 .ok_or(ManagedProviderClientError::Overloaded)?,
             inflight: false,
+            accepted: false,
+            shutdown: JobShutdownOutcome::Unclassified,
+            pool: Arc::downgrade(&self.pool),
             counters: Arc::clone(&self.pool.counters),
             reply: Some(reply_tx),
             _pending: pending,
@@ -811,9 +859,20 @@ impl PersistentManagedProviderJobClient {
         self.pool
             .pause(ManagedProviderTestPause::AdmissionBeforeSend)
             .await;
-        if tx.try_send(Command::Submit(Box::new(job))).is_err() {
-            self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
-            return Err(ManagedProviderClientError::Overloaded);
+        let mut job = Box::new(job);
+        // Set before publication so a scheduler on another executor cannot
+        // complete the Job before it has a shutdown classification. A failed
+        // publication returns ownership and explicitly revokes acceptance.
+        job.accepted = true;
+        match tx.try_send(Command::Submit(job)) {
+            Ok(()) => {}
+            Err(error) => {
+                if let Command::Submit(mut job) = error.into_inner() {
+                    job.accepted = false;
+                }
+                self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
+                return Err(ManagedProviderClientError::Overloaded);
+            }
         }
         drop(admission_guard);
         match reply_rx.await {
@@ -892,6 +951,30 @@ impl Pool {
 
     fn phase(&self) -> Phase {
         self.lifecycle().phase
+    }
+
+    /// Abort every owned background resource without requiring a Tokio
+    /// runtime. This is called by the last public client owner and is also the
+    /// drop backstop for a partially started pool.
+    fn close_from_last_client(&self) {
+        let (scheduler, handles) = {
+            let mut lifecycle = self.lifecycle();
+            if lifecycle.phase == Phase::Stopped {
+                return;
+            }
+            lifecycle.phase = Phase::Forced;
+            lifecycle.started = false;
+            (
+                lifecycle.scheduler.take(),
+                std::mem::take(&mut lifecycle.tasks),
+            )
+        };
+        self.readiness.store(0, Ordering::Release);
+        self.readiness_changed.notify_waiters();
+        drop(scheduler);
+        for handle in handles {
+            handle.abort();
+        }
     }
 
     fn running_and_started(&self) -> bool {
@@ -982,7 +1065,13 @@ impl Pool {
                     let (worker_tx, worker_rx) = mpsc::channel(1);
                     worker_txs.push(worker_tx);
                     handles.push(tokio::spawn(lane_worker(
-                        Arc::clone(self),
+                        Arc::downgrade(self),
+                        LaneConnectConfig {
+                            authority: self.authority.clone(),
+                            endpoint: self.endpoints[voter].clone(),
+                            config: self.config,
+                            counters: Arc::clone(&self.counters),
+                        },
                         voter,
                         lane,
                         worker_rx,
@@ -1021,6 +1110,25 @@ impl Pool {
         self.counters.queued.fetch_sub(1, Ordering::Relaxed);
         let now = self.counters.inflight.fetch_add(1, Ordering::Relaxed) + 1;
         high(&self.counters.inflight_high_water, now);
+    }
+
+    /// Queue-to-inflight transition shares the lifecycle gate with force.
+    /// A job either changes accounting before force, or observes force before
+    /// it can leave the queue; there is no sampled counter race.
+    fn begin_inflight(&self, job: &mut Job) -> Phase {
+        let lifecycle = self.lifecycle();
+        let phase = lifecycle.phase;
+        if !matches!(phase, Phase::Forced | Phase::Stopped) {
+            self.mark_inflight();
+            job.inflight = true;
+        }
+        phase
+    }
+
+    /// Completion is ordered against the force transition by the same gate.
+    fn classify_completion(&self, job: &mut Job) {
+        let lifecycle = self.lifecycle();
+        job.classify(lifecycle.phase);
     }
     fn update_readiness(&self) {
         if !self.running_and_started() {
@@ -1088,10 +1196,6 @@ impl Pool {
             }
             // A hung TLS peer or service cannot hold a retained supervisor
             // beyond its drain deadline. Abort only after the bounded drain.
-            pool.counters.shutdown_forced.fetch_add(
-                pool.counters.inflight.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
             for handle in &handles {
                 handle.abort();
             }
@@ -1141,6 +1245,21 @@ impl Pool {
     }
 }
 
+impl Drop for Pool {
+    fn drop(&mut self) {
+        let lifecycle = self
+            .lifecycle
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.phase = Phase::Forced;
+        lifecycle.scheduler.take();
+        let handles = std::mem::take(&mut lifecycle.tasks);
+        for handle in handles {
+            handle.abort();
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 struct FairKey([u8; 56], u8);
 fn job_key(request: &WireRequest) -> FairKey {
@@ -1162,14 +1281,58 @@ struct Job {
     frame_bytes: usize,
     deadline: tokio::time::Instant,
     inflight: bool,
+    accepted: bool,
+    shutdown: JobShutdownOutcome,
+    pool: Weak<Pool>,
     counters: Arc<Counters>,
     reply: Option<oneshot::Sender<Result<ManagedProviderJobStatus, ManagedProviderClientError>>>,
     _pending: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
     _cell: OwnedSemaphorePermit,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobShutdownOutcome {
+    Unclassified,
+    Drained,
+    Forced,
+}
+
+impl Job {
+    fn classify(&mut self, phase: Phase) {
+        if !self.accepted || self.shutdown != JobShutdownOutcome::Unclassified {
+            return;
+        }
+        match phase {
+            Phase::Running => {}
+            Phase::Draining => {
+                self.shutdown = JobShutdownOutcome::Drained;
+                self.counters
+                    .shutdown_drained
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Phase::Forced | Phase::Stopped => self.force(),
+        }
+    }
+
+    fn force(&mut self) {
+        if !self.accepted || self.shutdown != JobShutdownOutcome::Unclassified {
+            return;
+        }
+        self.shutdown = JobShutdownOutcome::Forced;
+        self.counters
+            .shutdown_forced
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 impl Drop for Job {
     fn drop(&mut self) {
+        if self.shutdown == JobShutdownOutcome::Unclassified {
+            if let Some(pool) = self.pool.upgrade() {
+                self.classify(pool.phase());
+            }
+        }
         if self.inflight {
             self.counters.inflight.fetch_sub(1, Ordering::Relaxed);
         } else {
@@ -1213,7 +1376,7 @@ async fn scheduler(
                 idle.push_front(lane);
                 break;
             };
-            let (job, empty) = match queues.get_mut(&key) {
+            let (mut job, empty) = match queues.get_mut(&key) {
                 Some(queue) => match queue.pop_front() {
                     Some(job) => (job, queue.is_empty()),
                     None => continue,
@@ -1226,7 +1389,8 @@ async fn scheduler(
                 } else {
                     rr.push_back(key);
                 }
-                complete(&p, job, Err(ManagedProviderClientError::Overloaded));
+                p.classify_completion(&mut job);
+                complete(job, Err(ManagedProviderClientError::Overloaded));
                 continue;
             }
             if empty {
@@ -1244,8 +1408,9 @@ async fn scheduler(
                     idle.push_front(lane);
                     break;
                 }
-                Err(mpsc::error::TrySendError::Closed(job)) => {
-                    complete(&p, job, Err(ManagedProviderClientError::Unavailable))
+                Err(mpsc::error::TrySendError::Closed(mut job)) => {
+                    p.classify_completion(&mut job);
+                    complete(job, Err(ManagedProviderClientError::Unavailable))
                 }
             }
         }
@@ -1256,9 +1421,13 @@ async fn scheduler(
                     let job = *job;
                     let Some(p) = pool.upgrade() else { return };
                     if p.phase() != Phase::Running {
-                        complete(&p, job, Err(ManagedProviderClientError::ShuttingDown));
+                        let mut job = job;
+                        job.force();
+                        complete(job, Err(ManagedProviderClientError::ShuttingDown));
                     } else if active.contains(&job.key) || queues.contains_key(&job.key) {
-                        complete(&p, job, Err(ManagedProviderClientError::Overloaded));
+                        let mut job = job;
+                        p.classify_completion(&mut job);
+                        complete(job, Err(ManagedProviderClientError::Overloaded));
                     } else {
                         let key = job.key;
                         queues.entry(key).or_default().push_back(job);
@@ -1267,11 +1436,11 @@ async fn scheduler(
                 }
                 Some(Command::Drain) => {}
                 Some(Command::Force) | None => {
-                    if let Some(p) = pool.upgrade() {
+                    if pool.upgrade().is_some() {
                         for (_, queue) in queues {
-                            for job in queue {
-                                p.counters.shutdown_forced.fetch_add(1, Ordering::Relaxed);
-                                complete(&p, job, Err(ManagedProviderClientError::ShuttingDown));
+                            for mut job in queue {
+                                job.force();
+                                complete(job, Err(ManagedProviderClientError::ShuttingDown));
                             }
                         }
                     }
@@ -1332,54 +1501,62 @@ async fn scheduler(
                 }
                 queues.retain(|_, queue| !queue.is_empty());
                 rr.retain(|key| queues.contains_key(key));
-                for job in expired {
-                    complete(&p, job, Err(ManagedProviderClientError::Overloaded));
+                for mut job in expired {
+                    p.classify_completion(&mut job);
+                    complete(job, Err(ManagedProviderClientError::Overloaded));
                 }
             }
         }
     }
 }
-fn complete(
-    _pool: &Pool,
-    mut job: Job,
-    result: Result<ManagedProviderJobStatus, ManagedProviderClientError>,
-) {
+fn complete(mut job: Job, result: Result<ManagedProviderJobStatus, ManagedProviderClientError>) {
     if let Some(reply) = job.reply.take() {
         let _ = reply.send(result);
     }
 }
 
+#[derive(Clone)]
+struct LaneConnectConfig {
+    authority: ManagedProviderClientAuthority,
+    endpoint: ManagedVoterEndpoint,
+    config: ManagedProviderPoolConfig,
+    counters: Arc<Counters>,
+}
+
+fn worker_phase(pool: &Weak<Pool>) -> Phase {
+    pool.upgrade().map_or(Phase::Stopped, |pool| pool.phase())
+}
+
 async fn lane_worker(
-    pool: Arc<Pool>,
+    pool: Weak<Pool>,
+    connect: LaneConnectConfig,
     voter: usize,
-    _lane: usize,
+    lane: usize,
     mut jobs: mpsc::Receiver<Job>,
     events: mpsc::Sender<Event>,
 ) {
-    let index = voter * pool.config.lanes_per_voter + _lane;
+    let index = voter * connect.config.lanes_per_voter + lane;
     let mut generation = 0_u64;
     let mut reconnect_attempt = 0_u8;
     loop {
-        if pool.phase() != Phase::Running {
+        if worker_phase(&pool) != Phase::Running {
             return;
         }
-        let connection = connect_lane(&pool, voter).await;
+        let connection = connect_lane(&connect).await;
         let mut connection = match connection {
             Ok(c) => {
-                if pool.phase() != Phase::Running {
+                if worker_phase(&pool) != Phase::Running {
                     // Shutdown may have started while the absolute setup
                     // transaction was in progress; never publish a late lane.
                     return;
                 }
                 generation = generation.wrapping_add(1);
                 reconnect_attempt = 0;
-                pool.counters.connections.fetch_add(1, Ordering::Relaxed);
-                let connection_counter = ConnectionCounterGuard {
-                    counters: &pool.counters,
-                };
+                connect.counters.connections.fetch_add(1, Ordering::Relaxed);
+                let connection_counter = ConnectionCounterGuard(Arc::clone(&connect.counters));
                 high(
-                    &pool.counters.connection_high_water,
-                    pool.counters.connections.load(Ordering::Relaxed),
+                    &connect.counters.connection_high_water,
+                    connect.counters.connections.load(Ordering::Relaxed),
                 );
                 if events.send(Event::Ready(index, generation)).await.is_err() {
                     return;
@@ -1398,47 +1575,75 @@ async fn lane_worker(
             }
         };
         while let Some(mut job) = jobs.recv().await {
-            if matches!(pool.phase(), Phase::Forced | Phase::Stopped) {
-                pool.counters
-                    .shutdown_forced
-                    .fetch_add(1, Ordering::Relaxed);
-                complete(&pool, job, Err(ManagedProviderClientError::ShuttingDown));
+            let phase = worker_phase(&pool);
+            if matches!(phase, Phase::Forced | Phase::Stopped) {
+                job.force();
+                complete(job, Err(ManagedProviderClientError::ShuttingDown));
                 continue;
             }
             if job.deadline <= tokio::time::Instant::now() {
                 let key = job.key;
-                complete(&pool, job, Err(ManagedProviderClientError::Overloaded));
+                if let Some(pool) = pool.upgrade() {
+                    pool.classify_completion(&mut job);
+                } else {
+                    job.force();
+                }
+                complete(job, Err(ManagedProviderClientError::Overloaded));
                 let _ = events.send(Event::Idle(index, generation, key)).await;
                 continue;
             }
-            pool.mark_inflight();
-            job.inflight = true;
+            let Some(pool_for_transition) = pool.upgrade() else {
+                job.force();
+                complete(job, Err(ManagedProviderClientError::ShuttingDown));
+                return;
+            };
+            if matches!(
+                pool_for_transition.begin_inflight(&mut job),
+                Phase::Forced | Phase::Stopped
+            ) {
+                drop(pool_for_transition);
+                job.force();
+                complete(job, Err(ManagedProviderClientError::ShuttingDown));
+                continue;
+            }
+            drop(pool_for_transition);
+            #[cfg(test)]
+            if let Some(pool) = pool.upgrade() {
+                pool.pause(ManagedProviderTestPause::WorkerAfterInflight)
+                    .await;
+            }
             let key = job.key;
             let result = call_on_lane(
                 &mut connection.0,
                 &job.frame,
-                pool.config.request_bytes,
-                pool.config.response_bytes,
+                connect.config.request_bytes,
+                connect.config.response_bytes,
                 job.deadline,
             )
             .await;
             match result {
                 Ok(value) => {
-                    if pool.phase() == Phase::Draining {
-                        pool.counters
-                            .shutdown_drained
-                            .fetch_add(1, Ordering::Relaxed);
+                    if let Some(pool) = pool.upgrade() {
+                        pool.classify_completion(&mut job);
+                    } else {
+                        job.force();
                     }
-                    complete(&pool, job, value);
+                    complete(job, value);
                     let _ = events.send(Event::Idle(index, generation, key)).await;
                 }
                 Err(error) => {
                     if error == ManagedProviderClientError::OutcomeUnknown {
-                        pool.counters
+                        connect
+                            .counters
                             .outcome_unknown
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    complete(&pool, job, Err(error));
+                    if let Some(pool) = pool.upgrade() {
+                        pool.classify_completion(&mut job);
+                    } else {
+                        job.force();
+                    }
+                    complete(job, Err(error));
                     // A failed lane must never advertise itself as idle. The
                     // generation-bound Lost event purges a stale idle slot.
                     let _ = events.send(Event::Lost(index, generation, Some(key))).await;
@@ -1452,12 +1657,14 @@ async fn lane_worker(
 }
 
 type ClientLane = tokio_rustls::client::TlsStream<TcpStream>;
-async fn connect_lane(pool: &Pool, voter: usize) -> Result<ClientLane, ManagedProviderClientError> {
-    let endpoint = &pool.endpoints[voter];
+async fn connect_lane(
+    connect: &LaneConnectConfig,
+) -> Result<ClientLane, ManagedProviderClientError> {
+    let endpoint = &connect.endpoint;
     // This deadline is deliberately created once.  Resolver, TCP, TLS, Hello,
     // and Ack are one setup transaction; no successful phase renews it.
     let deadline = tokio::time::Instant::now()
-        .checked_add(pool.config.setup_timeout)
+        .checked_add(connect.config.setup_timeout)
         .ok_or(ManagedProviderClientError::Unavailable)?;
     let address = tokio::time::timeout_at(deadline, (endpoint.resolve)())
         .await
@@ -1470,7 +1677,7 @@ async fn connect_lane(pool: &Pool, voter: usize) -> Result<ClientLane, ManagedPr
     stream
         .set_nodelay(true)
         .map_err(|_| ManagedProviderClientError::Unavailable)?;
-    let handshake = pool
+    let handshake = connect
         .authority
         .tls
         .begin_handshake()
@@ -1505,21 +1712,21 @@ async fn connect_lane(pool: &Pool, voter: usize) -> Result<ClientLane, ManagedPr
     let hello = WireRequest::Hello(WireHello {
         transport_revision: MANAGED_PROVIDER_JOB_TRANSPORT_REVISION,
         semantic_revision: MANAGED_PROVIDER_JOB_SEMANTIC_REVISION,
-        scope: pool.authority.scope,
+        scope: connect.authority.scope,
         profile_digest: profile_digest(),
-        request_frame_size: pool.config.request_bytes as u32,
-        response_frame_size: pool.config.response_bytes as u32,
+        request_frame_size: connect.config.request_bytes as u32,
+        response_frame_size: connect.config.response_bytes as u32,
         expected_voter: endpoint.identity.as_str().to_owned(),
     });
-    write_json_until(&mut tls, &hello, pool.config.request_bytes, deadline).await?;
-    let ack: WireResponse = read_json_until(&mut tls, pool.config.response_bytes, deadline).await?;
+    write_json_until(&mut tls, &hello, connect.config.request_bytes, deadline).await?;
+    let ack: WireResponse =
+        read_json_until(&mut tls, connect.config.response_bytes, deadline).await?;
     match ack {
         WireResponse::HelloAck(ack)
             if ack.transport_revision == MANAGED_PROVIDER_JOB_TRANSPORT_REVISION
                 && ack.semantic_revision == MANAGED_PROVIDER_JOB_SEMANTIC_REVISION
-                && ack.scope == pool.authority.scope
+                && ack.scope == connect.authority.scope
                 && ack.profile_digest == profile_digest()
-                && ack.voter_identity == endpoint.identity.as_str()
                 && ack.request_frame_size == MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES as u32
                 && ack.response_frame_size == MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u32 =>
         {
@@ -1703,7 +1910,6 @@ struct WireAck {
     semantic_revision: u16,
     scope: SessionConsumerScope,
     profile_digest: [u8; 32],
-    voter_identity: String,
     request_frame_size: u32,
     response_frame_size: u32,
 }
@@ -1805,6 +2011,8 @@ pub struct ManagedProviderJobServer {
     voter: SpiffeId,
     client: SpiffeId,
     max_connections: usize,
+    #[cfg(test)]
+    test_hooks: Arc<ManagedProviderServerTestHooks>,
 }
 #[derive(Default)]
 struct ServerCounters {
@@ -1818,6 +2026,181 @@ struct ServerConnectionGuard(Arc<ServerCounters>);
 impl Drop for ServerConnectionGuard {
     fn drop(&mut self) {
         self.0.connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Counts exactly one published task from registration until its future is
+/// removed or dropped. It is moved into the future before `JoinSet::spawn`, so
+/// an abort before first poll still releases the count.
+struct ServerTaskGuard(Arc<ServerCounters>);
+impl Drop for ServerTaskGuard {
+    fn drop(&mut self) {
+        self.0.tasks.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The shutdown barrier and the complete retained task set have one mutex.
+/// An accept path either publishes while this state remains open, or observes
+/// the closed barrier and drops its socket/permit without creating a task.
+struct ServerTaskRegistry {
+    closed: bool,
+    tasks: JoinSet<OwnedSemaphorePermit>,
+}
+
+impl ServerTaskRegistry {
+    fn new() -> Self {
+        Self {
+            closed: false,
+            tasks: JoinSet::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+struct ManagedProviderServerPublicationBarrier {
+    armed: AtomicBool,
+    entered: AtomicBool,
+    state: StdMutex<()>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl ManagedProviderServerPublicationBarrier {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            entered: AtomicBool::new(false),
+            state: StdMutex::new(()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn arm(&self) {
+        let _state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.entered.store(false, Ordering::Release);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    /// This deliberately blocks a listener executor thread rather than await
+    /// cancellation. It creates a real accept-to-publication interleaving: a
+    /// concurrent Drop can close the registry before this path resumes.
+    fn pause(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        self.entered.store(true, Ordering::Release);
+        self.changed.notify_all();
+        while self.armed.load(Ordering::Acquire) {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn wait_entered(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !self.entered.load(Ordering::Acquire) {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self) {
+        let _state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.armed.store(false, Ordering::Release);
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+struct ManagedProviderServerClosedObservation {
+    armed: AtomicBool,
+    observed: AtomicBool,
+    state: StdMutex<()>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl ManagedProviderServerClosedObservation {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            observed: AtomicBool::new(false),
+            state: StdMutex::new(()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn arm(&self) {
+        let _state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.observed.store(false, Ordering::Release);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    /// Acknowledges the exact accept-path recheck under the registry lock.
+    /// It is deliberately separate from the publication barrier: tests must
+    /// not infer that a released accept path actually observed closure.
+    fn observe_closed(&self) {
+        let _state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.armed.load(Ordering::Acquire) {
+            self.observed.store(true, Ordering::Release);
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait_observed(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !self.observed.load(Ordering::Acquire) {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(test)]
+struct ManagedProviderServerTestHooks {
+    after_accept_before_publication: ManagedProviderServerPublicationBarrier,
+    after_spawn_before_first_poll: ManagedProviderServerPublicationBarrier,
+    closed_registry_observed: ManagedProviderServerClosedObservation,
+    connection_task_first_polls: AtomicUsize,
+}
+
+#[cfg(test)]
+impl ManagedProviderServerTestHooks {
+    fn new() -> Self {
+        Self {
+            after_accept_before_publication: ManagedProviderServerPublicationBarrier::new(),
+            after_spawn_before_first_poll: ManagedProviderServerPublicationBarrier::new(),
+            closed_registry_observed: ManagedProviderServerClosedObservation::new(),
+            connection_task_first_polls: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -1840,6 +2223,7 @@ impl ManagedProviderJobServer {
             voter,
             client,
             max_connections: 64,
+            test_hooks: Arc::new(ManagedProviderServerTestHooks::new()),
         }
     }
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
@@ -1880,38 +2264,64 @@ impl ManagedProviderJobServer {
         // The task output retains its connection permit. A replacement cannot
         // be accepted until reaping consumes that output; caught panics follow
         // the same path, so retained entries stay structurally bounded.
-        let tasks = Arc::new(Mutex::new(JoinSet::<OwnedSemaphorePermit>::new()));
+        let tasks = Arc::new(StdMutex::new(ServerTaskRegistry::new()));
         let counters = Arc::new(ServerCounters::default());
         let permit = Arc::new(Semaphore::new(self.max_connections));
         let cancel = Arc::clone(&cancelled);
         let accept_tasks = Arc::clone(&tasks);
         let accept_counters = Arc::clone(&counters);
+        #[cfg(test)]
+        let accept_test_hooks = Arc::clone(&self.test_hooks);
         let handle = tokio::spawn(async move {
             let mut reap = tokio::time::interval(Duration::from_millis(10));
             reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             while !cancel.load(Ordering::Acquire) {
                 tokio::select! {
                     _ = reap.tick() => {
-                        let mut tasks = accept_tasks.lock().await;
-                        while tasks.try_join_next().is_some() {
-                            accept_counters.tasks.fetch_sub(1, Ordering::Relaxed);
-                        }
+                        let mut registry = accept_tasks
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        while registry.tasks.try_join_next().is_some() {}
                     }
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { continue };
                         let Ok(slot) = permit.clone().try_acquire_owned() else { continue };
+                        #[cfg(test)]
+                        accept_test_hooks.after_accept_before_publication.pause();
                         let service = self.service.clone();
                         let tls = self.tls.clone();
                         let scope = self.scope;
                         let voter = self.voter.clone();
                         let client = self.client.clone();
                         let counters = Arc::clone(&accept_counters);
+                        // The cancellation flag is only a wakeup aid for the
+                        // accept loop. `registry.closed`, checked below under
+                        // this same mutex as spawn, is the publication truth.
+                        let mut registry = accept_tasks
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if registry.closed || cancel.load(Ordering::Acquire) {
+                            #[cfg(test)]
+                            if registry.closed {
+                                accept_test_hooks.closed_registry_observed.observe_closed();
+                            }
+                            continue;
+                        }
                         let current = counters.connections.fetch_add(1, Ordering::Relaxed) + 1;
                         high(&counters.connection_high_water, current);
                         let tasks_current = counters.tasks.fetch_add(1, Ordering::Relaxed) + 1;
                         high(&counters.task_high_water, tasks_current);
-                        accept_tasks.lock().await.spawn(async move {
-                            let _connection = ServerConnectionGuard(counters);
+                        let connection_guard = ServerConnectionGuard(Arc::clone(&counters));
+                        let task_guard = ServerTaskGuard(counters);
+                        #[cfg(test)]
+                        let connection_test_hooks = Arc::clone(&accept_test_hooks);
+                        registry.tasks.spawn(async move {
+                            #[cfg(test)]
+                            connection_test_hooks
+                                .connection_task_first_polls
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _task = task_guard;
+                            let _connection = connection_guard;
                             let _ = AssertUnwindSafe(serve_connection(
                                 stream, service, tls, scope, voter, client,
                             ))
@@ -1919,6 +2329,15 @@ impl ManagedProviderJobServer {
                             .await;
                             slot
                         });
+                        #[cfg(test)]
+                        {
+                            // Keep this listener task synchronous after spawn
+                            // so a different thread can abort the retained
+                            // JoinSet entry before the connection future gets
+                            // its first poll.
+                            drop(registry);
+                            accept_test_hooks.after_spawn_before_first_poll.pause();
+                        }
                     }
                 }
             }
@@ -1929,6 +2348,8 @@ impl ManagedProviderJobServer {
                 cancelled,
                 tasks,
                 counters,
+                #[cfg(test)]
+                test_hooks: self.test_hooks,
             },
             address,
         ))
@@ -1937,10 +2358,26 @@ impl ManagedProviderJobServer {
 pub struct ManagedProviderJobServerHandle {
     handle: JoinHandle<()>,
     cancelled: Arc<AtomicBool>,
-    tasks: Arc<Mutex<JoinSet<OwnedSemaphorePermit>>>,
+    tasks: Arc<StdMutex<ServerTaskRegistry>>,
     counters: Arc<ServerCounters>,
+    #[cfg(test)]
+    test_hooks: Arc<ManagedProviderServerTestHooks>,
 }
 impl ManagedProviderJobServerHandle {
+    /// Cancellation and task abort are synchronous so ordinary Drop has the
+    /// same resource-closure guarantee as explicit shutdown, including when
+    /// the last server owner is dropped outside a Tokio runtime.
+    fn abort_now(&self) {
+        self.handle.abort();
+        let mut registry = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.cancelled.store(true, Ordering::Release);
+        registry.closed = true;
+        registry.tasks.abort_all();
+    }
+
     /// Return redaction-safe aggregate listener counters.
     pub fn diagnostics(&self) -> ManagedProviderServerDiagnostics {
         ManagedProviderServerDiagnostics {
@@ -1951,10 +2388,22 @@ impl ManagedProviderJobServerHandle {
         }
     }
     pub async fn shutdown(mut self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.handle.abort();
+        self.abort_now();
         let _ = (&mut self.handle).await;
-        self.tasks.lock().await.shutdown().await;
+        let mut tasks = {
+            let mut retained = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut retained.tasks, JoinSet::new())
+        };
+        tasks.shutdown().await;
+    }
+}
+
+impl Drop for ManagedProviderJobServerHandle {
+    fn drop(&mut self) {
+        self.abort_now();
     }
 }
 async fn serve_connection(
@@ -2002,6 +2451,7 @@ async fn serve_connection(
         || hello.semantic_revision != MANAGED_PROVIDER_JOB_SEMANTIC_REVISION
         || hello.scope != scope
         || hello.profile_digest != profile_digest()
+        || !wire_voter_identity_is_valid(&hello.expected_voter)
         || hello.expected_voter != voter.as_str()
         || hello.request_frame_size != MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES as u32
         || hello.response_frame_size != MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u32
@@ -2025,7 +2475,6 @@ async fn serve_connection(
             semantic_revision: MANAGED_PROVIDER_JOB_SEMANTIC_REVISION,
             scope,
             profile_digest: profile_digest(),
-            voter_identity: voter.as_str().to_owned(),
             request_frame_size: MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES as u32,
             response_frame_size: MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u32,
         }),
@@ -2116,6 +2565,9 @@ async fn serve_connection(
         )
         .await?;
     }
+}
+fn wire_voter_identity_is_valid(identity: &str) -> bool {
+    identity.len() <= PROFILE_MAX_SPIFFE_ID_BYTES && SpiffeId::new(identity.to_owned()).is_ok()
 }
 fn wire_operation_is_valid(operation: &WireOperation) -> bool {
     use opc_session_store::fenced_mutation_roster::{
@@ -2371,6 +2823,21 @@ mod tests {
         }
     }
 
+    fn lifecycle_test_operation_for(ordinal: u8) -> WireOperation {
+        match lifecycle_test_operation() {
+            WireOperation::Run {
+                admission,
+                protected_checkpoint,
+                ..
+            } => WireOperation::Run {
+                admission,
+                protected_checkpoint,
+                ordinal,
+            },
+            WireOperation::Status { .. } => unreachable!("test operation is Run"),
+        }
+    }
+
     fn assert_zero_lifecycle_resources(client: &PersistentManagedProviderJobClient) {
         let diagnostics = client.diagnostics();
         assert_eq!(diagnostics.queued, 0);
@@ -2389,6 +2856,30 @@ mod tests {
             client.pool.cells.available_permits(),
             client.pool.config.queued_and_inflight
         );
+    }
+
+    fn canonical_spiffe_with_len(length: usize) -> String {
+        let prefix = "spiffe://test.example/tenant/t/ns/";
+        let suffix = "/sa/s/nf/consumer/instance/i";
+        let namespace_len = length
+            .checked_sub(prefix.len() + suffix.len())
+            .expect("test SPIFFE length is large enough");
+        let identity = format!("{prefix}{}{suffix}", "n".repeat(namespace_len));
+        assert_eq!(identity.len(), length);
+        assert!(SpiffeId::new(identity.clone()).is_ok());
+        identity
+    }
+
+    async fn wait_for_server_drop(counters: &ServerCounters) {
+        for _ in 0..128 {
+            if counters.connections.load(AtomicOrdering::Relaxed) == 0
+                && counters.tasks.load(AtomicOrdering::Relaxed) == 0
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("server drop did not cancel every connection task");
     }
 
     struct NoopNetworkFacade;
@@ -2766,12 +3257,238 @@ mod tests {
         assert_eq!(lifecycle.phase, Phase::Stopped);
     }
 
+    #[tokio::test]
+    async fn last_public_client_drop_aborts_the_registry_without_early_clone_closure() {
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let client = lifecycle_test_client(Arc::clone(&resolver_calls));
+        client.pool.start().await.expect("test pool starts");
+        tokio::task::yield_now().await;
+        let weak = Arc::downgrade(&client.pool);
+        let counters = Arc::clone(&client.pool.counters);
+        let pending = Arc::clone(&client.pool.pending);
+        let bytes = Arc::clone(&client.pool.bytes);
+        let cells = Arc::clone(&client.pool.cells);
+        let queue_capacity = client.pool.config.queued_and_inflight;
+        let request_bytes = client.pool.config.request_bytes;
+        let shared = client.clone();
+        drop(client);
+        let retained = weak.upgrade().expect("a shared client retains the pool");
+        assert_eq!(
+            retained.lifecycle().tasks.len(),
+            MANAGED_PROVIDER_JOB_VOTERS + 1
+        );
+        drop(retained);
+        drop(shared);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "no task may keep a pool self-cycle"
+        );
+        assert_eq!(counters.connections.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(counters.queued.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(counters.inflight.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(pending.available_permits(), queue_capacity);
+        assert_eq!(bytes.available_permits(), request_bytes);
+        assert_eq!(cells.available_permits(), queue_capacity);
+        let calls_after_drop = resolver_calls.load(AtomicOrdering::Relaxed);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            resolver_calls.load(AtomicOrdering::Relaxed),
+            calls_after_drop
+        );
+    }
+
+    #[tokio::test]
+    async fn last_public_client_drop_off_runtime_aborts_the_registry() {
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let client = lifecycle_test_client(Arc::clone(&resolver_calls));
+        client.pool.start().await.expect("test pool starts");
+        tokio::task::yield_now().await;
+        let weak = Arc::downgrade(&client.pool);
+        let counters = Arc::clone(&client.pool.counters);
+        let pending = Arc::clone(&client.pool.pending);
+        let bytes = Arc::clone(&client.pool.bytes);
+        let cells = Arc::clone(&client.pool.cells);
+        let queue_capacity = client.pool.config.queued_and_inflight;
+        let request_bytes = client.pool.config.request_bytes;
+        let last_owner = client.clone();
+        drop(client);
+        std::thread::spawn(move || drop(last_owner))
+            .join()
+            .expect("off-runtime client drop joins");
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "off-runtime drop breaks every task edge"
+        );
+        assert_eq!(counters.connections.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(counters.queued.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(counters.inflight.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(pending.available_permits(), queue_capacity);
+        assert_eq!(bytes.available_permits(), request_bytes);
+        assert_eq!(cells.available_permits(), queue_capacity);
+        let calls_after_drop = resolver_calls.load(AtomicOrdering::Relaxed);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            resolver_calls.load(AtomicOrdering::Relaxed),
+            calls_after_drop
+        );
+    }
+
+    #[tokio::test]
+    async fn force_shutdown_reports_each_queued_and_inflight_production_job_once() {
+        let client = lifecycle_test_client(Arc::new(AtomicUsize::new(0)));
+        client.pool.readiness.store(2, Ordering::Release);
+        client.pool.warm[1].store(1, Ordering::Release);
+        client.pool.warm[2].store(1, Ordering::Release);
+        let (scheduler_tx, scheduler_rx) = mpsc::channel(client.pool.config.queued_and_inflight);
+        let (event_tx, event_rx) = mpsc::channel(2);
+        let (worker_tx, mut worker_rx) = mpsc::channel(1);
+        let worker_pool = Arc::downgrade(&client.pool);
+        let worker = tokio::spawn(async move {
+            let mut job = worker_rx
+                .recv()
+                .await
+                .expect("scheduler dispatches first job");
+            let pool = worker_pool.upgrade().expect("pool remains live for worker");
+            assert_eq!(pool.begin_inflight(&mut job), Phase::Running);
+            pool.pause(ManagedProviderTestPause::WorkerAfterInflight)
+                .await;
+            let _job = job;
+            std::future::pending::<()>().await;
+        });
+        let scheduler = tokio::spawn(scheduler(
+            Arc::downgrade(&client.pool),
+            scheduler_rx,
+            event_rx,
+            vec![worker_tx],
+        ));
+        {
+            let mut lifecycle = client.pool.lifecycle();
+            lifecycle.scheduler = Some(scheduler_tx);
+            lifecycle.tasks = vec![worker, scheduler];
+            lifecycle.started = true;
+        }
+        event_tx
+            .send(Event::Ready(0, 1))
+            .await
+            .expect("scheduler event channel is open");
+        let hook = client
+            .pool
+            .test_hooks
+            .hook(ManagedProviderTestPause::WorkerAfterInflight);
+        hook.arm();
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(lifecycle_test_operation_for(0)).await }
+        });
+        for _ in 0..128 {
+            if hook.entered.load(Ordering::Acquire) != 0 || first.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !first.is_finished(),
+            "first caller must remain owned by the production worker"
+        );
+        assert_ne!(
+            hook.entered.load(Ordering::Acquire),
+            0,
+            "production worker reaches the post-inflight pause"
+        );
+        let second = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(lifecycle_test_operation_for(1)).await }
+        });
+        for _ in 0..32 {
+            if client.diagnostics().queued == 1 && client.diagnostics().inflight == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(client.diagnostics().queued, 1);
+        assert_eq!(client.diagnostics().inflight, 1);
+        let report = client.shutdown().await;
+        hook.release();
+        assert_eq!(report.drained, 0);
+        assert_eq!(report.forced, 2);
+        assert_eq!(report.remaining_connections, 0);
+        assert_eq!(report.remaining_tasks, 0);
+        assert_eq!(
+            first.await.expect("first caller joins"),
+            Err(ManagedProviderClientError::ShuttingDown)
+        );
+        assert_eq!(
+            second.await.expect("second caller joins"),
+            Err(ManagedProviderClientError::ShuttingDown)
+        );
+        assert_zero_lifecycle_resources(&client);
+    }
+
     #[test]
     fn profile_is_pinned_to_the_exact_v5_revisions() {
         assert_eq!(MANAGED_PROVIDER_JOB_ALPN, b"opc-session-consumer/5");
         assert_eq!(MANAGED_PROVIDER_JOB_TRANSPORT_REVISION, 7);
         assert_eq!(MANAGED_PROVIDER_JOB_SEMANTIC_REVISION, 5);
+        assert_eq!(
+            PROFILE_MAX_SPIFFE_ID_BYTES,
+            opc_identity::MAX_SPIFFE_ID_URI_LEN
+        );
         assert_ne!(profile_digest(), [0; 32]);
+    }
+
+    #[test]
+    fn hello_and_ack_profile_accept_exact_maximum_spiffe_identity_without_an_ack_echo() {
+        let scope = test_scope();
+        for (length, accepted) in [
+            (PROFILE_MAX_SPIFFE_ID_BYTES - 1, true),
+            (PROFILE_MAX_SPIFFE_ID_BYTES, true),
+            (PROFILE_MAX_SPIFFE_ID_BYTES + 1, false),
+        ] {
+            let hello = WireHello {
+                transport_revision: MANAGED_PROVIDER_JOB_TRANSPORT_REVISION,
+                semantic_revision: MANAGED_PROVIDER_JOB_SEMANTIC_REVISION,
+                scope,
+                profile_digest: profile_digest(),
+                request_frame_size: MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES as u32,
+                response_frame_size: MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u32,
+                expected_voter: canonical_spiffe_with_len(length),
+            };
+            assert_eq!(
+                wire_voter_identity_is_valid(&hello.expected_voter),
+                accepted
+            );
+            if accepted {
+                assert!(bounded_json_len(
+                    &WireRequest::Hello(hello),
+                    MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES
+                )
+                .is_ok());
+            }
+        }
+        let ack = WireResponse::HelloAck(WireAck {
+            transport_revision: MANAGED_PROVIDER_JOB_TRANSPORT_REVISION,
+            semantic_revision: MANAGED_PROVIDER_JOB_SEMANTIC_REVISION,
+            scope,
+            profile_digest: profile_digest(),
+            request_frame_size: MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES as u32,
+            response_frame_size: MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES as u32,
+        });
+        let exact = serde_json::to_vec(&ack).expect("test Ack encoding").len();
+        assert!(exact <= MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES);
+        assert_eq!(bounded_json_len(&ack, exact), Ok(exact));
+        assert_eq!(
+            bounded_json_len(&ack, exact - 1),
+            Err(ManagedProviderClientError::Overloaded)
+        );
+        assert!(bounded_json_len(&ack, MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES).is_ok());
+        let encoded = serde_json::to_string(&ack).expect("test Ack JSON");
+        assert!(!encoded.contains("voter_identity"));
     }
 
     #[test]
@@ -3130,6 +3847,220 @@ mod tests {
             .listen("127.0.0.1:0".parse().expect("loopback address"))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_server_handle_cancels_listener_and_connection_tasks() {
+        let pki = TestPki::new();
+        let scope = test_scope();
+        let client_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/client";
+        let voter_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter";
+        let (handle, address) = ManagedProviderJobServer::for_test(
+            Arc::new(NoopNetworkFacade),
+            pki.server_config(voter_identity),
+            scope,
+            SpiffeId::new(voter_identity).expect("voter SPIFFE identity"),
+            SpiffeId::new(client_identity).expect("client SPIFFE identity"),
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("real host-local listener");
+        let counters = Arc::clone(&handle.counters);
+        let stream = TcpStream::connect(address).await.expect("loopback connect");
+        for _ in 0..128 {
+            if counters.connections.load(AtomicOrdering::Relaxed) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(counters.connections.load(AtomicOrdering::Relaxed), 1);
+        drop(handle);
+        wait_for_server_drop(&counters).await;
+        drop(stream);
+    }
+
+    #[test]
+    fn dropping_server_handle_inside_runtime_closes_the_accept_publication_barrier() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let listener = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test listener runtime");
+            runtime.block_on(async move {
+                let pki = TestPki::new();
+                let scope = test_scope();
+                let client_identity = "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/client";
+                let voter_identity = "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter";
+                let (handle, address) = ManagedProviderJobServer::for_test(
+                    Arc::new(NoopNetworkFacade),
+                    pki.server_config(voter_identity),
+                    scope,
+                    SpiffeId::new(voter_identity).expect("voter SPIFFE identity"),
+                    SpiffeId::new(client_identity).expect("client SPIFFE identity"),
+                )
+                .listen("127.0.0.1:0".parse().expect("loopback address"))
+                .await
+                .expect("real host-local listener");
+                let (stop_tx, stop_rx) = oneshot::channel();
+                ready_tx
+                    .send((handle, address, stop_tx))
+                    .expect("test listener receiver remains live");
+                let _ = stop_rx.await;
+            });
+        });
+        let (handle, address, stop_tx) = ready_rx.recv().expect("test listener is ready");
+        let hook = Arc::clone(&handle.test_hooks);
+        let counters = Arc::clone(&handle.counters);
+        hook.after_accept_before_publication.arm();
+        hook.closed_registry_observed.arm();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test client runtime");
+        runtime.block_on(async move {
+            let stream = TcpStream::connect(address).await.expect("loopback connect");
+            hook.after_accept_before_publication.wait_entered();
+            // This Drop runs inside Tokio while the listener executor is
+            // synchronously held between accept and registry publication.
+            drop(handle);
+            hook.after_accept_before_publication.release();
+            hook.closed_registry_observed.wait_observed();
+            wait_for_server_drop(&counters).await;
+            assert_eq!(
+                counters.connection_high_water.load(AtomicOrdering::Relaxed),
+                0
+            );
+            assert_eq!(counters.task_high_water.load(AtomicOrdering::Relaxed), 0);
+            drop(stream);
+        });
+        let _ = stop_tx.send(());
+        listener.join().expect("test listener thread joins");
+    }
+
+    #[tokio::test]
+    async fn dropping_server_handle_off_runtime_closes_the_accept_publication_barrier() {
+        let pki = TestPki::new();
+        let scope = test_scope();
+        let client_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/client";
+        let voter_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter";
+        let (handle, address) = ManagedProviderJobServer::for_test(
+            Arc::new(NoopNetworkFacade),
+            pki.server_config(voter_identity),
+            scope,
+            SpiffeId::new(voter_identity).expect("voter SPIFFE identity"),
+            SpiffeId::new(client_identity).expect("client SPIFFE identity"),
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("real host-local listener");
+        let counters = Arc::clone(&handle.counters);
+        let hook = Arc::clone(&handle.test_hooks);
+        hook.after_accept_before_publication.arm();
+        hook.closed_registry_observed.arm();
+        let drop_hook = Arc::clone(&hook);
+        let dropper = std::thread::spawn(move || {
+            drop_hook.after_accept_before_publication.wait_entered();
+            drop(handle);
+            drop_hook.after_accept_before_publication.release();
+        });
+        let stream = TcpStream::connect(address).await.expect("loopback connect");
+        // The listener task blocks synchronously at the hook. The off-runtime
+        // drop closes the registry, then releases it to recheck that barrier.
+        for _ in 0..128 {
+            if hook
+                .after_accept_before_publication
+                .entered
+                .load(Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            hook.after_accept_before_publication
+                .entered
+                .load(Ordering::Acquire),
+            "listener reached the accept-to-publication barrier"
+        );
+        dropper.join().expect("off-runtime server drop joins");
+        hook.closed_registry_observed.wait_observed();
+        wait_for_server_drop(&counters).await;
+        assert_eq!(
+            counters.connection_high_water.load(AtomicOrdering::Relaxed),
+            0
+        );
+        assert_eq!(counters.task_high_water.load(AtomicOrdering::Relaxed), 0);
+        drop(stream);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_server_handle_aborts_an_unpolled_published_task() {
+        let pki = TestPki::new();
+        let scope = test_scope();
+        let client_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/client";
+        let voter_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter";
+        let (handle, address) = ManagedProviderJobServer::for_test(
+            Arc::new(NoopNetworkFacade),
+            pki.server_config(voter_identity),
+            scope,
+            SpiffeId::new(voter_identity).expect("voter SPIFFE identity"),
+            SpiffeId::new(client_identity).expect("client SPIFFE identity"),
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("real host-local listener");
+        let counters = Arc::clone(&handle.counters);
+        let hook = Arc::clone(&handle.test_hooks);
+        hook.after_spawn_before_first_poll.arm();
+        let drop_hook = Arc::clone(&hook);
+        let dropper = std::thread::spawn(move || {
+            drop_hook.after_spawn_before_first_poll.wait_entered();
+            // The listener has released the registry mutex after publication,
+            // but cannot yield to the new task until this barrier releases.
+            // Drop therefore aborts the retained, never-polled future.
+            drop(handle);
+            drop_hook.after_spawn_before_first_poll.release();
+        });
+        let stream = TcpStream::connect(address).await.expect("loopback connect");
+        for _ in 0..128 {
+            if hook
+                .after_spawn_before_first_poll
+                .entered
+                .load(Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            hook.after_spawn_before_first_poll
+                .entered
+                .load(Ordering::Acquire),
+            "listener published the connection task before it could first poll"
+        );
+        dropper.join().expect("unpolled task abort joins");
+        wait_for_server_drop(&counters).await;
+        assert_eq!(
+            hook.connection_task_first_polls
+                .load(AtomicOrdering::Relaxed),
+            0,
+            "the aborted task never reached its first poll"
+        );
+        assert_eq!(
+            counters.connection_high_water.load(AtomicOrdering::Relaxed),
+            1
+        );
+        assert_eq!(counters.task_high_water.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(counters.connections.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(counters.tasks.load(AtomicOrdering::Relaxed), 0);
+        drop(stream);
     }
 
     #[tokio::test]
