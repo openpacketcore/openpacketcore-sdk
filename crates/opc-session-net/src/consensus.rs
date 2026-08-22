@@ -326,6 +326,29 @@ struct ConsensusConnection {
     response_frame_size: usize,
     request_frame_size: usize,
     lifecycle: ConnectionLifecycle,
+    // This is set only after a complete response has passed call-ID
+    // correlation and payload validation. TCP/TLS establishment and attempted
+    // writes do not prove that the peer observed a request.
+    last_successful_correlated_use: Option<tokio::time::Instant>,
+    // A staged cold connection has not yet completed a correlated call. Its
+    // establishment/bootstrapping age is therefore the conservative fallback
+    // used to prevent `None` from granting unbounded reuse.
+    idle_deadline_origin: tokio::time::Instant,
+}
+
+fn consensus_connection_idle_deadline(connection: &ConsensusConnection) -> tokio::time::Instant {
+    connection
+        .last_successful_correlated_use
+        .unwrap_or(connection.idle_deadline_origin)
+        .checked_add(DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit())
+        .unwrap_or(connection.idle_deadline_origin)
+}
+
+fn consensus_connection_idle_expired(
+    connection: &ConsensusConnection,
+    now: tokio::time::Instant,
+) -> bool {
+    now >= consensus_connection_idle_deadline(connection)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,6 +392,7 @@ enum ConsensusStagedConnectionInvalidation {
     Shutdown,
     Forced(RetirementReason),
     Lifecycle,
+    IdleTimeout,
 }
 
 impl ConsensusColdConnectionCoordinator {
@@ -473,6 +497,11 @@ impl ConsensusColdConnectionCoordinator {
                 }
                 ConsensusStagedConnectionInvalidation::Lifecycle => {
                     let _ = connection.lifecycle.retirement(tokio::time::Instant::now());
+                }
+                ConsensusStagedConnectionInvalidation::IdleTimeout => {
+                    connection
+                        .lifecycle
+                        .record_forced_retirement(RetirementReason::IdleTimeout);
                 }
             }
             state.phase = ConsensusColdConnectionPhase::Idle;
@@ -672,7 +701,21 @@ async fn reap_cached_consensus_connection(
                     drop(retired);
                     continue;
                 }
-                Some(connection.lifecycle.retire_at())
+                if consensus_connection_idle_expired(connection, now) {
+                    connection
+                        .lifecycle
+                        .record_forced_retirement(RetirementReason::IdleTimeout);
+                    let retired = cached.take();
+                    drop(cached);
+                    drop(retired);
+                    continue;
+                }
+                Some(
+                    connection
+                        .lifecycle
+                        .retire_at()
+                        .min(consensus_connection_idle_deadline(connection)),
+                )
             } else {
                 None
             }
@@ -832,6 +875,8 @@ impl ConsensusColdConnector {
                     Some(admission.epoch()),
                 )
                 .map_err(|_| SessionConsensusPeerError::Protocol)?,
+                last_successful_correlated_use: None,
+                idle_deadline_origin: tls_completed_at,
             });
         }
 
@@ -861,6 +906,8 @@ impl ConsensusColdConnector {
                 None,
             )
             .map_err(|_| SessionConsensusPeerError::Protocol)?,
+            last_successful_correlated_use: None,
+            idle_deadline_origin: established_at,
         })
     }
 
@@ -1191,16 +1238,17 @@ async fn monitor_staged_consensus_connection(
         let changed = coordinator.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        let retire_at = {
+        let (retire_at, idle_deadline) = {
             let state = coordinator.state.lock().await;
             match &state.phase {
                 ConsensusColdConnectionPhase::Ready {
                     attempt_id: current_attempt_id,
                     epoch: current_epoch,
                     connection,
-                } if *current_attempt_id == attempt_id && *current_epoch == epoch => {
-                    connection.lifecycle.retire_at()
-                }
+                } if *current_attempt_id == attempt_id && *current_epoch == epoch => (
+                    connection.lifecycle.retire_at(),
+                    consensus_connection_idle_deadline(connection),
+                ),
                 _ => return,
             }
         };
@@ -1235,8 +1283,12 @@ async fn monitor_staged_consensus_connection(
                 );
                 ConsensusStagedConnectionInvalidation::Forced(RetirementReason::MaterialEpoch)
             }
-            _ = tokio::time::sleep_until(retire_at) => {
-                ConsensusStagedConnectionInvalidation::Lifecycle
+            _ = tokio::time::sleep_until(retire_at.min(idle_deadline)) => {
+                if idle_deadline <= retire_at {
+                    ConsensusStagedConnectionInvalidation::IdleTimeout
+                } else {
+                    ConsensusStagedConnectionInvalidation::Lifecycle
+                }
             }
         };
         coordinator.invalidate_ready(attempt_id, invalidation).await;
@@ -1496,7 +1548,19 @@ impl RemoteSessionConsensusPeer {
                             connection,
                             ..
                         } if current_epoch == epoch => {
-                            ConsensusColdConnectionAction::Ready(connection)
+                            let now = tokio::time::Instant::now();
+                            if connection.lifecycle.retirement(now).is_some() {
+                                drop(connection);
+                                ConsensusColdConnectionAction::Retry
+                            } else if consensus_connection_idle_expired(&connection, now) {
+                                connection
+                                    .lifecycle
+                                    .record_forced_retirement(RetirementReason::IdleTimeout);
+                                drop(connection);
+                                ConsensusColdConnectionAction::Retry
+                            } else {
+                                ConsensusColdConnectionAction::Ready(connection)
+                            }
                         }
                         ConsensusColdConnectionPhase::Ready {
                             epoch: staged_epoch,
@@ -1635,10 +1699,20 @@ impl RemoteSessionConsensusPeer {
         // the taken socket is dropped rather than exposing a late response to
         // the next Openraft RPC.
         if let Some(mut connection) = connection_slot.take() {
-            if self.connection_is_current(&mut connection, tokio::time::Instant::now()) {
+            let now = tokio::time::Instant::now();
+            if self.connection_is_current(&mut connection, now)
+                && !self.connection_idle_reuse_expired(&connection, now)
+            {
+                // Sample no later than request dispatch, then commit only
+                // after a complete correlated and payload-validated response.
+                // A failed/cancelled write never refreshes this idle epoch.
+                let dispatched_at = tokio::time::Instant::now();
                 let result = self
                     .call_negotiated(&mut connection, request, deadline)
                     .await;
+                if result.is_ok() {
+                    connection.last_successful_correlated_use = Some(dispatched_at);
+                }
                 if result
                     .as_ref()
                     .is_ok_and(consensus_response_allows_connection_reuse)
@@ -1692,9 +1766,13 @@ impl RemoteSessionConsensusPeer {
                 return Err(SessionConsensusPeerError::Timeout);
             }
         };
+        let dispatched_at = tokio::time::Instant::now();
         let result = self
             .call_negotiated(&mut connection, request, deadline)
             .await;
+        if result.is_ok() {
+            connection.last_successful_correlated_use = Some(dispatched_at);
+        }
         if result
             .as_ref()
             .is_ok_and(consensus_response_allows_connection_reuse)
@@ -1765,6 +1843,20 @@ impl RemoteSessionConsensusPeer {
         // per-peer jitter deadline. Fresh handshakes take the strict mismatch
         // path in `call_once` and are never admitted with stale evidence.
         connection.lifecycle.retirement(now).is_none()
+    }
+
+    fn connection_idle_reuse_expired(
+        &self,
+        connection: &ConsensusConnection,
+        now: tokio::time::Instant,
+    ) -> bool {
+        if !consensus_connection_idle_expired(connection, now) {
+            return false;
+        }
+        connection
+            .lifecycle
+            .record_forced_retirement(RetirementReason::IdleTimeout);
+        true
     }
 
     fn mark_connection_usable(&self, connection: &ConsensusConnection) {
@@ -3450,6 +3542,8 @@ mod tests {
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 lifecycle,
+                last_successful_correlated_use: None,
+                idle_deadline_origin: now,
             }),
         };
         control
@@ -3515,6 +3609,8 @@ mod tests {
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 lifecycle,
+                last_successful_correlated_use: None,
+                idle_deadline_origin: now,
             }),
         };
         material.rotate();
@@ -3572,6 +3668,8 @@ mod tests {
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             lifecycle: ConnectionLifecycle::new(policy, now, None, None, 0, None)
                 .expect("connection lifecycle"),
+            last_successful_correlated_use: None,
+            idle_deadline_origin: now,
         };
         assert!(peer.connection_is_current(&mut connection, now));
 
@@ -3634,6 +3732,8 @@ mod tests {
                 Some(tls_config.material_status().epoch()),
             )
             .expect("connection lifecycle"),
+            last_successful_correlated_use: None,
+            idle_deadline_origin: now,
         };
         let edge_key = directed_connection_key(
             b"consensus",
@@ -3681,6 +3781,8 @@ mod tests {
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             lifecycle: ConnectionLifecycle::new(policy, now, None, None, 0, None)
                 .expect("connection lifecycle"),
+            last_successful_correlated_use: None,
+            idle_deadline_origin: now,
         };
 
         control
@@ -5178,6 +5280,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idle_cached_consensus_connection_is_reaped_at_its_soft_lifecycle_bound() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
         let policy = ConnectionLifecyclePolicy::try_new(
             Duration::from_secs(40),
             Duration::from_secs(10),
@@ -5202,6 +5307,8 @@ mod tests {
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 lifecycle,
+                last_successful_correlated_use: None,
+                idle_deadline_origin: established_at,
             });
         }
         pool.ensure_cached_connection_reaper(
@@ -5214,7 +5321,8 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(pool.primary.connection.lock().await.is_some());
 
-        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::advance(DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit())
+            .await;
         tokio::task::yield_now().await;
         assert!(
             pool.primary.connection.lock().await.is_none(),
@@ -5231,7 +5339,245 @@ mod tests {
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             lifecycle,
+            last_successful_correlated_use: None,
+            idle_deadline_origin: tokio::time::Instant::now(),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consensus_idle_reuse_limit_is_enforced_independently_for_both_lanes() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let policy = ConnectionLifecyclePolicy::default();
+        let now = tokio::time::Instant::now();
+        let lifecycle = || {
+            ConnectionLifecycle::new(policy, now, None, None, 0, None)
+                .expect("cached connection lifecycle")
+        };
+        let (_server_binding, client_binding) = bindings();
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(
+                &client_binding,
+                Arc::new(|| {
+                    Box::pin(async {
+                        Err(io::Error::new(io::ErrorKind::NotFound, "test resolver"))
+                    })
+                }),
+            ),
+            None,
+            client_binding,
+            None,
+        );
+        let mut primary = cached_consensus_connection(lifecycle());
+        let mut overflow = cached_consensus_connection(lifecycle());
+        primary.last_successful_correlated_use = Some(now);
+        overflow.last_successful_correlated_use = Some(now);
+
+        let reuse_limit = DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit();
+        tokio::time::advance(reuse_limit - Duration::from_millis(1)).await;
+        let just_inside = tokio::time::Instant::now();
+        assert!(!peer.connection_idle_reuse_expired(&primary, just_inside));
+        assert!(!peer.connection_idle_reuse_expired(&overflow, just_inside));
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let at_limit = tokio::time::Instant::now();
+        assert!(peer.connection_idle_reuse_expired(&primary, at_limit));
+        assert!(peer.connection_idle_reuse_expired(&overflow, at_limit));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_lane_reapers_retire_both_idle_lanes_at_the_exact_reuse_boundary() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let now = tokio::time::Instant::now();
+        let policy = ConnectionLifecyclePolicy::default();
+        let primary_lifecycle =
+            ConnectionLifecycle::new(policy, now, None, None, 0, None).expect("primary lifecycle");
+        let overflow_lifecycle =
+            ConnectionLifecycle::new(policy, now, None, None, 0, None).expect("overflow lifecycle");
+        let primary_probe = primary_lifecycle.clone();
+        let overflow_probe = overflow_lifecycle.clone();
+        let pool = Arc::new(ConsensusConnectionPool::new(policy));
+        let mut primary = cached_consensus_connection(primary_lifecycle);
+        let mut overflow = cached_consensus_connection(overflow_lifecycle);
+        primary.last_successful_correlated_use = Some(now);
+        overflow.last_successful_correlated_use = Some(now);
+        *pool.primary.connection.lock().await = Some(primary);
+        *pool.overflow.connection.lock().await = Some(overflow);
+        let reauthentication = SessionReauthenticationControl::new();
+        pool.ensure_cached_connection_reaper(
+            ConsensusConnectionLane::Primary,
+            None,
+            reauthentication.clone(),
+            [6; 32],
+        );
+        pool.ensure_cached_connection_reaper(
+            ConsensusConnectionLane::Overflow,
+            None,
+            reauthentication,
+            [7; 32],
+        );
+        pool.primary.changed.notify_one();
+        pool.overflow.changed.notify_one();
+        tokio::task::yield_now().await;
+
+        let reuse_limit = DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit();
+        tokio::time::advance(reuse_limit - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(pool.primary.connection.lock().await.is_some());
+        assert!(pool.overflow.connection.lock().await.is_some());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
+        wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Overflow).await;
+        for probe in [primary_probe, overflow_probe] {
+            assert_eq!(probe.recorded_retirement_count(), 1);
+            assert_eq!(
+                probe.recorded_retirement_reason(),
+                Some(RetirementReason::IdleTimeout)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn staged_ready_connection_retires_at_its_bootstrap_age_idle_boundary() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let (_server_binding, client_binding) = bindings();
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(
+                &client_binding,
+                Arc::new(|| Box::pin(std::future::pending::<io::Result<SocketAddr>>())),
+            ),
+            None,
+            client_binding,
+            Some(Duration::from_secs(1)),
+        );
+        let epoch = peer.cold_connector().epoch();
+        let attempt_id = uuid::Uuid::new_v4();
+        let now = tokio::time::Instant::now();
+        let lifecycle = ConnectionLifecycle::new(
+            peer.lifecycle_policy,
+            now,
+            None,
+            None,
+            epoch.reauthentication_generation,
+            epoch.material_epoch,
+        )
+        .expect("staged lifecycle");
+        let retirement_probe = lifecycle.clone();
+        let mut connection = cached_consensus_connection(lifecycle);
+        connection.idle_deadline_origin = now;
+        peer.connection_pool
+            .cold_connection
+            .state
+            .lock()
+            .await
+            .phase = ConsensusColdConnectionPhase::Ready {
+            attempt_id,
+            epoch,
+            connection: Box::new(connection),
+        };
+
+        let connector = peer.cold_connector();
+        let coordinator = Arc::clone(&peer.connection_pool.cold_connection);
+        let reconnect_gate = Arc::clone(&peer.connection_pool.reconnect_gate);
+        let mut shutdown = peer.connection_pool.shutdown.subscribe();
+        let monitor = tokio::spawn(async move {
+            monitor_staged_consensus_connection(
+                &connector,
+                &coordinator,
+                &reconnect_gate,
+                &mut shutdown,
+                attempt_id,
+                epoch,
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit())
+            .await;
+        monitor.await.expect("staged idle monitor join");
+        assert!(matches!(
+            peer.connection_pool
+                .cold_connection
+                .state
+                .lock()
+                .await
+                .phase,
+            ConsensusColdConnectionPhase::Idle
+        ));
+        assert_eq!(retirement_probe.recorded_retirement_count(), 1);
+        assert_eq!(
+            retirement_probe.recorded_retirement_reason(),
+            Some(RetirementReason::IdleTimeout)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claimant_drops_an_idle_staged_ready_connection_before_dispatch() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let (_server_binding, client_binding) = bindings();
+        let resolver: RemoteAddrResolver =
+            Arc::new(|| Box::pin(std::future::pending::<io::Result<SocketAddr>>()));
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolver),
+            None,
+            client_binding,
+            Some(Duration::from_secs(1)),
+        );
+        let epoch = peer.cold_connector().epoch();
+        let attempt_id = uuid::Uuid::new_v4();
+        let now = tokio::time::Instant::now();
+        let lifecycle = ConnectionLifecycle::new(
+            peer.lifecycle_policy,
+            now,
+            None,
+            None,
+            epoch.reauthentication_generation,
+            epoch.material_epoch,
+        )
+        .expect("staged lifecycle");
+        let retirement_probe = lifecycle.clone();
+        let mut connection = cached_consensus_connection(lifecycle);
+        connection.idle_deadline_origin = now;
+        peer.connection_pool
+            .cold_connection
+            .state
+            .lock()
+            .await
+            .phase = ConsensusColdConnectionPhase::Ready {
+            attempt_id,
+            epoch,
+            connection: Box::new(connection),
+        };
+
+        tokio::time::advance(DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit())
+            .await;
+        let claim_peer = peer.clone();
+        let claimant = tokio::spawn(async move {
+            claim_peer
+                .claim_or_start_cold_connection(
+                    tokio::time::Instant::now() + Duration::from_millis(1),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            claimant.await.expect("idle staged claimant join"),
+            Err(SessionConsensusPeerError::Timeout)
+        ));
+        assert_eq!(retirement_probe.recorded_retirement_count(), 1);
+        assert_eq!(
+            retirement_probe.recorded_retirement_reason(),
+            Some(RetirementReason::IdleTimeout)
+        );
     }
 
     async fn wait_for_cached_lane_to_empty(
@@ -5325,6 +5671,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cached_consensus_reaper_never_races_an_in_flight_lane() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
         let policy = ConnectionLifecyclePolicy::try_new(
             Duration::from_secs(40),
             Duration::from_secs(10),
@@ -5336,6 +5685,7 @@ mod tests {
         let lifecycle =
             ConnectionLifecycle::new(policy, tokio::time::Instant::now(), None, None, 0, None)
                 .expect("in-flight exclusion lifecycle");
+        let retirement_probe = lifecycle.clone();
         let pool = Arc::new(ConsensusConnectionPool::new(
             ConnectionLifecyclePolicy::default(),
         ));
@@ -5348,7 +5698,8 @@ mod tests {
             [3; 32],
         );
         pool.primary.changed.notify_one();
-        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::advance(DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit())
+            .await;
         tokio::task::yield_now().await;
         assert!(
             in_flight.is_some(),
@@ -5356,6 +5707,11 @@ mod tests {
         );
         drop(in_flight);
         wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
+        assert_eq!(retirement_probe.recorded_retirement_count(), 1);
+        assert_eq!(
+            retirement_probe.recorded_retirement_reason(),
+            Some(RetirementReason::IdleTimeout)
+        );
     }
 
     #[tokio::test]
