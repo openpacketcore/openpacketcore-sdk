@@ -17,10 +17,12 @@ use opc_key::{
 #[cfg(not(target_os = "linux"))]
 use opc_session_store::ConsensusSessionStoreOpenError;
 use opc_session_store::{
-    CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload, Generation,
-    OwnerId, QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionBackend,
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
+    CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload, FenceToken,
+    FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
+    FencedTransitionV2CallerNonce, FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch,
+    FencedTransitionV2Request, Generation, OwnerId, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
     SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
     SessionConsensusStorageAnchor, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SessionKey, SessionKeyType, SessionLeaseManager, SessionTopologyAbortAdmissionProof,
@@ -30,7 +32,8 @@ use opc_session_store::{
     SessionTopologyTransitionId, SessionTopologyTransitionPeers, SessionTopologyTransitionPhase,
     SessionTopologyTransitionRequest, SessionTopologyTransportAdmission,
     SessionTopologyTransportAdmissionError, SessionTopologyUniformCommitAdmissionProof,
-    SqliteSessionBackend, StateClass, StateType, StoredSessionRecord, ValidatedQuorumTopology,
+    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
+    ValidatedQuorumTopology,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use tempfile::TempDir;
@@ -91,6 +94,24 @@ async fn public_dynamic_consensus_rejects_unsupported_platform_before_durable_in
 
 type LoopbackHandler = Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum V2ProfilePeerOverride {
+    Exact = 0,
+    V1Only = 1,
+    MismatchedV2 = 2,
+}
+
+impl V2ProfilePeerOverride {
+    fn from_atomic(value: usize) -> Self {
+        match value {
+            1 => Self::V1Only,
+            2 => Self::MismatchedV2,
+            _ => Self::Exact,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LoopbackPeer {
     target: SessionConsensusNodeId,
@@ -99,6 +120,8 @@ struct LoopbackPeer {
     enabled: Arc<AtomicBool>,
     topology_response_drops_remaining: Arc<AtomicUsize>,
     topology_responses_dropped: Arc<AtomicUsize>,
+    v2_profile_override: Arc<AtomicUsize>,
+    v2_profile_probes: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for LoopbackPeer {
@@ -129,10 +152,48 @@ impl SessionConsensusPeer for LoopbackPeer {
         if !self.enabled.load(Ordering::Acquire) {
             return Err(SessionConsensusPeerError::Unavailable);
         }
-        if request.identity != self.scope {
+        if request.identity != self.scope
+            && request.family != SessionConsensusRpcFamily::TopologyAdmissionBarrier
+        {
             return Err(SessionConsensusPeerError::ScopeMismatch);
         }
         let family = request.family;
+        let override_reply =
+            V2ProfilePeerOverride::from_atomic(self.v2_profile_override.load(Ordering::Acquire));
+        let is_v2_profile_probe = matches!(
+            family,
+            SessionConsensusRpcFamily::TopologyAdmissionBarrier
+                | SessionConsensusRpcFamily::ReadBarrier
+        ) && request.payload.len() >= 32;
+        if is_v2_profile_probe && override_reply != V2ProfilePeerOverride::Exact {
+            self.v2_profile_probes.fetch_add(1, Ordering::AcqRel);
+            match override_reply {
+                // A V1-only peer rejects the unknown V2 wire shape before it
+                // can decode an exact-profile probe.
+                V2ProfilePeerOverride::V1Only => {
+                    return Ok(SessionConsensusWireResponse {
+                        result: Err(SessionConsensusPeerError::Protocol),
+                    });
+                }
+                // Both V2 probe payloads end with the fixed-width profile
+                // digest. Mutating only that byte preserves the wire shape
+                // and makes the real remote handler return its fail-closed
+                // mismatched-profile answer.
+                V2ProfilePeerOverride::MismatchedV2 => {
+                    let mut mismatched = request;
+                    let last = mismatched
+                        .payload
+                        .last_mut()
+                        .expect("V2 profile probe payload is nonempty");
+                    *last ^= 0x01;
+                    let Some(handler) = self.handler.read().await.clone() else {
+                        return Err(SessionConsensusPeerError::Unavailable);
+                    };
+                    return Ok(handler.handle(mismatched.sender, mismatched).await);
+                }
+                V2ProfilePeerOverride::Exact => unreachable!("exact override returned early"),
+            }
+        }
         let Some(handler) = self.handler.read().await.clone() else {
             return Err(SessionConsensusPeerError::Unavailable);
         };
@@ -159,6 +220,8 @@ struct LoopbackNetwork {
     links: Vec<Vec<Arc<AtomicBool>>>,
     topology_response_drops_remaining: Vec<Vec<Arc<AtomicUsize>>>,
     topology_responses_dropped: Vec<Vec<Arc<AtomicUsize>>>,
+    v2_profile_overrides: Vec<Vec<Arc<AtomicUsize>>>,
+    v2_profile_probes: Vec<Vec<Arc<AtomicUsize>>>,
 }
 
 impl LoopbackNetwork {
@@ -178,12 +241,16 @@ impl LoopbackNetwork {
             .collect::<Vec<_>>();
         let topology_response_drops_remaining = atomic_usize_matrix(node_ids.len());
         let topology_responses_dropped = atomic_usize_matrix(node_ids.len());
+        let v2_profile_overrides = atomic_usize_matrix(node_ids.len());
+        let v2_profile_probes = atomic_usize_matrix(node_ids.len());
         Self {
             node_ids,
             handlers,
             links,
             topology_response_drops_remaining,
             topology_responses_dropped,
+            v2_profile_overrides,
+            v2_profile_probes,
         }
     }
 
@@ -226,6 +293,8 @@ impl LoopbackNetwork {
                     topology_responses_dropped: Arc::clone(
                         &self.topology_responses_dropped[source][target],
                     ),
+                    v2_profile_override: Arc::clone(&self.v2_profile_overrides[source][target]),
+                    v2_profile_probes: Arc::clone(&self.v2_profile_probes[source][target]),
                 });
                 (self.node_ids[target], peer)
             })
@@ -272,6 +341,26 @@ impl LoopbackNetwork {
 
     fn dropped_topology_responses(&self, source: usize, target: usize) -> usize {
         self.topology_responses_dropped[source][target].load(Ordering::Acquire)
+    }
+
+    fn set_v2_profile_override_for_target(
+        &self,
+        target: usize,
+        override_reply: V2ProfilePeerOverride,
+    ) {
+        for source in 0..self.node_ids.len() {
+            if source != target {
+                self.v2_profile_overrides[source][target]
+                    .store(override_reply as usize, Ordering::Release);
+            }
+        }
+    }
+
+    fn v2_profile_probes_to(&self, target: usize) -> usize {
+        (0..self.node_ids.len())
+            .filter(|source| *source != target)
+            .map(|source| self.v2_profile_probes[source][target].load(Ordering::Acquire))
+            .sum()
     }
 }
 
@@ -981,6 +1070,136 @@ async fn terminal_first_abort_retries_lost_candidate_ack_and_restores_old_author
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_history_requires_exact_prospective_learner_and_recertifies_after_cutover_restart() {
+    let mut fleet = DynamicFleet::start_three().await;
+    let initial = [0, 1, 2];
+    let initial_leader = fleet.wait_transition_caller(&initial).await;
+    let initial_v2 = v2_transition_request(b"initial-v2", 0x61);
+    assert!(matches!(
+        fleet.stores[initial_leader]
+            .fenced_transition_v2(initial_v2)
+            .await
+            .expect("initial real-fleet V2 activation"),
+        outcome if matches!(outcome.mutation(), FencedTransitionMutationResult::Created)
+    ));
+    assert_eq!(
+        fleet.stores[initial_leader]
+            .fenced_transition_v2_capability()
+            .await
+            .expect("initial V2 certificate remains available"),
+        Some(FencedTransitionV2Capability::V2)
+    );
+
+    let expanded = [0, 1, 2, 3, 4];
+    let expand = fleet.transition_request(1, &expanded, 0xC2);
+    fleet.provision_expansion(&expand).await;
+    let candidate = 3;
+    let leader = fleet.wait_transition_caller(&initial).await;
+    let before_v1 = fleet.stores[leader].status();
+    let candidate_before_v1 = fleet.stores[candidate].status();
+    fleet
+        .network
+        .set_v2_profile_override_for_target(candidate, V2ProfilePeerOverride::V1Only);
+    assert_eq!(
+        fleet.stores[leader]
+            .prepare_topology_transition(&expand, fleet.network.peers_for_request(leader, &expand))
+            .await,
+        Err(SessionTopologyTransitionError::InvalidTransitionBindings),
+        "a V1-only candidate must fail before OpenRaft add_learner"
+    );
+    assert_eq!(
+        fleet.stores[leader].status().last_log_index,
+        before_v1.last_log_index.map(|index| index + 1),
+        "the rejected V1 candidate appended only the predecessor Prepare control"
+    );
+    assert_eq!(
+        fleet.stores[candidate].status().last_log_index,
+        candidate_before_v1.last_log_index,
+        "the rejected V1 candidate received neither learner replication nor membership admission"
+    );
+    assert!(!fleet.stores[candidate].status().admitted);
+    assert_eq!(fleet.network.v2_profile_probes_to(candidate), 1);
+
+    let before_mismatch = fleet.stores[leader].status();
+    let candidate_before_mismatch = fleet.stores[candidate].status();
+    fleet
+        .network
+        .set_v2_profile_override_for_target(candidate, V2ProfilePeerOverride::MismatchedV2);
+    assert_eq!(
+        fleet.stores[leader]
+            .prepare_topology_transition(&expand, fleet.network.peers_for_request(leader, &expand))
+            .await,
+        Err(SessionTopologyTransitionError::InvalidTransitionBindings),
+        "a V2 candidate with the wrong exact profile must fail before OpenRaft add_learner"
+    );
+    assert_eq!(
+        fleet.stores[leader].status().last_log_index,
+        before_mismatch.last_log_index,
+        "a rejected profile retry appended no learner, replication, or membership log entry"
+    );
+    assert_eq!(
+        fleet.stores[candidate].status().last_log_index,
+        candidate_before_mismatch.last_log_index,
+        "a mismatched candidate remained outside replicated learner state"
+    );
+    assert_eq!(fleet.network.v2_profile_probes_to(candidate), 2);
+
+    fleet
+        .network
+        .set_v2_profile_override_for_target(candidate, V2ProfilePeerOverride::Exact);
+    let proof = fleet.prepare(&expand, &expanded).await;
+    fleet.commit(&expand, &proof, &expanded).await;
+    wait_completed_and_admitted(&fleet.stores, &expand, &expanded, &[]).await;
+
+    // The successful cutover deliberately clears the predecessor-scoped V2
+    // certificate. Reopen a real successor voter and make its fresh proof see
+    // a valid V2 wire payload with the wrong digest.
+    let successor = candidate;
+    fleet
+        .restart_member_in_scope(successor, &expanded, expand.desired_identity(), &expand)
+        .await;
+    fleet.stores[successor]
+        .initialize_cluster()
+        .await
+        .expect("reinitialize the reopened completed-cutover voter");
+    wait_ready(&fleet.stores, &expanded).await;
+    let recertification_peer = 4;
+    let before_recertification_probe = fleet.network.v2_profile_probes_to(recertification_peer);
+    let before_recertification_log = fleet.stores[successor].status().last_log_index;
+    fleet.network.set_v2_profile_override_for_target(
+        recertification_peer,
+        V2ProfilePeerOverride::MismatchedV2,
+    );
+    assert!(matches!(
+        fleet.stores[successor]
+            .fenced_transition_v2(v2_transition_request(b"mismatched-recertification", 0x62))
+            .await,
+        Err(StoreError::CapabilityNotSupported(reason))
+            if reason == "atomic_fenced_transition_epoch_history_v2"
+    ));
+    assert!(
+        fleet.network.v2_profile_probes_to(recertification_peer) > before_recertification_probe,
+        "the successor reused predecessor V2 proof instead of re-probing"
+    );
+    assert_eq!(
+        fleet.stores[successor].status().last_log_index,
+        before_recertification_log,
+        "failed re-certification must not append a replacement V2 activation"
+    );
+
+    fleet
+        .network
+        .set_v2_profile_override_for_target(recertification_peer, V2ProfilePeerOverride::Exact);
+    assert!(matches!(
+        fleet.stores[successor]
+            .fenced_transition_v2(v2_transition_request(b"exact-recertification", 0x63))
+            .await
+            .expect("exact V2 re-certification after cutover"),
+        outcome if matches!(outcome.mutation(), FencedTransitionMutationResult::Created)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn finalizing_transition_blocks_successor_staging_until_exact_resume() {
     let mut fleet = DynamicFleet::start_three().await;
     let expanded = (0..EXPANDED_MEMBER_COUNT).collect::<Vec<_>>();
@@ -1487,6 +1706,60 @@ fn consensus_identity(
         derive_configuration_id(cluster_id, epoch, &fingerprints),
         epoch,
     )
+}
+
+fn v2_transition_request(label: &[u8], nonce: u8) -> FencedTransitionV2Request {
+    let key = session_key(label);
+    let owner = owner(format!("v2-topology-owner-{nonce}"));
+    let lease = FencedTransitionLease::acquire(
+        key.clone(),
+        owner.clone(),
+        FenceToken::new(0),
+        Duration::from_secs(30),
+    )
+    .expect("valid V2 acquire lease");
+    let fence = lease.committed_fence().expect("V2 acquire fence");
+    let mut record = StoredSessionRecord {
+        key,
+        generation: Generation::new(1),
+        owner,
+        fence,
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("dynamic-membership-v2-profile-proof"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([]),
+    };
+    let key_id = KeyId::new("synthetic-dynamic-membership-v2-key").expect("key ID");
+    let aad = EnvelopeAad::session(
+        record.key.tenant.clone(),
+        1,
+        SessionAad::new(
+            record.key.nf_kind.as_str(),
+            "dynamic-membership-v2-session-digest",
+            record.state_type.as_str(),
+            record.generation.get(),
+            record.fence.get(),
+            "dynamic-membership-test-backend",
+        )
+        .expect("session AAD"),
+    );
+    let envelope = CryptoEnvelopeV1 {
+        algorithm: AeadAlgorithm::Aes256GcmSiv,
+        key_id: key_id.clone(),
+        nonce: vec![0x63; AES_256_GCM_SIV_NONCE_LEN],
+        aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+        ciphertext_and_tag: vec![0xB6; AEAD_TAG_LEN],
+    }
+    .encode()
+    .expect("test envelope");
+    record.payload = EncryptedSessionPayload::try_envelope(envelope).expect("valid envelope");
+    FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 history epoch"),
+        FencedTransitionV2CallerNonce::from_bytes([nonce; 16]),
+        lease,
+        FencedTransitionMutation::create(record),
+    )
+    .expect("self-authenticating V2 request")
 }
 
 fn session_key(label: &[u8]) -> SessionKey {

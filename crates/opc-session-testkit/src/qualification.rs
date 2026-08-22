@@ -3488,6 +3488,8 @@ pub enum QualificationNodeCommandKind {
     DirectedHandshake,
     /// Read bounded connection-lifecycle metrics.
     LifecycleMetrics,
+    /// Read fixed, redaction-safe consensus-store diagnostic counters.
+    ConsensusDiagnostics,
     /// Change the qualification-only consensus RPC fault gate.
     SetConsensusRpcAvailability,
     /// Start the test-only stateless consumer endpoint.
@@ -3548,6 +3550,7 @@ impl QualificationNodeCommandKind {
         Self::RequestReauthentication,
         Self::DirectedHandshake,
         Self::LifecycleMetrics,
+        Self::ConsensusDiagnostics,
         Self::SetConsensusRpcAvailability,
         Self::StartStatelessConsumer,
         Self::ArmStatelessConsumerOutcomeUnknown,
@@ -3598,6 +3601,8 @@ pub enum QualificationNodeCommand {
         remote_node_index: usize,
     },
     LifecycleMetrics,
+    /// Return fixed, redaction-safe consensus-store diagnostic counters.
+    ConsensusDiagnostics,
     /// Enable or fail closed every consensus RPC path owned by this child.
     /// The stdin control channel remains available while RPCs are disabled.
     SetConsensusRpcAvailability {
@@ -3720,6 +3725,9 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::LifecycleMetrics => {
                 formatter.write_str("QualificationNodeCommand::LifecycleMetrics")
             }
+            Self::ConsensusDiagnostics => {
+                formatter.write_str("QualificationNodeCommand::ConsensusDiagnostics")
+            }
             Self::SetConsensusRpcAvailability { availability } => formatter
                 .debug_struct("QualificationNodeCommand::SetConsensusRpcAvailability")
                 .field("availability", availability)
@@ -3821,6 +3829,7 @@ impl QualificationNodeCommand {
             Self::RequestReauthentication => QualificationNodeCommandKind::RequestReauthentication,
             Self::DirectedHandshake { .. } => QualificationNodeCommandKind::DirectedHandshake,
             Self::LifecycleMetrics => QualificationNodeCommandKind::LifecycleMetrics,
+            Self::ConsensusDiagnostics => QualificationNodeCommandKind::ConsensusDiagnostics,
             Self::SetConsensusRpcAvailability { .. } => {
                 QualificationNodeCommandKind::SetConsensusRpcAvailability
             }
@@ -3867,6 +3876,7 @@ impl QualificationNodeCommand {
             | Self::ReauthenticationGeneration
             | Self::RequestReauthentication
             | Self::LifecycleMetrics
+            | Self::ConsensusDiagnostics
             | Self::SetConsensusRpcAvailability { .. }
             | Self::ArmStatelessConsumerOutcomeUnknown
             | Self::SecurityMetrics
@@ -4253,6 +4263,9 @@ pub enum QualificationNodeReply {
     },
     LifecycleMetrics {
         metrics: QualificationConnectionLifecycleMetrics,
+    },
+    ConsensusDiagnostics {
+        metrics: opc_session_store::ConsensusStoreDiagnosticSnapshot,
     },
     ConsensusRpcAvailability {
         availability: QualificationConsensusRpcAvailability,
@@ -5046,6 +5059,7 @@ mod tests {
                 remote_node_index: 1,
             },
             QualificationNodeCommand::LifecycleMetrics,
+            QualificationNodeCommand::ConsensusDiagnostics,
             QualificationNodeCommand::SetConsensusRpcAvailability {
                 availability: QualificationConsensusRpcAvailability::Available,
             },

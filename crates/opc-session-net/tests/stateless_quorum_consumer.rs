@@ -17,17 +17,18 @@ use opc_key::{
 };
 use opc_session_net::{
     conservative_payload_budget, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    RemoteAddrResolver, SessionConsumerAuthorizer, SessionConsumerClientError,
-    SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
-    SessionConsumerMutationError, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
-    MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
+    PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver, SessionConsumerAuthorizer,
+    SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
+    StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
     SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, ConsensusSessionStore,
     EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, Generation, OwnerId,
+    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
+    FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, Generation, LeaseGuard, OwnerId,
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
     PreparedFencedTransitionLookup, QuorumReplicaDescriptor, RecordExpiryPreflight,
     ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
@@ -35,12 +36,14 @@ use opc_session_store::{
     SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
     SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
     SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
     SessionPayloadEncoding, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
     StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
-use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -648,6 +651,89 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
         "a mismatched cluster/configuration/epoch scope must not reach the service"
     );
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn revision_four_v2_status_transports_a_retained_stale_fence_receipt() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-status-error-server");
+    let client_spiffe = spiffe("v2-status-error-client");
+    let (_snapshots, store, scope, authorizer) =
+        admitted_store_and_authorizer([client_spiffe.clone()]).await;
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        Arc::new(store.consumer_service()),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start revision-four consumer listener");
+    let client = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope);
+    let timestamp = time::OffsetDateTime::now_utc();
+    let absent_lease: LeaseGuard = serde_json::from_value(serde_json::json!({
+        "key": test_key(),
+        "owner": OwnerId::new("v2-status-error-owner").expect("owner"),
+        "fence": FenceToken::new(1),
+        "acquired_at": Timestamp::from_offset_datetime(timestamp),
+        "expires_at": Timestamp::from_offset_datetime(timestamp + time::Duration::minutes(1)),
+        "credential_id": 1,
+    }))
+    .expect("public lease wire shape");
+    let transition = FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(1).expect("nonzero history epoch"),
+        FencedTransitionV2CallerNonce::from_bytes([0x78; 16]),
+        FencedTransitionLease::renew(absent_lease, Duration::from_secs(30)).expect("renew request"),
+        FencedTransitionMutation::delete(Generation::new(1)),
+    )
+    .expect("self-authenticating V2 transition");
+
+    let request_id = transition.request_id();
+    let execute = client
+        .execute_v2(SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(transition.clone()),
+            },
+        ))
+        .await;
+    assert_eq!(
+        execute,
+        Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id }),
+        "the unbound execution error is recovered only through exact V2 status"
+    );
+
+    let status = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Status {
+            request: Box::new(transition),
+        },
+    );
+    assert_eq!(
+        client.execute_v2(status.clone()).await,
+        Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Err(
+                SessionConsumerV2FencedTransitionError::Store(
+                    SessionConsumerStoreError::StaleFence,
+                ),
+            ))),
+        )))
+    );
+
+    let mut malformed = serde_json::to_value(status).expect("status request encodes");
+    let serde_json::Value::Object(fields) = &mut malformed else {
+        panic!("V2 status envelope is an object");
+    };
+    fields.insert("request_id".into(), serde_json::Value::Null);
+    let malformed: SessionConsumerV2Request =
+        serde_json::from_value(malformed).expect("outer-ID mismatch decodes");
+    assert_eq!(
+        client.execute_v2(malformed).await,
+        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Protocol,
+        }),
+        "an outer full-ID mismatch remains rejected before dispatch"
+    );
     handle.abort_and_wait().await;
 }
 

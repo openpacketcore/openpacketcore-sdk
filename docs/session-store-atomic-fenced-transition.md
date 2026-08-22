@@ -497,43 +497,201 @@ the applied pointer, and the receipt, and leaves the watch sequence unchanged.
 Later blank or membership entries may still apply; this condition does not
 promise that generic normal mutations remain available.
 
+## V2 epoch-fenced history (#702)
+
+This is a distinct protocol contract from the protected V2 composition in
+[#701 protected preparation and exact retry bodies](#protected-preparation-and-exact-retry-bodies).
+That #701 composition remains a local SDK promise over an inner physical V1
+contract: its `fenced_transition` uncertainty path recovers the SDK-journal
+token. This #702 protocol has its own 56-byte V2 identity, epoch lifecycle,
+receipt capacity, maintenance, and revision-5 consumer lane; its
+`fenced_transition_v2` uncertainty path uses that exact V2 ID and canonical
+body. Neither contract reinterprets, upgrades, routes, or otherwise replaces
+the other.
+
+V1 is frozen. Its 4,096-entry receipt ledger is permanently absorbing for the
+storage consensus identity, including after every receipt result has become a
+digest tombstone. Implementations MUST NOT reinterpret V1 requests, increase
+the V1 limit, locally delete V1 tombstones, or silently route V1 callers to
+V2. The V1 capability continues to mean exactly the contract above.
+
+V2 is an explicit, separately probed protocol with schema version 2 and
+`FencedTransitionV2Capability::V2`. This capability is distinct from
+`AtomicFencedTransitionCapability::V2`, which only promises protected
+prepared-token journal recovery. A V2 proof carries the immutable V2 profile
+digest; the digest covers the schema, full identity layout, canonical
+body-commitment domain, active-epoch limit, operational target, and reclaim
+batch. The fixed profile digest is published by
+`fenced_transition_v2_profile_digest()` and is exactly
+`8a0b70b54654c7250cf5469db6e1e545f35e38e9778d5f500fea670696c4bdc3`.
+Before activation, every voter in the exact current voter set,
+including a prospective joining voter when it participates in the cutover,
+MUST reply to the V2 probe with that exact profile digest. A quorum, a V1
+reply, a capability bit, or a V2 reply with another profile is not evidence.
+
+V2 retains exactly one writable epoch plus at most seven closed, exactly
+replayable epochs. Its ceiling is therefore 1,048,576 V2 receipt bindings and
+18,469,617,664 semantic bytes. V1's permanent 4,096-binding ledger remains
+separate and absorbing, so the combined V1+V2 ceiling is 1,052,672 bindings
+and 18,541,535,232 semantic bytes. At the retained-epoch ceiling, reclamation
+advances only the retired floor and removes the oldest closed replay epoch in
+fixed batches after that epoch's final retention deadline; the active epoch
+remains writable throughout reclamation.
+
+The first V2 transition for a scope is one replicated activating command. It
+atomically installs the V2 database format (format 3), the exact-scope
+activation certificate and immutable profile, its V2 receipt, and its lease
+and record effect. A topology cutover clears the old scope certificate; it
+does not clear V2 history, the retired floor, or V2 format activation. The
+successor scope must obtain a new unanimous exact-profile proof before its
+first V2 activating/recovery transition. This is deliberately independent of
+V1 activation.
+
+### V2 identity and admission order
+
+A V2 request ID is exactly 56 bytes:
+
+- history epoch in `1..=i64::MAX`, encoded as an 8-byte unsigned integer;
+- caller-retained 16-byte nonce; and
+- the complete 32-byte SHA-256 commitment to the canonical V2 request body.
+
+Every V2 command and receipt timestamp uses canonical RFC 3339 and the fixed
+inclusive year range `0000..=9999` (Unix seconds
+`-62167219200..=253402300799`). Optional date-range features may not widen
+this profile. Maintenance command time and every derived lease, refresh, and
+retention deadline are checked against the same range before any projection or
+durable mutation.
+
+The commitment domain includes the V2 schema, epoch, nonce, and canonical
+lease/mutation body. All 56 bytes are persisted and compared; no prefix or
+V1 16-byte namespace may be used. A request is self-authenticated before any
+active/retired-floor lookup, receipt lookup, capacity decision, or mutation
+admission. Thus a request that keeps an old full ID but substitutes a body is
+`FencedTransitionRequestConflict`, even after its epoch's receipt rows have
+been deleted. A valid old exact retry reaches the retired floor and returns
+`FencedTransitionHistoryEpochRetired` (`FencedTransitionV2Status::Retired`);
+it never executes. This ordering is security-significant.
+
+A valid request above the retired floor that does not name the current active
+epoch returns `FencedTransitionHistoryEpochNotActive` (status
+`EpochNotActive`) without an effect. This includes the immediate successor
+while all eight retained epoch slots are occupied. Unlike `Retired`, this
+state is not terminal for that epoch: after eligible reclamation frees the
+oldest replay slot, a separate maintenance linearization may open the
+immediate successor only when the current active epoch is full. Callers must
+re-read the linearized history state before deriving new work.
+
+### Epoch lifecycle and maintenance
+
+Only the active V2 epoch accepts new identities. Its exact hard maximum is
+131,072 bindings. An implementation must support at least 100,000 committed
+unique transitions in one active epoch; the remaining 31,072 bindings are
+headroom, not a second configurable limit. Exact results retain the same
+24-hour window as V1. There is no age-only cleanup and no local cleanup: a
+node may not retire, delete, or open an epoch based on its own clock, compact
+cycle, restart, snapshot restore, or memory pressure.
+
+History reclamation is an explicit replicated operator-maintenance command,
+available only at the local state-process operator boundary under durable
+fixed-quorum authority. The operator entry point is local-leader-only and is
+not forwarded through the ordinary application surface; an operator loop MUST
+resolve the current leader again after a term change and before each batch. It
+is eligible only after the maximum retained deadline of the oldest closed
+replay epoch. The first command atomically advances the irreversible retired
+floor and deletes the first ordered, fixed 1,024-row batch while preserving
+the sole active epoch as writable. Every command is compare-and-set against the
+observed lifecycle generation and epoch/floor state. Subsequent commands
+delete one ordered batch; the final batch completes physical deletion without
+changing the active epoch. The floor is included in recovery and snapshots, so
+physical row deletion cannot reopen an identity.
+
+A maintenance transport failure is ambiguous: its lifecycle CAS may already
+have committed even though the caller did not receive the reply. The operator
+MUST obtain a fresh linearized V2 history state before retrying. If that state
+differs from the complete state supplied to the ambiguous CAS, the observed
+state is authoritative and the stale CAS MUST NOT be replayed as a request for
+another batch. If the complete state is unchanged, retrying that same CAS is
+safe. An unavailable reply alone is never evidence that a batch did or did not
+commit, and an operator MUST NOT manufacture a later expected generation.
+
+### Capacity and operational sizing
+
+At most 1,052,672 receipt bindings coexist: V1's fixed 4,096 plus eight V2
+epochs of 131,072 bindings each (one writable epoch and seven closed replay
+epochs). For qualification accounting, a maximum retained V2 row is a
+17,408-byte persisted response allowance plus 206 bytes of fixed
+logical metadata: 56-byte full ID; 8-byte history epoch; 8-byte ordered epoch
+ordinal; 8-byte storage configuration epoch; 32-byte canonical body digest; 30-byte
+canonical retention timestamp; 32-byte binding digest; and 32-byte response
+digest. Therefore one maximum V2 row is 17,614 logical bytes and the eight-epoch
+V2 maximum is 18,469,617,664 bytes (17.201 GiB). The V1 row remains 17,558
+logical bytes (the same 17,408-byte persisted response allowance, plus 16-byte
+ID, 8-byte configuration epoch, 32-byte body digest, 30-byte deadline, and two
+32-byte digests); the combined V1+V2 maximum is 18,541,535,232 bytes
+(17.268 GiB).
+These figures deliberately exclude SQLite B-tree, index, page, WAL, snapshot
+envelope, and filesystem allocation overhead; deployment capacity must add
+those measured overheads rather than treating the logical total as a disk
+reservation.
+
+A response remains at most 16 KiB on the wire: the larger 17,408-byte
+persisted allowance includes durable serialization and envelope budgeting, and
+history size does not make one operation's wire response larger. Snapshot
+transfer must budget the combined logical maximum above plus its envelope and
+storage-engine overhead; it must stream, not materialize all receipt outcomes
+in memory. Lookup is a keyed/indexed
+operation, maintenance scans only the deterministic ordered 1,024-row batch,
+and durable lifecycle counters (`active_epoch`, `retired_through`, generation,
+bound entries, reclaimed entries) make status and admission avoid a runtime
+full-history memory scan. No counter may be reconstructed from a node-local
+age cleanup pass.
+
 `NotFound` is not proof that an earlier delayed proposal cannot commit later.
 Only an explicit submission of the identical ID and complete body is
 idempotency-safe: it may create the first binding, replay or expire an existing
 binding, or return an absorbing unbound rejection. The SDK does not
 automatically resubmit after a possibly delivered forwarding write.
-If `fenced_transition` returns
+For the protected V2 composition above, if `fenced_transition` returns
 `FencedTransitionExecuteError::OutcomeUnknown { request_id }`, the caller MUST
 retain that stable ID, recover the SDK-journal token, and use the bounded exact
-status operation. `HistoryFull` and `RetentionExhausted` are definitive
-no-effect rejections, not unknown outcomes. Callers MUST NOT replay under a new
-ID, infer an unknown outcome from local intent, continue writes under an
-uncertain lease, or derive a next mutation until they have an authoritative
-observation.
+status operation. For this distinct epoch-fenced V2 protocol, if
+`fenced_transition_v2` returns `StoreError::FencedTransitionOutcomeUnknown`,
+the caller MUST retain the exact V2 ID and canonical V2 body and use its bounded
+exact status operation. In either contract, `HistoryFull` and
+`RetentionExhausted` are definitive no-effect rejections, not unknown outcomes.
+Callers MUST NOT replay under a new ID, infer an unknown outcome from local
+intent, continue writes under an uncertain lease, or derive a next mutation
+until they have an authoritative observation.
 A post-retention history must likewise be re-derived from current authoritative
-state under a fresh ID; the old transition is never revived. The consumer wire
-revision-3 contract preserves every status distinction, including
+state under a fresh ID; the old transition is never revived. The distinct V2
+consumer ALPN uses wire revision 5 and preserves every V2 status distinction,
+including `EpochNotActive` and
 `StorageExhausted` inside `Recorded`, through a closed wire-safe enum. Frozen
 legacy session-net v5 maps this result fail-closed as an unknown capability; no
 v5 wire enum changes and that protocol does not expose the transition operation.
 
-Each durable receipt carries a permanent commitment over fenced V1, its stable
-storage identity, row request ID, canonical request digest, and normalized
-retention deadline. A retained response additionally carries a commitment over
-its canonical typed result and committed metadata. Compaction clears the
+Each durable V2 receipt carries a permanent, V2-domain-separated binding
+commitment over the V2 schema and immutable profile digest, stable storage
+identity, complete 56-byte request ID, history epoch, ordered epoch ordinal,
+canonical request payload digest, and normalized retention deadline. A
+retained response additionally commits the exact fixed-codec response bytes,
+including its typed result and committed metadata. Compaction clears the
 response and its response commitment atomically while preserving the permanent
 binding commitment. Reopen, status, recovery, and snapshot installation verify
 these commitments and reject non-normalized timestamp text or a valid-shaped
-result substituted for the originally committed result.
+result substituted for the originally committed result. V1 retains its
+separate frozen commitment format and is never reinterpreted as V2.
 
 Snapshot installation also preserves monotonic local durability floors before
 replacing any state: consensus logical time, application sequence and digest,
 watch sequence and cursor-invalidation floor, recovery epoch and plan digest,
 and any pending recovery workflow. An exact published #684 snapshot may supply
 the empty Prepared layout only when the destination is still Prepared; it
-cannot erase a binding or regress an Activated destination. Activated snapshots
-must carry the persistent schema fence, any exact-current-scope certificate,
-and the complete bounded ledger, including compacted tombstones.
+cannot erase a binding or regress an Activated destination. Activated
+snapshots must carry the persistent schema fence, immutable V2 profile, any
+exact-current-scope certificate, the nonregressing retired floor and reclaim
+cursor, and every binding not covered by that floor, including compacted
+tombstones.
 
 ## Validation and diagnostics
 
@@ -568,18 +726,22 @@ timestamps, topology endpoints, or local storage details.
 
 ## Deliberate boundary
 
-This remains generic SDK semantics. Consumer transport revision 3 carries the
-same capability, observation, execution, ambiguity, and exact-status contract
-over both the one-shot and bounded persistent least-authority mTLS clients
-published by #695. It does not expose a generic backend, replication,
-membership, snapshot, rebuild, or administrative authority. Product/ePDG
-composition and workflow semantics remain outside this SDK operation.
+This remains generic SDK semantics. The consumer transport revision-3 surface
+is V1-only: it carries V1 capability, observation, execution, ambiguity, and
+exact-status semantics over both the one-shot and bounded persistent
+least-authority mTLS clients published by #695. Its public transition ID is
+the frozen 16-byte V1 ID. V2 does not extend that wire shape: it uses the
+separate ALPN `/2` revision-5 lane documented above, including V2's full
+56-byte identity and V2-specific status set. Neither lane exposes a generic
+backend, replication, membership, snapshot, rebuild, or administrative
+authority. Product/ePDG composition and workflow semantics remain outside this
+SDK operation.
 
-For that consumer surface, the public request ID is byte-identical to the
-nested transition ID. The internal receipt ID is domain-separated by the
-authenticated consumer identity, stable cluster identity, and public ID; it
-excludes the body and changing configuration epoch. The receipt itself binds
-the complete canonical body. The current exact scope is enforced under the
-activation lifecycle above, so an authorized successor can recover across
-rollover while a revoked predecessor cannot observe the receipt. No separate
-`BindConsumerRequest` or log entry exists.
+For the V1 revision-3 consumer surface, the public request ID is byte-identical
+to the nested 16-byte V1 transition ID. The internal V1 receipt ID is
+domain-separated by the authenticated consumer identity, stable cluster
+identity, and public ID; it excludes the body and changing configuration epoch.
+The receipt itself binds the complete canonical body. The current exact scope
+is enforced under the activation lifecycle above, so an authorized successor
+can recover across rollover while a revoked predecessor cannot observe the
+receipt. No separate `BindConsumerRequest` or log entry exists.

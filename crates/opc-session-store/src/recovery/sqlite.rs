@@ -26,6 +26,9 @@ use crate::consensus::{
 use crate::sqlite::{consensus, ops};
 use crate::{
     ReplicationEntry, ReplicationTxId, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS,
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES, FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
     REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 
@@ -43,10 +46,23 @@ const FILE_IDENTITY_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file-ident
 const LOGICAL_STATE_DOMAIN: &[u8] = b"openpacketcore/session-recovery/logical-state/v1\0";
 const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
-// Six base SQLite objects plus seventeen bounded consensus/recovery tables.
-// The sole bounded receipt-ledger index is validated separately below.
-const MAX_CURRENT_SCHEMA_OBJECTS: usize = 23;
+// Six base SQLite objects plus bounded consensus/recovery tables. V3 adds
+// three ledger objects and two required indexes.
+const MAX_CURRENT_SCHEMA_OBJECTS: usize = 28;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
+
+type FencedTransitionV2HistorySqlRow = (
+    i64,
+    Vec<u8>,
+    Option<i64>,
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+);
 
 const LEGACY_LEASE_COLUMNS_WITH_ACQUIRED_AT: &[&str] = &[
     "tenant",
@@ -384,6 +400,8 @@ fn inspect_current(
     budget.check()?;
     preflight_current_tables(conn, budget)?;
     validate_exact_recovery_schema(conn, false)?;
+    let v2_ledger_layout = consensus::fenced_transition_v2_ledger_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     let receipt_ledger_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let (schema_version, cluster, configuration, epoch): (i64, Vec<u8>, Vec<u8>, i64) = conn
@@ -393,14 +411,19 @@ fn inspect_current(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    let expected_schema_version = match receipt_ledger_layout {
-        consensus::FencedTransitionReceiptLedgerLayout::Published684
-        | consensus::FencedTransitionReceiptLedgerLayout::Prepared => {
-            i64::from(SESSION_CONSENSUS_SCHEMA_VERSION)
+    let expected_schema_version = match v2_ledger_layout {
+        consensus::FencedTransitionV2LedgerLayout::Activated => {
+            i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 2
         }
-        consensus::FencedTransitionReceiptLedgerLayout::Activated => {
-            i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 1
-        }
+        consensus::FencedTransitionV2LedgerLayout::Absent => match receipt_ledger_layout {
+            consensus::FencedTransitionReceiptLedgerLayout::Published684
+            | consensus::FencedTransitionReceiptLedgerLayout::Prepared => {
+                i64::from(SESSION_CONSENSUS_SCHEMA_VERSION)
+            }
+            consensus::FencedTransitionReceiptLedgerLayout::Activated => {
+                i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 1
+            }
+        },
     };
     if schema_version != expected_schema_version {
         return Err(RecoveryError::CorruptReplica);
@@ -432,6 +455,9 @@ fn inspect_current(
     }
     consensus::read_membership_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
+    if v2_ledger_layout == consensus::FencedTransitionV2LedgerLayout::Activated {
+        validate_fenced_transition_v2_recovery_state(conn, storage_identity)?;
+    }
     validate_consensus_sealed_records(conn, budget)?;
     validate_legacy_lease_state(conn, budget)?;
     if receipt_ledger_layout != consensus::FencedTransitionReceiptLedgerLayout::Published684 {
@@ -535,9 +561,7 @@ fn preflight_current_tables(
         "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(payload_digest), length(response_json))), 0), COALESCE(SUM(length(request_id) + length(payload_digest) + length(response_json)), 0) FROM consensus_request_outcomes",
     ] {
         let (count, maximum, total): (i64, i64, i64) = conn
-            .query_row(query, [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+            .query_row(query, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .map_err(|error| inspection_sql_error(error, budget))?;
         let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
         let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?;
@@ -615,6 +639,42 @@ fn preflight_current_tables(
             || total_bytes > budget.limits.max_total_value_bytes()
         {
             return Err(RecoveryError::WorkLimitExceeded);
+        }
+    }
+    if consensus::fenced_transition_v2_ledger_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?
+        == consensus::FencedTransitionV2LedgerLayout::Activated
+    {
+        preflight_fenced_transition_v2_receipt_count(conn)?;
+        for query in [
+            "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(payload_digest), length(retained_until), length(binding_digest), COALESCE(length(response_json), 0), COALESCE(length(response_digest), 0))), 0), COALESCE(SUM(length(request_id) + length(payload_digest) + length(retained_until) + length(binding_digest) + COALESCE(length(response_json), 0) + COALESCE(length(response_digest), 0)), 0) FROM consensus_fenced_transition_v2_receipts",
+            "SELECT COUNT(*), COALESCE(MAX(MAX(length(scope_configuration_id), length(voter_set_digest), length(profile_digest))), 0), COALESCE(SUM(length(scope_configuration_id) + length(voter_set_digest) + length(profile_digest)), 0) FROM consensus_fenced_transition_v2_activation",
+        ] {
+            let (count, maximum, total): (i64, i64, i64) = conn
+                .query_row(query, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .map_err(|error| inspection_sql_error(error, budget))?;
+            let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+            let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?;
+            let total = u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?;
+            total_bytes = total_bytes
+                .checked_add(total)
+                .ok_or(RecoveryError::WorkLimitExceeded)?;
+            if count > budget.limits.max_rows()
+                || maximum > budget.limits.max_value_bytes()
+                || total_bytes > budget.limits.max_total_value_bytes()
+            {
+                return Err(RecoveryError::WorkLimitExceeded);
+            }
+        }
+        let (count, maximum, total): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), 0, 0 FROM consensus_fenced_transition_v2_history",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| inspection_sql_error(error, budget))?;
+        if count != 1 || maximum != 0 || total != 0 {
+            return Err(RecoveryError::CorruptReplica);
         }
     }
     if table_exists(conn, "consensus_operator_recovery")? {
@@ -727,6 +787,334 @@ fn preflight_fenced_transition_receipt_count(conn: &Connection) -> Result<usize,
         return Err(RecoveryError::CorruptReplica);
     }
     Ok(count)
+}
+
+/// Probe the V2 protocol cap before inspecting receipt widths, bodies or
+/// hashes.  This stays intentionally independent of caller-selected recovery
+/// resource limits: accepting a larger persisted ledger would redefine V2.
+fn preflight_fenced_transition_v2_receipt_count(conn: &Connection) -> Result<usize, RecoveryError> {
+    let limit = i64::try_from(
+        FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES
+            .checked_add(1)
+            .ok_or(RecoveryError::CorruptReplica)?,
+    )
+    .map_err(|_| RecoveryError::CorruptReplica)?;
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT request_id FROM consensus_fenced_transition_v2_receipts LIMIT ?1)",
+            [limit],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let count = usize::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+    if count > FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    Ok(count)
+}
+
+/// Validate the complete V3 non-absorbing history state without repairing or
+/// advancing it.  In particular, recovery never infers a retirement from a
+/// missing row: doing so would make an offline inspection capable of erasing
+/// or resurrecting V2 history.
+fn validate_fenced_transition_v2_recovery_state(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+) -> Result<(), RecoveryError> {
+    preflight_fenced_transition_v2_receipt_count(conn)?;
+    let storage_epoch = i64::try_from(storage_identity.configuration_epoch().get())
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let activation_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM consensus_fenced_transition_v2_activation",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if !(0..=1).contains(&activation_count) {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    if activation_count == 1 {
+        let membership_scope = consensus::read_membership_scope_sync(conn, storage_identity)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        let scope_matches = consensus::fenced_transition_v2_activation_matches_scope_sync(
+            conn,
+            storage_identity,
+            membership_scope.current_identity,
+            &membership_scope.current_members,
+            crate::fenced_transition::fenced_transition_v2_profile_digest(),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+        if !scope_matches {
+            return Err(RecoveryError::CorruptReplica);
+        }
+    }
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM consensus_fenced_transition_v2_history",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if rows != 1 {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    let (
+        history_storage_epoch,
+        history_profile_digest,
+        active_epoch,
+        retired_through,
+        generation,
+        bound_count,
+        reclaim_epoch,
+        reclaim_cursor,
+        reclaim_remaining,
+        reclaimed_entries,
+    ): FencedTransitionV2HistorySqlRow = conn
+        .query_row(
+            "SELECT storage_configuration_epoch, profile_digest, active_epoch, retired_through_epoch, generation, current_bound_count, reclaim_epoch, reclaim_cursor_ordinal, reclaim_remaining, reclaimed_entries FROM consensus_fenced_transition_v2_history WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                ))
+            },
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if history_storage_epoch != storage_epoch {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    let history_profile_digest: [u8; 32] = history_profile_digest
+        .try_into()
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if history_profile_digest != crate::fenced_transition::fenced_transition_v2_profile_digest() {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    let retired_through =
+        u64::try_from(retired_through).map_err(|_| RecoveryError::CorruptReplica)?;
+    let _generation = u64::try_from(generation).map_err(|_| RecoveryError::CorruptReplica)?;
+    let bound_count = usize::try_from(bound_count).map_err(|_| RecoveryError::CorruptReplica)?;
+    let _reclaimed_entries =
+        u64::try_from(reclaimed_entries).map_err(|_| RecoveryError::CorruptReplica)?;
+    if bound_count > FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    let active_epoch = u64::try_from(active_epoch.ok_or(RecoveryError::CorruptReplica)?)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or(RecoveryError::CorruptReplica)?;
+    let reclaim_epoch = match reclaim_epoch {
+        Some(value) => Some(
+            u64::try_from(value)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or(RecoveryError::CorruptReplica)?,
+        ),
+        None => None,
+    };
+    let reclaim_cursor = reclaim_cursor
+        .map(|value| u64::try_from(value).map_err(|_| RecoveryError::CorruptReplica))
+        .transpose()?;
+    let reclaim_remaining = reclaim_remaining
+        .map(|value| usize::try_from(value).map_err(|_| RecoveryError::CorruptReplica))
+        .transpose()?;
+    let mut statement = conn
+        .prepare(
+            "SELECT request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest FROM consensus_fenced_transition_v2_receipts ORDER BY history_epoch, ordinal, request_id",
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let mut receipt_rows = statement
+        .query([])
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let mut receipts = Vec::with_capacity(bound_count);
+    while let Some(row) = receipt_rows
+        .next()
+        .map_err(|_| RecoveryError::CorruptReplica)?
+    {
+        let request_id: Vec<u8> = row.get(0).map_err(|_| RecoveryError::CorruptReplica)?;
+        let history_epoch: i64 = row.get(1).map_err(|_| RecoveryError::CorruptReplica)?;
+        let ordinal: i64 = row.get(2).map_err(|_| RecoveryError::CorruptReplica)?;
+        let configuration_epoch: i64 = row.get(3).map_err(|_| RecoveryError::CorruptReplica)?;
+        let payload_digest: Vec<u8> = row.get(4).map_err(|_| RecoveryError::CorruptReplica)?;
+        let retained_until: String = row.get(5).map_err(|_| RecoveryError::CorruptReplica)?;
+        let binding_digest: Vec<u8> = row.get(6).map_err(|_| RecoveryError::CorruptReplica)?;
+        let response: Option<Vec<u8>> = row.get(7).map_err(|_| RecoveryError::CorruptReplica)?;
+        let response_digest: Option<Vec<u8>> =
+            row.get(8).map_err(|_| RecoveryError::CorruptReplica)?;
+        let history_epoch =
+            u64::try_from(history_epoch).map_err(|_| RecoveryError::CorruptReplica)?;
+        let ordinal = u64::try_from(ordinal).map_err(|_| RecoveryError::CorruptReplica)?;
+        if history_epoch == 0
+            || ordinal == 0
+            || configuration_epoch != storage_epoch
+            || request_id.len() != FENCED_TRANSITION_V2_REQUEST_ID_BYTES
+            || payload_digest.len() != 32
+            || binding_digest.len() != 32
+            || retained_until.len() != consensus::FENCED_TRANSITION_RECEIPT_TIMESTAMP_BYTES
+            || response.as_ref().is_some_and(|value| {
+                value.is_empty() || value.len() > FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES
+            })
+            || match (&response, &response_digest) {
+                (None, None) => false,
+                (Some(_), Some(value)) if value.len() == 32 => false,
+                _ => true,
+            }
+        {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        let request_id: [u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES] = request_id
+            .try_into()
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        let request_epoch = u64::from_be_bytes(
+            request_id[..8]
+                .try_into()
+                .map_err(|_| RecoveryError::CorruptReplica)?,
+        );
+        if request_epoch != history_epoch {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        let timestamp =
+            Timestamp::from_str(&retained_until).map_err(|_| RecoveryError::CorruptReplica)?;
+        if ops::format_rfc3339_normalized(timestamp) != retained_until {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        let payload_digest: [u8; 32] = payload_digest
+            .try_into()
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        if payload_digest
+            != consensus::fenced_transition_v2_payload_digest_for_request_id(
+                storage_identity,
+                request_id,
+            )
+            .map_err(|_| RecoveryError::CorruptReplica)?
+        {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        let expected_binding = consensus::fenced_transition_v2_receipt_binding_digest(
+            storage_identity,
+            request_id,
+            history_epoch,
+            ordinal,
+            payload_digest,
+            &retained_until,
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+        let binding_digest: [u8; 32] = binding_digest
+            .try_into()
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        if binding_digest != expected_binding {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        if let (Some(response), Some(response_digest)) = (response, response_digest) {
+            consensus::decode_fenced_transition_v2_response(&response)
+                .map_err(|_| RecoveryError::CorruptReplica)?;
+            let response_digest: [u8; 32] = response_digest
+                .try_into()
+                .map_err(|_| RecoveryError::CorruptReplica)?;
+            if response_digest
+                != consensus::fenced_transition_v2_receipt_response_digest(
+                    expected_binding,
+                    &response,
+                )
+                .map_err(|_| RecoveryError::CorruptReplica)?
+            {
+                return Err(RecoveryError::CorruptReplica);
+            }
+        }
+        receipts.push((history_epoch, ordinal));
+    }
+    drop(receipt_rows);
+    drop(statement);
+
+    let maximum_history_entries = u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let retained_epochs = active_epoch.checked_sub(retired_through);
+    let reclaiming = match (reclaim_epoch, reclaim_cursor, reclaim_remaining) {
+        (None, None, None) => {
+            if !retained_epochs.is_some_and(|count| {
+                (1..=u64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1).unwrap_or(u64::MAX))
+                    .contains(&count)
+            }) {
+                return Err(RecoveryError::CorruptReplica);
+            }
+            false
+        }
+        (Some(reclaim), Some(cursor), Some(remaining)) => {
+            if reclaim != retired_through
+                || !retained_epochs.is_some_and(|count| {
+                    (1..=u64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS).unwrap_or(u64::MAX))
+                        .contains(&count)
+                })
+                || !(1..=FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES).contains(&remaining)
+                || cursor.checked_add(
+                    u64::try_from(remaining).map_err(|_| RecoveryError::CorruptReplica)?,
+                ) != Some(maximum_history_entries)
+            {
+                return Err(RecoveryError::CorruptReplica);
+            }
+            true
+        }
+        _ => return Err(RecoveryError::CorruptReplica),
+    };
+    let minimum_epoch = if reclaiming {
+        retired_through
+    } else {
+        retired_through
+            .checked_add(1)
+            .ok_or(RecoveryError::CorruptReplica)?
+    };
+    let mut epoch_counts = BTreeMap::<u64, usize>::new();
+    let mut previous_ordinals = BTreeMap::<u64, u64>::new();
+    for (epoch, ordinal) in receipts {
+        if !(minimum_epoch..=active_epoch).contains(&epoch) {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        let expected_ordinal = previous_ordinals
+            .get(&epoch)
+            .copied()
+            .unwrap_or_else(|| {
+                if reclaim_epoch == Some(epoch) {
+                    reclaim_cursor.unwrap_or(0)
+                } else {
+                    0
+                }
+            })
+            .checked_add(1)
+            .ok_or(RecoveryError::CorruptReplica)?;
+        if ordinal != expected_ordinal {
+            return Err(RecoveryError::CorruptReplica);
+        }
+        previous_ordinals.insert(epoch, ordinal);
+        let count = epoch_counts.entry(epoch).or_default();
+        *count = count.checked_add(1).ok_or(RecoveryError::CorruptReplica)?;
+        if *count > FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+            return Err(RecoveryError::CorruptReplica);
+        }
+    }
+    if epoch_counts.get(&active_epoch).copied().unwrap_or(0) != bound_count {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    for epoch in minimum_epoch..=active_epoch {
+        let count = epoch_counts.get(&epoch).copied().unwrap_or(0);
+        if !consensus::fenced_transition_v2_closed_epoch_is_exact(
+            epoch,
+            active_epoch,
+            reclaim_epoch,
+            reclaim_cursor,
+            reclaim_remaining
+                .map(|remaining| {
+                    u64::try_from(remaining).map_err(|_| RecoveryError::CorruptReplica)
+                })
+                .transpose()?,
+            count,
+        ) {
+            return Err(RecoveryError::CorruptReplica);
+        }
+    }
+    consensus::validate_fenced_transition_v2_receipts_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    Ok(())
 }
 
 fn validate_log_floors(
@@ -850,6 +1238,35 @@ fn hash_current_checkpoint(
     // branch.
     let receipt_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
+    let v2_ledger_layout = consensus::fenced_transition_v2_ledger_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if v2_ledger_layout == consensus::FencedTransitionV2LedgerLayout::Activated {
+        let (cluster, configuration, epoch): (Vec<u8>, Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT cluster_id, configuration_id, configuration_epoch FROM consensus_identity WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        let cluster: [u8; 32] = cluster
+            .try_into()
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        let configuration: [u8; 32] = configuration
+            .try_into()
+            .map_err(|_| RecoveryError::CorruptReplica)?;
+        let epoch = u64::try_from(epoch)
+            .ok()
+            .and_then(|value| SessionConsensusConfigurationEpoch::new(value).ok())
+            .ok_or(RecoveryError::CorruptReplica)?;
+        validate_fenced_transition_v2_recovery_state(
+            conn,
+            SessionConsensusIdentity::new(
+                crate::consensus::SessionConsensusClusterId::from_bytes(cluster),
+                SessionConsensusConfigurationId::from_bytes(configuration),
+                epoch,
+            ),
+        )?;
+    }
     hasher.update(b"openpacketcore/session-recovery/fenced-transition-layout/v1\0");
     // An exact #684 predecessor and an empty Prepared layout carry the same
     // state-machine semantics: neither can serve V1 and a writable reopen
@@ -861,6 +1278,11 @@ fn hash_current_checkpoint(
         consensus::FencedTransitionReceiptLedgerLayout::Published684
         | consensus::FencedTransitionReceiptLedgerLayout::Prepared => [0],
         consensus::FencedTransitionReceiptLedgerLayout::Activated => [1],
+    });
+    hasher.update(b"openpacketcore/session-recovery/fenced-transition-v2-layout/v1\0");
+    hasher.update(match v2_ledger_layout {
+        consensus::FencedTransitionV2LedgerLayout::Absent => [0],
+        consensus::FencedTransitionV2LedgerLayout::Activated => [1],
     });
     let schema_version: i64 = conn
         .query_row(
@@ -875,6 +1297,15 @@ fn hash_current_checkpoint(
     {
         let query = "SELECT * FROM consensus_fenced_transition_activation ORDER BY singleton";
         hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
+    }
+    if v2_ledger_layout == consensus::FencedTransitionV2LedgerLayout::Activated {
+        for query in [
+            "SELECT * FROM consensus_fenced_transition_v2_history ORDER BY singleton",
+            "SELECT * FROM consensus_fenced_transition_v2_activation ORDER BY singleton",
+            "SELECT * FROM consensus_fenced_transition_v2_receipts ORDER BY history_epoch, ordinal, request_id",
+        ] {
+            hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
+        }
     }
     let records_query =
         "SELECT * FROM session_records ORDER BY tenant, nf_kind, key_type, stable_id";
@@ -1192,6 +1623,8 @@ fn validate_exact_recovery_schema(
     conn: &Connection,
     require_recovery_table: bool,
 ) -> Result<(), RecoveryError> {
+    let v2_ledger_layout = consensus::fenced_transition_v2_ledger_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     let receipt_ledger_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     if receipt_ledger_layout == consensus::FencedTransitionReceiptLedgerLayout::Published684 {
@@ -1258,6 +1691,17 @@ fn validate_exact_recovery_schema(
         .ok_or(RecoveryError::DatabaseUnavailable)?;
 
     let mut observed = recovery_schema_manifest(conn)?;
+    if v2_ledger_layout == consensus::FencedTransitionV2LedgerLayout::Activated {
+        for table in [
+            "consensus_fenced_transition_v2_receipts",
+            "consensus_fenced_transition_v2_activation",
+            "consensus_fenced_transition_v2_history",
+        ] {
+            observed
+                .remove(table)
+                .ok_or(RecoveryError::CorruptReplica)?;
+        }
+    }
     let observed_lease = observed
         .remove("leases")
         .ok_or(RecoveryError::CorruptReplica)?;
@@ -1399,10 +1843,19 @@ fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String
             .get::<_, Option<String>>(2)
             .map_err(|_| RecoveryError::CorruptReplica)?
             .ok_or(RecoveryError::CorruptReplica)?;
-        if kind == "index" && name == "consensus_fenced_transition_receipts_due" {
-            let expected = normalize_schema_sql(
-                "CREATE INDEX consensus_fenced_transition_receipts_due ON consensus_fenced_transition_receipts (retained_until, request_id) WHERE response_json IS NOT NULL",
-            );
+        if kind == "index" {
+            let expected = match name.as_str() {
+                "consensus_fenced_transition_receipts_due" => normalize_schema_sql(
+                    "CREATE INDEX consensus_fenced_transition_receipts_due ON consensus_fenced_transition_receipts (retained_until, request_id) WHERE response_json IS NOT NULL",
+                ),
+                "consensus_fenced_transition_v2_receipts_reclaim" => normalize_schema_sql(
+                    "CREATE INDEX consensus_fenced_transition_v2_receipts_reclaim ON consensus_fenced_transition_v2_receipts (history_epoch, ordinal)",
+                ),
+                "consensus_fenced_transition_v2_receipts_due" => normalize_schema_sql(
+                    "CREATE INDEX consensus_fenced_transition_v2_receipts_due ON consensus_fenced_transition_v2_receipts (retained_until, request_id) WHERE response_json IS NOT NULL",
+                ),
+                _ => return Err(RecoveryError::CorruptReplica),
+            };
             if normalize_schema_sql(&sql) != expected {
                 return Err(RecoveryError::CorruptReplica);
             }
@@ -1623,16 +2076,13 @@ fn validate_legacy_lease_state(
         "SELECT COUNT(*), COALESCE(MAX(length(key)), 0), COALESCE(SUM(length(key)), 0) FROM lease_globals",
     ] {
         let (count, maximum, total): (i64, i64, i64) = conn
-            .query_row(query, [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+            .query_row(query, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .map_err(|error| inspection_sql_error(error, budget))?;
         row_count = row_count
             .checked_add(u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?)
             .ok_or(RecoveryError::WorkLimitExceeded)?;
-        maximum_value_bytes = maximum_value_bytes.max(
-            u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?,
-        );
+        maximum_value_bytes = maximum_value_bytes
+            .max(u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?);
         total_value_bytes = total_value_bytes
             .checked_add(u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?)
             .ok_or(RecoveryError::WorkLimitExceeded)?;
@@ -4412,6 +4862,83 @@ mod terminal_history_digest_tests {
     }
 
     #[test]
+    fn offline_recovery_rejects_a_truncated_closed_v2_epoch() {
+        let conn = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        conn.execute_batch(
+            r#"
+CREATE TABLE consensus_fenced_transition_v2_history (
+    singleton INTEGER PRIMARY KEY,
+    storage_configuration_epoch INTEGER NOT NULL,
+    profile_digest BLOB NOT NULL,
+    active_epoch INTEGER NOT NULL,
+    retired_through_epoch INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    current_bound_count INTEGER NOT NULL,
+    reclaim_epoch INTEGER,
+    reclaim_cursor_ordinal INTEGER,
+    reclaim_remaining INTEGER,
+    reclaimed_entries INTEGER NOT NULL
+);
+CREATE TABLE consensus_fenced_transition_v2_activation (singleton INTEGER PRIMARY KEY);
+CREATE TABLE consensus_fenced_transition_v2_receipts (
+    request_id BLOB NOT NULL,
+    history_epoch INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    configuration_epoch INTEGER NOT NULL,
+    payload_digest BLOB NOT NULL,
+    retained_until TEXT NOT NULL,
+    binding_digest BLOB NOT NULL,
+    response_json BLOB,
+    response_digest BLOB
+);
+"#,
+        )
+        .expect("install V2 recovery fixture");
+        let identity = SessionConsensusIdentity::new(
+            crate::consensus::SessionConsensusClusterId::from_bytes([0x71; 32]),
+            SessionConsensusConfigurationId::from_bytes([0x72; 32]),
+            SessionConsensusConfigurationEpoch::new(1).expect("configuration epoch"),
+        );
+        conn.execute(
+            "INSERT INTO consensus_fenced_transition_v2_history VALUES (1, 1, ?1, 2, 0, 0, 0, NULL, NULL, NULL, 0)",
+            [crate::fenced_transition::fenced_transition_v2_profile_digest().as_slice()],
+        )
+        .expect("insert truncated closed epoch");
+        let mut request_id = [0_u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES];
+        request_id[..8].copy_from_slice(&1_u64.to_be_bytes());
+        request_id[48..].copy_from_slice(&1_u64.to_be_bytes());
+        let retained_until = "2026-08-17T00:00:00.000000000Z";
+        let payload_digest =
+            consensus::fenced_transition_v2_payload_digest_for_request_id(identity, request_id)
+                .expect("payload digest");
+        let binding_digest = consensus::fenced_transition_v2_receipt_binding_digest(
+            identity,
+            request_id,
+            1,
+            1,
+            payload_digest,
+            retained_until,
+        )
+        .expect("binding digest");
+        conn.execute(
+            "INSERT INTO consensus_fenced_transition_v2_receipts VALUES (?1, 1, 1, 1, ?2, ?3, ?4, NULL, NULL)",
+            rusqlite::params![
+                request_id.as_slice(),
+                payload_digest.as_slice(),
+                retained_until,
+                binding_digest.as_slice(),
+            ],
+        )
+        .expect("insert truncated receipt");
+
+        assert!(matches!(
+            validate_fenced_transition_v2_recovery_state(&conn, identity),
+            Err(RecoveryError::CorruptReplica)
+        ));
+    }
+
+    #[test]
     fn terminal_history_changes_the_recovery_branch_digest() {
         let missing_history = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
             .expect("canonical database");
@@ -4604,6 +5131,43 @@ mod terminal_history_digest_tests {
         let mut hasher = Sha256::new();
         assert!(matches!(
             hash_current_checkpoint(&conn, &mut budget, &mut hasher),
+            Err(RecoveryError::CorruptReplica)
+        ));
+    }
+
+    #[test]
+    fn recovery_rejects_one_over_the_v2_history_protocol_cap_before_value_scans() {
+        let conn = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+            .expect("canonical database");
+        conn.execute_batch(
+            "CREATE TABLE consensus_fenced_transition_v2_receipts (request_id BLOB PRIMARY KEY)",
+        )
+        .expect("receipt fixture schema");
+        conn.execute_batch(
+            r#"
+WITH digits(value) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)),
+thousands(value) AS (
+    SELECT a.value + 10 * b.value + 100 * c.value
+    FROM digits AS a CROSS JOIN digits AS b CROSS JOIN digits AS c
+),
+ordinals(value) AS (
+    SELECT low.value + 1000 * high.value
+    FROM thousands AS low CROSS JOIN thousands AS high
+    UNION ALL
+    SELECT 1000000 + low.value + 1000 * high.value
+    FROM thousands AS low CROSS JOIN thousands AS high
+    WHERE low.value + 1000 * high.value < 48577
+)
+INSERT INTO consensus_fenced_transition_v2_receipts (request_id)
+SELECT CAST(printf('%056d', value) AS BLOB)
+FROM ordinals
+WHERE value <= 1048576;
+"#,
+        )
+        .expect("one-over V2 receipt fixture");
+
+        assert!(matches!(
+            preflight_fenced_transition_v2_receipt_count(&conn),
             Err(RecoveryError::CorruptReplica)
         ));
     }

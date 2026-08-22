@@ -215,6 +215,20 @@ pub enum StoreError {
     /// deterministic rejection so an exact retry can recover this result.
     #[error("fenced transition storage counter is exhausted")]
     FencedTransitionStorageExhausted,
+    /// A V2 fenced-transition request named an epoch that has been retired or
+    /// closed. Retirement is terminal: callers must not retry that identity
+    /// in the closed epoch, even after its receipt rows are reclaimed.
+    ///
+    /// New wire-visible variants are append-only so every pre-V2 postcard
+    /// discriminant remains unchanged.
+    #[error("fenced transition history epoch is retired")]
+    FencedTransitionHistoryEpochRetired,
+    /// A V2 fenced-transition request named an epoch that is not the active
+    /// epoch. This is a deterministic no-effect result while an active epoch
+    /// has not yet opened or a closed epoch is being reclaimed; it is distinct
+    /// from terminal retirement and from active-epoch capacity exhaustion.
+    #[error("fenced transition history epoch is not active")]
+    FencedTransitionHistoryEpochNotActive,
 }
 
 /// Error type for lease operations.

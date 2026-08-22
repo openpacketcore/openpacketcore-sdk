@@ -8,7 +8,7 @@ pub mod network;
 pub(crate) mod raft_adapter;
 pub(crate) mod snapshot;
 pub(crate) mod storage;
-mod store;
+pub(crate) mod store;
 pub mod types;
 
 pub use network::{
@@ -19,8 +19,8 @@ pub use network::{
 pub(crate) use store::OperatorRecoveryCommitError;
 pub use store::{
     validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
-    ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusStatus,
-    SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
+    ConsensusSessionStore, ConsensusSessionStoreOpenError, ConsensusStoreDiagnosticSnapshot,
+    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
     SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
 };

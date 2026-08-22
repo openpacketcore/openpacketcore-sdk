@@ -58,6 +58,12 @@ pub const MIN_SESSION_CONSENSUS_FRAME_SIZE: usize = 9 * 1024 * 1024;
 /// advertises 2,096,128 payload bytes, enough for the SQLite backend's 1 MiB
 /// value limit while keeping per-connection response storage finite.
 pub const MAX_NEGOTIATED_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+/// The largest temporary receive buffer used while incrementally retaining a
+/// declared frame.  A peer's length prefix is still checked against the exact
+/// negotiated ceiling before any payload read, but idle lanes never reserve
+/// that ceiling merely because it was declared.
+pub(crate) const FRAME_READ_CHUNK_BYTES: usize = 8 * 1024;
 pub const MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE: usize = MIN_NEGOTIATED_FRAME_SIZE;
 /// Fixed v5 revision-7 restore-page payload ceiling.
 ///
@@ -1526,12 +1532,13 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             StoreError::FencedTransitionRequestConflict => Self::CasIdempotencyConflict,
             StoreError::FencedTransitionOutcomeUnknown
             | StoreError::FencedTransitionRequestExpired => Self::CasIdempotencyOutcomeUnavailable,
-            // There is no safe legacy fallback after the permanent receipt
-            // ledger, retention horizon, or storage counter is exhausted.
-            // Represent all three as an
+            // There is no safe legacy fallback after a receipt-history,
+            // retention, epoch, or storage terminal. Represent them as an
             // unavailable capability, using the existing redaction-safe wire
             // spelling rather than extending the frozen v5 enum.
             StoreError::FencedTransitionHistoryFull
+            | StoreError::FencedTransitionHistoryEpochRetired
+            | StoreError::FencedTransitionHistoryEpochNotActive
             | StoreError::FencedTransitionRetentionExhausted
             | StoreError::FencedTransitionStorageExhausted => {
                 Self::CapabilityNotSupported("unknown_capability")
@@ -3551,6 +3558,43 @@ where
         .map_err(FrameWriteError::into_protocol_error)
 }
 
+/// Test/qualification helper: encode two bounded frames and write their
+/// length-prefixed bytes in one transport write sequence, exercising TCP/TLS
+/// coalescing without allowing an inter-frame scheduler gap.
+#[cfg(test)]
+pub(crate) async fn write_two_frames_coalesced<W, A, B>(
+    writer: &mut W,
+    first: &A,
+    second: &B,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    A: Serialize,
+    B: Serialize,
+{
+    let control = EncodingControl {
+        deadline: Some(deadline),
+        cancellation: &NEVER_CANCELLED,
+    };
+    let first = encode_frame_bounded(first, max_frame_size, control)?;
+    let second = encode_frame_bounded(second, max_frame_size, control)?;
+    let mut bytes = Vec::with_capacity(8 + first.encoded_len + second.encoded_len);
+    bytes.extend_from_slice(&(first.encoded_len as u32).to_be_bytes());
+    for chunk in &first.chunks {
+        bytes.extend_from_slice(chunk.initialized_bytes());
+    }
+    bytes.extend_from_slice(&(second.encoded_len as u32).to_be_bytes());
+    for chunk in &second.chunks {
+        bytes.extend_from_slice(chunk.initialized_bytes());
+    }
+    tokio::time::timeout_at(deadline, writer.write_all(&bytes))
+        .await
+        .map_err(|_| ProtocolError::UnexpectedResponse)?
+        .map_err(ProtocolError::Io)
+}
+
 /// Write one frame while preserving whether the transport effect boundary was
 /// crossed. Mutation clients use this to distinguish a request proven not
 /// sent from an outcome that requires exact-ID recovery.
@@ -3882,12 +3926,29 @@ where
     if len > max_frame_size {
         return Err(ProtocolError::FrameTooLarge(len));
     }
-    let mut buf = vec![0u8; len];
-    reader
-        .read_exact(&mut buf)
-        .await
-        .map_err(ProtocolError::Io)?;
-    Ok(buf)
+    read_declared_frame_payload(reader, len).await
+}
+
+async fn read_declared_frame_payload<R>(
+    reader: &mut R,
+    len: usize,
+) -> Result<Vec<u8>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut payload = Vec::with_capacity(len.min(FRAME_READ_CHUNK_BYTES));
+    let mut chunk = [0_u8; FRAME_READ_CHUNK_BYTES];
+    let mut remaining = len;
+    while remaining != 0 {
+        let chunk_len = remaining.min(chunk.len());
+        reader
+            .read_exact(&mut chunk[..chunk_len])
+            .await
+            .map_err(ProtocolError::Io)?;
+        payload.extend_from_slice(&chunk[..chunk_len]);
+        remaining -= chunk_len;
+    }
+    Ok(payload)
 }
 
 pub async fn read_frame<R, T>(reader: &mut R, max_frame_size: usize) -> Result<T, ProtocolError>
@@ -4016,9 +4077,9 @@ where
     if len > max_frame_size {
         return Err(ProtocolError::FrameTooLarge(len));
     }
-    let mut payload = vec![0_u8; len];
-    read_exact_frame_bytes_until(reader, &mut payload, deadline).await?;
-    Ok(Some(payload))
+    read_declared_frame_payload_until(reader, len, deadline)
+        .await
+        .map(Some)
 }
 
 /// Read one authenticated frame with a separate no-byte setup deadline and
@@ -4060,9 +4121,29 @@ where
     if len > max_frame_size {
         return Err(ProtocolError::FrameTooLarge(len));
     }
-    let mut payload = vec![0_u8; len];
-    read_exact_frame_bytes_until(reader, &mut payload, active_deadline).await?;
-    Ok(Some(payload))
+    read_declared_frame_payload_until(reader, len, active_deadline)
+        .await
+        .map(Some)
+}
+
+async fn read_declared_frame_payload_until<R>(
+    reader: &mut R,
+    len: usize,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut payload = Vec::with_capacity(len.min(FRAME_READ_CHUNK_BYTES));
+    let mut chunk = [0_u8; FRAME_READ_CHUNK_BYTES];
+    let mut remaining = len;
+    while remaining != 0 {
+        let chunk_len = remaining.min(chunk.len());
+        read_exact_frame_bytes_until(reader, &mut chunk[..chunk_len], deadline).await?;
+        payload.extend_from_slice(&chunk[..chunk_len]);
+        remaining -= chunk_len;
+    }
+    Ok(payload)
 }
 
 async fn read_exact_frame_bytes_until<R>(
