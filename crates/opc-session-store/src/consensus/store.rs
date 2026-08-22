@@ -1292,14 +1292,15 @@ impl ConsensusSessionStore {
     /// Create the only public managed-provider execution surface.
     ///
     /// This factory belongs at authenticated server composition: `scope`,
-    /// `worker`, and both commitments must come from that layer, never from a
-    /// request. The returned facade owns these fixed dependencies and exposes
-    /// no authority token or component-selection API.
+    /// `worker`, and the verifier commitment must come from that layer, never
+    /// from a request. The worker commitment is derived only from `worker` so
+    /// provider verification and durable job authority cannot diverge. The
+    /// returned facade owns these fixed dependencies and exposes no authority
+    /// token or component-selection API.
     pub fn managed_provider_job_facade<P, V>(
         &self,
         scope: SessionConsumerScope,
         worker: SessionConsumerIdentity,
-        worker_identity_commitment: [u8; 32],
         verifier_identity_commitment: [u8; 32],
         provider: P,
         verifier: V,
@@ -1310,7 +1311,7 @@ impl ConsensusSessionStore {
     {
         let authority = Self::managed_provider_job_authority(
             scope,
-            worker_identity_commitment,
+            worker.spiffe_identity_commitment(),
             verifier_identity_commitment,
         )?;
         Ok(ManagedProviderJobFacade::new(

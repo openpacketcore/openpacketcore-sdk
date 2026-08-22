@@ -588,6 +588,40 @@ fn assert_no_managed_provider_rows(
     }
 }
 
+fn managed_provider_job_row_counts(
+    cluster: &TestCluster,
+    leader: usize,
+    admission: &FencedMutationRosterAdmission,
+) -> [u64; 3] {
+    let connection = rusqlite::Connection::open(
+        cluster
+            ._directory
+            .path()
+            .join(format!("node-{leader}.sqlite")),
+    )
+    .expect("open file-backed leader SQLite for read-only assertion");
+    let request_id = admission.request_id().to_bytes();
+    let mut counts = [0; 3];
+    for (index, table) in [
+        "consensus_fenced_mutation_roster_protocol_claims",
+        "consensus_fenced_mutation_roster_managed_provider_jobs",
+        "consensus_fenced_mutation_roster_managed_provider_authorities",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let count: u64 = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE request_id = ?1"),
+                params![request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("query exact managed-provider job rows");
+        counts[index] = count;
+    }
+    counts
+}
+
 #[derive(Clone, Copy)]
 struct AppendEntriesRequestDelay {
     request_id: [u8; 16],
@@ -6019,6 +6053,66 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         other => panic!("exact public roster activation failed: {other:?}"),
     }
 
+    // A facade for worker A must never use worker B's admitted roster scope.
+    // The factory used to accept a separately supplied worker commitment, which
+    // let this facade verify as A while durable job authority used B.
+    let other_worker = SessionConsumerIdentity::new("spiffe://managed-adapter/other-worker")
+        .expect("other test worker identity");
+    let wrong_worker_admission = admit_managed_provider_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &other_worker,
+        managed_provider_adapter_admission(0x73, 1),
+    )
+    .await;
+    let wrong_worker_rows_before =
+        managed_provider_job_row_counts(&cluster, leader, &wrong_worker_admission);
+    let wrong_worker_provider = ManagedProviderAdapterDouble::applied();
+    let wrong_worker_facade = cluster.stores[leader]
+        .managed_provider_job_facade(
+            scope,
+            worker.clone(),
+            [0x74; 32],
+            wrong_worker_provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct mismatched worker facade");
+    let wrong_worker_ordinal = FencedMutationRosterOrdinal::new(0).expect("only ordinal");
+    assert_eq!(
+        wrong_worker_facade
+            .run_member(
+                wrong_worker_admission.clone(),
+                Box::new([0x75]),
+                wrong_worker_ordinal,
+            )
+            .await,
+        Err(ManagedProviderJobError::Unavailable),
+        "a facade must reject a roster admitted for a different worker"
+    );
+    assert_eq!(
+        wrong_worker_facade
+            .job_status(wrong_worker_admission.clone(), wrong_worker_ordinal)
+            .await,
+        Err(ManagedProviderJobError::Unavailable),
+        "status must reject the same differently bound roster"
+    );
+    let identity_canary = "spiffe://managed-adapter/worker";
+    let commitment_canary = format!("{:?}", wrong_worker_facade.worker_identity_commitment());
+    for rendered in [
+        format!("{wrong_worker_facade:?}"),
+        format!("{:?}", ManagedProviderJobError::Unavailable),
+        ManagedProviderJobError::Unavailable.to_string(),
+    ] {
+        assert!(!rendered.contains(identity_canary));
+        assert!(!rendered.contains(&commitment_canary));
+    }
+    assert_no_provider_io(&wrong_worker_provider);
+    assert_eq!(
+        managed_provider_job_row_counts(&cluster, leader, &wrong_worker_admission),
+        wrong_worker_rows_before,
+        "mismatched facade changes no durable managed-provider state"
+    );
+
     // The facade is not an admission API. An invalid member and a valid
     // member of an unadmitted roster both fail before a claim/job mutation or
     // provider call.
@@ -6027,7 +6121,6 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         .managed_provider_job_facade(
             scope,
             worker.clone(),
-            [0x75; 32],
             [0x76; 32],
             unadmitted_provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -6067,7 +6160,6 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         .managed_provider_job_facade(
             scope,
             worker.clone(),
-            [0x81; 32],
             [0x82; 32],
             applied.clone(),
             ManagedProviderAdapterVerifier,
@@ -6138,7 +6230,6 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         .managed_provider_job_facade(
             scope,
             worker.clone(),
-            [0x91; 32],
             [0x92; 32],
             inconclusive.clone(),
             ManagedProviderAdapterVerifier,
@@ -6208,7 +6299,6 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         .managed_provider_job_facade(
             stale_scope,
             worker.clone(),
-            [0xb1; 32],
             [0xb2; 32],
             stale_provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -6233,7 +6323,6 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         .managed_provider_job_facade(
             scope,
             abort_worker.clone(),
-            [0xc1; 32],
             [0xc2; 32],
             not_applied.clone(),
             ManagedProviderAdapterVerifier,
@@ -6295,7 +6384,6 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         .managed_provider_job_facade(
             scope,
             compensated_worker.clone(),
-            [0xd1; 32],
             [0xd2; 32],
             compensated_provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -6339,7 +6427,6 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         .managed_provider_job_facade(
             scope,
             worker.clone(),
-            [0xe1; 32],
             [0xe2; 32],
             predecessor_provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -6384,7 +6471,6 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         .managed_provider_job_facade(
             scope,
             worker,
-            [0xe1; 32],
             [0xe2; 32],
             reopened_provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -6459,7 +6545,6 @@ async fn managed_provider_facade_reopens_closed_format_seven_voters_through_prod
         .managed_provider_job_facade(
             reopened_scope,
             predecessor_worker,
-            [0xa6; 32],
             [0xa7; 32],
             predecessor_provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -6502,7 +6587,6 @@ async fn managed_provider_facade_reopens_closed_format_seven_voters_through_prod
         .managed_provider_job_facade(
             reopened_scope,
             managed_worker.clone(),
-            [0xa9; 32],
             [0xaa; 32],
             executing_provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -6534,7 +6618,6 @@ async fn managed_provider_facade_reopens_closed_format_seven_voters_through_prod
                 .consumer_scope()
                 .expect("twice-reopened consumer scope"),
             managed_worker,
-            [0xa9; 32],
             [0xaa; 32],
             persisted_provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -6620,7 +6703,6 @@ async fn reopened_format_eight_managed_terminal_phase_bindings_fail_closed() {
             .managed_provider_job_facade(
                 scope,
                 worker.clone(),
-                [marker.wrapping_add(1); 32],
                 [marker.wrapping_add(2); 32],
                 provider.clone(),
                 verifier.clone(),
@@ -6794,7 +6876,6 @@ async fn reopened_mixed_managed_v5_abort_preserves_per_ordinal_terminal_outcomes
         .managed_provider_job_facade(
             scope,
             worker.clone(),
-            [0xd6; 32],
             [0xd7; 32],
             provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -6835,7 +6916,6 @@ async fn reopened_mixed_managed_v5_abort_preserves_per_ordinal_terminal_outcomes
         .managed_provider_job_facade(
             scope,
             worker,
-            [0xd6; 32],
             [0xd7; 32],
             reopened_provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -6921,7 +7001,6 @@ async fn reopened_mixed_managed_v5_terminal_corruption_fails_closed() {
             .managed_provider_job_facade(
                 scope,
                 worker,
-                [marker.wrapping_add(2); 32],
                 [marker.wrapping_add(3); 32],
                 provider.clone(),
                 verifier.clone(),
@@ -7044,7 +7123,6 @@ async fn managed_provider_finalize_forwarded_by_a_stale_follower_waits_for_its_e
         .managed_provider_job_facade(
             scope,
             worker.clone(),
-            [0xf6; 32],
             [0xf7; 32],
             provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -7097,7 +7175,6 @@ async fn managed_provider_finalize_forwarded_by_a_stale_follower_waits_for_its_e
             scope,
             SessionConsumerIdentity::new("spiffe://managed-adapter/exact-local-apply")
                 .expect("worker identity"),
-            [0xf6; 32],
             [0xf7; 32],
             replay_provider.clone(),
             ManagedProviderAdapterVerifier,
@@ -7153,7 +7230,6 @@ async fn reopened_persisted_managed_v5_corruption_fails_closed_without_fabricati
             .managed_provider_job_facade(
                 scope,
                 worker.clone(),
-                [marker.wrapping_add(2); 32],
                 [marker.wrapping_add(3); 32],
                 provider.clone(),
                 verifier.clone(),
@@ -7256,7 +7332,6 @@ async fn reopened_persisted_managed_v5_corruption_fails_closed_without_fabricati
                     .managed_provider_job_facade(
                         scope,
                         worker.clone(),
-                        [marker.wrapping_add(2); 32],
                         [marker.wrapping_add(3); 32],
                         reopened_provider.clone(),
                         reopened_verifier.clone(),

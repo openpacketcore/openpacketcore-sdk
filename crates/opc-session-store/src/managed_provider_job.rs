@@ -12,10 +12,11 @@ use sha2::{Digest, Sha256};
 
 use crate::fenced_mutation_roster::FencedMutationRosterOrdinal;
 use crate::{
-    FencedMutationRosterAdmission, FencedMutationRosterMemberAttestation,
-    FencedMutationRosterMemberAttestationError, FencedMutationRosterMemberAttestationVerifier,
-    FencedMutationRosterMemberExecutionContext, FencedMutationRosterProviderOutcome,
-    FencedMutationRosterRequestId, SessionConsumerIdentity, SessionConsumerScope,
+    derive_fenced_mutation_roster_scope, FencedMutationRosterAdmission,
+    FencedMutationRosterMemberAttestation, FencedMutationRosterMemberAttestationError,
+    FencedMutationRosterMemberAttestationVerifier, FencedMutationRosterMemberExecutionContext,
+    FencedMutationRosterProviderOutcome, FencedMutationRosterRequestId, SessionConsumerIdentity,
+    SessionConsumerScope,
 };
 
 /// The sole immutable managed-provider-job protocol revision.
@@ -471,6 +472,29 @@ impl ManagedProviderJobFacade {
         }
     }
 
+    /// Return the exact consensus authority scope bound at facade composition.
+    pub const fn authority_scope(&self) -> SessionConsumerScope {
+        self.authority.scope()
+    }
+
+    /// Return the opaque worker commitment bound at facade composition.
+    pub const fn worker_identity_commitment(&self) -> [u8; 32] {
+        self.authority.worker_identity_commitment()
+    }
+
+    /// Confirm that an admission belongs to this facade's authenticated worker
+    /// and exact consensus authority scope before any provider, verifier, or
+    /// store operation.
+    fn admission_matches_authority(&self, admission: &FencedMutationRosterAdmission) -> bool {
+        let worker_identity_commitment = self.worker.spiffe_identity_commitment();
+        self.worker_identity_commitment() == worker_identity_commitment
+            && admission.scope()
+                == derive_fenced_mutation_roster_scope(
+                    worker_identity_commitment,
+                    self.authority_scope(),
+                )
+    }
+
     /// Run one fixed member of an immutable admitted roster.
     pub async fn run_member(
         &self,
@@ -485,6 +509,9 @@ impl ManagedProviderJobFacade {
                 .is_err()
         {
             return Err(ManagedProviderJobError::InvalidMember);
+        }
+        if !self.admission_matches_authority(&admission) {
+            return Err(ManagedProviderJobError::Unavailable);
         }
         ManagedProviderJobCoordinator::new(
             &self.store,
@@ -508,6 +535,9 @@ impl ManagedProviderJobFacade {
                 .is_err()
         {
             return Err(ManagedProviderJobError::InvalidMember);
+        }
+        if !self.admission_matches_authority(&admission) {
+            return Err(ManagedProviderJobError::Unavailable);
         }
         let id = ManagedProviderJobId::for_member(admission.request_id(), ordinal);
         self.store
