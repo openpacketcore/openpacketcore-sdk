@@ -434,6 +434,7 @@ pub(crate) struct SessionSnapshotFile {
     // Kept by a receiving artifact so cloned state-machine handles cannot
     // retain more than one unvalidated snapshot stream for one core.
     _receive_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    seek_in_flight: bool,
 }
 
 struct SnapshotCleanupGuard {
@@ -633,6 +634,7 @@ impl SessionSnapshotFile {
             extent: metadata.len(),
             receive_limit_exceeded: false,
             _receive_admission: None,
+            seek_in_flight: false,
         })
     }
 
@@ -706,7 +708,7 @@ impl SessionSnapshotFile {
 
     /// Flush both file content and metadata before promotion.
     pub(crate) async fn sync_all(&mut self) -> io::Result<()> {
-        self.file.flush().await?;
+        self.flush().await?;
         self.file.sync_all().await
     }
 
@@ -724,6 +726,20 @@ impl SessionSnapshotFile {
     fn receive_limit_error(&mut self, message: &'static str) -> io::Error {
         self.receive_limit_exceeded = true;
         io::Error::new(io::ErrorKind::InvalidData, message)
+    }
+
+    fn poll_complete_submitted_seek(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.seek_in_flight {
+            return Poll::Ready(Ok(()));
+        }
+        match self.as_mut().poll_complete(cx) {
+            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -817,6 +833,11 @@ impl AsyncRead for SessionSnapshotFile {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        match self.as_mut().poll_complete_submitted_seek(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         Pin::new(&mut self.file).poll_read(cx, buf)
     }
 }
@@ -827,6 +848,11 @@ impl AsyncWrite for SessionSnapshotFile {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        match self.as_mut().poll_complete_submitted_seek(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         if self.receive_limit_exceeded {
             return Poll::Ready(Err(self.receive_limit_error(
                 "snapshot receiver size limit was previously exceeded",
@@ -872,6 +898,11 @@ impl AsyncWrite for SessionSnapshotFile {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        match self.as_mut().poll_complete_submitted_seek(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         Pin::new(&mut self.file).poll_flush(cx)
     }
 
@@ -879,12 +910,20 @@ impl AsyncWrite for SessionSnapshotFile {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        match self.as_mut().poll_complete_submitted_seek(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         Pin::new(&mut self.file).poll_shutdown(cx)
     }
 }
 
 impl AsyncSeek for SessionSnapshotFile {
     fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        if self.seek_in_flight {
+            return Err(io::Error::other("snapshot seek is already in progress"));
+        }
         if self.receive_limit_exceeded {
             return Err(
                 self.receive_limit_error("snapshot receiver size limit was previously exceeded")
@@ -899,12 +938,28 @@ impl AsyncSeek for SessionSnapshotFile {
         if target > self.received_maximum {
             return Err(self.receive_limit_error("snapshot seek exceeds size limit"));
         }
-        self.cursor = target;
-        Pin::new(&mut self.file).start_seek(position)
+        Pin::new(&mut self.file).start_seek(io::SeekFrom::Start(target))?;
+        self.seek_in_flight = true;
+        Ok(())
     }
 
     fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
-        Pin::new(&mut self.file).poll_complete(cx)
+        match Pin::new(&mut self.file).poll_complete(cx) {
+            Poll::Ready(Ok(position)) if position <= self.received_maximum => {
+                self.cursor = position;
+                self.seek_in_flight = false;
+                Poll::Ready(Ok(position))
+            }
+            Poll::Ready(Ok(_)) => {
+                self.seek_in_flight = false;
+                Poll::Ready(Err(self.receive_limit_error("snapshot seek exceeds size limit")))
+            }
+            Poll::Ready(Err(error)) => {
+                self.seek_in_flight = false;
+                Poll::Ready(Err(error))
+            }
+            pending => pending,
+        }
     }
 }
 
@@ -1036,6 +1091,7 @@ mod tests {
         let original = b"original snapshot";
         let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
         snapshot.write_all(original).await?;
+        snapshot.sync_all().await?;
         snapshot.rewind().await?;
 
         let error = snapshot
