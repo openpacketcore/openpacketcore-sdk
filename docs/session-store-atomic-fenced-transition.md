@@ -383,7 +383,7 @@ incompatible and has no in-place migration or downgrade path. Neither durable
 version is inferred from the record envelope, consumer wire, or consensus
 capability. `AtomicFencedTransitionCapability::V2`
 is a local composition promise over an inner V1 physical contract; it does not
-rename the consensus or revision-4 authenticated-consumer wire as V2.
+rename the consensus or revision-5 authenticated-consumer wire as V2.
 
 A rolling upgrade MUST ensure every process that may execute or query a retained
 request understands both schemas and uses the same journal key/path and bound
@@ -511,8 +511,8 @@ ID, infer an unknown outcome from local intent, continue writes under an
 uncertain lease, or derive a next mutation until they have an authoritative
 observation.
 A post-retention history must likewise be re-derived from current authoritative
-state under a fresh ID; the old transition is never revived. The consumer wire
-revision-4 contract preserves every status distinction, including
+state under a fresh ID; the old transition is never revived. Consumer wire
+revision 5 retains every revision-4 status distinction, including
 `StorageExhausted` inside `Recorded`, through a closed wire-safe enum. Frozen
 legacy session-net v5 maps this result fail-closed as an unknown capability; no
 v5 wire enum changes and that protocol does not expose the transition operation.
@@ -568,7 +568,7 @@ timestamps, topology endpoints, or local storage details.
 
 ## Deliberate boundary
 
-This remains generic SDK semantics. Consumer transport revision 4 carries the
+This remains generic SDK semantics. Consumer transport revision 5 retains the
 same capability, observation, execution, ambiguity, and exact-status contract
 over both the one-shot and bounded persistent least-authority mTLS clients
 published by #695. It does not expose a generic backend, replication,

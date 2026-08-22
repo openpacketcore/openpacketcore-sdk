@@ -2161,7 +2161,7 @@ async fn malformed_and_oversized_consumer_frames_are_rejected_before_dispatch() 
     .await
     .expect("start stateless consumer listener");
 
-    // A frozen revision-3 peer completes the same mTLS and ALPN handshake as a
+    // A frozen revision-4 peer completes the same mTLS and ALPN handshake as a
     // real caller, but must be closed before application dispatch. There is no
     // downgrade or upgrade oracle at this boundary.
     let mut wrong_revision =
@@ -2169,7 +2169,7 @@ async fn malformed_and_oversized_consumer_frames_are_rejected_before_dispatch() 
     let wrong_hello = serde_json::to_vec(&serde_json::json!({
         "kind": "hello",
         "body": {
-            "transport_revision": 3_u16,
+            "transport_revision": 4_u16,
             "scope": scope,
             "response_frame_size": opc_session_net::MAX_NEGOTIATED_FRAME_SIZE,
         },

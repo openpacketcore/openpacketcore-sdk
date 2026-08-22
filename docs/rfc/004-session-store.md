@@ -1612,14 +1612,15 @@ umbrella until that fleet evidence passes.
 `StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
 `SessionQuorumConsumerServer` provide the typed least-authority
 application-consumer boundary. They MUST use mutual TLS and the dedicated
-`opc-session-consumer/1` ALPN with transport revision 4. This is a separate
+`opc-session-consumer/1` ALPN with transport revision 5. This is a separate
 exact protocol from both `opc-session-consensus/2` and the quarantined
 `opc-session-net/5` compatibility protocol. A listener MUST NOT offer a
 fallback, negotiate a common revision, or multiplex either other protocol as
-equivalent consumer authority. Revisions 1, 2, 3, and 4 do not interoperate.
+equivalent consumer authority. Revision 5 does not interoperate with revisions
+1, 2, 3, or 4.
 Because this SDK is unreleased, deployments MUST drain consumer clients and
-listeners, then make one coordinated revision-4 cutover; fallback, dual-mode,
-and mixed-revision consumer operation are unsupported. Revision-4 private JSON
+listeners, then make one coordinated revision-5 cutover; fallback, dual-mode,
+and mixed-revision consumer operation are unsupported. Revision-5 private JSON
 DTO bytes are canonical; reordered or otherwise noncanonical encodings,
 aliases, omissions, and unknown fields MUST fail closed.
 
@@ -1693,11 +1694,14 @@ to catch up merely because it did not acknowledge activation: an old reader
 could silently omit new snapshot state, which the persistent fence prevents by
 rejecting the activated image.
 
-Each request connection carries a connection-local, nonzero `u32`
-correlation that increases monotonically and never wraps; it is retired after
-at most 4,096 sequential calls. There is exactly one in-flight call per such
-connection, with no multiplexing. This is structural: it isolates cancellation
-and late responses and removes write-position ambiguity. The client uses a
+Each request connection carries a connection-local, nonzero `u32` sequence
+that increases monotonically and never wraps, paired with a fresh unpredictable
+UUID nonce serialized after the complete request. The server admits only the
+exact next sequence and the client accepts only the exact composite response
+correlation. A lane retires after at most 4,096 sequential calls. There is
+exactly one in-flight call per connection, with no multiplexing. This is
+structural: it isolates cancellation and pre-staged/late responses and removes
+write-position ambiguity. The client uses a
 fixed, fair pool of four request connections by default (at most 16 when
 configured), with 64 pending calls by default and a hard maximum of 256. A
 pending call may wait or age for at most 250 ms. Watches use two separate slots
@@ -1741,9 +1745,13 @@ is at most 30 seconds, and material-rotation jitter is at most 30 seconds. A
 consumer shutdown drains for at most 5 seconds. An establishment attempt has a
 1,500 ms setup limit and a call makes at most two pre-write establishment
 attempts. Resolution occurs only for establishment or re-establishment, never
-for a reused connection. With two attempts there is one between-attempt delay:
-the lifecycle backoff floor (50 ms by default) plus at most 25 ms jitter,
-clipped to the logical deadline. Reauthentication, material
+for a reused connection. Every cold request, watch, and rolling-prewarm setup
+MUST enter one pool-wide recovery lane after bounded physical admission. One
+failed setup or proven cached-lane loss publishes the shared exponential
+lifecycle backoff floor (50 ms by default) plus at most 25 ms jitter, clipped to
+each logical deadline;
+concurrent waiters MUST NOT start independent resolver/TCP/TLS/Hello attempts.
+Reauthentication, material
 changes, certificate expiry, idle retirement, cancellation, malformed frames,
 EOF, or an uncertain stream position terminate the connection/watch and release
 its transport task slot; they do not create another request on that connection.
@@ -1766,8 +1774,11 @@ records.
 
 The caller owns the request ID for every mutation or lease operation. Only a
 failure classified as `NotTransmitted` may be automatically retried, and then
-only with the identical request ID and body. Anything possibly written is
-`OutcomeUnknown`: the client evicts that lane and MUST NOT replay the request.
+only with the identical request ID and body. Positive ciphertext acceptance
+MUST be observed below TLS as well as at the framed plaintext writer, so a later
+outer TLS error cannot relabel an accepted prefix as `NotTransmitted`. Anything
+possibly written is `OutcomeUnknown`: the client evicts that lane and MUST NOT
+replay the request.
 The SDK MUST NOT mint a new request ID. Recovery may retry only the identical
 request body under the retained ID through the durable request binding; reuse
 of that ID for a different request is a closed conflict. Applications otherwise
@@ -1801,7 +1812,10 @@ revoked predecessor cannot observe it. Status is read-only, and `NotFound` does
 not prove that an earlier delayed proposal cannot still commit, does not permit
 deletion, and does not permit reuse of the stable transition ID.
 
-Prewarm and readiness may prove authenticated consumer transport capacity only;
+Each explicit prewarm MUST perform a rolling resolver/TCP/TLS/Hello refresh of
+every configured request lane and preserve refreshed plus unprocessed healthy
+capacity after a partial failure. Prewarm and readiness may prove authenticated
+consumer transport capacity only;
 they never prove quorum or product readiness. Readiness deliberately becomes
 false while a request lane is leased; isolated watch slots are non-gating.
 Diagnostics are fixed and
@@ -1815,15 +1829,18 @@ claim.
 The v7 qualification profile remains the revision-2 persistent-transport
 inventory and records its connection, frame, request/response, watch, task,
 and lifecycle limits beside the consensus profile. The published v6 profile
-remains the unchanged revision-1 contract. Revision 4 retains those bounded
-transport properties and the revision-3 generic #696 family, then adds exact
-retained status recovery for ordinary leases; its exact-head evidence is
-recorded with the receipt-status qualification. No profile or evidence records
-consumer identity or scope material. Synthetic warm accept/reuse checks gate
-only their transport method; elapsed samples are non-gating and are not an SLO.
+remains the unchanged revision-1 contract. Revision 5 retains those bounded
+transport properties, the revision-3 generic #696 family, and revision-4 exact
+retained status recovery for ordinary leases, then adds unpredictable causal
+correlation, exact below-TLS write observation, rolling fresh prewarm, and
+pool-wide cold-setup serialization. The live v8 exact-head schema remains
+experimental and fixes `qualification_complete=false`. No profile or evidence
+records consumer identity or scope material. Synthetic warm accept/reuse checks
+gate only their transport method; elapsed samples are non-gating and are not an
+SLO.
 
-Revision 4 carries `StorageExhausted` only inside the closed fenced-transition
-`Recorded` status result. Frozen session-net v5 maps this outcome fail-closed as
+Revision 5 retains revision 4's `StorageExhausted` only inside the closed
+fenced-transition `Recorded` status result. Frozen session-net v5 maps this outcome fail-closed as
 an unknown capability; its wire enum and revision remain unchanged. Product and
 ePDG composition remain outside this generic API.
 

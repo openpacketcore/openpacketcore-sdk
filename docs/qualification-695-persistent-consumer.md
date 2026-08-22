@@ -19,6 +19,72 @@ and held for the physical connection lifetime, including by persistent clients
 derived from the same lineage. Independent stateless constructors define
 independent logical clients, as independent persistent constructors do.
 
+## Current-main successor audit (2026-08-22)
+
+The closure successor starts exactly at SDK commit
+`f2ed1181c85540cc01ea0b4611fa3620891375fd`, tree
+`945ceab3870d2c1d2d1396aff29e819288fce76a`. It does not contain, rebase, or
+merge the stale qualification branch. Three focused regressions retained the
+following current-main RED evidence before the generic correction:
+
+```text
+prewarm_reresolves_and_reauthenticates_all_lanes_after_server_replacement
+  resolver calls: observed 2, required 4
+persistent_pool_shares_one_recovery_probe_across_twelve_callers
+  peak simultaneous resolver calls: observed 12, required 1
+pre_staged_future_rejection_after_a_completed_call_is_outcome_unknown
+  observed typed Rejected(Unavailable), required OutcomeUnknown
+```
+
+The causal correction is consumer transport revision 5. It retains the
+tenant-scoped mTLS/SPIFFE/ALPN/Hello authority and all fixed resource bounds,
+while adding four generic guarantees:
+
+- explicit prewarm rolls every configured lane through a fresh
+  resolver/TCP/TLS/Hello exchange and preserves refreshed plus unprocessed
+  healthy lanes after a partial failure;
+- all cold request, watch, and prewarm setups in one pool share one serialized
+  recovery lane and one coalesced exponential backoff deadline for failed setup
+  or proven cached-lane loss;
+- each connection-local monotonic sequence is paired with a fresh
+  unpredictable UUID nonce whose field is serialized only after the complete
+  request, and the exact composite value is required in the response; and
+- write classification observes positive ciphertext acceptance below TLS, so
+  a later outer TLS error cannot turn a possibly transmitted mutation into an
+  automatically replayable `NotTransmitted` result.
+
+The tracked v8 exact-head evidence schema now binds transport revision 5. It
+continues to require `experimental=true` and
+`qualification_complete=false`; it is a structural wire-binding schema, not a
+production qualification certificate. No new latency samples were collected
+for this successor, no shared-host latency gate was launched, and no cluster or
+ePDG state was changed. The bounded raw distribution below remains the earlier
+historical synthetic loopback observation and is not used as closure evidence
+or as a production/ePDG SLO claim.
+
+The current-main successor's bounded GREEN gates were run with all
+`opc-session-net` features on 2026-08-22:
+
+```text
+cargo test -p opc-session-net --all-features --lib
+  275 passed; 0 failed
+cargo test -p opc-session-net --all-features \
+  --test persistent_consumer_protocol \
+  --test persistent_consumer_boundaries \
+  --test persistent_consumer_transport
+  boundaries: 7 passed; protocol: 26 passed; transport: 29 passed
+cargo test -p opc-session-testkit --all-features --test qualification_profile
+  19 passed; 0 failed
+```
+
+The focused transport fixtures bind one serialized recovery probe across 12
+callers, coalesced bounded backoff, stale-epoch isolation, rolling fresh
+prewarm, production mTLS/SPIFFE/ALPN/Hello admission, exact composite
+correlation, below-TLS write classification, watch/request cancellation, and
+fixed request/watch/physical-admission bounds. They are correctness evidence;
+they do not replace the still-required production three-voter network latency
+qualification.
+
 Paused-clock lifecycle regressions additionally require a cached lane to remain
 reusable before its stable directed authenticated-edge material deadline and to
 retire exactly at that deadline. Two authenticated edges must produce stable,
