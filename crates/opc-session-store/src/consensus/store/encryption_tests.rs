@@ -194,6 +194,17 @@ fn key(label: &'static [u8]) -> SessionKey {
     }
 }
 
+fn snapshot_progress_key(index: usize) -> SessionKey {
+    SessionKey {
+        tenant: tenant(),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from(format!("snapshot-progress-{index:04}").into_bytes())
+            .try_into()
+            .expect("valid snapshot-progress stable ID"),
+    }
+}
+
 fn record(
     key: SessionKey,
     lease: &crate::lease::LeaseGuard,
@@ -1060,6 +1071,20 @@ impl RemoteRotationCluster {
             .collect()
     }
 
+    fn current_leader(&self) -> usize {
+        let members = (0..REMOTE_ROTATION_MEMBER_COUNT).collect::<Vec<_>>();
+        let statuses = self.statuses(&members);
+        let leader = statuses
+            .first()
+            .and_then(|status| status.leader_id)
+            .expect("ready remote rotation members report a leader");
+        statuses
+            .iter()
+            .enumerate()
+            .find_map(|(member, status)| (status.node_id == leader).then_some(member))
+            .expect("ready remote rotation leader is a member")
+    }
+
     async fn wait_ready_members(&self, members: &[usize], stage: &'static str) {
         let deadline = tokio::time::Instant::now()
             .checked_add(REMOTE_ROTATION_TRANSITION_TIMEOUT)
@@ -1448,5 +1473,88 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
     );
 
     drop(reader);
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_capture_does_not_starve_three_voter_commits() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let cluster = RemoteRotationCluster::start().await;
+    let leader = cluster.current_leader();
+    let owner = OwnerId::new("snapshot-progress-owner").expect("owner");
+
+    // Build a bounded, real three-voter state-machine image through the public
+    // lease proposal API. Snapshot construction is then requested from the
+    // same Openraft instance that owns the committed state.
+    for index in 0..64 {
+        cluster.stores[leader]
+            .acquire(
+                &snapshot_progress_key(index),
+                owner.clone(),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("bounded public preload commit");
+    }
+    let before = cluster.statuses(&(0..REMOTE_ROTATION_MEMBER_COUNT).collect::<Vec<_>>());
+    let before_term = before.first().expect("three-voter status").term;
+    let before_leader = before
+        .first()
+        .and_then(|status| status.leader_id)
+        .expect("three-voter leader");
+    assert!(before.iter().all(|status| {
+        status.admitted && status.term == before_term && status.leader_id == Some(before_leader)
+    }));
+
+    let gate = cluster.backends[leader].snapshot_capture_gate();
+    gate.arm();
+    let snapshot_log = cluster.stores[leader]
+        .inner
+        .raft
+        .metrics()
+        .borrow()
+        .last_applied
+        .expect("bounded preload applied before snapshot");
+    cluster.stores[leader]
+        .inner
+        .raft
+        .trigger()
+        .snapshot()
+        .await
+        .expect("request snapshot capture");
+
+    tokio::time::timeout(CONSENSUS_READY_TIMEOUT, async {
+        while !gate.started() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("snapshot capture starts after its consistent source image is fixed");
+
+    let committed_while_capture_is_held = tokio::time::timeout(
+        DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout(),
+        cluster.stores[leader].acquire(&snapshot_progress_key(64), owner, Duration::from_secs(30)),
+    )
+    .await;
+    gate.release();
+    committed_while_capture_is_held
+        .expect("public proposal remains within the existing operation deadline")
+        .expect("public proposal commits while snapshot capture is held");
+
+    cluster.stores[leader]
+        .inner
+        .raft
+        .wait(Some(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout()))
+        .snapshot(
+            snapshot_log,
+            "snapshot capture after concurrent public commit",
+        )
+        .await
+        .expect("held snapshot completes after release");
+    cluster.wait_all_ready().await;
+    let after = cluster.statuses(&(0..REMOTE_ROTATION_MEMBER_COUNT).collect::<Vec<_>>());
+    assert!(after.iter().all(|status| {
+        status.admitted && status.term == before_term && status.leader_id == Some(before_leader)
+    }));
     cluster.shutdown().await;
 }

@@ -1122,11 +1122,47 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .core
             .snapshot_dir
             .join(format!("seal-{}.part", uuid::Uuid::new_v4()));
-        let ((last_log_id, last_membership), (mut snapshot, checksum, byte_length)) =
-            if self.core.authority_profile == ConsensusAuthorityProfile::Dynamic {
-                let membership = {
-                    let conn = self.core.conn.lock().await;
-                    consensus::build_snapshot_database_with_authority_sync(
+        let ((last_log_id, last_membership), (mut snapshot, checksum, byte_length)) = if self
+            .core
+            .authority_profile
+            == ConsensusAuthorityProfile::Dynamic
+        {
+            let membership = {
+                let conn = self.core.conn.lock().await;
+                #[cfg(test)]
+                let membership = consensus::build_snapshot_database_with_capture_hook_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    &raw_path,
+                    || self.core.snapshot_capture_gate.block_after_capture(),
+                );
+                #[cfg(not(test))]
+                let membership = consensus::build_snapshot_database_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    &raw_path,
+                );
+                membership
+            }
+            .map_err(|error| {
+                storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+            })?;
+            let sealed = seal_snapshot_database_from_path(&raw_path, &temporary_path, &final_path)
+                .await
+                .map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                })?;
+            (membership, sealed)
+        } else {
+            let (membership, raw_snapshot) = {
+                let conn = self.core.conn.lock().await;
+                #[cfg(test)]
+                let snapshot =
+                    consensus::build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
                         &conn,
                         self.core.storage_identity,
                         self.core.authority_profile,
@@ -1134,41 +1170,30 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                         &self.core.expected_bindings,
                         self.core.fixed_placement_policy,
                         &raw_path,
-                    )
-                }
+                        || self.core.snapshot_capture_gate.block_after_capture(),
+                    );
+                #[cfg(not(test))]
+                let snapshot = consensus::build_snapshot_database_pinned_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    &raw_path,
+                );
+                snapshot
+            }
+            .map_err(|error| {
+                storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+            })?;
+            let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
+                .await
                 .map_err(|error| {
                     storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
                 })?;
-                let sealed =
-                    seal_snapshot_database_from_path(&raw_path, &temporary_path, &final_path)
-                        .await
-                        .map_err(|error| {
-                            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                        })?;
-                (membership, sealed)
-            } else {
-                let (membership, raw_snapshot) = {
-                    let conn = self.core.conn.lock().await;
-                    consensus::build_snapshot_database_pinned_with_authority_sync(
-                        &conn,
-                        self.core.storage_identity,
-                        self.core.authority_profile,
-                        &self.core.expected_members,
-                        &self.core.expected_bindings,
-                        self.core.fixed_placement_policy,
-                        &raw_path,
-                    )
-                }
-                .map_err(|error| {
-                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                })?;
-                let sealed = seal_snapshot_database(raw_snapshot, &temporary_path, &final_path)
-                    .await
-                    .map_err(|error| {
-                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                    })?;
-                (membership, sealed)
-            };
+            (membership, sealed)
+        };
         tokio::fs::rename(&temporary_path, &final_path)
             .await
             .map_err(|error| {

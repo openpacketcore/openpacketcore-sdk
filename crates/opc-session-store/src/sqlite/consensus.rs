@@ -11,6 +11,7 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
@@ -364,6 +365,51 @@ type ConsensusAppliedMembership = (
     Option<LogId<SessionConsensusNodeId>>,
     StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
 );
+
+/// Test-only coordination for holding snapshot capture after its source image
+/// has been fixed. It is deliberately absent from production builds.
+#[cfg(test)]
+pub(crate) struct SnapshotCaptureGate {
+    armed: AtomicBool,
+    started: AtomicBool,
+    released: AtomicBool,
+}
+
+#[cfg(test)]
+impl SnapshotCaptureGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn arm(&self) {
+        self.started.store(false, Ordering::SeqCst);
+        self.released.store(false, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn started(&self) -> bool {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn block_after_capture(&self) {
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
+        }
+        self.started.store(true, Ordering::SeqCst);
+        while !self.released.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.armed.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Exact durable identity history admitted for one bounded membership change.
 ///
@@ -1235,6 +1281,7 @@ pub(crate) fn install_migrated_operator_recovery_validation_schema_sync(
 #[derive(Clone)]
 pub(crate) struct SqliteConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
+    pub(crate) database_path: Option<Arc<PathBuf>>,
     /// Immutable database-incarnation identity used by legacy foreign keys.
     /// The active topology identity lives in `consensus_membership_scope`.
     pub(crate) storage_identity: SessionConsensusIdentity,
@@ -1251,6 +1298,8 @@ pub(crate) struct SqliteConsensusCore {
         Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ConsumerReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    pub(crate) snapshot_capture_gate: Arc<SnapshotCaptureGate>,
 }
 
 impl SqliteConsensusCore {
@@ -1349,6 +1398,7 @@ impl SqliteConsensusCore {
 
         Ok(Self {
             conn: Arc::clone(&backend.conn),
+            database_path: backend.database_path.clone(),
             storage_identity,
             authority_profile,
             fixed_placement_policy,
@@ -1365,6 +1415,8 @@ impl SqliteConsensusCore {
             consumer_watchers: Arc::clone(&backend.consumer_watchers),
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
+            #[cfg(test)]
+            snapshot_capture_gate: Arc::clone(&backend.consensus_snapshot_capture_gate),
         })
     }
 }
@@ -14819,11 +14871,25 @@ pub(crate) fn build_snapshot_database_sync(
     identity: SessionConsensusIdentity,
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
+    build_snapshot_database_with_capture_hook_sync(conn, identity, path, || {})
+}
+
+pub(crate) fn build_snapshot_database_with_capture_hook_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    path: &std::path::Path,
+    capture_hook: impl FnOnce(),
+) -> io::Result<ConsensusAppliedMembership> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
     validate_sealed_state_sync(&tx)?;
     validate_fenced_transition_receipts_sync(&tx, identity)?;
     let destination = create_pinned_snapshot_database(path)?;
-    let (snapshot, _) = build_snapshot_database_from_pinned_sync(&tx, identity, destination)?;
+    let (snapshot, _) = build_snapshot_database_from_pinned_with_capture_hook_sync(
+        &tx,
+        identity,
+        destination,
+        capture_hook,
+    )?;
     tx.commit().map_err(db_error)?;
     Ok(snapshot)
 }
@@ -14836,6 +14902,31 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     path: &std::path::Path,
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+)> {
+    build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
+        conn,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        path,
+        || {},
+    )
+}
+
+pub(crate) fn build_snapshot_database_pinned_with_authority_and_capture_hook_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    path: &std::path::Path,
+    capture_hook: impl FnOnce(),
 ) -> io::Result<(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
@@ -14854,8 +14945,12 @@ pub(crate) fn build_snapshot_database_pinned_with_authority_sync(
     // Do not create even an empty snapshot artifact until the durable fixed
     // authority check has succeeded under the source read transaction.
     let destination = create_pinned_snapshot_database(path)?;
-    let (snapshot, destination) =
-        capture_and_finalize_snapshot_database_sync(&tx, identity, destination)?;
+    let (snapshot, destination) = build_snapshot_database_from_pinned_with_capture_hook_sync(
+        &tx,
+        identity,
+        destination,
+        capture_hook,
+    )?;
     tx.commit().map_err(db_error)?;
     Ok((snapshot, destination))
 }
@@ -14893,7 +14988,19 @@ fn build_snapshot_database_from_pinned_sync(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
 )> {
-    capture_and_finalize_snapshot_database_sync(conn, identity, destination)
+    build_snapshot_database_from_pinned_with_capture_hook_sync(conn, identity, destination, || {})
+}
+
+fn build_snapshot_database_from_pinned_with_capture_hook_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    destination: crate::consensus::snapshot::PinnedSqliteFile,
+    capture_hook: impl FnOnce(),
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+)> {
+    capture_and_finalize_snapshot_database_sync(conn, identity, destination, capture_hook)
 }
 
 #[allow(dead_code)]
@@ -15060,6 +15167,7 @@ fn capture_and_finalize_snapshot_database_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    capture_hook: impl FnOnce(),
 ) -> io::Result<(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
@@ -15068,6 +15176,7 @@ fn capture_and_finalize_snapshot_database_sync(
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity)?;
     validate_membership_ids(&membership)?;
+    capture_hook();
 
     let (mut destination, descriptor_fds) = open_pinned_snapshot_database(&pinned)?;
     destination

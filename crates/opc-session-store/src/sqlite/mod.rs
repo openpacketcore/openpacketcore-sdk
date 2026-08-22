@@ -254,6 +254,8 @@ pub struct SqliteSessionBackend {
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
+    consensus_snapshot_capture_gate: Arc<consensus::SnapshotCaptureGate>,
+    #[cfg(test)]
     consensus_operator_recovery_failure: Arc<AtomicBool>,
     #[cfg(test)]
     fixed_quorum_v2_mutation_snapshot_cut: Arc<AtomicBool>,
@@ -698,6 +700,8 @@ impl SqliteSessionBackend {
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
+            consensus_snapshot_capture_gate: Arc::new(consensus::SnapshotCaptureGate::new()),
+            #[cfg(test)]
             consensus_operator_recovery_failure: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fixed_quorum_v2_mutation_snapshot_cut: Arc::new(AtomicBool::new(false)),
@@ -1049,6 +1053,11 @@ impl SqliteSessionBackend {
     /// concrete volume identity.
     pub(crate) const fn is_file_backed(&self) -> bool {
         self.database_path.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_capture_gate(&self) -> Arc<consensus::SnapshotCaptureGate> {
+        Arc::clone(&self.consensus_snapshot_capture_gate)
     }
 
     /// Synchronously test a fixed-quorum authority record without waiting for
