@@ -16308,11 +16308,10 @@ pub(crate) fn managed_provider_protocol_mode_sync(
     u8::try_from(mode).map_err(|_| fenced_mutation_roster_invalid("managed_provider_mode_invalid"))
 }
 
-/// Report whether a mode-three roster contains any V5 authority commitment.
+/// Prove the complete frozen predecessor/migrated terminal shape.
 ///
-/// A predecessor/migrated terminal has none.  Conversely, a partially
-/// damaged or mismatched V5 terminal must remain unavailable rather than be
-/// reclassified as frozen just because its complete-origin proof fails.
+/// Absence of V5 authority alone is insufficient: every canonical migrated
+/// job must still be pristine and the durable operation must be terminal.
 pub(crate) fn managed_provider_predecessor_terminal_phase_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
