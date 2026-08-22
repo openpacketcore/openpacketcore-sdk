@@ -957,14 +957,14 @@ impl SqliteSessionBackend {
         .await
     }
 
-    /// Determine whether a mode-three claim has begun V5 authority binding.
-    pub(crate) async fn consensus_managed_provider_has_v5_authority(
+    /// Prove the exact frozen predecessor/migrated terminal shape.
+    pub(crate) async fn consensus_managed_provider_predecessor_terminal_phase(
         &self,
         identity: crate::consensus::SessionConsensusIdentity,
         request_id: [u8; crate::FENCED_MUTATION_ROSTER_REQUEST_ID_BYTES],
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Option<u8>, StoreError> {
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
-            consensus::managed_provider_has_v5_authority_sync(conn, identity, request_id)
+            consensus::managed_provider_predecessor_terminal_phase_sync(conn, identity, request_id)
         })
         .await
     }

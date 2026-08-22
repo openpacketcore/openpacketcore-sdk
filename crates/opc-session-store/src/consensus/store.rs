@@ -970,10 +970,17 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
                 deadline,
             )
             .await?;
+        let applied_index = response.raft_log_index;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
-                self.managed_provider_outcome_status(admission, authority, outcome)
-                    .await
+                self.managed_provider_outcome_status(
+                    admission,
+                    authority,
+                    outcome,
+                    applied_index,
+                    deadline,
+                )
+                .await
             }
             _ => Err(consensus_unavailable()),
         }
@@ -1010,13 +1017,16 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
                 // Continue to the exact member-status lookup below.  A
                 // managed V5 terminal is recognized only after its complete
                 // authority/member proof, never from mode alone.
-            } else if !self.managed_provider_has_v5_authority(id.roster()).await? {
+            } else if let Some(terminal_phase) = self
+                .managed_provider_predecessor_terminal_phase(id.roster())
+                .await?
+            {
                 // Ordinary predecessor and migrated format-seven terminals
                 // share mode three but have no V5 authority or owner
                 // commitment. Their immutable mode is sufficient to report
                 // the frozen terminal; never let a missing V5 row turn that
                 // into Unavailable.
-                return managed_provider_status(3, 4, false);
+                return managed_provider_status(3, if terminal_phase == 2 { 4 } else { 5 }, false);
             } else {
                 // A V5 authority exists but the full terminal proof does not.
                 // Treat this as unavailable rather than downgrade a damaged
@@ -1067,14 +1077,21 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
                 deadline,
             )
             .await?;
+        let applied_index = response.raft_log_index;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) if outcome.execute => {
                 Ok(ManagedProviderJobEffectStart::Execute)
             }
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
                 Ok(ManagedProviderJobEffectStart::Existing(
-                    self.managed_provider_outcome_status(&admission, authority, outcome)
-                        .await?,
+                    self.managed_provider_outcome_status(
+                        &admission,
+                        authority,
+                        outcome,
+                        applied_index,
+                        deadline,
+                    )
+                    .await?,
                 ))
             }
             _ => Err(consensus_unavailable()),
@@ -1109,10 +1126,17 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
                 deadline,
             )
             .await?;
+        let applied_index = response.raft_log_index;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
-                self.managed_provider_outcome_status(&admission, authority, outcome)
-                    .await
+                self.managed_provider_outcome_status(
+                    &admission,
+                    authority,
+                    outcome,
+                    applied_index,
+                    deadline,
+                )
+                .await
             }
             _ => Err(consensus_unavailable()),
         }
@@ -1138,10 +1162,17 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
                 deadline,
             )
             .await?;
+        let applied_index = response.raft_log_index;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
-                self.managed_provider_outcome_status(admission, authority, outcome)
-                    .await
+                self.managed_provider_outcome_status(
+                    admission,
+                    authority,
+                    outcome,
+                    applied_index,
+                    deadline,
+                )
+                .await
             }
             _ => Err(consensus_unavailable()),
         }
@@ -1200,10 +1231,17 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
                 deadline,
             )
             .await?;
+        let applied_index = response.raft_log_index;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
-                self.managed_provider_outcome_status(&admission, authority, outcome)
-                    .await
+                self.managed_provider_outcome_status(
+                    &admission,
+                    authority,
+                    outcome,
+                    applied_index,
+                    deadline,
+                )
+                .await
             }
             _ => Err(consensus_unavailable()),
         }
@@ -1233,10 +1271,17 @@ impl ManagedProviderJobStore for ConsensusSessionStore {
                 deadline,
             )
             .await?;
+        let applied_index = response.raft_log_index;
         match response.result? {
             SessionMutationOutcome::ManagedProviderJob(outcome) => {
-                self.managed_provider_outcome_status(&admission, authority, outcome)
-                    .await
+                self.managed_provider_outcome_status(
+                    &admission,
+                    authority,
+                    outcome,
+                    applied_index,
+                    deadline,
+                )
+                .await
             }
             _ => Err(consensus_unavailable()),
         }
@@ -1349,13 +1394,13 @@ impl ConsensusSessionStore {
             .await
     }
 
-    async fn managed_provider_has_v5_authority(
+    async fn managed_provider_predecessor_terminal_phase(
         &self,
         request_id: FencedMutationRosterRequestId,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Option<u8>, StoreError> {
         self.inner
             .backend
-            .consensus_managed_provider_has_v5_authority(
+            .consensus_managed_provider_predecessor_terminal_phase(
                 self.inner.storage_identity,
                 request_id.to_bytes(),
             )
@@ -1367,7 +1412,17 @@ impl ConsensusSessionStore {
         admission: &FencedMutationRosterAdmission,
         authority: ManagedProviderJobAuthority,
         outcome: ManagedProviderJobMutationOutcome,
+        applied_index: u64,
+        deadline: tokio::time::Instant,
     ) -> Result<ManagedProviderJobStatus, StoreError> {
+        if applied_index == 0 {
+            return Err(consensus_unavailable());
+        }
+        self.inner
+            .read_barrier
+            .wait_for_applied_index(applied_index, deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
         let managed_terminal = if outcome.mode == 3 {
             self.managed_provider_terminal_is_managed(admission.request_id(), authority)
                 .await?
