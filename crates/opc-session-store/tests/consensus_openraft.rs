@@ -1060,6 +1060,113 @@ impl TestCluster {
         cluster
     }
 
+    /// Reopen every voter from the same closed file-backed fleet. This stays
+    /// on the production OpenRaft/store construction path; it only rebuilds
+    /// the in-process authenticated loopback transport used by this test
+    /// harness.
+    async fn reopen(directory: TempDir, operation_timeout: Duration) -> Self {
+        let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
+        let identity = consensus_identity(&members);
+        let topologies = (0..MEMBER_COUNT)
+            .map(|index| {
+                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                    replica_id(index),
+                    members.clone(),
+                    identity,
+                ))
+                .expect("validate reopened consensus topology")
+            })
+            .collect::<Vec<_>>();
+        let test_permit = Self::acquire_test_permit().await;
+        let backends = (0..MEMBER_COUNT)
+            .map(|index| {
+                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
+                    .expect("reopen file-backed SQLite node")
+            })
+            .collect::<Vec<_>>();
+        let node_ids = topologies
+            .iter()
+            .map(|topology| {
+                topology
+                    .local_consensus_node_id()
+                    .expect("reopened consensus node ID")
+            })
+            .collect::<Vec<_>>();
+        let mut paths = BTreeMap::new();
+        for source in 0..MEMBER_COUNT {
+            for (target, node_id) in node_ids.iter().copied().enumerate() {
+                if source != target {
+                    paths.insert(
+                        (source, target),
+                        Arc::new(LoopbackPeer::new(node_id, identity)),
+                    );
+                }
+            }
+        }
+        let mut stores = Vec::with_capacity(MEMBER_COUNT);
+        for index in 0..MEMBER_COUNT {
+            let peers = (0..MEMBER_COUNT)
+                .filter(|target| *target != index)
+                .map(|target| {
+                    let peer: Arc<dyn SessionConsensusPeer> = paths
+                        .get(&(index, target))
+                        .expect("reopened loopback path")
+                        .clone();
+                    (node_ids[target], peer)
+                })
+                .collect::<BTreeMap<_, _>>();
+            stores.push(
+                ConsensusSessionStore::open_with_clock(
+                    topologies[index].clone(),
+                    backends[index].clone(),
+                    directory.path().join(format!("snapshots-{index}")),
+                    peers,
+                    Arc::new(SystemClock),
+                    operation_timeout,
+                )
+                .await
+                .expect("reopen consensus node"),
+            );
+        }
+        let cluster = Self {
+            paths,
+            stores,
+            _backends: backends,
+            _directory: directory,
+            _test_permit: test_permit,
+        };
+        for ((_, target), path) in &cluster.paths {
+            path.install(cluster.stores[*target].rpc_handler());
+        }
+        let initialize = cluster
+            .stores
+            .iter()
+            .map(ConsensusSessionStore::initialize_cluster)
+            .collect::<Vec<_>>();
+        for result in futures_util::future::join_all(initialize).await {
+            result.expect("re-admit reopened initialized member");
+        }
+        cluster
+            .wait_all_ready(CLUSTER_START_TIMEOUT)
+            .await
+            .expect("reopened cluster reaches durable readiness");
+        cluster
+    }
+
+    /// Drop all stores, backends, and loopback handler references before a
+    /// raw SQLite corruption fixture opens the persistent files.
+    fn close_into_directory(mut self) -> TempDir {
+        for path in self.paths.values() {
+            path.clear_handler();
+        }
+        self.stores.clear();
+        self._backends.clear();
+        std::mem::replace(
+            &mut self._directory,
+            tempfile::tempdir().expect("replacement fleet directory"),
+        )
+    }
+
     async fn wait_all_ready(&self, deadline: Duration) -> Result<(), ()> {
         tokio::time::timeout(deadline, async {
             loop {
@@ -6271,4 +6378,205 @@ async fn managed_provider_finalize_forwarded_by_a_stale_follower_waits_for_its_e
         .expect("accepted terminal replay");
     assert_eq!(replay.phase(), ManagedProviderJobMemberPhase::Established);
     assert_no_provider_io(&replay_provider);
+}
+
+#[tokio::test]
+async fn reopened_persisted_managed_v5_corruption_fails_closed_without_fabricating_authority() {
+    #[derive(Clone, Copy)]
+    enum Corruption {
+        MissingAuthority,
+        MissingOwnedJob,
+    }
+
+    for corruption in [Corruption::MissingAuthority, Corruption::MissingOwnedJob] {
+        let cluster =
+            TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+                .await;
+        let (leader, _, _) = cluster.observed_leader();
+        let scope = cluster.stores[leader]
+            .consumer_scope()
+            .expect("current consumer scope");
+        let marker = match corruption {
+            Corruption::MissingAuthority => 0xa1,
+            Corruption::MissingOwnedJob => 0xa2,
+        };
+        activate_managed_provider_adapter_roster(&cluster.stores[leader], scope, marker).await;
+        let worker = SessionConsumerIdentity::new(format!(
+            "spiffe://managed-adapter/reopen-corruption-{marker:02x}"
+        ))
+        .expect("worker identity");
+        let admission = admit_managed_provider_adapter_roster(
+            &cluster.stores[leader],
+            scope,
+            &worker,
+            managed_provider_adapter_admission(marker.wrapping_add(1), 1),
+        )
+        .await;
+        let ordinal = FencedMutationRosterOrdinal::new(0).expect("test ordinal");
+        let provider = ManagedProviderAdapterDouble::applied();
+        let terminal = cluster.stores[leader]
+            .managed_provider_job_facade(
+                scope,
+                worker.clone(),
+                [marker.wrapping_add(2); 32],
+                [marker.wrapping_add(3); 32],
+                provider.clone(),
+                ManagedProviderAdapterVerifier,
+            )
+            .expect("construct committed V5 facade")
+            .run_member(
+                admission.clone(),
+                Box::new([marker.wrapping_add(4)]),
+                ordinal,
+            )
+            .await
+            .expect("commit managed V5 terminal before corruption");
+        assert_eq!(terminal.mode(), ManagedProviderJobMode::ManagedV5);
+        assert_eq!(terminal.phase(), ManagedProviderJobMemberPhase::Established);
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+
+        // Every Raft/store/backend handle is dropped before the raw persistent
+        // fixture opens an image. The terminal operation is copied verbatim;
+        // only one V5 proof component is removed from every voter.
+        let request_id = admission.request_id().to_bytes();
+        let directory = cluster.close_into_directory();
+        let mut terminal_evidence = None;
+        for index in 0..MEMBER_COUNT {
+            let connection =
+                rusqlite::Connection::open(directory.path().join(format!("node-{index}.sqlite")))
+                    .expect("open closed voter SQLite image");
+            let evidence = connection
+                .query_row(
+                    "SELECT phase, terminal_digest, terminal_result_digest \
+                     FROM consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
+                    params![request_id.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    },
+                )
+                .expect("read exact committed terminal evidence");
+            assert_eq!(evidence.0, 2, "fixture starts from a terminal roster");
+            if let Some(previous) = &terminal_evidence {
+                assert_eq!(previous, &evidence, "all voters persist the same terminal");
+            } else {
+                terminal_evidence = Some(evidence);
+            }
+            let (phase, attempt, receipt, outcome): (i64, i64, Option<Vec<u8>>, Option<i64>) =
+                connection
+                    .query_row(
+                        "SELECT phase, attempt_fence, receipt_digest, outcome \
+                         FROM consensus_fenced_mutation_roster_managed_provider_jobs \
+                         WHERE request_id = ?1 AND ordinal = 0",
+                        params![request_id.as_slice()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .expect("fixture has an owned terminal V5 job");
+            assert_eq!(phase, 4);
+            assert!(attempt > 0 && receipt.is_some() && outcome.is_some());
+            match corruption {
+                Corruption::MissingAuthority => {
+                    connection
+                        .execute(
+                            "DELETE FROM consensus_fenced_mutation_roster_managed_provider_authorities \
+                             WHERE request_id = ?1",
+                            params![request_id.as_slice()],
+                        )
+                        .expect("remove only persisted V5 authority");
+                }
+                Corruption::MissingOwnedJob => {
+                    connection
+                        .execute(
+                            "DELETE FROM consensus_fenced_mutation_roster_managed_provider_jobs \
+                             WHERE request_id = ?1 AND ordinal = 0",
+                            params![request_id.as_slice()],
+                        )
+                        .expect("remove only one required V5 job");
+                }
+            }
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .expect("checkpoint corrupt closed fixture");
+        }
+
+        let reopened =
+            TestCluster::reopen(directory, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT).await;
+        let (reopened_leader, _, _) = reopened.observed_leader();
+        let reopened_provider = ManagedProviderAdapterDouble::applied();
+        let facade = reopened.stores[reopened_leader]
+            .managed_provider_job_facade(
+                scope,
+                worker,
+                [marker.wrapping_add(2); 32],
+                [marker.wrapping_add(3); 32],
+                reopened_provider.clone(),
+                ManagedProviderAdapterVerifier,
+            )
+            .expect("construct public reopened facade");
+        assert_eq!(
+            facade.job_status(admission.clone(), ordinal).await,
+            Err(ManagedProviderJobError::Unavailable),
+            "partial V5 evidence must fail closed through the public facade"
+        );
+        assert_eq!(
+            facade
+                .run_member(
+                    admission.clone(),
+                    Box::new([marker.wrapping_add(4)]),
+                    ordinal
+                )
+                .await,
+            Err(ManagedProviderJobError::Unavailable),
+            "a damaged V5 terminal must not be reconstructed or executed"
+        );
+        assert_no_provider_io(&reopened_provider);
+
+        let directory = reopened.close_into_directory();
+        for index in 0..MEMBER_COUNT {
+            let connection =
+                rusqlite::Connection::open(directory.path().join(format!("node-{index}.sqlite")))
+                    .expect("inspect reopened voter SQLite image");
+            let evidence: (i64, Vec<u8>, Vec<u8>) = connection
+                .query_row(
+                    "SELECT phase, terminal_digest, terminal_result_digest \
+                     FROM consensus_fenced_mutation_roster_operations WHERE request_id = ?1",
+                    params![request_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("preserve committed predecessor evidence");
+            assert_eq!(Some(evidence), terminal_evidence);
+            let authority_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_fenced_mutation_roster_managed_provider_authorities \
+                     WHERE request_id = ?1",
+                    params![request_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("count V5 authorities after public rejection");
+            let job_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_fenced_mutation_roster_managed_provider_jobs \
+                     WHERE request_id = ?1",
+                    params![request_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("count V5 jobs after public rejection");
+            match corruption {
+                Corruption::MissingAuthority => {
+                    assert_eq!(
+                        authority_count, 0,
+                        "public status cannot fabricate authority"
+                    );
+                    assert_eq!(job_count, 1, "owned receipt evidence remains intact");
+                }
+                Corruption::MissingOwnedJob => {
+                    assert_eq!(authority_count, 1, "authority remains exact and unmodified");
+                    assert_eq!(job_count, 0, "public status cannot fabricate a missing job");
+                }
+            }
+        }
+    }
 }
