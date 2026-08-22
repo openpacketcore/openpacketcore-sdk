@@ -2436,6 +2436,7 @@ struct Fleet {
     canary_values: Vec<String>,
     candidate_evidence_inputs: CandidateEvidenceInputs,
     candidate_public_material_manifest: CandidatePublicMaterialManifest,
+    readiness_probe_commands: usize,
 }
 
 impl Fleet {
@@ -2613,6 +2614,7 @@ impl Fleet {
             canary_values: Vec::new(),
             candidate_evidence_inputs,
             candidate_public_material_manifest,
+            readiness_probe_commands: 0,
         };
         fleet.wait_ready();
         fleet.assert_all_material_ready();
@@ -2676,6 +2678,10 @@ impl Fleet {
         node_indices: &[usize],
         deadline: Instant,
     ) -> Vec<FleetReadiness> {
+        self.readiness_probe_commands = self
+            .readiness_probe_commands
+            .checked_add(node_indices.len())
+            .expect("readiness probe command count overflow");
         for node_index in node_indices {
             self.nodes[*node_index].send(&QualificationNodeCommand::Probe);
         }
@@ -5283,6 +5289,7 @@ impl Fleet {
             "replacement-canary-verification",
             recovery_deadline,
         );
+        let readiness_probe_commands_before_settlement = self.readiness_probe_commands;
         let (lifecycle_before, clean_traffic_baseline) = self
             .wait_for_recovery_fault_outcomes_to_settle(RecoveryFaultSettlementContext {
                 before: fault_lifecycle_before,
@@ -5293,6 +5300,10 @@ impl Fleet {
                 traffic_before: traffic_availability_baseline,
                 traffic_progress,
             });
+        assert_eq!(
+            self.readiness_probe_commands, readiness_probe_commands_before_settlement,
+            "fault-outcome settlement must not issue readiness commands through the lanes whose outcomes it measures"
+        );
         let started = Instant::now();
         let deadline = started + Duration::from_millis(QUALIFICATION_TRAFFIC_TRANSITION_MILLIS);
         self.reauthenticate_recovered_member_and_prove_paths(member);

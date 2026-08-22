@@ -248,11 +248,12 @@ required warm fixed-pool primitive for #695/ePDG latency. Production deployments
 that require warm reuse should use it. Both use mutual TLS with the unchanged
 `opc-session-consumer/1` ALPN and exact consumer transport revision 3. The
 additive V2 fenced-transition family instead uses only
-`opc-session-consumer/2` with transport revision 4. A V2 offer never falls
+`opc-session-consumer/2` with transport revision 5. A V2 offer never falls
 back to V1, and neither revision reuses the other's authenticated connection,
 Hello, or JSON envelope. A listener may provision both exact ALPNs during a
-cutover, but a V2-only operation requires a revision-4-capable listener and
-client; a V1-only peer fails before dispatch. Deploy listener support and any
+cutover, but a V2-only operation requires a revision-5-capable listener and
+client; the server rejects every other V2 revision before dispatch, and a
+V1-only peer fails before dispatch. Deploy listener support and any
 required V2 store/journal provisioning before enabling the explicit V2 API,
 then drain V2 callers before removing it. This is coexistence of separate
 protocols, not dual-mode negotiation or mixed-revision equivalence.
@@ -299,7 +300,7 @@ capacity.
 
 `PersistentSessionConsumerClient` keeps an additional, independent fixed V2
 request pool of the same configured width. `prewarm_v2` establishes those
-revision-4 lanes without a V2 operation, `execute_v2` uses only a V2 lane, and
+revision-5 lanes without a V2 operation, `execute_v2` uses only a V2 lane, and
 `v2_diagnostics` reports only that pool's redaction-safe counters. Each V1 or
 V2 lane still permits one in-flight request. Their queues and sockets are
 never cross-reused, but both pools share a bounded physical request-admission

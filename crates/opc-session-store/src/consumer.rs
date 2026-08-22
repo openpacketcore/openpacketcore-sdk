@@ -439,7 +439,7 @@ impl fmt::Debug for SessionConsumerRequest {
     }
 }
 
-/// Explicit revision-4-only operations for the V2 fenced-transition
+/// Explicit revision-5-only operations for the V2 fenced-transition
 /// contract.
 ///
 /// This is deliberately a distinct request family rather than variants on
@@ -534,7 +534,7 @@ impl SessionConsumerV2Operation {
     }
 }
 
-/// One scope-bound revision-4 V2 consumer request.
+/// One scope-bound revision-5 V2 consumer request.
 ///
 /// V2 execute/status retain the full 56-byte V2 request identity outside the
 /// operation body as well as inside it. The duplicated value is intentional:
@@ -550,7 +550,7 @@ pub struct SessionConsumerV2Request {
 }
 
 impl SessionConsumerV2Request {
-    /// Construct an exact revision-4 V2 request.
+    /// Construct an exact revision-5 V2 request.
     pub fn new(scope: SessionConsumerScope, operation: SessionConsumerV2Operation) -> Self {
         let request_id = operation.request_id();
         Self {
@@ -573,7 +573,7 @@ impl SessionConsumerV2Request {
         self.request_id
     }
 
-    /// Typed revision-4-only operation.
+    /// Typed revision-5-only operation.
     pub const fn operation(&self) -> &SessionConsumerV2Operation {
         &self.operation
     }
@@ -654,7 +654,7 @@ impl From<StoreError> for SessionConsumerStoreError {
             | StoreError::FencedTransitionStorageExhausted
             // These V2-only errors are unreachable through revision 3's V1
             // dispatch. Keep the frozen V1 family closed if a faulty backend
-            // nevertheless leaks one across that boundary; revision 4 maps
+            // nevertheless leaks one across that boundary; revision 5 maps
             // them with `SessionConsumerV2FencedTransitionError` instead.
             | StoreError::FencedTransitionHistoryEpochRetired
             | StoreError::FencedTransitionHistoryEpochNotActive => Self::CapabilityNotSupported,
@@ -807,7 +807,7 @@ pub enum SessionConsumerFencedTransitionError {
     StorageExhausted,
 }
 
-/// Revision-4-only safe error family for V2 execution.
+/// Revision-5-only safe error family for V2 execution.
 ///
 /// It is separate from the frozen V1 receipt error enum: V2 can retire a
 /// bounded epoch and can be temporarily inactive while a new epoch is being
@@ -883,7 +883,7 @@ impl From<StoreError> for SessionConsumerV2FencedTransitionError {
 }
 
 impl SessionConsumerV2FencedTransitionError {
-    /// Whether this error has the fixed revision-4 wire representation.
+    /// Whether this error has the fixed revision-5 wire representation.
     ///
     /// All closed discriminants are wire-valid. The payload-too-large form is
     /// the sole structured variant, so it must retain the frozen maximum and
@@ -1162,7 +1162,7 @@ impl From<FencedTransitionStatus> for SessionConsumerFencedTransitionStatus {
 ///
 /// Unlike the storage-domain [`FencedTransitionV2Status`], a recorded error
 /// here cannot carry backend diagnostics, platform-sized fields, or future
-/// unconstrained store variants across the revision-4 consumer transport.
+/// unconstrained store variants across the revision-5 consumer transport.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -1442,7 +1442,7 @@ pub enum SessionConsumerResponse {
     Rejected(SessionConsumerRejection),
 }
 
-/// Typed response carried only by the revision-4 V2 consumer lane.
+/// Typed response carried only by the revision-5 V2 consumer lane.
 ///
 /// This intentionally does not extend [`SessionConsumerResponse`]: adding a
 /// V2 response discriminator there would allow a revision-3 decoder to
@@ -1536,7 +1536,7 @@ pub trait SessionQuorumConsumer: Send + Sync {
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse;
 
-    /// Execute one authenticated revision-4 V2 request.
+    /// Execute one authenticated revision-5 V2 request.
     ///
     /// The default does no backend work and keeps an existing V1-only quorum
     /// implementation fail-closed on the new lane. Implementations that
