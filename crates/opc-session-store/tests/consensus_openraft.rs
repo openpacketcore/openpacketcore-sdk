@@ -1260,6 +1260,17 @@ impl TestCluster {
     /// Reopen the retained voter files through the public production `open`
     /// constructor, rather than the deterministic-clock test constructor.
     async fn reopen_path_backed_voters_through_production_open(&mut self) {
+        self.try_reopen_path_backed_voters_through_production_open()
+            .await
+            .expect("production-open closed consensus voter");
+    }
+
+    /// Attempt the public production reopen while preserving the exact
+    /// file-backed fleet for a caller that needs to observe fail-closed open
+    /// validation.
+    async fn try_reopen_path_backed_voters_through_production_open(
+        &mut self,
+    ) -> Result<(), opc_session_store::ConsensusSessionStoreOpenError> {
         assert!(
             self.stores.is_empty() && self._backends.is_empty(),
             "production reopen requires all prior consensus and SQLite handles to be closed"
@@ -1312,8 +1323,7 @@ impl TestCluster {
                     self._directory.path().join(format!("snapshots-{index}")),
                     peers,
                 )
-                .await
-                .expect("production-open closed consensus voter"),
+                .await?,
             );
         }
         for ((_, target), path) in &self.paths {
@@ -1327,11 +1337,12 @@ impl TestCluster {
             .map(ConsensusSessionStore::initialize_cluster)
             .collect::<Vec<_>>();
         for result in futures_util::future::join_all(initialized).await {
-            result.expect("reopen existing production cluster membership");
+            result?;
         }
         self.wait_all_ready(CLUSTER_START_TIMEOUT)
             .await
-            .expect("production-reopened voters regain durable readiness");
+            .map_err(|_| opc_session_store::ConsensusSessionStoreOpenError::RecoveryRequired)?;
+        Ok(())
     }
 
     fn observed_leader(&self) -> (usize, SessionConsensusNodeId, u64) {
@@ -6577,6 +6588,197 @@ async fn managed_provider_facade_reopens_closed_format_seven_voters_through_prod
         "the facade replay returns the exact persisted committed status"
     );
     assert_no_provider_io(&persisted_provider);
+}
+
+#[tokio::test]
+async fn reopened_format_eight_managed_terminal_phase_bindings_fail_closed() {
+    #[derive(Clone, Copy)]
+    enum Corruption {
+        EstablishedOperationWithAbortedJobs,
+        AbortedOperationWithEstablishedJobs,
+    }
+
+    for corruption in [
+        Corruption::EstablishedOperationWithAbortedJobs,
+        Corruption::AbortedOperationWithEstablishedJobs,
+    ] {
+        let mut cluster = TestCluster::start().await;
+        let (leader, _, _) = cluster.observed_leader();
+        let scope = cluster.stores[leader]
+            .consumer_scope()
+            .expect("current consumer scope");
+        activate_managed_provider_adapter_roster(&cluster.stores[leader], scope, 0xb4).await;
+
+        // Begin from the exact published format-seven file layout, then use
+        // only the public production open path to upgrade to the V5 tables.
+        cluster.close_path_backed_voters();
+        stage_closed_published_format_seven_voters(&cluster);
+        cluster
+            .reopen_path_backed_voters_through_production_open()
+            .await;
+        let (leader, _, _) = cluster.observed_leader();
+        let scope = cluster.stores[leader]
+            .consumer_scope()
+            .expect("upgraded consumer scope");
+
+        let marker = match corruption {
+            Corruption::EstablishedOperationWithAbortedJobs => 0xb5,
+            Corruption::AbortedOperationWithEstablishedJobs => 0xc5,
+        };
+        let worker = SessionConsumerIdentity::new(format!(
+            "spiffe://managed-adapter/phase-binding-corruption-{marker:02x}"
+        ))
+        .expect("worker identity");
+        let admission = admit_managed_provider_adapter_roster(
+            &cluster.stores[leader],
+            scope,
+            &worker,
+            managed_provider_adapter_admission(marker, 1),
+        )
+        .await;
+        let provider = match corruption {
+            Corruption::EstablishedOperationWithAbortedJobs => {
+                ManagedProviderAdapterDouble::applied()
+            }
+            Corruption::AbortedOperationWithEstablishedJobs => {
+                ManagedProviderAdapterDouble::compensated()
+            }
+        };
+        let ordinal = FencedMutationRosterOrdinal::new(0).expect("only ordinal");
+        let terminal = cluster.stores[leader]
+            .managed_provider_job_facade(
+                scope,
+                worker.clone(),
+                [marker.wrapping_add(1); 32],
+                [marker.wrapping_add(2); 32],
+                provider.clone(),
+                ManagedProviderAdapterVerifier,
+            )
+            .expect("construct committed V5 facade")
+            .run_member(
+                admission.clone(),
+                Box::new([marker.wrapping_add(3)]),
+                ordinal,
+            )
+            .await
+            .expect("commit managed V5 terminal before corruption");
+        let expected_phase = match corruption {
+            Corruption::EstablishedOperationWithAbortedJobs => {
+                ManagedProviderJobMemberPhase::Established
+            }
+            Corruption::AbortedOperationWithEstablishedJobs => {
+                ManagedProviderJobMemberPhase::Aborted
+            }
+        };
+        assert_eq!(terminal.mode(), ManagedProviderJobMode::ManagedV5);
+        assert_eq!(terminal.phase(), expected_phase);
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+
+        let request_id = admission.request_id().to_bytes();
+        cluster.close_path_backed_voters();
+        for index in 0..MEMBER_COUNT {
+            let connection = rusqlite::Connection::open(
+                cluster
+                    ._directory
+                    .path()
+                    .join(format!("node-{index}.sqlite")),
+            )
+            .expect("open closed format-eight voter");
+            let (operation_phase, job_phase, outcome): (i64, i64, i64) = connection
+                .query_row(
+                    "SELECT operation.phase, job.phase, job.outcome \
+                     FROM consensus_fenced_mutation_roster_operations AS operation \
+                     JOIN consensus_fenced_mutation_roster_managed_provider_jobs AS job \
+                       ON job.request_id = operation.request_id \
+                     WHERE operation.request_id = ?1 AND job.ordinal = 0",
+                    params![request_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read exact terminal V5 binding");
+            match corruption {
+                Corruption::EstablishedOperationWithAbortedJobs => {
+                    assert_eq!((operation_phase, job_phase, outcome), (2, 4, 0));
+                    connection
+                        .execute(
+                            "UPDATE consensus_fenced_mutation_roster_managed_provider_jobs \
+                             SET phase = 5, outcome = 3 \
+                             WHERE request_id = ?1",
+                            params![request_id.as_slice()],
+                        )
+                        .expect("corrupt only established terminal job binding");
+                }
+                Corruption::AbortedOperationWithEstablishedJobs => {
+                    assert_eq!((operation_phase, job_phase, outcome), (3, 5, 3));
+                    connection
+                        .execute(
+                            "UPDATE consensus_fenced_mutation_roster_managed_provider_jobs \
+                             SET phase = 4, outcome = 0 \
+                             WHERE request_id = ?1",
+                            params![request_id.as_slice()],
+                        )
+                        .expect("corrupt only aborted terminal job binding");
+                }
+            }
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .expect("checkpoint corrupt closed voter");
+        }
+
+        let reopened = cluster
+            .try_reopen_path_backed_voters_through_production_open()
+            .await;
+        assert!(
+            matches!(
+                reopened,
+                Err(opc_session_store::ConsensusSessionStoreOpenError::RecoveryRequired)
+            ),
+            "public production open must reject cross-bound terminal corruption: {reopened:?}"
+        );
+
+        for index in 0..MEMBER_COUNT {
+            let connection = rusqlite::Connection::open(
+                cluster
+                    ._directory
+                    .path()
+                    .join(format!("node-{index}.sqlite")),
+            )
+            .expect("inspect rejected format-eight voter");
+            let (operation_phase, job_phase, outcome): (i64, i64, i64) = connection
+                .query_row(
+                    "SELECT operation.phase, job.phase, job.outcome \
+                     FROM consensus_fenced_mutation_roster_operations AS operation \
+                     JOIN consensus_fenced_mutation_roster_managed_provider_jobs AS job \
+                       ON job.request_id = operation.request_id \
+                     WHERE operation.request_id = ?1 AND job.ordinal = 0",
+                    params![request_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read rejected terminal binding");
+            match corruption {
+                Corruption::EstablishedOperationWithAbortedJobs => {
+                    assert_eq!((operation_phase, job_phase, outcome), (2, 5, 3));
+                }
+                Corruption::AbortedOperationWithEstablishedJobs => {
+                    assert_eq!((operation_phase, job_phase, outcome), (3, 4, 0));
+                }
+            }
+        }
+        assert_eq!(
+            provider.execute_calls.load(Ordering::SeqCst),
+            1,
+            "rejected reopen performs no additional provider execution"
+        );
+        assert_eq!(
+            provider.status_calls.load(Ordering::SeqCst),
+            0,
+            "rejected reopen performs no provider status I/O"
+        );
+        assert_eq!(
+            provider.adopt_calls.load(Ordering::SeqCst),
+            0,
+            "rejected reopen performs no provider adoption I/O"
+        );
+    }
 }
 
 #[tokio::test]
