@@ -59,7 +59,8 @@ pub const DEFAULT_MANAGED_PROVIDER_POOL_RESPONSE_BYTES: usize = 1024;
 pub const MAX_MANAGED_PROVIDER_SERVER_CONNECTIONS: usize = Semaphore::MAX_PERMITS;
 
 // This is the exact JSON frame length for simultaneously maximal legal V5
-// fields: 8 members × 4096-byte descriptors, 1024-byte owner, 1 MiB plan,
+// fields: 8 members × 4096-byte descriptors, 128 NUL-byte owner (JSON's
+// longest legal string escaping), 1 MiB plan,
 // 16 KiB terminal result, and a second 1 MiB checkpoint, including each
 // closed-envelope byte. The maximum-legal-frame test derives this value from
 // those source profile maxima. Peers prove it in Hello instead of silently
