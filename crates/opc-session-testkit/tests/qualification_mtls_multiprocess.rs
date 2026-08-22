@@ -9506,7 +9506,7 @@ fn run_persistent_consumer_multiprocess_qualification(member_count: usize) {
     emit_current_persistent_consumer_head_evidence(member_count, measurements);
 }
 
-// The revision-4 lane deliberately uses its own ALPN and request envelope.
+// The revision-5 lane deliberately uses its own ALPN and request envelope.
 // This is a compact real-network recovery qualification, not a synthetic
 // backend exercise: every operation crosses projected-SVID mTLS into an
 // independently running OpenRaft/SQLite voter.
