@@ -344,6 +344,7 @@ pub(crate) struct SessionSnapshotFile {
     position: u64,
     length: u64,
     receiving: bool,
+    seek_in_flight: bool,
 }
 
 #[allow(dead_code)]
@@ -409,6 +410,7 @@ impl SessionSnapshotFile {
             position: 0,
             length,
             receiving,
+            seek_in_flight: false,
         })
     }
 
@@ -459,8 +461,22 @@ impl SessionSnapshotFile {
 
     /// Flush both file content and metadata before promotion.
     pub(crate) async fn sync_all(&mut self) -> io::Result<()> {
-        self.file.flush().await?;
+        self.flush().await?;
         self.file.sync_all().await
+    }
+
+    fn poll_complete_submitted_seek(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.seek_in_flight {
+            return Poll::Ready(Ok(()));
+        }
+        match self.as_mut().poll_complete(cx) {
+            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -555,6 +571,11 @@ impl AsyncRead for SessionSnapshotFile {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        match self.as_mut().poll_complete_submitted_seek(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         let before = buf.filled().len();
         match Pin::new(&mut self.file).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
@@ -589,6 +610,11 @@ impl AsyncWrite for SessionSnapshotFile {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        match self.as_mut().poll_complete_submitted_seek(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         if self.receiving && self.position != self.length {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -642,6 +668,11 @@ impl AsyncWrite for SessionSnapshotFile {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        match self.as_mut().poll_complete_submitted_seek(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         Pin::new(&mut self.file).poll_flush(cx)
     }
 
@@ -649,12 +680,20 @@ impl AsyncWrite for SessionSnapshotFile {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        match self.as_mut().poll_complete_submitted_seek(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         Pin::new(&mut self.file).poll_shutdown(cx)
     }
 }
 
 impl AsyncSeek for SessionSnapshotFile {
     fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        if self.seek_in_flight {
+            return Err(io::Error::other("snapshot seek is already in progress"));
+        }
         let target = match position {
             io::SeekFrom::Start(offset) => i128::from(offset),
             io::SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
@@ -673,6 +712,7 @@ impl AsyncSeek for SessionSnapshotFile {
             )
         })?;
         Pin::new(&mut self.file).start_seek(io::SeekFrom::Start(target))?;
+        self.seek_in_flight = true;
         Ok(())
     }
 
@@ -680,12 +720,20 @@ impl AsyncSeek for SessionSnapshotFile {
         match Pin::new(&mut self.file).poll_complete(cx) {
             Poll::Ready(Ok(position)) if position <= SNAPSHOT_MAX_ENVELOPE_BYTES => {
                 self.position = position;
+                self.seek_in_flight = false;
                 Poll::Ready(Ok(position))
             }
-            Poll::Ready(Ok(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "snapshot seek exceeds the maximum envelope size",
-            ))),
+            Poll::Ready(Ok(_)) => {
+                self.seek_in_flight = false;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "snapshot seek exceeds the maximum envelope size",
+                )))
+            }
+            Poll::Ready(Err(error)) => {
+                self.seek_in_flight = false;
+                Poll::Ready(Err(error))
+            }
             pending => pending,
         }
     }
@@ -820,6 +868,7 @@ mod tests {
         let original = b"original snapshot";
         let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
         snapshot.write_all(original).await?;
+        snapshot.sync_all().await?;
         snapshot.rewind().await?;
 
         let error = snapshot
