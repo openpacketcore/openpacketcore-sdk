@@ -2442,6 +2442,7 @@ struct Fleet {
     canary_values: Vec<String>,
     candidate_evidence_inputs: CandidateEvidenceInputs,
     candidate_public_material_manifest: CandidatePublicMaterialManifest,
+    readiness_probe_commands: usize,
 }
 
 impl Fleet {
@@ -2619,6 +2620,7 @@ impl Fleet {
             canary_values: Vec::new(),
             candidate_evidence_inputs,
             candidate_public_material_manifest,
+            readiness_probe_commands: 0,
         };
         fleet.wait_ready();
         fleet.assert_all_material_ready();
@@ -2682,6 +2684,10 @@ impl Fleet {
         node_indices: &[usize],
         deadline: Instant,
     ) -> Vec<FleetReadiness> {
+        self.readiness_probe_commands = self
+            .readiness_probe_commands
+            .checked_add(node_indices.len())
+            .expect("readiness probe command count overflow");
         for node_index in node_indices {
             self.nodes[*node_index].send(&QualificationNodeCommand::Probe);
         }
@@ -3601,8 +3607,12 @@ impl Fleet {
         let observed_at = Instant::now();
         let mut stable_since = observed_at;
         let mut server_tail_entered = observed_at >= server_tail_deadline;
-        let node_indices = (0..self.member_count()).collect::<Vec<_>>();
 
+        // The caller has just established all-voter readiness, and the next
+        // recovered-member phase establishes it again after this clean
+        // baseline. Do not issue readiness probes inside this interval: a
+        // probe uses the same authenticated consensus lanes whose terminal
+        // outcomes this loop is required to account for.
         loop {
             let traffic = self.traffic_status_snapshots_on_by(
                 &participants.observers,
@@ -3682,29 +3692,6 @@ impl Fleet {
                 traffic_progress.record_coverage(traffic.clone(), traffic_observed_at);
             }
 
-            let member_count = self.member_count();
-            let required_quorum = self.required_quorum();
-            let readiness_deadline = self.recovery_readiness_probe_deadline(
-                traffic_before,
-                &mut traffic_progress,
-                participants,
-                phase,
-                deadline,
-            );
-            let readiness = self.readiness_reports_by(&node_indices, readiness_deadline);
-            assert!(
-                readiness.iter().all(|report| {
-                    report.ready
-                        && report.reason_code == QualificationReadinessCode::Ready
-                        && report.configured_voters == member_count
-                        && report.fresh_reachable_voters == required_quorum
-                        && report.agreeing_voters == required_quorum
-                        && report.required_quorum == required_quorum
-                }),
-                "fleet readiness regressed while flushing fault-era connection outcomes: phase={phase}, readiness={readiness:?}, stderr={:?}",
-                self.stderr_diagnostics()
-            );
-
             lifecycle = self.all_lifecycle_metrics_by(traffic_progress.next_deadline(deadline));
             for (node_index, (fault_before, current)) in before.iter().zip(&lifecycle).enumerate() {
                 assert!(
@@ -3781,7 +3768,7 @@ impl Fleet {
             }
             assert!(
                 deadline_allows_completion(now, deadline),
-                "fault-era connection outcomes did not settle before the recovery baseline: phase={phase}, server_tail_window={server_tail_window:?}, outbound_quiet_window={outbound_quiet_window:?}, elapsed={:?}, outbound_stable_for={outbound_stable_for:?}, readiness={readiness:?}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                "fault-era connection outcomes did not settle before the recovery baseline: phase={phase}, server_tail_window={server_tail_window:?}, outbound_quiet_window={outbound_quiet_window:?}, elapsed={:?}, outbound_stable_for={outbound_stable_for:?}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
                 now.duration_since(started),
                 self.stderr_diagnostics()
             );
@@ -5308,6 +5295,7 @@ impl Fleet {
             "replacement-canary-verification",
             recovery_deadline,
         );
+        let readiness_probe_commands_before_settlement = self.readiness_probe_commands;
         let (lifecycle_before, clean_traffic_baseline) = self
             .wait_for_recovery_fault_outcomes_to_settle(RecoveryFaultSettlementContext {
                 before: fault_lifecycle_before,
@@ -5318,6 +5306,10 @@ impl Fleet {
                 traffic_before: traffic_availability_baseline,
                 traffic_progress,
             });
+        assert_eq!(
+            self.readiness_probe_commands, readiness_probe_commands_before_settlement,
+            "fault-outcome settlement must not issue readiness commands through the lanes whose outcomes it measures"
+        );
         let started = Instant::now();
         let deadline = started + Duration::from_millis(QUALIFICATION_TRAFFIC_TRANSITION_MILLIS);
         self.reauthenticate_recovered_member_and_prove_paths(member);

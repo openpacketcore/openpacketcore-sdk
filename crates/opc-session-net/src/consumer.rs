@@ -79,6 +79,8 @@ pub const SESSION_QUORUM_CONSUMER_V2_ALPN: &[u8] = b"opc-session-consumer/2";
 pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 4;
 
 /// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_V2_ALPN`].
+///
+/// The V2 server rejects every other Hello revision before dispatch.
 pub const SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION: u16 = 5;
 
 /// Maximum sequential application requests processed on one consumer

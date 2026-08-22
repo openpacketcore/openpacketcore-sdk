@@ -1722,7 +1722,7 @@ pending call may wait or age for at most 250 ms. Watches use two separate slots
 by default (at most 16 when configured), never consuming request-pool capacity.
 
 `PersistentSessionConsumerClient` has separate fixed V2 lanes of the same
-configured request width. `prewarm_v2` establishes revision-4 lanes without
+configured request width. `prewarm_v2` establishes revision-5 lanes without
 dispatching an operation, `execute_v2` dispatches only on a V2 lane, and
 `v2_diagnostics` reports only V2 redaction-safe pool state. V1 and V2 queues,
 sockets, and authenticated Hello exchanges are never cross-reused. Their

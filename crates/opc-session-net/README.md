@@ -252,7 +252,8 @@ additive V2 fenced-transition family instead uses only
 back to V1, and neither revision reuses the other's authenticated connection,
 Hello, or JSON envelope. A listener may provision both exact ALPNs during a
 cutover, but a V2-only operation requires a revision-5-capable listener and
-client; a V1-only peer fails before dispatch. Deploy listener support and any
+client; the server rejects every other V2 revision before dispatch, and a
+V1-only peer fails before dispatch. Deploy listener support and any
 required V2 store/journal provisioning before enabling the explicit V2 API,
 then drain V2 callers before removing it. This is coexistence of separate
 protocols, not dual-mode negotiation or mixed-revision equivalence.
