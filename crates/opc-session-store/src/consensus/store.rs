@@ -6708,8 +6708,12 @@ fn fenced_transition_v2_batch_outcomes_match_requests(
             .iter()
             .zip(outcomes)
             .all(|(request, outcome)| match outcome {
+                // A batch envelope can contain an exact retained replay
+                // alongside fresh work. The replay keeps its original
+                // profiled timestamp, which must not be later than this
+                // committed batch envelope.
                 Ok(outcome) => {
-                    fenced_transition_v2_outcome_matches_request(request, outcome, logical_time)
+                    outcome.recorded_at() <= logical_time && outcome.matches_v2_request(request)
                 }
                 Err(error) => committed_error_matches_intent(
                     &SessionMutationIntent::FencedTransitionV2(Box::new(request.clone())),
@@ -7006,6 +7010,16 @@ fn validate_consensus_command_preproposal(
             ));
         }
         for request in requests {
+            // A retained complete ID with a substituted body is a
+            // deterministic per-item conflict. Its nested record is not an
+            // independently admissible command payload, so do not let a
+            // malformed substitution override the conflict before apply.
+            if matches!(
+                request.validate(),
+                Err(StoreError::FencedTransitionRequestConflict)
+            ) {
+                continue;
+            }
             if let Some(record) = request.mutation().record() {
                 crate::sqlite::validate_consensus_record(record)?;
             }
@@ -7075,6 +7089,14 @@ fn validate_consensus_intent_with_recovery(
     if let SessionMutationIntent::FencedTransitionV2Batch(requests) = intent {
         validate_fenced_transition_v2_batch(requests)?;
         for request in requests {
+            // Keep the leader's generic validation aligned with SQLite apply:
+            // an exact V2 body conflict remains a committed per-item result.
+            if matches!(
+                request.validate(),
+                Err(StoreError::FencedTransitionRequestConflict)
+            ) {
+                continue;
+            }
             if let Some(record) = request.mutation().record() {
                 crate::sqlite::validate_consensus_record(record)?;
             }
@@ -10470,6 +10492,173 @@ mod membership_tests {
                 "fenced_transition_v2_batch_epoch_mismatch".into()
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn v2_batch_conflict_precedes_nested_record_validation() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let original = v2_create_request_for_supervision().await;
+        let altered = v2_request_with_same_id_different_body(&original);
+        assert_eq!(
+            altered.validate(),
+            Err(StoreError::FencedTransitionRequestConflict),
+            "the retained full ID must make this substituted body a conflict"
+        );
+        assert!(matches!(
+            crate::sqlite::validate_consensus_record(
+                altered
+                    .mutation()
+                    .record()
+                    .expect("altered V2 create record"),
+            ),
+            Err(StoreError::Crypto(_)),
+        ));
+
+        let directory = tempfile::tempdir().expect("V2 conflict batch directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("V2 conflict batch backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open V2 conflict batch store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize V2 conflict batch store");
+        let activated = store
+            .fenced_transition_v2_batch(vec![original])
+            .await
+            .expect("activate original V2 request");
+        let [Ok(activated)] = activated.as_slice() else {
+            panic!("original V2 request did not activate with an outcome");
+        };
+        let valid = FencedTransitionV2Request::new(
+            altered.request_id().epoch(),
+            FencedTransitionV2CallerNonce::from_bytes([0xD3; 16]),
+            FencedTransitionLease::renew(activated.lease().clone(), Duration::from_secs(60))
+                .expect("renewal lease for valid V2 batch suffix"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("valid V2 batch suffix");
+        let requests = vec![altered.clone(), valid.clone()];
+
+        let identity = singleton_topology()
+            .consensus_identity()
+            .expect("consensus identity");
+        let command = SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity,
+            request_id: fenced_transition_v2_batch_request_id(&requests).expect("batch request ID"),
+            logical_time: Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH),
+            intent: SessionMutationIntent::FencedTransitionV2Batch(requests.clone()),
+        };
+        assert!(
+            validate_consensus_command_preproposal(&command).is_ok(),
+            "leader preproposal must preserve the deterministic conflict"
+        );
+        assert!(
+            validate_consensus_intent(&command.intent).is_ok(),
+            "generic leader validation must preserve the deterministic conflict"
+        );
+        assert!(matches!(
+            store
+                .fenced_transition_v2_batch(requests)
+                .await
+                .expect("mixed V2 conflict batch"),
+            outcomes if matches!(outcomes.as_slice(), [
+                Err(StoreError::FencedTransitionRequestConflict),
+                Ok(_),
+            ])
+        ));
+    }
+
+    #[test]
+    fn v2_batch_exact_replay_resolves_with_original_recorded_at() {
+        let recorded_at = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let envelope_time = Timestamp::from_offset_datetime(
+            time::OffsetDateTime::UNIX_EPOCH
+                .checked_add(time::Duration::seconds(1))
+                .expect("later batch envelope time"),
+        );
+        let first = v2_test_request(1);
+        let second = FencedTransitionV2Request::new(
+            first.request_id().epoch(),
+            FencedTransitionV2CallerNonce::from_bytes([0x52; 16]),
+            first.lease().clone(),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("second V2 batch request");
+        let outcome = |request: &FencedTransitionV2Request, time| {
+            FencedTransitionOutcome::new(
+                LeaseGuard::new(
+                    request.lease().key().clone(),
+                    request.lease().owner().clone(),
+                    request.lease().committed_fence().expect("committed fence"),
+                    time,
+                    checked_session_deadline(time, request.lease().ttl())
+                        .expect("outcome lease deadline"),
+                    1,
+                ),
+                Generation::new(1),
+                FencedTransitionMutationResult::Deleted,
+                time,
+            )
+            .expect("matching V2 outcome")
+        };
+        let replay_first = outcome(&first, recorded_at);
+        let replay_second = outcome(&second, recorded_at);
+        let fresh_second = outcome(&second, envelope_time);
+        let response = |outcomes| SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+            sequence: 1,
+            digest: Some(crate::consensus::SessionConsensusEntryDigest::from_bytes(
+                [0xD4; 32],
+            )),
+            logical_time: Some(envelope_time),
+            raft_log_index: 1,
+        };
+        let requests = vec![first.clone(), second.clone()];
+        let request_ids = requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect::<Vec<_>>();
+
+        let all_replay = response(vec![Ok(replay_first.clone()), Ok(replay_second.clone())]);
+        assert!(
+            committed_response_matches_intent(
+                &SessionMutationIntent::FencedTransitionV2Batch(requests.clone()),
+                &all_replay,
+            ),
+            "an exact retained batch replay keeps every item's original timestamp"
+        );
+        assert!(matches!(
+            committed_fenced_transition_v2_batch_effect(
+                &request_ids,
+                &requests,
+                None,
+                all_replay,
+            ),
+            FencedTransitionV2Effect::Resolved(Ok(outcomes))
+                if outcomes == vec![Ok(replay_first.clone()), Ok(replay_second)]
+        ));
+
+        let mixed = response(vec![Ok(replay_first.clone()), Ok(fresh_second.clone())]);
+        assert!(
+            committed_response_matches_intent(
+                &SessionMutationIntent::FencedTransitionV2Batch(requests.clone()),
+                &mixed,
+            ),
+            "a replay may be ordered with a newly recorded batch item"
+        );
+        assert!(matches!(
+            committed_fenced_transition_v2_batch_effect(&request_ids, &requests, None, mixed),
+            FencedTransitionV2Effect::Resolved(Ok(outcomes))
+                if outcomes == vec![Ok(replay_first), Ok(fresh_second)]
+        ));
     }
 
     #[test]
