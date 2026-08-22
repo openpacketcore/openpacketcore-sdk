@@ -577,6 +577,7 @@ impl PersistentManagedProviderJobClient {
             frame,
             frame_bytes,
             deadline: tokio::time::Instant::now() + self.pool.config.queue_deadline,
+            inflight: false,
             reply: reply_tx,
             _pending: pending,
             _bytes: bytes,
@@ -725,6 +726,18 @@ impl Pool {
             .fetch_sub(bytes as u64, Ordering::Relaxed);
         self.counters.response_cells.fetch_sub(1, Ordering::Relaxed);
     }
+    fn mark_inflight(&self) {
+        self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+        let now = self.counters.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        high(&self.counters.inflight_high_water, now);
+    }
+    fn release_inflight(&self, bytes: usize) {
+        self.counters.inflight.fetch_sub(1, Ordering::Relaxed);
+        self.counters
+            .request_bytes
+            .fetch_sub(bytes as u64, Ordering::Relaxed);
+        self.counters.response_cells.fetch_sub(1, Ordering::Relaxed);
+    }
     fn update_readiness(&self) {
         let voters = self
             .warm
@@ -824,6 +837,7 @@ struct Job {
     frame: WireRequest,
     frame_bytes: usize,
     deadline: tokio::time::Instant,
+    inflight: bool,
     reply: oneshot::Sender<Result<ManagedProviderJobStatus, ManagedProviderClientError>>,
     _pending: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
@@ -992,7 +1006,11 @@ fn complete(
     job: Job,
     result: Result<ManagedProviderJobStatus, ManagedProviderClientError>,
 ) {
-    pool.release_enqueue(job.frame_bytes);
+    if job.inflight {
+        pool.release_inflight(job.frame_bytes);
+    } else {
+        pool.release_enqueue(job.frame_bytes);
+    }
     let _ = job.reply.send(result);
 }
 
@@ -1039,7 +1057,7 @@ async fn lane_worker(
                 continue;
             }
         };
-        while let Some(job) = jobs.recv().await {
+        while let Some(mut job) = jobs.recv().await {
             if matches!(Phase::load(&pool.phase), Phase::Forced | Phase::Stopped) {
                 pool.counters
                     .shutdown_forced
@@ -1053,8 +1071,8 @@ async fn lane_worker(
                 let _ = events.send(Event::Idle(index, generation, key)).await;
                 continue;
             }
-            let now = pool.counters.inflight.fetch_add(1, Ordering::Relaxed) + 1;
-            high(&pool.counters.inflight_high_water, now);
+            pool.mark_inflight();
+            job.inflight = true;
             let key = job.key;
             let result = call_on_lane(
                 &mut connection.0,
@@ -1064,7 +1082,6 @@ async fn lane_worker(
                 job.deadline,
             )
             .await;
-            pool.counters.inflight.fetch_sub(1, Ordering::Relaxed);
             match result {
                 Ok(value) => {
                     if Phase::load(&pool.phase) == Phase::Draining {
