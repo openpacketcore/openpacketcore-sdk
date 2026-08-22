@@ -77,7 +77,8 @@ qualification rather than being silently reduced.
 is retained only as the historical pre-successor three-voter artifact. It
 performed 131,074 unique attempts through Openraft and SQLite apply: 131,072
 admitted into epoch 1, one deterministic one-over rejection, and one
-successor-epoch commit after the then-required reclamation. It does not prove
+successor-epoch commit after immediate capacity rotation, with no reclamation.
+It does not prove
 the current active-plus-seven-replay lifecycle; the successor-scale release
 gate below is authoritative for that contract.
 
@@ -197,8 +198,8 @@ tree `fbccc8fd5546c6bdefc6aee54bfe0d36b1012f63`):
   committed unique transitions: 131,073
   epoch-1 bindings admitted: 131,072
   deterministic one-over rejections without business-state effect: 1
-  reclaimed bindings: 131,072 in ordered 1,024-row batches
-  successor-epoch transitions committed after reclamation: 1
+  reclaimed bindings: 0
+  successor-epoch transitions committed after immediate capacity rotation: 1
   transient exact-ID/body retries: 2,214
   database envelope: 2,182,756,256 bytes
   snapshot envelope: 2,077,053,072 bytes
@@ -250,7 +251,11 @@ when the quorum falls behind, so the emitted `achieved_ops_per_second` is the
 actual measured rate and must be published instead of inferred from the target
 rate. Because the last scheduled arrival still has to complete, the finite-run
 gate requires at least 99.9% of the offered rate as well as the latency SLO.
-In-flight batches remain no greater than production proposal admission.
+The emitted `peak_unjoined_batch_task_slots` is the peak `JoinSet::len()`
+after a batch task is submitted: batch task slots not yet joined, including a
+task that may already have completed. It remains no greater than production
+proposal admission, but does not measure simultaneously executing consensus
+calls.
 The 1,010,000-ID workload is followed by one separately reported fresh active
 epoch write during reclaim, which is lifecycle evidence rather than paced-load
 traffic.
