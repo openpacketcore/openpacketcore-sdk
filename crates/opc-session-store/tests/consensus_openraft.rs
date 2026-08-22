@@ -414,6 +414,65 @@ async fn terminalize_predecessor_adapter_roster(
     );
 }
 
+/// Stage the exact published format-seven layout only after every production
+/// SQLite/OpenRaft handle has closed. The next access is the public production
+/// open path, which validates and upgrades this on-disk image transactionally.
+fn stage_closed_published_format_seven_voters(cluster: &TestCluster) {
+    assert!(
+        cluster.stores.is_empty() && cluster._backends.is_empty(),
+        "format-seven staging is permitted only after every voter handle closes"
+    );
+    for index in 0..MEMBER_COUNT {
+        let connection = rusqlite::Connection::open(
+            cluster
+                ._directory
+                .path()
+                .join(format!("node-{index}.sqlite")),
+        )
+        .expect("open closed path-backed voter for exact format-seven staging");
+        connection
+            .execute_batch(
+                "DROP INDEX consensus_fenced_mutation_roster_managed_provider_jobs_recovery; \
+                 DROP TABLE consensus_fenced_mutation_roster_managed_provider_jobs; \
+                 DROP TABLE consensus_fenced_mutation_roster_managed_provider_authorities; \
+                 DROP TABLE consensus_fenced_mutation_roster_protocol_claims;",
+            )
+            .expect("remove only format-eight managed tables from closed voter");
+        connection
+            .execute(
+                "UPDATE consensus_identity SET schema_version = 7 WHERE singleton = 1",
+                [],
+            )
+            .expect("restore exact published format-seven marker");
+        let format: i64 = connection
+            .query_row(
+                "SELECT schema_version FROM consensus_identity WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect closed format-seven marker");
+        assert_eq!(
+            format, 7,
+            "closed voter has the published format-seven marker"
+        );
+        let managed_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ( \
+                    'consensus_fenced_mutation_roster_protocol_claims', \
+                    'consensus_fenced_mutation_roster_managed_provider_authorities', \
+                    'consensus_fenced_mutation_roster_managed_provider_jobs' \
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("verify no format-eight managed table remains on closed voter");
+        assert_eq!(
+            managed_tables, 0,
+            "format-seven source keeps no format-eight managed-provider table"
+        );
+    }
+}
+
 fn assert_no_provider_io(provider: &ManagedProviderAdapterDouble) {
     assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
     assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
@@ -1186,6 +1245,93 @@ impl TestCluster {
         })
         .await
         .map_err(|_| ())
+    }
+
+    /// Close every SQLite/OpenRaft handle while retaining only the exact
+    /// path-backed voter files and their authenticated in-process peers.
+    fn close_path_backed_voters(&mut self) {
+        for path in self.paths.values() {
+            path.clear_handler();
+        }
+        self.stores.clear();
+        self._backends.clear();
+    }
+
+    /// Reopen the retained voter files through the public production `open`
+    /// constructor, rather than the deterministic-clock test constructor.
+    async fn reopen_path_backed_voters_through_production_open(&mut self) {
+        assert!(
+            self.stores.is_empty() && self._backends.is_empty(),
+            "production reopen requires all prior consensus and SQLite handles to be closed"
+        );
+        let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
+        let identity = consensus_identity(&members);
+        let topologies = (0..MEMBER_COUNT)
+            .map(|index| {
+                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                    replica_id(index),
+                    members.clone(),
+                    identity,
+                ))
+                .expect("validate reopened consensus topology")
+            })
+            .collect::<Vec<_>>();
+        let node_ids = topologies
+            .iter()
+            .map(|topology| {
+                topology
+                    .local_consensus_node_id()
+                    .expect("reopened consensus node ID")
+            })
+            .collect::<Vec<_>>();
+        let backends = (0..MEMBER_COUNT)
+            .map(|index| {
+                SqliteSessionBackend::open(
+                    self._directory.path().join(format!("node-{index}.sqlite")),
+                )
+                .expect("reopen closed file-backed SQLite node")
+            })
+            .collect::<Vec<_>>();
+        let mut stores = Vec::with_capacity(MEMBER_COUNT);
+        for index in 0..MEMBER_COUNT {
+            let peers = (0..MEMBER_COUNT)
+                .filter(|target| *target != index)
+                .map(|target| {
+                    let peer: Arc<dyn SessionConsensusPeer> = self
+                        .paths
+                        .get(&(index, target))
+                        .expect("reopened loopback path")
+                        .clone();
+                    (node_ids[target], peer)
+                })
+                .collect::<BTreeMap<_, _>>();
+            stores.push(
+                ConsensusSessionStore::open(
+                    topologies[index].clone(),
+                    backends[index].clone(),
+                    self._directory.path().join(format!("snapshots-{index}")),
+                    peers,
+                )
+                .await
+                .expect("production-open closed consensus voter"),
+            );
+        }
+        for ((_, target), path) in &self.paths {
+            path.install(stores[*target].rpc_handler());
+        }
+        self._backends = backends;
+        self.stores = stores;
+        let initialized = self
+            .stores
+            .iter()
+            .map(ConsensusSessionStore::initialize_cluster)
+            .collect::<Vec<_>>();
+        for result in futures_util::future::join_all(initialized).await {
+            result.expect("reopen existing production cluster membership");
+        }
+        self.wait_all_ready(CLUSTER_START_TIMEOUT)
+            .await
+            .expect("production-reopened voters regain durable readiness");
     }
 
     fn observed_leader(&self) -> (usize, SessionConsensusNodeId, u64) {
@@ -6281,6 +6427,156 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         "a reopened predecessor terminal remains frozen"
     );
     assert_no_provider_io(&reopened_provider);
+}
+
+#[tokio::test]
+async fn managed_provider_facade_reopens_closed_format_seven_voters_through_production_open() {
+    let mut cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let scope = cluster.stores[leader]
+        .consumer_scope()
+        .expect("current consumer scope");
+
+    // Commit a predecessor terminal through the public V3/V4 APIs before
+    // closing the voters. The closed format-seven image must preserve this
+    // result as a frozen predecessor, never reinterpret it as managed V5.
+    activate_managed_provider_adapter_roster(&cluster.stores[leader], scope, 0xa4).await;
+    let predecessor_worker =
+        SessionConsumerIdentity::new("spiffe://managed-adapter/format-seven-predecessor")
+            .expect("predecessor worker identity");
+    let predecessor_admission = admit_managed_provider_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &predecessor_worker,
+        managed_provider_adapter_admission(0xa5, 1),
+    )
+    .await;
+    terminalize_predecessor_adapter_roster(
+        &cluster.stores[leader],
+        scope,
+        &predecessor_worker,
+        &predecessor_admission,
+    )
+    .await;
+
+    cluster.close_path_backed_voters();
+    stage_closed_published_format_seven_voters(&cluster);
+    cluster
+        .reopen_path_backed_voters_through_production_open()
+        .await;
+
+    let (leader, _, _) = cluster.observed_leader();
+    let reopened_scope = cluster.stores[leader]
+        .consumer_scope()
+        .expect("reopened consumer scope");
+    assert_eq!(
+        scope, reopened_scope,
+        "reopen preserves the exact tenant scope"
+    );
+    let predecessor_provider = ManagedProviderAdapterDouble::applied();
+    let predecessor_facade = cluster.stores[leader]
+        .managed_provider_job_facade(
+            reopened_scope,
+            predecessor_worker,
+            [0xa6; 32],
+            [0xa7; 32],
+            predecessor_provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct public facade after format-seven production open");
+    let predecessor_status = predecessor_facade
+        .job_status(
+            predecessor_admission,
+            FencedMutationRosterOrdinal::new(0).expect("predecessor ordinal"),
+        )
+        .await
+        .expect("public facade reads persisted predecessor terminal after production open");
+    assert_eq!(
+        predecessor_status.mode(),
+        ManagedProviderJobMode::FrozenV4Terminal,
+        "the migrated format-seven terminal remains a frozen predecessor"
+    );
+    assert_eq!(
+        predecessor_status.phase(),
+        ManagedProviderJobMemberPhase::Established,
+        "the public facade returns the exact committed predecessor phase"
+    );
+    assert_no_provider_io(&predecessor_provider);
+
+    // Commit a managed V5 terminal after the production open. A second full
+    // close/reopen must make a fresh public facade return the same persisted
+    // result and must not perform another provider effect.
+    let managed_worker =
+        SessionConsumerIdentity::new("spiffe://managed-adapter/format-seven-managed")
+            .expect("managed worker identity");
+    let managed_admission = admit_managed_provider_adapter_roster(
+        &cluster.stores[leader],
+        reopened_scope,
+        &managed_worker,
+        managed_provider_adapter_admission(0xa8, 1),
+    )
+    .await;
+    let executing_provider = ManagedProviderAdapterDouble::applied();
+    let executing_facade = cluster.stores[leader]
+        .managed_provider_job_facade(
+            reopened_scope,
+            managed_worker.clone(),
+            [0xa9; 32],
+            [0xaa; 32],
+            executing_provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct public managed facade after format-seven production open");
+    let ordinal = FencedMutationRosterOrdinal::new(0).expect("managed ordinal");
+    let checkpoint = Box::new([0xab]);
+    let committed = executing_facade
+        .run_member(managed_admission.clone(), checkpoint.clone(), ordinal)
+        .await
+        .expect("public facade returns committed managed terminal");
+    assert_eq!(committed.mode(), ManagedProviderJobMode::ManagedV5);
+    assert_eq!(
+        committed.phase(),
+        ManagedProviderJobMemberPhase::Established
+    );
+    assert_eq!(executing_provider.execute_calls.load(Ordering::SeqCst), 1);
+
+    cluster.close_path_backed_voters();
+    cluster
+        .reopen_path_backed_voters_through_production_open()
+        .await;
+
+    let (leader, _, _) = cluster.observed_leader();
+    let persisted_provider = ManagedProviderAdapterDouble::applied();
+    let persisted_facade = cluster.stores[leader]
+        .managed_provider_job_facade(
+            cluster.stores[leader]
+                .consumer_scope()
+                .expect("twice-reopened consumer scope"),
+            managed_worker,
+            [0xa9; 32],
+            [0xaa; 32],
+            persisted_provider.clone(),
+            ManagedProviderAdapterVerifier,
+        )
+        .expect("construct fresh public facade after second production open");
+    let persisted = persisted_facade
+        .job_status(managed_admission.clone(), ordinal)
+        .await
+        .expect("fresh public facade reads exact persisted managed terminal");
+    assert_eq!(
+        persisted, committed,
+        "the fresh public facade returns the exact persisted committed status"
+    );
+    assert_no_provider_io(&persisted_provider);
+    let replay = persisted_facade
+        .run_member(managed_admission, checkpoint, ordinal)
+        .await
+        .expect("public facade replays the exact persisted managed terminal");
+    assert_eq!(
+        replay, committed,
+        "the facade replay returns the exact persisted committed status"
+    );
+    assert_no_provider_io(&persisted_provider);
 }
 
 #[tokio::test]
