@@ -2428,4 +2428,37 @@ mod tests {
             .await
             .is_err());
     }
+
+    #[tokio::test]
+    async fn completed_server_entries_retain_permits_until_reaped() {
+        let pki = TestPki::new();
+        let scope = test_scope();
+        let client_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/client";
+        let voter_identity =
+            "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/voter";
+        let (handle, address) = ManagedProviderJobServer::for_test(
+            Arc::new(NoopNetworkFacade),
+            pki.server_config(voter_identity),
+            scope,
+            SpiffeId::new(voter_identity).expect("voter SPIFFE identity"),
+            SpiffeId::new(client_identity).expect("client SPIFFE identity"),
+        )
+        .with_max_connections(1)
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("real host-local listener");
+        for _ in 0..32 {
+            let stream = TcpStream::connect(address).await.expect("loopback connect");
+            drop(stream);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let diagnostics = handle.diagnostics();
+        assert!(diagnostics.connection_tasks <= 1);
+        assert_eq!(diagnostics.task_high_water, 1);
+        assert!(diagnostics.connections <= 1);
+        assert_eq!(diagnostics.connection_high_water, 1);
+        handle.shutdown().await;
+    }
 }
