@@ -1064,7 +1064,10 @@ impl TestCluster {
     /// on the production OpenRaft/store construction path; it only rebuilds
     /// the in-process authenticated loopback transport used by this test
     /// harness.
-    async fn reopen(directory: TempDir, operation_timeout: Duration) -> Self {
+    async fn reopen(
+        directory: TempDir,
+        operation_timeout: Duration,
+    ) -> Result<Self, opc_session_store::ConsensusSessionStoreOpenError> {
         let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
         let identity = consensus_identity(&members);
         let topologies = (0..MEMBER_COUNT)
@@ -1124,8 +1127,7 @@ impl TestCluster {
                     Arc::new(SystemClock),
                     operation_timeout,
                 )
-                .await
-                .expect("reopen consensus node"),
+                .await?,
             );
         }
         let cluster = Self {
@@ -1144,13 +1146,13 @@ impl TestCluster {
             .map(ConsensusSessionStore::initialize_cluster)
             .collect::<Vec<_>>();
         for result in futures_util::future::join_all(initialize).await {
-            result.expect("re-admit reopened initialized member");
+            result?;
         }
         cluster
             .wait_all_ready(CLUSTER_START_TIMEOUT)
             .await
-            .expect("reopened cluster reaches durable readiness");
-        cluster
+            .map_err(|_| opc_session_store::ConsensusSessionStoreOpenError::RecoveryRequired)?;
+        Ok(cluster)
     }
 
     /// Drop all stores, backends, and loopback handler references before a
@@ -6502,8 +6504,24 @@ async fn reopened_persisted_managed_v5_corruption_fails_closed_without_fabricati
                 .expect("checkpoint corrupt closed fixture");
         }
 
-        let reopened =
-            TestCluster::reopen(directory, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT).await;
+        let reopened = match corruption {
+            Corruption::MissingAuthority => {
+                TestCluster::reopen(directory, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+                    .await
+                    .expect("authority-only damage remains observable through the facade")
+            }
+            Corruption::MissingOwnedJob => {
+                assert!(
+                    matches!(
+                        TestCluster::reopen(directory, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+                            .await,
+                        Err(opc_session_store::ConsensusSessionStoreOpenError::RecoveryRequired)
+                    ),
+                    "missing required V5 job cardinality rejects the public store open"
+                );
+                continue;
+            }
+        };
         let (reopened_leader, _, _) = reopened.observed_leader();
         let reopened_provider = ManagedProviderAdapterDouble::applied();
         let facade = reopened.stores[reopened_leader]

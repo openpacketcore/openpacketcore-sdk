@@ -1423,13 +1423,26 @@ impl ConsensusSessionStore {
             .wait_for_applied_index(applied_index, deadline)
             .await
             .map_err(|_| consensus_unavailable())?;
-        let managed_terminal = if outcome.mode == 3 {
-            self.managed_provider_terminal_is_managed(admission.request_id(), authority)
+        if outcome.mode == 3 {
+            if self
+                .managed_provider_terminal_is_managed(admission.request_id(), authority)
                 .await?
-        } else {
-            false
-        };
-        managed_provider_status(outcome.mode, outcome.phase, managed_terminal)
+            {
+                return managed_provider_status(3, outcome.phase, true);
+            }
+            if let Some(terminal_phase) = self
+                .managed_provider_predecessor_terminal_phase(admission.request_id())
+                .await?
+            {
+                return managed_provider_status(3, if terminal_phase == 2 { 4 } else { 5 }, false);
+            }
+            // Match the public status path: a mode-three terminal that has
+            // neither its exact V5 authority/job proof nor the exact legacy
+            // predecessor shape is damaged durable state, never a frozen
+            // predecessor fallback.
+            return Err(consensus_unavailable());
+        }
+        managed_provider_status(outcome.mode, outcome.phase, false)
     }
 
     fn require_dynamic_consensus_platform() -> Result<(), ConsensusSessionStoreOpenError> {
