@@ -156,6 +156,9 @@ impl ManagedProviderPoolConfig {
             || self.queue_deadline.is_zero()
             || self.setup_timeout.is_zero()
             || self.shutdown_drain.is_zero()
+            || self.queue_deadline == Duration::MAX
+            || self.setup_timeout == Duration::MAX
+            || self.shutdown_drain == Duration::MAX
         {
             return Err(ManagedProviderPoolConfigError);
         }
@@ -296,8 +299,8 @@ pub struct ManagedProviderPoolDiagnostics {
     pub outcome_unknown: u64,
 }
 
-/// Aggregate listener state. Completed connection tasks are reaped before a
-/// new accept is admitted, so `connection_tasks` is bounded by `connections`.
+/// Aggregate listener state. Active and retained completed connection tasks
+/// share the listener permit and are bounded by configured `max_connections`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagedProviderServerDiagnostics {
     pub connections: u64,
@@ -426,6 +429,18 @@ struct Pool {
     shutdown_report: StdMutex<Option<ManagedProviderShutdownReport>>,
     shutdown_complete: Notify,
     readiness_changed: Notify,
+    active_admissions: AtomicUsize,
+    admissions_changed: Notify,
+}
+
+struct AdmissionGuard {
+    pool: Arc<Pool>,
+}
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.pool.active_admissions.fetch_sub(1, Ordering::AcqRel);
+        self.pool.admissions_changed.notify_waiters();
+    }
 }
 
 impl PersistentManagedProviderJobClient {
@@ -462,6 +477,8 @@ impl PersistentManagedProviderJobClient {
                 shutdown_report: StdMutex::new(None),
                 shutdown_complete: Notify::new(),
                 readiness_changed: Notify::new(),
+                active_admissions: AtomicUsize::new(0),
+                admissions_changed: Notify::new(),
             }),
         })
     }
@@ -494,16 +511,20 @@ impl PersistentManagedProviderJobClient {
     }
     pub async fn prewarm(&self) -> Result<ManagedProviderReadiness, ManagedProviderClientError> {
         self.pool.start()?;
-        let deadline = tokio::time::Instant::now() + self.pool.config.setup_timeout;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.pool.config.setup_timeout)
+            .ok_or(ManagedProviderClientError::Unavailable)?;
         loop {
+            // Register before observing state so a readiness transition cannot
+            // notify in the check-to-wait gap.
+            let notified = self.pool.readiness_changed.notified();
+            tokio::pin!(notified);
             if self.readiness() == ManagedProviderReadiness::Ready {
                 return Ok(ManagedProviderReadiness::Ready);
             }
             if Phase::load(&self.pool.phase) != Phase::Running {
                 return Err(ManagedProviderClientError::ShuttingDown);
             }
-            let notified = self.pool.readiness_changed.notified();
-            tokio::pin!(notified);
             if tokio::time::timeout_at(deadline, &mut notified)
                 .await
                 .is_err()
@@ -540,9 +561,7 @@ impl PersistentManagedProviderJobClient {
         &self,
         operation: WireOperation,
     ) -> Result<ManagedProviderJobStatus, ManagedProviderClientError> {
-        if Phase::load(&self.pool.phase) != Phase::Running {
-            return Err(ManagedProviderClientError::ShuttingDown);
-        }
+        let admission_guard = self.pool.enter_admission()?;
         if self.readiness() == ManagedProviderReadiness::Unready {
             return Err(ManagedProviderClientError::Unavailable);
         }
@@ -586,7 +605,9 @@ impl PersistentManagedProviderJobClient {
             key,
             frame,
             frame_bytes,
-            deadline: tokio::time::Instant::now() + self.pool.config.queue_deadline,
+            deadline: tokio::time::Instant::now()
+                .checked_add(self.pool.config.queue_deadline)
+                .ok_or(ManagedProviderClientError::Overloaded)?,
             inflight: false,
             counters: Arc::clone(&self.pool.counters),
             reply: Some(reply_tx),
@@ -606,6 +627,7 @@ impl PersistentManagedProviderJobClient {
             self.pool.counters.overload.fetch_add(1, Ordering::Relaxed);
             return Err(ManagedProviderClientError::Overloaded);
         }
+        drop(admission_guard);
         match reply_rx.await {
             Ok(reply) => reply,
             Err(_) => Err(ManagedProviderClientError::ShuttingDown),
@@ -674,6 +696,31 @@ fn operation_matches_authority(
 }
 
 impl Pool {
+    fn enter_admission(self: &Arc<Self>) -> Result<AdmissionGuard, ManagedProviderClientError> {
+        loop {
+            if Phase::load(&self.phase) != Phase::Running {
+                return Err(ManagedProviderClientError::ShuttingDown);
+            }
+            self.active_admissions.fetch_add(1, Ordering::AcqRel);
+            if Phase::load(&self.phase) == Phase::Running {
+                return Ok(AdmissionGuard {
+                    pool: Arc::clone(self),
+                });
+            }
+            self.active_admissions.fetch_sub(1, Ordering::AcqRel);
+            self.admissions_changed.notify_waiters();
+        }
+    }
+    async fn wait_admissions_closed(&self) {
+        loop {
+            let notified = self.admissions_changed.notified();
+            tokio::pin!(notified);
+            if self.active_admissions.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
     fn start(self: &Arc<Self>) -> Result<(), ManagedProviderClientError> {
         if self.started.load(Ordering::Acquire) {
             return Ok(());
@@ -681,6 +728,13 @@ impl Pool {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(ManagedProviderClientError::Unavailable);
         }
+        // Reserve the sole supervisor registry before spawning. A failed
+        // registry acquisition therefore cannot detach partially created
+        // workers from shutdown ownership.
+        let mut registered = self
+            .tasks
+            .try_lock()
+            .map_err(|_| ManagedProviderClientError::Unavailable)?;
         if self.started.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -711,10 +765,7 @@ impl Pool {
             event_rx,
             worker_txs,
         )));
-        *self
-            .tasks
-            .try_lock()
-            .map_err(|_| ManagedProviderClientError::Unavailable)? = handles;
+        *registered = handles;
         Ok(())
     }
     fn track_enqueue(&self, bytes: usize) {
@@ -759,13 +810,14 @@ impl Pool {
             return;
         }
         self.phase.store(Phase::Draining as u8, Ordering::Release);
-        let scheduler = self
-            .scheduler
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
         let pool = Arc::clone(self);
         tokio::spawn(async move {
+            pool.wait_admissions_closed().await;
+            let scheduler = pool
+                .scheduler
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             if let Some(tx) = scheduler {
                 let _ = tx.send(Command::Drain).await;
                 tokio::time::sleep(pool.config.shutdown_drain).await;
@@ -808,6 +860,10 @@ impl Pool {
     }
     async fn wait_shutdown(&self) -> ManagedProviderShutdownReport {
         loop {
+            // Register before the report check for the same lost-wakeup
+            // protection as prewarm.
+            let notified = self.shutdown_complete.notified();
+            tokio::pin!(notified);
             if let Some(report) = *self
                 .shutdown_report
                 .lock()
@@ -815,7 +871,7 @@ impl Pool {
             {
                 return report;
             }
-            self.shutdown_complete.notified().await;
+            notified.await;
         }
     }
 }
@@ -1045,6 +1101,11 @@ async fn lane_worker(
         let connection = connect_lane(&pool, voter).await;
         let mut connection = match connection {
             Ok(c) => {
+                if Phase::load(&pool.phase) != Phase::Running {
+                    // Shutdown may have started while the absolute setup
+                    // transaction was in progress; never publish a late lane.
+                    return;
+                }
                 generation = generation.wrapping_add(1);
                 reconnect_attempt = 0;
                 pool.counters.connections.fetch_add(1, Ordering::Relaxed);
@@ -2058,6 +2119,33 @@ mod tests {
             Duration::from_millis(1),
         )
         .is_ok());
+        for (queue, setup, drain) in [
+            (
+                Duration::MAX,
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            ),
+            (
+                Duration::from_millis(1),
+                Duration::MAX,
+                Duration::from_millis(1),
+            ),
+            (
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+                Duration::MAX,
+            ),
+        ] {
+            assert!(ManagedProviderPoolConfig::try_new(
+                DEFAULT_MANAGED_PROVIDER_POOL_LANES,
+                MANAGED_PROVIDER_V5_REQUEST_FRAME_BYTES,
+                MANAGED_PROVIDER_V5_RESPONSE_FRAME_BYTES,
+                queue,
+                setup,
+                drain,
+            )
+            .is_err());
+        }
     }
 
     #[test]
