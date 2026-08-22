@@ -365,17 +365,12 @@ impl SessionSnapshotFile {
         #[cfg(test)] after_create: Option<&SnapshotArtifactGate>,
     ) -> io::Result<Self> {
         reject_symlink(&path).await?;
-        let file = snapshot_open_options(true, true, true).open(&path).await?;
+        let (file, cleanup) = create_new_snapshot_file(&path)?;
         #[cfg(test)]
         if let Some(after_create) = after_create {
             after_create.block_if_armed().await;
         }
-        let cleanup = UnpublishedSnapshotArtifact::from_metadata(
-            path.clone(),
-            &file.metadata().await?,
-            false,
-        )?;
-        Self::from_file_with_cleanup(file, path, Some(cleanup)).await
+        Self::from_file_with_cleanup(tokio::fs::File::from_std(file), path, Some(cleanup)).await
     }
 
     /// Open an immutable current snapshot for transfer.
@@ -516,6 +511,24 @@ fn snapshot_open_options(create_new: bool, read: bool, write: bool) -> tokio::fs
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     options
+}
+
+fn create_new_snapshot_file(
+    path: &Path,
+) -> io::Result<(std::fs::File, UnpublishedSnapshotArtifact)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let cleanup = UnpublishedSnapshotArtifact::from_file(&file, path.to_path_buf(), false)?;
+    Ok((file, cleanup))
 }
 
 async fn reject_symlink(path: &Path) -> io::Result<()> {
