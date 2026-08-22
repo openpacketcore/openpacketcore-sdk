@@ -16,6 +16,11 @@ use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::linux::fs::MetadataExt as _;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+/// Maximum payload bytes admitted in one consensus snapshot envelope.
+pub(crate) const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Maximum bytes accepted from a snapshot sender, including its fixed footer.
+pub(crate) const SNAPSHOT_MAX_ENVELOPE_BYTES: u64 = SNAPSHOT_MAX_BYTES + 48;
+
 /// Immutable identity taken from an already-open SQLite file descriptor.
 ///
 /// On Linux this is deliberately based on the descriptor rather than its
@@ -67,9 +72,17 @@ impl UnpublishedSnapshotArtifact {
         path: PathBuf,
         sqlite_sidecars: bool,
     ) -> io::Result<Self> {
+        Self::from_metadata(path, &file.metadata()?, sqlite_sidecars)
+    }
+
+    pub(crate) fn from_metadata(
+        path: PathBuf,
+        metadata: &std::fs::Metadata,
+        sqlite_sidecars: bool,
+    ) -> io::Result<Self> {
         Ok(Self {
             path,
-            identity: file_identity(&file.metadata()?)?,
+            identity: file_identity(metadata)?,
             sqlite_sidecars,
             sidecars: Vec::new(),
             armed: true,
@@ -272,6 +285,10 @@ impl fmt::Debug for PinnedSqliteFile {
 pub(crate) struct SessionSnapshotFile {
     file: tokio::fs::File,
     path: PathBuf,
+    _cleanup: Option<UnpublishedSnapshotArtifact>,
+    position: u64,
+    length: u64,
+    receiving: bool,
 }
 
 #[allow(dead_code)]
@@ -280,7 +297,12 @@ impl SessionSnapshotFile {
     pub(crate) async fn create(path: PathBuf) -> io::Result<Self> {
         reject_symlink(&path).await?;
         let file = snapshot_open_options(true, true, true).open(&path).await?;
-        Self::from_file(file, path).await
+        let cleanup = UnpublishedSnapshotArtifact::from_metadata(
+            path.clone(),
+            &file.metadata().await?,
+            false,
+        )?;
+        Self::from_file_with_cleanup(file, path, Some(cleanup)).await
     }
 
     /// Open an immutable current snapshot for transfer.
@@ -289,13 +311,37 @@ impl SessionSnapshotFile {
         let file = snapshot_open_options(false, true, false)
             .open(&path)
             .await?;
-        Self::from_file(file, path).await
+        Self::from_file_with_cleanup(file, path, None).await
     }
 
     /// Attach a diagnostic path to an already-open regular snapshot handle.
     pub(crate) async fn from_file(file: tokio::fs::File, path: PathBuf) -> io::Result<Self> {
-        ensure_regular_file(&file.metadata().await?)?;
-        Ok(Self { file, path })
+        Self::from_file_with_cleanup(file, path, None).await
+    }
+
+    async fn from_file_with_cleanup(
+        file: tokio::fs::File,
+        path: PathBuf,
+        cleanup: Option<UnpublishedSnapshotArtifact>,
+    ) -> io::Result<Self> {
+        let metadata = file.metadata().await?;
+        ensure_regular_file(&metadata)?;
+        let length = metadata.len();
+        if length > SNAPSHOT_MAX_ENVELOPE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot file exceeds the maximum envelope size",
+            ));
+        }
+        let receiving = cleanup.is_some();
+        Ok(Self {
+            file,
+            path,
+            _cleanup: cleanup,
+            position: 0,
+            length,
+            receiving,
+        })
     }
 
     /// Convert an already-open standard file without resolving its path again.
@@ -423,7 +469,31 @@ impl AsyncRead for SessionSnapshotFile {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.file).poll_read(cx, buf)
+        let before = buf.filled().len();
+        match Pin::new(&mut self.file).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let read = match u64::try_from(buf.filled().len() - before) {
+                    Ok(read) => read,
+                    Err(_) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "snapshot read length overflow",
+                        )));
+                    }
+                };
+                self.position = match self.position.checked_add(read) {
+                    Some(position) => position,
+                    None => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "snapshot position overflow",
+                        )));
+                    }
+                };
+                Poll::Ready(Ok(()))
+            }
+            pending => pending,
+        }
     }
 }
 
@@ -433,7 +503,56 @@ impl AsyncWrite for SessionSnapshotFile {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.file).poll_write(cx, buf)
+        if self.receiving && self.position != self.length {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot receive writes must be contiguous",
+            )));
+        }
+        let requested = match u64::try_from(buf.len()) {
+            Ok(length) => length,
+            Err(_) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "snapshot write length is invalid",
+                )));
+            }
+        };
+        if self
+            .position
+            .checked_add(requested)
+            .is_none_or(|end| end > SNAPSHOT_MAX_ENVELOPE_BYTES)
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot write exceeds the maximum envelope size",
+            )));
+        }
+        match Pin::new(&mut self.file).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                let written_u64 = match u64::try_from(written) {
+                    Ok(written) => written,
+                    Err(_) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "snapshot write length overflow",
+                        )));
+                    }
+                };
+                self.position = match self.position.checked_add(written_u64) {
+                    Some(position) => position,
+                    None => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "snapshot position overflow",
+                        )));
+                    }
+                };
+                self.length = self.length.max(self.position);
+                Poll::Ready(Ok(written))
+            }
+            pending => pending,
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -450,11 +569,39 @@ impl AsyncWrite for SessionSnapshotFile {
 
 impl AsyncSeek for SessionSnapshotFile {
     fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
-        Pin::new(&mut self.file).start_seek(position)
+        let target = match position {
+            io::SeekFrom::Start(offset) => i128::from(offset),
+            io::SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            io::SeekFrom::End(offset) => i128::from(self.length) + i128::from(offset),
+        };
+        if target < 0 || target > i128::from(SNAPSHOT_MAX_ENVELOPE_BYTES) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot seek exceeds the maximum envelope size",
+            ));
+        }
+        let target = u64::try_from(target).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot seek target is invalid",
+            )
+        })?;
+        Pin::new(&mut self.file).start_seek(io::SeekFrom::Start(target))?;
+        Ok(())
     }
 
     fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
-        Pin::new(&mut self.file).poll_complete(cx)
+        match Pin::new(&mut self.file).poll_complete(cx) {
+            Poll::Ready(Ok(position)) if position <= SNAPSHOT_MAX_ENVELOPE_BYTES => {
+                self.position = position;
+                Poll::Ready(Ok(position))
+            }
+            Poll::Ready(Ok(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot seek exceeds the maximum envelope size",
+            ))),
+            pending => pending,
+        }
     }
 }
 
@@ -571,6 +718,21 @@ mod tests {
             .err()
             .ok_or("create succeeded")?;
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn abandoned_receive_cleanup_never_unlinks_a_same_name_replacement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let receiving = SessionSnapshotFile::create(path.clone()).await?;
+        let replacement = directory.path().join("replacement.part");
+        std::fs::write(&replacement, b"replacement")?;
+        std::fs::rename(&replacement, &path)?;
+        drop(receiving);
+        assert_eq!(std::fs::read(path)?, b"replacement");
         Ok(())
     }
 
