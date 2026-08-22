@@ -5939,6 +5939,15 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
         &predecessor_admission,
     )
     .await;
+    let predecessor_status = predecessor
+        .job_status(predecessor_admission.clone(), ordinal)
+        .await
+        .expect("ordinary predecessor terminal is publicly classifiable");
+    assert_eq!(
+        predecessor_status.mode(),
+        ManagedProviderJobMode::FrozenV4Terminal,
+        "ordinary mode-three terminals classify before absent V5 job ownership is rejected"
+    );
     assert_eq!(
         predecessor
             .run_member(predecessor_admission.clone(), Box::new([0xe3]), ordinal,)
@@ -5960,6 +5969,15 @@ async fn managed_provider_facade_uses_exact_postcommit_results_on_file_backed_th
             ManagedProviderAdapterVerifier,
         )
         .expect("construct reopened predecessor facade");
+    let reopened_status = reopened
+        .job_status(predecessor_admission.clone(), ordinal)
+        .await
+        .expect("reopened ordinary predecessor terminal is publicly classifiable");
+    assert_eq!(
+        reopened_status.mode(),
+        ManagedProviderJobMode::FrozenV4Terminal,
+        "a follower classifies the replicated ordinary terminal without a local V5 authority row"
+    );
     assert_eq!(
         reopened
             .run_member(predecessor_admission, Box::new([0xe3]), ordinal)
