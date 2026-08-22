@@ -2177,6 +2177,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receiving_snapshot_rejects_sparse_or_oversized_offsets_and_cleans_abandoned_artifacts()
+    {
+        let directory = tempfile::tempdir().expect("receiving snapshot directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
+            .expect("receiving snapshot backend");
+        let (_, mut state_machine) = open(
+            &backend,
+            directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("receiving snapshot storage");
+
+        for _ in 0..2 {
+            let receiving = state_machine
+                .begin_receiving_snapshot()
+                .await
+                .expect("fresh receiving snapshot");
+            let path = receiving.path().to_path_buf();
+            assert!(path.is_file(), "fresh receive artifact exists while owned");
+            drop(receiving);
+            assert!(
+                !path.exists(),
+                "a later fresh snapshot must not retain an abandoned receive artifact"
+            );
+        }
+
+        let mut receiving = state_machine
+            .begin_receiving_snapshot()
+            .await
+            .expect("bounded receiving snapshot");
+        let path = receiving.path().to_path_buf();
+        assert!(
+            receiving
+                .seek(io::SeekFrom::Start(
+                    SNAPSHOT_MAX_BYTES + SNAPSHOT_FOOTER_BYTES + 1
+                ))
+                .await
+                .is_err(),
+            "a receive cursor beyond the snapshot envelope must fail before writing"
+        );
+        assert_eq!(
+            0,
+            receiving.metadata().await.expect("receive metadata").len(),
+            "an oversized receive cursor must not grow the artifact"
+        );
+        receiving
+            .seek(io::SeekFrom::Start(1))
+            .await
+            .expect("position sparse receive cursor");
+        assert!(
+            receiving.write_all(b"x").await.is_err(),
+            "a sparse receive write must fail closed"
+        );
+        assert_eq!(
+            0,
+            receiving.metadata().await.expect("receive metadata").len(),
+            "a rejected sparse write must not grow the artifact"
+        );
+        drop(receiving);
+        assert!(
+            !path.exists(),
+            "bounded receive artifact is cleaned on drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_detach_error_preserves_durably_current_candidate() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let source_directory = tempfile::tempdir().expect("snapshot source directory");
+        let source_backend =
+            SqliteSessionBackend::open(source_directory.path().join("sessions.sqlite"))
+                .expect("snapshot source backend");
+        let (_, mut source) = open(
+            &source_backend,
+            source_directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("snapshot source storage");
+        source
+            .apply([initial_membership_entry()])
+            .await
+            .expect("snapshot source membership");
+        let mut builder = source.get_snapshot_builder().await;
+        let mut built = builder
+            .build_snapshot()
+            .await
+            .expect("build source snapshot");
+
+        let target_directory = tempfile::tempdir().expect("snapshot target directory");
+        let target_backend =
+            SqliteSessionBackend::open(target_directory.path().join("sessions.sqlite"))
+                .expect("snapshot target backend");
+        let (_, mut target) = open(
+            &target_backend,
+            target_directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("snapshot target storage");
+        let mut receiving = target
+            .begin_receiving_snapshot()
+            .await
+            .expect("target receive snapshot");
+        built
+            .snapshot
+            .rewind()
+            .await
+            .expect("rewind source snapshot");
+        tokio::io::copy(&mut built.snapshot, &mut receiving)
+            .await
+            .expect("copy source snapshot");
+
+        {
+            let conn = target.core.conn.lock().await;
+            conn.authorizer(Some(|context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Detach { .. }) {
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }));
+        }
+        assert!(
+            target
+                .install_snapshot(&built.meta, receiving)
+                .await
+                .is_err(),
+            "the injected post-commit DETACH denial remains observable"
+        );
+        {
+            let conn = target.core.conn.lock().await;
+            conn.authorizer(Some(|_: AuthContext<'_>| Authorization::Allow));
+            let (_, file_name, _, _) =
+                consensus::read_current_snapshot_sync(&conn, target.core.storage_identity)
+                    .expect("read durably installed snapshot metadata")
+                    .expect("post-commit installation remains current");
+            assert!(
+                target_directory
+                    .path()
+                    .join("snapshots")
+                    .join(file_name)
+                    .is_file(),
+                "a current snapshot candidate survives a post-commit DETACH error"
+            );
+        }
+        drop(target);
+        let (_, mut restarted) = open(
+            &target_backend,
+            target_directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("restart preserves the current installed snapshot");
+        assert!(
+            restarted
+                .get_current_snapshot()
+                .await
+                .expect("read current snapshot after restart")
+                .is_some(),
+            "restart reads the candidate that durable metadata references"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_seal_output_removes_its_exact_unpublished_inode() {
         let directory = tempfile::tempdir().expect("snapshot seal cancellation directory");
         let output_path = directory.path().join("seal-cancelled.part");
