@@ -4,7 +4,7 @@
 //! durable-quorum voters and their public proposal/apply APIs; it never seeds
 //! the receipt table or invokes a private state-machine helper.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
@@ -38,6 +38,7 @@ use opc_session_store::{
     FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
+use tokio::task::JoinSet;
 
 const VOTERS: usize = 3;
 const QUALIFICATION_SESSIONS: usize = 50_000;
@@ -90,14 +91,19 @@ struct ReleaseLatencySamples {
 }
 
 impl ReleaseLatencySamples {
-    fn record_batch(&mut self, elapsed: Duration, item_scheduled_at: &[Instant]) {
+    fn record_batch(
+        &mut self,
+        elapsed: Duration,
+        completed_at: Instant,
+        item_scheduled_at: &[Instant],
+    ) {
         self.batch.push(elapsed);
-        let completed = Instant::now();
-        self.item_scheduled_to_completion.extend(
-            item_scheduled_at
-                .iter()
-                .map(|scheduled_at| completed.duration_since(*scheduled_at)),
-        );
+        self.item_scheduled_to_completion
+            .extend(item_scheduled_at.iter().map(|scheduled_at| {
+                completed_at
+                    .checked_duration_since(*scheduled_at)
+                    .expect("a release batch cannot complete before an item is scheduled")
+            }));
     }
 
     fn percentile(samples: &mut [Duration], numerator: usize, denominator: usize) -> Duration {
@@ -117,6 +123,61 @@ impl ReleaseLatencySamples {
             Self::percentile(&mut self.item_scheduled_to_completion, 999, 1_000),
         )
     }
+}
+
+struct ReleaseBatchCompletion {
+    requests: Vec<FencedTransitionV2Request>,
+    outcomes: Vec<Result<FencedTransitionOutcome, StoreError>>,
+    session_slots: Vec<usize>,
+    scheduled_at: Vec<Instant>,
+    batch_elapsed: Duration,
+    completed_at: Instant,
+    successor_first_item: bool,
+}
+
+async fn collect_next_release_batch(
+    in_flight: &mut JoinSet<Result<ReleaseBatchCompletion, StoreError>>,
+    in_flight_session_slots: &mut BTreeSet<usize>,
+    latency: &mut ReleaseLatencySamples,
+    sessions: &mut [(FencedTransitionV2Request, FencedTransitionOutcome)],
+    representatives: &mut Vec<(FencedTransitionV2Request, FencedTransitionOutcome)>,
+) -> usize {
+    let completion = in_flight
+        .join_next()
+        .await
+        .expect("a release batch must remain in flight")
+        .expect("a release batch task must not panic")
+        .expect("a paced bounded V2 batch must complete through quorum");
+    let ReleaseBatchCompletion {
+        requests,
+        outcomes,
+        session_slots,
+        scheduled_at,
+        batch_elapsed,
+        completed_at,
+        successor_first_item,
+    } = completion;
+    let batch_len = requests.len();
+    assert_eq!(outcomes.len(), batch_len);
+    assert_eq!(session_slots.len(), batch_len);
+    latency.record_batch(batch_elapsed, completed_at, &scheduled_at);
+    for (batch_offset, ((request, outcome), slot)) in requests
+        .into_iter()
+        .zip(outcomes)
+        .zip(session_slots)
+        .enumerate()
+    {
+        assert!(
+            in_flight_session_slots.remove(&slot),
+            "a completed release batch must own every session slot exactly once"
+        );
+        let outcome = outcome.expect("paced V2 item result");
+        if successor_first_item && batch_offset == 0 {
+            representatives.push((request.clone(), outcome.clone()));
+        }
+        sessions[slot].1 = outcome;
+    }
+    batch_len
 }
 
 #[derive(Debug, Clone)]
@@ -1418,7 +1479,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
     let (mut stores, database_paths, snapshot_paths) =
         fixed_cluster(directory.path(), clock.clone()).await;
     let provider = sealing_provider();
-    let transient_retries = AtomicU64::new(0);
+    let transient_retries = Arc::new(AtomicU64::new(0));
     let first_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
 
     assert_eq!(
@@ -1439,11 +1500,14 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
     // no receipt, database, or private-apply shortcut exists in this path.
     // Keep the original request/outcome as an attestation exemplar for each
     // epoch; later updates exercise independent lease renewal paths.
+    // Readiness and leader discovery are phase setup, not application traffic.
+    // Keep one public ingress: its normal forwarding path follows any later
+    // leader change without adding three fresh read barriers to every batch.
     let leader = ready_leader(&stores).await;
-    let store = &stores[leader];
+    let ingress_store = &stores[leader];
     let first_key = key(0);
     let first_observation = retry_exact_consensus_operation(&transient_retries, || {
-        store.observe_fenced_transition(&first_key)
+        ingress_store.observe_fenced_transition(&first_key)
     })
     .await
     .expect("singleton activation fence observation");
@@ -1456,7 +1520,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
     )
     .await;
     let first_outcome = retry_exact_consensus_operation(&transient_retries, || {
-        store.fenced_transition_v2(first_request.clone())
+        ingress_store.fenced_transition_v2(first_request.clone())
     })
     .await
     .expect("singleton V2 activation");
@@ -1468,7 +1532,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         for session_index in chunk_start..chunk_end {
             let session_key = key(session_index);
             let observation = retry_exact_consensus_operation(&transient_retries, || {
-                store.observe_fenced_transition(&session_key)
+                ingress_store.observe_fenced_transition(&session_key)
             })
             .await
             .expect("preload batch fence observation");
@@ -1484,7 +1548,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
             );
         }
         let outcomes = retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2_batch(requests.clone())
+            ingress_store.fenced_transition_v2_batch(requests.clone())
         })
         .await
         .expect("preload bounded V2 batch");
@@ -1523,8 +1587,16 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         let phase_started = Instant::now();
         let mut latency = ReleaseLatencySamples::default();
         let mut submitted = 0usize;
-        while submitted < operations {
+        let mut completed = 0usize;
+        let mut in_flight: JoinSet<Result<ReleaseBatchCompletion, StoreError>> = JoinSet::new();
+        let mut in_flight_session_slots = BTreeSet::new();
+        let mut peak_in_flight_batches = 0usize;
+        while completed < operations {
             if active_entries == FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+                assert!(
+                    in_flight.is_empty() && in_flight_session_slots.is_empty(),
+                    "successor rotation must wait for every exact submitted batch"
+                );
                 let leader = current_local_maintenance_leader(&stores).await;
                 let before = retry_exact_consensus_operation(&transient_retries, || {
                     stores[leader].fenced_transition_v2_history_state()
@@ -1583,64 +1655,92 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
                 }
             }
 
-            let leader = ready_leader(&stores).await;
-            let batch_len = QUALIFICATION_PACED_BATCH_OPERATIONS
-                .min(operations - submitted)
-                .min(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - active_entries);
-            let mut requests = Vec::with_capacity(batch_len);
-            let mut session_slots = Vec::with_capacity(batch_len);
-            let mut scheduled_at = Vec::with_capacity(batch_len);
-            let successor_first_item = active_entries == 0;
-            for batch_offset in 0..batch_len {
-                pace_release_phase(phase_started, submitted + batch_offset, target_rate).await;
-                scheduled_at.push(
-                    phase_started
-                        + Duration::from_secs_f64(
-                            (submitted + batch_offset) as f64 / target_rate as f64,
-                        ),
-                );
-                // Each batch updates distinct independently fenced sessions.
-                // Its first item after a rotation is retained as that epoch's
-                // exact replay representative. A physical batch is
-                // coalescing only; it has no inter-item conditional or
-                // all-or-nothing meaning.
-                let slot = nonce % sessions.len();
-                let update =
-                    renew_update_request(nonce, active_epoch, &sessions[slot].1, &provider).await;
-                requests.push(update);
-                session_slots.push(slot);
-                nonce += 1;
-            }
-            let batch_started = Instant::now();
-            let outcomes = retry_exact_consensus_operation(&transient_retries, || {
-                stores[leader].fenced_transition_v2_batch(requests.clone())
-            })
-            .await
-            .expect("paced bounded V2 batch");
-            latency.record_batch(batch_started.elapsed(), &scheduled_at);
-            assert_eq!(outcomes.len(), requests.len());
-            for (batch_offset, ((request, outcome), slot)) in requests
-                .into_iter()
-                .zip(outcomes)
-                .zip(session_slots)
-                .enumerate()
+            let outstanding_entries = in_flight_session_slots.len();
+            let remaining_epoch_capacity = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+                .checked_sub(active_entries + outstanding_entries)
+                .expect("in-flight release batches remain within the active epoch");
+            if submitted < operations
+                && in_flight.len() < QUALIFICATION_IN_FLIGHT_CLIENTS
+                && remaining_epoch_capacity > 0
             {
-                let outcome = outcome.expect("paced V2 item result");
-                if successor_first_item && batch_offset == 0 {
-                    representatives.push((request.clone(), outcome.clone()));
+                let batch_len = QUALIFICATION_PACED_BATCH_OPERATIONS
+                    .min(operations - submitted)
+                    .min(remaining_epoch_capacity);
+                let mut requests = Vec::with_capacity(batch_len);
+                let mut session_slots = Vec::with_capacity(batch_len);
+                let mut scheduled_at = Vec::with_capacity(batch_len);
+                let successor_first_item = active_entries == 0 && outstanding_entries == 0;
+                for batch_offset in 0..batch_len {
+                    pace_release_phase(phase_started, submitted + batch_offset, target_rate).await;
+                    scheduled_at.push(
+                        phase_started
+                            + Duration::from_secs_f64(
+                                (submitted + batch_offset) as f64 / target_rate as f64,
+                            ),
+                    );
+                    // Every outstanding batch updates disjoint independently
+                    // fenced sessions. Its first item after a rotation is
+                    // retained as that epoch's exact replay representative.
+                    // Physical coalescing never creates an all-or-nothing
+                    // multi-key contract or permits two concurrent effects
+                    // for one session.
+                    let slot = nonce % sessions.len();
+                    assert!(
+                        in_flight_session_slots.insert(slot),
+                        "one session cannot have two release mutations in flight"
+                    );
+                    let update =
+                        renew_update_request(nonce, active_epoch, &sessions[slot].1, &provider)
+                            .await;
+                    requests.push(update);
+                    session_slots.push(slot);
+                    nonce += 1;
                 }
-                sessions[slot].1 = outcome;
+                let task_ingress_store = (*ingress_store).clone();
+                let task_retries = Arc::clone(&transient_retries);
+                let batch_started = Instant::now();
+                in_flight.spawn(async move {
+                    let outcomes = retry_exact_consensus_operation(&task_retries, || {
+                        task_ingress_store.fenced_transition_v2_batch(requests.clone())
+                    })
+                    .await?;
+                    let completed_at = Instant::now();
+                    Ok(ReleaseBatchCompletion {
+                        requests,
+                        outcomes,
+                        session_slots,
+                        scheduled_at,
+                        batch_elapsed: completed_at.duration_since(batch_started),
+                        completed_at,
+                        successor_first_item,
+                    })
+                });
+                submitted += batch_len;
+                peak_in_flight_batches = peak_in_flight_batches.max(in_flight.len());
+                continue;
             }
+            let batch_len = collect_next_release_batch(
+                &mut in_flight,
+                &mut in_flight_session_slots,
+                &mut latency,
+                &mut sessions,
+                &mut representatives,
+            )
+            .await;
             active_entries += batch_len;
-            submitted += batch_len;
+            completed += batch_len;
         }
+        assert_eq!(submitted, operations);
+        assert!(in_flight.is_empty());
+        assert!(in_flight_session_slots.is_empty());
+        assert!(peak_in_flight_batches <= QUALIFICATION_IN_FLIGHT_CLIENTS);
         let elapsed = phase_started.elapsed();
         let batch_samples = latency.batch.len();
         let item_samples = latency.item_scheduled_to_completion.len();
         let (batch_p99, batch_p999, item_p99, item_p999) = latency.p99_and_p999();
         let achieved_ops_per_second = operations as f64 / elapsed.as_secs_f64();
         eprintln!(
-            "sdk-702 successor phase: name={phase_name} offered_ops_per_second={target_rate} achieved_ops_per_second={achieved_ops_per_second:.6} operations={operations} batch_samples={batch_samples} item_samples={item_samples} batch_p99_us={} batch_p999_us={} item_p99_us={} item_p999_us={} elapsed_ms={}",
+            "sdk-702 successor phase: name={phase_name} offered_ops_per_second={target_rate} achieved_ops_per_second={achieved_ops_per_second:.6} operations={operations} batch_samples={batch_samples} item_samples={item_samples} peak_in_flight_batches={peak_in_flight_batches} batch_p99_us={} batch_p999_us={} item_p99_us={} item_p999_us={} elapsed_ms={}",
             batch_p99.as_micros(),
             batch_p999.as_micros(),
             item_p99.as_micros(),
