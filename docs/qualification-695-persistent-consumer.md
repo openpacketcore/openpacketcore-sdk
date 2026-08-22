@@ -119,12 +119,14 @@ opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_tran
 ### Admission, cursor, and idle-replacement regressions
 
 The configured complete-operation deadline begins before a persistent caller
-waits for a request lane.  The retained paused-clock
-`pool_admission_consumes_the_original_complete_operation_deadline` regression
-holds the only lane for a controlled prefix of that deadline, releases it into
-a pending resolver, and requires setup to consume only the remaining budget
-before returning `NotTransmitted(Deadline)`: waiting for admission cannot add a
-second timeout window or lose the deadline's cause.  The fixed pool also
+waits for a request lane.  The retained real mTLS transport and paused-clock
+unit forms of
+`pool_admission_consumes_the_original_complete_operation_deadline` hold the
+only lane beyond the queued caller's deadline and require
+`NotTransmitted(Deadline)` without a second dispatch.  The paused-clock form
+also releases the lane into a pending resolver and proves setup can consume
+only the original deadline's remaining budget: waiting for admission cannot
+add a second timeout window or lose the deadline's cause.  The fixed pool also
 preserves semaphore arrival order.  The retained
 `queued_lane_waiter_cannot_be_overtaken_by_late_callers` adversarial fixture
 queues one caller, starts repeated late callers, releases the held lane, and
