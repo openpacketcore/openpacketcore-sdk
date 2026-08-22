@@ -454,7 +454,7 @@ impl SessionSnapshotFile {
 
     /// Seek the held file back to its first byte.
     pub(crate) async fn rewind(&mut self) -> io::Result<()> {
-        self.file.rewind().await.map(|_| ())
+        self.seek(io::SeekFrom::Start(0)).await.map(|_| ())
     }
 
     /// Flush both file content and metadata before promotion.
