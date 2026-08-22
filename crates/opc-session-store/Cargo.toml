@@ -50,6 +50,7 @@ rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks", "limits
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0" }
 
 [dev-dependencies]
+opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0", features = ["test-vfs"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "test-util"] }
 tempfile = "3"

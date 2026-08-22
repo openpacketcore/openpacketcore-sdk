@@ -156,12 +156,15 @@ fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
 pub struct SqliteSessionBackend {
     conn: Arc<tokio::sync::Mutex<Connection>>,
     database_path: Option<Arc<PathBuf>>,
+    consensus_snapshot_observation: Arc<consensus::SnapshotBuildObservation>,
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
     restore_scan_workers: Arc<tokio::sync::Semaphore>,
     operation_workers: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    consensus_snapshot_capture_gate: Arc<consensus::SnapshotCaptureGate>,
     #[cfg(test)]
     consensus_operator_recovery_failure: Arc<AtomicBool>,
     watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
@@ -436,6 +439,7 @@ impl SqliteSessionBackend {
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             database_path: database_path.map(Arc::new),
+            consensus_snapshot_observation: Arc::new(consensus::SnapshotBuildObservation::default()),
             caps: sqlite_capabilities(),
             clock: Arc::new(crate::clock::SystemClock),
             restore_scan_workers: Arc::new(tokio::sync::Semaphore::new(
@@ -446,6 +450,8 @@ impl SqliteSessionBackend {
             )),
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            consensus_snapshot_capture_gate: Arc::new(consensus::SnapshotCaptureGate::new()),
             #[cfg(test)]
             consensus_operator_recovery_failure: Arc::new(AtomicBool::new(false)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -628,6 +634,16 @@ impl SqliteSessionBackend {
         self.database_path.is_some()
     }
 
+    /// Fixed-dimension observation shared by the consensus snapshot builder.
+    pub(crate) fn snapshot_observation(&self) -> Arc<consensus::SnapshotBuildObservation> {
+        Arc::clone(&self.consensus_snapshot_observation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_capture_gate(&self) -> Arc<consensus::SnapshotCaptureGate> {
+        Arc::clone(&self.consensus_snapshot_capture_gate)
+    }
+
     /// Synchronously test a fixed-quorum authority record without waiting for
     /// a concurrent SQLite operation. Callers must treat lock contention or a
     /// malformed durable record as revoked authority.
@@ -802,6 +818,38 @@ impl SqliteSessionBackend {
                 &tx,
                 storage_identity,
                 storage_identity,
+                &request,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(status)
+        })
+        .await
+    }
+
+    /// Read one ordinary consumer lease-mutation receipt after the caller has
+    /// completed its leader-linearizable barrier.  This opens a SQLite read
+    /// transaction only; it does not advance logical time or submit a
+    /// consensus command.
+    pub(crate) async fn consensus_consumer_lease_mutation_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        authority_identity: crate::consensus::SessionConsensusIdentity,
+        binding_request_id: crate::consensus::SessionConsensusRequestId,
+        operation_request_id: crate::consensus::SessionConsensusRequestId,
+        request: &crate::consumer::SessionConsumerRequest,
+    ) -> Result<crate::consumer::SessionConsumerLeaseMutationStatus, StoreError> {
+        let request = request.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let status = consensus::read_consumer_lease_mutation_status_sync(
+                &tx,
+                storage_identity,
+                authority_identity,
+                binding_request_id,
+                operation_request_id,
                 &request,
             )?;
             tx.commit()

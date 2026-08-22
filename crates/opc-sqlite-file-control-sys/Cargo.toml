@@ -13,7 +13,13 @@ keywords = ["sqlite", "vfs", "ffi", "durability", "security"]
 categories = ["database", "external-ffi-bindings"]
 publish = false
 
+[features]
+# Compile only for the session-store unit regression that proves snapshot
+# finalization does not require a process-global SQLite temporary directory.
+test-vfs = []
+
 [dependencies]
+libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [lints.rust]

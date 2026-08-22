@@ -3748,6 +3748,7 @@ dependencies = [
 name = "opc-sqlite-file-control-sys"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "rusqlite",
 ]
 

@@ -1612,14 +1612,14 @@ umbrella until that fleet evidence passes.
 `StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
 `SessionQuorumConsumerServer` provide the typed least-authority
 application-consumer boundary. They MUST use mutual TLS and the dedicated
-`opc-session-consumer/1` ALPN with transport revision 3. This is a separate
+`opc-session-consumer/1` ALPN with transport revision 4. This is a separate
 exact protocol from both `opc-session-consensus/2` and the quarantined
 `opc-session-net/5` compatibility protocol. A listener MUST NOT offer a
 fallback, negotiate a common revision, or multiplex either other protocol as
-equivalent consumer authority. Revisions 1, 2, and 3 do not interoperate.
+equivalent consumer authority. Revisions 1, 2, 3, and 4 do not interoperate.
 Because this SDK is unreleased, deployments MUST drain consumer clients and
-listeners, then make one coordinated revision-3 cutover; fallback, dual-mode,
-and mixed-revision consumer operation are unsupported. Revision-3 private JSON
+listeners, then make one coordinated revision-4 cutover; fallback, dual-mode,
+and mixed-revision consumer operation are unsupported. Revision-4 private JSON
 DTO bytes are canonical; reordered or otherwise noncanonical encodings,
 aliases, omissions, and unknown fields MUST fail closed.
 
@@ -1815,14 +1815,14 @@ claim.
 The v7 qualification profile remains the revision-2 persistent-transport
 inventory and records its connection, frame, request/response, watch, task,
 and lifecycle limits beside the consensus profile. The published v6 profile
-remains the unchanged revision-1 contract. Revision 3 retains those bounded
-transport properties and adds the generic #696 family; its exact-head evidence
-is recorded with the atomic-transition qualification. No profile or evidence
-records consumer identity or scope material. Synthetic warm accept/reuse checks
-gate only their transport method; elapsed samples are non-gating and are not an
-SLO.
+remains the unchanged revision-1 contract. Revision 4 retains those bounded
+transport properties and the revision-3 generic #696 family, then adds exact
+retained status recovery for ordinary leases; its exact-head evidence is
+recorded with the receipt-status qualification. No profile or evidence records
+consumer identity or scope material. Synthetic warm accept/reuse checks gate
+only their transport method; elapsed samples are non-gating and are not an SLO.
 
-Revision 3 carries `StorageExhausted` only inside the closed fenced-transition
+Revision 4 carries `StorageExhausted` only inside the closed fenced-transition
 `Recorded` status result. Frozen session-net v5 maps this outcome fail-closed as
 an unknown capability; its wire enum and revision remain unchanged. Product and
 ePDG composition remain outside this generic API.

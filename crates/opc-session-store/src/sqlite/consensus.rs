@@ -11,7 +11,10 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
@@ -78,6 +81,8 @@ const CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES: i64 = 16 * 1024;
 static ACTIVATED_CONSENSUS_IDENTITY_SCHEMA_FORMS: OnceLock<BTreeSet<String>> = OnceLock::new();
 const OPERATOR_RECOVERY_LATCH_MAGIC: &[u8; 8] = b"OPCRL001";
 const OPERATOR_RECOVERY_LATCH_BYTES: usize = 8 + 32 + 32 + 8 + 8 + 32 + 1;
+#[cfg(test)]
+static SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OperatorRecoveryLatch {
@@ -304,10 +309,102 @@ pub(crate) fn clear_operator_recovery_latch_sync(
     .sync_all()
 }
 
-type ConsensusAppliedMembership = (
+pub(crate) type ConsensusAppliedMembership = (
     Option<LogId<SessionConsensusNodeId>>,
     StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
 );
+
+/// Fixed-dimension snapshot-capture observations.
+///
+/// These counters deliberately exclude paths, session identifiers, and payload
+/// material. They are status/evidence values, not labelled metrics or
+/// per-subscriber state.
+#[derive(Clone, Copy, Default)]
+struct SnapshotBuildStatus {
+    latest_wal_bytes: u64,
+    peak_wal_bytes: u64,
+    last_duration_millis: u64,
+    completed_snapshot_count: u64,
+}
+
+/// The status fields are published under one fixed mutex only after a sealed
+/// snapshot becomes the durable OpenRaft current snapshot. Readers therefore
+/// observe one generation, never a mixture of success generations.
+#[derive(Default)]
+pub(crate) struct SnapshotBuildObservation {
+    status: Mutex<SnapshotBuildStatus>,
+}
+
+impl SnapshotBuildObservation {
+    /// Publish the complete successful-capture generation.
+    pub(crate) fn record_published(&self, captured_wal_peak: u64, duration: std::time::Duration) {
+        let mut status = match self.status.lock() {
+            Ok(status) => status,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        status.latest_wal_bytes = captured_wal_peak;
+        status.peak_wal_bytes = status.peak_wal_bytes.max(captured_wal_peak);
+        status.last_duration_millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        status.completed_snapshot_count = status.completed_snapshot_count.saturating_add(1);
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64) {
+        let status = match self.status.lock() {
+            Ok(status) => status,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (
+            status.latest_wal_bytes,
+            status.peak_wal_bytes,
+            status.last_duration_millis,
+            status.completed_snapshot_count,
+        )
+    }
+}
+
+/// Test-only coordination for holding snapshot capture after its source image
+/// has been fixed. It is deliberately absent from production builds.
+#[cfg(test)]
+pub(crate) struct SnapshotCaptureGate {
+    armed: AtomicBool,
+    started: AtomicBool,
+    released: AtomicBool,
+}
+
+#[cfg(test)]
+impl SnapshotCaptureGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn arm(&self) {
+        self.started.store(false, Ordering::SeqCst);
+        self.released.store(false, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn started(&self) -> bool {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn block_after_capture(&self) {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.started.store(true, Ordering::SeqCst);
+        while !self.released.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+}
 
 /// Exact durable identity history admitted for one bounded membership change.
 ///
@@ -1179,6 +1276,10 @@ pub(crate) fn install_migrated_operator_recovery_validation_schema_sync(
 #[derive(Clone)]
 pub(crate) struct SqliteConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
+    /// A duplicate of the actual live SQLite main-file descriptor, admitted
+    /// from SQLite's VFS rather than from path metadata.
+    pub(crate) database_file: Option<Arc<crate::consensus::snapshot::PinnedSqliteFile>>,
+    pub(crate) snapshot_observation: Arc<SnapshotBuildObservation>,
     /// Immutable database-incarnation identity used by legacy foreign keys.
     /// The active topology identity lives in `consensus_membership_scope`.
     pub(crate) storage_identity: SessionConsensusIdentity,
@@ -1187,14 +1288,21 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) expected_members: BTreeSet<SessionConsensusNodeId>,
     pub(crate) expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     pub(crate) snapshot_dir: Arc<PathBuf>,
+    /// A cancellation-safe staging cleanup failure. It is consumed only by a
+    /// later operation holding the single snapshot gate.
+    pub(crate) snapshot_cleanup_failed: Arc<AtomicBool>,
     pub(crate) caps: BackendCapabilities,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Only one unvalidated receiver may own disk space for this core.
+    pub(crate) snapshot_receive_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
     pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ReplicationWatcher>>>,
     pub(crate) consumer_watchers:
         Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ConsumerReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    pub(crate) snapshot_capture_gate: Arc<SnapshotCaptureGate>,
 }
 
 impl SqliteConsensusCore {
@@ -1273,7 +1381,7 @@ impl SqliteConsensusCore {
             .await
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
 
-        let (storage_identity, applied) = {
+        let (storage_identity, applied, database_file) = {
             let conn = backend.conn.lock().await;
             let storage_identity = initialize_schema_with_storage_anchor_and_pending_and_bindings(
                 &conn,
@@ -1287,28 +1395,51 @@ impl SqliteConsensusCore {
             )?;
             let applied = read_applied_sync(&conn, storage_identity)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-            (storage_identity, applied)
+            let database_file = match &backend.database_path {
+                Some(path) => {
+                    let file = opc_sqlite_file_control_sys::main_file_descriptor(&conn)
+                        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+                    // The canonical path is only the reader's WAL lookup hint.
+                    // The duplicated live descriptor remains authoritative.
+                    let canonical_path = std::fs::canonicalize(path.as_ref())
+                        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+                    let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+                        file,
+                        canonical_path,
+                    )
+                    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+                    Some(Arc::new(pinned))
+                }
+                None => None,
+            };
+            (storage_identity, applied, database_file)
         };
         let (applied_progress, _) = tokio::sync::watch::channel(applied);
 
         Ok(Self {
             conn: Arc::clone(&backend.conn),
+            database_file,
+            snapshot_observation: backend.snapshot_observation(),
             storage_identity,
             authority_profile,
             fixed_placement_policy,
             expected_members,
             expected_bindings,
             snapshot_dir: Arc::new(canonical_snapshot_dir),
+            snapshot_cleanup_failed: Arc::new(AtomicBool::new(false)),
             // The core is shared by state-machine apply, snapshots, and
             // recovery/reopen paths. It must retain the consensus adapter's
             // advertised profile rather than SQLite's standalone ceiling.
             caps: backend.consensus_capabilities(),
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_receive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             applied_progress,
             watchers: Arc::clone(&backend.watchers),
             consumer_watchers: Arc::clone(&backend.consumer_watchers),
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
+            #[cfg(test)]
+            snapshot_capture_gate: Arc::clone(&backend.consensus_snapshot_capture_gate),
         })
     }
 }
@@ -7579,14 +7710,36 @@ fn payload_digest(
             authority_identity,
             mutation,
             ..
-        } => encode_json(&(
-            command.schema_version,
-            command.identity,
-            authority_identity,
-            mutation.as_ref(),
-        ))?,
+        } => {
+            return authorized_mutation_payload_digest(
+                storage_identity,
+                *authority_identity,
+                mutation.as_ref(),
+            )
+        }
         intent => encode_json(&(command.schema_version, command.identity, intent))?,
     };
+    let mut hasher = Sha256::new();
+    hasher.update(OUTCOME_DIGEST_DOMAIN);
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
+}
+
+/// Calculate the durable payload digest for the authenticated application
+/// envelope without reconstructing a leader-owned command.  Receipt status
+/// uses this for an already-authorized exact scope; it deliberately accepts
+/// neither a client-supplied internal request ID nor an unbound digest.
+fn authorized_mutation_payload_digest(
+    storage_identity: SessionConsensusIdentity,
+    authority_identity: SessionConsensusIdentity,
+    mutation: &SessionMutationIntent,
+) -> io::Result<[u8; 32]> {
+    let encoded = encode_json(&(
+        SESSION_CONSENSUS_SCHEMA_VERSION,
+        storage_identity,
+        authority_identity,
+        mutation,
+    ))?;
     let mut hasher = Sha256::new();
     hasher.update(OUTCOME_DIGEST_DOMAIN);
     hasher.update(encoded);
@@ -8390,6 +8543,272 @@ pub(crate) fn read_fenced_transition_status_sync(
         return Ok(FencedTransitionStatus::RetentionExhausted);
     }
     Ok(FencedTransitionStatus::NotFound)
+}
+
+/// Read the exact binding and operation outcomes for an ordinary consumer
+/// lease mutation without applying a consensus command or evaluating current
+/// lease state.
+///
+/// The caller supplies only IDs derived at the authenticated server boundary.
+/// The complete original consumer request is still required here to rebuild
+/// both expected commitments.  A matching public ID with a changed body is a
+/// conflict; an absent row is merely an observation at the caller's completed
+/// linearizable read barrier.
+pub(crate) fn read_consumer_lease_mutation_status_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    authority_identity: SessionConsensusIdentity,
+    binding_request_id: SessionConsensusRequestId,
+    operation_request_id: SessionConsensusRequestId,
+    request: &crate::consumer::SessionConsumerRequest,
+) -> Result<crate::consumer::SessionConsumerLeaseMutationStatus, StoreError> {
+    use crate::consumer::{
+        SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationStatus,
+        SessionConsumerOperation,
+    };
+
+    request.validate().map_err(|_| {
+        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+    })?;
+    if request.scope().consensus_identity() != authority_identity {
+        return Err(StoreError::BackendUnavailable(
+            "consumer lease receipt status is unavailable".into(),
+        ));
+    }
+    let lease_operation = match request.operation() {
+        SessionConsumerOperation::AcquireLease { key, owner, ttl } => {
+            SessionConsumerLeaseMutationOperation::Acquire {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl: *ttl,
+            }
+        }
+        SessionConsumerOperation::RenewLease { lease, ttl } => {
+            SessionConsumerLeaseMutationOperation::Renew {
+                lease: lease.clone(),
+                ttl: *ttl,
+            }
+        }
+        SessionConsumerOperation::ReleaseLease { lease } => {
+            SessionConsumerLeaseMutationOperation::Release {
+                lease: lease.clone(),
+            }
+        }
+        _ => {
+            return Err(StoreError::BackendUnavailable(
+                "consumer lease receipt status is unavailable".into(),
+            ));
+        }
+    };
+    let commitment = crate::consumer::consumer_request_commitment(request).map_err(|_| {
+        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+    })?;
+    let binding_digest = authorized_mutation_payload_digest(
+        storage_identity,
+        authority_identity,
+        &SessionMutationIntent::BindConsumerRequest {
+            request_commitment: commitment,
+        },
+    )
+    .map_err(|_| {
+        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+    })?;
+    let operation_intent = match &lease_operation {
+        SessionConsumerLeaseMutationOperation::Acquire { key, owner, ttl } => {
+            SessionMutationIntent::AcquireLease {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl: *ttl,
+            }
+        }
+        SessionConsumerLeaseMutationOperation::Renew { lease, ttl } => {
+            SessionMutationIntent::RenewLease {
+                lease: lease.clone(),
+                ttl: *ttl,
+            }
+        }
+        SessionConsumerLeaseMutationOperation::Release { lease } => {
+            SessionMutationIntent::ReleaseLease(lease.clone())
+        }
+    };
+    let operation_digest =
+        authorized_mutation_payload_digest(storage_identity, authority_identity, &operation_intent)
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "consumer lease receipt status is unavailable".into(),
+                )
+            })?;
+
+    let binding = read_outcome_sync(conn, storage_identity, binding_request_id).map_err(|_| {
+        StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+    })?;
+    let binding_matches = match binding {
+        Some((digest, response)) if digest == binding_digest => {
+            matches!(response.result, Ok(SessionMutationOutcome::Unit))
+        }
+        Some(_) => return Ok(SessionConsumerLeaseMutationStatus::RequestConflict),
+        None => false,
+    };
+    if !binding_matches {
+        if request_id_is_occupied_sync(conn, storage_identity, binding_request_id)?
+            || request_id_is_occupied_sync(conn, storage_identity, operation_request_id)?
+        {
+            return Ok(SessionConsumerLeaseMutationStatus::RequestConflict);
+        }
+        return Ok(SessionConsumerLeaseMutationStatus::NotFound);
+    }
+
+    let Some((digest, response)) = read_outcome_sync(conn, storage_identity, operation_request_id)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+        })?
+    else {
+        if request_id_is_occupied_sync(conn, storage_identity, operation_request_id)? {
+            return Ok(SessionConsumerLeaseMutationStatus::RequestConflict);
+        }
+        return Ok(SessionConsumerLeaseMutationStatus::NotFound);
+    };
+    if digest != operation_digest {
+        return Ok(SessionConsumerLeaseMutationStatus::RequestConflict);
+    }
+    let recorded = consumer_lease_mutation_result_from_response(&lease_operation, &response)?;
+    Ok(SessionConsumerLeaseMutationStatus::Recorded(Box::new(
+        recorded,
+    )))
+}
+
+fn request_id_is_occupied_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: SessionConsensusRequestId,
+) -> Result<bool, StoreError> {
+    if read_outcome_sync(conn, identity, request_id)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+        })?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    read_fenced_transition_receipt_sync(conn, identity, request_id)
+        .map(|receipt| receipt.is_some())
+        .map_err(|_| {
+            StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into())
+        })
+}
+
+fn consumer_lease_mutation_result_from_response(
+    operation: &crate::consumer::SessionConsumerLeaseMutationOperation,
+    response: &SessionConsensusResponse,
+) -> Result<
+    Result<
+        crate::consumer::SessionConsumerLeaseMutationResult,
+        crate::consumer::SessionConsumerLeaseError,
+    >,
+    StoreError,
+> {
+    use crate::consumer::{
+        SessionConsumerLeaseError, SessionConsumerLeaseMutationOperation,
+        SessionConsumerLeaseMutationResult,
+    };
+
+    let unavailable =
+        || StoreError::BackendUnavailable("consumer lease receipt status is unavailable".into());
+    let deterministic_error = |error: &StoreError, permits: &[SessionConsumerLeaseError]| {
+        let projected = match error {
+            StoreError::LeaseHeld => SessionConsumerLeaseError::AlreadyHeld,
+            StoreError::LeaseExpired => SessionConsumerLeaseError::Expired,
+            StoreError::StaleFence | StoreError::TopologyAuthorityRevoked => {
+                SessionConsumerLeaseError::StaleFence
+            }
+            StoreError::NotFound => SessionConsumerLeaseError::NotFound,
+            StoreError::InvalidSessionTtl => SessionConsumerLeaseError::InvalidTtl,
+            _ => return None,
+        };
+        permits.contains(&projected).then_some(projected)
+    };
+    match operation {
+        SessionConsumerLeaseMutationOperation::Acquire { key, owner, ttl } => {
+            match &response.result {
+                Ok(SessionMutationOutcome::Lease(guard)) => {
+                    guard.validate_profile().map_err(|_| unavailable())?;
+                    if guard.key() != key
+                        || guard.owner() != owner
+                        || guard.acquired_at() != response.logical_time.ok_or_else(unavailable)?
+                        || guard.expires_at()
+                            != crate::ttl::checked_session_deadline(
+                                response.logical_time.ok_or_else(unavailable)?,
+                                *ttl,
+                            )
+                            .map_err(|_| unavailable())?
+                    {
+                        return Err(unavailable());
+                    }
+                    Ok(Ok(SessionConsumerLeaseMutationResult::Acquire(
+                        guard.clone(),
+                    )))
+                }
+                Err(error) => deterministic_error(
+                    error,
+                    &[
+                        SessionConsumerLeaseError::AlreadyHeld,
+                        SessionConsumerLeaseError::StaleFence,
+                        SessionConsumerLeaseError::InvalidTtl,
+                    ],
+                )
+                .map(Err)
+                .ok_or_else(unavailable),
+                Ok(_) => Err(unavailable()),
+            }
+        }
+        SessionConsumerLeaseMutationOperation::Renew { lease, ttl } => match &response.result {
+            Ok(SessionMutationOutcome::Lease(guard)) => {
+                guard.validate_profile().map_err(|_| unavailable())?;
+                if guard.key() != lease.key()
+                    || guard.owner() != lease.owner()
+                    || guard.fence() != lease.fence()
+                    || guard.credential_id() != lease.credential_id()
+                    || guard.acquired_at() != lease.acquired_at()
+                    || guard.expires_at()
+                        != crate::ttl::checked_session_deadline(
+                            response.logical_time.ok_or_else(unavailable)?,
+                            *ttl,
+                        )
+                        .map_err(|_| unavailable())?
+                {
+                    return Err(unavailable());
+                }
+                Ok(Ok(SessionConsumerLeaseMutationResult::Renew(guard.clone())))
+            }
+            Err(error) => deterministic_error(
+                error,
+                &[
+                    SessionConsumerLeaseError::AlreadyHeld,
+                    SessionConsumerLeaseError::Expired,
+                    SessionConsumerLeaseError::StaleFence,
+                    SessionConsumerLeaseError::NotFound,
+                    SessionConsumerLeaseError::InvalidTtl,
+                ],
+            )
+            .map(Err)
+            .ok_or_else(unavailable),
+            Ok(_) => Err(unavailable()),
+        },
+        SessionConsumerLeaseMutationOperation::Release { lease: _ } => match &response.result {
+            Ok(SessionMutationOutcome::Unit) => Ok(Ok(SessionConsumerLeaseMutationResult::Release)),
+            Err(error) => deterministic_error(
+                error,
+                &[
+                    SessionConsumerLeaseError::AlreadyHeld,
+                    SessionConsumerLeaseError::StaleFence,
+                    SessionConsumerLeaseError::NotFound,
+                ],
+            )
+            .map(Err)
+            .ok_or_else(unavailable),
+            Ok(_) => Err(unavailable()),
+        },
+    }
 }
 
 fn replay_conflict_response(
@@ -10860,52 +11279,37 @@ fn refresh_pinned_snapshot_database(
 }
 
 #[cfg(target_os = "linux")]
-fn matching_pinned_snapshot_descriptors(
-    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
-) -> io::Result<BTreeSet<std::os::fd::RawFd>> {
-    let mut descriptors = BTreeSet::new();
-    for entry in std::fs::read_dir("/proc/self/fd")? {
-        let entry = entry?;
-        let Some(fd) = entry
-            .file_name()
-            .to_str()
-            .and_then(|value| value.parse::<std::os::fd::RawFd>().ok())
-        else {
-            continue;
-        };
-        match pinned.path_matches_identity(&entry.path()) {
-            Ok(true) => {
-                descriptors.insert(fd);
-            }
-            Ok(false) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(descriptors)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn matching_pinned_snapshot_descriptors(
-    _pinned: &crate::consensus::snapshot::PinnedSqliteFile,
-) -> io::Result<BTreeSet<i32>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "pinned SQLite snapshot binding requires Linux",
-    ))
-}
-
-#[cfg(target_os = "linux")]
 fn pinned_snapshot_uri(
     pinned: &crate::consensus::snapshot::PinnedSqliteFile,
     read_only: bool,
 ) -> String {
     let mode = if read_only { "ro" } else { "rw" };
     format!(
-        "file:/proc/self/fd/{}?mode={mode}&cache=private{}",
+        "file:/proc/self/fd/{}?mode={mode}&cache=private{}{}",
         pinned.raw_fd(),
-        if read_only { "&immutable=1" } else { "" }
+        if read_only { "&immutable=1" } else { "" },
+        snapshot_test_vfs_uri_parameter(),
     )
+}
+
+// A child unit-test process enables the feature-gated safe VFS registration in
+// `opc-sqlite-file-control-sys` and flips this local selector.  Production
+// never builds or selects that VFS.
+#[cfg(test)]
+fn snapshot_test_vfs_uri_parameter() -> String {
+    if SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS.load(Ordering::Acquire) {
+        format!(
+            "&vfs={}",
+            opc_sqlite_file_control_sys::TEST_TEMP_PATH_FAILURE_VFS_NAME
+        )
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(not(test))]
+fn snapshot_test_vfs_uri_parameter() -> String {
+    String::new()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -10919,9 +11323,8 @@ fn pinned_snapshot_uri(
 #[cfg(target_os = "linux")]
 fn open_pinned_snapshot_database(
     pinned: &crate::consensus::snapshot::PinnedSqliteFile,
-) -> io::Result<(Connection, BTreeSet<std::os::fd::RawFd>)> {
+) -> io::Result<Connection> {
     pinned.verify_identity()?;
-    let before = matching_pinned_snapshot_descriptors(pinned)?;
     let uri = pinned_snapshot_uri(pinned, false);
     let destination = Connection::open_with_flags(
         uri,
@@ -10933,20 +11336,14 @@ fn open_pinned_snapshot_database(
     destination
         .query_row("PRAGMA schema_version", [], |_| Ok(()))
         .map_err(db_error)?;
-    let after = matching_pinned_snapshot_descriptors(pinned)?;
-    let opened = after.difference(&before).copied().collect::<BTreeSet<_>>();
-    if opened.len() != 1 {
-        return Err(invalid_data(
-            "SQLite did not retain exactly one pinned snapshot descriptor",
-        ));
-    }
-    Ok((destination, opened))
+    verify_pinned_snapshot_descriptor(pinned, &destination)?;
+    Ok(destination)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn open_pinned_snapshot_database(
     _pinned: &crate::consensus::snapshot::PinnedSqliteFile,
-) -> io::Result<(Connection, BTreeSet<i32>)> {
+) -> io::Result<Connection> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "pinned SQLite snapshot binding requires Linux",
@@ -10956,13 +11353,22 @@ fn open_pinned_snapshot_database(
 #[cfg(target_os = "linux")]
 fn verify_pinned_snapshot_descriptor(
     pinned: &crate::consensus::snapshot::PinnedSqliteFile,
-    retained: &BTreeSet<std::os::fd::RawFd>,
+    connection: &Connection,
 ) -> io::Result<()> {
     pinned.verify_identity()?;
-    let observed = matching_pinned_snapshot_descriptors(pinned)?;
-    if retained.is_empty() || !retained.is_subset(&observed) {
+    if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+        .map_err(|_| invalid_data("SQLite pinned snapshot descriptor is unavailable"))?
+    {
+        return Err(invalid_data("SQLite pinned snapshot descriptor moved"));
+    }
+    let actual = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+        opc_sqlite_file_control_sys::main_file_descriptor(connection)
+            .map_err(|_| invalid_data("SQLite pinned snapshot descriptor is unavailable"))?,
+        pinned.path().to_path_buf(),
+    )?;
+    if actual.identity() != pinned.identity() {
         return Err(invalid_data(
-            "SQLite released the pinned snapshot descriptor",
+            "SQLite opened a different pinned snapshot descriptor",
         ));
     }
     Ok(())
@@ -10971,12 +11377,490 @@ fn verify_pinned_snapshot_descriptor(
 #[cfg(not(target_os = "linux"))]
 fn verify_pinned_snapshot_descriptor(
     _pinned: &crate::consensus::snapshot::PinnedSqliteFile,
-    _retained: &BTreeSet<i32>,
+    _connection: &Connection,
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "pinned SQLite snapshot binding requires Linux",
     ))
+}
+
+/// Verify SQLite's named attached-database handle against the descriptor that
+/// was pinned before `ATTACH`. No process-wide descriptor enumeration is used.
+#[cfg(target_os = "linux")]
+fn verify_attached_snapshot_descriptor(
+    pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+    connection: &Connection,
+    database: &str,
+) -> io::Result<()> {
+    pinned.verify_identity()?;
+    let actual = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+        opc_sqlite_file_control_sys::database_file_descriptor(connection, database)
+            .map_err(|_| invalid_data("SQLite attached snapshot descriptor is unavailable"))?,
+        pinned.path().to_path_buf(),
+    )?;
+    if actual.identity() != pinned.identity() {
+        return Err(invalid_data(
+            "SQLite opened a different attached snapshot descriptor",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_attached_snapshot_descriptor(
+    _pinned: &crate::consensus::snapshot::PinnedSqliteFile,
+    _connection: &Connection,
+    _database: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "pinned SQLite snapshot binding requires Linux",
+    ))
+}
+
+// A reader can retain WAL frames only while one snapshot is being copied. Its
+// fixed envelope is deliberately no larger than the sealed snapshot envelope.
+const SNAPSHOT_SOURCE_WAL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const SNAPSHOT_BACKUP_STEP_PAGES: i32 = 128;
+
+/// One descriptor-verified, independently pinned SQLite snapshot reader.
+///
+/// The live consensus connection is never moved into this reader. The reader
+/// is admitted only after its SQLite-owned main descriptor is compared with
+/// the duplicated descriptor taken from that live connection.
+pub(crate) struct SnapshotReadConnection {
+    pub(crate) connection: Connection,
+    source: crate::consensus::snapshot::PinnedSqliteFile,
+    wal: Mutex<Option<crate::consensus::snapshot::PinnedSqliteFile>>,
+}
+
+fn verify_snapshot_read_connection(reader: &SnapshotReadConnection) -> io::Result<()> {
+    reader.source.verify_identity()?;
+    if opc_sqlite_file_control_sys::main_file_has_moved(&reader.connection)
+        .map_err(|_| invalid_data("session consensus snapshot reader descriptor is unavailable"))?
+    {
+        return Err(invalid_data(
+            "session consensus snapshot reader main file moved",
+        ));
+    }
+    let actual_source = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+        opc_sqlite_file_control_sys::main_file_descriptor(&reader.connection).map_err(|_| {
+            invalid_data("session consensus snapshot reader descriptor is unavailable")
+        })?,
+        reader.source.path().to_path_buf(),
+    )?;
+    if actual_source.identity() != reader.source.identity() {
+        return Err(invalid_data(
+            "session consensus snapshot reader source descriptor changed",
+        ));
+    }
+    Ok(())
+}
+
+/// Open one read-only, file-backed snapshot reader without sharing the live
+/// consensus connection. Its caller must still create exactly one read
+/// transaction before admitting a source cut.
+pub(crate) fn open_snapshot_read_connection(
+    source: &crate::consensus::snapshot::PinnedSqliteFile,
+) -> io::Result<SnapshotReadConnection> {
+    #[cfg(target_os = "linux")]
+    {
+        source.verify_identity()?;
+        let source = source.try_clone()?;
+        let conn = Connection::open_with_flags(
+            source.path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(db_error)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA query_only = ON;")
+            .map_err(db_error)?;
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .map_err(db_error)?;
+        if foreign_keys != 1 {
+            return Err(invalid_data(
+                "session consensus snapshot reader has no foreign key enforcement",
+            ));
+        }
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(db_error)?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(invalid_data(
+                "session consensus snapshot reader requires WAL mode",
+            ));
+        }
+        let reader = SnapshotReadConnection {
+            connection: conn,
+            source,
+            wal: Mutex::new(None),
+        };
+        verify_snapshot_read_connection(&reader)?;
+        Ok(reader)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = source;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "session consensus snapshot readers require Linux",
+        ))
+    }
+}
+
+/// Read the exact applied/membership cut that names one SQLite snapshot.
+pub(crate) fn snapshot_applied_membership_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<ConsensusAppliedMembership> {
+    let applied = read_applied_sync(conn, identity)?;
+    let membership = read_membership_sync(conn, identity)?;
+    validate_membership_ids(&membership)?;
+    Ok((applied, membership))
+}
+
+/// Begin the sole snapshot-reader transaction and establish its source cut.
+pub(crate) fn begin_snapshot_read_sync(
+    reader: &SnapshotReadConnection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<ConsensusAppliedMembership> {
+    verify_snapshot_read_connection(reader)?;
+    reader
+        .connection
+        .execute_batch("BEGIN DEFERRED TRANSACTION;")
+        .map_err(db_error)?;
+    match snapshot_applied_membership_sync(&reader.connection, identity) {
+        Ok(cut) => match pin_snapshot_reader_wal(reader) {
+            Ok(()) => Ok(cut),
+            Err(error) => match reader
+                .connection
+                .execute_batch("ROLLBACK;")
+                .map_err(db_error)
+            {
+                Ok(()) => Err(error),
+                Err(release_error) => Err(release_error),
+            },
+        },
+        Err(error) => match reader
+            .connection
+            .execute_batch("ROLLBACK;")
+            .map_err(db_error)
+        {
+            Ok(()) => Err(error),
+            Err(release_error) => Err(release_error),
+        },
+    }
+}
+
+/// Release a source reader as soon as its backup has completed.
+pub(crate) fn release_snapshot_read_sync(reader: &SnapshotReadConnection) -> io::Result<()> {
+    // This is deliberately the only operation on the reader at backup exit:
+    // source identity checks, paths, destination validation, and offline
+    // VACUUM all follow this unconditional transaction release.
+    reader
+        .connection
+        .execute_batch("ROLLBACK;")
+        .map_err(db_error)
+}
+
+/// Enforce a caller-selected WAL ceiling without identifying the source.
+pub(crate) fn enforce_snapshot_source_wal_bound(bytes: u64, maximum: u64) -> io::Result<()> {
+    if bytes > maximum {
+        return Err(invalid_data(
+            "session consensus snapshot source WAL exceeds its fixed bound",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_reader_wal_bound(
+    reader: &SnapshotReadConnection,
+    maximum: u64,
+) -> io::Result<u64> {
+    let bytes = verify_snapshot_reader_wal(reader)?;
+    enforce_snapshot_source_wal_bound(bytes, maximum)?;
+    Ok(bytes)
+}
+
+/// Return the length from the exact WAL descriptor owned by the reader.
+/// A replacement or unlink changes the retained descriptor or link count and
+/// is rejected. It can never become a path-derived zero sample.
+fn verify_snapshot_reader_wal(reader: &SnapshotReadConnection) -> io::Result<u64> {
+    let stored = match reader.wal.lock() {
+        Ok(stored) => stored,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let wal = stored
+        .as_ref()
+        .ok_or_else(|| invalid_data("session consensus snapshot reader WAL is not pinned"))?;
+    #[cfg(target_os = "linux")]
+    wal.verify_linked_identity()?;
+    let actual_wal = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+        opc_sqlite_file_control_sys::main_journal_descriptor(&reader.connection).map_err(|_| {
+            invalid_data("session consensus snapshot reader WAL descriptor is unavailable")
+        })?,
+        wal.path().to_path_buf(),
+    )?;
+    if actual_wal.identity() != wal.identity() {
+        return Err(invalid_data(
+            "session consensus snapshot reader WAL descriptor changed",
+        ));
+    }
+    Ok(wal.file().metadata()?.len())
+}
+
+fn pin_snapshot_reader_wal(reader: &SnapshotReadConnection) -> io::Result<()> {
+    let mut wal_path = reader.source.path().as_os_str().to_os_string();
+    wal_path.push("-wal");
+    let wal = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+        opc_sqlite_file_control_sys::main_journal_descriptor(&reader.connection)
+            .map_err(|_| invalid_data("session consensus snapshot reader has no WAL descriptor"))?,
+        PathBuf::from(wal_path),
+    )?;
+    let mut stored = match reader.wal.lock() {
+        Ok(stored) => stored,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if stored.is_some() {
+        return Err(invalid_data(
+            "session consensus snapshot reader WAL was already pinned",
+        ));
+    }
+    *stored = Some(wal);
+    Ok(())
+}
+
+/// Copy a reader-owned SQLite snapshot in bounded steps.
+/// The WAL descriptor is verified and bounded before the first step, after
+/// each bounded step, and immediately before every continuation. A transient
+/// SQLite lock is not retried under a retained reader.
+fn backup_snapshot_reader_bounded(
+    reader: &SnapshotReadConnection,
+    destination: &mut Connection,
+    wal_maximum: u64,
+) -> io::Result<u64> {
+    backup_snapshot_reader_bounded_with_hook_and_step(
+        reader,
+        destination,
+        wal_maximum,
+        || {},
+        |backup| backup.step(SNAPSHOT_BACKUP_STEP_PAGES),
+    )
+}
+
+/// The hook is intentionally internal: production supplies a zero-work
+/// closure, while deterministic tests inject WAL growth between two bounded
+/// steps without scheduling or timing assumptions.
+#[cfg(test)]
+fn backup_snapshot_reader_bounded_with_hook<F>(
+    reader: &SnapshotReadConnection,
+    destination: &mut Connection,
+    wal_maximum: u64,
+    after_step: F,
+) -> io::Result<u64>
+where
+    F: FnMut(),
+{
+    backup_snapshot_reader_bounded_with_hook_and_step(
+        reader,
+        destination,
+        wal_maximum,
+        after_step,
+        |backup| backup.step(SNAPSHOT_BACKUP_STEP_PAGES),
+    )
+}
+
+/// Keep step result injection confined to this private test seam: production
+/// supplies the exact `Backup::step` call above, while the test can prove a
+/// post-step WAL overflow wins over a SQLite step error.
+fn backup_snapshot_reader_bounded_with_hook_and_step<F, S>(
+    reader: &SnapshotReadConnection,
+    destination: &mut Connection,
+    wal_maximum: u64,
+    mut after_step: F,
+    mut step: S,
+) -> io::Result<u64>
+where
+    F: FnMut(),
+    S: for<'a, 'b> FnMut(
+        &rusqlite::backup::Backup<'a, 'b>,
+    ) -> rusqlite::Result<rusqlite::backup::StepResult>,
+{
+    let mut wal_peak = validate_snapshot_reader_wal_bound(reader, wal_maximum)?;
+    let backup =
+        rusqlite::backup::Backup::new(&reader.connection, destination).map_err(db_error)?;
+    loop {
+        verify_snapshot_read_connection(reader)?;
+        // This is deliberately repeated for every continuation rather than
+        // inferred from the preceding post-step sample.
+        let before_step = validate_snapshot_reader_wal_bound(reader, wal_maximum)?;
+        wal_peak = wal_peak.max(before_step);
+        // Preserve the SQLite result until the reader-owned WAL has been
+        // sampled. Even a failed step can have retained or extended WAL frames.
+        let result = step(&backup);
+        after_step();
+        let observed = validate_snapshot_reader_wal_bound(reader, wal_maximum)?;
+        wal_peak = wal_peak.max(observed);
+        let result = result.map_err(db_error)?;
+        match result {
+            rusqlite::backup::StepResult::Done => return Ok(wal_peak),
+            rusqlite::backup::StepResult::More => {}
+            rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
+                return Err(invalid_data(
+                    "session consensus bounded snapshot backup lost its SQLite read lock",
+                ));
+            }
+            _ => {
+                return Err(invalid_data(
+                    "session consensus bounded snapshot backup returned an unknown result",
+                ));
+            }
+        }
+    }
+}
+
+/// Copy one already-fixed source reader image into a descriptor-pinned raw
+/// snapshot. This never performs destination cleanup or validation while the
+/// source reader remains open.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_snapshot_database_from_reader_sync(
+    reader: &SnapshotReadConnection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    expected_cut: &ConsensusAppliedMembership,
+    path: &Path,
+) -> io::Result<(
+    ConsensusAppliedMembership,
+    crate::consensus::snapshot::PinnedSqliteFile,
+    u64,
+)> {
+    verify_snapshot_read_connection(reader)?;
+    validate_existing_schema(&reader.connection, identity)
+        .map_err(|_| invalid_data("session consensus snapshot source schema is invalid"))?;
+    validate_durable_authority_for_raw_access(
+        &reader.connection,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+    )?;
+    validate_sealed_state_sync(&reader.connection)?;
+    let observed_cut = snapshot_applied_membership_sync(&reader.connection, identity)?;
+    if &observed_cut != expected_cut {
+        return Err(invalid_data(
+            "session consensus snapshot source cut differs from the live cut",
+        ));
+    }
+    let pinned = create_pinned_snapshot_database(path)?;
+    let mut destination = open_pinned_snapshot_database(&pinned)?;
+    destination
+        .execute_batch("PRAGMA journal_mode = OFF;")
+        .map_err(db_error)?;
+    let wal_bytes =
+        backup_snapshot_reader_bounded(reader, &mut destination, SNAPSHOT_SOURCE_WAL_MAX_BYTES)?;
+    drop(destination);
+    Ok((observed_cut, pinned, wal_bytes))
+}
+
+/// Finish a raw snapshot only after its reader has been released.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_captured_snapshot_database_sync(
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    expected_cut: &ConsensusAppliedMembership,
+    pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    vacuum_path: &Path,
+) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
+    // `VACUUM` asks SQLite's VFS for a process-global temporary directory.
+    // The stateful image deliberately has no writable root or `/tmp`, while
+    // this UUID-named sibling is in the durable snapshot directory.  Create
+    // and retain its descriptor before SQLite sees it: a bare pathname would
+    // leave a replacement window and does not guarantee O_EXCL/O_NOFOLLOW.
+    let mut compacted = create_pinned_snapshot_database(vacuum_path)?;
+    compacted.verify_linked_identity()?;
+    let vacuum_uri = pinned_snapshot_uri(&compacted, false);
+    let destination = open_pinned_snapshot_database(&pinned)?;
+    destination
+        .execute_batch(
+            r#"
+        DELETE FROM consensus_vote;
+        DELETE FROM consensus_committed;
+        DELETE FROM consensus_purged;
+        DELETE FROM consensus_log;
+        DELETE FROM consensus_snapshot;
+        "#,
+        )
+        .map_err(db_error)?;
+    ops::rotate_restore_scan_epoch_sync(&destination)
+        .map_err(|_| invalid_data("built session consensus snapshot restore metadata failed"))?;
+    validate_existing_schema(&destination, identity)
+        .map_err(|_| invalid_data("built session consensus snapshot failed validation"))?;
+    validate_sealed_state_sync(&destination)?;
+    let observed_cut = snapshot_applied_membership_sync(&destination, identity)?;
+    if &observed_cut != expected_cut {
+        return Err(invalid_data(
+            "session consensus snapshot metadata differs from its captured cut",
+        ));
+    }
+    verify_pinned_snapshot_descriptor(&pinned, &destination)?;
+    drop(destination);
+
+    // The URI resolves this process's already-pinned descriptor.  SQLite
+    // accepts the pre-created empty output, and cannot create or redirect a
+    // pathname outside that descriptor binding.
+    let source = open_pinned_snapshot_database(&pinned)?;
+    source
+        .execute("VACUUM INTO ?1", params![vacuum_uri])
+        .map_err(db_error)?;
+    verify_pinned_snapshot_descriptor(&pinned, &source)?;
+    drop(source);
+
+    compacted.verify_linked_identity()?;
+    compacted.file().sync_all()?;
+    sync_snapshot_parent_directory(vacuum_path)?;
+    let compacted_connection = open_pinned_snapshot_database(&compacted)?;
+    validate_durable_authority_for_raw_access(
+        &compacted_connection,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+    )?;
+    validate_existing_schema(&compacted_connection, identity).map_err(|_| {
+        invalid_data("built session consensus compacted snapshot failed validation")
+    })?;
+    validate_sealed_state_sync(&compacted_connection)?;
+    let observed_cut = snapshot_applied_membership_sync(&compacted_connection, identity)?;
+    if &observed_cut != expected_cut {
+        return Err(invalid_data(
+            "session consensus compacted snapshot metadata differs from its captured cut",
+        ));
+    }
+    compacted = refresh_pinned_snapshot_database(compacted)?;
+    verify_pinned_snapshot_descriptor(&compacted, &compacted_connection)?;
+    if !compacted.path_matches_identity(vacuum_path)? {
+        return Err(invalid_data(
+            "session consensus compacted snapshot path was replaced",
+        ));
+    }
+    drop(compacted_connection);
+    Ok(compacted)
+}
+
+fn sync_snapshot_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_data("session consensus vacuum snapshot has no parent"))?;
+    File::open(parent)?.sync_all()
 }
 
 /// Capture the source image while the caller holds the SQLite transaction that
@@ -10995,7 +11879,7 @@ fn capture_and_finalize_snapshot_database_sync(
     let membership = read_membership_sync(conn, identity)?;
     validate_membership_ids(&membership)?;
 
-    let (mut destination, descriptor_fds) = open_pinned_snapshot_database(&pinned)?;
+    let mut destination = open_pinned_snapshot_database(&pinned)?;
     destination
         .execute_batch("PRAGMA journal_mode = OFF;")
         .map_err(db_error)?;
@@ -11006,7 +11890,7 @@ fn capture_and_finalize_snapshot_database_sync(
             .map_err(db_error)?;
     }
     pinned = refresh_pinned_snapshot_database(pinned)?;
-    verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
+    verify_pinned_snapshot_descriptor(&pinned, &destination)?;
     destination
         .execute_batch(
             r#"
@@ -11026,7 +11910,7 @@ fn capture_and_finalize_snapshot_database_sync(
         .map_err(|_| invalid_data("built session consensus snapshot failed validation"))?;
     validate_sealed_state_sync(&destination)?;
     pinned = refresh_pinned_snapshot_database(pinned)?;
-    verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
+    verify_pinned_snapshot_descriptor(&pinned, &destination)?;
     drop(destination);
     Ok(((applied, membership), pinned))
 }
@@ -11968,20 +12852,15 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
     checksum: [u8; 32],
     byte_length: u64,
 ) -> io::Result<()> {
+    if pinned.has_immutable_generation() {
+        pinned.verify_immutable_generation()?;
+    }
     let incoming_last_log_id = meta.last_log_id.as_ref();
     validate_snapshot_floor(conn, identity, incoming_last_log_id)?;
     let expected_scope = read_membership_scope_sync(conn, identity)?;
     let local_candidate_marker = read_candidate_bootstrap_marker_sync(conn, identity)?;
-    if final_file_name.is_empty()
-        || final_file_name.contains('/')
-        || final_file_name.contains('\\')
-        || final_file_name == "."
-        || final_file_name == ".."
-    {
-        return Err(invalid_data("invalid session consensus snapshot file name"));
-    }
+    validate_published_snapshot_file_name(final_file_name)?;
     let byte_length = checked_positive_i64(byte_length)?;
-    let before = matching_pinned_snapshot_descriptors(&pinned)?;
     let snapshot_uri = pinned_snapshot_uri(&pinned, true);
     conn.execute("ATTACH DATABASE ?1 AS consensus_incoming", [snapshot_uri])
         .map_err(db_error)?;
@@ -11991,13 +12870,11 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         |_| Ok(()),
     )
     .map_err(db_error)?;
-    let after = matching_pinned_snapshot_descriptors(&pinned)?;
-    let retained_descriptors = after.difference(&before).copied().collect::<BTreeSet<_>>();
-    if retained_descriptors.len() != 1 {
-        let _ = conn.execute("DETACH DATABASE consensus_incoming", []);
-        return Err(invalid_data(
-            "SQLite did not retain exactly one pinned incoming snapshot descriptor",
-        ));
+    if let Err(error) = verify_attached_snapshot_descriptor(&pinned, conn, "consensus_incoming") {
+        return match conn.execute("DETACH DATABASE consensus_incoming", []) {
+            Ok(_) => Err(error),
+            Err(detach_error) => Err(db_error(detach_error)),
+        };
     }
 
     let result = (|| {
@@ -12218,8 +13095,12 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             ],
         )
         .map_err(db_error)?;
-        verify_pinned_snapshot_descriptor(&pinned, &retained_descriptors)?;
+        verify_attached_snapshot_descriptor(&pinned, &tx, "consensus_incoming")?;
+        if pinned.has_immutable_generation() {
+            pinned.verify_immutable_generation()?;
+        }
         if let Some((published_snapshot, published_path)) = published_snapshot {
+            published_snapshot.verify_immutable_generation()?;
             if !published_snapshot.path_matches_identity(published_path)? {
                 return Err(invalid_data(
                     "session consensus published snapshot was replaced",
@@ -12414,6 +13295,7 @@ fn save_current_snapshot_in_tx(
     checksum: [u8; 32],
     byte_length: u64,
 ) -> io::Result<()> {
+    validate_published_snapshot_file_name(file_name)?;
     let scope = read_membership_scope_sync(conn, identity)?;
     if let Some(log_id) = meta.last_membership.log_id() {
         validate_membership_for_log(&meta.last_membership, &scope, log_id.index)?;
@@ -12473,16 +13355,8 @@ pub(crate) fn read_current_snapshot_sync(
         return Ok(None);
     };
     validate_epoch(epoch, identity)?;
-    if file_name.is_empty()
-        || file_name.contains('/')
-        || file_name.contains('\\')
-        || file_name == "."
-        || file_name == ".."
-    {
-        return Err(invalid_data(
-            "persisted session consensus snapshot file name is invalid",
-        ));
-    }
+    validate_published_snapshot_file_name(&file_name)
+        .map_err(|_| invalid_data("persisted session consensus snapshot file name is invalid"))?;
     let checksum = checksum
         .try_into()
         .map_err(|_| invalid_data("persisted session consensus snapshot checksum is invalid"))?;
@@ -12504,6 +13378,21 @@ pub(crate) fn read_current_snapshot_sync(
         checksum,
         checked_positive_u64(byte_length)?,
     )))
+}
+
+/// Only UUID-named published images may be made durable. Staging prefixes are
+/// never an authority name, even when a corrupt database row attempts to make
+/// one look current.
+fn validate_published_snapshot_file_name(file_name: &str) -> io::Result<()> {
+    let Some(stem) = file_name
+        .strip_prefix("snapshot-")
+        .and_then(|name| name.strip_suffix(".opc"))
+    else {
+        return Err(invalid_data("invalid session consensus snapshot file name"));
+    };
+    uuid::Uuid::parse_str(stem)
+        .map(|_| ())
+        .map_err(|_| invalid_data("invalid session consensus snapshot file name"))
 }
 
 #[cfg(test)]
@@ -12530,6 +13419,256 @@ mod tests {
 
     const FIXED_TEST_PLACEMENT_POLICY: Option<PlacementResiliencePolicy> =
         Some(PlacementResiliencePolicy::RequireIndependentFailureDomains);
+
+    #[test]
+    fn snapshot_source_wal_bound_rejects_small_overflow() {
+        assert!(enforce_snapshot_source_wal_bound(1, 1).is_ok());
+        assert!(enforce_snapshot_source_wal_bound(2, 1).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_vacuum_into_finalization_survives_temp_path_failure_and_preserves_authority_and_receipts(
+    ) {
+        const CHILD: &str = "OPC_SESSION_STORE_TEST_FAIL_TEMP_VFS";
+        const TEST_NAME: &str = "sqlite::consensus::tests::pinned_vacuum_into_finalization_survives_temp_path_failure_and_preserves_authority_and_receipts";
+
+        // The VFS registry is process-global.  Re-exec exactly this test so
+        // no parallel unit test can observe its deliberate fault injection.
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current unit-test executable"),
+            )
+            .args(["--exact", TEST_NAME])
+            .env(CHILD, "1")
+            .status()
+            .expect("run isolated temporary-path failure regression");
+            assert!(status.success(), "isolated regression succeeds");
+            return;
+        }
+
+        opc_sqlite_file_control_sys::install_test_temp_path_failure_vfs()
+            .expect("register temporary-path failure VFS");
+        SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS.store(true, Ordering::Release);
+
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let legacy_path = directory.path().join("legacy-vacuum.sqlite");
+        let legacy = Connection::open_with_flags_and_vfs(
+            &legacy_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            "opc-test-fail-temp-vfs",
+        )
+        .expect("open legacy vacuum fixture through failure VFS");
+        legacy
+            .execute_batch(
+                "PRAGMA page_size = 4096; \
+                 PRAGMA cache_size = 1; \
+                 CREATE TABLE retained(value BLOB); \
+                 WITH RECURSIVE rows(value) AS ( \
+                     VALUES(1) UNION ALL SELECT value + 1 FROM rows WHERE value < 256 \
+                 ) \
+                 INSERT INTO retained SELECT zeroblob(4096) FROM rows;",
+            )
+            .expect("seed legacy vacuum fixture");
+        let legacy_error = legacy
+            .execute_batch("VACUUM")
+            .expect_err("ordinary VACUUM must require a global temporary path");
+        assert!(matches!(
+            legacy_error,
+            rusqlite::Error::SqliteFailure(error, _)
+                if error.extended_code == rusqlite::ffi::SQLITE_IOERR_GETTEMPPATH
+        ));
+        drop(legacy);
+
+        // All descriptor-backed snapshot opens below use the same failure VFS.
+        // `VACUUM INTO` must nevertheless succeed because it writes the
+        // pre-created sibling descriptor rather than requesting an unnamed
+        // SQLite temporary file.
+        let source_path = directory.path().join("source.sqlite");
+        let backend = SqliteSessionBackend::open(&source_path).expect("open source backend");
+        let source = backend.conn.blocking_lock();
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &source,
+            identity(),
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed source authority");
+        // Keep the retained source larger than the one-page fixture that can
+        // stay entirely in SQLite's cache.  This models the retained-state
+        // compaction boundary while remaining at the accepted payload cap.
+        let request =
+            fenced_transition_request_with_payload(0xD4, "vacuum-into-owner", 256 * 4_096);
+        apply_entries_with_authority_sync(
+            &source,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![
+                membership_entry_at(0, vec![members.clone()], members.clone()),
+                fenced_transition_entry_for_voters(1, request.clone(), timestamp(1), &members),
+            ],
+        )
+        .expect("seed authority and fenced receipt");
+        assert!(matches!(
+            read_fenced_transition_status_sync(&source, identity(), identity(), &request),
+            Ok(FencedTransitionStatus::Recorded(_))
+        ));
+        let source_file = PinnedSqliteFile::from_file(
+            opc_sqlite_file_control_sys::main_file_descriptor(&source)
+                .expect("duplicate live source descriptor"),
+            source_path.clone(),
+        )
+        .expect("pin source descriptor");
+        let reader = open_snapshot_read_connection(&source_file).expect("open snapshot reader");
+        let source_cut = begin_snapshot_read_sync(&reader, identity()).expect("begin source cut");
+        let raw_path = directory.path().join("build-vacuum-test.sqlite");
+        let (_, raw_snapshot, _) = capture_snapshot_database_from_reader_sync(
+            &reader,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &source_cut,
+            &raw_path,
+        )
+        .expect("capture descriptor-bound source");
+        release_snapshot_read_sync(&reader).expect("release source reader before finalization");
+
+        let collision = directory.path().join("vacuum-collision.sqlite");
+        std::fs::write(&collision, b"pre-existing").expect("seed collision artifact");
+        let raw_before_collision =
+            std::fs::read(&raw_path).expect("read raw snapshot before collision");
+        let collision_error = finalize_captured_snapshot_database_sync(
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &source_cut,
+            raw_snapshot
+                .try_clone()
+                .expect("clone raw descriptor for collision check"),
+            &collision,
+        )
+        .expect_err("pre-existing vacuum artifact must fail O_EXCL before mutating the raw image");
+        assert_eq!(io::ErrorKind::AlreadyExists, collision_error.kind());
+        assert_eq!(
+            std::fs::read(&collision).expect("collision artifact is untouched"),
+            b"pre-existing",
+        );
+        assert_eq!(
+            raw_before_collision,
+            std::fs::read(&raw_path).expect("read raw snapshot after collision"),
+            "collision rejection leaves the raw snapshot unmodified",
+        );
+
+        let compact_path = directory.path().join("vacuum-result.sqlite");
+        let compacted = finalize_captured_snapshot_database_sync(
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &source_cut,
+            raw_snapshot,
+            &compact_path,
+        )
+        .expect("pinned VACUUM INTO finalization succeeds without a temp path");
+        compacted
+            .verify_linked_identity()
+            .expect("compacted descriptor remains singly linked");
+        assert!(
+            compacted
+                .path_matches_identity(&compact_path)
+                .expect("compare compacted descriptor and name"),
+            "VACUUM INTO retains the pre-created pinned inode"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            0o600,
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&compact_path)
+                    .expect("compacted artifact metadata")
+                    .permissions(),
+            ) & 0o777,
+            "compacted artifact retains the private creation mode"
+        );
+
+        let compacted_connection =
+            open_pinned_snapshot_database(&compacted).expect("open compacted pinned descriptor");
+        assert_eq!(
+            ConsensusAuthorityProfile::FixedImmutable,
+            read_consensus_authority_profile_sync(&compacted_connection)
+                .expect("compacted authority profile")
+        );
+        assert!(matches!(
+            read_fenced_transition_status_sync(
+                &compacted_connection,
+                identity(),
+                identity(),
+                &request,
+            ),
+            Ok(FencedTransitionStatus::Recorded(_))
+        ));
+        for table in [
+            "consensus_vote",
+            "consensus_committed",
+            "consensus_purged",
+            "consensus_log",
+            "consensus_snapshot",
+        ] {
+            let count: i64 = compacted_connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("read compacted transient table");
+            assert_eq!(0, count, "{table} is removed from the compacted image");
+        }
+        let retained_records: i64 = compacted_connection
+            .query_row("SELECT COUNT(*) FROM session_records", [], |row| row.get(0))
+            .expect("read retained state");
+        assert_eq!(
+            1, retained_records,
+            "fenced transition state survives compaction"
+        );
+        drop(compacted_connection);
+        SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn successful_snapshot_observation_is_coherent_and_monotonic() {
+        let observation = Arc::new(SnapshotBuildObservation::default());
+        let writer = Arc::clone(&observation);
+        let started = Arc::new(AtomicBool::new(false));
+        let writer_started = Arc::clone(&started);
+        let writer = std::thread::spawn(move || {
+            writer_started.store(true, Ordering::Release);
+            for generation in 1_u64..=512 {
+                writer.record_published(generation, Duration::from_millis(generation * 3));
+            }
+        });
+        while !started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        while !writer.is_finished() {
+            let (latest_wal, peak_wal, duration, completed) = observation.snapshot();
+            assert!(peak_wal >= latest_wal);
+            if completed != 0 {
+                assert_eq!(duration, latest_wal.saturating_mul(3));
+            }
+        }
+        writer.join().expect("observation writer joins");
+        assert_eq!((512, 512, 1536, 512), observation.snapshot());
+    }
 
     fn identity() -> SessionConsensusIdentity {
         SessionConsensusIdentity::new(
@@ -12606,6 +13745,187 @@ mod tests {
             ..local
         };
         assert!(validate_snapshot_monotonic_state(&pending_local, &finalized).is_ok());
+    }
+
+    #[test]
+    fn durable_current_snapshot_name_cannot_be_a_staging_artifact() {
+        assert!(validate_published_snapshot_file_name("incoming-current.part").is_err());
+        assert!(validate_published_snapshot_file_name(
+            "snapshot-00000000-0000-4000-8000-000000000000.opc"
+        )
+        .is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_reader_rejects_path_substitution_against_the_pinned_live_descriptor() {
+        let directory = tempfile::tempdir().expect("snapshot source directory");
+        let source = directory.path().join("source.sqlite");
+        let replacement = directory.path().join("replacement.sqlite");
+        let source_backend = SqliteSessionBackend::open(&source).expect("open source SQLite");
+        let source_connection = source_backend.conn.blocking_lock();
+        initialize_schema(&source_connection, identity(), &expected_members())
+            .expect("initialize source authority");
+        source_connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE source_only(value INTEGER); INSERT INTO source_only VALUES (7);",
+            )
+            .expect("set source WAL mode");
+        let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            opc_sqlite_file_control_sys::main_file_descriptor(&source_connection)
+                .expect("duplicate live source descriptor"),
+            source.clone(),
+        )
+        .expect("pin live source descriptor");
+        let replacement_backend =
+            SqliteSessionBackend::open(&replacement).expect("open replacement SQLite");
+        let replacement_connection = replacement_backend.conn.blocking_lock();
+        initialize_schema(&replacement_connection, identity(), &expected_members())
+            .expect("initialize replacement authority");
+        replacement_connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE replacement_only(value INTEGER); INSERT INTO replacement_only VALUES (9);",
+            )
+            .expect("set replacement WAL mode");
+        drop(replacement_connection);
+        std::fs::rename(&replacement, &source).expect("replace source path");
+
+        assert!(open_snapshot_read_connection(&pinned).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stepped_backup_rejects_mid_copy_small_cap_growth_and_releases_reader() {
+        let directory = tempfile::tempdir().expect("snapshot WAL directory");
+        let source_path = directory.path().join("source.sqlite");
+        let destination_path = directory.path().join("destination.sqlite");
+        let source = Connection::open(&source_path).expect("open source SQLite");
+        source
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE payload(value BLOB);")
+            .expect("enable source WAL");
+        for _ in 0..256 {
+            source
+                .execute("INSERT INTO payload(value) VALUES (zeroblob(4096))", [])
+                .expect("seed stepped backup pages");
+        }
+        source
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("move seeded pages into the source main file");
+        let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            opc_sqlite_file_control_sys::main_file_descriptor(&source)
+                .expect("duplicate source descriptor"),
+            source_path.clone(),
+        )
+        .expect("pin source descriptor");
+        let reader = open_snapshot_read_connection(&pinned).expect("open pinned reader");
+        reader
+            .connection
+            .execute_batch("BEGIN DEFERRED TRANSACTION; SELECT count(*) FROM payload;")
+            .expect("begin reader transaction");
+        pin_snapshot_reader_wal(&reader).expect("pin reader WAL descriptor");
+        let writer = Connection::open(&source_path).expect("open WAL writer");
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL;")
+            .expect("writer WAL mode");
+        let mut destination = Connection::open(destination_path).expect("open destination");
+        let mut injected = false;
+        let error = backup_snapshot_reader_bounded_with_hook(&reader, &mut destination, 1, || {
+            if !injected {
+                writer
+                    .execute("INSERT INTO payload(value) VALUES (zeroblob(4096))", [])
+                    .expect("grow reader-pinned WAL");
+                injected = true;
+            }
+        })
+        .expect_err("small cap must reject WAL growth between backup steps");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        release_snapshot_read_sync(&reader).expect("release reader after cap rejection");
+        writer
+            .execute("INSERT INTO payload(value) VALUES (zeroblob(8))", [])
+            .expect("writer remains usable after reader release");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stepped_backup_samples_reader_wal_after_step_error_before_propagating_it() {
+        let directory = tempfile::tempdir().expect("snapshot WAL directory");
+        let source_path = directory.path().join("source.sqlite");
+        let destination_path = directory.path().join("destination.sqlite");
+        let source = Connection::open(&source_path).expect("open source SQLite");
+        source
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE payload(value BLOB);")
+            .expect("enable source WAL");
+        let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            opc_sqlite_file_control_sys::main_file_descriptor(&source)
+                .expect("duplicate source descriptor"),
+            source_path.clone(),
+        )
+        .expect("pin source descriptor");
+        let reader = open_snapshot_read_connection(&pinned).expect("open pinned reader");
+        reader
+            .connection
+            .execute_batch("BEGIN DEFERRED TRANSACTION; SELECT count(*) FROM payload;")
+            .expect("begin reader transaction");
+        pin_snapshot_reader_wal(&reader).expect("pin reader WAL descriptor");
+        let writer = Connection::open(&source_path).expect("open WAL writer");
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL;")
+            .expect("writer WAL mode");
+        let mut destination = Connection::open(destination_path).expect("open destination");
+        let mut injected = false;
+        let error = backup_snapshot_reader_bounded_with_hook_and_step(
+            &reader,
+            &mut destination,
+            1,
+            || {
+                if !injected {
+                    writer
+                        .execute("INSERT INTO payload(value) VALUES (zeroblob(4096))", [])
+                        .expect("grow real reader WAL after step");
+                    injected = true;
+                }
+            },
+            |_| Err(rusqlite::Error::QueryReturnedNoRows),
+        )
+        .expect_err("post-step WAL overflow must win over the forced step error");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        release_snapshot_read_sync(&reader).expect("release reader after cap rejection");
+        writer
+            .execute("INSERT INTO payload(value) VALUES (zeroblob(8))", [])
+            .expect("writer remains usable after reader release");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_reader_wal_unlink_or_replacement_is_never_reported_as_zero() {
+        let directory = tempfile::tempdir().expect("snapshot WAL directory");
+        let source_path = directory.path().join("source.sqlite");
+        let source = Connection::open(&source_path).expect("open source SQLite");
+        source
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE payload(value INTEGER); INSERT INTO payload VALUES (1);",
+            )
+            .expect("seed WAL source");
+        let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            opc_sqlite_file_control_sys::main_file_descriptor(&source)
+                .expect("duplicate source descriptor"),
+            source_path.clone(),
+        )
+        .expect("pin source descriptor");
+        let reader = open_snapshot_read_connection(&pinned).expect("open pinned reader");
+        reader
+            .connection
+            .execute_batch("BEGIN DEFERRED TRANSACTION; SELECT count(*) FROM payload;")
+            .expect("begin reader transaction");
+        pin_snapshot_reader_wal(&reader).expect("pin reader WAL descriptor");
+        let wal_path = source_path.with_file_name("source.sqlite-wal");
+        std::fs::remove_file(&wal_path).expect("unlink pinned WAL");
+        std::fs::write(&wal_path, []).expect("replace WAL pathname");
+        let error = verify_snapshot_reader_wal(&reader).expect_err(
+            "unlinked reader WAL must fail closed rather than report replacement bytes",
+        );
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        release_snapshot_read_sync(&reader).expect("release reader after WAL replacement");
     }
 
     fn member(value: u64) -> SessionConsensusNodeId {
@@ -12688,6 +14008,101 @@ mod tests {
             stable_id: Bytes::from_static(b"state-machine-fault-session")
                 .try_into()
                 .expect("valid stable ID"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_lease_receipt_projects_only_operation_exact_deterministic_errors() {
+        fn response(error: StoreError) -> SessionConsensusResponse {
+            SessionConsensusResponse {
+                result: Err(error),
+                sequence: 0,
+                digest: None,
+                logical_time: None,
+                raft_log_index: 0,
+            }
+        }
+
+        fn deterministic_errors() -> [(crate::consumer::SessionConsumerLeaseError, StoreError); 5] {
+            [
+                (
+                    crate::consumer::SessionConsumerLeaseError::AlreadyHeld,
+                    StoreError::LeaseHeld,
+                ),
+                (
+                    crate::consumer::SessionConsumerLeaseError::Expired,
+                    StoreError::LeaseExpired,
+                ),
+                (
+                    crate::consumer::SessionConsumerLeaseError::StaleFence,
+                    StoreError::StaleFence,
+                ),
+                (
+                    crate::consumer::SessionConsumerLeaseError::NotFound,
+                    StoreError::NotFound,
+                ),
+                (
+                    crate::consumer::SessionConsumerLeaseError::InvalidTtl,
+                    StoreError::InvalidSessionTtl,
+                ),
+            ]
+        }
+
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let lease = crate::SessionLeaseManager::acquire(
+            &backend,
+            &key(),
+            OwnerId::new("lease-receipt-projection").expect("owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("fixture lease");
+        let operations = [
+            (
+                crate::consumer::SessionConsumerLeaseMutationOperation::Acquire {
+                    key: key(),
+                    owner: OwnerId::new("lease-receipt-projection").expect("owner"),
+                    ttl: Duration::from_secs(30),
+                },
+                &[
+                    crate::consumer::SessionConsumerLeaseError::AlreadyHeld,
+                    crate::consumer::SessionConsumerLeaseError::StaleFence,
+                    crate::consumer::SessionConsumerLeaseError::InvalidTtl,
+                ][..],
+            ),
+            (
+                crate::consumer::SessionConsumerLeaseMutationOperation::Renew {
+                    lease: lease.clone(),
+                    ttl: Duration::from_secs(30),
+                },
+                &[
+                    crate::consumer::SessionConsumerLeaseError::AlreadyHeld,
+                    crate::consumer::SessionConsumerLeaseError::Expired,
+                    crate::consumer::SessionConsumerLeaseError::StaleFence,
+                    crate::consumer::SessionConsumerLeaseError::NotFound,
+                    crate::consumer::SessionConsumerLeaseError::InvalidTtl,
+                ][..],
+            ),
+            (
+                crate::consumer::SessionConsumerLeaseMutationOperation::Release { lease },
+                &[
+                    crate::consumer::SessionConsumerLeaseError::AlreadyHeld,
+                    crate::consumer::SessionConsumerLeaseError::StaleFence,
+                    crate::consumer::SessionConsumerLeaseError::NotFound,
+                ][..],
+            ),
+        ];
+
+        for (operation, permitted) in operations {
+            for (expected, error) in deterministic_errors() {
+                let projected =
+                    consumer_lease_mutation_result_from_response(&operation, &response(error));
+                if permitted.contains(&expected) {
+                    assert_eq!(projected, Ok(Err(expected)));
+                } else {
+                    assert!(matches!(projected, Err(StoreError::BackendUnavailable(_))));
+                }
+            }
         }
     }
 
@@ -14007,7 +15422,7 @@ mod tests {
             identity(),
             &snapshot_path,
             &meta,
-            "capped-fenced-history.opc",
+            "snapshot-00000000-0000-4000-8000-000000000001.opc",
             [0xD8; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("snapshot metadata")
@@ -15519,7 +16934,7 @@ LIMIT 20000;
             identity(),
             &snapshot_path,
             &meta,
-            "fenced-transition.opc",
+            "snapshot-00000000-0000-4000-8000-0000000000e8.opc",
             [0xE8; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("snapshot metadata")
@@ -15647,7 +17062,7 @@ LIMIT 20000;
             storage_identity,
             &same_scope_path,
             &same_scope_meta,
-            "same-scope-zero-certificate.opc",
+            "snapshot-00000000-0000-4000-8000-000000000002.opc",
             [0xEB; 32],
             std::fs::metadata(&same_scope_path)
                 .expect("same-scope snapshot metadata")
@@ -15738,7 +17153,7 @@ LIMIT 20000;
             storage_identity,
             &successor_path,
             &successor_meta,
-            "successor-zero-certificate.opc",
+            "snapshot-00000000-0000-4000-8000-000000000003.opc",
             [0xED; 32],
             std::fs::metadata(&successor_path)
                 .expect("successor snapshot metadata")
@@ -15945,7 +17360,7 @@ LIMIT 20000;
                 identity(),
                 &snapshot_path,
                 &meta,
-                "legacy-acquired-at.opc",
+                "snapshot-00000000-0000-4000-8000-000000000004.opc",
                 [0xCC; 32],
                 std::fs::metadata(&snapshot_path)
                     .expect("legacy snapshot metadata")
@@ -16010,7 +17425,7 @@ LIMIT 20000;
             identity(),
             &snapshot_path,
             &meta,
-            "legacy-acquired-at-near-miss.opc",
+            "snapshot-00000000-0000-4000-8000-000000000005.opc",
             [0xCD; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("malformed snapshot metadata")
@@ -16420,7 +17835,7 @@ LIMIT 20000;
                 identity(),
                 &snapshot_path,
                 &meta,
-                "weak-activation-marker.opc",
+                "snapshot-00000000-0000-4000-8000-000000000006.opc",
                 [0xD1; 32],
                 std::fs::metadata(&snapshot_path)
                     .expect("weak snapshot metadata")
@@ -16479,7 +17894,7 @@ LIMIT 20000;
             identity(),
             &snapshot_path,
             &meta,
-            "activated-missing-ledger.opc",
+            "snapshot-00000000-0000-4000-8000-000000000007.opc",
             [0xE8; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("activated snapshot metadata")
@@ -16512,7 +17927,7 @@ LIMIT 20000;
             identity(),
             &snapshot_path,
             &meta,
-            "pre-receipt-empty.opc",
+            "snapshot-00000000-0000-4000-8000-000000000008.opc",
             [0xE9; 32],
             byte_length,
         )
@@ -16549,7 +17964,7 @@ LIMIT 20000;
             identity(),
             &snapshot_path,
             &meta,
-            "pre-receipt-bound.opc",
+            "snapshot-00000000-0000-4000-8000-000000000009.opc",
             [0xEC; 32],
             byte_length,
         )
@@ -16614,7 +18029,7 @@ LIMIT 20000;
                 identity(),
                 &snapshot_path,
                 &meta,
-                "partial-receipt-schema.opc",
+                "snapshot-00000000-0000-4000-8000-00000000000a.opc",
                 [0xED; 32],
                 std::fs::metadata(&snapshot_path)
                     .expect("snapshot metadata")
@@ -16718,7 +18133,7 @@ BEGIN IMMEDIATE;
             identity(),
             &snapshot_path,
             &meta,
-            "uncapped-no-index-receipts.opc",
+            "snapshot-00000000-0000-4000-8000-00000000000b.opc",
             [0xAA; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("snapshot metadata")
@@ -16818,7 +18233,7 @@ BEGIN IMMEDIATE;
                 identity(),
                 &snapshot_path,
                 &meta,
-                "rewritten-fenced-transition-receipt.opc",
+                "snapshot-00000000-0000-4000-8000-00000000000c.opc",
                 [0xF1; 32],
                 std::fs::metadata(&snapshot_path)
                     .expect("snapshot metadata")
@@ -17405,7 +18820,7 @@ BEGIN IMMEDIATE;
             pinned,
             None,
             &meta,
-            "pinned-dynamic.opc",
+            "snapshot-00000000-0000-4000-8000-00000000000d.opc",
             [0xD6; 32],
             byte_length_a,
         )
@@ -17788,7 +19203,7 @@ BEGIN IMMEDIATE;
             identity,
             &snapshot_path,
             &meta,
-            "oversized.opc",
+            "snapshot-00000000-0000-4000-8000-00000000000e.opc",
             [0x41; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("incoming metadata")
@@ -18589,7 +20004,7 @@ BEGIN IMMEDIATE;
             &conn,
             storage_identity,
             &snapshot_meta,
-            "membership-transition-two.opc",
+            "snapshot-00000000-0000-4000-8000-00000000000f.opc",
             [0x71; 32],
             1,
         )
@@ -19147,7 +20562,7 @@ BEGIN IMMEDIATE;
             storage_identity,
             &snapshot,
             &snapshot_meta,
-            "terminal-history.opc",
+            "snapshot-00000000-0000-4000-8000-000000000010.opc",
             [0xd1; 32],
             snapshot_bytes,
         )
@@ -19177,7 +20592,7 @@ BEGIN IMMEDIATE;
             storage_identity,
             &regressed_snapshot,
             &snapshot_meta,
-            "terminal-history-regressed.opc",
+            "snapshot-00000000-0000-4000-8000-000000000011.opc",
             [0xd2; 32],
             regressed_bytes,
         )
@@ -19617,7 +21032,7 @@ BEGIN IMMEDIATE;
                 storage_identity,
                 &snapshot_path,
                 &meta,
-                "exact-pending-scope.opc",
+                "snapshot-00000000-0000-4000-8000-000000000012.opc",
                 [0x81; 32],
                 byte_length,
             )
@@ -19666,7 +21081,7 @@ BEGIN IMMEDIATE;
                 storage_identity,
                 &snapshot_path,
                 &meta,
-                "conflicting-pending-scope.opc",
+                "snapshot-00000000-0000-4000-8000-000000000013.opc",
                 [0x82; 32],
                 byte_length,
             )
@@ -19769,7 +21184,7 @@ BEGIN IMMEDIATE;
                 &conn,
                 storage_identity,
                 &compaction_meta,
-                "late-candidate-compaction.opc",
+                "snapshot-00000000-0000-4000-8000-000000000014.opc",
                 [0x75; 32],
                 1,
             )
@@ -19854,7 +21269,7 @@ BEGIN IMMEDIATE;
             storage_identity,
             &snapshot_path,
             &meta,
-            "late-candidate-source.opc",
+            "snapshot-00000000-0000-4000-8000-000000000015.opc",
             [0x76; 32],
             byte_length,
         )
@@ -19947,10 +21362,15 @@ BEGIN IMMEDIATE;
             last_membership: unexpected,
             snapshot_id: "mismatched-membership".into(),
         };
-        assert!(
-            save_current_snapshot_sync(&conn, identity, &meta, "snapshot.opc", [0; 32], 1,)
-                .is_err()
-        );
+        assert!(save_current_snapshot_sync(
+            &conn,
+            identity,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000016.opc",
+            [0; 32],
+            1,
+        )
+        .is_err());
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM consensus_snapshot", [], |row| {
                 row.get(0)
@@ -20010,7 +21430,7 @@ BEGIN IMMEDIATE;
             identity,
             &snapshot_path,
             &meta,
-            "installed.opc",
+            "snapshot-00000000-0000-4000-8000-000000000017.opc",
             [0x5a; 32],
             byte_length,
         )
@@ -20068,7 +21488,7 @@ BEGIN IMMEDIATE;
             identity,
             &snapshot_path,
             &meta,
-            "installed-second.opc",
+            "snapshot-00000000-0000-4000-8000-000000000018.opc",
             [0x6b; 32],
             byte_length,
         )
@@ -21186,7 +22606,7 @@ BEGIN IMMEDIATE;
                     ),
                     snapshot_id: format!("fixed-identity-drift-{drift}"),
                 },
-                "fixed-identity-drift.opc",
+                "snapshot-00000000-0000-4000-8000-000000000019.opc",
                 [0x93; 32],
                 1,
             )
@@ -21298,7 +22718,7 @@ BEGIN IMMEDIATE;
             &bindings,
             FIXED_TEST_PLACEMENT_POLICY,
             &snapshot_meta,
-            "fixed-raw-drift.opc",
+            "snapshot-00000000-0000-4000-8000-00000000001a.opc",
             [0x71; 32],
             1,
         )
@@ -21599,7 +23019,7 @@ BEGIN IMMEDIATE;
             &bindings,
             FIXED_TEST_PLACEMENT_POLICY,
             &snapshot_meta,
-            "fixed-policy-drift.opc",
+            "snapshot-00000000-0000-4000-8000-00000000001b.opc",
             [0x91; 32],
             1,
         )
@@ -21619,7 +23039,7 @@ BEGIN IMMEDIATE;
             FIXED_TEST_PLACEMENT_POLICY,
             &source_snapshot_path,
             &source_meta,
-            "fixed-policy-drift-install.opc",
+            "snapshot-00000000-0000-4000-8000-00000000001c.opc",
             [0x92; 32],
             std::fs::metadata(&source_snapshot_path)
                 .expect("source snapshot metadata")
@@ -21720,7 +23140,7 @@ BEGIN IMMEDIATE;
             Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
             &snapshot_path,
             &meta,
-            "fixed-local-drift.opc",
+            "snapshot-00000000-0000-4000-8000-00000000001d.opc",
             [0x51; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("snapshot metadata")
@@ -21820,7 +23240,7 @@ BEGIN IMMEDIATE;
                 Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
                 &symlink_path,
                 &meta,
-                "symlink-source.opc",
+                "snapshot-00000000-0000-4000-8000-00000000001e.opc",
                 [0xa0; 32],
                 std::fs::metadata(&valid_path)
                     .expect("valid source metadata")
@@ -21840,7 +23260,7 @@ BEGIN IMMEDIATE;
             Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
             &replaced_path,
             &meta,
-            "replaced-source.opc",
+            "snapshot-00000000-0000-4000-8000-00000000001f.opc",
             [0xa1; 32],
             std::fs::metadata(&replaced_path)
                 .expect("replacement metadata")
@@ -21861,7 +23281,7 @@ BEGIN IMMEDIATE;
             Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
             &valid_path,
             &meta,
-            "valid-source.opc",
+            "snapshot-00000000-0000-4000-8000-000000000020.opc",
             [0xa2; 32],
             std::fs::metadata(&valid_path)
                 .expect("valid source metadata")
@@ -21961,7 +23381,7 @@ BEGIN IMMEDIATE;
             ConsensusAuthorityProfile::FixedImmutable,
             &snapshot_path,
             &meta,
-            "fixed-source.opc",
+            "snapshot-00000000-0000-4000-8000-000000000021.opc",
             [0x91; 32],
             byte_length,
         )
@@ -21982,7 +23402,7 @@ BEGIN IMMEDIATE;
             ConsensusAuthorityProfile::Dynamic,
             &snapshot_path,
             &meta,
-            "fixed-source.opc",
+            "snapshot-00000000-0000-4000-8000-000000000021.opc",
             [0x92; 32],
             byte_length,
         )
@@ -22020,7 +23440,7 @@ BEGIN IMMEDIATE;
             ConsensusAuthorityProfile::FixedImmutable,
             &snapshot_path,
             &meta,
-            "fixed-policy-mismatch.opc",
+            "snapshot-00000000-0000-4000-8000-000000000022.opc",
             [0x93; 32],
             byte_length,
         )
@@ -22082,7 +23502,7 @@ BEGIN IMMEDIATE;
             ConsensusAuthorityProfile::Dynamic,
             &snapshot_path,
             &meta,
-            "legacy-dynamic.opc",
+            "snapshot-00000000-0000-4000-8000-000000000023.opc",
             [0x94; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("legacy snapshot metadata")
@@ -22110,7 +23530,7 @@ BEGIN IMMEDIATE;
             ConsensusAuthorityProfile::FixedImmutable,
             &snapshot_path,
             &meta,
-            "legacy-dynamic-fixed.opc",
+            "snapshot-00000000-0000-4000-8000-000000000024.opc",
             [0x95; 32],
             std::fs::metadata(&snapshot_path)
                 .expect("legacy snapshot metadata")
@@ -22188,7 +23608,7 @@ BEGIN IMMEDIATE;
             ConsensusAuthorityProfile::FixedImmutable,
             &snapshot_path,
             &meta,
-            "drifted-fixed.opc",
+            "snapshot-00000000-0000-4000-8000-000000000025.opc",
             [0x75; 32],
             byte_length,
         )
@@ -22226,8 +23646,7 @@ BEGIN IMMEDIATE;
         std::fs::rename(&displaced, &replacement).expect("retain A for ABA restore");
 
         let opened = open_pinned_snapshot_database(&pinned);
-        std::fs::rename(&replacement, &path).expect("restore A after SQLite proof");
-        if let Ok((connection, retained)) = opened {
+        if let Ok(connection) = opened {
             let value: i64 = connection
                 .query_row("SELECT value FROM original_only", [], |row| row.get(0))
                 .expect("SQLite must consume A rather than B");
@@ -22236,9 +23655,10 @@ BEGIN IMMEDIATE;
                 .query_row("SELECT value FROM replacement_only", [], |row| row
                     .get::<_, i64>(0))
                 .is_err());
-            verify_pinned_snapshot_descriptor(&pinned, &retained)
-                .expect("retained descriptor must still be A before mutation");
+            verify_pinned_snapshot_descriptor(&pinned, &connection)
+                .expect("retained descriptor must still be A before pathname restoration");
         }
+        std::fs::rename(&replacement, &path).expect("restore A after SQLite proof");
     }
 
     #[test]

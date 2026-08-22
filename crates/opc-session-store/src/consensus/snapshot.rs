@@ -6,8 +6,11 @@
 
 use std::fmt;
 use std::io;
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 #[cfg(target_os = "linux")]
@@ -29,7 +32,6 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteE
 pub(crate) struct FileIdentity {
     device: u64,
     inode: u64,
-    size: u64,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -46,6 +48,17 @@ pub(crate) struct PinnedSqliteFile {
     file: std::fs::File,
     path: PathBuf,
     identity: FileIdentity,
+    immutable_generation: Option<ImmutableFileGeneration>,
+}
+
+/// Content and length bound to an immutable snapshot artifact. This is kept
+/// separate from the live SQLite descriptor identity: SQLite legitimately
+/// changes a live database through another descriptor while a published or
+/// install artifact must never change after it is verified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImmutableFileGeneration {
+    length: u64,
+    digest: [u8; 32],
 }
 
 #[allow(dead_code)]
@@ -59,6 +72,7 @@ impl PinnedSqliteFile {
             file,
             path,
             identity,
+            immutable_generation: None,
         })
     }
 
@@ -91,6 +105,7 @@ impl PinnedSqliteFile {
             file,
             path: self.path.clone(),
             identity: self.identity,
+            immutable_generation: self.immutable_generation,
         })
     }
 
@@ -112,6 +127,58 @@ impl PinnedSqliteFile {
         }
     }
 
+    /// Bind this handle to the exact contents of an artifact that has become
+    /// immutable. Live SQLite descriptors intentionally never use this.
+    pub(crate) fn pin_immutable(mut self) -> io::Result<Self> {
+        self.verify_identity()?;
+        self.immutable_generation = Some(immutable_file_generation(&self.file)?);
+        Ok(self)
+    }
+
+    /// Recheck the previously bound immutable content generation.
+    pub(crate) fn verify_immutable_generation(&self) -> io::Result<()> {
+        self.verify_identity()?;
+        let expected = self.immutable_generation.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pinned SQLite file immutable generation is absent",
+            )
+        })?;
+        if immutable_file_generation(&self.file)? == expected {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pinned SQLite file immutable generation changed",
+            ))
+        }
+    }
+
+    /// Whether this descriptor was explicitly promoted to an immutable
+    /// artifact pin rather than a mutable live SQLite source pin.
+    pub(crate) fn has_immutable_generation(&self) -> bool {
+        self.immutable_generation.is_some()
+    }
+
+    /// Verify this descriptor still names a linked regular file.
+    ///
+    /// Snapshot readers use this for their WAL descriptor. An unlinked WAL
+    /// could otherwise retain bytes after a replacement while pathname
+    /// metadata reports zero or a different file.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_linked_identity(&self) -> io::Result<()> {
+        use std::os::linux::fs::MetadataExt as _;
+
+        self.verify_identity()?;
+        if self.file.metadata()?.st_nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pinned SQLite file is no longer singly linked",
+            ));
+        }
+        Ok(())
+    }
+
     /// Compare a pathname with the pinned identity for diagnostics or cleanup.
     ///
     /// This follows the path at the time of comparison and is intentionally
@@ -131,6 +198,27 @@ impl PinnedSqliteFile {
     }
 }
 
+fn immutable_file_generation(file: &std::fs::File) -> io::Result<ImmutableFileGeneration> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut reader = file.try_clone()?;
+    reader.seek(io::SeekFrom::Start(0))?;
+    let length = reader.metadata()?.len();
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(ImmutableFileGeneration {
+        length,
+        digest: digest.finalize().into(),
+    })
+}
+
 impl fmt::Debug for PinnedSqliteFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PinnedSqliteFile(<redacted>)")
@@ -141,15 +229,103 @@ impl fmt::Debug for PinnedSqliteFile {
 pub(crate) struct SessionSnapshotFile {
     file: tokio::fs::File,
     path: PathBuf,
+    cleanup: Option<SnapshotCleanupGuard>,
+    received_bytes: u64,
+    received_maximum: u64,
+    cursor: u64,
+    extent: u64,
+    receive_limit_exceeded: bool,
+    // Kept by a receiving artifact so cloned state-machine handles cannot
+    // retain more than one unvalidated snapshot stream for one core.
+    _receive_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+struct SnapshotCleanupGuard {
+    path: PathBuf,
+    armed: bool,
+    cleanup_failed: Option<Arc<AtomicBool>>,
+}
+
+impl SnapshotCleanupGuard {
+    async fn remove(&mut self) -> io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        match tokio::fs::remove_file(&self.path).await {
+            Ok(()) => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(cleanup_failed) = &self.cleanup_failed {
+                    cleanup_failed.store(true, Ordering::Release);
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for SnapshotCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                if let Some(cleanup_failed) = &self.cleanup_failed {
+                    cleanup_failed.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
 }
 
 #[allow(dead_code)]
 impl SessionSnapshotFile {
     /// Create a new receiving file. Existing data is never reused.
     pub(crate) async fn create(path: PathBuf) -> io::Result<Self> {
+        Self::create_with_cleanup(path, None).await
+    }
+
+    /// Create a receiving file whose staging name is removed on every exit.
+    ///
+    /// A synchronous `Drop` fallback protects cancellation. Its error is
+    /// recorded in `cleanup_failed` so the next gated snapshot operation
+    /// surfaces it instead of treating artifact cleanup as best effort.
+    pub(crate) async fn create_with_cleanup(
+        path: PathBuf,
+        cleanup_failed: Option<Arc<AtomicBool>>,
+    ) -> io::Result<Self> {
+        Self::create_with_cleanup_bounded(path, cleanup_failed, u64::MAX, None).await
+    }
+
+    /// Create a receiving file with a fixed stream budget and optional
+    /// state-machine admission. The budget counts bytes accepted by writes,
+    /// before envelope validation is attempted.
+    pub(crate) async fn create_with_cleanup_bounded(
+        path: PathBuf,
+        cleanup_failed: Option<Arc<AtomicBool>>,
+        received_maximum: u64,
+        receive_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> io::Result<Self> {
         reject_symlink(&path).await?;
         let file = snapshot_open_options(true, true, true).open(&path).await?;
-        Self::from_file(file, path).await
+        let mut snapshot = Self::from_file(file, path).await?;
+        snapshot.cleanup = Some(SnapshotCleanupGuard {
+            path: snapshot.path.clone(),
+            armed: true,
+            cleanup_failed,
+        });
+        snapshot.received_maximum = received_maximum;
+        snapshot._receive_admission = receive_admission;
+        Ok(snapshot)
     }
 
     /// Open an immutable current snapshot for transfer.
@@ -163,8 +339,19 @@ impl SessionSnapshotFile {
 
     /// Attach a diagnostic path to an already-open regular snapshot handle.
     pub(crate) async fn from_file(file: tokio::fs::File, path: PathBuf) -> io::Result<Self> {
-        ensure_regular_file(&file.metadata().await?)?;
-        Ok(Self { file, path })
+        let metadata = file.metadata().await?;
+        ensure_regular_file(&metadata)?;
+        Ok(Self {
+            file,
+            path,
+            cleanup: None,
+            received_bytes: 0,
+            received_maximum: u64::MAX,
+            cursor: 0,
+            extent: metadata.len(),
+            receive_limit_exceeded: false,
+            _receive_admission: None,
+        })
     }
 
     /// Convert an already-open standard file without resolving its path again.
@@ -178,28 +365,51 @@ impl SessionSnapshotFile {
     }
 
     /// Borrow the held Tokio file without reopening its path.
-    pub(crate) fn file(&self) -> &tokio::fs::File {
-        &self.file
+    pub(crate) fn file(&self) -> io::Result<&tokio::fs::File> {
+        self.receiving_file_access().map(|()| &self.file)
     }
 
     /// Mutably borrow the held Tokio file without reopening its path.
-    pub(crate) fn file_mut(&mut self) -> &mut tokio::fs::File {
-        &mut self.file
+    pub(crate) fn file_mut(&mut self) -> io::Result<&mut tokio::fs::File> {
+        self.receiving_file_access().map(|()| &mut self.file)
     }
 
     /// Clone the held file handle without resolving its path again.
     pub(crate) async fn try_clone(&self) -> io::Result<Self> {
-        Self::from_file(self.file.try_clone().await?, self.path.clone()).await
+        if self._receive_admission.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "snapshot receiver cannot be cloned",
+            ));
+        }
+        let mut cloned = Self::from_file(self.file.try_clone().await?, self.path.clone()).await?;
+        cloned.received_bytes = self.received_bytes;
+        cloned.received_maximum = self.received_maximum;
+        cloned.cursor = self.cursor;
+        cloned.extent = self.extent;
+        cloned.receive_limit_exceeded = self.receive_limit_exceeded;
+        Ok(cloned)
+    }
+
+    /// Close a receiving file and synchronously observe removal of its
+    /// staging name. Immutable published snapshots never opt into removal.
+    pub(crate) async fn close_and_cleanup(mut self) -> io::Result<()> {
+        match self.cleanup.as_mut() {
+            Some(cleanup) => cleanup.remove().await,
+            None => Ok(()),
+        }
     }
 
     /// Consume the wrapper and return the already-open Tokio file.
-    pub(crate) fn into_file(self) -> tokio::fs::File {
-        self.file
+    pub(crate) fn into_file(self) -> io::Result<tokio::fs::File> {
+        self.receiving_file_access()?;
+        Ok(self.file)
     }
 
     /// Consume the wrapper and return the already-open standard file.
-    pub(crate) async fn into_std(self) -> std::fs::File {
-        self.file.into_std().await
+    pub(crate) async fn into_std(self) -> io::Result<std::fs::File> {
+        self.receiving_file_access()?;
+        Ok(self.file.into_std().await)
     }
 
     /// Read metadata from the held handle rather than resolving its path.
@@ -216,6 +426,22 @@ impl SessionSnapshotFile {
     pub(crate) async fn sync_all(&mut self) -> io::Result<()> {
         self.file.flush().await?;
         self.file.sync_all().await
+    }
+
+    fn receiving_file_access(&self) -> io::Result<()> {
+        if self._receive_admission.is_some() {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "snapshot receiver is private",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn receive_limit_error(&mut self, message: &'static str) -> io::Error {
+        self.receive_limit_exceeded = true;
+        io::Error::new(io::ErrorKind::InvalidData, message)
     }
 }
 
@@ -236,7 +462,6 @@ fn file_identity(metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
     Ok(FileIdentity {
         device: metadata.st_dev(),
         inode: metadata.st_ino(),
-        size: metadata.st_size(),
     })
 }
 
@@ -292,7 +517,48 @@ impl AsyncWrite for SessionSnapshotFile {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.file).poll_write(cx, buf)
+        if self.receive_limit_exceeded {
+            return Poll::Ready(Err(self.receive_limit_error(
+                "snapshot receiver size limit was previously exceeded",
+            )));
+        }
+        let requested = match u64::try_from(buf.len()) {
+            Ok(requested) => requested,
+            Err(_) => {
+                return Poll::Ready(Err(
+                    self.receive_limit_error("snapshot write length is invalid")
+                ));
+            }
+        };
+        let Some(next) = self.received_bytes.checked_add(requested) else {
+            return Poll::Ready(Err(
+                self.receive_limit_error("snapshot stream exceeds size limit")
+            ));
+        };
+        if next > self.received_maximum {
+            return Poll::Ready(Err(
+                self.receive_limit_error("snapshot stream exceeds size limit")
+            ));
+        }
+        let Some(end) = self.cursor.checked_add(requested) else {
+            return Poll::Ready(Err(
+                self.receive_limit_error("snapshot stream exceeds size limit")
+            ));
+        };
+        if end > self.received_maximum {
+            return Poll::Ready(Err(
+                self.receive_limit_error("snapshot stream exceeds size limit")
+            ));
+        }
+        match Pin::new(&mut self.file).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                self.received_bytes = self.received_bytes.saturating_add(written as u64);
+                self.cursor = self.cursor.saturating_add(written as u64);
+                self.extent = self.extent.max(self.cursor);
+                Poll::Ready(Ok(written))
+            }
+            outcome => outcome,
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -309,6 +575,21 @@ impl AsyncWrite for SessionSnapshotFile {
 
 impl AsyncSeek for SessionSnapshotFile {
     fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        if self.receive_limit_exceeded {
+            return Err(
+                self.receive_limit_error("snapshot receiver size limit was previously exceeded")
+            );
+        }
+        let target = match position {
+            io::SeekFrom::Start(offset) => Some(offset),
+            io::SeekFrom::Current(offset) => self.cursor.checked_add_signed(offset),
+            io::SeekFrom::End(offset) => self.extent.checked_add_signed(offset),
+        }
+        .ok_or_else(|| self.receive_limit_error("snapshot seek is invalid"))?;
+        if target > self.received_maximum {
+            return Err(self.receive_limit_error("snapshot seek exceeds size limit"));
+        }
+        self.cursor = target;
         Pin::new(&mut self.file).start_seek(position)
     }
 
@@ -326,6 +607,7 @@ mod tests {
     use super::PinnedSqliteFile;
     use super::SessionSnapshotFile;
     use tempfile::tempdir;
+    use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
     #[tokio::test]
     async fn create_new_rejects_an_existing_file() -> Result<(), Box<dyn std::error::Error>> {
@@ -382,7 +664,7 @@ mod tests {
         let path = directory.path().join("snapshot");
         std::fs::write(&path, b"original")?;
         let snapshot = SessionSnapshotFile::open(path.clone()).await?;
-        let pinned = PinnedSqliteFile::from_file(snapshot.into_std().await, path.clone())?;
+        let pinned = PinnedSqliteFile::from_file(snapshot.into_std().await?, path.clone())?;
         let identity = pinned.identity();
 
         let replacement = directory.path().join("replacement");
@@ -404,16 +686,17 @@ mod tests {
         let directory = tempdir()?;
         let path = directory.path().join("snapshot");
         std::fs::write(&path, b"original")?;
-        let pinned = PinnedSqliteFile::from_file(std::fs::File::open(&path)?, path.clone())?;
+        let pinned = PinnedSqliteFile::from_file(std::fs::File::open(&path)?, path.clone())?
+            .pin_immutable()?;
 
         let mut writer = std::fs::OpenOptions::new().append(true).open(path)?;
         writer.write_all(b" changed")?;
         writer.sync_all()?;
 
         let error = pinned
-            .verify_identity()
+            .verify_immutable_generation()
             .err()
-            .ok_or("mutated handle identity was accepted")?;
+            .ok_or("mutated immutable artifact was accepted")?;
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         Ok(())
     }
@@ -427,9 +710,57 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            let pinned = PinnedSqliteFile::from_file(snapshot.into_std().await, path)?;
+            let pinned = PinnedSqliteFile::from_file(snapshot.into_std().await?, path)?;
             assert!(!format!("{pinned:?}").contains("secret-snapshot-name"));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_receiver_rejects_writes_before_file_growth(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming");
+        let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = std::sync::Arc::clone(&admission).try_acquire_owned()?;
+        let mut snapshot =
+            SessionSnapshotFile::create_with_cleanup_bounded(path.clone(), None, 3, Some(permit))
+                .await?;
+        let error = snapshot
+            .write_all(b"four")
+            .await
+            .err()
+            .ok_or("write succeeded")?;
+        assert_eq!(std::io::ErrorKind::InvalidData, error.kind());
+        assert_eq!(0, snapshot.metadata().await?.len());
+        assert!(admission.try_acquire().is_err());
+        snapshot.close_and_cleanup().await?;
+        assert!(admission.try_acquire().is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receiving_handle_cannot_bypass_the_stream_ceiling(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming");
+        let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1)).try_acquire_owned()?;
+        let mut snapshot =
+            SessionSnapshotFile::create_with_cleanup_bounded(path.clone(), None, 3, Some(permit))
+                .await?;
+        let seek = snapshot.seek(std::io::SeekFrom::Start(4)).await;
+        assert!(seek.is_err(), "seek beyond a receiving ceiling must fail");
+        assert!(
+            snapshot.file().is_err(),
+            "raw receiving file escapes the ceiling"
+        );
+        assert!(
+            snapshot.file_mut().is_err(),
+            "raw mutable receiving file escapes the ceiling"
+        );
+        assert!(snapshot.try_clone().await.is_err());
+        assert_eq!(0, snapshot.metadata().await?.len());
+        snapshot.close_and_cleanup().await?;
         Ok(())
     }
 }

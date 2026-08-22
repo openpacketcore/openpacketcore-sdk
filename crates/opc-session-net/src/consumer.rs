@@ -30,12 +30,13 @@ use opc_session_store::{
     RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionBackend,
     SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
     SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
-    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
-    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionOp, SessionOpResult, SessionPayloadEncoding,
-    SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
-    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerLeaseMutationOperation,
+    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
+    SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionOp,
+    SessionOpResult, SessionPayloadEncoding, SessionQuorumConsumer, StatelessSessionConsumer,
+    StoreError, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use opc_types::SpiffeId;
 use serde::{Deserialize, Serialize};
@@ -66,7 +67,7 @@ use crate::protocol::{
 pub const SESSION_QUORUM_CONSUMER_ALPN: &[u8] = b"opc-session-consumer/1";
 
 /// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_ALPN`].
-pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 3;
+pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 4;
 
 /// Maximum sequential application requests processed on one consumer
 /// connection. Every request has an exact nonzero connection-local
@@ -74,7 +75,7 @@ pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 3;
 pub const MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION: usize = 4096;
 /// Fixed logical width of the nonzero connection-local correlation value.
 pub const SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES: usize = std::mem::size_of::<u32>();
-/// Revision 3 deliberately admits one in-flight request per physical lane.
+/// Revision 4 deliberately admits one in-flight request per physical lane.
 pub const MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION: usize = 1;
 
 /// Default number of authenticated request lanes retained by a persistent
@@ -535,6 +536,7 @@ fn consumer_operation_is_effectful(operation: &SessionConsumerOperation) -> bool
         | SessionConsumerOperation::Watch { .. }
         | SessionConsumerOperation::FencedTransitionCapability
         | SessionConsumerOperation::ObserveFencedTransition { .. }
+        | SessionConsumerOperation::LeaseMutationStatus { .. }
         | SessionConsumerOperation::FencedTransitionStatus { .. } => false,
         SessionConsumerOperation::Batch { ops } => ops
             .iter()
@@ -550,7 +552,7 @@ fn consumer_operation_is_effectful(operation: &SessionConsumerOperation) -> bool
     }
 }
 
-/// Revision 3 deliberately binds the outer consumer id to the complete
+/// Revision 4 retains the revision-3 rule binding the outer consumer id to the complete
 /// fenced-transition body's stable id byte-for-byte.  Keep this check at both
 /// client and listener boundaries so a hand-built generic request cannot
 /// submit one durable body under a second public identity.
@@ -697,7 +699,11 @@ impl PersistentSessionConsumerConfig {
     pub const fn setup_timeout(&self) -> Duration {
         self.setup_timeout
     }
-    /// Return the maximum safe pre-write attempt count.
+    /// Return the bounded attempt count for persistent calls.
+    ///
+    /// Mutations use it only for safe pre-write connection retries.  A
+    /// retained read-only fenced-transition receipt lookup may also consume
+    /// this bound after a lost response; it never resubmits a mutation.
     pub const fn connect_attempts(&self) -> usize {
         self.connect_attempts
     }
@@ -1186,7 +1192,7 @@ struct BorrowedConsumerCall<'a> {
 
 /// Serialization-only view of a call. Keeping the caller-owned request
 /// borrowed avoids copying a potentially maximum-sized payload for every safe
-/// pre-write reconnect attempt while retaining the exact revision-3 encoding.
+/// pre-write reconnect attempt while retaining the exact revision-4 encoding.
 #[derive(Serialize)]
 #[serde(
     tag = "kind",
@@ -1250,11 +1256,12 @@ enum ConsumerSessionResponseWire {
     AcquireLease(Result<ConsumerSessionLeaseGrantWire, SessionConsumerLeaseError>),
     RenewLease(Result<ConsumerSessionLeaseGrantWire, SessionConsumerLeaseError>),
     ReleaseLease(Result<(), SessionConsumerLeaseError>),
+    LeaseMutationStatus(Result<ConsumerSessionLeaseMutationStatusWire, SessionConsumerStoreError>),
     OutcomeUnknown(SessionConsumerOutcomeUnknown),
     Rejected(SessionConsumerRejection),
 }
 
-/// Private revision-3 lease authority envelope. The public store response
+/// Private revision-4 lease authority envelope. The public store response
 /// remains the source-compatible `LeaseGuard`; only this transport validates
 /// the committed authority time before removing the envelope.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1288,6 +1295,59 @@ impl ConsumerSessionLeaseGrantWire {
 impl fmt::Debug for ConsumerSessionLeaseGrantWire {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ConsumerSessionLeaseGrantWire(<redacted>)")
+    }
+}
+
+/// Transport-only authority envelope for a retained ordinary lease receipt.
+/// A lease guard is never exposed from status until the response is bound to
+/// the complete original lease body carried by the request.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "result",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum ConsumerSessionLeaseMutationResultWire {
+    Acquire(ConsumerSessionLeaseGrantWire),
+    Renew(ConsumerSessionLeaseGrantWire),
+    Release,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum ConsumerSessionLeaseMutationStatusWire {
+    Recorded(Box<Result<ConsumerSessionLeaseMutationResultWire, SessionConsumerLeaseError>>),
+    RequestConflict,
+    NotFound,
+}
+
+impl ConsumerSessionLeaseMutationStatusWire {
+    fn into_public(self) -> SessionConsumerLeaseMutationStatus {
+        match self {
+            Self::Recorded(result) => {
+                SessionConsumerLeaseMutationStatus::Recorded(Box::new((*result).map(|result| {
+                    match result {
+                        ConsumerSessionLeaseMutationResultWire::Acquire(grant) => {
+                            SessionConsumerLeaseMutationResult::Acquire(grant.into_guard())
+                        }
+                        ConsumerSessionLeaseMutationResultWire::Renew(grant) => {
+                            SessionConsumerLeaseMutationResult::Renew(grant.into_guard())
+                        }
+                        ConsumerSessionLeaseMutationResultWire::Release => {
+                            SessionConsumerLeaseMutationResult::Release
+                        }
+                    }
+                })))
+            }
+            Self::RequestConflict => SessionConsumerLeaseMutationStatus::RequestConflict,
+            Self::NotFound => SessionConsumerLeaseMutationStatus::NotFound,
+        }
     }
 }
 
@@ -1328,6 +1388,9 @@ impl TryFrom<ConsumerSessionResponseWire> for SessionConsumerResponse {
                 Self::RenewLease(value.map(ConsumerSessionLeaseGrantWire::into_guard))
             }
             ConsumerSessionResponseWire::ReleaseLease(value) => Self::ReleaseLease(value),
+            ConsumerSessionResponseWire::LeaseMutationStatus(value) => Self::LeaseMutationStatus(
+                value.map(ConsumerSessionLeaseMutationStatusWire::into_public),
+            ),
             ConsumerSessionResponseWire::OutcomeUnknown(value) => Self::OutcomeUnknown(value),
             ConsumerSessionResponseWire::Rejected(value) => Self::Rejected(value),
         })
@@ -1345,6 +1408,66 @@ fn consumer_authority_time_from_expiry(
         .as_offset_datetime()
         .checked_sub(delta)
         .map(opc_types::Timestamp::from_offset_datetime)
+}
+
+fn consumer_lease_mutation_status_wire_from_public(
+    operation: &SessionConsumerLeaseMutationOperation,
+    status: SessionConsumerLeaseMutationStatus,
+) -> Result<ConsumerSessionLeaseMutationStatusWire, ProtocolError> {
+    let status = match status {
+        SessionConsumerLeaseMutationStatus::Recorded(result) => {
+            let result = match *result {
+                Ok(SessionConsumerLeaseMutationResult::Acquire(guard)) => {
+                    if !matches!(
+                        operation,
+                        SessionConsumerLeaseMutationOperation::Acquire { .. }
+                    ) {
+                        return Err(ProtocolError::UnexpectedResponse);
+                    }
+                    Ok(ConsumerSessionLeaseMutationResultWire::Acquire(
+                        ConsumerSessionLeaseGrantWire::new(guard.clone(), guard.acquired_at()),
+                    ))
+                }
+                Ok(SessionConsumerLeaseMutationResult::Renew(guard)) => {
+                    let SessionConsumerLeaseMutationOperation::Renew { ttl, .. } = operation else {
+                        return Err(ProtocolError::UnexpectedResponse);
+                    };
+                    let authority_time =
+                        consumer_authority_time_from_expiry(guard.expires_at(), *ttl)
+                            .ok_or(ProtocolError::InvalidWireValue)?;
+                    Ok(ConsumerSessionLeaseMutationResultWire::Renew(
+                        ConsumerSessionLeaseGrantWire::new(guard, authority_time),
+                    ))
+                }
+                Ok(SessionConsumerLeaseMutationResult::Release) => {
+                    if !matches!(
+                        operation,
+                        SessionConsumerLeaseMutationOperation::Release { .. }
+                    ) {
+                        return Err(ProtocolError::UnexpectedResponse);
+                    }
+                    Ok(ConsumerSessionLeaseMutationResultWire::Release)
+                }
+                Err(error) => Err(error),
+                _ => return Err(ProtocolError::UnexpectedResponse),
+            };
+            ConsumerSessionLeaseMutationStatusWire::Recorded(Box::new(result))
+        }
+        SessionConsumerLeaseMutationStatus::RequestConflict => {
+            ConsumerSessionLeaseMutationStatusWire::RequestConflict
+        }
+        SessionConsumerLeaseMutationStatus::NotFound => {
+            ConsumerSessionLeaseMutationStatusWire::NotFound
+        }
+        _ => return Err(ProtocolError::UnexpectedResponse),
+    };
+    // Validate on emission as well as receipt. A service cannot turn an
+    // impossible persisted outcome into a valid-looking authenticated frame,
+    // even if a caller never observes that frame.
+    if !lease_mutation_status_wire_matches_operation(operation, &status) {
+        return Err(ProtocolError::UnexpectedResponse);
+    }
+    Ok(status)
 }
 
 fn consumer_wire_response_from_public(
@@ -1411,6 +1534,18 @@ fn consumer_wire_response_from_public(
         SessionConsumerResponse::ReleaseLease(value) => {
             ConsumerSessionResponseWire::ReleaseLease(value)
         }
+        SessionConsumerResponse::LeaseMutationStatus(value) => {
+            let ConsumerLeaseWireContext::LeaseMutationStatus(operation) = lease_context else {
+                return Err(ProtocolError::UnexpectedResponse);
+            };
+            let value = match value {
+                Ok(status) => Ok(consumer_lease_mutation_status_wire_from_public(
+                    &operation, status,
+                )?),
+                Err(error) => Err(error),
+            };
+            ConsumerSessionResponseWire::LeaseMutationStatus(value)
+        }
         SessionConsumerResponse::OutcomeUnknown(value) => {
             ConsumerSessionResponseWire::OutcomeUnknown(value)
         }
@@ -1419,11 +1554,12 @@ fn consumer_wire_response_from_public(
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ConsumerLeaseWireContext {
     Other,
     Acquire,
     Renew(Duration),
+    LeaseMutationStatus(SessionConsumerLeaseMutationOperation),
 }
 
 impl ConsumerLeaseWireContext {
@@ -1431,8 +1567,97 @@ impl ConsumerLeaseWireContext {
         match operation {
             SessionConsumerOperation::AcquireLease { .. } => Self::Acquire,
             SessionConsumerOperation::RenewLease { ttl, .. } => Self::Renew(*ttl),
+            SessionConsumerOperation::LeaseMutationStatus { request } => {
+                Self::LeaseMutationStatus(request.operation().clone())
+            }
             _ => Self::Other,
         }
+    }
+}
+
+fn recorded_lease_receipt_error_matches_operation(
+    operation: &SessionConsumerLeaseMutationOperation,
+    error: SessionConsumerLeaseError,
+) -> bool {
+    match operation {
+        SessionConsumerLeaseMutationOperation::Acquire { .. } => matches!(
+            error,
+            SessionConsumerLeaseError::AlreadyHeld
+                | SessionConsumerLeaseError::StaleFence
+                | SessionConsumerLeaseError::InvalidTtl
+        ),
+        SessionConsumerLeaseMutationOperation::Renew { .. } => matches!(
+            error,
+            SessionConsumerLeaseError::AlreadyHeld
+                | SessionConsumerLeaseError::Expired
+                | SessionConsumerLeaseError::StaleFence
+                | SessionConsumerLeaseError::NotFound
+                | SessionConsumerLeaseError::InvalidTtl
+        ),
+        SessionConsumerLeaseMutationOperation::Release { .. } => matches!(
+            error,
+            SessionConsumerLeaseError::AlreadyHeld
+                | SessionConsumerLeaseError::StaleFence
+                | SessionConsumerLeaseError::NotFound
+        ),
+        _ => false,
+    }
+}
+
+fn lease_mutation_status_wire_matches_request(
+    request: &SessionConsumerLeaseMutationRequest,
+    status: &ConsumerSessionLeaseMutationStatusWire,
+) -> bool {
+    lease_mutation_status_wire_matches_operation(request.operation(), status)
+}
+
+fn lease_mutation_status_wire_matches_operation(
+    operation: &SessionConsumerLeaseMutationOperation,
+    status: &ConsumerSessionLeaseMutationStatusWire,
+) -> bool {
+    match status {
+        ConsumerSessionLeaseMutationStatusWire::Recorded(result) => {
+            match (operation, result.as_ref()) {
+                (
+                    SessionConsumerLeaseMutationOperation::Acquire { key, owner, ttl },
+                    Ok(ConsumerSessionLeaseMutationResultWire::Acquire(grant)),
+                ) => {
+                    let guard = grant.guard();
+                    guard.key() == key
+                        && guard.owner() == owner
+                        && crate::protocol::validate_lease_profile(guard).is_ok()
+                        && grant.authority_time() == guard.acquired_at()
+                        && checked_session_deadline(grant.authority_time(), *ttl)
+                            .is_ok_and(|deadline| deadline == guard.expires_at())
+                }
+                (
+                    SessionConsumerLeaseMutationOperation::Renew { lease, ttl },
+                    Ok(ConsumerSessionLeaseMutationResultWire::Renew(grant)),
+                ) => {
+                    let renewed = grant.guard();
+                    renewed.key() == lease.key()
+                        && renewed.owner() == lease.owner()
+                        && renewed.fence() == lease.fence()
+                        && renewed.credential_id() == lease.credential_id()
+                        && renewed.acquired_at() == lease.acquired_at()
+                        && crate::protocol::validate_lease_profile(renewed).is_ok()
+                        && grant.authority_time() >= lease.acquired_at()
+                        && grant.authority_time() < lease.expires_at()
+                        && checked_session_deadline(grant.authority_time(), *ttl)
+                            .is_ok_and(|deadline| deadline == renewed.expires_at())
+                }
+                (
+                    SessionConsumerLeaseMutationOperation::Release { .. },
+                    Ok(ConsumerSessionLeaseMutationResultWire::Release),
+                ) => true,
+                (_, Err(error)) => {
+                    recorded_lease_receipt_error_matches_operation(operation, *error)
+                }
+                _ => false,
+            }
+        }
+        ConsumerSessionLeaseMutationStatusWire::RequestConflict
+        | ConsumerSessionLeaseMutationStatusWire::NotFound => true,
     }
 }
 
@@ -1475,8 +1700,38 @@ fn consumer_public_response_from_wire(
                 return Err(ProtocolError::UnexpectedResponse);
             }
         }
-        (ConsumerSessionResponseWire::AcquireLease(Ok(_)), _)
-        | (ConsumerSessionResponseWire::RenewLease(Ok(_)), _) => {
+        (
+            ConsumerSessionResponseWire::LeaseMutationStatus(Ok(status)),
+            SessionConsumerOperation::LeaseMutationStatus { request },
+        ) => {
+            if !lease_mutation_status_wire_matches_request(request, status) {
+                return Err(ProtocolError::UnexpectedResponse);
+            }
+        }
+        // Preserve the exact operation/response family binding before
+        // converting any result (including a closed error). Result-specific
+        // validators run at the request boundary immediately after this
+        // conversion; a cross-operation lease envelope never reaches them.
+        (
+            ConsumerSessionResponseWire::AcquireLease(_),
+            SessionConsumerOperation::AcquireLease { .. },
+        )
+        | (
+            ConsumerSessionResponseWire::RenewLease(_),
+            SessionConsumerOperation::RenewLease { .. },
+        )
+        | (
+            ConsumerSessionResponseWire::ReleaseLease(_),
+            SessionConsumerOperation::ReleaseLease { .. },
+        )
+        | (
+            ConsumerSessionResponseWire::LeaseMutationStatus(_),
+            SessionConsumerOperation::LeaseMutationStatus { .. },
+        ) => {}
+        (ConsumerSessionResponseWire::AcquireLease(_), _)
+        | (ConsumerSessionResponseWire::RenewLease(_), _)
+        | (ConsumerSessionResponseWire::ReleaseLease(_), _)
+        | (ConsumerSessionResponseWire::LeaseMutationStatus(_), _) => {
             return Err(ProtocolError::UnexpectedResponse);
         }
         _ => {}
@@ -1543,6 +1798,7 @@ enum ConsumerOperationKind {
     ObserveFencedTransition,
     FencedTransition,
     FencedTransitionStatus,
+    LeaseMutationStatus,
     Get,
     PreflightRecordExpiry,
     CompareAndSet,
@@ -1573,6 +1829,7 @@ impl ConsumerOperationKind {
             }
             SessionConsumerOperation::FencedTransition { .. } => Self::FencedTransition,
             SessionConsumerOperation::FencedTransitionStatus { .. } => Self::FencedTransitionStatus,
+            SessionConsumerOperation::LeaseMutationStatus { .. } => Self::LeaseMutationStatus,
             SessionConsumerOperation::Get { .. } => Self::Get,
             SessionConsumerOperation::PreflightRecordExpiry { .. } => Self::PreflightRecordExpiry,
             SessionConsumerOperation::CompareAndSet { .. } => Self::CompareAndSet,
@@ -1615,6 +1872,9 @@ fn response_matches_operation(
         ) | (
             ConsumerOperationKind::FencedTransitionStatus,
             SessionConsumerResponse::FencedTransitionStatus(_)
+        ) | (
+            ConsumerOperationKind::LeaseMutationStatus,
+            SessionConsumerResponse::LeaseMutationStatus(_)
         ) | (ConsumerOperationKind::Get, SessionConsumerResponse::Get(_))
             | (
                 ConsumerOperationKind::PreflightRecordExpiry,
@@ -1725,6 +1985,12 @@ fn store_error_matches_operation(
                 | SessionConsumerStoreError::Unavailable
                 | SessionConsumerStoreError::InvalidInput
                 | SessionConsumerStoreError::CapabilityNotSupported
+                | SessionConsumerStoreError::ProtectedDataRejected
+        ),
+        SessionConsumerOperation::LeaseMutationStatus { .. } => matches!(
+            error,
+            SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::InvalidInput
                 | SessionConsumerStoreError::ProtectedDataRejected
         ),
         SessionConsumerOperation::Get { .. } => matches!(
@@ -1847,7 +2113,7 @@ fn batch_slot_error_matches_operation(
     }
 }
 
-/// Closed revision-3 error family for an already-open watch. These are the
+/// Closed revision-4 error family for an already-open watch. These are the
 /// only failures that can describe observation/catch-up of committed changes;
 /// mutation, request-binding, lease, restore, and TTL errors are impossible on
 /// this stream and therefore poison the authenticated lane.
@@ -2027,6 +2293,14 @@ fn response_matches_request(
             SessionConsumerOperation::FencedTransitionStatus { .. },
             SessionConsumerResponse::FencedTransitionStatus(result),
         ) => store_result_matches_operation(request.operation(), result),
+        (
+            SessionConsumerOperation::LeaseMutationStatus { request: retained },
+            SessionConsumerResponse::LeaseMutationStatus(Ok(status)),
+        ) => lease_mutation_status_matches_request(retained, status),
+        (
+            SessionConsumerOperation::LeaseMutationStatus { .. },
+            SessionConsumerResponse::LeaseMutationStatus(result),
+        ) => store_result_matches_operation(request.operation(), result),
         (SessionConsumerOperation::Get { key }, SessionConsumerResponse::Get(result)) => {
             get_result_matches_key(
                 key,
@@ -2172,6 +2446,58 @@ fn fenced_transition_status_matches_request(
         | SessionConsumerFencedTransitionStatus::HistoryFull
         | SessionConsumerFencedTransitionStatus::RetentionExhausted
         | SessionConsumerFencedTransitionStatus::NotFound => true,
+        _ => false,
+    }
+}
+
+fn lease_mutation_status_matches_request(
+    request: &SessionConsumerLeaseMutationRequest,
+    status: &SessionConsumerLeaseMutationStatus,
+) -> bool {
+    match status {
+        SessionConsumerLeaseMutationStatus::Recorded(result) => {
+            match (request.operation(), result.as_ref()) {
+                (
+                    SessionConsumerLeaseMutationOperation::Acquire { key, owner, ttl },
+                    Ok(SessionConsumerLeaseMutationResult::Acquire(guard)),
+                ) => {
+                    guard.key() == key
+                        && guard.owner() == owner
+                        && crate::protocol::validate_lease_profile(guard).is_ok()
+                        && checked_session_deadline(guard.acquired_at(), *ttl)
+                            .is_ok_and(|deadline| deadline == guard.expires_at())
+                }
+                (
+                    SessionConsumerLeaseMutationOperation::Renew { lease, ttl },
+                    Ok(SessionConsumerLeaseMutationResult::Renew(renewed)),
+                ) => {
+                    let authority_time =
+                        consumer_authority_time_from_expiry(renewed.expires_at(), *ttl);
+                    renewed.key() == lease.key()
+                        && renewed.owner() == lease.owner()
+                        && renewed.fence() == lease.fence()
+                        && renewed.credential_id() == lease.credential_id()
+                        && renewed.acquired_at() == lease.acquired_at()
+                        && crate::protocol::validate_lease_profile(renewed).is_ok()
+                        && authority_time.is_some_and(|authority_time| {
+                            authority_time >= lease.acquired_at()
+                                && authority_time < lease.expires_at()
+                                && checked_session_deadline(authority_time, *ttl)
+                                    .is_ok_and(|deadline| deadline == renewed.expires_at())
+                        })
+                }
+                (
+                    SessionConsumerLeaseMutationOperation::Release { .. },
+                    Ok(SessionConsumerLeaseMutationResult::Release),
+                ) => true,
+                (_, Err(error)) => {
+                    recorded_lease_receipt_error_matches_operation(request.operation(), *error)
+                }
+                _ => false,
+            }
+        }
+        SessionConsumerLeaseMutationStatus::RequestConflict
+        | SessionConsumerLeaseMutationStatus::NotFound => true,
         _ => false,
     }
 }
@@ -2389,7 +2715,7 @@ fn response_is_known_failure(response: &SessionConsumerResponse) -> bool {
 /// internal/legacy code and cannot globally enable `deny_unknown_fields`.
 /// `serde_ignored` reports most fields that shared DTO deserializers would
 /// ignore. Internally tagged enums can hide deeper ignored fields from that
-/// adapter, so the decoded revision-3 type is serialized through a streaming
+/// adapter, so the decoded revision-4 type is serialized through a streaming
 /// byte comparator against the bounded received payload. This rejects aliases,
 /// omissions, noncanonical encodings, and unknown nested fields without a
 /// second buffer, a generic JSON tree, or surfacing their content.
@@ -2512,7 +2838,7 @@ where
 }
 
 /// Compare the exact private wire encoding without retaining a second JSON
-/// buffer or materializing generic value trees. Revision 3 is emitted only by
+/// buffer or materializing generic value trees. Revision 4 is emitted only by
 /// this module's private DTOs, so canonical bytes are part of the negotiated
 /// contract; the borrowed/owned wire-equivalence tests seal both writers.
 struct ExactConsumerJson<'a> {
@@ -2898,7 +3224,7 @@ struct ConsumerConnection {
     next_correlation: NonZeroU32,
     calls: usize,
     idle_deadline: tokio::time::Instant,
-    /// Exact server-advertised request-frame ceiling for this revision-3 lane.
+    /// Exact server-advertised request-frame ceiling for this revision-4 lane.
     request_frame_size: usize,
     shutdown_io: Option<Arc<PersistentConsumerIoBarrier>>,
     /// Weak owner used only for exact physical request-lane accounting.
@@ -3622,7 +3948,7 @@ impl StatelessSessionConsumerClient {
     /// Set the finite bootstrap and active-frame idle timeout.
     ///
     /// Zero remains invalid. Source-compatible stateless callers may retain a
-    /// larger legacy value; revision 3 applies its five-second active-frame
+    /// larger legacy value; revision 4 applies its five-second active-frame
     /// ceiling internally. Persistent construction rejects values outside its
     /// explicit bounded profile.
     #[must_use]
@@ -4491,6 +4817,36 @@ impl StatelessSessionConsumerClient {
             }
             Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
                 "consumer fenced-transition status unavailable".into(),
+            )),
+        }
+    }
+
+    /// Read the exact durable receipt for a retained ordinary lease mutation.
+    ///
+    /// This sends the caller's original public ID and complete lease body to
+    /// the authenticated service. It is a read-only lookup: `NotFound` and a
+    /// transport failure remain ambiguous rather than authorizing a replay.
+    pub async fn lease_mutation_status(
+        &self,
+        request: &SessionConsumerLeaseMutationRequest,
+    ) -> Result<SessionConsumerLeaseMutationStatus, StoreError> {
+        match self
+            .execute(self.request(
+                request.request_id(),
+                SessionConsumerOperation::LeaseMutationStatus {
+                    request: Box::new(request.clone()),
+                },
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::LeaseMutationStatus(result)) => {
+                result.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                Err(rejection_into_store_error(rejection))
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer lease receipt status unavailable".into(),
             )),
         }
     }
@@ -6761,6 +7117,34 @@ impl PersistentSessionConsumerClient {
             .ok_or(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Deadline,
             ))?;
+        self.execute_classified_before(request, deadline, self.pool.config.connect_attempts)
+            .await
+    }
+
+    /// Execute an exact request inside a caller-owned fixed operation budget.
+    ///
+    /// This is intentionally separate from [`Self::execute_classified`] so a
+    /// retained receipt lookup can reconnect after a post-write response loss
+    /// without starting another operation timeout.  Mutating calls invoke it
+    /// once and keep their internal retries pre-write-only; only the outer
+    /// read-only receipt-status helper re-enters it after ambiguity.
+    async fn execute_classified_before(
+        &self,
+        request: &SessionConsumerRequest,
+        deadline: tokio::time::Instant,
+        connect_attempts: usize,
+    ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        // A retained status lookup has one immutable operation deadline, but
+        // each bounded transport attempt must enter the pool at its own
+        // instant.  Reusing the original start here would make a response
+        // loss older than `pool_wait_timeout` fail locally as overloaded
+        // before its safe read-only reconnect can even acquire a lane.
+        let started = tokio::time::Instant::now();
+        if started >= deadline {
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Deadline,
+            ));
+        }
         if request.scope() != self.pool.client.scope {
             self.pool
                 .record_error(SessionConsumerClientError::Scope, false, false);
@@ -6806,7 +7190,13 @@ impl PersistentSessionConsumerClient {
             }
         };
         let result = self
-            .execute_admitted(request, started, deadline, &write_progress)
+            .execute_admitted(
+                request,
+                started,
+                deadline,
+                &write_progress,
+                connect_attempts,
+            )
             .await;
         outcome.complete();
         match result {
@@ -6840,6 +7230,83 @@ impl PersistentSessionConsumerClient {
                     consumer_operation_is_effectful(request.operation()),
                 );
                 Err(error)
+            }
+        }
+    }
+
+    /// Reconnect an exact, read-only fenced-transition receipt lookup after a
+    /// post-write transport loss.  Every attempt carries the same consumer
+    /// request ID and immutable transition body, and all attempts share one
+    /// original deadline.  A mutation is never retried here.
+    async fn execute_fenced_transition_status(
+        &self,
+        request: SessionConsumerRequest,
+    ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        if !matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedTransitionStatus { .. }
+        ) {
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
+            ));
+        }
+        let started = tokio::time::Instant::now();
+        let deadline = started
+            .checked_add(effective_consumer_operation_timeout(
+                self.pool.client.operation_timeout,
+            ))
+            .ok_or(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Deadline,
+            ))?;
+        let mut attempts = 0_usize;
+        loop {
+            attempts = attempts.saturating_add(1);
+            match self
+                // The outer recovery loop owns the complete attempt budget.
+                // Giving each inner call one transport attempt prevents a
+                // post-write retry from multiplying the configured bound via
+                // nested pre-write reconnect loops.
+                .execute_classified_before(&request, deadline, 1)
+                .await
+            {
+                Err(
+                    error @ (SessionConsumerCallError::BeforeCallWrite(
+                        SessionConsumerClientError::Unavailable
+                        | SessionConsumerClientError::Deadline,
+                    )
+                    | SessionConsumerCallError::MayHaveSent(
+                        SessionConsumerClientError::Unavailable
+                        | SessionConsumerClientError::Deadline,
+                    )),
+                ) if attempts < self.pool.config.connect_attempts
+                    && tokio::time::Instant::now() < deadline =>
+                {
+                    // Reuse the pool's existing bounded reconnect policy; do
+                    // not create a second timeout or a special recovery
+                    // budget for receipt status.
+                    let delay = self.pool.reconnect_delay();
+                    if !delay.is_zero() {
+                        let mut shutdown = self.pool.shutdown_tx.subscribe();
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_forced_shutdown(
+                                &mut shutdown,
+                                &self.pool.shutdown_phase,
+                            ) => {
+                                return Err(SessionConsumerCallError::BeforeCallWrite(
+                                    SessionConsumerClientError::ShuttingDown,
+                                ));
+                            }
+                            _ = tokio::time::sleep_until(
+                                (tokio::time::Instant::now() + delay).min(deadline),
+                            ) => {}
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+                result => return result,
             }
         }
     }
@@ -6979,7 +7446,7 @@ impl PersistentSessionConsumerClient {
     ) -> Result<SessionConsumerFencedTransitionStatus, StoreError> {
         let request_id = consumer_fenced_transition_request_id(request);
         match self
-            .execute_read(self.request(
+            .execute_fenced_transition_status(self.request(
                 request_id,
                 SessionConsumerOperation::FencedTransitionStatus {
                     request: Box::new(request.clone()),
@@ -6995,6 +7462,34 @@ impl PersistentSessionConsumerClient {
             }
             Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
                 "consumer fenced-transition status unavailable".into(),
+            )),
+        }
+    }
+
+    /// Read the exact durable receipt for a retained ordinary lease mutation
+    /// over a persistent read lane. A missing or unavailable receipt remains
+    /// ambiguous to the caller and never submits the retained lease body.
+    pub async fn lease_mutation_status(
+        &self,
+        request: &SessionConsumerLeaseMutationRequest,
+    ) -> Result<SessionConsumerLeaseMutationStatus, StoreError> {
+        match self
+            .execute_read(self.request(
+                request.request_id(),
+                SessionConsumerOperation::LeaseMutationStatus {
+                    request: Box::new(request.clone()),
+                },
+            ))
+            .await
+        {
+            Ok(SessionConsumerResponse::LeaseMutationStatus(result)) => {
+                result.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                Err(rejection_into_store_error(rejection))
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer lease receipt status unavailable".into(),
             )),
         }
     }
@@ -7290,6 +7785,7 @@ impl PersistentSessionConsumerClient {
         started: tokio::time::Instant,
         deadline: tokio::time::Instant,
         write_progress: &FrameWriteProgress,
+        connect_attempts: usize,
     ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
         let (pre_request_deadline, pre_request_budget_active) =
             self.pool.client.pre_request_deadline(started, deadline);
@@ -7318,7 +7814,7 @@ impl PersistentSessionConsumerClient {
             let connection = match connection {
                 Ok(connection) => connection,
                 Err(error)
-                    if attempt < self.pool.config.connect_attempts
+                    if attempt < connect_attempts
                         && matches!(
                             error,
                             SessionConsumerClientError::Unavailable
@@ -7382,7 +7878,7 @@ impl PersistentSessionConsumerClient {
                     return Ok(response);
                 }
                 Err(SessionConsumerCallError::BeforeCallWrite(error))
-                    if attempt < self.pool.config.connect_attempts
+                    if attempt < connect_attempts
                         && matches!(
                             error,
                             SessionConsumerClientError::Unavailable
@@ -7859,7 +8355,7 @@ impl SessionQuorumConsumerServer {
     }
 
     /// Set the active authenticated-frame idle deadline. A larger legacy
-    /// stateless value remains source-compatible, while revision 3 applies its
+    /// stateless value remains source-compatible, while revision 4 applies its
     /// five-second active-frame ceiling internally.
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
@@ -8227,7 +8723,7 @@ async fn handle_server_connection(
     #[cfg(test)] setup_test_hooks: Option<Arc<ConsumerServerSetupTestHooks>>,
     #[cfg(test)] expire_at_final_ack_boundary: bool,
 ) -> Result<(), ProtocolError> {
-    // Revision 3 reuses a socket for small request/response frames. Disable
+    // Revision 4 reuses a socket for small request/response frames. Disable
     // Nagle on both peers so a warm exchange cannot inherit the platform's
     // delayed-ACK cadence and consume the bounded fair-pool wait budget.
     stream.set_nodelay(true).map_err(ProtocolError::Io)?;
@@ -8797,7 +9293,7 @@ async fn handle_server_connection(
             (&restore_request, &response)
         {
             // Keep #684's page validation and response-fit replacement before
-            // writing a frame; revision-3 only adds the small correlation
+            // writing a frame; revision-4 only adds the small correlation
             // envelope to the fit calculation.
             if page.validate_for_request(request).is_err()
                 || !consumer_response_fits_for_correlation(
@@ -9128,6 +9624,7 @@ fn consumer_timeout_response(
         | ConsumerOperationKind::FencedTransitionCapability
         | ConsumerOperationKind::ObserveFencedTransition
         | ConsumerOperationKind::FencedTransitionStatus
+        | ConsumerOperationKind::LeaseMutationStatus
         | ConsumerOperationKind::Get
         | ConsumerOperationKind::PreflightRecordExpiry
         | ConsumerOperationKind::Batch {
@@ -9238,21 +9735,24 @@ mod tests {
         authenticated_consumer_binding, classify_call_write_error, complete_before_deadline,
         consumer_connection_current, consumer_execute_into_fenced_transition,
         consumer_fresh_admission_is_current, consumer_payload_fragments_exceed_frame,
-        consumer_request_has_exact_fenced_transition_id, consumer_response_fits,
-        consumer_watch_error_is_legal, consumer_wire_response_from_public,
+        consumer_public_response_from_wire, consumer_request_has_exact_fenced_transition_id,
+        consumer_response_fits, consumer_watch_error_is_legal, consumer_wire_response_from_public,
         decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
-        fenced_transition_response, lease_error_matches_operation, lease_response,
-        mutation_response, persistent_execute_error, poll_persistent_consumer_setup_io,
-        publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
-        read_authenticated_consumer_frame_until, read_authenticated_consumer_frame_within,
-        response_is_outcome_unknown, response_matches_operation, response_matches_request,
+        fenced_transition_response, lease_error_matches_operation,
+        lease_mutation_status_matches_request, lease_mutation_status_wire_matches_request,
+        lease_response, mutation_response, persistent_execute_error,
+        poll_persistent_consumer_setup_io, publish_monotonic_shutdown_phase,
+        queued_consumer_watch_stream, read_authenticated_consumer_frame_until,
+        read_authenticated_consumer_frame_within, response_is_outcome_unknown,
+        response_matches_operation, response_matches_request,
         response_retires_connection_authority, server_connection_current,
         store_error_matches_operation, valid_consumer_operation_timeout, wait_for_forced_shutdown,
         write_consumer_call_rejection_supervised, BorrowedConsumerCall,
         BorrowedConsumerCallResponse, BorrowedConsumerWireRequest, BorrowedConsumerWireResponse,
         BoxStream, ConsumerCall, ConsumerCallResponse, ConsumerConnection, ConsumerHello,
         ConsumerLeaseWireContext, ConsumerOperationKind, ConsumerServerCancellation,
-        ConsumerServerSetupTestHooks, ConsumerSessionResponseWire, ConsumerSetupPhase,
+        ConsumerServerSetupTestHooks, ConsumerSessionLeaseMutationResultWire,
+        ConsumerSessionLeaseMutationStatusWire, ConsumerSessionResponseWire, ConsumerSetupPhase,
         ConsumerSetupPhaseAttempt, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
         ConsumerWireRequest, ConsumerWireResponse, PersistentCheckedOutConnection,
         PersistentConsumerCounters, PersistentConsumerIoBarrier, PersistentConsumerShutdownReader,
@@ -9291,11 +9791,13 @@ mod tests {
         SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
         SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
         SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
-        SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-        SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-        SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
-        MAX_SESSION_TTL,
+        SessionConsumerLeaseError, SessionConsumerLeaseMutationOperation,
+        SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
+        SessionConsumerLeaseMutationStatus, SessionConsumerOperation,
+        SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
+        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
+        SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType, StoreError,
+        StoredSessionRecord, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -10234,7 +10736,232 @@ mod tests {
     }
 
     #[test]
-    fn revision_three_semantics_bind_ttl_records_batches_watches_and_future_operations() {
+    fn lease_receipt_status_errors_are_exact_for_public_and_wire_validators() {
+        fn lease_guard(
+            key: SessionKey,
+            owner: OwnerId,
+            fence: FenceToken,
+            acquired_at: Timestamp,
+            expires_at: Timestamp,
+            credential_id: u64,
+        ) -> LeaseGuard {
+            serde_json::from_value(serde_json::json!({
+                "key": key,
+                "owner": owner,
+                "fence": fence,
+                "acquired_at": acquired_at,
+                "expires_at": expires_at,
+                "credential_id": credential_id,
+            }))
+            .expect("public lease wire shape")
+        }
+
+        let key = SessionKey {
+            tenant: TenantId::new("lease-receipt-errors").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"lease-receipt-errors")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("lease-receipt-owner").expect("test owner");
+        let acquired_at = Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH);
+        let lease = lease_guard(
+            key.clone(),
+            owner.clone(),
+            FenceToken::new(7),
+            acquired_at,
+            checked_session_deadline(acquired_at, Duration::from_secs(30)).expect("test expiry"),
+            11,
+        );
+        let all_errors = [
+            SessionConsumerLeaseError::RequestConflict,
+            SessionConsumerLeaseError::AlreadyHeld,
+            SessionConsumerLeaseError::Expired,
+            SessionConsumerLeaseError::StaleFence,
+            SessionConsumerLeaseError::NotFound,
+            SessionConsumerLeaseError::InvalidTtl,
+            SessionConsumerLeaseError::OutcomeUnavailable,
+            SessionConsumerLeaseError::Unavailable,
+        ];
+        let cases = [
+            (
+                SessionConsumerLeaseMutationOperation::Acquire {
+                    key: key.clone(),
+                    owner: owner.clone(),
+                    ttl: Duration::from_secs(30),
+                },
+                &[
+                    SessionConsumerLeaseError::AlreadyHeld,
+                    SessionConsumerLeaseError::StaleFence,
+                    SessionConsumerLeaseError::InvalidTtl,
+                ][..],
+            ),
+            (
+                SessionConsumerLeaseMutationOperation::Renew {
+                    lease: lease.clone(),
+                    ttl: Duration::from_secs(30),
+                },
+                &[
+                    SessionConsumerLeaseError::AlreadyHeld,
+                    SessionConsumerLeaseError::Expired,
+                    SessionConsumerLeaseError::StaleFence,
+                    SessionConsumerLeaseError::NotFound,
+                    SessionConsumerLeaseError::InvalidTtl,
+                ][..],
+            ),
+            (
+                SessionConsumerLeaseMutationOperation::Release {
+                    lease: lease.clone(),
+                },
+                &[
+                    SessionConsumerLeaseError::AlreadyHeld,
+                    SessionConsumerLeaseError::StaleFence,
+                    SessionConsumerLeaseError::NotFound,
+                ][..],
+            ),
+        ];
+
+        let acquire_retained = SessionConsumerLeaseMutationRequest::new(
+            SessionConsumerRequestId::from_bytes([0xA5; 16]),
+            SessionConsumerLeaseMutationOperation::Acquire {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl: Duration::from_secs(30),
+            },
+        );
+        let acquire_status_request = SessionConsumerRequest::new(
+            scope(),
+            acquire_retained.request_id(),
+            SessionConsumerOperation::LeaseMutationStatus {
+                request: Box::new(acquire_retained.clone()),
+            },
+        );
+        let recorded_acquire = SessionConsumerResponse::LeaseMutationStatus(Ok(
+            SessionConsumerLeaseMutationStatus::Recorded(Box::new(Ok(
+                SessionConsumerLeaseMutationResult::Acquire(lease.clone()),
+            ))),
+        ));
+        let recorded_acquire_wire = consumer_wire_response_from_public(
+            ConsumerLeaseWireContext::LeaseMutationStatus(acquire_retained.operation().clone()),
+            recorded_acquire.clone(),
+        )
+        .expect("exact recorded acquire receipt emits on the status wire");
+        assert_eq!(
+            consumer_public_response_from_wire(&acquire_status_request, recorded_acquire_wire)
+                .expect("valid recorded acquire receipt decodes"),
+            recorded_acquire,
+            "a valid recorded acquire receipt must not fall through into the mismatched-response rejection"
+        );
+        let not_found_wire = consumer_wire_response_from_public(
+            ConsumerLeaseWireContext::LeaseMutationStatus(acquire_retained.operation().clone()),
+            SessionConsumerResponse::LeaseMutationStatus(Ok(
+                SessionConsumerLeaseMutationStatus::NotFound,
+            )),
+        )
+        .expect("exact receipt NotFound emits on the status wire");
+        assert!(matches!(
+            consumer_public_response_from_wire(&acquire_status_request, not_found_wire),
+            Ok(SessionConsumerResponse::LeaseMutationStatus(Ok(
+                SessionConsumerLeaseMutationStatus::NotFound
+            )))
+        ));
+        let mismatched_recorded_variant = ConsumerSessionResponseWire::LeaseMutationStatus(Ok(
+            ConsumerSessionLeaseMutationStatusWire::Recorded(Box::new(Ok(
+                ConsumerSessionLeaseMutationResultWire::Release,
+            ))),
+        ));
+        assert!(
+            consumer_public_response_from_wire(
+                &acquire_status_request,
+                mismatched_recorded_variant
+            )
+            .is_err(),
+            "a release receipt cannot satisfy an acquire status request"
+        );
+        assert!(
+            consumer_public_response_from_wire(
+                &acquire_status_request,
+                ConsumerSessionResponseWire::ReleaseLease(Ok(())),
+            )
+            .is_err(),
+            "a direct lease envelope cannot satisfy a receipt-status request"
+        );
+        assert!(
+            consumer_wire_response_from_public(
+                ConsumerLeaseWireContext::LeaseMutationStatus(
+                    acquire_retained.operation().clone(),
+                ),
+                SessionConsumerResponse::LeaseMutationStatus(Ok(
+                    SessionConsumerLeaseMutationStatus::Recorded(Box::new(Err(
+                        SessionConsumerLeaseError::Expired,
+                    ))),
+                )),
+            )
+            .is_err(),
+            "an impossible acquire receipt error must not be emitted"
+        );
+
+        for (case_index, (operation, permitted)) in cases.into_iter().enumerate() {
+            let retained = SessionConsumerLeaseMutationRequest::new(
+                SessionConsumerRequestId::from_bytes(
+                    [u8::try_from(case_index + 1).expect("bounded fixed test request index"); 16],
+                ),
+                operation,
+            );
+            let status_request = SessionConsumerRequest::new(
+                scope(),
+                retained.request_id(),
+                SessionConsumerOperation::LeaseMutationStatus {
+                    request: Box::new(retained.clone()),
+                },
+            );
+            for error in all_errors {
+                let expected = permitted.contains(&error);
+                let wire = ConsumerSessionLeaseMutationStatusWire::Recorded(Box::new(Err(error)));
+                let public = SessionConsumerLeaseMutationStatus::Recorded(Box::new(Err(error)));
+                assert_eq!(
+                    lease_mutation_status_wire_matches_request(&retained, &wire),
+                    expected,
+                    "wire receipt error must be operation-exact"
+                );
+                assert_eq!(
+                    lease_mutation_status_matches_request(&retained, &public),
+                    expected,
+                    "public receipt error must be operation-exact"
+                );
+                assert_eq!(
+                    response_matches_request(
+                        &status_request,
+                        &SessionConsumerResponse::LeaseMutationStatus(Ok(public)),
+                    ),
+                    expected,
+                    "response envelope must retain the operation-exact receipt matrix"
+                );
+            }
+            for status in [
+                ConsumerSessionLeaseMutationStatusWire::RequestConflict,
+                ConsumerSessionLeaseMutationStatusWire::NotFound,
+            ] {
+                assert!(lease_mutation_status_wire_matches_request(
+                    &retained, &status
+                ));
+            }
+            for status in [
+                SessionConsumerLeaseMutationStatus::RequestConflict,
+                SessionConsumerLeaseMutationStatus::NotFound,
+            ] {
+                assert!(lease_mutation_status_matches_request(&retained, &status));
+                assert!(response_matches_request(
+                    &status_request,
+                    &SessionConsumerResponse::LeaseMutationStatus(Ok(status)),
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn revision_four_semantics_bind_ttl_records_batches_watches_and_future_operations() {
         fn lease_guard(
             key: SessionKey,
             owner: OwnerId,
@@ -10596,7 +11323,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_three_fenced_transition_outer_identity_is_byte_exact() {
+    fn revision_four_fenced_transition_outer_identity_is_byte_exact() {
         let key = SessionKey {
             tenant: TenantId::new("fenced-transition-id").expect("test tenant"),
             nf_kind: NetworkFunctionKind::smf(),
@@ -11093,7 +11820,7 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_revision_three_envelopes_are_wire_identical() {
+    fn borrowed_revision_four_envelopes_are_wire_identical() {
         let request = mutation_request(SessionConsumerRequestId::new());
         let owned_request = ConsumerWireRequest::Call(ConsumerCall {
             correlation: NonZeroU32::MIN,
@@ -11167,7 +11894,7 @@ mod tests {
         "{\"kind\":\"response\",\"body\":{\"response\":\"watch_opened\"}}";
 
     #[test]
-    fn frozen_revision_one_frames_never_cross_decode_as_revision_three() {
+    fn frozen_revision_one_frames_never_cross_decode_as_revision_four() {
         let hello = format!(
             "{{\"kind\":\"hello\",\"body\":{{\"transport_revision\":1,\"scope\":{REVISION_ONE_SCOPE_JSON}}}}}"
         );
@@ -11540,7 +12267,7 @@ mod tests {
         assert_eq!(
             resolver_calls.load(Ordering::SeqCst),
             1,
-            "a legacy stateless timeout above the revision-3 ceiling remains source-compatible; the effective wire operation is internally capped"
+            "a legacy stateless timeout above the revision-4 ceiling remains source-compatible; the effective wire operation is internally capped"
         );
 
         let server_material = RotatableServerMaterial::new(

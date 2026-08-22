@@ -246,16 +246,17 @@ and compatibility fresh-authentication typed least-authority surface required by
 `PersistentSessionConsumerClient` with `SessionQuorumConsumerServer` is the
 required warm fixed-pool primitive for #695/ePDG latency. Production deployments
 that require warm reuse should use it. Both use mutual TLS with the unchanged
-`opc-session-consumer/1` ALPN and exact consumer transport revision 3. Earlier
+`opc-session-consumer/1` ALPN and exact consumer transport revision 4. Earlier
 revisions will not fall back or interoperate. The unreleased SDK requires one
-coordinated, drained client/listener cutover; there is no dual mode. Revision-3
+coordinated, drained client/listener cutover; there is no dual mode. Revision-4
 private JSON DTO bytes are canonical; reordered or
 otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
 closed. This does not add `RemoteSessionBackend` or any
 consensus/replication/snapshot/rebuild/membership/admin authority, and it
-adds only #696's generic, single-record atomic fenced-transition capability,
-observation, execution, and exact-status operations. Product composition and
-ePDG-specific semantics remain excluded.
+retains #696's generic, single-record atomic fenced-transition capability,
+observation, execution, and exact-status operations, and adds exact retained
+status recovery for ordinary acquire, renew, and release requests. Product
+composition and ePDG-specific semantics remain excluded.
 
 For a fenced transition, the public consumer request ID is byte-identical to
 the nested transition ID. The internal receipt ID is domain-separated by
@@ -351,9 +352,10 @@ samples are retained in
 
 The revision-2 persistent-consumer transport qualification contract remains
 recorded in the v7 profile and the published v6 profile remains the unchanged
-revision-1 contract. Revision 3 retains every bounded persistent-transport
-property from that evidence and adds the generic #696 operation family; its
-exact-head evidence is recorded with the atomic-transition qualification.
+revision-1 contract. Revision 4 retains every bounded persistent-transport
+property from that evidence and the revision-3 generic #696 operation family,
+then adds exact retained status recovery for ordinary leases; its exact-head
+evidence is recorded with the receipt-status qualification.
 
 ## API Shape
 

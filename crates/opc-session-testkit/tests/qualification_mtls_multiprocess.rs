@@ -38,9 +38,11 @@ use opc_session_store::{
     ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
     SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
     SessionConsensusWireRequest, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerOperation, SessionConsumerRequest,
+    SessionConsumerFencedTransitionStatus, SessionConsumerLeaseMutationOperation,
+    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
+    SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerRequest,
     SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope, SessionKey,
-    SessionKeyType, StateClass, StateType, StoredSessionRecord,
+    SessionKeyType, StateClass, StateType, StoreError, StoredSessionRecord,
 };
 use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
@@ -125,6 +127,10 @@ const STATELESS_CONSUMER_LEADER_RECOVERY_TIMEOUT: Duration = Duration::from_mill
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis,
 );
 const CHILD_TIMEOUT: Duration = Duration::from_millis(QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
+/// This is intentionally shorter than the qualification child's fixed
+/// post-commit response delay. It exercises the real response deadline rather
+/// than creating a synthetic application outcome.
+const DELAYED_CONSUMER_CLIENT_DEADLINE: Duration = Duration::from_millis(250);
 const CANARY_TTL_MILLIS: u64 = 60 * 60 * 1_000;
 const CANARY_STABLE_ID: &str = "rotation-core-canary";
 const CANARY_LEASE_HANDLE: &str = "rotation-core-lease";
@@ -2648,13 +2654,13 @@ impl Fleet {
         }
     }
 
-    fn arm_stateless_consumer_outcome_unknown(&mut self, node_index: usize) {
+    fn arm_stateless_consumer_delayed_response(&mut self, node_index: usize) {
         match self.nodes[node_index]
-            .invoke(&QualificationNodeCommand::ArmStatelessConsumerOutcomeUnknown)
+            .invoke(&QualificationNodeCommand::ArmStatelessConsumerDelayedResponse)
         {
-            QualificationNodeReply::StatelessConsumerOutcomeUnknownArmed => {}
+            QualificationNodeReply::StatelessConsumerDelayedResponseArmed => {}
             reply => panic!(
-                "stateless consumer outcome-unknown simulation did not arm: node={node_index}, reply={reply:?}, stderr={}",
+                "stateless consumer delayed-response simulation did not arm: node={node_index}, reply={reply:?}, stderr={}",
                 self.node_stderr(node_index)
             ),
         }
@@ -8257,6 +8263,16 @@ impl QualificationConsumerClient {
         }
     }
 
+    async fn lease_mutation_status(
+        &self,
+        request: &SessionConsumerLeaseMutationRequest,
+    ) -> Result<SessionConsumerLeaseMutationStatus, StoreError> {
+        match self {
+            Self::Stateless(client) => client.lease_mutation_status(request).await,
+            Self::Persistent(client) => client.lease_mutation_status(request).await,
+        }
+    }
+
     async fn prewarm(&self) -> Result<bool, SessionConsumerClientError> {
         match self {
             Self::Stateless(_) => Ok(true),
@@ -8975,37 +8991,150 @@ fn run_consumer_multiprocess_qualification(
         );
         thread::sleep(Duration::from_millis(50));
     }
-    let (healthy_node_index, healthy_client) = clients
+    let survivor_reports = fleet.readiness_reports(&voter_survivors);
+    let current_leader = survivor_reports
         .iter()
-        .enumerate()
-        .find(|(index, _)| index % member_count != voter_loss_node)
-        .map(|(index, client)| (index % member_count, client))
-        .expect("consumer client on a live voter endpoint");
-    fleet.arm_stateless_consumer_outcome_unknown(healthy_node_index);
+        .find_map(|report| {
+            report
+                .leader_id
+                .filter(|leader| *leader == report.node_id)
+                .map(|_| report.node_index)
+        })
+        .expect("leader after voter loss");
+    let follower_node_index = survivor_reports
+        .iter()
+        .find(|report| report.node_index != current_leader)
+        .map(|report| {
+            assert_eq!(
+                report.leader_id,
+                Some(
+                    survivor_reports
+                        .iter()
+                        .find(|candidate| candidate.node_index == current_leader)
+                        .expect("current leader report")
+                        .node_id
+                )
+            );
+            report.node_index
+        })
+        .expect("live follower after voter loss");
+    let before_delayed_log_index = survivor_reports[0]
+        .applied_index
+        .expect("stable applied index before delayed acquire");
+    assert!(survivor_reports.iter().all(|report| {
+        report.committed_index == Some(before_delayed_log_index)
+            && report.applied_index == Some(before_delayed_log_index)
+    }));
+    let healthy_client = &clients[follower_node_index];
+    let (delayed_identity_source, delayed_identity_receiver) = watch::channel(Some(
+        fleet
+            .pki
+            .consumer_identity_state(&consumer_identities[follower_node_index]),
+    ));
+    let delayed_tls = TlsConfigBuilder::new(delayed_identity_receiver)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("delayed-response consumer mTLS configuration");
+    let delayed_stateless = StatelessSessionConsumerClient::new(
+        endpoints[follower_node_index],
+        rustls_pki_types::ServerName::IpAddress(endpoints[follower_node_index].ip().into()),
+        SpiffeId::new(spiffe_id(follower_node_index)).expect("follower consumer server identity"),
+        scope,
+        delayed_tls,
+    )
+    .with_operation_timeout(DELAYED_CONSUMER_CLIENT_DEADLINE);
+    let delayed_client = match mode {
+        ConsumerQualificationMode::Stateless => {
+            QualificationConsumerClient::Stateless(Box::new(delayed_stateless))
+        }
+        ConsumerQualificationMode::Persistent => QualificationConsumerClient::Persistent(
+            PersistentSessionConsumerClient::try_from_stateless(
+                delayed_stateless,
+                PersistentSessionConsumerConfig::default(),
+            )
+            .expect("bounded delayed persistent consumer configuration"),
+        ),
+    };
+    fleet.arm_stateless_consumer_delayed_response(follower_node_index);
     let ambiguous_request_id = SessionConsumerRequestId::from_bytes([0x52; 16]);
     let ambiguous_key = stateless_consumer_key(1);
     let ambiguous_owner =
         OwnerId::new("qualification-ambiguous-owner").expect("ambiguous consumer owner");
+    let ambiguous_ttl = Duration::from_secs(30);
     assert!(matches!(
-        runtime.block_on(healthy_client.acquire_with_id(
+        runtime.block_on(delayed_client.acquire_with_id(
             ambiguous_request_id,
             ambiguous_key.clone(),
             ambiguous_owner.clone(),
-            Duration::from_secs(30),
+            ambiguous_ttl,
         )),
         Err(SessionConsumerLeaseMutationError::OutcomeUnknown { request_id }) if request_id == ambiguous_request_id
     ));
-    assert!(
-        runtime
-            .block_on(healthy_client.acquire_with_id(
-                ambiguous_request_id,
-                ambiguous_key,
-                ambiguous_owner,
-                Duration::from_secs(30),
-            ))
-            .is_ok(),
-        "only the caller's retained request ID may recover a durable ambiguous mutation"
+    drop(delayed_client);
+    let retained = SessionConsumerLeaseMutationRequest::new(
+        ambiguous_request_id,
+        SessionConsumerLeaseMutationOperation::Acquire {
+            key: ambiguous_key.clone(),
+            owner: ambiguous_owner.clone(),
+            ttl: ambiguous_ttl,
+        },
     );
+    let status_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    let recovered = loop {
+        match runtime.block_on(healthy_client.lease_mutation_status(&retained)) {
+            Ok(SessionConsumerLeaseMutationStatus::Recorded(result)) => match *result {
+                Ok(SessionConsumerLeaseMutationResult::Acquire(guard)) => break guard,
+                _ => panic!("lease receipt returned an unexpected recorded result"),
+            },
+            // Receipt absence and transport unavailability are both
+            // deliberately ambiguous after an outcome-unknown mutation. A
+            // bounded status-only retry can reconcile them; it never submits
+            // a second mutation.
+            Ok(SessionConsumerLeaseMutationStatus::NotFound) | Err(_) => {
+                assert!(
+                    Instant::now() < status_deadline,
+                    "read-only receipt did not converge after the delayed acquire"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            _ => panic!("lease receipt recovery returned an unexpected status"),
+        }
+    };
+    assert_eq!(recovered.key(), &ambiguous_key);
+    assert_eq!(recovered.owner(), &ambiguous_owner);
+    assert!(
+        recovered.expires_at() > recovered.acquired_at(),
+        "receipt recovery returns the persisted guard, not a fresh acquisition"
+    );
+    assert_eq!(
+        runtime.block_on(healthy_client.lease_mutation_status(&retained)),
+        Ok(SessionConsumerLeaseMutationStatus::Recorded(Box::new(Ok(
+            SessionConsumerLeaseMutationResult::Acquire(recovered.clone())
+        )))),
+        "a second read-only status lookup must preserve the exact guard, TTL, fence, and credential"
+    );
+    // An ordinary retained consumer mutation has exactly two consensus
+    // entries: its body-binding marker and the inner Acquire. The status
+    // barrier/read never proposes an entry, so this exact delta proves one
+    // Acquire and no replay or status-induced logical-time/fence/TTL change.
+    const DELAYED_ACQUIRE_CONSENSUS_ENTRIES: u64 = 2;
+    let delayed_settlement_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    loop {
+        let reports = fleet.readiness_reports(&voter_survivors);
+        if reports.iter().all(|report| {
+            report.committed_index
+                == Some(before_delayed_log_index + DELAYED_ACQUIRE_CONSENSUS_ENTRIES)
+                && report.applied_index
+                    == Some(before_delayed_log_index + DELAYED_ACQUIRE_CONSENSUS_ENTRIES)
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < delayed_settlement_deadline,
+            "the delayed acquire must consume only its binding and one Acquire log position"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     assert!(runtime.block_on(healthy_client.capabilities()).is_ok());
 
     let voter_ids_before = before_fault
@@ -9030,6 +9159,7 @@ fn run_consumer_multiprocess_qualification(
         });
     }
     drop(replacement_identity_source);
+    drop(delayed_identity_source);
     drop(identity_sources);
     fleet.shutdown();
     persistent_measurements

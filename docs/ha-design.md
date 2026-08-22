@@ -440,17 +440,18 @@ least-authority surface required by #649, #688, and #691; it is neither hidden,
 deprecated, nor test-only. `PersistentSessionConsumerClient` remains the
 required warm fixed-pool primitive for #695/ePDG latency, so production
 deployments requiring warm reuse should use it. It retains the
-`opc-session-consumer/1` ALPN and now uses exact consumer transport revision 3.
+`opc-session-consumer/1` ALPN and now uses exact consumer transport revision 4.
 There is no fallback, dual mode, or
 mixed-revision path: clients and listeners must be drained and cut over
-coordinately. Revision-3 private JSON DTO bytes are canonical; reordered or
+coordinately. Revision-4 private JSON DTO bytes are canonical; reordered or
 otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
 closed. This boundary remains separate from consensus and the quarantined
 legacy backend protocol; it exposes no `RemoteSessionBackend`, consensus,
-replication, snapshot, rebuild, membership, or admin API. Revision 3 includes
-only #696's generic one-record atomic fenced-transition capability,
-observation, execution, and exact status; it does not include product
-composition or ePDG-specific semantics.
+replication, snapshot, rebuild, membership, or admin API. Revision 4 retains
+#696's generic one-record atomic fenced-transition capability, observation,
+execution, and exact status, and adds exact retained status recovery for
+ordinary acquire, renew, and release; it does not include product composition
+or ePDG-specific semantics.
 
 Before V1 is activated for the exact current consensus voter scope, capability,
 observation, status, and first-transition admission require fresh authenticated
@@ -489,7 +490,7 @@ revoked predecessor cannot observe the receipt. There is no separate
 `BindConsumerRequest` or log entry. `FencedTransitionStorageExhausted` is a
 retained, body-bound deterministic no-effect result after ordinary
 stale-fence/CAS/lease admission;
-consumer revision 3 carries it as a closed `StorageExhausted` error inside
+consumer revision 4 carries it as a closed `StorageExhausted` error inside
 `Recorded` status. Frozen legacy session-net v5 maps it fail-closed as an
 unknown capability without changing its wire enum.
 
@@ -545,8 +546,9 @@ is leased; isolated watch slots are non-gating. Performance evidence is
 synthetic only and makes no ePDG production-SLO claim. Its warm accept/reuse
 checks gate only the synthetic transport method; elapsed samples are
 non-gating. The revision-2 persistent-consumer qualification contract is v7;
-the published v6 profile remains the unchanged revision-1 contract. Revision 3
-retains that bounded transport and adds exact-head atomic-transition evidence.
+the published v6 profile remains the unchanged revision-1 contract. Revision 4
+retains that bounded transport and the revision-3 atomic-transition evidence,
+then adds exact retained status recovery for ordinary leases.
 
 ### Legacy backend and restore transport (protocol v5)
 
