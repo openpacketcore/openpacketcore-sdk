@@ -9712,11 +9712,16 @@ impl PersistentSessionConsumerClient {
         let v2_pool = Arc::new(PersistentSessionConsumerV2Pool {
             client: pool.client.clone(),
             config,
-            // V1 and V2 share one aggregate lane/pending admission budget;
-            // their idle pools remain ALPN-specific.
-            lanes: Arc::clone(&pool.lanes),
+            // V2 retains its own fixed logical admission budget. Its actor
+            // and physical caps remain separately bounded below.
+            lanes: Arc::new(Semaphore::new(config.request_connections)),
             actor_lanes: Arc::new(Semaphore::new(config.request_connections)),
-            pending: Arc::clone(&pool.pending),
+            // Includes active V2 lane owners, independently of V1's queue.
+            pending: Arc::new(Semaphore::new(
+                config
+                    .request_connections
+                    .saturating_add(config.pending_calls),
+            )),
             prewarm: Arc::new(Semaphore::new(1)),
             idle: StdMutex::new(VecDeque::with_capacity(config.request_connections)),
             shutdown: AtomicBool::new(false),
@@ -17459,6 +17464,54 @@ mod tests {
         })
     }
 
+    fn independent_pool_admission_test_client() -> (
+        PersistentSessionConsumerClient,
+        PersistentSessionConsumerConfig,
+    ) {
+        let config = PersistentSessionConsumerConfig::try_new(
+            2,
+            3,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+            Duration::ZERO,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+        )
+        .expect("independent fixed-pool test config");
+        let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        (
+            PersistentSessionConsumerClient::try_from_stateless(stateless, config)
+                .expect("valid independent fixed-pool client"),
+            config,
+        )
+    }
+
+    fn seed_v2_idle_lanes(
+        client: &PersistentSessionConsumerClient,
+        receivers: &mut Vec<mpsc::Receiver<PersistentV2LaneCall>>,
+    ) {
+        let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut idle = client
+            .v2_pool
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for _ in 0..client.v2_pool.config.request_connections {
+            let (commands, receiver) = mpsc::channel(1);
+            let (retirement, _retirement_rx) = watch::channel(None);
+            receivers.push(receiver);
+            idle.push_back(PersistentV2PoolEntry::Lane(PersistentV2Connection {
+                commands,
+                idle_deadline,
+                retirement,
+                admitted_generation: client.v2_pool.client.reauthentication.generation(),
+                admitted_material_epoch: client.v2_pool.client.tls_config.material_status().epoch(),
+                state: PersistentV2LaneState::new(),
+            }));
+        }
+    }
+
     async fn persistent_v2_idle_declared_frame_requests(declared: u32) -> Vec<usize> {
         let config = PersistentSessionConsumerConfig::try_new(
             1,
@@ -17589,6 +17642,168 @@ mod tests {
         ));
         assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_v1_logical_admission_does_not_block_v2_admission_prewarm_or_readiness() {
+        let (client, config) = independent_pool_admission_test_client();
+        let mut v2_receivers = Vec::new();
+        seed_v2_idle_lanes(&client, &mut v2_receivers);
+        let v1_lanes = (0..config.request_connections)
+            .map(|_| {
+                Arc::clone(&client.pool.lanes)
+                    .try_acquire_owned()
+                    .expect("hold every V1 logical lane")
+            })
+            .collect::<Vec<_>>();
+        let v1_pending = (0..config
+            .request_connections
+            .saturating_add(config.pending_calls))
+            .map(|_| {
+                Arc::clone(&client.pool.pending)
+                    .try_acquire_owned()
+                    .expect("fill every V1 pending admission")
+            })
+            .collect::<Vec<_>>();
+
+        let started = tokio::time::Instant::now();
+        let v2_admission = client
+            .v2_pool
+            .admit_call(started, started + Duration::from_secs(1))
+            .await
+            .expect("V2 admission remains independent from a full V1 pool");
+        drop(v2_admission);
+        client
+            .prewarm_v2()
+            .await
+            .expect("V2 prewarm remains independent from a full V1 pool");
+        assert!(
+            client.v2_readiness().await.ready,
+            "V2 readiness remains true with all V2 fixed lanes idle"
+        );
+
+        drop((v1_pending, v1_lanes, v2_receivers));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_v2_logical_admission_does_not_block_v1_admission() {
+        let (client, config) = independent_pool_admission_test_client();
+        let v2_lanes = (0..config.request_connections)
+            .map(|_| {
+                Arc::clone(&client.v2_pool.lanes)
+                    .try_acquire_owned()
+                    .expect("hold every V2 logical lane")
+            })
+            .collect::<Vec<_>>();
+        let v2_pending = (0..config
+            .request_connections
+            .saturating_add(config.pending_calls))
+            .map(|_| {
+                Arc::clone(&client.v2_pool.pending)
+                    .try_acquire_owned()
+                    .expect("fill every V2 pending admission")
+            })
+            .collect::<Vec<_>>();
+
+        let started = tokio::time::Instant::now();
+        let v1_admission = client
+            .pool
+            .admit_call(started, started + Duration::from_secs(1))
+            .await
+            .expect("V1 admission remains independent from a full V2 pool");
+        drop(v1_admission);
+        drop((v2_pending, v2_lanes));
+    }
+
+    #[test]
+    fn persistent_v1_v2_pools_have_distinct_exact_logical_and_physical_caps() {
+        let (client, config) = independent_pool_admission_test_client();
+        assert!(
+            !Arc::ptr_eq(&client.pool.lanes, &client.v2_pool.lanes)
+                && !Arc::ptr_eq(&client.pool.pending, &client.v2_pool.pending),
+            "V1 and V2 must not share logical admission semaphores"
+        );
+
+        let v1_lanes = (0..config.request_connections)
+            .map(|_| Arc::clone(&client.pool.lanes).try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        assert!(Arc::clone(&client.pool.lanes).try_acquire_owned().is_err());
+        let v2_lanes = (0..config.request_connections)
+            .map(|_| {
+                Arc::clone(&client.v2_pool.lanes)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(Arc::clone(&client.v2_pool.lanes)
+            .try_acquire_owned()
+            .is_err());
+
+        let pending_limit = config
+            .request_connections
+            .saturating_add(config.pending_calls);
+        let v1_pending = (0..pending_limit)
+            .map(|_| {
+                Arc::clone(&client.pool.pending)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(Arc::clone(&client.pool.pending)
+            .try_acquire_owned()
+            .is_err());
+        let v2_pending = (0..pending_limit)
+            .map(|_| {
+                Arc::clone(&client.v2_pool.pending)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(Arc::clone(&client.v2_pool.pending)
+            .try_acquire_owned()
+            .is_err());
+
+        let v1_physical = (0..MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS)
+            .map(|_| {
+                client
+                    .pool
+                    .client
+                    .physical_admission
+                    .try_acquire_v1()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(client
+            .pool
+            .client
+            .physical_admission
+            .try_acquire_v1()
+            .is_err());
+        let v2_physical = (0..MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS)
+            .map(|_| {
+                client
+                    .pool
+                    .client
+                    .physical_admission
+                    .try_acquire_v2()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(client
+            .pool
+            .client
+            .physical_admission
+            .try_acquire_v2()
+            .is_err());
+
+        drop((
+            v1_lanes,
+            v2_lanes,
+            v1_pending,
+            v2_pending,
+            v1_physical,
+            v2_physical,
+        ));
     }
 
     #[tokio::test(start_paused = true)]
