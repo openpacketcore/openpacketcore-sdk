@@ -1614,16 +1614,17 @@ umbrella until that fleet evidence passes.
 application-consumer boundary. They MUST use mutual TLS and the dedicated
 `opc-session-consumer/1` ALPN with transport revision 3 for the existing V1
 operation family. The additive V2 fenced-transition family MUST use only the
-distinct `opc-session-consumer/2` ALPN with transport revision 4. These are
+distinct `opc-session-consumer/2` ALPN with transport revision 5. These are
 separate exact protocols from both `opc-session-consensus/2` and the
 quarantined `opc-session-net/5` compatibility protocol. A V2 client MUST NOT
 fall back to V1, and a lane authenticated for either ALPN MUST NOT carry or be
 reused for the other's Hello or request envelope. A listener MAY offer both
 exact ALPNs, but only as independently authenticated, independently decoded
 lanes; it MUST NOT negotiate a common revision or treat either as equivalent
-consumer authority. A V1-only peer therefore fails before V2 dispatch.
+consumer authority. The server MUST reject every V2 revision other than 5
+before dispatch; a V1-only peer therefore also fails before V2 dispatch.
 
-Deployment MUST provision revision-4 listener support, V2-capable store
+Deployment MUST provision revision-5 listener support, V2-capable store
 authority, and the required protected-wrapper V2 journal before enabling an
 explicit V2 client call. V1 traffic may continue on its revision-3 ALPN while
 V2 is introduced or drained, but that coexistence is not fallback, dual-mode
@@ -1721,7 +1722,7 @@ pending call may wait or age for at most 250 ms. Watches use two separate slots
 by default (at most 16 when configured), never consuming request-pool capacity.
 
 `PersistentSessionConsumerClient` has separate fixed V2 lanes of the same
-configured request width. `prewarm_v2` establishes revision-4 lanes without
+configured request width. `prewarm_v2` establishes revision-5 lanes without
 dispatching an operation, `execute_v2` dispatches only on a V2 lane, and
 `v2_diagnostics` reports only V2 redaction-safe pool state. V1 and V2 queues,
 sockets, and authenticated Hello exchanges are never cross-reused. Their

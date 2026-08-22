@@ -504,7 +504,7 @@ This is a distinct protocol contract from the protected V2 composition in
 That #701 composition remains a local SDK promise over an inner physical V1
 contract: its `fenced_transition` uncertainty path recovers the SDK-journal
 token. This #702 protocol has its own 56-byte V2 identity, epoch lifecycle,
-receipt capacity, maintenance, and revision-4 consumer lane; its
+receipt capacity, maintenance, and revision-5 consumer lane; its
 `fenced_transition_v2` uncertainty path uses that exact V2 ID and canonical
 body. Neither contract reinterprets, upgrades, routes, or otherwise replaces
 the other.
@@ -523,11 +523,20 @@ digest; the digest covers the schema, full identity layout, canonical
 body-commitment domain, active-epoch limit, operational target, and reclaim
 batch. The fixed profile digest is published by
 `fenced_transition_v2_profile_digest()` and is exactly
-`bf2210e09a84b417b7270646821b87a73d1a87503821fc44922db22e04879d15`.
+`8a0b70b54654c7250cf5469db6e1e545f35e38e9778d5f500fea670696c4bdc3`.
 Before activation, every voter in the exact current voter set,
 including a prospective joining voter when it participates in the cutover,
 MUST reply to the V2 probe with that exact profile digest. A quorum, a V1
 reply, a capability bit, or a V2 reply with another profile is not evidence.
+
+V2 retains exactly one writable epoch plus at most seven closed, exactly
+replayable epochs. Its ceiling is therefore 1,048,576 V2 receipt bindings and
+18,469,617,664 semantic bytes. V1's permanent 4,096-binding ledger remains
+separate and absorbing, so the combined V1+V2 ceiling is 1,052,672 bindings
+and 18,541,535,232 semantic bytes. At the retained-epoch ceiling, reclamation
+advances only the retired floor and removes the oldest closed replay epoch in
+fixed batches after that epoch's final retention deadline; the active epoch
+remains writable throughout reclamation.
 
 The first V2 transition for a scope is one replicated activating command. It
 atomically installs the V2 database format (format 3), the exact-scope
@@ -586,14 +595,14 @@ available only at the local state-process operator boundary under durable
 fixed-quorum authority. The operator entry point is local-leader-only and is
 not forwarded through the ordinary application surface; an operator loop MUST
 resolve the current leader again after a term change and before each batch. It
-is eligible only after the maximum retained deadline of the active epoch. The
-first command atomically clears the active epoch, advances the irreversible
-retired floor, and then deletes the first ordered, fixed 1,024-row batch. Every
-command is compare-and-set against the observed lifecycle generation and
-epoch/floor state. Subsequent commands delete one ordered batch; the final
-batch atomically creates `retired_floor + 1` as the only active epoch. The
-floor is included in recovery and snapshots, so physical row deletion cannot
-reopen an identity.
+is eligible only after the maximum retained deadline of the oldest closed
+replay epoch. The first command atomically advances the irreversible retired
+floor and deletes the first ordered, fixed 1,024-row batch while preserving
+the sole active epoch as writable. Every command is compare-and-set against the
+observed lifecycle generation and epoch/floor state. Subsequent commands
+delete one ordered batch; the final batch completes physical deletion without
+changing the active epoch. The floor is included in recovery and snapshots, so
+physical row deletion cannot reopen an identity.
 
 A maintenance transport failure is ambiguous: its lifecycle CAS may already
 have committed even though the caller did not receive the reply. The operator
@@ -653,7 +662,7 @@ intent, continue writes under an uncertain lease, or derive a next mutation
 until they have an authoritative observation.
 A post-retention history must likewise be re-derived from current authoritative
 state under a fresh ID; the old transition is never revived. The distinct V2
-consumer ALPN uses wire revision 4 and preserves every V2 status distinction,
+consumer ALPN uses wire revision 5 and preserves every V2 status distinction,
 including `EpochNotActive` and
 `StorageExhausted` inside `Recorded`, through a closed wire-safe enum. Frozen
 legacy session-net v5 maps this result fail-closed as an unknown capability; no
@@ -720,7 +729,7 @@ is V1-only: it carries V1 capability, observation, execution, ambiguity, and
 exact-status semantics over both the one-shot and bounded persistent
 least-authority mTLS clients published by #695. Its public transition ID is
 the frozen 16-byte V1 ID. V2 does not extend that wire shape: it uses the
-separate ALPN `/2` revision-4 lane documented above, including V2's full
+separate ALPN `/2` revision-5 lane documented above, including V2's full
 56-byte identity and V2-specific status set. Neither lane exposes a generic
 backend, replication, membership, snapshot, rebuild, or administrative
 authority. Product/ePDG composition and workflow semantics remain outside this

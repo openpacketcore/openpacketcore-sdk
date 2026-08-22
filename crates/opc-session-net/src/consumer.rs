@@ -77,6 +77,8 @@ pub const SESSION_QUORUM_CONSUMER_V2_ALPN: &[u8] = b"opc-session-consumer/2";
 pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 3;
 
 /// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_V2_ALPN`].
+///
+/// The V2 server rejects every other Hello revision before dispatch.
 pub const SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION: u16 = 5;
 
 /// Maximum sequential application requests processed on one consumer
@@ -689,7 +691,7 @@ pub enum PersistentSessionConsumerConfigError {
 ///
 /// Fields are private so a pool cannot be constructed with an unbounded task,
 /// queue, or connection cardinality. A pending-call count of zero deliberately
-/// selects fail-fast admission. Revision 3 and revision 4 each receive this
+/// selects fail-fast admission. Revision 3 and revision 5 each receive this
 /// fixed request width (at most 16) and their own bounded pending queue; their
 /// sockets and physical admission ceilings remain ALPN-isolated.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1626,7 +1628,7 @@ enum ConsumerWireResponse {
     WatchEntry(ConsumerWatchEntry),
 }
 
-/// Revision-4-only call envelope. It intentionally has no V1 operation or
+/// Revision-5-only call envelope. It intentionally has no V1 operation or
 /// response member, so a V2 frame cannot be decoded as a V1 call frame.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1666,7 +1668,7 @@ fn v2_attempt_nonce() -> Result<[u8; 16], rand::rngs::SysError> {
     Ok(nonce)
 }
 
-/// Private wire family admitted only after the V2 ALPN and exact revision-4
+/// Private wire family admitted only after the V2 ALPN and exact revision-5
 /// handshake. Keeping it as a separate enum freezes revision 3's postcard
 /// and JSON discriminator ordering.
 #[derive(Serialize, Deserialize)]
@@ -2893,7 +2895,7 @@ fn consumer_client_tls_config_for_alpn(
 fn consumer_server_tls_config(config: Arc<opc_tls::ServerConfig>) -> Arc<opc_tls::ServerConfig> {
     let mut config = config.as_ref().clone();
     // The client's one-element ALPN offer selects exactly one lane. Keeping
-    // both names here lets one listener serve V1/revision 3 and V2/revision 4
+    // both names here lets one listener serve V1/revision 3 and V2/revision 5
     // without falling back across their semantic boundary.
     config.alpn_protocols = vec![
         SESSION_QUORUM_CONSUMER_V2_ALPN.to_vec(),
@@ -4611,7 +4613,7 @@ impl StatelessSessionConsumerClient {
             .map_err(SessionConsumerCallError::into_client_error)
     }
 
-    /// Execute one explicit revision-4 V2 consumer request.
+    /// Execute one explicit revision-5 V2 consumer request.
     ///
     /// This deliberately opens a fresh V2-ALPN connection. Persistent V1
     /// lanes are never reused, so a caller cannot accidentally send a V2
@@ -6218,7 +6220,7 @@ struct PersistentConsumerCounters {
     deadline: AtomicU64,
 }
 
-/// Redaction-safe revision-4 lane counters.  They are deliberately separate
+/// Redaction-safe revision-5 lane counters.  They are deliberately separate
 /// from the revision-3 pool: a V2 outage must not consume V1's finite queue.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct PersistentSessionConsumerV2Diagnostics {
@@ -9414,14 +9416,14 @@ impl PersistentSessionConsumerClient {
         Ok(generation)
     }
 
-    /// Establish the independent fixed revision-4 pool without dispatching a
+    /// Establish the independent fixed revision-5 pool without dispatching a
     /// V2 operation. V1 and V2 retain separate queues and sockets while
     /// sharing the stateless client's bounded physical connection admission.
     pub async fn prewarm_v2(&self) -> Result<(), SessionConsumerClientError> {
         self.v2_pool.prewarm().await
     }
 
-    /// Execute one revision-4 request on a dedicated bounded V2 lane.
+    /// Execute one revision-5 request on a dedicated bounded V2 lane.
     ///
     /// A post-write transport loss reports the complete caller-retained V2
     /// ID as `OutcomeUnknown`; callers recover through V2 status rather than
@@ -9439,7 +9441,7 @@ impl PersistentSessionConsumerClient {
     }
 
     /// Return a conservative authenticated-idle-capacity snapshot for the
-    /// independent revision-4 pool.
+    /// independent revision-5 pool.
     pub async fn v2_readiness(&self) -> PersistentSessionConsumerReadiness {
         self.v2_pool.readiness()
     }
@@ -10947,8 +10949,8 @@ where
     .await
 }
 
-/// Serve the deliberately narrow revision-4 lane after mTLS selected its
-/// dedicated ALPN. No V1 DTO is decoded on this path, and a revision-4
+/// Serve the deliberately narrow revision-5 lane after mTLS selected its
+/// dedicated ALPN. No V1 DTO is decoded on this path, and a revision-5
 /// decoder cannot emit V1 responses or watch frames.
 struct ConsumerV2ServerConnectionContext {
     service: Arc<dyn SessionQuorumConsumer>,
