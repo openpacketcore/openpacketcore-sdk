@@ -257,6 +257,36 @@ impl FencedMutationRosterMemberAttestationVerifier for ManagedProviderAdapterVer
     }
 }
 
+#[derive(Clone)]
+struct CountingManagedProviderAdapterVerifier {
+    calls: Arc<AtomicUsize>,
+}
+
+impl CountingManagedProviderAdapterVerifier {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl FencedMutationRosterMemberAttestationVerifier for CountingManagedProviderAdapterVerifier {
+    async fn verify_member_attestation(
+        &self,
+        _identity: &SessionConsumerIdentity,
+        context: &FencedMutationRosterMemberExecutionContext<'_>,
+        attestation: &FencedMutationRosterMemberAttestation,
+    ) -> Result<FencedMutationRosterProviderOutcome, FencedMutationRosterMemberAttestationError>
+    {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        attestation
+            .validate_for(context)
+            .map_err(|_| FencedMutationRosterMemberAttestationError::Rejected)?;
+        Ok(attestation.outcome())
+    }
+}
+
 fn managed_provider_adapter_admission(
     operation_byte: u8,
     member_count: usize,
@@ -497,6 +527,35 @@ fn assert_no_provider_io(provider: &ManagedProviderAdapterDouble) {
     assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
     assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
     assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+}
+
+fn provider_io_counts(provider: &ManagedProviderAdapterDouble) -> (usize, usize, usize) {
+    (
+        provider.execute_calls.load(Ordering::SeqCst),
+        provider.status_calls.load(Ordering::SeqCst),
+        provider.adopt_calls.load(Ordering::SeqCst),
+    )
+}
+
+fn closed_voter_database_bytes(cluster: &TestCluster) -> BTreeMap<usize, Vec<u8>> {
+    assert!(
+        cluster.stores.is_empty() && cluster._backends.is_empty(),
+        "durable voter bytes require every store handle to be closed"
+    );
+    (0..MEMBER_COUNT)
+        .map(|index| {
+            (
+                index,
+                std::fs::read(
+                    cluster
+                        ._directory
+                        .path()
+                        .join(format!("node-{index}.sqlite")),
+                )
+                .expect("read closed voter database bytes"),
+            )
+        })
+        .collect()
 }
 
 fn assert_no_managed_provider_rows(
@@ -1137,115 +1196,6 @@ impl TestCluster {
             .await
             .expect("fresh cluster reaches durable readiness");
         cluster
-    }
-
-    /// Reopen every voter from the same closed file-backed fleet. This stays
-    /// on the production OpenRaft/store construction path; it only rebuilds
-    /// the in-process authenticated loopback transport used by this test
-    /// harness.
-    async fn reopen(
-        directory: TempDir,
-        operation_timeout: Duration,
-    ) -> Result<Self, opc_session_store::ConsensusSessionStoreOpenError> {
-        let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
-        let identity = consensus_identity(&members);
-        let topologies = (0..MEMBER_COUNT)
-            .map(|index| {
-                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
-                    replica_id(index),
-                    members.clone(),
-                    identity,
-                ))
-                .expect("validate reopened consensus topology")
-            })
-            .collect::<Vec<_>>();
-        let test_permit = Self::acquire_test_permit().await;
-        let backends = (0..MEMBER_COUNT)
-            .map(|index| {
-                SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
-                    .expect("reopen file-backed SQLite node")
-            })
-            .collect::<Vec<_>>();
-        let node_ids = topologies
-            .iter()
-            .map(|topology| {
-                topology
-                    .local_consensus_node_id()
-                    .expect("reopened consensus node ID")
-            })
-            .collect::<Vec<_>>();
-        let mut paths = BTreeMap::new();
-        for source in 0..MEMBER_COUNT {
-            for (target, node_id) in node_ids.iter().copied().enumerate() {
-                if source != target {
-                    paths.insert(
-                        (source, target),
-                        Arc::new(LoopbackPeer::new(node_id, identity)),
-                    );
-                }
-            }
-        }
-        let mut stores = Vec::with_capacity(MEMBER_COUNT);
-        for index in 0..MEMBER_COUNT {
-            let peers = (0..MEMBER_COUNT)
-                .filter(|target| *target != index)
-                .map(|target| {
-                    let peer: Arc<dyn SessionConsensusPeer> = paths
-                        .get(&(index, target))
-                        .expect("reopened loopback path")
-                        .clone();
-                    (node_ids[target], peer)
-                })
-                .collect::<BTreeMap<_, _>>();
-            stores.push(
-                ConsensusSessionStore::open_with_clock(
-                    topologies[index].clone(),
-                    backends[index].clone(),
-                    directory.path().join(format!("snapshots-{index}")),
-                    peers,
-                    Arc::new(SystemClock),
-                    operation_timeout,
-                )
-                .await?,
-            );
-        }
-        let cluster = Self {
-            paths,
-            stores,
-            _backends: backends,
-            _directory: directory,
-            _test_permit: test_permit,
-        };
-        for ((_, target), path) in &cluster.paths {
-            path.install(cluster.stores[*target].rpc_handler());
-        }
-        let initialize = cluster
-            .stores
-            .iter()
-            .map(ConsensusSessionStore::initialize_cluster)
-            .collect::<Vec<_>>();
-        for result in futures_util::future::join_all(initialize).await {
-            result?;
-        }
-        cluster
-            .wait_all_ready(CLUSTER_START_TIMEOUT)
-            .await
-            .map_err(|_| opc_session_store::ConsensusSessionStoreOpenError::RecoveryRequired)?;
-        Ok(cluster)
-    }
-
-    /// Drop all stores, backends, and loopback handler references before a
-    /// raw SQLite corruption fixture opens the persistent files.
-    fn close_into_directory(mut self) -> TempDir {
-        for path in self.paths.values() {
-            path.clear_handler();
-        }
-        self.stores.clear();
-        self._backends.clear();
-        std::mem::replace(
-            &mut self._directory,
-            tempfile::tempdir().expect("replacement fleet directory"),
-        )
     }
 
     async fn wait_all_ready(&self, deadline: Duration) -> Result<(), ()> {
@@ -6664,6 +6614,7 @@ async fn reopened_format_eight_managed_terminal_phase_bindings_fail_closed() {
                 ManagedProviderAdapterDouble::compensated()
             }
         };
+        let verifier = CountingManagedProviderAdapterVerifier::new();
         let ordinal = FencedMutationRosterOrdinal::new(0).expect("only ordinal");
         let terminal = cluster.stores[leader]
             .managed_provider_job_facade(
@@ -6672,7 +6623,7 @@ async fn reopened_format_eight_managed_terminal_phase_bindings_fail_closed() {
                 [marker.wrapping_add(1); 32],
                 [marker.wrapping_add(2); 32],
                 provider.clone(),
-                ManagedProviderAdapterVerifier,
+                verifier.clone(),
             )
             .expect("construct committed V5 facade")
             .run_member(
@@ -6743,6 +6694,11 @@ async fn reopened_format_eight_managed_terminal_phase_bindings_fail_closed() {
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
                 .expect("checkpoint corrupt closed voter");
         }
+        // A rejected public open is observational only: retain byte-identical
+        // operation, terminal/member, job/receipt, and authority records.
+        let durable_before = closed_voter_database_bytes(&cluster);
+        let provider_before = provider_io_counts(&provider);
+        let verifier_before = verifier.calls.load(Ordering::SeqCst);
 
         let reopened = cluster
             .try_reopen_path_backed_voters_through_production_open()
@@ -6753,6 +6709,21 @@ async fn reopened_format_eight_managed_terminal_phase_bindings_fail_closed() {
                 Err(opc_session_store::ConsensusSessionStoreOpenError::RecoveryRequired)
             ),
             "public production open must reject cross-bound terminal corruption: {reopened:?}"
+        );
+        assert_eq!(
+            closed_voter_database_bytes(&cluster),
+            durable_before,
+            "rejected public reopen preserves every durable V5 proof byte"
+        );
+        assert_eq!(
+            provider_io_counts(&provider),
+            provider_before,
+            "rejected public reopen performs no provider I/O"
+        );
+        assert_eq!(
+            verifier.calls.load(Ordering::SeqCst),
+            verifier_before,
+            "rejected public reopen performs no attestation verifier I/O"
         );
 
         for index in 0..MEMBER_COUNT {
@@ -6945,6 +6916,7 @@ async fn reopened_mixed_managed_v5_terminal_corruption_fails_closed() {
         )
         .await;
         let provider = ManagedProviderAdapterDouble::applied_then_compensated();
+        let verifier = CountingManagedProviderAdapterVerifier::new();
         let facade = cluster.stores[leader]
             .managed_provider_job_facade(
                 scope,
@@ -6952,7 +6924,7 @@ async fn reopened_mixed_managed_v5_terminal_corruption_fails_closed() {
                 [marker.wrapping_add(2); 32],
                 [marker.wrapping_add(3); 32],
                 provider.clone(),
-                ManagedProviderAdapterVerifier,
+                verifier.clone(),
             )
             .expect("construct mixed corruption facade");
         let checkpoint = Box::new([marker.wrapping_add(4)]);
@@ -7013,6 +6985,9 @@ async fn reopened_mixed_managed_v5_terminal_corruption_fails_closed() {
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
                 .expect("checkpoint corrupt voter");
         }
+        let durable_before = closed_voter_database_bytes(&cluster);
+        let provider_before = provider_io_counts(&provider);
+        let verifier_before = verifier.calls.load(Ordering::SeqCst);
         assert!(
             matches!(
                 cluster
@@ -7022,9 +6997,21 @@ async fn reopened_mixed_managed_v5_terminal_corruption_fails_closed() {
             ),
             "public reopen rejects mixed terminal proof corruption"
         );
-        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            closed_voter_database_bytes(&cluster),
+            durable_before,
+            "rejected public reopen preserves every terminal/member/job/receipt/authority byte"
+        );
+        assert_eq!(
+            provider_io_counts(&provider),
+            provider_before,
+            "rejected public reopen performs no provider I/O"
+        );
+        assert_eq!(
+            verifier.calls.load(Ordering::SeqCst),
+            verifier_before,
+            "rejected public reopen performs no attestation verifier I/O"
+        );
     }
 }
 
@@ -7136,7 +7123,7 @@ async fn reopened_persisted_managed_v5_corruption_fails_closed_without_fabricati
     }
 
     for corruption in [Corruption::MissingAuthority, Corruption::MissingOwnedJob] {
-        let cluster =
+        let mut cluster =
             TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
                 .await;
         let (leader, _, _) = cluster.observed_leader();
@@ -7161,6 +7148,7 @@ async fn reopened_persisted_managed_v5_corruption_fails_closed_without_fabricati
         .await;
         let ordinal = FencedMutationRosterOrdinal::new(0).expect("test ordinal");
         let provider = ManagedProviderAdapterDouble::applied();
+        let verifier = CountingManagedProviderAdapterVerifier::new();
         let terminal = cluster.stores[leader]
             .managed_provider_job_facade(
                 scope,
@@ -7168,7 +7156,7 @@ async fn reopened_persisted_managed_v5_corruption_fails_closed_without_fabricati
                 [marker.wrapping_add(2); 32],
                 [marker.wrapping_add(3); 32],
                 provider.clone(),
-                ManagedProviderAdapterVerifier,
+                verifier.clone(),
             )
             .expect("construct committed V5 facade")
             .run_member(
@@ -7186,12 +7174,16 @@ async fn reopened_persisted_managed_v5_corruption_fails_closed_without_fabricati
         // fixture opens an image. The terminal operation is copied verbatim;
         // only one V5 proof component is removed from every voter.
         let request_id = admission.request_id().to_bytes();
-        let directory = cluster.close_into_directory();
+        cluster.close_path_backed_voters();
         let mut terminal_evidence = None;
         for index in 0..MEMBER_COUNT {
-            let connection =
-                rusqlite::Connection::open(directory.path().join(format!("node-{index}.sqlite")))
-                    .expect("open closed voter SQLite image");
+            let connection = rusqlite::Connection::open(
+                cluster
+                    ._directory
+                    .path()
+                    .join(format!("node-{index}.sqlite")),
+            )
+            .expect("open closed voter SQLite image");
             let evidence = connection
                 .query_row(
                     "SELECT phase, terminal_digest, terminal_result_digest \
@@ -7248,60 +7240,88 @@ async fn reopened_persisted_managed_v5_corruption_fails_closed_without_fabricati
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
                 .expect("checkpoint corrupt closed fixture");
         }
+        let durable_before = closed_voter_database_bytes(&cluster);
+        let provider_before = provider_io_counts(&provider);
+        let verifier_before = verifier.calls.load(Ordering::SeqCst);
 
-        let reopened = match corruption {
+        match corruption {
             Corruption::MissingAuthority => {
-                TestCluster::reopen(directory, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
-                    .await
-                    .expect("authority-only damage remains observable through the facade")
+                cluster
+                    .reopen_path_backed_voters_through_production_open()
+                    .await;
+                let (reopened_leader, _, _) = cluster.observed_leader();
+                let reopened_provider = ManagedProviderAdapterDouble::applied();
+                let reopened_verifier = CountingManagedProviderAdapterVerifier::new();
+                let facade = cluster.stores[reopened_leader]
+                    .managed_provider_job_facade(
+                        scope,
+                        worker.clone(),
+                        [marker.wrapping_add(2); 32],
+                        [marker.wrapping_add(3); 32],
+                        reopened_provider.clone(),
+                        reopened_verifier.clone(),
+                    )
+                    .expect("construct public reopened facade");
+                assert_eq!(
+                    facade.job_status(admission.clone(), ordinal).await,
+                    Err(ManagedProviderJobError::Unavailable),
+                    "partial V5 evidence must fail closed through the public facade"
+                );
+                assert_eq!(
+                    facade
+                        .run_member(
+                            admission.clone(),
+                            Box::new([marker.wrapping_add(4)]),
+                            ordinal
+                        )
+                        .await,
+                    Err(ManagedProviderJobError::Unavailable),
+                    "a damaged V5 terminal must not be reconstructed or executed"
+                );
+                assert_no_provider_io(&reopened_provider);
+                assert_eq!(
+                    reopened_verifier.calls.load(Ordering::SeqCst),
+                    0,
+                    "public facade rejection performs no attestation verifier I/O"
+                );
+                cluster.close_path_backed_voters();
             }
             Corruption::MissingOwnedJob => {
                 assert!(
                     matches!(
-                        TestCluster::reopen(directory, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+                        cluster
+                            .try_reopen_path_backed_voters_through_production_open()
                             .await,
                         Err(opc_session_store::ConsensusSessionStoreOpenError::RecoveryRequired)
                     ),
                     "missing required V5 job cardinality rejects the public store open"
                 );
-                continue;
             }
-        };
-        let (reopened_leader, _, _) = reopened.observed_leader();
-        let reopened_provider = ManagedProviderAdapterDouble::applied();
-        let facade = reopened.stores[reopened_leader]
-            .managed_provider_job_facade(
-                scope,
-                worker,
-                [marker.wrapping_add(2); 32],
-                [marker.wrapping_add(3); 32],
-                reopened_provider.clone(),
-                ManagedProviderAdapterVerifier,
-            )
-            .expect("construct public reopened facade");
+        }
         assert_eq!(
-            facade.job_status(admission.clone(), ordinal).await,
-            Err(ManagedProviderJobError::Unavailable),
-            "partial V5 evidence must fail closed through the public facade"
+            closed_voter_database_bytes(&cluster),
+            durable_before,
+            "failed public recovery preserves every operation/terminal/member/job/receipt/authority byte"
         );
         assert_eq!(
-            facade
-                .run_member(
-                    admission.clone(),
-                    Box::new([marker.wrapping_add(4)]),
-                    ordinal
-                )
-                .await,
-            Err(ManagedProviderJobError::Unavailable),
-            "a damaged V5 terminal must not be reconstructed or executed"
+            provider_io_counts(&provider),
+            provider_before,
+            "failed public recovery performs no provider I/O"
         );
-        assert_no_provider_io(&reopened_provider);
+        assert_eq!(
+            verifier.calls.load(Ordering::SeqCst),
+            verifier_before,
+            "failed public recovery performs no attestation verifier I/O"
+        );
 
-        let directory = reopened.close_into_directory();
         for index in 0..MEMBER_COUNT {
-            let connection =
-                rusqlite::Connection::open(directory.path().join(format!("node-{index}.sqlite")))
-                    .expect("inspect reopened voter SQLite image");
+            let connection = rusqlite::Connection::open(
+                cluster
+                    ._directory
+                    .path()
+                    .join(format!("node-{index}.sqlite")),
+            )
+            .expect("inspect reopened voter SQLite image");
             let evidence: (i64, Vec<u8>, Vec<u8>) = connection
                 .query_row(
                     "SELECT phase, terminal_digest, terminal_result_digest \
