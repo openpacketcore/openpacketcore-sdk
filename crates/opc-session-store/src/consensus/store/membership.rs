@@ -1368,6 +1368,8 @@ impl ConsensusSessionStore {
                 DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
             )),
             diagnostics,
+            #[cfg(test)]
+            accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
         LogicalReadTimeSupervisor::start(logical_read_time_receiver, Arc::downgrade(&inner));
         FencedTransitionV2StatusLogicalTimeIngressSupervisor::start(

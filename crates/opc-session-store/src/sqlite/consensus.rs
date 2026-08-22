@@ -15,13 +15,17 @@ use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Condvar;
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 #[cfg(target_os = "linux")]
 use rusqlite::OpenFlags;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    backup::StepResult, params, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{
@@ -424,7 +428,8 @@ impl SnapshotBuildObservation {
 pub(crate) struct SnapshotCaptureGate {
     armed: AtomicBool,
     started: AtomicBool,
-    released: AtomicBool,
+    started_notify: tokio::sync::Notify,
+    release: (Mutex<bool>, Condvar),
 }
 
 #[cfg(test)]
@@ -433,13 +438,14 @@ impl SnapshotCaptureGate {
         Self {
             armed: AtomicBool::new(false),
             started: AtomicBool::new(false),
-            released: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
+            release: (Mutex::new(false), Condvar::new()),
         }
     }
 
     pub(crate) fn arm(&self) {
         self.started.store(false, Ordering::SeqCst);
-        self.released.store(false, Ordering::SeqCst);
+        *self.release.0.lock().expect("snapshot gate mutex") = false;
         self.armed.store(true, Ordering::SeqCst);
     }
 
@@ -447,8 +453,20 @@ impl SnapshotCaptureGate {
         self.started.load(Ordering::SeqCst)
     }
 
+    pub(crate) async fn wait_started(&self) {
+        loop {
+            let notified = self.started_notify.notified();
+            if self.started() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub(crate) fn release(&self) {
-        self.released.store(true, Ordering::SeqCst);
+        let mut released = self.release.0.lock().expect("snapshot gate mutex");
+        *released = true;
+        self.release.1.notify_all();
     }
 
     pub(crate) fn block_after_capture(&self) {
@@ -456,8 +474,10 @@ impl SnapshotCaptureGate {
             return;
         }
         self.started.store(true, Ordering::SeqCst);
-        while !self.released.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        self.started_notify.notify_waiters();
+        let mut released = self.release.0.lock().expect("snapshot gate mutex");
+        while !*released {
+            released = self.release.1.wait(released).expect("snapshot gate mutex");
         }
         self.armed.store(false, Ordering::SeqCst);
     }
@@ -15251,13 +15271,14 @@ pub(crate) fn build_snapshot_database_with_capture_hook_sync(
     validate_sealed_state_sync(&tx)?;
     validate_fenced_transition_receipts_sync(&tx, identity)?;
     let destination = create_pinned_snapshot_database(path)?;
-    let (snapshot, _) = build_snapshot_database_from_pinned_with_capture_hook_sync(
+    let (snapshot, mut destination) = build_snapshot_database_from_pinned_with_capture_hook_sync(
         &tx,
         identity,
         destination,
         capture_hook,
     )?;
     tx.commit().map_err(db_error)?;
+    destination.disarm_cleanup();
     Ok(snapshot)
 }
 
@@ -15332,9 +15353,6 @@ pub(crate) fn build_snapshot_database_with_authority_sync(
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     path: &std::path::Path,
 ) -> io::Result<ConsensusAppliedMembership> {
-    if authority_profile == ConsensusAuthorityProfile::Dynamic {
-        return build_snapshot_database_sync(conn, identity, path);
-    }
     build_snapshot_database_pinned_with_authority_sync(
         conn,
         identity,
@@ -15344,7 +15362,10 @@ pub(crate) fn build_snapshot_database_with_authority_sync(
         fixed_placement_policy,
         path,
     )
-    .map(|(snapshot, _)| snapshot)
+    .map(|(snapshot, mut destination)| {
+        destination.disarm_cleanup();
+        snapshot
+    })
 }
 
 fn build_snapshot_database_from_pinned_sync(
@@ -15385,7 +15406,7 @@ fn create_pinned_snapshot_database(
             .write(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        crate::consensus::snapshot::PinnedSqliteFile::from_file(
+        crate::consensus::snapshot::PinnedSqliteFile::from_new_file(
             options.open(path)?,
             path.to_path_buf(),
         )
@@ -15403,8 +15424,7 @@ fn create_pinned_snapshot_database(
 fn refresh_pinned_snapshot_database(
     pinned: crate::consensus::snapshot::PinnedSqliteFile,
 ) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
-    let path = pinned.path().to_path_buf();
-    crate::consensus::snapshot::PinnedSqliteFile::from_file(pinned.into_file(), path)
+    pinned.refresh_identity()
 }
 
 #[cfg(target_os = "linux")]
@@ -15549,11 +15569,17 @@ fn verify_attached_snapshot_descriptor(
 }
 
 // A reader can retain WAL frames only while one snapshot is being copied. Its
-// fixed envelope is deliberately no larger than the sealed snapshot envelope.
-const SNAPSHOT_SOURCE_WAL_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+// fixed envelope is deliberately no larger than the sealed snapshot envelope:
+// a corrupt or stalled source cannot retain more than one snapshot's worth of
+// additional database state.
+const SNAPSHOT_DATABASE_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const SNAPSHOT_SOURCE_WAL_MAX_BYTES: u64 = SNAPSHOT_DATABASE_MAX_BYTES;
 const SNAPSHOT_BACKUP_STEP_PAGES: i32 = 128;
+const SNAPSHOT_BACKUP_BUSY_RETRY_LIMIT: usize = 8;
+const SNAPSHOT_BACKUP_STEP_LIMIT: usize =
+    (SNAPSHOT_DATABASE_MAX_BYTES as usize / 512 / SNAPSHOT_BACKUP_STEP_PAGES as usize) + 1;
 
-/// One descriptor-verified, independently pinned SQLite snapshot reader.
+/// One VFS-verified, independently pinned SQLite snapshot reader.
 ///
 /// The live consensus connection is never moved into this reader. The reader
 /// is admitted only after its SQLite-owned main descriptor is compared with
@@ -15847,6 +15873,42 @@ where
             }
         }
     }
+
+}
+
+fn validate_snapshot_database_extent(
+    page_count: i64,
+    page_size: i64,
+    maximum_bytes: u64,
+) -> io::Result<(i32, u64)> {
+    let page_count = i32::try_from(page_count)
+        .ok()
+        .filter(|count| *count >= 0)
+        .ok_or_else(|| invalid_data("session consensus snapshot page count is invalid"))?;
+    let page_size = u64::try_from(page_size)
+        .ok()
+        .filter(|size| (512..=65_536).contains(size) && size.is_power_of_two())
+        .ok_or_else(|| invalid_data("session consensus snapshot page size is invalid"))?;
+    let bytes = u64::try_from(page_count)
+        .ok()
+        .and_then(|count| count.checked_mul(page_size))
+        .ok_or_else(|| invalid_data("session consensus snapshot size is invalid"))?;
+    if bytes > maximum_bytes {
+        return Err(invalid_data(
+            "session consensus snapshot exceeds its fixed bound",
+        ));
+    }
+    Ok((page_count, page_size))
+}
+
+fn snapshot_database_extent_sync(conn: &Connection) -> io::Result<(i32, u64)> {
+    let page_count = conn
+        .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+        .map_err(db_error)?;
+    let page_size = conn
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+        .map_err(db_error)?;
+    validate_snapshot_database_extent(page_count, page_size, SNAPSHOT_DATABASE_MAX_BYTES)
 }
 
 /// Copy one already-fixed source reader image into a descriptor-pinned raw
@@ -15885,7 +15947,7 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
             "session consensus snapshot source cut differs from the live cut",
         ));
     }
-    let pinned = create_pinned_snapshot_database(path)?;
+    let mut pinned = create_pinned_snapshot_database(path)?;
     let mut destination = open_pinned_snapshot_database(&pinned)?;
     destination
         .execute_batch("PRAGMA journal_mode = OFF;")
@@ -15893,6 +15955,7 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
     let wal_bytes =
         backup_snapshot_reader_bounded(reader, &mut destination, SNAPSHOT_SOURCE_WAL_MAX_BYTES)?;
     drop(destination);
+    pinned.capture_created_sidecars();
     Ok((observed_cut, pinned, wal_bytes))
 }
 
@@ -15941,7 +16004,6 @@ pub(crate) fn finalize_captured_snapshot_database_sync(
     }
     verify_pinned_snapshot_descriptor(&pinned, &destination)?;
     drop(destination);
-
     // The URI resolves this process's already-pinned descriptor.  SQLite
     // accepts the pre-created empty output, and cannot create or redirect a
     // pathname outside that descriptor binding.
@@ -15982,6 +16044,7 @@ pub(crate) fn finalize_captured_snapshot_database_sync(
         ));
     }
     drop(compacted_connection);
+    compacted.capture_created_sidecars();
     Ok(compacted)
 }
 
@@ -16009,6 +16072,7 @@ fn capture_and_finalize_snapshot_database_sync(
     let membership = read_membership_sync(conn, identity)?;
     validate_membership_ids(&membership)?;
     capture_hook();
+    let (expected_pages, page_size) = snapshot_database_extent_sync(conn)?;
 
     let mut destination = open_pinned_snapshot_database(&pinned)?;
     destination
@@ -16016,9 +16080,56 @@ fn capture_and_finalize_snapshot_database_sync(
         .map_err(db_error)?;
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
-        backup
-            .run_to_completion(128, std::time::Duration::ZERO, None)
-            .map_err(db_error)?;
+        let mut busy_retries = 0_usize;
+        let mut completed = false;
+        for _ in 0..SNAPSHOT_BACKUP_STEP_LIMIT {
+            let result = backup
+                .step(SNAPSHOT_BACKUP_PAGES_PER_STEP)
+                .map_err(db_error)?;
+            let progress = backup.progress();
+            if progress.remaining < 0
+                || progress.pagecount != expected_pages
+                || progress.remaining > progress.pagecount
+                || u64::try_from(progress.pagecount)
+                    .ok()
+                    .and_then(|count| count.checked_mul(page_size))
+                    .is_none_or(|bytes| bytes > SNAPSHOT_DATABASE_MAX_BYTES)
+            {
+                return Err(invalid_data(
+                    "session consensus snapshot backup progress is invalid",
+                ));
+            }
+            match result {
+                StepResult::Done if progress.remaining == 0 => {
+                    completed = true;
+                    break;
+                }
+                StepResult::Done => {
+                    return Err(invalid_data(
+                        "session consensus snapshot backup completed inconsistently",
+                    ));
+                }
+                StepResult::More => busy_retries = 0,
+                StepResult::Busy | StepResult::Locked => {
+                    busy_retries = busy_retries.saturating_add(1);
+                    if busy_retries > SNAPSHOT_BACKUP_BUSY_RETRY_LIMIT {
+                        return Err(invalid_data(
+                            "session consensus snapshot backup remained busy",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(invalid_data(
+                        "session consensus snapshot backup status is invalid",
+                    ));
+                }
+            }
+        }
+        if !completed {
+            return Err(invalid_data(
+                "session consensus snapshot backup exceeded its fixed step limit",
+            ));
+        }
     }
     pinned = refresh_pinned_snapshot_database(pinned)?;
     verify_pinned_snapshot_descriptor(&pinned, &destination)?;
@@ -17782,6 +17893,19 @@ mod tests {
     fn snapshot_source_wal_bound_rejects_small_overflow() {
         assert!(enforce_snapshot_source_wal_bound(1, 1).is_ok());
         assert!(enforce_snapshot_source_wal_bound(2, 1).is_err());
+    }
+
+    #[test]
+    fn snapshot_extent_uses_the_actual_sqlite_page_size() {
+        assert_eq!(
+            validate_snapshot_database_extent(8, 4_096, 32_768).expect("exact snapshot extent"),
+            (8, 4_096)
+        );
+        assert!(validate_snapshot_database_extent(9, 4_096, 32_768).is_err());
+        assert!(validate_snapshot_database_extent(64, 512, 32_768).is_ok());
+        assert!(validate_snapshot_database_extent(65, 512, 32_768).is_err());
+        assert!(validate_snapshot_database_extent(1, 1_000, 32_768).is_err());
+        assert!(validate_snapshot_database_extent(-1, 4_096, 32_768).is_err());
     }
 
     #[test]

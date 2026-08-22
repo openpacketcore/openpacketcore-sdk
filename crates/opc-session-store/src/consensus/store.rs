@@ -14,7 +14,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 #[cfg(test)]
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream, StreamExt};
@@ -790,6 +790,8 @@ struct ConsensusSessionStoreInner {
     fenced_transition_v2_status_batch: FencedTransitionV2StatusBatchSupervisor,
     proposal_admission: Arc<tokio::sync::Semaphore>,
     diagnostics: Arc<ConsensusStoreDiagnosticCounters>,
+    #[cfg(test)]
+    accepted_receiver_test_outcomes: Mutex<VecDeque<AcceptedClientWriteReceiverTestOutcome>>,
 }
 
 /// Test-only result injection at the post-acceptance `client_write_ff`
@@ -801,11 +803,6 @@ struct ConsensusSessionStoreInner {
 enum AcceptedClientWriteReceiverTestOutcome {
     ForwardToLeader,
 }
-
-#[cfg(test)]
-static ACCEPTED_RECEIVER_TEST_OUTCOMES: LazyLock<
-    Mutex<VecDeque<AcceptedClientWriteReceiverTestOutcome>>,
-> = LazyLock::new(|| Mutex::new(VecDeque::new()));
 
 /// One bounded status response awaiting a shared exact-scope acceptance read.
 struct FencedTransitionV2StatusBatchRequest {
@@ -1578,7 +1575,8 @@ impl ConsensusSessionStore {
         &self,
         outcome: AcceptedClientWriteReceiverTestOutcome,
     ) {
-        ACCEPTED_RECEIVER_TEST_OUTCOMES
+        self.inner
+            .accepted_receiver_test_outcomes
             .lock()
             .expect("accepted receiver test outcomes lock")
             .push_back(outcome);
@@ -1815,6 +1813,8 @@ impl ConsensusSessionStore {
                 DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
             )),
             diagnostics,
+            #[cfg(test)]
+            accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
         LogicalReadTimeSupervisor::start(logical_read_time_receiver, Arc::downgrade(&inner));
         FencedTransitionV2StatusLogicalTimeIngressSupervisor::start(
@@ -2008,6 +2008,8 @@ impl ConsensusSessionStore {
                 DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
             )),
             diagnostics,
+            #[cfg(test)]
+            accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
         LogicalReadTimeSupervisor::start(logical_read_time_receiver, Arc::downgrade(&inner));
         FencedTransitionV2StatusLogicalTimeIngressSupervisor::start(
@@ -5184,7 +5186,9 @@ impl ConsensusSessionStore {
                 }
             };
         #[cfg(test)]
-        let accepted_receiver_test_error = ACCEPTED_RECEIVER_TEST_OUTCOMES
+        let accepted_receiver_test_error = self
+            .inner
+            .accepted_receiver_test_outcomes
             .lock()
             .expect("accepted receiver test outcomes lock")
             .pop_front()
