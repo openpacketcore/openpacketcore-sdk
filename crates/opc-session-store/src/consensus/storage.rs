@@ -1177,7 +1177,6 @@ async fn build_file_backed_snapshot_database(
     let expected_bindings = core.expected_bindings.clone();
     let fixed_placement_policy = core.fixed_placement_policy;
     let raw_path = raw_path.to_path_buf();
-    let snapshot_observation = std::sync::Arc::clone(&core.snapshot_observation);
     #[cfg(test)]
     let snapshot_capture_gate = std::sync::Arc::clone(&core.snapshot_capture_gate);
 
@@ -1204,8 +1203,7 @@ async fn build_file_backed_snapshot_database(
         let released = consensus::release_snapshot_read_sync(&reader);
         let captured = match (captured, released) {
             (Ok(captured), Ok(())) => {
-                let (captured_cut, raw_snapshot, wal_bytes) = captured;
-                snapshot_observation.record_source_wal(wal_bytes);
+                let (captured_cut, raw_snapshot) = captured;
                 consensus::finalize_captured_snapshot_database_sync(
                     storage_identity,
                     &captured_cut,
@@ -1234,7 +1232,6 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
     async fn build_snapshot(
         &mut self,
     ) -> Result<Snapshot<SessionRaftTypeConfig>, StorageError<SessionConsensusNodeId>> {
-        let snapshot_started = std::time::Instant::now();
         let snapshot_guard = std::sync::Arc::clone(&self.core.snapshot_gate)
             .lock_owned()
             .await;
@@ -1411,9 +1408,6 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 error,
             )
         })?;
-        self.core
-            .snapshot_observation
-            .record_completed(snapshot_started.elapsed());
         Ok(Snapshot {
             meta,
             snapshot: Box::new(snapshot),

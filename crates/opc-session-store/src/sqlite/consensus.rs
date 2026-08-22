@@ -12,8 +12,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 #[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
@@ -376,40 +375,6 @@ pub(crate) type ConsensusAppliedMembership = (
 pub(crate) struct SnapshotSourceFileIdentity {
     device: u64,
     inode: u64,
-}
-
-/// Fixed-dimension snapshot-capture observations.
-///
-/// These counters deliberately exclude paths, session identifiers, and payload
-/// material. They are status/evidence values, not labelled metrics or
-/// per-subscriber state.
-#[derive(Default)]
-pub(crate) struct SnapshotBuildObservation {
-    latest_wal_bytes: AtomicU64,
-    peak_wal_bytes: AtomicU64,
-    last_duration_millis: AtomicU64,
-}
-
-impl SnapshotBuildObservation {
-    pub(crate) fn record_source_wal(&self, bytes: u64) {
-        self.latest_wal_bytes.store(bytes, Ordering::Relaxed);
-        self.peak_wal_bytes.fetch_max(bytes, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_completed(&self, duration: std::time::Duration) {
-        self.last_duration_millis.store(
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-    }
-
-    pub(crate) fn snapshot(&self) -> (u64, u64, u64) {
-        (
-            self.latest_wal_bytes.load(Ordering::Relaxed),
-            self.peak_wal_bytes.load(Ordering::Relaxed),
-            self.last_duration_millis.load(Ordering::Relaxed),
-        )
-    }
 }
 
 pub(crate) fn snapshot_source_file_identity(path: &Path) -> io::Result<SnapshotSourceFileIdentity> {
@@ -1350,7 +1315,6 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
     pub(crate) database_path: Option<Arc<PathBuf>>,
     pub(crate) database_file_identity: Option<SnapshotSourceFileIdentity>,
-    pub(crate) snapshot_observation: Arc<SnapshotBuildObservation>,
     /// Immutable database-incarnation identity used by legacy foreign keys.
     /// The active topology identity lives in `consensus_membership_scope`.
     pub(crate) storage_identity: SessionConsensusIdentity,
@@ -1475,7 +1439,6 @@ impl SqliteConsensusCore {
             conn: Arc::clone(&backend.conn),
             database_path: backend.database_path.clone(),
             database_file_identity,
-            snapshot_observation: backend.snapshot_observation(),
             storage_identity,
             authority_profile,
             fixed_placement_policy,
@@ -15426,7 +15389,6 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
 ) -> io::Result<(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
-    u64,
 )> {
     verify_snapshot_read_connection(reader)?;
     validate_existing_schema(&reader.connection, identity)
@@ -15462,12 +15424,11 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
             .map_err(db_error)?;
     }
     verify_snapshot_read_connection(reader)?;
-    let wal_bytes =
-        validate_snapshot_source_wal_bound(&reader.source_path, reader.source_identity)?;
+    validate_snapshot_source_wal_bound(&reader.source_path, reader.source_identity)?;
     pinned = refresh_pinned_snapshot_database(pinned)?;
     verify_pinned_snapshot_descriptor(&pinned, &descriptor_fds)?;
     drop(destination);
-    Ok((observed_cut, pinned, wal_bytes))
+    Ok((observed_cut, pinned))
 }
 
 /// Finish a raw snapshot only after its reader has been released.
