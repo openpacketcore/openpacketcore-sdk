@@ -1062,16 +1062,16 @@ test-only. `PersistentSessionConsumerClient` remains the required warm
 fixed-pool primitive for #695/ePDG latency, and production deployments
 requiring warm reuse should use it. Its mutual-TLS ALPN remains
 `opc-session-consumer/1`, while its exact transport
-revision is now 3 with no fallback or dual mode. Drain consumer clients and
+revision is now 4 with no fallback or dual mode. Drain consumer clients and
 listeners for one coordinated cutover; different consumer revisions must never
-coexist. Revision-3 private JSON DTO bytes are
+coexist. Revision-4 private JSON DTO bytes are
 canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
 and unknown fields fail closed. This does not admit the legacy
 `RemoteSessionBackend` surface or consensus, replication, snapshot, rebuild,
-membership, or admin authority. Revision 3 admits only #696's generic
-single-record atomic fenced-transition capability, observation, execution, and
-exact-status operations; product composition and ePDG-specific semantics remain
-excluded.
+membership, or admin authority. Revision 4 retains #696's generic single-record
+atomic fenced-transition capability, observation, execution, and exact-status
+operations, and adds exact retained status recovery for ordinary acquire, renew,
+and release; product composition and ePDG-specific semantics remain excluded.
 
 Before V1 is activated for the exact current consensus voter scope, capability,
 observation, status, and first-transition admission require fresh authenticated
@@ -1112,7 +1112,7 @@ while a revoked predecessor cannot observe the receipt. No separate
 `BindConsumerRequest` or log entry is created.
 `FencedTransitionStorageExhausted` is retained only after ordinary
 stale-fence/CAS/lease admission for an otherwise successful transition;
-revision 3 returns it as a closed `StorageExhausted` error inside `Recorded`
+revision 4 returns it as a closed `StorageExhausted` error inside `Recorded`
 status, with no lease, record, watch, or restore effect. Frozen legacy
 session-net v5 maps it fail-closed as an unknown capability without a wire
 enum change.
@@ -1172,8 +1172,8 @@ Any performance evidence is synthetic only and is not an ePDG production-SLO
 claim. Warm accept/reuse assertions gate only that synthetic method; elapsed
 samples are non-gating. The revision-2 persistent-consumer qualification
 contract remains v7, while the published v6 profile remains the unchanged
-revision-1 contract. Revision-3 atomic-transition evidence must additionally
-prove typed one-shot and persistent round trips and exact ambiguity recovery.
+revision-1 contract. Revision 4 evidence additionally proves typed one-shot and
+persistent round trips and exact ambiguity recovery for ordinary leases.
 
 ### Legacy direct-backend session-net v5 rollout boundary
 

@@ -8621,6 +8621,7 @@ fn consumer_lease_mutation_result_from_response(
                     error,
                     &[
                         SessionConsumerLeaseError::AlreadyHeld,
+                        SessionConsumerLeaseError::StaleFence,
                         SessionConsumerLeaseError::InvalidTtl,
                     ],
                 )
@@ -8651,6 +8652,7 @@ fn consumer_lease_mutation_result_from_response(
             Err(error) => deterministic_error(
                 error,
                 &[
+                    SessionConsumerLeaseError::AlreadyHeld,
                     SessionConsumerLeaseError::Expired,
                     SessionConsumerLeaseError::StaleFence,
                     SessionConsumerLeaseError::NotFound,
@@ -8666,7 +8668,7 @@ fn consumer_lease_mutation_result_from_response(
             Err(error) => deterministic_error(
                 error,
                 &[
-                    SessionConsumerLeaseError::Expired,
+                    SessionConsumerLeaseError::AlreadyHeld,
                     SessionConsumerLeaseError::StaleFence,
                     SessionConsumerLeaseError::NotFound,
                 ],
@@ -12974,6 +12976,101 @@ mod tests {
             stable_id: Bytes::from_static(b"state-machine-fault-session")
                 .try_into()
                 .expect("valid stable ID"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_lease_receipt_projects_only_operation_exact_deterministic_errors() {
+        fn response(error: StoreError) -> SessionConsensusResponse {
+            SessionConsensusResponse {
+                result: Err(error),
+                sequence: 0,
+                digest: None,
+                logical_time: None,
+                raft_log_index: 0,
+            }
+        }
+
+        fn deterministic_errors() -> [(crate::consumer::SessionConsumerLeaseError, StoreError); 5] {
+            [
+                (
+                    crate::consumer::SessionConsumerLeaseError::AlreadyHeld,
+                    StoreError::LeaseHeld,
+                ),
+                (
+                    crate::consumer::SessionConsumerLeaseError::Expired,
+                    StoreError::LeaseExpired,
+                ),
+                (
+                    crate::consumer::SessionConsumerLeaseError::StaleFence,
+                    StoreError::StaleFence,
+                ),
+                (
+                    crate::consumer::SessionConsumerLeaseError::NotFound,
+                    StoreError::NotFound,
+                ),
+                (
+                    crate::consumer::SessionConsumerLeaseError::InvalidTtl,
+                    StoreError::InvalidSessionTtl,
+                ),
+            ]
+        }
+
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let lease = crate::SessionLeaseManager::acquire(
+            &backend,
+            &key(),
+            OwnerId::new("lease-receipt-projection").expect("owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("fixture lease");
+        let operations = [
+            (
+                crate::consumer::SessionConsumerLeaseMutationOperation::Acquire {
+                    key: key(),
+                    owner: OwnerId::new("lease-receipt-projection").expect("owner"),
+                    ttl: Duration::from_secs(30),
+                },
+                &[
+                    crate::consumer::SessionConsumerLeaseError::AlreadyHeld,
+                    crate::consumer::SessionConsumerLeaseError::StaleFence,
+                    crate::consumer::SessionConsumerLeaseError::InvalidTtl,
+                ][..],
+            ),
+            (
+                crate::consumer::SessionConsumerLeaseMutationOperation::Renew {
+                    lease: lease.clone(),
+                    ttl: Duration::from_secs(30),
+                },
+                &[
+                    crate::consumer::SessionConsumerLeaseError::AlreadyHeld,
+                    crate::consumer::SessionConsumerLeaseError::Expired,
+                    crate::consumer::SessionConsumerLeaseError::StaleFence,
+                    crate::consumer::SessionConsumerLeaseError::NotFound,
+                    crate::consumer::SessionConsumerLeaseError::InvalidTtl,
+                ][..],
+            ),
+            (
+                crate::consumer::SessionConsumerLeaseMutationOperation::Release { lease },
+                &[
+                    crate::consumer::SessionConsumerLeaseError::AlreadyHeld,
+                    crate::consumer::SessionConsumerLeaseError::StaleFence,
+                    crate::consumer::SessionConsumerLeaseError::NotFound,
+                ][..],
+            ),
+        ];
+
+        for (operation, permitted) in operations {
+            for (expected, error) in deterministic_errors() {
+                let projected =
+                    consumer_lease_mutation_result_from_response(&operation, &response(error));
+                if permitted.contains(&expected) {
+                    assert_eq!(projected, Ok(Err(expected)));
+                } else {
+                    assert!(matches!(projected, Err(StoreError::BackendUnavailable(_))));
+                }
+            }
         }
     }
 

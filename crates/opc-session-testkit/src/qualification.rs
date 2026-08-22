@@ -3492,9 +3492,9 @@ pub enum QualificationNodeCommandKind {
     SetConsensusRpcAvailability,
     /// Start the test-only stateless consumer endpoint.
     StartStatelessConsumer,
-    /// Cause the next successful stateless-consumer mutation to report an
-    /// explicitly ambiguous outcome after durable dispatch.
-    ArmStatelessConsumerOutcomeUnknown,
+    /// Delay the next successful stateless-consumer mutation response after
+    /// durable dispatch so the caller's own deadline creates ambiguity.
+    ArmStatelessConsumerDelayedResponse,
     /// Read bounded security metrics.
     SecurityMetrics,
     /// Start the deterministic traffic watch.
@@ -3550,7 +3550,7 @@ impl QualificationNodeCommandKind {
         Self::LifecycleMetrics,
         Self::SetConsensusRpcAvailability,
         Self::StartStatelessConsumer,
-        Self::ArmStatelessConsumerOutcomeUnknown,
+        Self::ArmStatelessConsumerDelayedResponse,
         Self::SecurityMetrics,
         Self::StartTrafficWatch,
         Self::ReconcileTrafficWatch,
@@ -3609,9 +3609,9 @@ pub enum QualificationNodeCommand {
     StartStatelessConsumer {
         consumer_identities: Vec<String>,
     },
-    /// Arm a one-shot, test-only post-dispatch response-loss simulation for
-    /// the dedicated stateless-consumer endpoint.
-    ArmStatelessConsumerOutcomeUnknown,
+    /// Arm one one-shot, test-only delayed post-dispatch response for the
+    /// dedicated stateless-consumer endpoint.
+    ArmStatelessConsumerDelayedResponse,
     /// Return a redacted fixed-cardinality security telemetry snapshot.
     SecurityMetrics,
     /// Register exactly one protected applied-state watch before any traffic
@@ -3731,8 +3731,8 @@ impl fmt::Debug for QualificationNodeCommand {
                 .field("consumer_count", &consumer_identities.len())
                 .field("identities", &"<redacted>")
                 .finish(),
-            Self::ArmStatelessConsumerOutcomeUnknown => {
-                formatter.write_str("QualificationNodeCommand::ArmStatelessConsumerOutcomeUnknown")
+            Self::ArmStatelessConsumerDelayedResponse => {
+                formatter.write_str("QualificationNodeCommand::ArmStatelessConsumerDelayedResponse")
             }
             Self::SecurityMetrics => {
                 formatter.write_str("QualificationNodeCommand::SecurityMetrics")
@@ -3827,8 +3827,8 @@ impl QualificationNodeCommand {
             Self::StartStatelessConsumer { .. } => {
                 QualificationNodeCommandKind::StartStatelessConsumer
             }
-            Self::ArmStatelessConsumerOutcomeUnknown => {
-                QualificationNodeCommandKind::ArmStatelessConsumerOutcomeUnknown
+            Self::ArmStatelessConsumerDelayedResponse => {
+                QualificationNodeCommandKind::ArmStatelessConsumerDelayedResponse
             }
             Self::SecurityMetrics => QualificationNodeCommandKind::SecurityMetrics,
             Self::StartTrafficWatch => QualificationNodeCommandKind::StartTrafficWatch,
@@ -3868,7 +3868,7 @@ impl QualificationNodeCommand {
             | Self::RequestReauthentication
             | Self::LifecycleMetrics
             | Self::SetConsensusRpcAvailability { .. }
-            | Self::ArmStatelessConsumerOutcomeUnknown
+            | Self::ArmStatelessConsumerDelayedResponse
             | Self::SecurityMetrics
             | Self::StartTrafficWatch
             | Self::ReconcileTrafficWatch
@@ -4266,8 +4266,8 @@ pub enum QualificationNodeReply {
         bind_addr: SocketAddr,
         scope: SessionConsumerScope,
     },
-    /// A one-shot post-dispatch ambiguous-outcome simulation was armed.
-    StatelessConsumerOutcomeUnknownArmed,
+    /// A one-shot post-dispatch delayed response was armed.
+    StatelessConsumerDelayedResponseArmed,
     TrafficStatus {
         status: QualificationTrafficStatus,
     },
@@ -5058,7 +5058,7 @@ mod tests {
                     })
                     .collect(),
             },
-            QualificationNodeCommand::ArmStatelessConsumerOutcomeUnknown,
+            QualificationNodeCommand::ArmStatelessConsumerDelayedResponse,
             QualificationNodeCommand::SecurityMetrics,
             QualificationNodeCommand::StartTrafficWatch,
             QualificationNodeCommand::ReconcileTrafficWatch,

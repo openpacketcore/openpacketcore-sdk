@@ -41,7 +41,7 @@
       "properties": {
         "client_type": { "const": "PersistentSessionConsumerClient" },
         "consumer_profile_path": { "const": "protocol.persistent_consumer" },
-        "transport_revision": { "const": 3 },
+        "transport_revision": { "const": 4 },
         "authenticated_route": { "const": "authenticated-mtls-persistent" }
       }
     },

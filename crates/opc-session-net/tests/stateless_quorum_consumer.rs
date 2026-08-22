@@ -21,7 +21,6 @@ use opc_session_net::{
     SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
     SessionConsumerMutationError, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
     MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
-    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, ConsensusSessionStore,
@@ -1522,15 +1521,15 @@ async fn malformed_and_oversized_consumer_frames_are_rejected_before_dispatch() 
     .await
     .expect("start stateless consumer listener");
 
-    // This peer completes the same mTLS and ALPN handshake as a real caller,
-    // but offers the wrong fixed consumer revision. It must be closed before
-    // any application dispatch and without an upgrade oracle.
+    // A frozen revision-3 peer completes the same mTLS and ALPN handshake as a
+    // real caller, but must be closed before application dispatch. There is no
+    // downgrade or upgrade oracle at this boundary.
     let mut wrong_revision =
         raw_authenticated_consumer_connection(&pki, address, &client_spiffe).await;
     let wrong_hello = serde_json::to_vec(&serde_json::json!({
         "kind": "hello",
         "body": {
-            "transport_revision": SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION.wrapping_add(1),
+            "transport_revision": 3_u16,
             "scope": scope,
             "response_frame_size": opc_session_net::MAX_NEGOTIATED_FRAME_SIZE,
         },

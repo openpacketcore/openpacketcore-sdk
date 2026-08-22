@@ -45,11 +45,11 @@ use opc_session_store::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
     SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
-    SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionKey, SessionKeyType,
-    SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend,
-    StateClass, StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
+    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_key_bytes_sha256, qualification_owner_sha256, qualification_state_type_sha256,
@@ -123,6 +123,10 @@ const QUALIFICATION_CONTROL_SOCKET_MODE: u32 = 0o600;
 #[cfg(unix)]
 const QUALIFICATION_CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const QUALIFICATION_RETAINED_RELEASED_LEASE_HANDLES: usize = 4;
+/// The caller-owned test deadline is intentionally shorter than this fixed
+/// post-commit delay, so ambiguity comes from the real response path rather
+/// than a synthetic application response.
+const QUALIFICATION_DELAYED_CONSUMER_RESPONSE: Duration = Duration::from_secs(2);
 
 type ProtectedStore = EncryptingSessionBackend<ConsensusSessionStore, MemoryKeyProvider>;
 
@@ -327,7 +331,7 @@ struct QualificationNode {
     server: Option<SessionConsensusServerHandle>,
     consumer_server: Option<SessionQuorumConsumerServerHandle>,
     consumer_transport: Option<QualificationConsumerTransport>,
-    consumer_outcome_unknown: Arc<AtomicBool>,
+    consumer_delayed_response: Arc<AtomicBool>,
     transport: QualificationTransportRuntime,
     leases: HashMap<String, QualificationLease>,
     next_lease_retention_sequence: u64,
@@ -357,13 +361,13 @@ struct QualificationTrafficRuntime {
     watch_task: Option<JoinHandle<Result<(), QualificationTrafficFailure>>>,
 }
 
-struct QualificationConsumerOutcomeUnknownService {
+struct QualificationConsumerDelayedResponseService {
     inner: Arc<dyn SessionQuorumConsumer>,
     armed: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
-impl SessionQuorumConsumer for QualificationConsumerOutcomeUnknownService {
+impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
     async fn execute(
         &self,
         identity: &SessionConsumerIdentity,
@@ -378,7 +382,7 @@ impl SessionQuorumConsumer for QualificationConsumerOutcomeUnknownService {
         let response = self.inner.execute(identity, request).await;
         if lease_mutation
             && matches!(
-                response,
+                &response,
                 SessionConsumerResponse::AcquireLease(Ok(_))
                     | SessionConsumerResponse::RenewLease(Ok(_))
                     | SessionConsumerResponse::ReleaseLease(Ok(()))
@@ -388,7 +392,7 @@ impl SessionQuorumConsumer for QualificationConsumerOutcomeUnknownService {
                 .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            return SessionConsumerResponse::OutcomeUnknown(SessionConsumerOutcomeUnknown::Lease);
+            tokio::time::sleep(QUALIFICATION_DELAYED_CONSUMER_RESPONSE).await;
         }
         response
     }
@@ -900,7 +904,7 @@ impl QualificationNode {
             server: Some(server),
             consumer_server: None,
             consumer_transport,
-            consumer_outcome_unknown: Arc::new(AtomicBool::new(false)),
+            consumer_delayed_response: Arc::new(AtomicBool::new(false)),
             transport,
             leases: HashMap::new(),
             next_lease_retention_sequence: 1,
@@ -954,14 +958,14 @@ impl QualificationNode {
             QualificationNodeCommand::StartStatelessConsumer {
                 consumer_identities,
             } => self.start_stateless_consumer(consumer_identities).await,
-            QualificationNodeCommand::ArmStatelessConsumerOutcomeUnknown => {
+            QualificationNodeCommand::ArmStatelessConsumerDelayedResponse => {
                 if self.consumer_server.is_none() {
                     QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::InvalidRequest,
                     }
                 } else {
-                    self.consumer_outcome_unknown.store(true, Ordering::SeqCst);
-                    QualificationNodeReply::StatelessConsumerOutcomeUnknownArmed
+                    self.consumer_delayed_response.store(true, Ordering::SeqCst);
+                    QualificationNodeReply::StatelessConsumerDelayedResponseArmed
                 }
             }
             QualificationNodeCommand::SecurityMetrics => QualificationNodeReply::SecurityMetrics {
@@ -1213,9 +1217,9 @@ impl QualificationNode {
             }
         };
         let listener = SessionQuorumConsumerServer::new(
-            Arc::new(QualificationConsumerOutcomeUnknownService {
+            Arc::new(QualificationConsumerDelayedResponseService {
                 inner: Arc::new(self.store.consumer_service()),
-                armed: Arc::clone(&self.consumer_outcome_unknown),
+                armed: Arc::clone(&self.consumer_delayed_response),
             }),
             transport.server_config.clone(),
             authorizer,

@@ -4248,7 +4248,14 @@ impl ConsensusSessionConsumerService {
                     deadline,
                 )
                 .await
-                .map_err(SessionConsumerStoreError::from),
+                // A receipt lookup has no operation-specific outer error
+                // family. Its only authoritative outcomes are the exact
+                // retained receipt, RequestConflict, and NotFound. In
+                // particular, topology or read-barrier failures must remain
+                // ambiguous availability rather than being converted into a
+                // lease-shaped value (such as StaleFence) that the transport
+                // correctly rejects as impossible for this read-only call.
+                .map_err(|_| SessionConsumerStoreError::Unavailable),
         )
     }
 

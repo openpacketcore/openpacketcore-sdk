@@ -1,4 +1,4 @@
-//! Adversarial wire tests for the revision-2 persistent consumer transport.
+//! Adversarial wire tests for the revision-4 persistent consumer transport.
 //!
 //! The peer in these tests deliberately speaks only JSON values.  That keeps
 //! the private consumer wire DTOs private while still checking that a live
@@ -676,7 +676,7 @@ async fn assert_malicious_semantic_wire_response_is_unconfirmed(
 
 #[tokio::test]
 async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
-    for wrong in ["revision", "scope"] {
+    for wrong in ["frozen-revision-three", "scope"] {
         let pki = TestPki::new();
         let server_spiffe = spiffe(&format!("hello-{wrong}-server"));
         let client_spiffe = spiffe(&format!("hello-{wrong}-client"));
@@ -691,7 +691,7 @@ async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
             let hello = read_value(&mut tls).await;
             let mut ack = hello_ack(&hello);
             match wrong {
-                "revision" => ack["body"]["transport_revision"] = json!(u16::MAX),
+                "frozen-revision-three" => ack["body"]["transport_revision"] = json!(3_u16),
                 "scope" => ack["body"]["scope"] = serde_json::to_value(scope(9)).expect("scope"),
                 _ => unreachable!("fixed test cases"),
             }
