@@ -6803,7 +6803,9 @@ fn fenced_transition_v2_batch_outcomes_match_requests(
                 // profiled timestamp, which must not be later than this
                 // committed batch envelope.
                 Ok(outcome) => {
-                    outcome.recorded_at() <= logical_time && outcome.matches_v2_request(request)
+                    outcome.recorded_at() <= logical_time
+                        && !outcome.is_expired_at(logical_time)
+                        && outcome.matches_v2_request(request)
                 }
                 Err(error) => committed_error_matches_intent(
                     &SessionMutationIntent::FencedTransitionV2(Box::new(request.clone())),
@@ -10800,13 +10802,13 @@ mod membership_tests {
         let replay_first = outcome(&first, recorded_at);
         let replay_second = outcome(&second, recorded_at);
         let fresh_second = outcome(&second, envelope_time);
-        let response = |outcomes| SessionConsensusResponse {
+        let response = |logical_time, outcomes| SessionConsensusResponse {
             result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
             sequence: 1,
             digest: Some(crate::consensus::SessionConsensusEntryDigest::from_bytes(
                 [0xD4; 32],
             )),
-            logical_time: Some(envelope_time),
+            logical_time: Some(logical_time),
             raft_log_index: 1,
         };
         let requests = vec![first.clone(), second.clone()];
@@ -10815,7 +10817,10 @@ mod membership_tests {
             .map(FencedTransitionV2Request::request_id)
             .collect::<Vec<_>>();
 
-        let all_replay = response(vec![Ok(replay_first.clone()), Ok(replay_second.clone())]);
+        let all_replay = response(
+            envelope_time,
+            vec![Ok(replay_first.clone()), Ok(replay_second.clone())],
+        );
         assert!(
             committed_response_matches_intent(
                 &SessionMutationIntent::FencedTransitionV2Batch(requests.clone()),
@@ -10831,10 +10836,13 @@ mod membership_tests {
                 all_replay,
             ),
             FencedTransitionV2Effect::Resolved(Ok(outcomes))
-                if outcomes == vec![Ok(replay_first.clone()), Ok(replay_second)]
+                if outcomes == vec![Ok(replay_first.clone()), Ok(replay_second.clone())]
         ));
 
-        let mixed = response(vec![Ok(replay_first.clone()), Ok(fresh_second.clone())]);
+        let mixed = response(
+            envelope_time,
+            vec![Ok(replay_first.clone()), Ok(fresh_second.clone())],
+        );
         assert!(
             committed_response_matches_intent(
                 &SessionMutationIntent::FencedTransitionV2Batch(requests.clone()),
@@ -10845,8 +10853,20 @@ mod membership_tests {
         assert!(matches!(
             committed_fenced_transition_v2_batch_effect(&request_ids, &requests, None, mixed),
             FencedTransitionV2Effect::Resolved(Ok(outcomes))
-                if outcomes == vec![Ok(replay_first), Ok(fresh_second)]
+                if outcomes == vec![Ok(replay_first.clone()), Ok(fresh_second)]
         ));
+
+        let expired_replay = response(
+            replay_second.retained_until(),
+            vec![Ok(replay_first), Ok(replay_second)],
+        );
+        assert!(
+            !committed_response_matches_intent(
+                &SessionMutationIntent::FencedTransitionV2Batch(requests),
+                &expired_replay,
+            ),
+            "a terminal replay cannot be accepted at its retention boundary"
+        );
     }
 
     #[test]
