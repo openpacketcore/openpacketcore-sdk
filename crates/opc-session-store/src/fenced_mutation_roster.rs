@@ -2849,12 +2849,16 @@ mod tests {
     fn qualification_capacity_includes_the_starting_bound() {
         const STARTING_BOUND: usize = 100;
         const UNIQUE_OPERATION_RECEIPTS: usize = 960_000;
-        const REQUIRED_BINDINGS: usize = STARTING_BOUND + UNIQUE_OPERATION_RECEIPTS;
+        let starting_bound = std::hint::black_box(STARTING_BOUND);
+        let unique_operation_receipts = std::hint::black_box(UNIQUE_OPERATION_RECEIPTS);
+        let required_bindings = starting_bound + unique_operation_receipts;
+        let operational_target = std::hint::black_box(FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET);
+        let max_retained_results = std::hint::black_box(MAX_RETAINED_RESULTS);
 
-        assert_eq!(REQUIRED_BINDINGS, 960_100);
-        assert!(FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET >= REQUIRED_BINDINGS);
-        assert!(MAX_RETAINED_RESULTS >= FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET);
-        assert_eq!(MAX_RETAINED_RESULTS, 1_048_576);
+        assert_eq!(required_bindings, 960_100);
+        assert!(operational_target >= required_bindings);
+        assert!(max_retained_results >= operational_target);
+        assert_eq!(max_retained_results, 1_048_576);
     }
     #[test]
     fn ambiguity_carries_identity_but_not_nontransmission() {
