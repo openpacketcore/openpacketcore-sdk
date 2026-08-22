@@ -976,8 +976,9 @@ async fn run_fenced_transition_v2_status_batch_supervisor(
 /// One caller awaiting a shared committed logical-time advance.
 ///
 /// The owned admission permit bounds both queued and in-progress waiters. A
-/// dropped caller only drops its reply receiver; it cannot cancel a cohort
-/// that has already begun its consensus proposal.
+/// dropped caller only drops its reply receiver. The worker prunes it before
+/// proposal dispatch; after dispatch begins, the worker still supervises the
+/// accepted cohort to a bounded terminal result.
 struct LogicalReadTimeRequest {
     required_consumer_scope: Option<SessionConsensusIdentity>,
     deadline: tokio::time::Instant,
@@ -1077,31 +1078,75 @@ async fn run_logical_read_time_supervisor(
             }
         }
 
+        // No consensus proposal has begun at this boundary. Discard callers
+        // whose reply authority is already gone, plus requests whose complete
+        // deadline has elapsed while queued. Once submit_request_before starts,
+        // its existing detached supervision remains responsible for any
+        // accepted client_write_ff outcome.
+        let now = tokio::time::Instant::now();
+        cohort.retain(|request| !request.reply.is_closed() && now < request.deadline);
+        if cohort.is_empty() {
+            continue;
+        }
+
         let deadline = cohort
             .iter()
             .map(|request| request.deadline)
             .max()
             .unwrap_or_else(tokio::time::Instant::now);
-        let result = match store.upgrade() {
-            Some(inner) => {
-                let store = ConsensusSessionStore { inner };
-                store
-                    .submit_request_before(
-                        SessionConsensusRequestId::new(),
-                        SessionMutationIntent::AdvanceLogicalTime,
-                        scope,
-                        deadline,
-                    )
-                    .await
-                    .map_err(|error| match error {
-                        // A shared logical-time advance has no caller-visible
-                        // mutation. Its unresolved result remains a transient
-                        // read failure, exactly as the direct path did.
-                        StoreError::BackendOperationOutcomeUnavailable => consensus_unavailable(),
-                        error => error,
-                    })
+        let result = {
+            let submission = async {
+                match store.upgrade() {
+                    Some(inner) => {
+                        let store = ConsensusSessionStore { inner };
+                        store
+                            .submit_request_before(
+                                SessionConsensusRequestId::new(),
+                                SessionMutationIntent::AdvanceLogicalTime,
+                                scope,
+                                deadline,
+                            )
+                            .await
+                            .map_err(|error| match error {
+                                // A shared logical-time advance has no caller-visible
+                                // mutation. Its unresolved result remains a transient
+                                // read failure, exactly as the direct path did.
+                                StoreError::BackendOperationOutcomeUnavailable => {
+                                    consensus_unavailable()
+                                }
+                                error => error,
+                            })
+                    }
+                    None => Err(consensus_unavailable()),
+                }
+            };
+            tokio::pin!(submission);
+            let all_reply_authority_lost = async {
+                for request in &mut cohort {
+                    if request.reply.is_closed() || tokio::time::Instant::now() >= request.deadline
+                    {
+                        continue;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = request.reply.closed() => {}
+                        _ = tokio::time::sleep_until(request.deadline) => {}
+                    }
+                }
+            };
+            tokio::pin!(all_reply_authority_lost);
+            tokio::select! {
+                biased;
+                result = &mut submission => Some(result),
+                () = &mut all_reply_authority_lost => None,
             }
-            None => Err(consensus_unavailable()),
+        };
+        let Some(result) = result else {
+            // Dropping an unaccepted submission cancels its routing/proposal
+            // work. If client_write_ff already accepted it, the lower-level
+            // detached supervisor retains the proposal permit and completes
+            // the outcome independently of this caller cohort.
+            continue;
         };
         for request in cohort {
             let _ = request.reply.send(result.clone());
@@ -13147,6 +13192,108 @@ mod membership_tests {
             store.inner.raft.metrics().borrow().last_log_index,
             Some(before + 2),
             "rejected overflow cannot append another logical-time command"
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_read_time_supervisor_drops_all_dead_preproposal_cohort_without_dispatch() {
+        let directory = tempfile::tempdir().expect("logical-read pruning directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("logical-read pruning SQLite backend");
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open logical-read pruning store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize logical-read pruning store");
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        let held_proposals = Arc::clone(&store.inner.proposal_admission)
+            .acquire_many_owned(
+                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                    .expect("proposal capacity fits u32"),
+            )
+            .await
+            .expect("hold every proposal before client_write_ff");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut dead_callers = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move { store.logical_read_time_before(None, deadline).await })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.inner.logical_read_time.admission.available_permits()
+                > DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY - dead_callers.len()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dead cohort reaches bounded supervisor admission");
+        for caller in &dead_callers {
+            caller.abort();
+        }
+        for caller in dead_callers.drain(..) {
+            let _ = caller.await;
+        }
+        let dead_permits = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&store.inner.logical_read_time.admission).acquire_many_owned(
+                u32::try_from(DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY)
+                    .expect("logical-read admission capacity fits u32"),
+            ),
+        )
+        .await
+        .expect("all-dead preproposal cohort releases its admissions")
+        .expect("logical-read admission remains open");
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before),
+            "a cohort with no live reply authority appends no consensus command"
+        );
+        drop(dead_permits);
+
+        let dead_store = store.clone();
+        let dead =
+            tokio::spawn(async move { dead_store.logical_read_time_before(None, deadline).await });
+        let live_store = store.clone();
+        let live =
+            tokio::spawn(async move { live_store.logical_read_time_before(None, deadline).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.inner.logical_read_time.admission.available_permits()
+                > DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY - 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mixed cohort reaches bounded supervisor admission");
+        dead.abort();
+        let _ = dead.await;
+        drop(held_proposals);
+        let _live_result = tokio::time::timeout(Duration::from_secs(1), live)
+            .await
+            .expect("mixed cohort live caller completes")
+            .expect("join mixed cohort live caller")
+            .expect("mixed cohort logical-time proposal succeeds");
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "one live member causes exactly one logical-time proposal"
         );
     }
 
