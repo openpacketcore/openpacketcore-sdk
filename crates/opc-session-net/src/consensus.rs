@@ -326,6 +326,10 @@ struct ConsensusConnection {
     response_frame_size: usize,
     request_frame_size: usize,
     lifecycle: ConnectionLifecycle,
+    // This is set only after a complete response has passed call-ID
+    // correlation and payload validation. TCP/TLS establishment and attempted
+    // writes do not prove that the peer observed a request.
+    last_successful_correlated_use: Option<tokio::time::Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -832,6 +836,7 @@ impl ConsensusColdConnector {
                     Some(admission.epoch()),
                 )
                 .map_err(|_| SessionConsensusPeerError::Protocol)?,
+                last_successful_correlated_use: None,
             });
         }
 
@@ -861,6 +866,7 @@ impl ConsensusColdConnector {
                 None,
             )
             .map_err(|_| SessionConsensusPeerError::Protocol)?,
+            last_successful_correlated_use: None,
         })
     }
 
@@ -1635,10 +1641,16 @@ impl RemoteSessionConsensusPeer {
         // the taken socket is dropped rather than exposing a late response to
         // the next Openraft RPC.
         if let Some(mut connection) = connection_slot.take() {
-            if self.connection_is_current(&mut connection, tokio::time::Instant::now()) {
+            let now = tokio::time::Instant::now();
+            if !self.connection_idle_reuse_expired(&connection, now)
+                && self.connection_is_current(&mut connection, now)
+            {
                 let result = self
                     .call_negotiated(&mut connection, request, deadline)
                     .await;
+                if result.is_ok() {
+                    connection.last_successful_correlated_use = Some(tokio::time::Instant::now());
+                }
                 if result
                     .as_ref()
                     .is_ok_and(consensus_response_allows_connection_reuse)
@@ -1695,6 +1707,9 @@ impl RemoteSessionConsensusPeer {
         let result = self
             .call_negotiated(&mut connection, request, deadline)
             .await;
+        if result.is_ok() {
+            connection.last_successful_correlated_use = Some(tokio::time::Instant::now());
+        }
         if result
             .as_ref()
             .is_ok_and(consensus_response_allows_connection_reuse)
@@ -1765,6 +1780,19 @@ impl RemoteSessionConsensusPeer {
         // per-peer jitter deadline. Fresh handshakes take the strict mismatch
         // path in `call_once` and are never admitted with stale evidence.
         connection.lifecycle.retirement(now).is_none()
+    }
+
+    fn connection_idle_reuse_expired(
+        &self,
+        connection: &ConsensusConnection,
+        now: tokio::time::Instant,
+    ) -> bool {
+        connection
+            .last_successful_correlated_use
+            .is_some_and(|last_use| {
+                now.saturating_duration_since(last_use)
+                    >= DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit()
+            })
     }
 
     fn mark_connection_usable(&self, connection: &ConsensusConnection) {
@@ -3450,6 +3478,7 @@ mod tests {
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 lifecycle,
+                last_successful_correlated_use: None,
             }),
         };
         control
@@ -3515,6 +3544,7 @@ mod tests {
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 lifecycle,
+                last_successful_correlated_use: None,
             }),
         };
         material.rotate();
@@ -3572,6 +3602,7 @@ mod tests {
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             lifecycle: ConnectionLifecycle::new(policy, now, None, None, 0, None)
                 .expect("connection lifecycle"),
+            last_successful_correlated_use: None,
         };
         assert!(peer.connection_is_current(&mut connection, now));
 
@@ -3681,6 +3712,7 @@ mod tests {
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             lifecycle: ConnectionLifecycle::new(policy, now, None, None, 0, None)
                 .expect("connection lifecycle"),
+            last_successful_correlated_use: None,
         };
 
         control
@@ -5202,6 +5234,7 @@ mod tests {
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 lifecycle,
+                last_successful_correlated_use: None,
             });
         }
         pool.ensure_cached_connection_reaper(
@@ -5231,7 +5264,47 @@ mod tests {
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             lifecycle,
+            last_successful_correlated_use: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consensus_idle_reuse_limit_is_enforced_independently_for_both_lanes() {
+        let policy = ConnectionLifecyclePolicy::default();
+        let now = tokio::time::Instant::now();
+        let lifecycle = || {
+            ConnectionLifecycle::new(policy, now, None, None, 0, None)
+                .expect("cached connection lifecycle")
+        };
+        let (_server_binding, client_binding) = bindings();
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(
+                &client_binding,
+                Arc::new(|| {
+                    Box::pin(async {
+                        Err(io::Error::new(io::ErrorKind::NotFound, "test resolver"))
+                    })
+                }),
+            ),
+            None,
+            client_binding,
+            None,
+        );
+        let mut primary = cached_consensus_connection(lifecycle());
+        let mut overflow = cached_consensus_connection(lifecycle());
+        primary.last_successful_correlated_use = Some(now);
+        overflow.last_successful_correlated_use = Some(now);
+
+        let reuse_limit = DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit();
+        tokio::time::advance(reuse_limit - Duration::from_millis(1)).await;
+        let just_inside = tokio::time::Instant::now();
+        assert!(!peer.connection_idle_reuse_expired(&primary, just_inside));
+        assert!(!peer.connection_idle_reuse_expired(&overflow, just_inside));
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let at_limit = tokio::time::Instant::now();
+        assert!(peer.connection_idle_reuse_expired(&primary, at_limit));
+        assert!(peer.connection_idle_reuse_expired(&overflow, at_limit));
     }
 
     async fn wait_for_cached_lane_to_empty(

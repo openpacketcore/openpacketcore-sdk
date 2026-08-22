@@ -114,6 +114,20 @@ impl DurableConsensusTimingProfile {
         Duration::from_millis(self.server_idle_timeout_millis)
     }
 
+    /// Return the maximum client-observed idle age allowed for a cached
+    /// consensus connection.
+    ///
+    /// A reconnect has to begin before the listener's fixed frame-idle
+    /// ceiling. Reserving the complete cold-connect allowance gives resolver,
+    /// TCP, mutual-TLS, and bootstrap work a profile-owned safety margin
+    /// instead of coupling callers to a deployment-specific timeout.
+    pub const fn client_connection_reuse_limit(self) -> Duration {
+        Duration::from_millis(
+            self.server_idle_timeout_millis
+                .saturating_sub(self.cold_connect_timeout_millis),
+        )
+    }
+
     /// Return the consensus listener handler ceiling.
     pub const fn server_handler_timeout(self) -> Duration {
         Duration::from_millis(self.server_handler_timeout_millis)
@@ -212,6 +226,7 @@ pub fn validate_durable_consensus_timing_profile(
         || profile.vote_timeout_millis != profile.election_timeout_min_millis
         || profile.forward_mutation_timeout_millis > profile.operation_timeout_millis
         || profile.read_barrier_timeout_millis > profile.operation_timeout_millis
+        || profile.server_idle_timeout_millis <= profile.cold_connect_timeout_millis
         || profile.server_idle_timeout_millis < largest_rpc_timeout
         || profile.server_handler_timeout_millis < largest_rpc_timeout
     {
@@ -323,6 +338,11 @@ mod tests {
         assert_eq!(profile.operation_timeout(), Duration::from_millis(10_000));
         assert_eq!(profile.server_idle_timeout(), Duration::from_millis(30_000));
         assert_eq!(
+            profile.client_connection_reuse_limit(),
+            Duration::from_millis(28_500)
+        );
+        assert!(profile.client_connection_reuse_limit() < profile.server_idle_timeout());
+        assert_eq!(
             profile.server_handler_timeout(),
             Duration::from_millis(30_000)
         );
@@ -379,6 +399,10 @@ mod tests {
             },
             DurableConsensusTimingProfile {
                 server_idle_timeout_millis: fixed.install_snapshot_timeout_millis - 1,
+                ..fixed
+            },
+            DurableConsensusTimingProfile {
+                server_idle_timeout_millis: fixed.cold_connect_timeout_millis,
                 ..fixed
             },
             DurableConsensusTimingProfile {

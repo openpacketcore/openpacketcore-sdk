@@ -3153,6 +3153,103 @@ async fn cached_dead_consensus_socket_is_evicted_before_a_fresh_reconnect() {
 }
 
 #[tokio::test]
+async fn consensus_idle_reuse_limit_evicts_before_the_server_idle_trap_without_replay() {
+    let pki = TestPki::new();
+    let manifest = manifest("consensus-idle-reuse-limit", 11, 1);
+    let handler = Arc::new(CountingEchoHandler::default());
+    let binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("server binding");
+    let (server, addr) =
+        SessionConsensusServer::new(handler.clone(), pki.server_config(SERVER_REPLICA), binding)
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("consensus idle-reuse listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let counted_resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(addr) })
+        })
+    };
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        manifest
+            .bind_local(replica_id(1))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding"),
+        counted_resolver,
+        pki.client_config(1),
+        Some(Duration::from_secs(2)),
+    );
+    let reuse_limit = DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit();
+
+    assert!(peer
+        .call(request(&manifest, 1, b"initial".to_vec()))
+        .await
+        .is_ok());
+    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+
+    tokio::time::pause();
+    tokio::time::advance(reuse_limit - Duration::from_millis(1)).await;
+    tokio::time::resume();
+    assert!(peer
+        .call(request(&manifest, 1, b"inside-limit".to_vec()))
+        .await
+        .is_ok());
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "a just-inside cached use must not reconnect"
+    );
+
+    tokio::time::pause();
+    tokio::time::advance(reuse_limit).await;
+    tokio::time::resume();
+    assert!(peer
+        .call(request(&manifest, 1, b"at-limit".to_vec()))
+        .await
+        .is_ok());
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        2,
+        "at the profile-derived limit the cached lane must be evicted before dispatch"
+    );
+
+    // This is the production-shaped cadence: the server has already retired
+    // the fresh cached socket before the next lease retry. The client must
+    // still resolve/TCP/mTLS/bootstrap before writing this request, rather
+    // than discovering EOF after a potentially transmitted call.
+    tokio::time::pause();
+    tokio::time::advance(
+        DURABLE_CONSENSUS_TIMING_PROFILE.server_idle_timeout() + Duration::from_millis(250),
+    )
+    .await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    assert_eq!(
+        peer.call(request(&manifest, 1, b"after-server-idle".to_vec()))
+            .await,
+        Ok(SessionConsensusWireResponse {
+            result: Ok(b"after-server-idle".to_vec()),
+        })
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        3,
+        "the post-idle call must establish a fresh authenticated lane before its first byte"
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        4,
+        "each request is handled exactly once; transport never replays a possibly written call"
+    );
+
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn cached_consensus_connection_retires_at_the_finite_soft_lifecycle_bound() {
     let pki = TestPki::new();
     let manifest = manifest("consensus-cached-lifetime", 12, 1);
