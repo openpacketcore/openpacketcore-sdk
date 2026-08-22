@@ -20,7 +20,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::stream::{self, BoxStream, StreamExt};
-use futures_util::FutureExt;
 use opc_session_store::{
     checked_session_deadline, session_consumer_batch_result_into_store,
     validate_stored_record_expiry_profile, AtomicFencedTransitionCapability, BackendCapabilities,
@@ -122,6 +121,10 @@ pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN: Duration = Duratio
 
 const DEFAULT_CONSUMER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONSUMER_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+// Connection establishment is bounded independently of an admitted typed
+// request. A per-request dispatch deadline must begin only once the request
+// has crossed the authenticated Hello boundary.
+const DEFAULT_CONSUMER_SETUP_TIMEOUT: Duration = Duration::from_millis(1500);
 const DEFAULT_CONSUMER_MAX_CONNECTIONS: usize = 256;
 const CONSUMER_WATCH_CHANNEL_CAPACITY: usize = 64;
 const CONSUMER_WATCH_CHANNEL_MAX_BYTES: usize = 512 * 1024;
@@ -8859,7 +8862,14 @@ impl PersistentSessionConsumerPool {
         }
         let lane_wait = Arc::clone(&self.lanes).acquire_owned();
         tokio::pin!(lane_wait);
-        let lane = match lane_wait.as_mut().now_or_never() {
+        // Poll the fair semaphore waiter with this task's waker before
+        // accounting it as queued, so the deadline covers the same waiter
+        // that entered Tokio's FIFO queue.
+        let lane = match tokio::select! {
+            biased;
+            result = &mut lane_wait => Some(result),
+            _ = tokio::task::yield_now() => None,
+        } {
             Some(result) => complete_before_deadline(
                 result.map_err(|_| SessionConsumerClientError::ShuttingDown)?,
                 wait_deadline,
@@ -10663,11 +10673,12 @@ impl SessionQuorumConsumerServer {
                 let Ok((stream, _)) = accepted else {
                     continue;
                 };
-                // Capture the one setup boundary at kernel acceptance, before
-                // task bookkeeping or scheduling. TLS, Hello, rejection/Ack,
-                // and publication all consume this same finite budget.
+                // Capture the one finite setup boundary at kernel acceptance,
+                // before task bookkeeping or scheduling. TLS, Hello,
+                // rejection/Ack, and publication consume this setup budget;
+                // an admitted typed request starts its own dispatch deadline.
                 let setup_deadline = tokio::time::Instant::now()
-                    .checked_add(operation_timeout)
+                    .checked_add(DEFAULT_CONSUMER_SETUP_TIMEOUT)
                     .expect("validated consumer setup has a bounded deadline");
                 let service = Arc::clone(&service);
                 let tls_config = tls_config.clone();
