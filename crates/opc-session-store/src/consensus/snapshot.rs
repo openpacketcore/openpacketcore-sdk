@@ -613,7 +613,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::io::{Read as _, Write as _};
 
-    #[cfg(target_os = "linux")]
     use super::PinnedSqliteFile;
     use super::SessionSnapshotFile;
     use tempfile::tempdir;
