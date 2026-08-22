@@ -67,7 +67,6 @@ const QUALIFICATION_PRELOAD_BATCH_OPERATIONS: usize = 256;
 // That leaves real budget for quorum apply while measuring each item's full
 // scheduled-arrival-to-completion latency against the 25 ms p99 contract.
 const QUALIFICATION_PACED_BATCH_OPERATIONS: usize = 8;
-const QUALIFICATION_PROGRESS_OPERATIONS: usize = 4_096;
 // The isolated qualification voters contain only this feature's state. These
 // fixed physical regression envelopes deliberately exceed the immutable
 // semantic receipt maximum to allow SQLite pages/indexes and one bounded WAL,
@@ -473,9 +472,6 @@ fn maintenance_leader_selection_replaces_a_stale_self_reported_three_voter_leade
         last_log_index: None,
         applied_index: None,
         admitted: true,
-        snapshot_wal_bytes: 0,
-        peak_snapshot_wal_bytes: 0,
-        last_snapshot_duration_millis: 0,
     };
 
     let initial_term = [
@@ -665,132 +661,6 @@ fn sqlite_database_family_bytes(path: &Path) -> io::Result<u64> {
                 )
             })
         })
-}
-
-fn sqlite_wal_bytes(path: &Path) -> io::Result<u64> {
-    let mut wal = path.as_os_str().to_os_string();
-    wal.push("-wal");
-    match std::fs::metadata(std::path::PathBuf::from(wal)) {
-        Ok(metadata) => Ok(metadata.len()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(error),
-    }
-}
-
-/// Emit only fixed-dimension, redaction-safe qualification progress.
-///
-/// This deliberately prints no voter IDs, paths, request IDs, or backend
-/// errors. Snapshot WAL values are the builder's authoritative capture-time
-/// measurements; filesystem WAL values provide a separate live observation.
-#[allow(clippy::too_many_arguments)]
-fn emit_release_progress(
-    phase: &str,
-    committed_operations: usize,
-    phase_operations: usize,
-    rotations: usize,
-    started: Instant,
-    phase_started: Instant,
-    stores: &[ConsensusSessionStore],
-    database_paths: &[std::path::PathBuf],
-    snapshot_paths: &[std::path::PathBuf],
-) -> io::Result<()> {
-    let statuses = stores
-        .iter()
-        .map(ConsensusSessionStore::status)
-        .collect::<Vec<_>>();
-    let database_bytes = database_paths
-        .iter()
-        .map(|path| sqlite_database_family_bytes(path))
-        .collect::<io::Result<Vec<_>>>()?;
-    let live_wal_bytes = database_paths
-        .iter()
-        .map(|path| sqlite_wal_bytes(path))
-        .collect::<io::Result<Vec<_>>>()?;
-    let snapshot_bytes = snapshot_paths
-        .iter()
-        .map(|path| directory_bytes(path))
-        .collect::<io::Result<Vec<_>>>()?;
-    if statuses.len() != VOTERS
-        || database_bytes.len() != VOTERS
-        || live_wal_bytes.len() != VOTERS
-        || snapshot_bytes.len() != VOTERS
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "release progress does not cover every voter",
-        ));
-    }
-    let first_leader = statuses.first().and_then(|status| status.leader_id);
-    let leader_unanimous = first_leader.is_some()
-        && statuses
-            .iter()
-            .all(|status| status.leader_id == first_leader);
-    eprintln!(
-        "sdk-702 successor progress: phase={phase} committed_operations={committed_operations} phase_operations={phase_operations} rotations={rotations} elapsed_ms={} phase_elapsed_ms={} terms={:?} last_log_indexes={:?} applied_indexes={:?} admitted={:?} leader_unanimous={leader_unanimous} database_bytes_by_voter={database_bytes:?} live_wal_bytes_by_voter={live_wal_bytes:?} snapshot_bytes_by_voter={snapshot_bytes:?} captured_snapshot_wal_bytes_by_voter={:?} peak_captured_snapshot_wal_bytes_by_voter={:?} last_snapshot_duration_ms_by_voter={:?}",
-        started.elapsed().as_millis(),
-        phase_started.elapsed().as_millis(),
-        statuses.iter().map(|status| status.term).collect::<Vec<_>>(),
-        statuses
-            .iter()
-            .map(|status| status.last_log_index)
-            .collect::<Vec<_>>(),
-        statuses
-            .iter()
-            .map(|status| status.applied_index)
-            .collect::<Vec<_>>(),
-        statuses.iter().map(|status| status.admitted).collect::<Vec<_>>(),
-        statuses
-            .iter()
-            .map(|status| status.snapshot_wal_bytes)
-            .collect::<Vec<_>>(),
-        statuses
-            .iter()
-            .map(|status| status.peak_snapshot_wal_bytes)
-            .collect::<Vec<_>>(),
-        statuses
-            .iter()
-            .map(|status| status.last_snapshot_duration_millis)
-            .collect::<Vec<_>>(),
-    );
-    Ok(())
-}
-
-/// Preserve the existing retry contract while making an exhausted scalable
-/// proposal emit a final redaction-safe checkpoint before the failure escapes.
-#[allow(clippy::too_many_arguments)]
-async fn retry_release_consensus_operation<T, Operation, OperationFuture>(
-    phase: &str,
-    committed_operations: usize,
-    phase_operations: usize,
-    rotations: usize,
-    started: Instant,
-    phase_started: Instant,
-    stores: &[ConsensusSessionStore],
-    database_paths: &[std::path::PathBuf],
-    snapshot_paths: &[std::path::PathBuf],
-    transient_retries: &AtomicU64,
-    operation: Operation,
-) -> Result<T, StoreError>
-where
-    Operation: FnMut() -> OperationFuture,
-    OperationFuture: Future<Output = Result<T, StoreError>>,
-{
-    let result = retry_exact_consensus_operation(transient_retries, operation).await;
-    if result.is_err() {
-        emit_release_progress(
-            phase,
-            committed_operations,
-            phase_operations,
-            rotations,
-            started,
-            phase_started,
-            stores,
-            database_paths,
-            snapshot_paths,
-        )
-        .expect("release retry-exhaustion resource checkpoint");
-    }
-    result
 }
 
 fn assert_voter_resource_ceiling(label: &str, values: &[u64], ceiling: u64) {
@@ -1703,24 +1573,11 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         }
     }
     assert_eq!(sessions.len(), QUALIFICATION_SESSIONS);
-    emit_release_progress(
-        "preload-complete",
-        QUALIFICATION_SESSIONS,
-        QUALIFICATION_SESSIONS,
-        0,
-        started,
-        started,
-        &stores,
-        &database_paths,
-        &snapshot_paths,
-    )
-    .expect("preload release progress");
     let mut representatives = vec![sessions[0].clone()];
     let mut active_epoch = first_epoch;
     let mut active_entries = QUALIFICATION_SESSIONS;
     let mut nonce = QUALIFICATION_SESSIONS;
     let mut rotations = 0usize;
-    let mut committed_before_phase = QUALIFICATION_SESSIONS;
 
     // Keep exactly 50,000 representative sessions in memory. The retained
     // receipt resource itself is bounded by the public eight-epoch contract
@@ -1829,19 +1686,9 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
                 nonce += 1;
             }
             let batch_started = Instant::now();
-            let outcomes = retry_release_consensus_operation(
-                phase_name,
-                committed_before_phase + submitted,
-                submitted,
-                rotations,
-                started,
-                phase_started,
-                &stores,
-                &database_paths,
-                &snapshot_paths,
-                &transient_retries,
-                || stores[leader].fenced_transition_v2_batch(requests.clone()),
-            )
+            let outcomes = retry_exact_consensus_operation(&transient_retries, || {
+                stores[leader].fenced_transition_v2_batch(requests.clone())
+            })
             .await
             .expect("paced bounded V2 batch");
             latency.record_batch(batch_started.elapsed(), &scheduled_at);
@@ -1860,22 +1707,6 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
             }
             active_entries += batch_len;
             submitted += batch_len;
-            if submitted.is_multiple_of(QUALIFICATION_PROGRESS_OPERATIONS)
-                || submitted == operations
-            {
-                emit_release_progress(
-                    phase_name,
-                    committed_before_phase + submitted,
-                    submitted,
-                    rotations,
-                    started,
-                    phase_started,
-                    &stores,
-                    &database_paths,
-                    &snapshot_paths,
-                )
-                .expect("periodic release progress");
-            }
         }
         let elapsed = phase_started.elapsed();
         let batch_samples = latency.batch.len();
@@ -1896,7 +1727,6 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         );
         assert!(item_p99 <= Duration::from_millis(25));
         assert!(item_p999 <= Duration::from_millis(100));
-        committed_before_phase += operations;
     }
 
     assert_eq!(
@@ -2111,17 +1941,9 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         .map(|path| directory_bytes(path))
         .collect::<io::Result<Vec<_>>>()
         .expect("post-reclaim snapshot resource evidence");
-    let peak_snapshot_wal_bytes_by_voter = stores
-        .iter()
-        .map(|store| store.status().peak_snapshot_wal_bytes)
-        .collect::<Vec<_>>();
-    let last_snapshot_duration_ms_by_voter = stores
-        .iter()
-        .map(|store| store.status().last_snapshot_duration_millis)
-        .collect::<Vec<_>>();
     let peak_rss_kib = process_peak_rss_kib();
     eprintln!(
-        "sdk-702 successor qualification: elapsed_ms={} topology_voters={} release_operations_committed={} active_reclaim_operations_committed=1 total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} peak_captured_snapshot_wal_bytes_by_voter={peak_snapshot_wal_bytes_by_voter:?} last_snapshot_duration_ms_by_voter={last_snapshot_duration_ms_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
+        "sdk-702 successor qualification: elapsed_ms={} topology_voters={} release_operations_committed={} active_reclaim_operations_committed=1 total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
         started.elapsed().as_millis(),
         stores.len(),
         QUALIFICATION_RELEASE_TRANSITIONS,
