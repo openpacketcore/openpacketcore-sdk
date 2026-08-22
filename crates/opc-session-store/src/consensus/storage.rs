@@ -1381,9 +1381,9 @@ async fn build_file_backed_snapshot_database(
     #[cfg(test)]
     let snapshot_capture_gate = Arc::clone(&core.snapshot_capture_gate);
     // The owned guard moves into the worker and comes back with its result.
-    // Cancelling the async caller cannot detach a second snapshot worker or a
-    // second WAL-pinning reader for this consensus core.
-    let (snapshot_guard, captured) = tokio::task::spawn_blocking(move || {
+    // Cancellation of the async caller therefore cannot detach a second
+    // snapshot worker or a second WAL-pinning reader for this consensus core.
+    let (captured, snapshot_guard) = tokio::task::spawn_blocking(move || {
         let raw_artifact = raw_artifact;
         let vacuum_artifact = vacuum_artifact;
         #[cfg(test)]
@@ -1431,7 +1431,11 @@ async fn build_file_backed_snapshot_database(
             (Err(_), Err(release_error)) | (Ok(_), Err(release_error)) => Err(release_error),
             (Err(error), Ok(())) => Err(error),
         };
-        (snapshot_guard, captured)
+        // Keep cleanup-bearing capture state before the guard in drop order.
+        // If the async caller is cancelled, Tokio drops this detached worker
+        // output in field order, so every unpublished artifact is removed
+        // before another snapshot builder can acquire sole-worker ownership.
+        (captured, snapshot_guard)
     })
     .await
     .map_err(|_| {
