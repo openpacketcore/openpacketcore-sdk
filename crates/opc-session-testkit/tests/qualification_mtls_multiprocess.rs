@@ -3595,8 +3595,12 @@ impl Fleet {
         let observed_at = Instant::now();
         let mut stable_since = observed_at;
         let mut server_tail_entered = observed_at >= server_tail_deadline;
-        let node_indices = (0..self.member_count()).collect::<Vec<_>>();
 
+        // The caller has just established all-voter readiness, and the next
+        // recovered-member phase establishes it again after this clean
+        // baseline. Do not issue readiness probes inside this interval: a
+        // probe uses the same authenticated consensus lanes whose terminal
+        // outcomes this loop is required to account for.
         loop {
             let traffic = self.traffic_status_snapshots_on_by(
                 &participants.observers,
@@ -3676,29 +3680,6 @@ impl Fleet {
                 traffic_progress.record_coverage(traffic.clone(), traffic_observed_at);
             }
 
-            let member_count = self.member_count();
-            let required_quorum = self.required_quorum();
-            let readiness_deadline = self.recovery_readiness_probe_deadline(
-                traffic_before,
-                &mut traffic_progress,
-                participants,
-                phase,
-                deadline,
-            );
-            let readiness = self.readiness_reports_by(&node_indices, readiness_deadline);
-            assert!(
-                readiness.iter().all(|report| {
-                    report.ready
-                        && report.reason_code == QualificationReadinessCode::Ready
-                        && report.configured_voters == member_count
-                        && report.fresh_reachable_voters == required_quorum
-                        && report.agreeing_voters == required_quorum
-                        && report.required_quorum == required_quorum
-                }),
-                "fleet readiness regressed while flushing fault-era connection outcomes: phase={phase}, readiness={readiness:?}, stderr={:?}",
-                self.stderr_diagnostics()
-            );
-
             lifecycle = self.all_lifecycle_metrics_by(traffic_progress.next_deadline(deadline));
             for (node_index, (fault_before, current)) in before.iter().zip(&lifecycle).enumerate() {
                 assert!(
@@ -3775,7 +3756,7 @@ impl Fleet {
             }
             assert!(
                 deadline_allows_completion(now, deadline),
-                "fault-era connection outcomes did not settle before the recovery baseline: phase={phase}, server_tail_window={server_tail_window:?}, outbound_quiet_window={outbound_quiet_window:?}, elapsed={:?}, outbound_stable_for={outbound_stable_for:?}, readiness={readiness:?}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                "fault-era connection outcomes did not settle before the recovery baseline: phase={phase}, server_tail_window={server_tail_window:?}, outbound_quiet_window={outbound_quiet_window:?}, elapsed={:?}, outbound_stable_for={outbound_stable_for:?}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
                 now.duration_since(started),
                 self.stderr_diagnostics()
             );
