@@ -6023,6 +6023,22 @@ pub(crate) fn validate_command_for_log(
             "session consensus authorized intent nesting is invalid",
         ));
     }
+    match semantic_intent {
+        SessionMutationIntent::PreflightFencedTransitionCapability => {
+            return Err(invalid_data(
+                "session consensus activation preflight reached the log",
+            ));
+        }
+        SessionMutationIntent::ActivateFencedTransitionCapability { schema_version, .. }
+            if *schema_version != FENCED_TRANSITION_SCHEMA_V1
+                || !matches!(command.intent, SessionMutationIntent::Authorized { .. }) =>
+        {
+            return Err(invalid_data(
+                "session consensus activation certificate is invalid",
+            ));
+        }
+        _ => {}
+    }
     if let SessionMutationIntent::CompareAndSet(op) = semantic_intent {
         crate::ttl::validate_stored_record_expiry_at(&op.new_record, command.logical_time)
             .map_err(|_| invalid_data("session consensus record expiry is invalid"))?;
@@ -6232,6 +6248,33 @@ impl MembershipLogProjection {
             EntryPayload::Normal(command) => {
                 let request_id = *command.request_id.as_bytes();
                 let is_fenced_transition = fenced_transition_request(&command.intent).is_some();
+                let is_capability_activation = !is_fenced_transition
+                    && fenced_transition_activation(&command.intent).is_some();
+                if is_capability_activation {
+                    let access_is_authorized = fenced_transition_access_is_authorized_sync(
+                        &self.scope,
+                        storage_identity,
+                        &command.intent,
+                    )?;
+                    if access_is_authorized {
+                        let (scope_identity, voter_set_digest) =
+                            fenced_transition_activation(&command.intent)
+                                .expect("checked capability activation");
+                        if scope_identity != self.scope.current_identity
+                            || voter_set_digest
+                                != fenced_transition_voter_set_digest(
+                                    self.scope.current_identity,
+                                    &self.scope.current_members,
+                                )
+                        {
+                            return Err(invalid_data(
+                                "projected fenced transition activation scope is stale",
+                            ));
+                        }
+                        self.fenced_transition_scope_activated = true;
+                        self.fenced_receipt_ledger_has_commitments = true;
+                    }
+                }
                 if is_fenced_transition {
                     let access_is_authorized = fenced_transition_access_is_authorized_sync(
                         &self.scope,
@@ -6656,6 +6699,8 @@ impl MembershipLogProjection {
             | SessionMutationIntent::ReadConsumerRecord { .. }
             | SessionMutationIntent::FencedTransition(_)
             | SessionMutationIntent::ActivateFencedTransition { .. }
+            | SessionMutationIntent::PreflightFencedTransitionCapability
+            | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
             | SessionMutationIntent::CompareAndSet(_)
             | SessionMutationIntent::DeleteFenced(_)
             | SessionMutationIntent::RefreshTtl { .. }
@@ -7902,12 +7947,26 @@ fn fenced_transition_activation(
             voter_set_digest,
             ..
         } => Some((*scope_identity, *voter_set_digest)),
+        SessionMutationIntent::ActivateFencedTransitionCapability {
+            schema_version,
+            scope_identity,
+            voter_set_digest,
+        } if *schema_version == FENCED_TRANSITION_SCHEMA_V1 => {
+            Some((*scope_identity, *voter_set_digest))
+        }
         SessionMutationIntent::Authorized { mutation, .. } => match mutation.as_ref() {
             SessionMutationIntent::ActivateFencedTransition {
                 scope_identity,
                 voter_set_digest,
                 ..
             } => Some((*scope_identity, *voter_set_digest)),
+            SessionMutationIntent::ActivateFencedTransitionCapability {
+                schema_version,
+                scope_identity,
+                voter_set_digest,
+            } if *schema_version == FENCED_TRANSITION_SCHEMA_V1 => {
+                Some((*scope_identity, *voter_set_digest))
+            }
             _ => None,
         },
         _ => None,
@@ -9704,7 +9763,8 @@ fn execute_application_intent_sync(
 ) -> Result<(SessionMutationOutcome, Option<ReplicationOp>), StoreError> {
     match intent {
         SessionMutationIntent::AdvanceLogicalTime
-        | SessionMutationIntent::BindConsumerRequest { .. } => {
+        | SessionMutationIntent::BindConsumerRequest { .. }
+        | SessionMutationIntent::ActivateFencedTransitionCapability { .. } => {
             Ok((SessionMutationOutcome::Unit, None))
         }
         SessionMutationIntent::ReadConsumerRecord { key } => {
@@ -9838,6 +9898,7 @@ fn execute_application_intent_sync(
         | SessionMutationIntent::FenceTopologyAuthority { .. }
         | SessionMutationIntent::AbortTopologyTransition { .. }
         | SessionMutationIntent::FinalizeTopologyTransition { .. }
+        | SessionMutationIntent::PreflightFencedTransitionCapability
         | SessionMutationIntent::Authorized { .. } => Err(StoreError::BackendUnavailable(
             "session consensus internal intent reached application executor".into(),
         )),
@@ -9896,6 +9957,7 @@ fn fenced_transition_access_is_authorized_sync(
             mutation.as_ref(),
             SessionMutationIntent::FencedTransition(_)
                 | SessionMutationIntent::ActivateFencedTransition { .. }
+                | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
         ) =>
         {
             Ok(application_authority_matches(
@@ -9908,6 +9970,9 @@ fn fenced_transition_access_is_authorized_sync(
         | SessionMutationIntent::ActivateFencedTransition { .. } => {
             Ok(untouched_initial_membership_scope(scope, storage_identity))
         }
+        SessionMutationIntent::ActivateFencedTransitionCapability { .. } => Err(invalid_data(
+            "fenced transition activation lacks an authority envelope",
+        )),
         _ => Err(invalid_data(
             "fenced transition authority envelope is invalid",
         )),
@@ -10221,6 +10286,41 @@ pub(crate) fn apply_entries_with_authority_sync(
             EntryPayload::Normal(command) => {
                 let digest = payload_digest(identity, &command)?;
                 let is_fenced_transition = fenced_transition_request(&command.intent).is_some();
+                let is_capability_activation = !is_fenced_transition
+                    && fenced_transition_activation(&command.intent).is_some();
+                if is_capability_activation {
+                    let access_is_authorized = fenced_transition_access_is_authorized_sync(
+                        &scope,
+                        identity,
+                        &command.intent,
+                    )?;
+                    if access_is_authorized {
+                        let (scope_identity, voter_set_digest) =
+                            fenced_transition_activation(&command.intent)
+                                .expect("checked capability activation");
+                        if scope_identity != scope.current_identity
+                            || voter_set_digest
+                                != fenced_transition_voter_set_digest(
+                                    scope.current_identity,
+                                    &scope.current_members,
+                                )
+                        {
+                            return Err(invalid_data(
+                                "fenced transition activation scope is stale",
+                            ));
+                        }
+                        // This is a cluster-scope certificate only. It has no
+                        // tenant/session body and publishes no replication
+                        // effect; the generic authenticated command below
+                        // durably records its idempotent outcome.
+                        activate_fenced_transition_scope_sync(
+                            &tx,
+                            identity,
+                            scope.current_identity,
+                            &scope.current_members,
+                        )?;
+                    }
+                }
                 if is_fenced_transition {
                     let access_is_authorized = fenced_transition_access_is_authorized_sync(
                         &scope,

@@ -4135,38 +4135,48 @@ async fn fenced_transition_preproposal_partition_leaves_no_receipt_or_fence() {
 }
 
 #[tokio::test]
-async fn fenced_transition_durable_activation_avoids_reprobe_on_rejecting_peer_path() {
+async fn state_voter_activation_avoids_reprobe_on_rejecting_peer_path() {
     let cluster = TestCluster::start().await;
     let (leader, _, _) = cluster.observed_leader();
     let source = (leader + 1) % MEMBER_COUNT;
     let store = &cluster.stores[source];
-
-    let activation_key = session_key(b"fenced-transition-activation-before-rejected-probe");
-    let activation_observation = store
-        .observe_fenced_transition(&activation_key)
-        .await
-        .expect("observe the activating transition key");
-    let (activation_request, _) = fenced_acquire_create_request(
-        activation_key,
-        owner("fenced-transition-activation-owner"),
-        activation_observation.current_fence(),
-        [0x60; 16],
-        Duration::from_secs(30),
-        b"sealed-fenced-transition-activation-before-rejected-probe",
-    );
+    let before = cluster.stores[leader]
+        .status()
+        .last_log_index
+        .expect("formed cluster log head");
     store
-        .fenced_transition(activation_request)
+        .activate_fenced_transition_capability()
         .await
-        .expect("commit the first transition and durable activation");
+        .expect("commit the state-voter V1 activation before consumer readiness");
+    assert_eq!(
+        store.status().applied_index,
+        Some(before + 1),
+        "a forwarding voter returns from activation only after its local state machine applies the certificate"
+    );
     cluster
         .wait_all_ready(RECOVERY_TIMEOUT)
         .await
         .expect("all live voters apply durable activation");
+    assert_eq!(
+        cluster.stores[leader].status().last_log_index,
+        Some(before + 1),
+        "cold state-voter activation appends exactly one cluster-scope certificate"
+    );
+    store
+        .activate_fenced_transition_capability()
+        .await
+        .expect("repeated startup activation is idempotent");
+    assert_eq!(
+        cluster.stores[leader].status().last_log_index,
+        Some(before + 1),
+        "a durable exact certificate avoids a second activation proposal"
+    );
 
     // This precise shim is not an old binary: it rejects only a new V1 probe,
     // while ordinary barriers, forwarding, and Raft append traffic stay live.
     // A later operation must use the durable activation rather than probing it.
     cluster.reject_fenced_transition_capability_probe(source, leader);
+    cluster.reject_fenced_transition_capability_probe(leader, source);
     assert!(
         matches!(
             store
@@ -4198,7 +4208,7 @@ async fn fenced_transition_durable_activation_avoids_reprobe_on_rejecting_peer_p
         .expect("post-activation transition succeeds through the rejecting probe path");
     assert!(
         matches!(second.mutation(), FencedTransitionMutationResult::Created),
-        "the activated path commits one fresh record"
+        "the activated path commits one fresh record without any capability-probe RPC"
     );
     assert!(
         cluster.forward_mutation_calls(source) > forwards_before,
@@ -4217,6 +4227,38 @@ async fn fenced_transition_durable_activation_avoids_reprobe_on_rejecting_peer_p
         "the post-activation transition retains its exact result"
     );
     cluster.restore_current_rpc_handler(source, leader);
+    cluster.restore_current_rpc_handler(leader, source);
+}
+
+#[tokio::test]
+async fn state_voter_activation_rejects_a_missing_exact_v1_peer_before_proposal() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let rejected_peer = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[leader];
+    let before = store
+        .status()
+        .last_log_index
+        .expect("formed cluster has a durable log head");
+
+    // This preserves ordinary authenticated Raft and read-barrier traffic but
+    // refuses precisely the V1 capability probe from the current leader.
+    cluster.reject_fenced_transition_capability_probe(leader, rejected_peer);
+    let result = store.activate_fenced_transition_capability().await;
+    assert!(
+        matches!(
+            result,
+            Err(StoreError::CapabilityNotSupported(ref capability))
+                if capability == "atomic_fenced_transition_v1"
+        ),
+        "a missing exact V1 voter fails the startup preflight closed"
+    );
+    assert_eq!(
+        store.status().last_log_index,
+        Some(before),
+        "a failed unanimous V1 proof cannot append a certificate proposal"
+    );
+    cluster.restore_current_rpc_handler(leader, rejected_peer);
 }
 
 #[tokio::test]

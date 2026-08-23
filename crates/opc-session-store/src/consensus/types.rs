@@ -261,6 +261,26 @@ pub enum SessionMutationIntent {
         /// Canonical digest of the exact voter IDs in that scope.
         voter_set_digest: [u8; 32],
     },
+    /// SDK-internal request to durably activate V1 for the current exact
+    /// voter scope. Only a concrete state voter can submit this marker; the
+    /// local leader replaces it with the scope-bound activation command after
+    /// one typed quorum admission and unanimous V1 probes.
+    #[doc(hidden)]
+    PreflightFencedTransitionCapability,
+    /// SDK-internal cluster-scope V1 activation certificate.
+    ///
+    /// The leader derives every field from its currently admitted scope after
+    /// the preflight marker has been authenticated. Raw callers must never
+    /// submit this command shape directly.
+    #[doc(hidden)]
+    ActivateFencedTransitionCapability {
+        /// Exact V1 protocol schema admitted by every voter.
+        schema_version: u16,
+        /// Exact current authority scope observed during unanimous V1 proof.
+        scope_identity: SessionConsensusIdentity,
+        /// Canonical digest of the exact voter IDs in that scope.
+        voter_set_digest: [u8; 32],
+    },
 }
 
 impl fmt::Debug for SessionMutationIntent {
