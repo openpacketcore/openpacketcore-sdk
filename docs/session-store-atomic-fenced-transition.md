@@ -633,11 +633,15 @@ WAL, snapshot envelope, and filesystem allocation overhead; deployment capacity
 must add those measured overheads rather than treating the logical total as a
 disk reservation.
 
-A response remains at most 16 KiB on the wire: the larger 17,408-byte persisted
-allowance includes durable serialization and envelope budgeting, and history
-size does not make one operation's wire response larger. Snapshot transfer must
-budget the combined logical maximum above plus its envelope and storage-engine
-overhead; it must stream, not materialize all receipt outcomes in memory.
+One canonical JSON singleton or per-item outcome remains at most 16 KiB: the
+larger 17,408-byte persisted allowance includes durable serialization and
+envelope budgeting, and history size does not make one outcome larger. The
+fully Postcard-encoded V2 batch request vector and outcome vector each have an
+exact 1 MiB (1,048,576-byte) bound. These are inner codec payload bounds; the
+outer authenticated-consumer JSON frame remains subject to its separately
+negotiated frame bound. Snapshot transfer must budget the combined logical
+maximum above plus its envelope and storage-engine overhead; it must stream,
+not materialize all receipt outcomes in memory.
 Lookup is a keyed/indexed operation, maintenance scans only the deterministic
 ordered 1,024-row batch, and durable lifecycle counters (`active_epoch`,
 `retired_through`, generation, bound entries, reclaimed entries) make status

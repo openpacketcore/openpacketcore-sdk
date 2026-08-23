@@ -1659,9 +1659,13 @@ bounded restore scans, capability discovery, a coarse committed-change watch,
 and #696's generic one-record atomic fenced transition. The latter includes an
 exact-key observation, one lease-acquire or lease-renew action plus one bounded
 record mutation, and exact retained-status readback. V2 exposes only typed V2
-capability, V2 history state, one epoch-fenced transition, and exact V2
-transition status. V2 does not add raw consensus or replication operations,
-membership/voting authority, or product-specific roster/policy semantics.
+capability, V2 history state, one epoch-fenced transition,
+`SessionConsumerV2Operation::FencedTransitionV2Batch`, and exact V2 transition
+status. The batch is an ordered, same-epoch `1..=256` transition batch and is
+not all-or-nothing: each item has its own outcome and earlier items may have
+effects when a later item does not. V2 does not add raw consensus or replication
+operations, membership/voting authority, or product-specific roster/policy
+semantics.
 Before V1 activation for
 the exact current voter scope, capability, observation, status, and first
 transition admission require fresh authenticated replies from every exact
@@ -1757,9 +1761,13 @@ allowance. The bootstrap and active-frame idle bound remains 5 seconds and one
 complete request/response operation remains bounded to 10 seconds. A watch has
 a 64-item, 512 KiB transport queue, rechecks cancellation at least every 50
 ms, and is also bounded by the 256 KiB store-side projection buffer. The fixed
-request identity is 16 bytes; consumer identity input is capped at 253 UTF-8
-bytes; one batch has at most 256 operations and retains at most 8 MiB of
-serialized response data.
+V1 request identity is 16 bytes; a V2 singleton or V2 batch item identity is
+56 bytes; consumer identity input is capped at 253 UTF-8 bytes. One V1 generic
+batch has at most 256 operations and retains at most 8 MiB of serialized
+response data. A V2 batch has at most 256 operations and separately limits its
+fully Postcard-encoded request vector and outcome vector to 1 MiB each; the
+outer authenticated-consumer JSON frame remains subject to its negotiated
+frame bound.
 
 The complete operation timeout MUST validate strictly greater than zero and no
 greater than 10 seconds. The configured idle timeout is at most 5 seconds and
@@ -1825,7 +1833,10 @@ may have been delivered; the exact caller-owned `FencedTransitionV2RequestId`
 and complete body remain the recovery identity. The client MUST discard that
 lane and MUST NOT mint a successor ID or automatically replay the transition;
 recovery uses exact V2 status under the same ID/body and the durable V2 journal
-where protection is present.
+where protection is present. `OutcomeUnknownBatch { request_ids }` is returned
+when a V2 batch may have been delivered; `request_ids` preserves input order,
+and the client MUST use each matching ID for exact V2 status recovery rather
+than blindly replaying any mutation.
 
 `FencedTransitionStorageExhausted` is a retained, complete-body-bound,
 deterministic no-effect receipt, returned only after ordinary stale-fence,
@@ -1942,15 +1953,22 @@ unavailability MAY block new protection or plaintext reads, but MUST NOT cause
 provider I/O during deterministic apply or make already sealed Raft replay and
 quorum formation depend on provider availability.
 
-Raw physical stores and authenticated-consumer transport implement only V1.
-For protected transitions, V2 requires the outer
-`EncryptingSessionBackend` or `RemoteSealingSessionBackend` to own an SDK
-caller-side durable `PreparedFencedTransitionJournal` and to compose over an
-exact V1 physical boundary that explicitly witnesses unchanged protected bytes.
-This journal, rather than a legacy prepared token or application-persisted
-request state, is the durable recovery authority. The application retains only
-the caller-stable `FencedTransitionRequestId`, which it MUST reuse for that
-same logical operation after restart.
+The following protected-transition rules apply only to #701's protected V2
+composition. Its raw physical store and authenticated-consumer transport execute
+only the V1 `fenced_transition` protocol. This is distinct from #702's
+epoch-fenced V2 protocol, which has its separate
+`FencedTransitionV2Capability::V2`, `FencedTransitionV2PreparedJournal`,
+56-byte identity, and `/2` consumer lane.
+
+For #701 protected transitions, the outer `EncryptingSessionBackend` or
+`RemoteSealingSessionBackend` advertises
+`AtomicFencedTransitionCapability::V2` only when it owns an SDK caller-side
+durable `PreparedFencedTransitionJournal` and composes over an exact V1 physical
+boundary that explicitly witnesses unchanged protected bytes. This #701
+journal, rather than a legacy prepared token or application-persisted request
+state, is the durable recovery authority. The application retains only the
+caller-stable `FencedTransitionRequestId`, which it MUST reuse for that same
+logical operation after restart.
 
 Protected preparation validates the request, capability-gates the exact inner
 V1 boundary, and checks that the journal has no binding for the ID before
@@ -1998,19 +2016,23 @@ NFS-like mounts are unsupported. Within one process, callers MUST clone the
 admitted SDK journal handle instead of reopening the same inode or opening it
 directly through SQLite. The SDK enforces one live SQLite connection per
 admitted inode so its pre-open header check cannot release another connection's
-process-scoped POSIX locks. Platforms without those checks fail closed for V2.
+process-scoped POSIX locks. Platforms without those checks fail closed for the
+#701 protected V2 composition.
 
-The journal uses zeroize-on-drop HMAC-SHA-256 state, SQLite WAL, a fixed
+The #701 journal uses zeroize-on-drop HMAC-SHA-256 state, SQLite WAL, a fixed
 pre-open page/cache-header profile, `synchronous=EXTRA`, bounded SQLite limits
 and catalog/membership scans, and bounded opaque rows containing no plaintext.
 A full authenticated journal
 rejects a new ID before expiry, provider, or inner-prepare work. Payloads,
 identities, request IDs, paths, keys, provider material, token bytes, and
 journal contents MUST NOT appear in examples, fixtures, logs, diagnostics, or
-evidence. Prepared-token schema, journal schema, and V2 are downgrade fences:
-unknown versions, raw V1, and older binaries MUST NOT operate the protected
-journaled path. The V2 journal layer makes no journal GC, retention,
-ledger-lifetime, or capacity-lifecycle claim.
+evidence. The #701 prepared-token and `PreparedFencedTransitionJournal` schemas
+are downgrade fences: unknown versions, raw V1, and older binaries MUST NOT
+operate this protected journaled path. #702's separate
+`FencedTransitionV2Capability::V2` and `FencedTransitionV2PreparedJournal` do
+not upgrade, replace, or share the #701 protocol or journal. The #701 journal
+layer makes no journal GC, retention, ledger-lifetime, or capacity-lifecycle
+claim.
 
 The schema-3 journal also commits a fresh per-journal incarnation, bounded
 membership count, and root over the exact retained request-ID/tag set with a

@@ -272,9 +272,13 @@ status recovery for ordinary acquire, renew, and release requests. Product
 composition and ePDG-specific semantics remain excluded.
 
 V2 is deliberately narrower: its only typed operations are V2 capability,
-active-history state, one epoch-fenced transition, and exact V2 transition
-status. It does not expose raw consensus, replication, membership, or product
-roster/policy authority. A protected `EncryptingSessionBackend` or
+active-history state, one epoch-fenced transition,
+`SessionConsumerV2Operation::FencedTransitionV2Batch`, and exact V2 transition
+status. The batch is an ordered, same-epoch `1..=256` transition batch and is
+not all-or-nothing: each item has its own outcome and earlier items may have
+effects when a later item does not. V2 does not expose raw consensus,
+replication, membership, or product roster/policy authority. A protected
+`EncryptingSessionBackend` or
 `RemoteSealingSessionBackend` must independently be configured with the
 separately scoped `FencedTransitionV2PreparedJournal` described in the
 session-store documentation; V2 transport does not create, substitute for, or
@@ -415,10 +419,13 @@ for a non-effectful V2 capability/history/status operation and can be retried as
 that read. `OutcomeUnknown { request_id }` means a V2 fenced transition may have
 reached the service; the lane is discarded, the caller retains that exact stable
 V2 request ID and complete body, and recovery uses exact V2 status rather than a
-successor ID or replay on another lane. Reauthentication, accepted material
-rotation, idle/lifecycle retirement, and the public bounded shutdown apply to
-both ALPN-isolated pools; shutdown begins both drains together so V2 cannot add
-a second drain window.
+successor ID or replay on another lane. `OutcomeUnknownBatch { request_ids }`
+means a V2 batch may have reached the service; `request_ids` preserves input
+order, and the caller recovers every item through exact V2 status under its
+matching ID rather than blindly replaying any mutation. Reauthentication,
+accepted material rotation, idle/lifecycle retirement, and the public bounded
+shutdown apply to both ALPN-isolated pools; shutdown begins both drains together
+so V2 cannot add a second drain window.
 
 The revision-2 persistent-consumer transport qualification contract remains
 recorded in the v7 profile and the published v6 profile remains the unchanged
