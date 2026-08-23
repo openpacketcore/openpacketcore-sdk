@@ -150,11 +150,16 @@ pub const SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
 /// completed qualification or seamless-rotation production credit.
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON: &str =
     include_str!("../qualification/v2/session-mtls-candidate-evidence.schema.json");
+/// Closed schema for mTLS batch release-gate evidence.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON: &str =
+    include_str!("../qualification/v1/session-mtls-batch-release-gate-evidence.schema.json");
 /// Maximum accepted size of one v2 projected-mTLS candidate evidence document.
 ///
 /// [`SessionMtlsCandidateEvidenceV2::from_json`] applies this bound before
 /// deserializing any untrusted JSON.
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES: usize = 64 * 1024;
+/// Maximum accepted size of one batch release-gate evidence document.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_MAX_BYTES: usize = 64 * 1024;
 
 /// Version of the private node configuration and control protocol.
 pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 4;
@@ -1218,6 +1223,248 @@ pub fn session_mtls_candidate_evidence_v2_schema_sha256() -> String {
         let _ = write!(&mut encoded, "{byte:02x}");
     }
     encoded
+}
+
+/// Closed schema version for the batch release-gate evidence contract.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_VERSION: &str =
+    "opc-session-mtls-batch-release-gate-evidence/v1";
+
+/// SHA-256 of the fixed release-gate workload schedule.
+pub fn session_mtls_batch_release_gate_schedule_sha256() -> String {
+    use std::fmt::Write as _;
+    const SCHEDULE: &str = concat!(
+        "session-mtls-batch-release-gate/v1;members=3;clients=12;lanes=4;",
+        "listener-slots=16;wave=48;preload=50000x256;warm-status=1008x53;",
+        "paced=60000x12@1000;active-history=110001;",
+        "negative=old-credential/new-only-server,new-only-credential/old-root-server"
+    );
+    let digest = Sha256::digest(SCHEDULE.as_bytes());
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256:");
+    for byte in digest {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+/// SHA-256 of the immutable batch release-gate evidence schema bytes.
+pub fn session_mtls_batch_release_gate_evidence_v1_schema_sha256() -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON.as_bytes());
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256:");
+    for byte in digest {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+/// Immutable digest bindings for one batch release-gate observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsBatchReleaseGateBindingsV1 {
+    /// Digest of the closed evidence schema.
+    pub evidence_schema_sha256: String,
+    /// Digest of the consumed qualification configuration.
+    pub configuration_sha256: String,
+    /// Digest of the public projected-material manifest.
+    pub public_material_manifest_sha256: String,
+    /// Digest of the exact fixed workload schedule.
+    pub workload_schedule_sha256: String,
+    /// Source revision from which the observation was built.
+    pub source_revision: String,
+    /// Digest of the source worktree snapshot.
+    pub source_worktree_sha256: String,
+    /// Digest of the spawned qualification child.
+    pub child_sha256: String,
+    /// Digest of the qualification harness.
+    pub harness_sha256: String,
+}
+
+/// Settled connection-pool accounting for one declared client pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+    /// Fixed pool lane role.
+    pub name: String,
+    /// Every physical connection setup attempt for this pool.
+    pub setup_attempts: u64,
+    /// Failed setup attempts for this pool.
+    pub setup_failures: u64,
+    /// Successful setup attempts for this pool.
+    pub setup_successes: u64,
+    /// Queued callers after the pool has settled.
+    pub pool_wait_current: u64,
+    /// Largest observed queued-caller count for this pool.
+    pub pool_wait_max: u64,
+}
+
+/// Closed, non-production evidence emitted by the mTLS batch release gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsBatchReleaseGateEvidenceV1 {
+    /// Closed evidence schema version.
+    pub schema_version: String,
+    /// This record is experimental only.
+    pub experimental: bool,
+    /// This record cannot assert production qualification.
+    pub qualification_complete: bool,
+    /// Cargo profile used for the observation.
+    pub cargo_profile: String,
+    /// Rust optimization level used for the observation.
+    pub opt_level: String,
+    /// Whether debug assertions were enabled.
+    pub debug_assertions: bool,
+    /// Immutable inputs bound to this observation.
+    pub bindings: SessionMtlsBatchReleaseGateBindingsV1,
+    /// Fixed cluster member count.
+    pub members: usize,
+    /// Fixed persistent client count.
+    pub clients: usize,
+    /// Fixed lane count per normal client.
+    pub lanes_per_client: usize,
+    /// Offered logical operations per second, distinct from concurrency.
+    pub logical_operations_per_second: usize,
+    /// Exact retained-request warm status sample count.
+    pub warm_status_samples: usize,
+    /// Exact count of distinct retained requests addressed by warm reads.
+    pub warm_status_request_cardinality: usize,
+    /// Lowest one-based retained preload request index addressed by warm reads.
+    pub warm_status_request_index_min: usize,
+    /// Highest one-based retained preload request index addressed by warm reads.
+    pub warm_status_request_index_max: usize,
+    /// Fixed deterministic retained-request index stride.
+    pub warm_status_request_stride: usize,
+    /// Exact active-history entry count after preload and paced work.
+    pub active_history_entries: usize,
+    /// Accounting for the original fixed normal-client pool set.
+    pub original_fixed_pools: SessionMtlsBatchReleaseGatePoolEvidenceV1,
+    /// Every sequential supplemental pool that reuses released capacity.
+    pub supplemental_pools: Vec<SessionMtlsBatchReleaseGatePoolEvidenceV1>,
+    /// Sum of setup attempts across every declared pool.
+    pub aggregate_setup_attempts: u64,
+    /// Sum of failed setup attempts across every declared pool.
+    pub aggregate_setup_failures: u64,
+    /// Sum of successful setup attempts across every declared pool.
+    pub aggregate_setup_successes: u64,
+    /// Total typed read-unavailable retries during paced batch work.
+    pub typed_read_unavailable_retries: usize,
+    /// Per-call high-water of typed read-unavailable retries.
+    pub typed_read_unavailable_retry_high_water: usize,
+    /// Maximum queued-caller high-water across every declared pool.
+    pub aggregate_pool_wait_max: u64,
+    /// Old client credential rejected by a new-only server while trusting it.
+    pub old_credential_new_only_server_authentication: bool,
+    /// New-only client credential rejected by an old-root server.
+    pub new_only_credential_old_root_server_authentication: bool,
+    /// Exact successful new-credential/new-server normal-client statuses.
+    pub positive_new_credential_new_server_statuses: usize,
+}
+
+/// Typed rejection reason for batch release-gate evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SessionMtlsBatchReleaseGateEvidenceError {
+    /// Input exceeds the bounded evidence-document size.
+    #[error("mTLS batch evidence document exceeds the supported size")]
+    DocumentTooLarge,
+    #[error("mTLS batch evidence document is invalid")]
+    InvalidDocument,
+    #[error("mTLS batch evidence claim is invalid")]
+    Claim,
+    #[error("mTLS batch evidence binding is invalid")]
+    Binding,
+    #[error("mTLS batch evidence pool accounting is invalid")]
+    PoolAccounting,
+}
+
+impl SessionMtlsBatchReleaseGateEvidenceV1 {
+    /// Decode, size-bound, and validate one closed evidence document.
+    pub fn from_json(document: &[u8]) -> Result<Self, SessionMtlsBatchReleaseGateEvidenceError> {
+        if document.len() > SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_MAX_BYTES {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::DocumentTooLarge);
+        }
+        let evidence: Self = serde_json::from_slice(document)
+            .map_err(|_| SessionMtlsBatchReleaseGateEvidenceError::InvalidDocument)?;
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    /// Enforce the fixed schedule, bindings, and complete pool accounting.
+    pub fn validate(&self) -> Result<(), SessionMtlsBatchReleaseGateEvidenceError> {
+        if self.schema_version != SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_VERSION
+            || !self.experimental
+            || self.qualification_complete
+            || self.cargo_profile != "release"
+            || self.opt_level != "3"
+            || self.debug_assertions
+            || self.members != 3
+            || self.clients != 12
+            || self.lanes_per_client != 4
+            || self.logical_operations_per_second != 1_000
+            || self.warm_status_samples != 1_008
+            || self.warm_status_request_cardinality != 1_008
+            || self.warm_status_request_index_min != 1
+            || self.warm_status_request_index_max != 49_980
+            || self.warm_status_request_stride != 53
+            || self.active_history_entries != 110_001
+            || !self.old_credential_new_only_server_authentication
+            || !self.new_only_credential_old_root_server_authentication
+            || self.positive_new_credential_new_server_statuses != 4
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::Claim);
+        }
+        if !is_exact_sha256(&self.bindings.evidence_schema_sha256)
+            || !is_exact_sha256(&self.bindings.configuration_sha256)
+            || !is_exact_sha256(&self.bindings.public_material_manifest_sha256)
+            || !is_exact_sha256(&self.bindings.workload_schedule_sha256)
+            || !is_lower_hex_exact(&self.bindings.source_revision, 40)
+            || !is_exact_sha256(&self.bindings.source_worktree_sha256)
+            || !is_exact_sha256(&self.bindings.child_sha256)
+            || !is_exact_sha256(&self.bindings.harness_sha256)
+            || self.bindings.evidence_schema_sha256
+                != session_mtls_batch_release_gate_evidence_v1_schema_sha256()
+            || self.bindings.workload_schedule_sha256
+                != session_mtls_batch_release_gate_schedule_sha256()
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::Binding);
+        }
+        if self.original_fixed_pools.name != "original_fixed_pools"
+            || self.supplemental_pools.len() != 3
+            || self.supplemental_pools[0].name != "old_credential_new_only_server"
+            || self.supplemental_pools[1].name != "delayed_response_ambiguity"
+            || self.supplemental_pools[2].name != "new_only_credential_old_root_server"
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
+        }
+        let mut observed_max = 0;
+        let mut attempts: u64 = 0;
+        let mut failures: u64 = 0;
+        let mut successes: u64 = 0;
+        for pool in
+            std::iter::once(&self.original_fixed_pools).chain(self.supplemental_pools.iter())
+        {
+            if pool.setup_attempts != pool.setup_successes.saturating_add(pool.setup_failures)
+                || pool.pool_wait_current != 0
+            {
+                return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
+            }
+            attempts = attempts.saturating_add(pool.setup_attempts);
+            failures = failures.saturating_add(pool.setup_failures);
+            successes = successes.saturating_add(pool.setup_successes);
+            observed_max = observed_max.max(pool.pool_wait_max);
+        }
+        if attempts != self.aggregate_setup_attempts
+            || failures != self.aggregate_setup_failures
+            || successes != self.aggregate_setup_successes
+            || attempts != successes.saturating_add(failures)
+            || self.typed_read_unavailable_retry_high_water > self.typed_read_unavailable_retries
+            || observed_max != self.aggregate_pool_wait_max
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
+        }
+        Ok(())
+    }
 }
 
 /// Domain-separated digest of one exact local mTLS campaign schedule.
@@ -3488,6 +3735,8 @@ pub enum QualificationNodeCommandKind {
     DirectedHandshake,
     /// Read bounded connection-lifecycle metrics.
     LifecycleMetrics,
+    /// Read fixed, redaction-safe consensus-store diagnostic counters.
+    ConsensusDiagnostics,
     /// Change the qualification-only consensus RPC fault gate.
     SetConsensusRpcAvailability,
     /// Start the test-only stateless consumer endpoint.
@@ -3548,6 +3797,7 @@ impl QualificationNodeCommandKind {
         Self::RequestReauthentication,
         Self::DirectedHandshake,
         Self::LifecycleMetrics,
+        Self::ConsensusDiagnostics,
         Self::SetConsensusRpcAvailability,
         Self::StartStatelessConsumer,
         Self::ArmStatelessConsumerDelayedResponse,
@@ -3598,6 +3848,8 @@ pub enum QualificationNodeCommand {
         remote_node_index: usize,
     },
     LifecycleMetrics,
+    /// Return fixed, redaction-safe consensus-store diagnostic counters.
+    ConsensusDiagnostics,
     /// Enable or fail closed every consensus RPC path owned by this child.
     /// The stdin control channel remains available while RPCs are disabled.
     SetConsensusRpcAvailability {
@@ -3720,6 +3972,9 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::LifecycleMetrics => {
                 formatter.write_str("QualificationNodeCommand::LifecycleMetrics")
             }
+            Self::ConsensusDiagnostics => {
+                formatter.write_str("QualificationNodeCommand::ConsensusDiagnostics")
+            }
             Self::SetConsensusRpcAvailability { availability } => formatter
                 .debug_struct("QualificationNodeCommand::SetConsensusRpcAvailability")
                 .field("availability", availability)
@@ -3821,6 +4076,7 @@ impl QualificationNodeCommand {
             Self::RequestReauthentication => QualificationNodeCommandKind::RequestReauthentication,
             Self::DirectedHandshake { .. } => QualificationNodeCommandKind::DirectedHandshake,
             Self::LifecycleMetrics => QualificationNodeCommandKind::LifecycleMetrics,
+            Self::ConsensusDiagnostics => QualificationNodeCommandKind::ConsensusDiagnostics,
             Self::SetConsensusRpcAvailability { .. } => {
                 QualificationNodeCommandKind::SetConsensusRpcAvailability
             }
@@ -3867,6 +4123,7 @@ impl QualificationNodeCommand {
             | Self::ReauthenticationGeneration
             | Self::RequestReauthentication
             | Self::LifecycleMetrics
+            | Self::ConsensusDiagnostics
             | Self::SetConsensusRpcAvailability { .. }
             | Self::ArmStatelessConsumerDelayedResponse
             | Self::SecurityMetrics
@@ -4253,6 +4510,9 @@ pub enum QualificationNodeReply {
     },
     LifecycleMetrics {
         metrics: QualificationConnectionLifecycleMetrics,
+    },
+    ConsensusDiagnostics {
+        metrics: opc_session_store::ConsensusStoreDiagnosticSnapshot,
     },
     ConsensusRpcAvailability {
         availability: QualificationConsensusRpcAvailability,
@@ -4886,6 +5146,134 @@ where
 mod tests {
     use super::*;
 
+    fn batch_release_gate_pool(
+        name: &str,
+        successes: u64,
+        failures: u64,
+        wait_max: u64,
+    ) -> SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+        SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+            name: name.to_owned(),
+            setup_attempts: successes + failures,
+            setup_failures: failures,
+            setup_successes: successes,
+            pool_wait_current: 0,
+            pool_wait_max: wait_max,
+        }
+    }
+
+    fn batch_release_gate_evidence_fixture() -> SessionMtlsBatchReleaseGateEvidenceV1 {
+        let original_fixed_pools = batch_release_gate_pool("original_fixed_pools", 48, 0, 2);
+        let supplemental_pools = vec![
+            batch_release_gate_pool("old_credential_new_only_server", 0, 1, 1),
+            batch_release_gate_pool("delayed_response_ambiguity", 4, 0, 3),
+            batch_release_gate_pool("new_only_credential_old_root_server", 0, 1, 1),
+        ];
+        let aggregate_setup_attempts = std::iter::once(&original_fixed_pools)
+            .chain(supplemental_pools.iter())
+            .map(|pool| pool.setup_attempts)
+            .sum();
+        let aggregate_setup_failures = std::iter::once(&original_fixed_pools)
+            .chain(supplemental_pools.iter())
+            .map(|pool| pool.setup_failures)
+            .sum();
+        let aggregate_setup_successes = std::iter::once(&original_fixed_pools)
+            .chain(supplemental_pools.iter())
+            .map(|pool| pool.setup_successes)
+            .sum();
+        SessionMtlsBatchReleaseGateEvidenceV1 {
+            schema_version: SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_VERSION.to_owned(),
+            experimental: true,
+            qualification_complete: false,
+            cargo_profile: "release".to_owned(),
+            opt_level: "3".to_owned(),
+            debug_assertions: false,
+            bindings: SessionMtlsBatchReleaseGateBindingsV1 {
+                evidence_schema_sha256: session_mtls_batch_release_gate_evidence_v1_schema_sha256(),
+                configuration_sha256: format!("sha256:{}", "a".repeat(64)),
+                public_material_manifest_sha256: format!("sha256:{}", "b".repeat(64)),
+                workload_schedule_sha256: session_mtls_batch_release_gate_schedule_sha256(),
+                source_revision: "c".repeat(40),
+                source_worktree_sha256: format!("sha256:{}", "d".repeat(64)),
+                child_sha256: format!("sha256:{}", "e".repeat(64)),
+                harness_sha256: format!("sha256:{}", "f".repeat(64)),
+            },
+            members: 3,
+            clients: 12,
+            lanes_per_client: 4,
+            logical_operations_per_second: 1_000,
+            warm_status_samples: 1_008,
+            warm_status_request_cardinality: 1_008,
+            warm_status_request_index_min: 1,
+            warm_status_request_index_max: 49_980,
+            warm_status_request_stride: 53,
+            active_history_entries: 110_001,
+            original_fixed_pools,
+            supplemental_pools,
+            aggregate_setup_attempts,
+            aggregate_setup_failures,
+            aggregate_setup_successes,
+            typed_read_unavailable_retries: 0,
+            typed_read_unavailable_retry_high_water: 0,
+            aggregate_pool_wait_max: 3,
+            old_credential_new_only_server_authentication: true,
+            new_only_credential_old_root_server_authentication: true,
+            positive_new_credential_new_server_statuses: 4,
+        }
+    }
+
+    #[test]
+    fn batch_release_gate_evidence_round_trips_and_rejects_unsettled_pool() {
+        let evidence = batch_release_gate_evidence_fixture();
+        evidence.validate().expect("valid closed evidence");
+        let encoded = serde_json::to_vec(&evidence).expect("encode evidence");
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(&encoded)
+                .expect("round-trip closed evidence"),
+            evidence
+        );
+
+        let mut unsettled = batch_release_gate_evidence_fixture();
+        unsettled.supplemental_pools[1].pool_wait_current = 1;
+        assert_eq!(
+            unsettled.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut unaccounted = batch_release_gate_evidence_fixture();
+        unaccounted.aggregate_setup_attempts =
+            unaccounted.aggregate_setup_attempts.saturating_add(1);
+        assert_eq!(
+            unaccounted.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+    }
+
+    #[test]
+    fn batch_release_gate_schema_and_schedule_are_closed() {
+        let schema: serde_json::Value =
+            serde_json::from_str(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON)
+                .expect("batch release-gate schema is JSON");
+        assert_eq!(
+            schema["properties"]["schema_version"]["const"],
+            SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_VERSION
+        );
+        assert_eq!(
+            schema["properties"]["active_history_entries"]["const"],
+            110_001
+        );
+        assert!(schema["required"]
+            .as_array()
+            .expect("closed schema has required fields")
+            .iter()
+            .any(|field| field == "aggregate_setup_attempts"));
+        assert_ne!(
+            session_mtls_batch_release_gate_schedule_sha256(),
+            session_mtls_candidate_schedule_sha256(SessionMtlsCandidateCampaign::RotationCore, 3)
+                .expect("rotation-core schedule is defined")
+        );
+    }
+
     #[test]
     fn bounded_line_reader_rejects_oversize_before_next_frame() {
         let input = format!(
@@ -5046,6 +5434,7 @@ mod tests {
                 remote_node_index: 1,
             },
             QualificationNodeCommand::LifecycleMetrics,
+            QualificationNodeCommand::ConsensusDiagnostics,
             QualificationNodeCommand::SetConsensusRpcAvailability {
                 availability: QualificationConsensusRpcAvailability::Available,
             },

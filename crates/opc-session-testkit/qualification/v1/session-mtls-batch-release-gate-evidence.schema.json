@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-mtls-batch-release-gate-evidence/v1",
+  "title": "Closed local persistent-V2 batch release-gate evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "experimental", "qualification_complete", "cargo_profile", "opt_level", "debug_assertions", "bindings", "members", "clients", "lanes_per_client", "logical_operations_per_second", "warm_status_samples", "warm_status_request_cardinality", "warm_status_request_index_min", "warm_status_request_index_max", "warm_status_request_stride", "active_history_entries", "original_fixed_pools", "supplemental_pools", "aggregate_setup_attempts", "aggregate_setup_failures", "aggregate_setup_successes", "typed_read_unavailable_retries", "typed_read_unavailable_retry_high_water", "aggregate_pool_wait_max", "old_credential_new_only_server_authentication", "new_only_credential_old_root_server_authentication", "positive_new_credential_new_server_statuses"],
+  "properties": {
+    "schema_version": {"const": "opc-session-mtls-batch-release-gate-evidence/v1"},
+    "experimental": {"const": true},
+    "qualification_complete": {"const": false},
+    "cargo_profile": {"const": "release"},
+    "opt_level": {"const": "3"},
+    "debug_assertions": {"const": false},
+    "bindings": {"$ref": "#/$defs/bindings"},
+    "members": {"const": 3},
+    "clients": {"const": 12},
+    "lanes_per_client": {"const": 4},
+    "logical_operations_per_second": {"const": 1000},
+    "warm_status_samples": {"const": 1008},
+    "warm_status_request_cardinality": {"const": 1008},
+    "warm_status_request_index_min": {"const": 1},
+    "warm_status_request_index_max": {"const": 49980},
+    "warm_status_request_stride": {"const": 53},
+    "active_history_entries": {"const": 110001},
+    "original_fixed_pools": {"$ref": "#/$defs/pool"},
+    "supplemental_pools": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"$ref": "#/$defs/pool"}},
+    "aggregate_setup_attempts": {"type": "integer", "minimum": 0},
+    "aggregate_setup_failures": {"type": "integer", "minimum": 0},
+    "aggregate_setup_successes": {"type": "integer", "minimum": 0},
+    "typed_read_unavailable_retries": {"type": "integer", "minimum": 0},
+    "typed_read_unavailable_retry_high_water": {"type": "integer", "minimum": 0},
+    "aggregate_pool_wait_max": {"type": "integer", "minimum": 0},
+    "old_credential_new_only_server_authentication": {"const": true},
+    "new_only_credential_old_root_server_authentication": {"const": true},
+    "positive_new_credential_new_server_statuses": {"const": 4}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "bindings": {
+      "type": "object", "additionalProperties": false,
+      "required": ["evidence_schema_sha256", "configuration_sha256", "public_material_manifest_sha256", "workload_schedule_sha256", "source_revision", "source_worktree_sha256", "child_sha256", "harness_sha256"],
+      "properties": {
+        "evidence_schema_sha256": {"$ref": "#/$defs/sha256"}, "configuration_sha256": {"$ref": "#/$defs/sha256"}, "public_material_manifest_sha256": {"$ref": "#/$defs/sha256"}, "workload_schedule_sha256": {"$ref": "#/$defs/sha256"}, "source_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "source_worktree_sha256": {"$ref": "#/$defs/sha256"}, "child_sha256": {"$ref": "#/$defs/sha256"}, "harness_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "pool": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "setup_attempts", "setup_failures", "setup_successes", "pool_wait_current", "pool_wait_max"],
+      "properties": {"name": {"type": "string", "maxLength": 64}, "setup_attempts": {"type": "integer", "minimum": 0}, "setup_failures": {"type": "integer", "minimum": 0}, "setup_successes": {"type": "integer", "minimum": 0}, "pool_wait_current": {"type": "integer", "minimum": 0}, "pool_wait_max": {"type": "integer", "minimum": 0}}
+    }
+  }
+}
