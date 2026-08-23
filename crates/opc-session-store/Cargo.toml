@@ -20,6 +20,9 @@ default = []
 # Enables non-production consensus election controls used only by integration
 # tests that must deterministically exercise a real authenticated campaign.
 test-control = []
+# Test-only VFS hooks used to qualify SQLite durability boundaries with the
+# bundled SQLite build. This feature is never enabled by production crates.
+test-vfs = ["opc-sqlite-file-control-sys/test-vfs"]
 
 [dependencies]
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
@@ -62,6 +65,11 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "test-util"] }
 tempfile = "3"
 proptest = "1.9"
+
+[[test]]
+name = "sqlite_checkpoint_hotpath"
+path = "tests/sqlite_checkpoint_hotpath.rs"
+required-features = ["test-vfs"]
 
 [lints]
 workspace = true

@@ -14,8 +14,8 @@ categories = ["database", "external-ffi-bindings"]
 publish = false
 
 [features]
-# Compile only for the session-store unit regression that proves snapshot
-# finalization does not require a process-global SQLite temporary directory.
+# Test-only VFS hooks for session-store snapshot and SQLite durability
+# qualification. Production crates never enable this feature.
 test-vfs = []
 
 [dependencies]
