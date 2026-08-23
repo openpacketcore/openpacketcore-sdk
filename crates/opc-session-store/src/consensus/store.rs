@@ -2935,13 +2935,19 @@ impl ConsensusSessionStore {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
+        let every_request_is_self_authenticated =
+            requests.iter().all(|request| request.validate().is_ok());
         let route_scope = self.public_fixed_raw_v2_warm_scope()?;
         let outcomes = self
             .fenced_transition_v2_batch_before(requests, route_scope, deadline)
             .await?;
         // A fresh public batch keeps the existing singleton activation shape;
-        // only its definitive successful return can warm later public calls.
-        self.seed_fixed_raw_v2_warm_route();
+        // only its definitive successful return for an entirely
+        // self-authenticated request set can warm later public calls. A
+        // locally resolved body conflict is not activation evidence.
+        if every_request_is_self_authenticated {
+            self.seed_fixed_raw_v2_warm_route();
+        }
         Ok(outcomes)
     }
 
@@ -2971,6 +2977,8 @@ impl ConsensusSessionStore {
         requests: Vec<FencedTransitionV2Request>,
         deadline: tokio::time::Instant,
     ) -> Result<(Vec<Result<FencedTransitionOutcome, StoreError>>, bool), StoreError> {
+        let every_request_is_self_authenticated =
+            requests.iter().all(|request| request.validate().is_ok());
         let result = self
             .fenced_transition_v2_batch_execution_before(
                 requests,
@@ -2979,7 +2987,7 @@ impl ConsensusSessionStore {
                 true,
             )
             .await;
-        if result.is_ok() {
+        if result.is_ok() && every_request_is_self_authenticated {
             self.seed_fixed_raw_v2_warm_route();
         }
         result
@@ -2993,6 +3001,18 @@ impl ConsensusSessionStore {
         preserve_rejected_response: bool,
     ) -> Result<(Vec<Result<FencedTransitionOutcome, StoreError>>, bool), StoreError> {
         validate_fenced_transition_v2_batch(&requests)?;
+        let contains_body_conflict = requests
+            .iter()
+            .any(fenced_transition_v2_request_is_body_conflict);
+        if requests
+            .iter()
+            .all(fenced_transition_v2_request_is_body_conflict)
+        {
+            return Ok((
+                fenced_transition_v2_batch_body_conflict_outcomes(&requests),
+                false,
+            ));
+        }
 
         // Local V2 support is only a route hint. The exact consumer scope is
         // carried in the forwarded request and the selected leader consumes
@@ -3037,9 +3057,10 @@ impl ConsensusSessionStore {
             .require_fenced_transition_v2_capability_before(deadline)
             .await?;
 
-        // Batch coalescing never activates or replays an arbitrary lifecycle
-        // epoch.  Every submitted batch uses the one currently active epoch;
-        // the singleton activation below has the same exact precondition.
+        // Batch coalescing admits only the active epoch or the bounded
+        // retained interval above the durable floor. SQLite remains the
+        // authority that distinguishes an exact retained receipt from an
+        // unbound identity in that closed epoch.
         let (authority_identity, _) = self.current_scope()?;
         if required_consumer_scope.is_none()
             && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
@@ -3057,10 +3078,19 @@ impl ConsensusSessionStore {
                 authority_identity,
             )
             .await?;
-        require_fenced_transition_v2_batch_active_epoch(
+        if let Err(error) = require_fenced_transition_v2_batch_history_epoch(
             &history,
             requests[0].request_id().epoch(),
-        )?;
+        ) {
+            return if contains_body_conflict {
+                Ok((
+                    fenced_transition_v2_batch_epoch_outcomes(&requests, error),
+                    false,
+                ))
+            } else {
+                Err(error)
+            };
+        }
         if !self
             .current_scope()
             .is_ok_and(|(current_identity, _)| current_identity == authority_identity)
@@ -3077,7 +3107,19 @@ impl ConsensusSessionStore {
             // V2 caller effect keeps the pre-existing singleton activation
             // receipt/certificate semantics.  Only after that one committed
             // effect may the remaining items share their single batch entry.
-            let first = requests.remove(0);
+            let Some(activation_slot) = requests
+                .iter()
+                .position(|request| !fenced_transition_v2_request_is_body_conflict(request))
+            else {
+                return Ok((
+                    fenced_transition_v2_batch_body_conflict_outcomes(&requests),
+                    false,
+                ));
+            };
+            let first = requests.remove(activation_slot);
+            let has_unresolved_suffix = requests
+                .iter()
+                .any(|request| !fenced_transition_v2_request_is_body_conflict(request));
             let response = self
                 .submit_request_before_with_rejected_response(
                     fenced_transition_v2_outer_request_id(&first),
@@ -3090,8 +3132,10 @@ impl ConsensusSessionStore {
             let activation_committed = response.raft_log_index != 0;
             let outcome = match response.result {
                 Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome,
-                Err(error) if activation_committed && requests.is_empty() => {
-                    return Ok((vec![Err(error)], true));
+                Err(error) if activation_committed && !has_unresolved_suffix => {
+                    let mut outcomes = fenced_transition_v2_batch_body_conflict_outcomes(&requests);
+                    outcomes.insert(activation_slot, Err(error));
+                    return Ok((outcomes, true));
                 }
                 Err(_) if activation_committed => {
                     return Err(StoreError::FencedTransitionOutcomeUnknown);
@@ -3099,12 +3143,13 @@ impl ConsensusSessionStore {
                 Err(error) => return Err(error),
                 Ok(_) => return Err(StoreError::FencedTransitionOutcomeUnknown),
             };
-            activation_outcome = Some(Ok(outcome));
-            if requests.is_empty() {
-                return Ok((
-                    activation_outcome.into_iter().collect(),
-                    activation_committed,
-                ));
+            activation_outcome = Some((activation_slot, Ok(outcome)));
+            if !has_unresolved_suffix {
+                let mut outcomes = fenced_transition_v2_batch_body_conflict_outcomes(&requests);
+                if let Some((slot, outcome)) = activation_outcome {
+                    outcomes.insert(slot, outcome);
+                }
+                return Ok((outcomes, activation_committed));
             }
         }
 
@@ -3141,8 +3186,8 @@ impl ConsensusSessionStore {
             Ok(_) => return Err(StoreError::FencedTransitionOutcomeUnknown),
             Err(error) => return Err(error),
         };
-        if let Some(outcome) = activation_outcome {
-            outcomes.insert(0, outcome);
+        if let Some((slot, outcome)) = activation_outcome {
+            outcomes.insert(slot, outcome);
         }
         Ok((outcomes, committed || activation_effect_may_have_committed))
     }
@@ -3161,6 +3206,8 @@ impl ConsensusSessionStore {
         if let Err(error) = validate_fenced_transition_v2_batch(&requests) {
             return FencedTransitionV2Effect::Resolved(Err(error));
         }
+        let every_request_is_self_authenticated =
+            requests.iter().all(|request| request.validate().is_ok());
         let request_ids = requests
             .iter()
             .map(FencedTransitionV2Request::request_id)
@@ -3176,6 +3223,16 @@ impl ConsensusSessionStore {
                 Err(error) => FencedTransitionV2Effect::NotTransmitted(error),
                 Ok(_) => unknown(),
             };
+
+        if !every_request_is_self_authenticated
+            && requests
+                .iter()
+                .all(fenced_transition_v2_request_is_body_conflict)
+        {
+            return FencedTransitionV2Effect::Resolved(Ok(
+                fenced_transition_v2_batch_body_conflict_outcomes(&requests),
+            ));
+        }
 
         if self.fixed_raw_v2_consumer_warm_route(required_consumer_scope.as_ref()) {
             let request_id = match fenced_transition_v2_batch_request_id(&requests) {
@@ -3249,11 +3306,17 @@ impl ConsensusSessionStore {
             Ok(history) => history,
             Err(error) => return FencedTransitionV2Effect::NotTransmitted(error),
         };
-        if let Err(error) = require_fenced_transition_v2_batch_active_epoch(
+        if let Err(error) = require_fenced_transition_v2_batch_history_epoch(
             &history,
             requests[0].request_id().epoch(),
         ) {
-            return FencedTransitionV2Effect::NotTransmitted(error);
+            return if every_request_is_self_authenticated {
+                FencedTransitionV2Effect::NotTransmitted(error)
+            } else {
+                FencedTransitionV2Effect::Resolved(Ok(fenced_transition_v2_batch_epoch_outcomes(
+                    &requests, error,
+                )))
+            };
         }
         if !self
             .current_scope()
@@ -3267,7 +3330,18 @@ impl ConsensusSessionStore {
             admission,
             FencedTransitionV2CapabilityAdmission::FreshUnanimous
         ) {
-            let first = requests.remove(0);
+            let Some(activation_slot) = requests
+                .iter()
+                .position(|request| !fenced_transition_v2_request_is_body_conflict(request))
+            else {
+                return FencedTransitionV2Effect::Resolved(Ok(
+                    fenced_transition_v2_batch_body_conflict_outcomes(&requests),
+                ));
+            };
+            let first = requests.remove(activation_slot);
+            let has_unresolved_suffix = requests
+                .iter()
+                .any(|request| !fenced_transition_v2_request_is_body_conflict(request));
             let activation_request = first.clone();
             match self
                 .submit_request_effect_before(
@@ -3285,14 +3359,17 @@ impl ConsensusSessionStore {
                 ConsensusSubmissionEffect::Committed(response) => {
                     match committed_fenced_transition_v2_activation_result(
                         &activation_request,
-                        !requests.is_empty(),
+                        has_unresolved_suffix,
                         response,
                     ) {
                         Some(Ok(outcome)) => {
-                            activation_outcome = Some(Ok(outcome));
+                            activation_outcome = Some((activation_slot, Ok(outcome)));
                         }
                         Some(Err(error)) => {
-                            return FencedTransitionV2Effect::Resolved(Ok(vec![Err(error)]));
+                            let mut outcomes =
+                                fenced_transition_v2_batch_body_conflict_outcomes(&requests);
+                            outcomes.insert(activation_slot, Err(error));
+                            return FencedTransitionV2Effect::Resolved(Ok(outcomes));
                         }
                         None => return unknown(),
                     }
@@ -3302,10 +3379,12 @@ impl ConsensusSessionStore {
                     Ok(_) => return unknown(),
                 },
             }
-            if requests.is_empty() {
-                return FencedTransitionV2Effect::Resolved(Ok(activation_outcome
-                    .into_iter()
-                    .collect()));
+            if !has_unresolved_suffix {
+                let mut outcomes = fenced_transition_v2_batch_body_conflict_outcomes(&requests);
+                if let Some((slot, outcome)) = activation_outcome {
+                    outcomes.insert(slot, outcome);
+                }
+                return FencedTransitionV2Effect::Resolved(Ok(outcomes));
             }
         }
 
@@ -6838,23 +6917,47 @@ fn classify_fresh_v2_history_epoch(
     }
 }
 
-/// Batch commands may only target the exact currently active V2 history
-/// epoch.  Unlike singleton status/replay handling, coalescing does not turn
-/// an older retained identity into a fresh batch slot.
-fn require_fenced_transition_v2_batch_active_epoch(
+/// Admit a batch epoch only while it is active or retained above the durable
+/// floor. The state machine still resolves each retained identity against its
+/// exact receipt and rejects an absent old identity without allocating a new
+/// slot.
+fn require_fenced_transition_v2_batch_history_epoch(
     history: &FencedTransitionV2HistoryState,
     request_epoch: FencedTransitionV2HistoryEpoch,
 ) -> Result<(), StoreError> {
-    if history
-        .retired_through()
-        .is_some_and(|floor| request_epoch <= floor)
-    {
-        return Err(StoreError::FencedTransitionHistoryEpochRetired);
-    }
-    if history.active_epoch() != Some(request_epoch) {
-        return Err(StoreError::FencedTransitionHistoryEpochNotActive);
-    }
-    Ok(())
+    classify_fresh_v2_history_epoch(history, request_epoch)
+}
+
+fn fenced_transition_v2_request_is_body_conflict(request: &FencedTransitionV2Request) -> bool {
+    matches!(
+        request.validate(),
+        Err(StoreError::FencedTransitionRequestConflict)
+    )
+}
+
+fn fenced_transition_v2_batch_body_conflict_outcomes(
+    requests: &[FencedTransitionV2Request],
+) -> Vec<Result<FencedTransitionOutcome, StoreError>> {
+    requests
+        .iter()
+        .map(|_| Err(StoreError::FencedTransitionRequestConflict))
+        .collect()
+}
+
+fn fenced_transition_v2_batch_epoch_outcomes(
+    requests: &[FencedTransitionV2Request],
+    epoch_error: StoreError,
+) -> Vec<Result<FencedTransitionOutcome, StoreError>> {
+    requests
+        .iter()
+        .map(|request| {
+            if fenced_transition_v2_request_is_body_conflict(request) {
+                Err(StoreError::FencedTransitionRequestConflict)
+            } else {
+                Err(epoch_error.clone())
+            }
+        })
+        .collect()
 }
 
 fn session_raft_config() -> Result<opc_consensus::engine::Config, ConsensusSessionStoreOpenError> {
@@ -7177,13 +7280,14 @@ fn fenced_transition_v2_batch_outcomes_match_requests(
 ///
 /// An outer committed envelope or a deterministic error alone cannot resolve
 /// a batch: callers retain one independent status ID per item.  In the fresh
-/// activation path, `activation_outcome` supplies the first item and this
+/// activation path, `activation_outcome` supplies the selected activating
+/// item and this
 /// response must still prove the complete suffix before the combined batch is
 /// resolved.
 fn committed_fenced_transition_v2_batch_effect(
     original_request_ids: &[crate::FencedTransitionV2RequestId],
     requests: &[FencedTransitionV2Request],
-    activation_outcome: Option<Result<FencedTransitionOutcome, StoreError>>,
+    activation_outcome: Option<(usize, Result<FencedTransitionOutcome, StoreError>)>,
     response: SessionConsensusResponse,
 ) -> FencedTransitionV2Effect<Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError>>
 {
@@ -7197,8 +7301,11 @@ fn committed_fenced_transition_v2_batch_effect(
     let Ok(SessionMutationOutcome::FencedTransitionV2Batch(mut outcomes)) = response.result else {
         return unknown();
     };
-    if let Some(outcome) = activation_outcome {
-        outcomes.insert(0, outcome);
+    if let Some((slot, outcome)) = activation_outcome {
+        if slot > outcomes.len() {
+            return unknown();
+        }
+        outcomes.insert(slot, outcome);
     }
     FencedTransitionV2Effect::Resolved(Ok(outcomes))
 }
@@ -8974,6 +9081,8 @@ impl SessionBackend for ConsensusSessionStore {
         if let Err(error) = validate_fenced_transition_v2_batch(&requests) {
             return FencedTransitionV2Effect::Resolved(Err(error));
         }
+        let every_request_is_self_authenticated =
+            requests.iter().all(|request| request.validate().is_ok());
         let request_ids = requests
             .iter()
             .map(FencedTransitionV2Request::request_id)
@@ -9007,7 +9116,9 @@ impl SessionBackend for ConsensusSessionStore {
         // after this public invocation obtained the full definitive result;
         // a pre-transmission rejection or an ambiguous effect cannot prove
         // activation and must leave the next call on the cold path.
-        if matches!(&effect, FencedTransitionV2Effect::Resolved(Ok(_))) {
+        if every_request_is_self_authenticated
+            && matches!(&effect, FencedTransitionV2Effect::Resolved(Ok(_)))
+        {
             self.seed_fixed_raw_v2_warm_route();
         }
         effect
@@ -10269,6 +10380,25 @@ mod membership_tests {
         .expect("V2 transition request")
     }
 
+    fn v2_test_request_with_same_id_different_body(
+        request: &FencedTransitionV2Request,
+    ) -> FencedTransitionV2Request {
+        let altered = FencedTransitionV2Request::new(
+            request.request_id().epoch(),
+            request.request_id().nonce(),
+            request.lease().clone(),
+            FencedTransitionMutation::delete(Generation::new(2)),
+        )
+        .expect("altered V2 transition request");
+        let original_id = serde_json::to_value(request.request_id()).expect("full V2 ID encodes");
+        let mut encoded = serde_json::to_value(altered).expect("altered V2 request encodes");
+        let serde_json::Value::Object(fields) = &mut encoded else {
+            panic!("V2 request is an object");
+        };
+        fields.insert("request_id".into(), original_id);
+        serde_json::from_value(encoded).expect("structural V2 body conflict decodes")
+    }
+
     #[tokio::test]
     async fn generic_receiver_forward_to_leader_is_rerouted_with_same_request_id() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
@@ -10500,6 +10630,232 @@ mod membership_tests {
         assert_eq!(
             store.inner.raft.metrics().borrow().last_log_index,
             Some(before + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_v2_batch_activates_with_a_valid_item_and_preserves_conflict_order() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let open = |label: &'static str| async move {
+            let directory = tempfile::tempdir().expect("cold conflict batch directory");
+            let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+                .expect("cold conflict batch backend");
+            let store = ConsensusSessionStore::open_with_clock(
+                singleton_topology(),
+                backend,
+                directory.path().join("snapshots"),
+                BTreeMap::new(),
+                Arc::new(SystemClock),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("open {label} cold conflict batch store"));
+            store
+                .initialize_cluster()
+                .await
+                .unwrap_or_else(|_| panic!("initialize {label} cold conflict batch store"));
+            (directory, store)
+        };
+        let requests = || {
+            let original = v2_test_request(1);
+            let conflict = v2_test_request_with_same_id_different_body(&original);
+            let valid = FencedTransitionV2Request::new(
+                original.request_id().epoch(),
+                FencedTransitionV2CallerNonce::from_bytes([0x52; 16]),
+                original.lease().clone(),
+                FencedTransitionMutation::delete(Generation::new(1)),
+            )
+            .expect("self-authenticated activation item");
+            assert_eq!(
+                conflict.validate(),
+                Err(StoreError::FencedTransitionRequestConflict)
+            );
+            assert!(valid.validate().is_ok());
+            vec![conflict, valid]
+        };
+
+        let (_directory, store) = open("public effect").await;
+        let public_requests = requests();
+        let public_ids = public_requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect::<Vec<_>>();
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        let effect =
+            SessionBackend::fenced_transition_v2_batch_effect(&store, public_requests).await;
+        let FencedTransitionV2Effect::Resolved(Ok(outcomes)) = effect else {
+            panic!("cold public conflict batch must resolve exactly");
+        };
+        assert!(matches!(
+            outcomes.as_slice(),
+            [
+                Err(StoreError::FencedTransitionRequestConflict),
+                Err(StoreError::CasConflict)
+            ]
+        ));
+        wait_for_log_index_after(&store, before, "valid cold batch activation item").await;
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "the conflict-only suffix needs no second proposal"
+        );
+        assert_eq!(
+            public_ids.len(),
+            outcomes.len(),
+            "every original caller ID retains one ordered result"
+        );
+
+        let (_directory, store, scope, identity, _key, _lease) = consumer_boundary_store().await;
+        let consumer_requests = requests();
+        let consumer_ids = consumer_requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect::<Vec<_>>();
+        let response = store
+            .consumer_service()
+            .execute_v2(
+                &identity,
+                SessionConsumerV2Request::new(
+                    scope,
+                    SessionConsumerV2Operation::FencedTransitionV2Batch {
+                        requests: consumer_requests,
+                    },
+                ),
+            )
+            .await;
+        let SessionConsumerV2Response::FencedTransitionV2Batch(Ok(results)) = response else {
+            panic!("cold consumer conflict batch must resolve exactly");
+        };
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].request_id(), consumer_ids[0]);
+        assert_eq!(results[1].request_id(), consumer_ids[1]);
+        assert_eq!(
+            results[0].result(),
+            &Err(SessionConsumerV2FencedTransitionError::RequestConflict)
+        );
+        assert_eq!(
+            results[1].result(),
+            &Err(SessionConsumerV2FencedTransitionError::Store(
+                SessionConsumerStoreError::CasConflict,
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_v2_batch_keeps_body_conflict_ahead_of_a_future_epoch() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let mixed_requests = |epoch: u64, valid_nonce: u8| {
+            let original = v2_test_request(epoch);
+            let conflict = v2_test_request_with_same_id_different_body(&original);
+            let valid = FencedTransitionV2Request::new(
+                original.request_id().epoch(),
+                FencedTransitionV2CallerNonce::from_bytes([valid_nonce; 16]),
+                original.lease().clone(),
+                FencedTransitionMutation::delete(Generation::new(1)),
+            )
+            .expect("valid cold epoch-classification request");
+            vec![conflict, valid]
+        };
+
+        let directory = tempfile::tempdir().expect("cold epoch batch directory");
+        let database = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&database).expect("cold epoch batch backend");
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open cold epoch batch store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize cold epoch batch store");
+        assert_eq!(
+            store.fenced_transition_v2(v2_test_request(1)).await,
+            Err(StoreError::CasConflict),
+            "the deterministic initial error still binds the activation receipt",
+        );
+        rusqlite::Connection::open(&database)
+            .expect("open public future epoch fixture")
+            .execute(
+                "DELETE FROM consensus_fenced_transition_v2_activation WHERE singleton = 1",
+                [],
+            )
+            .expect("clear the public activation certificate");
+        let before_future = store.inner.raft.metrics().borrow().last_log_index;
+        assert!(matches!(
+            SessionBackend::fenced_transition_v2_batch_effect(
+                &store,
+                mixed_requests(2, 0x56),
+            )
+            .await,
+            FencedTransitionV2Effect::Resolved(Ok(outcomes))
+                if matches!(outcomes.as_slice(), [
+                    Err(StoreError::FencedTransitionRequestConflict),
+                    Err(StoreError::FencedTransitionHistoryEpochNotActive),
+                ])
+        ));
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            before_future,
+            "a conflict plus future epoch is fully resolved before proposal",
+        );
+
+        let (directory, consumer_store, scope, identity, _key, _lease) =
+            consumer_boundary_store().await;
+        assert_eq!(
+            consumer_store
+                .fenced_transition_v2(v2_test_request(1))
+                .await,
+            Err(StoreError::CasConflict),
+        );
+        rusqlite::Connection::open(directory.path().join("store.sqlite"))
+            .expect("open consumer future epoch fixture")
+            .execute(
+                "DELETE FROM consensus_fenced_transition_v2_activation WHERE singleton = 1",
+                [],
+            )
+            .expect("clear the consumer activation certificate");
+        let consumer_requests = mixed_requests(2, 0x57);
+        let consumer_ids = consumer_requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect::<Vec<_>>();
+        let response = consumer_store
+            .consumer_service()
+            .execute_v2(
+                &identity,
+                SessionConsumerV2Request::new(
+                    scope,
+                    SessionConsumerV2Operation::FencedTransitionV2Batch {
+                        requests: consumer_requests,
+                    },
+                ),
+            )
+            .await;
+        let SessionConsumerV2Response::FencedTransitionV2Batch(Ok(results)) = response else {
+            panic!("cold consumer future batch must preserve per-item outcomes");
+        };
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].request_id(), consumer_ids[0]);
+        assert_eq!(results[1].request_id(), consumer_ids[1]);
+        assert_eq!(
+            results[0].result(),
+            &Err(SessionConsumerV2FencedTransitionError::RequestConflict)
+        );
+        assert_eq!(
+            results[1].result(),
+            &Err(SessionConsumerV2FencedTransitionError::EpochNotActive)
         );
     }
 
@@ -11390,8 +11746,9 @@ mod membership_tests {
     }
 
     #[test]
-    fn v2_batch_requires_exact_active_epoch() {
-        let active = FencedTransitionV2HistoryEpoch::new(2).expect("active epoch");
+    fn v2_batch_admits_retained_or_active_epoch_and_rejects_floor_or_future() {
+        let retained = FencedTransitionV2HistoryEpoch::new(2).expect("retained epoch");
+        let active = FencedTransitionV2HistoryEpoch::new(3).expect("active epoch");
         let history = FencedTransitionV2HistoryState::new(
             Some(active),
             Some(FencedTransitionV2HistoryEpoch::new(1).expect("retired epoch")),
@@ -11403,23 +11760,60 @@ mod membership_tests {
         )
         .expect("history");
         assert_eq!(
-            require_fenced_transition_v2_batch_active_epoch(
+            require_fenced_transition_v2_batch_history_epoch(
                 &history,
                 FencedTransitionV2HistoryEpoch::new(1).expect("retired request epoch"),
             ),
             Err(StoreError::FencedTransitionHistoryEpochRetired)
         );
         assert_eq!(
-            require_fenced_transition_v2_batch_active_epoch(
+            require_fenced_transition_v2_batch_history_epoch(
                 &history,
-                FencedTransitionV2HistoryEpoch::new(3).expect("future request epoch"),
+                FencedTransitionV2HistoryEpoch::new(4).expect("future request epoch"),
             ),
             Err(StoreError::FencedTransitionHistoryEpochNotActive)
         );
         assert_eq!(
-            require_fenced_transition_v2_batch_active_epoch(&history, active),
+            require_fenced_transition_v2_batch_history_epoch(&history, retained),
             Ok(())
         );
+        assert_eq!(
+            require_fenced_transition_v2_batch_history_epoch(&history, active),
+            Ok(())
+        );
+
+        let original = v2_test_request(1);
+        let conflict = v2_test_request_with_same_id_different_body(&original);
+        let valid = FencedTransitionV2Request::new(
+            original.request_id().epoch(),
+            FencedTransitionV2CallerNonce::from_bytes([0x53; 16]),
+            original.lease().clone(),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("valid epoch-classification request");
+        let requests = vec![conflict, valid];
+        assert!(matches!(
+            fenced_transition_v2_batch_epoch_outcomes(
+                &requests,
+                StoreError::FencedTransitionHistoryEpochRetired,
+            )
+            .as_slice(),
+            [
+                Err(StoreError::FencedTransitionRequestConflict),
+                Err(StoreError::FencedTransitionHistoryEpochRetired),
+            ]
+        ));
+        assert!(matches!(
+            fenced_transition_v2_batch_epoch_outcomes(
+                &requests,
+                StoreError::FencedTransitionHistoryEpochNotActive,
+            )
+            .as_slice(),
+            [
+                Err(StoreError::FencedTransitionRequestConflict),
+                Err(StoreError::FencedTransitionHistoryEpochNotActive),
+            ]
+        ));
     }
 
     #[test]

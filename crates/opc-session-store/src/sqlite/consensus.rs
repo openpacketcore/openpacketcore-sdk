@@ -6120,7 +6120,7 @@ fn activate_fenced_transition_v2_scope_sync(
     scope_identity: SessionConsensusIdentity,
     voters: &BTreeSet<SessionConsensusNodeId>,
     profile_digest: [u8; 32],
-    initial_active_epoch: FencedTransitionV2HistoryEpoch,
+    request_epoch: FencedTransitionV2HistoryEpoch,
 ) -> io::Result<()> {
     if scope_identity.cluster_id() != storage_identity.cluster_id()
         || voters.is_empty()
@@ -6132,7 +6132,7 @@ fn activate_fenced_transition_v2_scope_sync(
         ));
     }
     if fenced_transition_v2_ledger_layout_sync(conn)? == FencedTransitionV2LedgerLayout::Absent {
-        if initial_active_epoch.get() != FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH {
+        if request_epoch.get() != FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH {
             return Err(invalid_data(
                 "fenced transition V2 initial epoch is invalid",
             ));
@@ -6164,19 +6164,26 @@ fn activate_fenced_transition_v2_scope_sync(
             params![
                 epoch_i64(storage_identity)?,
                 profile_digest.as_slice(),
-                checked_positive_i64(initial_active_epoch.get())?,
+                checked_positive_i64(request_epoch.get())?,
                 0_i64,
             ],
         )
         .map_err(db_error)?;
     }
     let history = read_fenced_transition_v2_history_row_in_sync(conn, storage_identity, false)?;
-    if history.profile_digest != profile_digest
-        || history.active_epoch != Some(initial_active_epoch)
-    {
+    if history.profile_digest != profile_digest {
         return Err(invalid_data(
-            "fenced transition V2 activation epoch is not active",
+            "fenced transition V2 activation profile is stale",
         ));
+    }
+    // A topology cutover clears only the old scope certificate. A fresh
+    // exact-scope proof may re-certify an exact retained request above the
+    // irreversible floor as well as the active epoch. The later receipt and
+    // active-epoch checks still ensure that an absent retained identity can
+    // neither allocate nor execute. A floor/future race installs no
+    // certificate and falls through to the caller-visible typed outcome.
+    if !fenced_transition_v2_history_epoch_may_recertify(&history, request_epoch) {
+        return Ok(());
     }
     conn.execute(
         "INSERT INTO consensus_fenced_transition_v2_activation (singleton, storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, voter_set_digest, profile_digest) VALUES (1, ?1, ?2, ?3, ?4, ?5) ON CONFLICT(singleton) DO UPDATE SET storage_configuration_epoch = excluded.storage_configuration_epoch, scope_configuration_id = excluded.scope_configuration_id, scope_configuration_epoch = excluded.scope_configuration_epoch, voter_set_digest = excluded.voter_set_digest, profile_digest = excluded.profile_digest",
@@ -6201,6 +6208,16 @@ fn activate_fenced_transition_v2_scope_sync(
         ));
     }
     Ok(())
+}
+
+fn fenced_transition_v2_history_epoch_may_recertify(
+    history: &FencedTransitionV2HistoryRow,
+    request_epoch: FencedTransitionV2HistoryEpoch,
+) -> bool {
+    request_epoch.get() > history.retired_through
+        && history
+            .active_epoch
+            .is_some_and(|active_epoch| request_epoch <= active_epoch)
 }
 
 fn fenced_transition_receipt_ledger_layout_in_sync(
@@ -7826,7 +7843,7 @@ impl MembershipLogProjection {
                     "projected fenced transition V2 activation scope is stale",
                 ));
             }
-            match self.projected_v2_history {
+            let activation_epoch_is_admitted = match self.projected_v2_history {
                 None if request.request_id().epoch().get()
                     == FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH =>
                 {
@@ -7841,20 +7858,26 @@ impl MembershipLogProjection {
                         reclaim_remaining: None,
                         reclaimed_entries: 0,
                     });
+                    true
                 }
                 None => {
                     return Err(invalid_data(
                         "projected fenced transition V2 initial epoch is invalid",
                     ));
                 }
-                Some(history) if history.active_epoch == Some(request.request_id().epoch()) => {}
-                Some(_) => {
+                Some(history) if history.profile_digest != profile_digest => {
                     return Err(invalid_data(
-                        "projected fenced transition V2 activation epoch is not active",
+                        "projected fenced transition V2 activation profile is stale",
                     ));
                 }
+                Some(history) => fenced_transition_v2_history_epoch_may_recertify(
+                    &history,
+                    request.request_id().epoch(),
+                ),
+            };
+            if activation_epoch_is_admitted {
+                self.projected_v2_scope_activated = true;
             }
-            self.projected_v2_scope_activated = true;
         } else if !self.projected_v2_scope_activated {
             return Err(invalid_data(
                 "projected fenced transition V2 lacks an exact activation certificate",
@@ -12675,31 +12698,6 @@ fn apply_fenced_transition_v2_batch_command_sync(
         ));
     }
     let history = read_fenced_transition_v2_history_row_in_sync(tx, storage_identity, false)?;
-    if history.active_epoch != Some(requests[0].request_id().epoch()) {
-        let outcomes = requests
-            .iter()
-            .map(|request| {
-                if matches!(
-                    request.validate(),
-                    Err(StoreError::FencedTransitionRequestConflict)
-                ) {
-                    Err(StoreError::FencedTransitionRequestConflict)
-                } else {
-                    Err(StoreError::FencedTransitionHistoryEpochNotActive)
-                }
-            })
-            .collect::<Vec<_>>();
-        validate_fenced_transition_v2_batch_outcomes(&outcomes)
-            .map_err(|_| invalid_data("fenced transition V2 batch outcome is invalid"))?;
-        advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
-        return Ok(SessionConsensusResponse {
-            result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
-            sequence: machine.0,
-            digest: Some(machine.1),
-            logical_time: Some(logical_time),
-            raft_log_index,
-        });
-    }
     let mut outcomes = vec![None; requests.len()];
     let mut fresh = Vec::new();
     for (slot, request) in requests.iter().enumerate() {
@@ -20485,6 +20483,60 @@ mod tests {
         }
     }
 
+    fn insert_v2_recorded_rows_in_epoch(
+        conn: &Connection,
+        epoch: u64,
+        first_ordinal: u64,
+        count: usize,
+        response: &SessionConsensusResponse,
+        retained_until: Timestamp,
+    ) {
+        let retained_until = ops::format_rfc3339_normalized(retained_until);
+        let encoded_response =
+            encode_fenced_transition_v2_response(response).expect("encode V2 fixture response");
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO consensus_fenced_transition_v2_receipts (request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .expect("prepare V2 recorded receipt insert");
+        for offset in 0..count {
+            let ordinal = first_ordinal
+                .checked_add(u64::try_from(offset).expect("fixture offset"))
+                .expect("fixture ordinal");
+            let mut request_id = [0_u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES];
+            request_id[..8].copy_from_slice(&epoch.to_be_bytes());
+            request_id[48..].copy_from_slice(&ordinal.to_be_bytes());
+            let payload_digest =
+                fenced_transition_v2_payload_digest_for_request_id(identity(), request_id)
+                    .expect("V2 recorded receipt payload");
+            let binding_digest = fenced_transition_v2_receipt_binding_digest(
+                identity(),
+                request_id,
+                epoch,
+                ordinal,
+                payload_digest,
+                &retained_until,
+            )
+            .expect("V2 recorded receipt binding");
+            let response_digest =
+                fenced_transition_v2_receipt_response_digest(binding_digest, &encoded_response)
+                    .expect("V2 recorded receipt response digest");
+            insert
+                .execute(params![
+                    request_id.as_slice(),
+                    checked_positive_i64(epoch).expect("V2 epoch"),
+                    checked_positive_i64(ordinal).expect("V2 ordinal"),
+                    epoch_i64(identity()).expect("identity epoch"),
+                    payload_digest.as_slice(),
+                    retained_until.as_str(),
+                    binding_digest.as_slice(),
+                    encoded_response.as_slice(),
+                    response_digest.as_slice(),
+                ])
+                .expect("insert V2 recorded receipt");
+        }
+    }
+
     /// Seed compacted, structurally valid permanent bindings without paying
     /// for thousands of record/lease state transitions. The fixture first
     /// forms V2 for the exact persisted membership scope, because a prepared
@@ -22140,7 +22192,7 @@ mod tests {
         initialize_schema(&conn, storage_identity, &predecessor_members).expect("consensus schema");
 
         let request = fenced_transition_v2_request(0xEA, 1, "v2-rollover-owner");
-        apply_entries_sync(
+        let predecessor_activation = apply_entries_sync(
             &conn,
             storage_identity,
             &backend.caps,
@@ -22162,6 +22214,48 @@ mod tests {
             ],
         )
         .expect("activate V2 under predecessor authority");
+        let original_response = predecessor_activation.responses[1].clone();
+        let original_outcome = match &original_response.result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.clone(),
+            result => panic!("predecessor V2 activation must succeed: {result:?}"),
+        };
+        // Form the exact durable shape after the first capacity rotation:
+        // epoch one stays replayable above floor zero while epoch two owns
+        // all fresh allocations. A closed epoch is complete by contract, so
+        // fill its remaining ordinals before applying the real maintenance
+        // transition instead of fabricating a partial closed namespace. The
+        // topology cutover below must clear only the predecessor scope
+        // certificate, not this lifetime state.
+        insert_v2_recorded_rows_in_epoch(
+            &conn,
+            1,
+            2,
+            FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - 1,
+            &original_response,
+            crate::checked_session_deadline(timestamp(1), FENCED_TRANSITION_OUTCOME_RETENTION)
+                .expect("predecessor receipt retention"),
+        );
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = ?1 WHERE singleton = 1 AND active_epoch = 1 AND retired_through_epoch = 0 AND generation = 0 AND current_bound_count = 1",
+            [i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                .expect("V2 history cap fits SQLite")],
+        )
+        .expect("fill predecessor V2 history epoch");
+        assert_eq!(
+            maintain_fenced_transition_v2_history_sync(
+                &conn,
+                storage_identity,
+                0,
+                Some(FencedTransitionV2HistoryEpoch::new(1).expect("epoch one")),
+                0,
+                FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64,
+                timestamp(2),
+            )
+            .expect("rotate V2 history fixture to epoch two"),
+            FencedTransitionV2MaintenanceResult::Applied,
+        );
+        validate_existing_schema(&conn, storage_identity)
+            .expect("rotated V2 history fixture remains internally valid");
 
         stage_membership_scope_sync(
             &conn,
@@ -22196,12 +22290,12 @@ mod tests {
         fence_application_authority_sync(&conn, storage_identity, transition_id, transition_digest)
             .expect("roll application authority forward");
 
-        // Epoch two is validly self-authenticated but cannot execute while
-        // epoch one is live.  The old (now revoked) authority must not learn
+        // Epoch three is validly self-authenticated but cannot execute while
+        // epoch two is live.  The old (now revoked) authority must not learn
         // that fact: authorization wins over the non-active-epoch terminal.
         let delayed = fenced_transition_v2_authorized_entry(
             4,
-            fenced_transition_v2_request(0xEB, 2, "v2-delayed-predecessor"),
+            fenced_transition_v2_request(0xEB, 3, "v2-delayed-predecessor"),
             timestamp(4),
             member(7),
             storage_identity,
@@ -22239,8 +22333,8 @@ mod tests {
 
         // Full topology promotion clears the predecessor-scope certificate,
         // but it must leave the independent lifetime profile/floor intact.
-        // The successor can re-prove its own exact voter scope at the durable
-        // active epoch without reopening the retired namespace.
+        // The successor can re-prove its own exact voter scope through an
+        // exact retained receipt without reopening that closed namespace.
         apply_entries_sync(
             &conn,
             storage_identity,
@@ -22278,28 +22372,46 @@ mod tests {
             history_after_cutover.retired_through, history_before.retired_through,
             "topology certificate clearing cannot change the V2 retirement floor",
         );
+        assert_eq!(
+            history_after_cutover.active_epoch,
+            Some(FencedTransitionV2HistoryEpoch::new(2).expect("active epoch two")),
+        );
+        let state_before_recertification = proposal_state_sync(&conn, storage_identity)
+            .expect("state before retained recertification");
+        let receipt_count_before_recertification = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_fenced_transition_v2_receipts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count receipts before retained recertification");
+        let recertification_entry = activating_fenced_transition_v2_authorized_entry(
+            7,
+            request.clone(),
+            timestamp(7),
+            member(10),
+            successor_identity,
+            successor_identity,
+            &successor_members,
+        );
+        MembershipLogProjection::load(&conn, storage_identity, false)
+            .expect("load retained recertification projection")
+            .project(&conn, &recertification_entry, storage_identity)
+            .expect("project retained receipt recertification");
         let recertified = apply_entries_sync(
             &conn,
             storage_identity,
             &backend.caps,
-            vec![activating_fenced_transition_v2_authorized_entry(
-                7,
-                request,
-                timestamp(7),
-                member(10),
-                successor_identity,
-                successor_identity,
-                &successor_members,
-            )],
+            vec![recertification_entry],
         )
-        .expect("successor re-certifies the durable active V2 epoch");
-        assert!(matches!(
-            recertified.responses.as_slice(),
-            [SessionConsensusResponse {
-                result: Ok(SessionMutationOutcome::FencedTransition(_)),
-                ..
-            }]
-        ));
+        .expect("successor re-certifies through the durable retained V2 receipt");
+        assert_eq!(
+            recertified.responses[0].result,
+            Ok(SessionMutationOutcome::FencedTransition(
+                original_outcome.clone(),
+            ))
+        );
+        assert!(recertified.notifications.is_empty());
         assert!(fenced_transition_v2_activation_matches_scope_sync(
             &conn,
             storage_identity,
@@ -22308,6 +22420,148 @@ mod tests {
             fenced_transition_v2_profile_digest(),
         )
         .expect("successor V2 certificate is exact"));
+        assert_eq!(
+            read_fenced_transition_v2_history_row_in_sync(&conn, storage_identity, false)
+                .expect("history after retained recertification"),
+            history_after_cutover,
+            "recertification changes scope evidence, not lifetime state",
+        );
+        let state_after_recertification = proposal_state_sync(&conn, storage_identity)
+            .expect("state after retained recertification");
+        assert_eq!(
+            state_after_recertification.0, state_before_recertification.0,
+            "an exact retained replay cannot repeat its application sequence",
+        );
+        assert_eq!(
+            state_after_recertification.1, state_before_recertification.1,
+            "an exact retained replay cannot change its application digest",
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_fenced_transition_v2_receipts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count receipts after retained recertification"),
+            receipt_count_before_recertification,
+        );
+
+        // The fresh scope proof is independent of a particular receipt. An
+        // absent ID in the retained interval may install that exact
+        // certificate, but it remains closed to allocation and execution.
+        conn.execute(
+            "DELETE FROM consensus_fenced_transition_v2_activation WHERE singleton = 1",
+            [],
+        )
+        .expect("clear certificate before absent retained recertification");
+        let absent_retained = fenced_transition_v2_request(0xEC, 1, "v2-absent-retained-owner");
+        let absent_entry = activating_fenced_transition_v2_authorized_entry(
+            8,
+            absent_retained.clone(),
+            timestamp(8),
+            member(10),
+            successor_identity,
+            successor_identity,
+            &successor_members,
+        );
+        MembershipLogProjection::load(&conn, storage_identity, false)
+            .expect("load absent retained projection")
+            .project(&conn, &absent_entry, storage_identity)
+            .expect("project absent retained recertification");
+        let absent_result =
+            apply_entries_sync(&conn, storage_identity, &backend.caps, vec![absent_entry])
+                .expect("apply absent retained recertification");
+        assert!(matches!(
+            absent_result.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionHistoryEpochNotActive),
+                ..
+            }]
+        ));
+        assert!(absent_result.notifications.is_empty());
+        assert!(fenced_transition_v2_activation_matches_scope_sync(
+            &conn,
+            storage_identity,
+            successor_identity,
+            &successor_members,
+            fenced_transition_v2_profile_digest(),
+        )
+        .expect("absent retained request installs only the exact successor certificate"));
+        assert!(
+            read_fenced_transition_v2_receipt_sync(&conn, storage_identity, &absent_retained)
+                .expect("read absent retained receipt")
+                .is_none(),
+        );
+        assert_eq!(
+            read_fenced_transition_v2_history_row_in_sync(&conn, storage_identity, false)
+                .expect("history after absent retained request"),
+            history_after_cutover,
+        );
+        let state_after_absent = proposal_state_sync(&conn, storage_identity)
+            .expect("state after absent retained recertification");
+        assert_eq!(state_after_absent.0, state_before_recertification.0);
+        assert_eq!(state_after_absent.1, state_before_recertification.1);
+
+        // A maintenance race can move the floor after the leader's cold read
+        // but before this activating entry applies. Floor and future epochs
+        // remain typed no-effect outcomes and must not install a certificate.
+        conn.execute_batch(
+            "DELETE FROM consensus_fenced_transition_v2_activation WHERE singleton = 1;
+             DELETE FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = 1;",
+        )
+        .expect("remove reclaimed epoch rows and its old certificate");
+        assert_eq!(
+            conn.execute(
+                "UPDATE consensus_fenced_transition_v2_history SET retired_through_epoch = 1, generation = 2, reclaimed_entries = ?1 WHERE singleton = 1 AND active_epoch = 2 AND current_bound_count = 0",
+                [i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                    .expect("V2 history cap fits SQLite")],
+            )
+            .expect("publish exact post-reclaim history state"),
+            1,
+        );
+        validate_existing_schema(&conn, storage_identity)
+            .expect("post-reclaim recertification fixture remains valid");
+        for (index, candidate, expected) in [
+            (
+                9_u8,
+                fenced_transition_v2_request(0xED, 1, "v2-floor-recertification"),
+                StoreError::FencedTransitionHistoryEpochRetired,
+            ),
+            (
+                10_u8,
+                fenced_transition_v2_request(0xEE, 3, "v2-future-recertification"),
+                StoreError::FencedTransitionHistoryEpochNotActive,
+            ),
+        ] {
+            let entry = activating_fenced_transition_v2_authorized_entry(
+                u64::from(index),
+                candidate,
+                timestamp(index),
+                member(10),
+                successor_identity,
+                successor_identity,
+                &successor_members,
+            );
+            MembershipLogProjection::load(&conn, storage_identity, false)
+                .expect("load out-of-window recertification projection")
+                .project(&conn, &entry, storage_identity)
+                .expect("project typed out-of-window recertification");
+            let rejected = apply_entries_sync(&conn, storage_identity, &backend.caps, vec![entry])
+                .expect("apply typed out-of-window recertification");
+            assert!(matches!(
+                rejected.responses.as_slice(),
+                [SessionConsensusResponse { result: Err(error), .. }] if error == &expected
+            ));
+            assert!(rejected.notifications.is_empty());
+            assert!(!fenced_transition_v2_activation_matches_scope_sync(
+                &conn,
+                storage_identity,
+                successor_identity,
+                &successor_members,
+                fenced_transition_v2_profile_digest(),
+            )
+            .expect("out-of-window request cannot install a certificate"));
+        }
     }
 
     #[test]
@@ -24527,6 +24781,11 @@ LIMIT 20000;
         .responses
         .pop()
         .expect("predecessor response");
+        let original_outcome = match original.result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome,
+            Err(error) => panic!("predecessor failed: {error:?}"),
+            Ok(_) => panic!("predecessor must be a V2 transition"),
+        };
         insert_v2_tombstone_rows_in_epoch(
             &conn,
             1,
@@ -24567,13 +24826,9 @@ LIMIT 20000;
         assert_eq!(successor.reclaim_epoch, None);
         assert_eq!(
             read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &predecessor),
-            Ok(FencedTransitionV2Status::Recorded(Box::new(
-                match original.result {
-                    Ok(SessionMutationOutcome::FencedTransition(outcome)) => Ok(outcome),
-                    Err(error) => Err(error),
-                    Ok(_) => panic!("predecessor must be a V2 transition"),
-                }
-            )))
+            Ok(FencedTransitionV2Status::Recorded(Box::new(Ok(
+                original_outcome.clone(),
+            ))))
         );
         assert_eq!(
             read_fenced_transition_v2_status_sync(
@@ -24585,13 +24840,76 @@ LIMIT 20000;
             Ok(FencedTransitionV2Status::RequestConflict)
         );
 
+        let retained_replay = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(
+                2,
+                vec![predecessor.clone()],
+                timestamp(2),
+            )],
+        )
+        .expect("replay retained predecessor through batch");
+        assert!(matches!(
+            retained_replay.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+                ..
+            }] if outcomes == &vec![Ok(original_outcome.clone())]
+        ));
+        assert!(
+            retained_replay.notifications.is_empty(),
+            "an exact retained replay cannot repeat its business effect",
+        );
+
+        let retained_conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(
+                3,
+                vec![altered_fenced_transition_v2_request(&predecessor)],
+                timestamp(2),
+            )],
+        )
+        .expect("reject changed retained predecessor body");
+        assert!(matches!(
+            retained_conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+                ..
+            }] if outcomes == &vec![Err(StoreError::FencedTransitionRequestConflict)]
+        ));
+
+        let absent_predecessor =
+            fenced_transition_v2_request(0xE6, 1, "v2-absent-predecessor-owner");
+        let retained_absent = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(
+                4,
+                vec![absent_predecessor],
+                timestamp(2),
+            )],
+        )
+        .expect("reject an unbound identity in a retained epoch");
+        assert!(matches!(
+            retained_absent.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+                ..
+            }] if outcomes == &vec![Err(StoreError::FencedTransitionHistoryEpochNotActive)]
+        ));
+
         let successor_request = fenced_transition_v2_request(0xE8, 2, "v2-successor-owner");
         apply_entries_sync(
             &conn,
             identity(),
             &backend.caps,
             vec![fenced_transition_v2_entry(
-                2,
+                5,
                 successor_request,
                 timestamp(2),
             )],
