@@ -23,10 +23,12 @@ use opc_session_net::{
 use opc_session_store::{
     BackendCapabilities, ConsensusSessionStore, QuorumReplicaDescriptor, ReplicaBackingIdentity,
     ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionConsensusIdentity,
-    SessionConsumerChange, SessionConsumerIdentity, SessionConsumerOperation,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
-    SessionKeyType, SessionQuorumConsumer, SqliteSessionBackend, ValidatedQuorumTopology,
+    SessionConsumerAuthorization, SessionConsumerAuthorizationGrant, SessionConsumerChange,
+    SessionConsumerOperation, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionConsumerVoterAuthority,
+    SessionKey, SessionKeyType, SessionQuorumConsumer, SqliteSessionBackend,
+    ValidatedQuorumTopology,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
@@ -118,6 +120,7 @@ struct ControlledConsumer {
     watch_stays_open: AtomicBool,
     watch_closes_without_item: AtomicBool,
     watch_error: Mutex<Option<SessionConsumerStoreError>>,
+    watch_rejection: Mutex<Option<SessionConsumerRejection>>,
     watch_starts: Mutex<Vec<u64>>,
     watch_started_at: Mutex<Vec<Instant>>,
 }
@@ -201,6 +204,13 @@ impl ControlledConsumer {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
     }
 
+    fn reject_watch(&self, rejection: SessionConsumerRejection) {
+        *self
+            .watch_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
+    }
+
     fn watch_starts(&self) -> Vec<u64> {
         self.watch_starts
             .lock()
@@ -230,7 +240,7 @@ impl ControlledConsumer {
 impl SessionQuorumConsumer for ControlledConsumer {
     async fn execute(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _identity: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -259,7 +269,7 @@ impl SessionQuorumConsumer for ControlledConsumer {
 
     async fn watch(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _identity: &SessionConsumerAuthorization,
         _scope: SessionConsumerScope,
         start_sequence: u64,
     ) -> Result<
@@ -274,6 +284,13 @@ impl SessionQuorumConsumer for ControlledConsumer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(Instant::now());
+        if let Some(rejection) = *self
+            .watch_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(rejection);
+        }
         if let Some(error) = *self
             .watch_error
             .lock()
@@ -580,15 +597,45 @@ fn spiffe(name: &str) -> String {
     format!("spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/{name}")
 }
 
+fn voter_authority(
+    scope: SessionConsumerScope,
+    server_spiffe: &str,
+) -> SessionConsumerVoterAuthority {
+    let replica_id = ReplicaId::new("persistent-consumer-test").expect("replica ID");
+    let descriptor = QuorumReplicaDescriptor::new(
+        replica_id.clone(),
+        ReplicaEndpoint::new("persistent-consumer.test.invalid", 7443).expect("endpoint"),
+        ReplicaTlsIdentity::new(server_spiffe).expect("server TLS identity"),
+        ReplicaFailureDomain::new("persistent-consumer-zone").expect("failure domain"),
+        ReplicaBackingIdentity::new("persistent-consumer-disk").expect("backing identity"),
+    );
+    let topology = ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+        replica_id,
+        vec![descriptor],
+        scope.consensus_identity(),
+    )
+    .expect("same validated topology as the store fixture");
+    topology
+        .session_consumer_roster()
+        .expect("consumer roster")
+        .voter(topology.local_consensus_node_id().expect("local node ID"))
+        .expect("local voter authority")
+}
+
 async fn authorizer_and_scope(
     client_spiffe: &str,
-) -> (SessionConsumerAuthorizer, SessionConsumerScope) {
+    server_spiffe: &str,
+) -> (
+    SessionConsumerAuthorizer,
+    SessionConsumerScope,
+    SessionConsumerVoterAuthority,
+) {
     let snapshots = tempfile::tempdir().expect("snapshot directory");
     let replica_id = ReplicaId::new("persistent-consumer-test").expect("replica ID");
     let descriptor = QuorumReplicaDescriptor::new(
         replica_id.clone(),
         ReplicaEndpoint::new("persistent-consumer.test.invalid", 7443).expect("endpoint"),
-        ReplicaTlsIdentity::new(spiffe("member")).expect("member TLS identity"),
+        ReplicaTlsIdentity::new(server_spiffe).expect("server TLS identity"),
         ReplicaFailureDomain::new("persistent-consumer-zone").expect("failure domain"),
         ReplicaBackingIdentity::new("persistent-consumer-disk").expect("backing identity"),
     );
@@ -602,6 +649,11 @@ async fn authorizer_and_scope(
         SessionConsensusIdentity::new(cluster, configuration, epoch),
     )
     .expect("singleton topology");
+    let roster = topology.session_consumer_roster().expect("consumer roster");
+    let scope = roster.scope();
+    let authority = roster
+        .voter(topology.local_consensus_node_id().expect("local node ID"))
+        .expect("local voter authority");
     let store = ConsensusSessionStore::open(
         topology,
         SqliteSessionBackend::in_memory().expect("SQLite backend"),
@@ -612,16 +664,37 @@ async fn authorizer_and_scope(
     .expect("open store");
     store.initialize_cluster().await.expect("initialize store");
     let manifest = store
-        .consumer_authorization_manifest()
+        .consumer_authorization_manifest([SessionConsumerAuthorizationGrant::try_new(
+            SpiffeId::new(client_spiffe).expect("client SPIFFE"),
+            [
+                SessionConsumerTenantNfScope::new(
+                    TenantId::new("watch-pressure").expect("tenant"),
+                    NetworkFunctionKind::smf(),
+                ),
+                SessionConsumerTenantNfScope::new(
+                    TenantId::new("watch-envelope-edge").expect("tenant"),
+                    NetworkFunctionKind::smf(),
+                ),
+                SessionConsumerTenantNfScope::new(
+                    TenantId::new("watch-exact-cap").expect("tenant"),
+                    NetworkFunctionKind::smf(),
+                ),
+                SessionConsumerTenantNfScope::new(
+                    TenantId::new("watch-queue").expect("tenant"),
+                    NetworkFunctionKind::smf(),
+                ),
+                SessionConsumerTenantNfScope::new(
+                    TenantId::new("setup-budget").expect("tenant"),
+                    NetworkFunctionKind::smf(),
+                ),
+            ],
+        )
+        .expect("explicit consumer grant")])
         .await
         .expect("consumer authorization manifest");
-    let scope = manifest.scope();
-    let authorizer = SessionConsumerAuthorizer::try_new(
-        manifest,
-        [SpiffeId::new(client_spiffe).expect("client SPIFFE")],
-    )
-    .expect("consumer authorizer");
-    (authorizer, scope)
+    assert_eq!(manifest.scope(), scope, "manifest preserves topology scope");
+    let authorizer = SessionConsumerAuthorizer::try_new(manifest).expect("consumer authorizer");
+    (authorizer, scope, authority)
 }
 
 fn config(
@@ -654,8 +727,7 @@ fn persistent_client(
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         server_name,
-        SpiffeId::new(server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority(scope, server_spiffe),
         pki.client_config(client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(2));
@@ -669,7 +741,8 @@ async fn prewarm_opens_fixed_lanes_reuses_them_and_keeps_diagnostics_redacted() 
     let pki = TestPki::new();
     let server_spiffe = spiffe("prewarm-server");
     let client_spiffe = spiffe("prewarm-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let (handle, upstream) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -810,7 +883,8 @@ async fn persistent_pools_derived_from_one_stateless_lineage_share_physical_admi
     let pki = TestPki::new();
     let server_spiffe = spiffe("lineage-cap-server");
     let client_spiffe = spiffe("lineage-cap-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, _scope, authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let (handle, upstream) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -847,8 +921,7 @@ async fn persistent_pools_derived_from_one_stateless_lineage_share_physical_admi
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(proxy.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        authority,
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(2));
@@ -907,7 +980,8 @@ async fn persistent_watch_preserves_typed_overload_from_shared_physical_admissio
     let pki = TestPki::new();
     let server_spiffe = spiffe("lineage-watch-cap-server");
     let client_spiffe = spiffe("lineage-watch-cap-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, _scope, authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let (handle, upstream) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -949,8 +1023,7 @@ async fn persistent_watch_preserves_typed_overload_from_shared_physical_admissio
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(proxy.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        authority,
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(2));
@@ -1019,7 +1092,8 @@ async fn lane_retires_before_the_4097th_call_and_correlation_restarts_on_replace
     let pki = TestPki::new();
     let server_spiffe = spiffe("rollover-server");
     let client_spiffe = spiffe("rollover-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -1066,7 +1140,8 @@ async fn one_lane_dispatches_twelve_bounded_waiters_in_admission_order() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("fair-server");
     let client_spiffe = spiffe("fair-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.arm_blocks(1);
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -1150,7 +1225,8 @@ async fn queued_lane_waiter_cannot_be_overtaken_by_late_callers() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("no-barge-server");
     let client_spiffe = spiffe("no-barge-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.arm_blocks(1);
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -1246,7 +1322,7 @@ async fn pool_admission_consumes_the_original_complete_operation_deadline() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("admission-deadline-server");
     let client_spiffe = spiffe("admission-deadline-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, authority) = authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.arm_blocks(1);
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -1261,8 +1337,7 @@ async fn pool_admission_consumes_the_original_complete_operation_deadline() {
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        authority,
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_millis(240));
@@ -1313,7 +1388,8 @@ async fn persistent_watch_zero_cursor_normalizes_to_the_first_committed_sequence
     let pki = TestPki::new();
     let server_spiffe = spiffe("zero-watch-server");
     let client_spiffe = spiffe("zero-watch-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.emit_watch_entries_then_close(small_watch_change_at(1), 1);
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -1349,11 +1425,65 @@ async fn persistent_watch_zero_cursor_normalizes_to_the_first_committed_sequence
 }
 
 #[tokio::test]
+async fn authenticated_persistent_watch_rejection_emits_no_open_or_watch_frame() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("watch-rejection-server");
+    let client_spiffe = spiffe("watch-rejection-client");
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    // This is a service-side watch admission rejection, not a grant-authorizer
+    // denial. The client identity remains validly authenticated and granted.
+    service.reject_watch(SessionConsumerRejection::Unavailable);
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, 0, 1),
+    );
+
+    assert!(matches!(
+        client.open_watch(0).await,
+        Err(SessionConsumerClientError::Unavailable)
+    ));
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(service.watch_starts(), vec![1]);
+    assert_eq!(
+        service.watch_emitted.load(Ordering::SeqCst),
+        0,
+        "a rejected watch must not produce an event/cursor frame"
+    );
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.watch_active, 0);
+    assert_eq!(diagnostics.setup_attempts, 1);
+    assert_eq!(diagnostics.setup_successes, 0);
+    assert_eq!(diagnostics.setup_failures, 1);
+    assert_eq!(diagnostics.not_transmitted, 0);
+    assert_eq!(diagnostics.outcome_unknown, 0);
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn slow_lane_does_not_serialize_sixteen_callers_and_watch_capacity_is_isolated() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("parallel-server");
     let client_spiffe = spiffe("parallel-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -1464,7 +1594,7 @@ async fn admitted_call_drains_across_rotation_and_hard_deadline_releases_its_lan
     let pki = TestPki::new();
     let server_spiffe = spiffe("drain-server");
     let client_spiffe = spiffe("drain-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, authority) = authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let lifecycle = ConnectionLifecyclePolicy::try_new(
         Duration::from_secs(2),
@@ -1489,8 +1619,7 @@ async fn admitted_call_drains_across_rotation_and_hard_deadline_releases_its_lan
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        authority,
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(1))
@@ -1582,7 +1711,8 @@ async fn byte_saturated_watch_queue_terminalizes_without_rotation_or_caller_poll
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-drain-server");
     let client_spiffe = spiffe("watch-drain-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.emit_watch_entries_then_pending(large_watch_change(), 2);
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -1639,7 +1769,8 @@ async fn endpoint_loss_at_exact_watch_byte_saturation_releases_without_reconnect
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-exact-byte-loss-server");
     let client_spiffe = spiffe("watch-exact-byte-loss-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.emit_watch_entries_then_close(exact_watch_byte_budget_change(), 1);
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -1708,7 +1839,8 @@ async fn sixty_fifth_item_terminalizes_an_unpolled_full_watch_queue() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-small-queue-server");
     let client_spiffe = spiffe("watch-small-queue-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.emit_watch_entries_then_pending(small_watch_change(), WATCH_QUEUE_ITEMS + 1);
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -1775,7 +1907,8 @@ async fn wrapped_watch_item_one_byte_over_the_local_cap_is_terminal_not_eof() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-envelope-cap-server");
     let client_spiffe = spiffe("watch-envelope-cap-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let edge = watch_result_envelope_edge_change();
     let actual = serde_json::to_vec(&Ok::<_, SessionConsumerStoreError>(edge.clone()))
@@ -1832,7 +1965,8 @@ async fn maximum_watch_sequence_is_delivered_once_then_closes_cleanly() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-max-sequence-server");
     let client_spiffe = spiffe("watch-max-sequence-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.emit_watch_entries_then_close(small_watch_change_at(u64::MAX), 1);
     let (handle, address) =
@@ -1878,7 +2012,8 @@ async fn terminal_watch_error_and_eof_never_advance_the_persistent_cursor() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-error-cursor-server");
     let client_spiffe = spiffe("watch-error-cursor-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.emit_terminal_watch_error(SessionConsumerStoreError::WatchCatchUpRequired);
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -1924,7 +2059,8 @@ async fn cancelled_watch_reconnect_has_one_terminal_setup_outcome() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-reconnect-cancel-server");
     let client_spiffe = spiffe("watch-reconnect-cancel-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.emit_watch_entries_then_close(small_watch_change_at(1), 1);
     let (handle, address) =
@@ -2003,7 +2139,8 @@ async fn watch_open_without_item_has_one_paced_bounded_recovery_window() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-no-progress-server");
     let client_spiffe = spiffe("watch-no-progress-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.close_watch_without_item();
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -2073,7 +2210,8 @@ async fn persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoin
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-reconnect-server");
     let client_spiffe = spiffe("watch-reconnect-client");
-    let (first_authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (first_authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let first_service = Arc::new(ControlledConsumer::default());
     first_service.arm_watch_block();
     first_service.emit_watch_entries_then_close(small_watch_change_at(1), 1);
@@ -2091,7 +2229,8 @@ async fn persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoin
     .await
     .expect("start first consumer listener");
 
-    let (second_authorizer, second_scope) = authorizer_and_scope(&client_spiffe).await;
+    let (second_authorizer, second_scope, _second_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     assert_eq!(scope, second_scope, "endpoint replacement retains scope");
     let second_service = Arc::new(ControlledConsumer::default());
     second_service.emit_watch_entries_then_close(small_watch_change_at(2), 1);
@@ -2199,7 +2338,8 @@ async fn persistent_watch_reconnects_after_authenticated_rotation() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-rotation-server");
     let client_spiffe = spiffe("watch-rotation-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.emit_one_watch_entry_then_pending(small_watch_change_at(1));
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -2268,7 +2408,8 @@ async fn peer_terminal_releases_an_unpolled_full_small_item_watch_queue() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("watch-peer-terminal-server");
     let client_spiffe = spiffe("watch-peer-terminal-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     service.emit_watch_entries_then_close(small_watch_change(), WATCH_QUEUE_ITEMS);
     let (handle, address) = SessionQuorumConsumerServer::new(
@@ -2341,7 +2482,8 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes()
     let pki = TestPki::new();
     let server_spiffe = spiffe("replacement-server");
     let client_spiffe = spiffe("replacement-client");
-    let (first_authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (first_authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let first_service = Arc::new(ControlledConsumer::default());
     let (first_handle, first_address) = SessionQuorumConsumerServer::new(
         first_service.clone(),
@@ -2461,7 +2603,8 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes()
     );
 
     first_handle.abort_and_wait().await;
-    let (second_authorizer, second_scope) = authorizer_and_scope(&client_spiffe).await;
+    let (second_authorizer, second_scope, _second_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     assert!(
         scope == second_scope,
         "replacement retains the exact consumer scope"
@@ -2535,7 +2678,8 @@ async fn forced_shutdown_stops_admission_and_bounds_active_calls_and_watches() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("shutdown-server");
     let client_spiffe = spiffe("shutdown-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -2583,7 +2727,8 @@ async fn cancelled_shutdown_future_still_forces_and_releases_a_quiet_watch() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("cancelled-shutdown-server");
     let client_spiffe = spiffe("cancelled-shutdown-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let (handle, address) =
         SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
@@ -2635,7 +2780,8 @@ async fn shutting_down_one_derived_pool_does_not_rotate_its_live_sibling() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("sibling-shutdown-server");
     let client_spiffe = spiffe("sibling-shutdown-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, _scope, authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let (handle, address) =
         SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
@@ -2648,8 +2794,7 @@ async fn shutting_down_one_derived_pool_does_not_rotate_its_live_sibling() {
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        authority,
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(2))
@@ -2680,7 +2825,8 @@ async fn consumer_listener_preserves_stateless_bounds_and_reaps_a_tls_blackhole(
     let pki = TestPki::new();
     let server_spiffe = spiffe("bounded-listener-server");
     let client_spiffe = spiffe("bounded-listener-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, _scope, authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let occupied = TcpListener::bind("127.0.0.1:0")
         .await
@@ -2793,8 +2939,7 @@ async fn consumer_listener_preserves_stateless_bounds_and_reaps_a_tls_blackhole(
     let client = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(proxy_address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        authority,
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(1));
@@ -2815,7 +2960,7 @@ async fn persistent_setup_preserves_the_shorter_stateless_pre_request_budget() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("setup-budget-server");
     let client_spiffe = spiffe("setup-budget-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, scope, authority) = authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -2840,8 +2985,7 @@ async fn persistent_setup_preserves_the_shorter_stateless_pre_request_budget() {
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        authority,
         pki.client_config(&client_spiffe),
     )
     .with_pre_request_connection_timeout(Duration::from_millis(25))

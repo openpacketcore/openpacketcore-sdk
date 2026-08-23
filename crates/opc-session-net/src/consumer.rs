@@ -33,16 +33,17 @@ use opc_session_store::{
     PreparedFencedTransition, PreparedLeaseAcquireExecuteError, PreparedLeaseAcquirePrepareError,
     PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError, ProtectedSessionBackend,
     RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionBackend,
-    SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
-    SessionConsumerCompareAndSetReceiptOutcome, SessionConsumerCompareAndSetRequest,
-    SessionConsumerCompareAndSetStatus, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerLeaseError,
-    SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationRequest,
-    SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionOp, SessionOpResult,
-    SessionPayloadEncoding, SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
+    SessionConsensusNodeId, SessionConsumerAuthorization, SessionConsumerAuthorizationManifest,
+    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerCompareAndSetReceiptOutcome,
+    SessionConsumerCompareAndSetRequest, SessionConsumerCompareAndSetStatus,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerLeaseMutationOperation,
+    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
+    SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerVoterAuthority, SessionOp, SessionOpResult, SessionPayloadEncoding,
+    SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
     MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 use opc_types::SpiffeId;
@@ -74,7 +75,7 @@ use crate::protocol::{
 pub const SESSION_QUORUM_CONSUMER_ALPN: &[u8] = b"opc-session-consumer/1";
 
 /// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_ALPN`].
-pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 5;
+pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 6;
 
 /// Maximum sequential application requests processed on one consumer
 /// connection. Every request has an exact nonzero connection-local
@@ -82,7 +83,7 @@ pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 5;
 pub const MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION: usize = 4096;
 /// Fixed logical width of the nonzero connection-local correlation value.
 pub const SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES: usize = std::mem::size_of::<u32>();
-/// Revision 5 deliberately admits one in-flight request per physical lane.
+/// Revision 6 deliberately admits one in-flight request per physical lane.
 pub const MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION: usize = 1;
 
 /// Default number of authenticated request lanes retained by a persistent
@@ -1083,8 +1084,7 @@ pub enum SessionConsumerAuthorizationError {
 /// consumer set, preventing role confusion at the listener boundary.
 #[derive(Clone)]
 pub struct SessionConsumerAuthorizer {
-    scope: SessionConsumerScope,
-    consumers: BTreeSet<String>,
+    manifest: SessionConsumerAuthorizationManifest,
     consensus_members: BTreeSet<String>,
 }
 
@@ -1092,7 +1092,6 @@ impl fmt::Debug for SessionConsumerAuthorizer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionConsumerAuthorizer")
-            .field("consumer_count", &self.consumers.len())
             .field("consensus_member_count", &self.consensus_members.len())
             .finish()
     }
@@ -1100,74 +1099,118 @@ impl fmt::Debug for SessionConsumerAuthorizer {
 
 impl SessionConsumerAuthorizer {
     /// Construct an authorization policy from the store-issued current-member
-    /// manifest and application mTLS SPIFFE IDs.
+    /// and explicit SPIFFE-to-tenant/NF manifest.
     ///
     /// The member exclusion set and scope cannot be supplied independently:
     /// doing so would let a deployment omit an actual quorum member and admit
     /// it through the consumer listener.
     pub fn try_new(
         manifest: SessionConsumerAuthorizationManifest,
-        consumer_identities: impl IntoIterator<Item = SpiffeId>,
     ) -> Result<Self, SessionConsumerAuthorizationError> {
-        Self::from_authoritative_members(
-            manifest.scope(),
-            consumer_identities,
-            manifest.consensus_member_identities().map(str::to_owned),
-        )
-    }
-
-    fn from_authoritative_members(
-        scope: SessionConsumerScope,
-        consumer_identities: impl IntoIterator<Item = SpiffeId>,
-        consensus_member_identities: impl IntoIterator<Item = String>,
-    ) -> Result<Self, SessionConsumerAuthorizationError> {
-        let consumers = consumer_identities
-            .into_iter()
-            .map(|identity| {
-                SessionConsumerIdentity::new(identity.as_str().to_owned())
-                    .map(|identity| identity.as_str().to_owned())
-                    .map_err(|_| SessionConsumerAuthorizationError::InvalidIdentity)
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        if consumers.is_empty() {
-            return Err(SessionConsumerAuthorizationError::Empty);
-        }
-        let consensus_members = consensus_member_identities
-            .into_iter()
+        let consensus_members = manifest
+            .consensus_member_identities()
+            .map(str::to_owned)
             .map(|identity| {
                 SessionConsumerIdentity::new(identity)
                     .map(|identity| identity.as_str().to_owned())
                     .map_err(|_| SessionConsumerAuthorizationError::InvalidIdentity)
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
-        if consumers
-            .iter()
-            .any(|identity| consensus_members.contains(identity))
-        {
-            return Err(SessionConsumerAuthorizationError::MemberRoleConflict);
-        }
         Ok(Self {
-            scope,
-            consumers,
+            manifest,
             consensus_members,
         })
     }
 
+    #[cfg(test)]
+    fn from_authoritative_members(
+        scope: SessionConsumerScope,
+        consumers: impl IntoIterator<Item = SpiffeId>,
+        consensus_members: impl IntoIterator<Item = String>,
+    ) -> Result<Self, SessionConsumerAuthorizationError> {
+        let roster = test_consumer_roster();
+        if roster.scope() != scope {
+            return Err(SessionConsumerAuthorizationError::InvalidIdentity);
+        }
+        let consensus_members = consensus_members.into_iter().collect::<BTreeSet<_>>();
+        let scopes = [
+            "adapter-transition",
+            "consumer-error-family",
+            "consumer-frame-test",
+            "consumer-legacy-token",
+            "consumer-payload-preflight",
+            "consumer-physical-admission",
+            "consumer-physical-token",
+            "consumer-record-free-admission",
+            "fenced-transition-id",
+            "fenced-transition-receipt",
+            "lease-receipt-errors",
+            "prepared-cas-receipt",
+            "prepared-lease-admission",
+            "prepared-lease-healthy",
+            "prepared-lease-status-deadline",
+            "prepared-router-cas",
+            "semantic-profile",
+            "wire-test",
+        ];
+        let grants = consumers
+            .into_iter()
+            .map(|consumer| {
+                if consensus_members.contains(consumer.as_str()) {
+                    return Err(SessionConsumerAuthorizationError::MemberRoleConflict);
+                }
+                let scopes = scopes
+                    .iter()
+                    .map(|tenant| {
+                        Ok(opc_session_store::SessionConsumerTenantNfScope::new(
+                            opc_types::TenantId::new(*tenant)
+                                .map_err(|_| SessionConsumerAuthorizationError::InvalidIdentity)?,
+                            opc_types::NetworkFunctionKind::smf(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, SessionConsumerAuthorizationError>>()?;
+                opc_session_store::SessionConsumerAuthorizationGrant::try_new(consumer, scopes)
+                    .map_err(|_| SessionConsumerAuthorizationError::InvalidIdentity)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let local_node_id = roster
+            .consensus_members()
+            .next()
+            .ok_or(SessionConsumerAuthorizationError::Empty)?
+            .node_id();
+        let manifest = roster
+            .authorization_manifest(local_node_id, grants)
+            .map_err(|_| SessionConsumerAuthorizationError::InvalidIdentity)?;
+        Self::try_new(manifest)
+    }
+
     /// Return the only consensus scope this policy admits.
     pub const fn scope(&self) -> SessionConsumerScope {
-        self.scope
+        self.manifest.scope()
+    }
+
+    fn local_node_id(&self) -> opc_session_store::SessionConsensusNodeId {
+        self.manifest.local_node_id()
+    }
+
+    fn voter_count(&self) -> usize {
+        self.manifest.voter_count()
+    }
+
+    fn roster_commitment(&self) -> opc_session_store::SessionConsumerRosterCommitment {
+        self.manifest.roster_commitment()
     }
 
     fn authorize(
         &self,
         identity: &SpiffeId,
-    ) -> Result<SessionConsumerIdentity, SessionConsumerRejection> {
-        let identity = identity.as_str();
-        if self.consensus_members.contains(identity) || !self.consumers.contains(identity) {
+    ) -> Result<SessionConsumerAuthorization, SessionConsumerRejection> {
+        if self.consensus_members.contains(identity.as_str()) {
             return Err(SessionConsumerRejection::Unauthorized);
         }
-        SessionConsumerIdentity::new(identity.to_owned())
-            .map_err(|_| SessionConsumerRejection::Unauthorized)
+        let identity = SessionConsumerIdentity::new(identity.as_str().to_owned())
+            .map_err(|_| SessionConsumerRejection::Unauthorized)?;
+        self.manifest.authorize(&identity)
     }
 }
 
@@ -1176,6 +1219,9 @@ impl SessionConsumerAuthorizer {
 struct ConsumerHello {
     transport_revision: u16,
     scope: SessionConsumerScope,
+    expected_server_node_id: u64,
+    voter_count: u16,
+    roster_commitment: [u8; 32],
     response_frame_size: u32,
 }
 
@@ -1184,6 +1230,9 @@ struct ConsumerHello {
 struct ConsumerHelloAck {
     transport_revision: u16,
     scope: SessionConsumerScope,
+    server_node_id: u64,
+    voter_count: u16,
+    roster_commitment: [u8; 32],
     request_frame_size: u32,
 }
 
@@ -1205,7 +1254,7 @@ struct BorrowedConsumerCall<'a> {
 
 /// Serialization-only view of a call. Keeping the caller-owned request
 /// borrowed avoids copying a potentially maximum-sized payload for every safe
-/// pre-write reconnect attempt while retaining the exact revision-5 encoding.
+/// pre-write reconnect attempt while retaining the exact revision-6 encoding.
 #[derive(Serialize)]
 #[serde(
     tag = "kind",
@@ -3797,17 +3846,24 @@ impl PreparedConsumerRouter {
         if clients.is_empty() || clients.len() > MAX_PREPARED_CONSUMER_VOTERS {
             return Err(SessionConsumerPreparedCheckpointBackendError);
         }
-        let scope = clients[0].scope();
-        let binding = clients[0]
+        let first = &clients[0];
+        let scope = first.scope();
+        let binding = first
             .prepared_consumer_binding()
             .ok_or(SessionConsumerPreparedCheckpointBackendError)?;
+        let voter_count = first.pool.client.voter.voter_count();
+        let roster_commitment = first.pool.client.voter.roster_commitment();
+        if clients.len() != voter_count || voter_count > MAX_PREPARED_CONSUMER_VOTERS {
+            return Err(SessionConsumerPreparedCheckpointBackendError);
+        }
         if clients.iter().any(|client| {
-            client.scope() != scope || client.prepared_consumer_binding() != Some(binding)
-        }) || !prepared_router_roster_is_distinct(
-            clients
-                .iter()
-                .map(|client| client.pool.client.expected_server_identity.as_str()),
-        ) {
+            let authority = &client.pool.client.voter;
+            client.scope() != scope
+                || client.prepared_consumer_binding() != Some(binding)
+                || authority.voter_count() != voter_count
+                || authority.roster_commitment() != roster_commitment
+        }) || !prepared_router_roster_is_exact(&clients)
+        {
             return Err(SessionConsumerPreparedCheckpointBackendError);
         }
         Ok(Self {
@@ -3818,6 +3874,16 @@ impl PreparedConsumerRouter {
     }
 }
 
+fn prepared_router_roster_is_exact(clients: &[PersistentSessionConsumerClient]) -> bool {
+    let mut node_ids = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    clients.iter().all(|client| {
+        let authority = &client.pool.client.voter;
+        node_ids.insert(authority.node_id()) && identities.insert(authority.tls_identity())
+    })
+}
+
+#[cfg(test)]
 fn prepared_router_roster_is_distinct<'a>(identities: impl IntoIterator<Item = &'a str>) -> bool {
     let mut seen = BTreeSet::new();
     identities.into_iter().all(|identity| seen.insert(identity))
@@ -4100,8 +4166,7 @@ impl SessionBackend for SessionConsumerFencedTransitionBackend {
 pub struct StatelessSessionConsumerClient {
     resolve: RemoteAddrResolver,
     server_name: rustls_pki_types::ServerName<'static>,
-    expected_server_identity: SpiffeId,
-    scope: SessionConsumerScope,
+    voter: ConsumerVoterBinding,
     tls_config: opc_tls::AuthenticatedClientConfig,
     idle_timeout: Duration,
     operation_timeout: Duration,
@@ -4111,6 +4176,118 @@ pub struct StatelessSessionConsumerClient {
     physical_admission: StatelessConsumerPhysicalAdmission,
     #[cfg(test)]
     final_admission_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[derive(Clone)]
+enum ConsumerVoterBinding {
+    Authority(SessionConsumerVoterAuthority),
+    #[cfg(test)]
+    Test {
+        scope: SessionConsumerScope,
+        node_id: SessionConsensusNodeId,
+        voter_count: usize,
+        roster_commitment: [u8; 32],
+        tls_identity: String,
+    },
+}
+
+impl ConsumerVoterBinding {
+    const fn scope(&self) -> SessionConsumerScope {
+        match self {
+            Self::Authority(authority) => authority.scope(),
+            #[cfg(test)]
+            Self::Test { scope, .. } => *scope,
+        }
+    }
+
+    const fn node_id(&self) -> SessionConsensusNodeId {
+        match self {
+            Self::Authority(authority) => authority.node_id(),
+            #[cfg(test)]
+            Self::Test { node_id, .. } => *node_id,
+        }
+    }
+
+    const fn voter_count(&self) -> usize {
+        match self {
+            Self::Authority(authority) => authority.voter_count(),
+            #[cfg(test)]
+            Self::Test { voter_count, .. } => *voter_count,
+        }
+    }
+
+    fn roster_commitment(&self) -> [u8; 32] {
+        match self {
+            Self::Authority(authority) => *authority.roster_commitment().as_bytes(),
+            #[cfg(test)]
+            Self::Test {
+                roster_commitment, ..
+            } => *roster_commitment,
+        }
+    }
+
+    fn tls_identity(&self) -> &str {
+        match self {
+            Self::Authority(authority) => authority.tls_identity(),
+            #[cfg(test)]
+            Self::Test { tls_identity, .. } => tls_identity,
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_consumer_roster() -> opc_session_store::SessionConsumerRoster {
+    static ROSTER: OnceLock<opc_session_store::SessionConsumerRoster> = OnceLock::new();
+    ROSTER
+        .get_or_init(|| {
+            let replica_id = opc_session_store::ReplicaId::new("consumer-unit-voter")
+                .expect("test replica ID");
+            let descriptor = opc_session_store::QuorumReplicaDescriptor::new(
+                replica_id.clone(),
+                opc_session_store::ReplicaEndpoint::new(
+                    "consumer-unit-voter.test.invalid",
+                    7443,
+                )
+                .expect("test replica endpoint"),
+                opc_session_store::ReplicaTlsIdentity::new(
+                    "spiffe://test.example/tenant/test/ns/default/sa/session/nf/consensus/instance/unit",
+                )
+                .expect("test replica TLS identity"),
+                opc_session_store::ReplicaFailureDomain::new("consumer-unit-zone")
+                    .expect("test failure domain"),
+                opc_session_store::ReplicaBackingIdentity::new("consumer-unit-volume")
+                    .expect("test backing identity"),
+            );
+            let cluster = opc_session_store::SessionConsensusClusterId::from_bytes([1; 32]);
+            let epoch = opc_session_store::SessionConsensusConfigurationEpoch::new(1)
+                .expect("test configuration epoch");
+            let configuration = opc_consensus::derive_configuration_id(
+                cluster,
+                epoch,
+                &[descriptor.configuration_fingerprint()],
+            );
+            let topology = opc_session_store::ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+                replica_id,
+                vec![descriptor],
+                opc_session_store::SessionConsensusIdentity::new(cluster, configuration, epoch),
+            )
+            .expect("test singleton topology");
+            topology
+                .session_consumer_roster()
+                .expect("test consumer roster")
+        })
+        .clone()
+}
+
+#[cfg(test)]
+fn test_consumer_voter_authority() -> SessionConsumerVoterAuthority {
+    let roster = test_consumer_roster();
+    let node_id = roster
+        .consensus_members()
+        .next()
+        .expect("test voter")
+        .node_id();
+    roster.voter(node_id).expect("test voter authority")
 }
 
 impl fmt::Debug for StatelessSessionConsumerClient {
@@ -4133,15 +4310,13 @@ impl StatelessSessionConsumerClient {
     pub fn new(
         address: SocketAddr,
         server_name: rustls_pki_types::ServerName<'static>,
-        expected_server_identity: SpiffeId,
-        scope: SessionConsumerScope,
+        voter_authority: SessionConsumerVoterAuthority,
         tls_config: opc_tls::AuthenticatedClientConfig,
     ) -> Self {
         Self::new_with_resolver(
             constant_address_resolver(address),
             server_name,
-            expected_server_identity,
-            scope,
+            voter_authority,
             tls_config,
         )
     }
@@ -4158,15 +4333,13 @@ impl StatelessSessionConsumerClient {
     pub fn new_with_resolver(
         resolve: RemoteAddrResolver,
         server_name: rustls_pki_types::ServerName<'static>,
-        expected_server_identity: SpiffeId,
-        scope: SessionConsumerScope,
+        voter_authority: SessionConsumerVoterAuthority,
         tls_config: opc_tls::AuthenticatedClientConfig,
     ) -> Self {
         Self {
             resolve,
             server_name,
-            expected_server_identity,
-            scope,
+            voter: ConsumerVoterBinding::Authority(voter_authority),
             tls_config,
             idle_timeout: DEFAULT_CONSUMER_IDLE_TIMEOUT,
             operation_timeout: DEFAULT_CONSUMER_OPERATION_TIMEOUT,
@@ -4180,6 +4353,53 @@ impl StatelessSessionConsumerClient {
     }
 
     #[cfg(test)]
+    fn new_unattested_for_test(
+        address: SocketAddr,
+        server_name: rustls_pki_types::ServerName<'static>,
+        expected_server_identity: SpiffeId,
+        scope: SessionConsumerScope,
+        tls_config: opc_tls::AuthenticatedClientConfig,
+    ) -> Self {
+        Self::new_with_resolver_unattested_for_test(
+            constant_address_resolver(address),
+            server_name,
+            expected_server_identity,
+            scope,
+            tls_config,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_resolver_unattested_for_test(
+        resolve: RemoteAddrResolver,
+        server_name: rustls_pki_types::ServerName<'static>,
+        expected_server_identity: SpiffeId,
+        scope: SessionConsumerScope,
+        tls_config: opc_tls::AuthenticatedClientConfig,
+    ) -> Self {
+        let authority = test_consumer_voter_authority();
+        Self {
+            resolve,
+            server_name,
+            voter: ConsumerVoterBinding::Test {
+                scope,
+                node_id: authority.node_id(),
+                voter_count: authority.voter_count(),
+                roster_commitment: *authority.roster_commitment().as_bytes(),
+                tls_identity: expected_server_identity.as_str().to_owned(),
+            },
+            tls_config,
+            idle_timeout: DEFAULT_CONSUMER_IDLE_TIMEOUT,
+            operation_timeout: DEFAULT_CONSUMER_OPERATION_TIMEOUT,
+            pre_request_connection_timeout: None,
+            lifecycle_policy: ConnectionLifecyclePolicy::default(),
+            reauthentication: SessionReauthenticationControl::new(),
+            physical_admission: StatelessConsumerPhysicalAdmission::new(),
+            final_admission_test_hook: None,
+        }
+    }
+
+    #[cfg(test)]
     fn with_final_admission_test_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.final_admission_test_hook = Some(hook);
         self
@@ -4188,7 +4408,7 @@ impl StatelessSessionConsumerClient {
     /// Set the finite bootstrap and active-frame idle timeout.
     ///
     /// Zero remains invalid. Source-compatible stateless callers may retain a
-    /// larger legacy value; revision 5 applies its five-second active-frame
+    /// larger legacy value; revision 6 applies its five-second active-frame
     /// ceiling internally. Persistent construction rejects values outside its
     /// explicit bounded profile.
     #[must_use]
@@ -4239,7 +4459,7 @@ impl StatelessSessionConsumerClient {
 
     /// Return the exact quorum scope carried on every request.
     pub const fn scope(&self) -> SessionConsumerScope {
-        self.scope
+        self.voter.scope()
     }
 
     /// Return redaction-safe current mTLS material health.
@@ -4335,7 +4555,7 @@ impl StatelessSessionConsumerClient {
         }
         let peer = opc_tls::peer_tls_identity_from_client_connection(tls.get_ref().1)
             .map_err(|_| SessionConsumerClientError::Authentication)?;
-        if peer.spiffe_id() != &self.expected_server_identity {
+        if peer.spiffe_id().as_str() != self.voter.tls_identity() {
             return Err(SessionConsumerClientError::Authentication);
         }
         let rotation_jitter = handshake.consumer_rotation_jitter(peer.spiffe_id());
@@ -4371,7 +4591,11 @@ impl StatelessSessionConsumerClient {
             ConsumerSetupPhaseAttempt::begin(setup_counters, ConsumerSetupPhase::Hello);
         let hello = ConsumerWireRequest::Hello(ConsumerHello {
             transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
-            scope: self.scope,
+            scope: self.scope(),
+            expected_server_node_id: self.voter.node_id().get(),
+            voter_count: u16::try_from(self.voter.voter_count())
+                .map_err(|_| SessionConsumerClientError::Protocol)?,
+            roster_commitment: self.voter.roster_commitment(),
             response_frame_size: consumer_wire_frame_size(MAX_NEGOTIATED_FRAME_SIZE)
                 .map_err(SessionConsumerClientError::from)?,
         });
@@ -4480,7 +4704,10 @@ impl StatelessSessionConsumerClient {
         let request_frame_size = match ack {
             ConsumerWireResponse::HelloAck(ack)
                 if ack.transport_revision == SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION
-                    && ack.scope == self.scope =>
+                    && ack.scope == self.scope()
+                    && ack.server_node_id == self.voter.node_id().get()
+                    && usize::from(ack.voter_count) == self.voter.voter_count()
+                    && ack.roster_commitment == self.voter.roster_commitment() =>
             {
                 checked_consumer_frame_size(ack.request_frame_size)
                     .map_err(SessionConsumerClientError::from)?
@@ -4849,7 +5076,7 @@ impl StatelessSessionConsumerClient {
         &self,
         request: SessionConsumerRequest,
     ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
-        if request.scope() != self.scope {
+        if request.scope() != self.scope() {
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Scope,
             ));
@@ -4901,7 +5128,7 @@ impl StatelessSessionConsumerClient {
         request_id: SessionConsumerRequestId,
         operation: SessionConsumerOperation,
     ) -> SessionConsumerRequest {
-        SessionConsumerRequest::new(self.scope, request_id, operation)
+        SessionConsumerRequest::new(self.scope(), request_id, operation)
     }
 
     /// Read current capabilities from an authoritative quorum path.
@@ -5610,7 +5837,7 @@ impl StatelessSessionConsumerClient {
                 response,
             }) if exact_correlation(correlation, received).is_ok() => {
                 let request = SessionConsumerRequest::new(
-                    self.scope,
+                    self.scope(),
                     SessionConsumerRequestId::from_bytes([0; 16]),
                     SessionConsumerOperation::Watch { start_sequence },
                 );
@@ -7385,7 +7612,7 @@ impl PersistentSessionConsumerClient {
                 SessionConsumerClientError::Deadline,
             ));
         }
-        if request.scope() != self.pool.client.scope {
+        if request.scope() != self.pool.client.scope() {
             self.pool
                 .record_error(SessionConsumerClientError::Scope, false, false);
             return Err(SessionConsumerCallError::BeforeCallWrite(
@@ -9810,7 +10037,7 @@ async fn handle_server_connection(
     }
     let peer = opc_tls::peer_tls_identity_from_server_connection(tls.get_ref().1)
         .map_err(|_| ProtocolError::Authentication)?;
-    let identity = authorizer
+    let authorization = authorizer
         .authorize(peer.spiffe_id())
         .map_err(|_| ProtocolError::Authentication)?;
     let rotation_jitter = handshake.consumer_rotation_jitter(peer.spiffe_id());
@@ -9894,7 +10121,17 @@ async fn handle_server_connection(
     }
     let response_frame_size =
         checked_consumer_frame_size(hello.response_frame_size)?.min(max_frame_size);
-    if hello.scope != authorizer.scope() {
+    let hello_rejection = if hello.scope != authorizer.scope() {
+        Some(SessionConsumerRejection::ScopeMismatch)
+    } else if hello.expected_server_node_id != authorizer.local_node_id().get()
+        || usize::from(hello.voter_count) != authorizer.voter_count()
+        || hello.roster_commitment != *authorizer.roster_commitment().as_bytes()
+    {
+        Some(SessionConsumerRejection::Unauthorized)
+    } else {
+        None
+    };
+    if let Some(hello_rejection) = hello_rejection {
         let rejection_deadline = setup_deadline.min(lifecycle.retire_at()).min(
             tokio::time::Instant::now()
                 .checked_add(idle_timeout)
@@ -9902,7 +10139,7 @@ async fn handle_server_connection(
         );
         let rejection = write_consumer_response_until(
             &mut writer,
-            ConsumerWireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch),
+            ConsumerWireResponse::HelloRejected(hello_rejection),
             response_frame_size,
             rejection_deadline,
         );
@@ -10003,6 +10240,10 @@ async fn handle_server_connection(
             ConsumerWireResponse::HelloAck(ConsumerHelloAck {
                 transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
                 scope: authorizer.scope(),
+                server_node_id: authorizer.local_node_id().get(),
+                voter_count: u16::try_from(authorizer.voter_count())
+                    .map_err(|_| ProtocolError::InvalidWireValue)?,
+                roster_commitment: *authorizer.roster_commitment().as_bytes(),
                 request_frame_size: consumer_wire_frame_size(max_frame_size)?,
             }),
             response_frame_size,
@@ -10238,7 +10479,7 @@ async fn handle_server_connection(
         let operation = ConsumerOperationKind::from_operation(request.operation());
         let scope = request.scope();
         let request_id = request.request_id();
-        let execute = service.execute(&identity, *request);
+        let execute = service.execute(&authorization, *request);
         tokio::pin!(execute);
         let mut response = loop {
             let hard_deadline = lifecycle
@@ -10348,7 +10589,7 @@ async fn handle_server_connection(
         let mut opened_watch = None;
         if let Some(start_sequence) = watch_start {
             if matches!(response, SessionConsumerResponse::WatchOpened) {
-                let watch_setup = service.watch(&identity, scope, start_sequence);
+                let watch_setup = service.watch(&authorization, scope, start_sequence);
                 tokio::pin!(watch_setup);
                 let watch_result = loop {
                     let hard_deadline = lifecycle
@@ -10767,6 +11008,7 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use super::test_consumer_voter_authority;
     use super::{
         authenticated_consumer_binding, classify_call_write_error,
         classify_prepared_lease_acquire_error, classify_prepared_lease_acquire_rejection,
@@ -10800,13 +11042,13 @@ mod tests {
         PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
         PersistentSessionConsumerExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
         PersistentWatchRecovery, PreparedConsumerRouter, PreparedLeaseAcquireDispatchResult,
-        PreparedRequestState, QueuedConsumerWatchItem, SessionConsumerAuthorizationError,
-        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
-        SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
-        SessionConsumerFencedTransitionMutationError, SessionConsumerIdentity,
-        SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-        SessionConsumerPreparedCheckpointBackend, SessionConsumerRejection, SessionQuorumConsumer,
-        SessionQuorumConsumerServer, StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        PreparedRequestState, QueuedConsumerWatchItem, SessionConsumerAuthorization,
+        SessionConsumerAuthorizationError, SessionConsumerAuthorizer, SessionConsumerCallError,
+        SessionConsumerChange, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+        SessionConsumerFencedTransitionMutationError, SessionConsumerLeaseMutationError,
+        SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
+        SessionConsumerRejection, SessionQuorumConsumer, SessionQuorumConsumerServer,
+        StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
         DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
@@ -10843,8 +11085,9 @@ mod tests {
         SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
         SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRequest,
         SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-        SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-        StateClass, StateType, StoreError, StoredSessionRecord, MAX_SESSION_TTL,
+        SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionKey, SessionKeyType,
+        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
+        MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -11068,6 +11311,78 @@ mod tests {
     }
 
     #[test]
+    fn prepared_router_requires_one_exact_complete_store_issued_roster() {
+        let material =
+            RotatableClientMaterial::new(material_spiffe("exact-roster-client").as_str());
+        let persistent = |authority: opc_session_store::SessionConsumerVoterAuthority| {
+            PersistentSessionConsumerClient::from_stateless(StatelessSessionConsumerClient::new(
+                "127.0.0.1:9".parse().expect("test socket"),
+                rustls_pki_types::ServerName::try_from("consumer.test").expect("test server name"),
+                authority,
+                material.config(),
+            ))
+            .expect("test persistent voter")
+        };
+
+        let identities = (0..3)
+            .map(|index| material_spiffe(&format!("exact-roster-voter-{index}")))
+            .collect::<Vec<_>>();
+        let roster = test_consumer_roster_for(&identities);
+        let authorities = identities
+            .iter()
+            .map(|identity| voter_authority_for_identity(&roster, identity))
+            .collect::<Vec<_>>();
+        assert!(
+            PreparedConsumerRouter::persistent(authorities.iter().cloned().map(&persistent))
+                .is_ok()
+        );
+        assert!(PreparedConsumerRouter::persistent(
+            authorities[..2].iter().cloned().map(&persistent)
+        )
+        .is_err());
+        assert!(PreparedConsumerRouter::persistent(
+            [
+                authorities[0].clone(),
+                authorities[0].clone(),
+                authorities[2].clone(),
+            ]
+            .into_iter()
+            .map(&persistent),
+        )
+        .is_err());
+        assert!(PreparedConsumerRouter::persistent(
+            authorities
+                .iter()
+                .cloned()
+                .chain(std::iter::once(authorities[1].clone()))
+                .map(&persistent),
+        )
+        .is_err());
+
+        let other_identities = (0..3)
+            .map(|index| material_spiffe(&format!("mixed-roster-voter-{index}")))
+            .collect::<Vec<_>>();
+        let other_roster = test_consumer_roster_for(&other_identities);
+        let mixed = voter_authority_for_identity(&other_roster, &other_identities[1]);
+        assert!(PreparedConsumerRouter::persistent(
+            [authorities[0].clone(), mixed, authorities[2].clone()]
+                .into_iter()
+                .map(&persistent),
+        )
+        .is_err());
+
+        let max_identities = (0..opc_session_store::QUORUM_TOPOLOGY_MAX_MEMBERS)
+            .map(|index| material_spiffe(&format!("max-roster-voter-{index}")))
+            .collect::<Vec<_>>();
+        let max_roster = test_consumer_roster_for(&max_identities);
+        let max_clients = max_identities
+            .iter()
+            .map(|identity| persistent(voter_authority_for_identity(&max_roster, identity)))
+            .collect::<Vec<_>>();
+        assert!(PreparedConsumerRouter::persistent(max_clients).is_ok());
+    }
+
+    #[test]
     fn explicit_checkpoint_attempt_budgets_allow_cellular_sweeps_without_default_wait() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         for timeout in [25_u64, 50, 100] {
@@ -11206,14 +11521,39 @@ mod tests {
     async fn prepared_cas_three_voter_response_loss_converges_via_next_receipt_voter() {
         let client_identity = material_spiffe("prepared-cas-router-client");
         let voter_a_identity = material_spiffe("prepared-cas-router-a");
+        let voter_b_identity = material_spiffe("prepared-cas-router-b");
         let voter_c_identity = material_spiffe("prepared-cas-router-c");
         let client_material = RotatableClientMaterial::new(client_identity.as_str());
-        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
-            scope(),
-            [client_identity],
-            std::iter::empty(),
+        let roster = test_consumer_roster_for(&[
+            voter_a_identity.clone(),
+            voter_b_identity.clone(),
+            voter_c_identity.clone(),
+        ]);
+        let scope = roster.scope();
+        let authority_a = voter_authority_for_identity(&roster, &voter_a_identity);
+        let authority_b = voter_authority_for_identity(&roster, &voter_b_identity);
+        let authority_c = voter_authority_for_identity(&roster, &voter_c_identity);
+        let grant = opc_session_store::SessionConsumerAuthorizationGrant::try_new(
+            client_identity,
+            [SessionConsumerTenantNfScope::new(
+                TenantId::new("prepared-router-cas").expect("test tenant"),
+                NetworkFunctionKind::smf(),
+            )],
         )
-        .expect("prepared-router authorizer");
+        .expect("prepared-router grant");
+        let authorizer_a = SessionConsumerAuthorizer::try_new(
+            roster
+                .clone()
+                .authorization_manifest(authority_a.node_id(), [grant.clone()])
+                .expect("A consumer manifest"),
+        )
+        .expect("A prepared-router authorizer");
+        let authorizer_c = SessionConsumerAuthorizer::try_new(
+            roster
+                .authorization_manifest(authority_c.node_id(), [grant])
+                .expect("C consumer manifest"),
+        )
+        .expect("C prepared-router authorizer");
 
         let a_status_calls = Arc::new(AtomicUsize::new(0));
         let c_mutation_calls = Arc::new(AtomicUsize::new(0));
@@ -11223,7 +11563,7 @@ mod tests {
                 status_calls: Arc::clone(&a_status_calls),
             }),
             client_material.trusted_server_config(voter_a_identity.as_str()),
-            authorizer.clone(),
+            authorizer_a,
         )
         .listen("127.0.0.1:0".parse().expect("A listener"))
         .await
@@ -11234,7 +11574,7 @@ mod tests {
                 mutations: Arc::clone(&c_mutations),
             }),
             client_material.trusted_server_config(voter_c_identity.as_str()),
-            authorizer,
+            authorizer_c,
         )
         .listen("127.0.0.1:0".parse().expect("C listener"))
         .await
@@ -11286,8 +11626,7 @@ mod tests {
             StatelessSessionConsumerClient::new_with_resolver(
                 a_resolver,
                 server_name.clone(),
-                voter_a_identity,
-                scope(),
+                authority_a,
                 client_material.config(),
             ),
         )
@@ -11296,8 +11635,7 @@ mod tests {
             StatelessSessionConsumerClient::new_with_resolver(
                 b_resolver,
                 server_name.clone(),
-                material_spiffe("prepared-cas-router-b"),
-                scope(),
+                authority_b,
                 client_material.config(),
             ),
         )
@@ -11306,8 +11644,7 @@ mod tests {
             StatelessSessionConsumerClient::new_with_resolver(
                 c_resolver,
                 server_name,
-                voter_c_identity,
-                scope(),
+                authority_c,
                 client_material.config(),
             ),
         )
@@ -11316,7 +11653,7 @@ mod tests {
             PreparedConsumerRouter::persistent([client_a, client_b, client_c])
                 .expect("three distinct same-scope voters"),
         );
-        let request = unprotected_router_state_test_compare_and_set_request().await;
+        let request = unprotected_router_state_test_compare_and_set_request(scope).await;
         let expected_request = request.clone();
         let token = PersistentPreparedCompareAndSetToken {
             router: Arc::clone(&router),
@@ -11410,21 +11747,22 @@ mod tests {
         )
         .await
         .expect("prepared CAS admission listener starts");
-        let client =
-            PersistentSessionConsumerClient::from_stateless(StatelessSessionConsumerClient::new(
+        let client = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_unattested_for_test(
                 address,
                 rustls_pki_types::ServerName::IpAddress(address.ip().into()),
                 voter_identity,
                 scope(),
                 client_material.config(),
-            ))
-            .expect("prepared CAS admission persistent voter");
+            ),
+        )
+        .expect("prepared CAS admission persistent voter");
         let router = Arc::new(
             PreparedConsumerRouter::persistent([client]).expect("prepared CAS admission router"),
         );
         let token = Arc::new(PersistentPreparedCompareAndSetToken {
             router: Arc::clone(&router),
-            request: Arc::new(unprotected_router_state_test_compare_and_set_request().await),
+            request: Arc::new(unprotected_router_state_test_compare_and_set_request(scope()).await),
             receipt: OnceLock::new(),
             budget: PreparedCheckpointBudget::new(
                 tokio::time::Instant::now() + Duration::from_secs(1),
@@ -11514,15 +11852,16 @@ mod tests {
         )
         .await
         .expect("prepared lease admission listener starts");
-        let client =
-            PersistentSessionConsumerClient::from_stateless(StatelessSessionConsumerClient::new(
+        let client = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_unattested_for_test(
                 address,
                 rustls_pki_types::ServerName::IpAddress(address.ip().into()),
                 voter_identity,
                 scope(),
                 client_material.config(),
-            ))
-            .expect("prepared lease admission persistent voter");
+            ),
+        )
+        .expect("prepared lease admission persistent voter");
         let router = Arc::new(
             PreparedConsumerRouter::persistent([client]).expect("prepared lease admission router"),
         );
@@ -11612,7 +11951,9 @@ mod tests {
 
     /// Context-free input reserved for router state-machine tests. Production
     /// callers obtain the opaque request/token only from protected wrappers.
-    async fn unprotected_router_state_test_compare_and_set_request() -> SessionConsumerRequest {
+    async fn unprotected_router_state_test_compare_and_set_request(
+        request_scope: SessionConsumerScope,
+    ) -> SessionConsumerRequest {
         let key = SessionKey {
             tenant: TenantId::new("prepared-router-cas").expect("test tenant"),
             nf_kind: NetworkFunctionKind::smf(),
@@ -11643,7 +11984,7 @@ mod tests {
         };
         let request_id = SessionConsumerRequestId::new();
         SessionConsumerRequest::new(
-            scope(),
+            request_scope,
             request_id,
             SessionConsumerOperation::CompareAndSet {
                 op: Box::new(operation),
@@ -11675,21 +12016,22 @@ mod tests {
         .listen("127.0.0.1:0".parse().expect("healthy listener"))
         .await
         .expect("healthy listener starts");
-        let client =
-            PersistentSessionConsumerClient::from_stateless(StatelessSessionConsumerClient::new(
+        let client = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_unattested_for_test(
                 address,
                 rustls_pki_types::ServerName::IpAddress(address.ip().into()),
                 voter_identity,
                 scope(),
                 client_material.config(),
-            ))
-            .expect("healthy persistent client");
+            ),
+        )
+        .expect("healthy persistent client");
         let router = Arc::new(
             PreparedConsumerRouter::persistent([client]).expect("one healthy same-scope voter"),
         );
         // This is intentionally a router-state test, not a protected
         // authority test; see the helper's scope note.
-        let request = unprotected_router_state_test_compare_and_set_request().await;
+        let request = unprotected_router_state_test_compare_and_set_request(scope()).await;
         let token = PersistentPreparedCompareAndSetToken {
             router: Arc::clone(&router),
             request: Arc::new(request),
@@ -11767,15 +12109,16 @@ mod tests {
         .listen("127.0.0.1:0".parse().expect("healthy lease listener"))
         .await
         .expect("healthy lease listener starts");
-        let client =
-            PersistentSessionConsumerClient::from_stateless(StatelessSessionConsumerClient::new(
+        let client = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_unattested_for_test(
                 address,
                 rustls_pki_types::ServerName::IpAddress(address.ip().into()),
                 voter_identity,
                 scope(),
                 client_material.config(),
-            ))
-            .expect("healthy lease persistent client");
+            ),
+        )
+        .expect("healthy lease persistent client");
         let wrapper = Arc::new(EncryptingSessionBackend::new(
             backend,
             Arc::new(MemoryKeyProvider::new()),
@@ -11834,15 +12177,16 @@ mod tests {
         .listen("127.0.0.1:0".parse().expect("multi-tenant listener"))
         .await
         .expect("multi-tenant listener starts");
-        let client =
-            PersistentSessionConsumerClient::from_stateless(StatelessSessionConsumerClient::new(
+        let client = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_unattested_for_test(
                 address,
                 rustls_pki_types::ServerName::IpAddress(address.ip().into()),
                 voter_identity,
                 scope(),
                 client_material.config(),
-            ))
-            .expect("multi-tenant persistent voter");
+            ),
+        )
+        .expect("multi-tenant persistent voter");
         let inner = Arc::new(FakeSessionBackend::new());
         let provider = Arc::new(MemoryKeyProvider::new());
         let wrapper = Arc::new(EncryptingSessionBackend::new(
@@ -11942,7 +12286,7 @@ mod tests {
     impl SessionQuorumConsumer for RecordedPreparedCasReceiptConsumer {
         async fn execute(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             request: SessionConsumerRequest,
         ) -> SessionConsumerResponse {
             assert!(matches!(
@@ -11959,7 +12303,7 @@ mod tests {
 
         async fn watch(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _scope: SessionConsumerScope,
             _start_sequence: u64,
         ) -> Result<
@@ -11978,7 +12322,7 @@ mod tests {
     impl SessionQuorumConsumer for RecordedPreparedLeaseReceiptConsumer {
         async fn execute(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             request: SessionConsumerRequest,
         ) -> SessionConsumerResponse {
             assert!(matches!(
@@ -11995,7 +12339,7 @@ mod tests {
 
         async fn watch(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _scope: SessionConsumerScope,
             _start_sequence: u64,
         ) -> Result<
@@ -12015,7 +12359,7 @@ mod tests {
     impl SessionQuorumConsumer for DroppedPreparedCasResponseConsumer {
         async fn execute(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             request: SessionConsumerRequest,
         ) -> SessionConsumerResponse {
             assert!(matches!(
@@ -12031,7 +12375,7 @@ mod tests {
 
         async fn watch(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _scope: SessionConsumerScope,
             _start_sequence: u64,
         ) -> Result<
@@ -12051,7 +12395,7 @@ mod tests {
     impl SessionQuorumConsumer for HealthyPreparedCasConsumer {
         async fn execute(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             request: SessionConsumerRequest,
         ) -> SessionConsumerResponse {
             match request.operation() {
@@ -12073,7 +12417,7 @@ mod tests {
 
         async fn watch(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _scope: SessionConsumerScope,
             _start_sequence: u64,
         ) -> Result<
@@ -12094,7 +12438,7 @@ mod tests {
     impl SessionQuorumConsumer for HealthyPreparedLeaseConsumer {
         async fn execute(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             request: SessionConsumerRequest,
         ) -> SessionConsumerResponse {
             match request.operation() {
@@ -12114,7 +12458,7 @@ mod tests {
 
         async fn watch(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _scope: SessionConsumerScope,
             _start_sequence: u64,
         ) -> Result<
@@ -12131,7 +12475,7 @@ mod tests {
     impl SessionQuorumConsumer for RejectingTestConsumer {
         async fn execute(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _request: SessionConsumerRequest,
         ) -> SessionConsumerResponse {
             SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
@@ -12139,7 +12483,7 @@ mod tests {
 
         async fn watch(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _scope: SessionConsumerScope,
             _start_sequence: u64,
         ) -> Result<
@@ -12158,7 +12502,7 @@ mod tests {
     impl SessionQuorumConsumer for CountingRejectingTestConsumer {
         async fn execute(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _request: SessionConsumerRequest,
         ) -> SessionConsumerResponse {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -12167,7 +12511,7 @@ mod tests {
 
         async fn watch(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _scope: SessionConsumerScope,
             _start_sequence: u64,
         ) -> Result<
@@ -12186,7 +12530,7 @@ mod tests {
     impl SessionQuorumConsumer for AuthorityRejectingTestConsumer {
         async fn execute(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _request: SessionConsumerRequest,
         ) -> SessionConsumerResponse {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -12195,7 +12539,7 @@ mod tests {
 
         async fn watch(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             _scope: SessionConsumerScope,
             _start_sequence: u64,
         ) -> Result<
@@ -12207,11 +12551,73 @@ mod tests {
     }
 
     fn scope() -> SessionConsumerScope {
-        SessionConsumerScope::new(SessionConsensusIdentity::new(
-            SessionConsensusClusterId::from_bytes([1; 32]),
-            SessionConsensusConfigurationId::from_bytes([2; 32]),
-            SessionConsensusConfigurationEpoch::new(1).expect("non-zero configuration epoch"),
-        ))
+        test_consumer_voter_authority().scope()
+    }
+
+    fn test_consumer_roster_for(
+        voter_identities: &[SpiffeId],
+    ) -> opc_session_store::SessionConsumerRoster {
+        assert!(
+            voter_identities.len() == 1
+                || ((3..=opc_session_store::QUORUM_TOPOLOGY_MAX_MEMBERS)
+                    .contains(&voter_identities.len())
+                    && voter_identities.len() % 2 == 1)
+        );
+        let descriptors = voter_identities
+            .iter()
+            .enumerate()
+            .map(|(index, identity)| {
+                opc_session_store::QuorumReplicaDescriptor::new(
+                    opc_session_store::ReplicaId::new(format!("consumer-test-voter-{index}"))
+                        .expect("test voter replica ID"),
+                    opc_session_store::ReplicaEndpoint::new(
+                        format!("consumer-test-voter-{index}.test.invalid"),
+                        7443,
+                    )
+                    .expect("test voter endpoint"),
+                    opc_session_store::ReplicaTlsIdentity::new(identity.as_str())
+                        .expect("test voter TLS identity"),
+                    opc_session_store::ReplicaFailureDomain::new(format!(
+                        "consumer-test-zone-{index}"
+                    ))
+                    .expect("test voter failure domain"),
+                    opc_session_store::ReplicaBackingIdentity::new(format!(
+                        "consumer-test-volume-{index}"
+                    ))
+                    .expect("test voter backing identity"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cluster = SessionConsensusClusterId::from_bytes([0x73; 32]);
+        let epoch = SessionConsensusConfigurationEpoch::new(1).expect("test configuration epoch");
+        let fingerprints = descriptors
+            .iter()
+            .map(opc_session_store::QuorumReplicaDescriptor::configuration_fingerprint)
+            .collect::<Vec<_>>();
+        let configuration = opc_consensus::derive_configuration_id(cluster, epoch, &fingerprints);
+        let topology = opc_session_store::ValidatedQuorumTopology::try_from(
+            opc_session_store::QuorumTopologyConfig::new_consensus(
+                descriptors[0].replica_id().clone(),
+                descriptors,
+                SessionConsensusIdentity::new(cluster, configuration, epoch),
+            ),
+        )
+        .expect("test consumer topology");
+        topology
+            .session_consumer_roster()
+            .expect("test consumer roster")
+    }
+
+    fn voter_authority_for_identity(
+        roster: &opc_session_store::SessionConsumerRoster,
+        identity: &SpiffeId,
+    ) -> opc_session_store::SessionConsumerVoterAuthority {
+        let node_id = roster
+            .consensus_members()
+            .find(|member| member.tls_identity() == identity.as_str())
+            .expect("test voter is in roster")
+            .node_id();
+        roster.voter(node_id).expect("test voter authority")
     }
 
     async fn authenticated_consumer_physical_create_request(
@@ -12602,7 +13008,7 @@ mod tests {
         let material = RotatableClientMaterial::new(
             "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/client",
         );
-        let client = StatelessSessionConsumerClient::new(
+        let client = StatelessSessionConsumerClient::new_unattested_for_test(
             "127.0.0.1:9".parse().expect("test socket address"),
             rustls_pki_types::ServerName::try_from("consumer.test").expect("test TLS server name"),
             spiffe("server"),
@@ -12640,7 +13046,10 @@ mod tests {
                     .tls_config
                     .begin_handshake()
                     .expect("test client handshake snapshot")
-                    .consumer_rotation_jitter(&client.expected_server_identity),
+                    .consumer_rotation_jitter(
+                        &SpiffeId::new(client.voter.tls_identity().to_owned())
+                            .expect("test voter SPIFFE identity"),
+                    ),
                 next_correlation: NonZeroU32::MIN,
                 calls: 0,
                 idle_deadline,
@@ -13822,7 +14231,7 @@ mod tests {
         let material = RotatableClientMaterial::new(
             "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/client",
         );
-        let client = StatelessSessionConsumerClient::new_with_resolver(
+        let client = StatelessSessionConsumerClient::new_with_resolver_unattested_for_test(
             Arc::new(move || {
                 resolving.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok("127.0.0.1:9".parse().expect("test address")) })
@@ -13889,7 +14298,7 @@ mod tests {
         let material = RotatableClientMaterial::new(
             "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/client",
         );
-        let client = StatelessSessionConsumerClient::new_with_resolver(
+        let client = StatelessSessionConsumerClient::new_with_resolver_unattested_for_test(
             Arc::new(move || {
                 resolving.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok("127.0.0.1:9".parse().expect("test address")) })
@@ -14307,6 +14716,12 @@ mod tests {
         let current_hello = ConsumerWireRequest::Hello(ConsumerHello {
             transport_revision: super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
             scope: scope(),
+            expected_server_node_id: test_consumer_voter_authority().node_id().get(),
+            voter_count: u16::try_from(test_consumer_voter_authority().voter_count())
+                .expect("test voter count"),
+            roster_commitment: *test_consumer_voter_authority()
+                .roster_commitment()
+                .as_bytes(),
             response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
                 .expect("consumer frame cap fits u32"),
         });
@@ -14356,13 +14771,7 @@ mod tests {
             [member.as_str().to_owned()],
         )
         .expect("disjoint roles are valid");
-        assert_eq!(
-            authorizer
-                .authorize(&consumer)
-                .expect("consumer is authorized")
-                .as_str(),
-            consumer.as_str()
-        );
+        assert!(authorizer.authorize(&consumer).is_ok());
         assert!(authorizer.authorize(&member).is_err());
         assert!(authorizer.authorize(&spiffe("untrusted")).is_err());
 
@@ -14628,7 +15037,7 @@ mod tests {
         let resolving = Arc::clone(&resolver_calls);
         let control = SessionReauthenticationControl::new();
         let (_base, material) = stateless_test_client(control);
-        let client = StatelessSessionConsumerClient::new_with_resolver(
+        let client = StatelessSessionConsumerClient::new_with_resolver_unattested_for_test(
             Arc::new(move || {
                 resolving.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok("127.0.0.1:9".parse().expect("test address")) })
@@ -14743,6 +15152,12 @@ mod tests {
             &ConsumerWireRequest::Hello(super::ConsumerHello {
                 transport_revision: super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
                 scope: scope(),
+                expected_server_node_id: test_consumer_voter_authority().node_id().get(),
+                voter_count: u16::try_from(test_consumer_voter_authority().voter_count())
+                    .expect("test voter count"),
+                roster_commitment: *test_consumer_voter_authority()
+                    .roster_commitment()
+                    .as_bytes(),
                 response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
                     .expect("test frame size fits u32"),
             }),
@@ -14989,6 +15404,12 @@ mod tests {
                 ConsumerWireResponse::HelloAck(super::ConsumerHelloAck {
                     transport_revision: super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
                     scope: scope(),
+                    server_node_id: test_consumer_voter_authority().node_id().get(),
+                    voter_count: u16::try_from(test_consumer_voter_authority().voter_count())
+                        .expect("test voter count"),
+                    roster_commitment: *test_consumer_voter_authority()
+                        .roster_commitment()
+                        .as_bytes(),
                     request_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
                         .expect("consumer frame cap fits u32"),
                 }),
@@ -15022,7 +15443,7 @@ mod tests {
         });
 
         let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-        let client = StatelessSessionConsumerClient::new_with_resolver(
+        let client = StatelessSessionConsumerClient::new_with_resolver_unattested_for_test(
             resolver,
             rustls_pki_types::ServerName::IpAddress(address.ip().into()),
             server_identity,
@@ -15094,7 +15515,7 @@ mod tests {
         let client_hook_calls = Arc::new(AtomicUsize::new(0));
         let client_hook_material = Arc::clone(&client_material);
         let client_hook_count = Arc::clone(&client_hook_calls);
-        let client = StatelessSessionConsumerClient::new(
+        let client = StatelessSessionConsumerClient::new_unattested_for_test(
             client_side_address,
             rustls_pki_types::ServerName::IpAddress(client_side_address.ip().into()),
             server_identity.clone(),
@@ -15148,7 +15569,7 @@ mod tests {
         .listen("127.0.0.1:0".parse().expect("loopback address"))
         .await
         .expect("listen for server final-admission race");
-        let client = StatelessSessionConsumerClient::new(
+        let client = StatelessSessionConsumerClient::new_unattested_for_test(
             server_side_address,
             rustls_pki_types::ServerName::IpAddress(server_side_address.ip().into()),
             server_identity,
@@ -15188,7 +15609,7 @@ mod tests {
                 .listen("127.0.0.1:0".parse().expect("loopback address"))
                 .await
                 .expect("listen for Ack-expiry boundary");
-        let client = StatelessSessionConsumerClient::new(
+        let client = StatelessSessionConsumerClient::new_unattested_for_test(
             address,
             rustls_pki_types::ServerName::IpAddress(address.ip().into()),
             server_identity,
@@ -15229,7 +15650,7 @@ mod tests {
         .listen("127.0.0.1:0".parse().expect("loopback address"))
         .await
         .expect("listen for service authority rejection");
-        let client = StatelessSessionConsumerClient::new(
+        let client = StatelessSessionConsumerClient::new_unattested_for_test(
             address,
             rustls_pki_types::ServerName::IpAddress(address.ip().into()),
             server_identity,

@@ -63,6 +63,10 @@ const MEMBERSHIP_TRANSITION_ID_BYTES: usize = 16;
 // IDs therefore fail closed on a binding/digest mismatch; there is no
 // permissive fallback for a protected prepared request.
 const OUTCOME_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/outcome-payload/v2\0";
+// Fenced-transition requests retain their independently published V1
+// canonical digest; the generic outcome namespace version does not migrate it.
+const FENCED_TRANSITION_PAYLOAD_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/outcome-payload/v1\0";
 const FENCED_TRANSITION_RECEIPT_BINDING_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-receipt-binding/v1\0";
 const FENCED_TRANSITION_RECEIPT_RESPONSE_DIGEST_DOMAIN: &[u8] =
@@ -1301,8 +1305,6 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) snapshot_receive_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
     pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ReplicationWatcher>>>,
-    pub(crate) consumer_watchers:
-        Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ConsumerReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -1439,7 +1441,6 @@ impl SqliteConsensusCore {
             snapshot_receive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             applied_progress,
             watchers: Arc::clone(&backend.watchers),
-            consumer_watchers: Arc::clone(&backend.consumer_watchers),
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
             #[cfg(test)]
@@ -7924,7 +7925,7 @@ fn fenced_transition_payload_digest(
     let intent = SessionMutationIntent::FencedTransition(Box::new(request.clone()));
     let encoded = encode_json(&(FENCED_TRANSITION_SCHEMA_V1, storage_identity, intent))?;
     let mut hasher = Sha256::new();
-    hasher.update(OUTCOME_DIGEST_DOMAIN);
+    hasher.update(FENCED_TRANSITION_PAYLOAD_DIGEST_DOMAIN);
     hasher.update(encoded);
     Ok(hasher.finalize().into())
 }

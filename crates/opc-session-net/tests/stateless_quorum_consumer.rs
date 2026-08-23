@@ -43,11 +43,12 @@ use opc_session_store::{
     RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
     ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, SessionBackend, SessionConsensusIdentity,
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
-    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
-    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerAuthorization,
+    SessionConsumerAuthorizationGrant, SessionConsumerChange, SessionConsumerLeaseError,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
+    SessionConsumerVoterAuthority, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
     SessionPayloadEncoding, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
     StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
@@ -201,6 +202,7 @@ impl GatedReadBarrierPeer {
 
 struct ThreeVoterConsumerFleet {
     manifest: Arc<SessionReplicationManifest>,
+    topologies: Vec<ValidatedQuorumTopology>,
     pki: Arc<TestPki>,
     path_enabled: BTreeMap<(usize, usize), Arc<AtomicBool>>,
     consensus_peers: BTreeMap<(usize, usize), Arc<GatedReadBarrierPeer>>,
@@ -358,6 +360,7 @@ impl ThreeVoterConsumerFleet {
         }
         let fleet = Self {
             manifest,
+            topologies,
             pki,
             path_enabled,
             consensus_peers,
@@ -400,6 +403,15 @@ impl ThreeVoterConsumerFleet {
         })
         .await
         .expect("three-voter cluster reaches durable readiness");
+    }
+
+    fn voter_authority(&self, index: usize) -> SessionConsumerVoterAuthority {
+        let topology = &self.topologies[index];
+        topology
+            .session_consumer_roster()
+            .expect("three-voter consumer roster")
+            .voter(topology.local_consensus_node_id().expect("local node ID"))
+            .expect("local three-voter authority")
     }
 
     fn reset_read_barrier_calls(&self) {
@@ -686,7 +698,7 @@ impl CommitThenLosePreparedCasResponse {
 impl SessionQuorumConsumer for CommitThenLosePreparedCasResponse {
     async fn execute(
         &self,
-        identity: &SessionConsumerIdentity,
+        identity: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         let cas = matches!(
@@ -711,7 +723,7 @@ impl SessionQuorumConsumer for CommitThenLosePreparedCasResponse {
 
     async fn watch(
         &self,
-        identity: &SessionConsumerIdentity,
+        identity: &SessionConsumerAuthorization,
         scope: SessionConsumerScope,
         start_sequence: u64,
     ) -> Result<
@@ -731,7 +743,7 @@ struct CountingPreparedCasStatusConsumer {
 impl SessionQuorumConsumer for CountingPreparedCasStatusConsumer {
     async fn execute(
         &self,
-        identity: &SessionConsumerIdentity,
+        identity: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         if matches!(
@@ -745,7 +757,7 @@ impl SessionQuorumConsumer for CountingPreparedCasStatusConsumer {
 
     async fn watch(
         &self,
-        identity: &SessionConsumerIdentity,
+        identity: &SessionConsumerAuthorization,
         scope: SessionConsumerScope,
         start_sequence: u64,
     ) -> Result<
@@ -799,7 +811,7 @@ impl CommitThenLoseConsumerResponse {
 impl SessionQuorumConsumer for CommitThenLoseConsumerResponse {
     async fn execute(
         &self,
-        identity: &SessionConsumerIdentity,
+        identity: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         let transition = matches!(
@@ -842,7 +854,7 @@ impl SessionQuorumConsumer for CommitThenLoseConsumerResponse {
 
     async fn watch(
         &self,
-        identity: &SessionConsumerIdentity,
+        identity: &SessionConsumerAuthorization,
         scope: SessionConsumerScope,
         start_sequence: u64,
     ) -> Result<
@@ -867,7 +879,7 @@ struct HangingConsumer {
 impl SessionQuorumConsumer for HangingConsumer {
     async fn execute(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _identity: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -880,7 +892,7 @@ impl SessionQuorumConsumer for HangingConsumer {
 
     async fn watch(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _identity: &SessionConsumerAuthorization,
         _scope: SessionConsumerScope,
         _start_sequence: u64,
     ) -> Result<
@@ -895,7 +907,7 @@ impl SessionQuorumConsumer for HangingConsumer {
 impl SessionQuorumConsumer for CountingConsumer {
     async fn execute(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _identity: &SessionConsumerAuthorization,
         _request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -904,7 +916,7 @@ impl SessionQuorumConsumer for CountingConsumer {
 
     async fn watch(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _identity: &SessionConsumerAuthorization,
         _scope: SessionConsumerScope,
         _start_sequence: u64,
     ) -> Result<
@@ -917,21 +929,46 @@ impl SessionQuorumConsumer for CountingConsumer {
 
 async fn authorizer_from_admitted_store(
     client_spiffe: &str,
-) -> (SessionConsumerAuthorizer, SessionConsumerScope) {
-    let (_snapshots, store, scope, authorizer) =
-        admitted_store_and_authorizer([client_spiffe.to_owned()]).await;
+    server_spiffe: &str,
+) -> (
+    SessionConsumerAuthorizer,
+    SessionConsumerScope,
+    SessionConsumerVoterAuthority,
+) {
+    let (_snapshots, store, scope, voter_authority, authorizer) =
+        admitted_store_and_authorizer([client_spiffe.to_owned()], server_spiffe).await;
     // The authorizer contains the store-issued scope and member exclusion set;
     // it remains valid after this short-lived fixture store is dropped.
     drop(store);
-    (authorizer, scope)
+    (authorizer, scope, voter_authority)
+}
+
+async fn three_voter_authorizer(
+    store: &ConsensusSessionStore,
+    client_spiffe: &str,
+) -> SessionConsumerAuthorizer {
+    let manifest = store
+        .consumer_authorization_manifest([SessionConsumerAuthorizationGrant::try_new(
+            SpiffeId::new(client_spiffe).expect("three-voter client SPIFFE"),
+            [SessionConsumerTenantNfScope::new(
+                TenantId::new("consumer-test").expect("tenant"),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("three-voter explicit consumer grant")])
+        .await
+        .expect("three-voter consumer manifest");
+    SessionConsumerAuthorizer::try_new(manifest).expect("three-voter consumer authorizer")
 }
 
 async fn admitted_store_and_authorizer(
     client_spiffes: impl IntoIterator<Item = String>,
+    server_spiffe: &str,
 ) -> (
     tempfile::TempDir,
     ConsensusSessionStore,
     SessionConsumerScope,
+    SessionConsumerVoterAuthority,
     SessionConsumerAuthorizer,
 ) {
     let snapshots = tempfile::tempdir().expect("snapshot directory");
@@ -939,7 +976,7 @@ async fn admitted_store_and_authorizer(
     let descriptor = QuorumReplicaDescriptor::new(
         replica_id.clone(),
         ReplicaEndpoint::new("consumer-authorizer.test.invalid", 7443).expect("endpoint"),
-        ReplicaTlsIdentity::new(spiffe("member")).expect("member TLS identity"),
+        ReplicaTlsIdentity::new(server_spiffe).expect("member TLS identity"),
         ReplicaFailureDomain::new("consumer-authorizer-zone").expect("failure domain"),
         ReplicaBackingIdentity::new("consumer-authorizer-disk").expect("backing identity"),
     );
@@ -954,6 +991,11 @@ async fn admitted_store_and_authorizer(
         SessionConsensusIdentity::new(cluster, configuration, epoch),
     )
     .expect("singleton topology");
+    let voter_authority = topology
+        .session_consumer_roster()
+        .expect("consumer roster")
+        .voter(topology.local_consensus_node_id().expect("local node ID"))
+        .expect("local voter authority");
     let store = ConsensusSessionStore::open(
         topology,
         SqliteSessionBackend::in_memory().expect("SQLite backend"),
@@ -963,19 +1005,26 @@ async fn admitted_store_and_authorizer(
     .await
     .expect("open store");
     store.initialize_cluster().await.expect("initialize store");
+    let grants = client_spiffes
+        .into_iter()
+        .map(|identity| {
+            SessionConsumerAuthorizationGrant::try_new(
+                SpiffeId::new(identity).expect("client SPIFFE"),
+                [SessionConsumerTenantNfScope::new(
+                    TenantId::new("consumer-test").expect("tenant"),
+                    NetworkFunctionKind::smf(),
+                )],
+            )
+            .expect("explicit consumer grant")
+        })
+        .collect::<Vec<_>>();
     let manifest = store
-        .consumer_authorization_manifest()
+        .consumer_authorization_manifest(grants)
         .await
         .expect("admitted consumer manifest");
     let scope = manifest.scope();
-    let authorizer = SessionConsumerAuthorizer::try_new(
-        manifest,
-        client_spiffes
-            .into_iter()
-            .map(|identity| SpiffeId::new(identity).expect("client SPIFFE")),
-    )
-    .expect("consumer authorizer");
-    (snapshots, store, scope, authorizer)
+    let authorizer = SessionConsumerAuthorizer::try_new(manifest).expect("consumer authorizer");
+    (snapshots, store, scope, voter_authority, authorizer)
 }
 
 fn spiffe(suffix: &str) -> String {
@@ -985,15 +1034,14 @@ fn spiffe(suffix: &str) -> String {
 fn consumer_client(
     pki: &TestPki,
     address: SocketAddr,
-    server_spiffe: &str,
+    _server_spiffe: &str,
     client_spiffe: &str,
-    scope: SessionConsumerScope,
+    voter_authority: SessionConsumerVoterAuthority,
 ) -> StatelessSessionConsumerClient {
     StatelessSessionConsumerClient::new(
         address,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority,
         pki.client_config(client_spiffe),
     )
 }
@@ -1104,7 +1152,7 @@ impl OneShotOutcomeUnknownConsumer {
 impl SessionQuorumConsumer for OneShotOutcomeUnknownConsumer {
     async fn execute(
         &self,
-        identity: &SessionConsumerIdentity,
+        identity: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         let physical_evidence = match request.operation() {
@@ -1143,7 +1191,7 @@ impl SessionQuorumConsumer for OneShotOutcomeUnknownConsumer {
 
     async fn watch(
         &self,
-        identity: &SessionConsumerIdentity,
+        identity: &SessionConsumerAuthorization,
         scope: SessionConsumerScope,
         start_sequence: u64,
     ) -> Result<
@@ -1179,9 +1227,9 @@ fn fenced_consumer_backend(
     address: SocketAddr,
     server_spiffe: &str,
     client_spiffe: &str,
-    scope: SessionConsumerScope,
+    voter_authority: SessionConsumerVoterAuthority,
 ) -> FencedConsumerClientHandle {
-    let stateless = consumer_client(pki, address, server_spiffe, client_spiffe, scope);
+    let stateless = consumer_client(pki, address, server_spiffe, client_spiffe, voter_authority);
     match kind {
         FencedConsumerClientKind::Stateless => FencedConsumerClientHandle {
             backend: Arc::new(
@@ -1340,7 +1388,8 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
     let server_spiffe = spiffe("server");
     let client_spiffe = spiffe("client");
     let service = Arc::new(CountingConsumer::default());
-    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
         pki.server_config(&server_spiffe),
@@ -1352,8 +1401,7 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
     let client = StatelessSessionConsumerClient::new(
         address,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority.clone(),
         pki.client_config(&client_spiffe),
     );
 
@@ -1370,22 +1418,18 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
         "the client must send exactly one request and never replay it automatically"
     );
 
-    let wrong_scope = SessionConsumerScope::new(SessionConsensusIdentity::new(
-        ConsensusClusterId::from_bytes([1; 32]),
-        opc_consensus::ConsensusConfigurationId::from_bytes([3; 32]),
-        ConsensusConfigurationEpoch::new(1).expect("non-zero configuration epoch"),
-    ));
+    let (_wrong_authorizer, _wrong_scope, wrong_voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &spiffe("wrong-scope-server")).await;
     let wrong_scope_client = StatelessSessionConsumerClient::new(
         address,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        wrong_scope,
+        wrong_voter_authority,
         pki.client_config(&client_spiffe),
     );
     assert_eq!(
         wrong_scope_client.capabilities().await,
-        Err(SessionConsumerClientError::Scope),
-        "a mismatched cluster/configuration/epoch scope must not reach the service"
+        Err(SessionConsumerClientError::Authentication),
+        "a topology-derived authority for another server must not reach the service"
     );
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
     handle.abort_and_wait().await;
@@ -1400,7 +1444,8 @@ async fn stateless_serial_calls_authenticate_fresh_and_accumulate_setup_delay() 
     let server_spiffe = spiffe("red-server");
     let client_spiffe = spiffe("red-client");
     let service = Arc::new(CountingConsumer::default());
-    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let (handle, upstream_address) = SessionQuorumConsumerServer::new(
         service.clone(),
         pki.server_config(&server_spiffe),
@@ -1436,7 +1481,13 @@ async fn stateless_serial_calls_authenticate_fresh_and_accumulate_setup_delay() 
         })
     };
 
-    let client = consumer_client(&pki, proxy_address, &server_spiffe, &client_spiffe, scope);
+    let client = consumer_client(
+        &pki,
+        proxy_address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
     let started_at = tokio::time::Instant::now();
     for _ in 0..CALLS {
         assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
@@ -1463,7 +1514,8 @@ async fn cloned_stateless_request_connections_fail_fast_at_the_shared_physical_c
     let pki = TestPki::new();
     let server_spiffe = spiffe("physical-request-server");
     let client_spiffe = spiffe("physical-request-client");
-    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(HangingConsumer::default());
     let (handle, upstream) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -1475,7 +1527,7 @@ async fn cloned_stateless_request_connections_fail_fast_at_the_shared_physical_c
     .await
     .expect("start physical-cap listener");
     let (proxy, accepted, proxy_task) = counting_tcp_proxy(upstream).await;
-    let client = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, scope);
+    let client = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, voter_authority);
 
     let mut held = (0..PHYSICAL_CAP)
         .map(|_| {
@@ -1525,7 +1577,8 @@ async fn cloned_stateless_watch_connections_have_an_isolated_shared_physical_cap
     let pki = TestPki::new();
     let server_spiffe = spiffe("physical-watch-server");
     let client_spiffe = spiffe("physical-watch-client");
-    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(HangingConsumer::default());
     let (handle, upstream) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -1537,7 +1590,7 @@ async fn cloned_stateless_watch_connections_have_an_isolated_shared_physical_cap
     .await
     .expect("start physical-watch listener");
     let (proxy, accepted, proxy_task) = counting_tcp_proxy(upstream).await;
-    let client = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, scope);
+    let client = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, voter_authority);
 
     let mut watches = Vec::with_capacity(PHYSICAL_CAP);
     for _ in 0..PHYSICAL_CAP {
@@ -1581,7 +1634,8 @@ async fn independent_stateless_constructors_do_not_share_physical_request_budget
     let pki = TestPki::new();
     let server_spiffe = spiffe("independent-physical-server");
     let client_spiffe = spiffe("independent-physical-client");
-    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(HangingConsumer::default());
     let (handle, upstream) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -1593,8 +1647,14 @@ async fn independent_stateless_constructors_do_not_share_physical_request_budget
     .await
     .expect("start independent-budget listener");
     let (proxy, accepted, proxy_task) = counting_tcp_proxy(upstream).await;
-    let first = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, scope);
-    let second = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, scope);
+    let first = consumer_client(
+        &pki,
+        proxy,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority.clone(),
+    );
+    let second = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, voter_authority);
 
     let mut held = Vec::with_capacity(PHYSICAL_CAP * 2);
     for _ in 0..PHYSICAL_CAP {
@@ -1629,7 +1689,8 @@ async fn consumer_resolver_reconnects_the_same_client_after_endpoint_replacement
     let server_spiffe = spiffe("resolver-server");
     let client_spiffe = spiffe("resolver-client");
     let first_service = Arc::new(CountingConsumer::default());
-    let (first_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (first_authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let (first_handle, first_address) = SessionQuorumConsumerServer::new(
         first_service.clone(),
         pki.server_config(&server_spiffe),
@@ -1656,8 +1717,7 @@ async fn consumer_resolver_reconnects_the_same_client_after_endpoint_replacement
     let client = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority.clone(),
         pki.client_config(&client_spiffe),
     );
 
@@ -1666,7 +1726,8 @@ async fn consumer_resolver_reconnects_the_same_client_after_endpoint_replacement
     first_handle.abort_and_wait().await;
 
     let second_service = Arc::new(CountingConsumer::default());
-    let (second_authorizer, second_scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (second_authorizer, second_scope, _second_voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     assert_eq!(scope, second_scope, "replacement listener keeps its scope");
     let (second_handle, second_address) = SessionQuorumConsumerServer::new(
         second_service.clone(),
@@ -1697,7 +1758,8 @@ async fn pre_request_connection_budget_expires_during_a_stalled_tls_handshake() 
     let pki = TestPki::new();
     let server_spiffe = spiffe("pre-request-stalled-server");
     let client_spiffe = spiffe("pre-request-stalled-client");
-    let (_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (_authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind stalled TLS listener");
@@ -1714,8 +1776,7 @@ async fn pre_request_connection_budget_expires_during_a_stalled_tls_handshake() 
     let client = StatelessSessionConsumerClient::new_with_resolver(
         Arc::new(move || Box::pin(async move { Ok(address) })),
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority.clone(),
         pki.client_config(&client_spiffe),
     )
     .with_pre_request_connection_timeout(Duration::from_millis(100))
@@ -1745,7 +1806,8 @@ async fn pre_request_connection_budget_leaves_time_for_a_healthy_later_roster_en
     let pki = TestPki::new();
     let server_spiffe = spiffe("pre-request-roster-server");
     let client_spiffe = spiffe("pre-request-roster-client");
-    let (_first_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (_first_authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let stalled_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind stalled TLS listener");
@@ -1765,7 +1827,8 @@ async fn pre_request_connection_budget_leaves_time_for_a_healthy_later_roster_en
         })
     };
     let healthy_service = Arc::new(CountingConsumer::default());
-    let (healthy_authorizer, healthy_scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (healthy_authorizer, healthy_scope, _healthy_voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     assert_eq!(scope, healthy_scope, "fixed roster retains one scope");
     let (healthy_handle, healthy_address) = SessionQuorumConsumerServer::new(
         healthy_service.clone(),
@@ -1791,8 +1854,7 @@ async fn pre_request_connection_budget_leaves_time_for_a_healthy_later_roster_en
     let client = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(stalled_address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority.clone(),
         pki.client_config(&client_spiffe),
     )
     .with_pre_request_connection_timeout(Duration::from_millis(500))
@@ -1829,7 +1891,8 @@ async fn pre_request_connection_budget_does_not_shorten_post_call_outcome_deadli
     let pki = TestPki::new();
     let server_spiffe = spiffe("pre-request-post-call-server");
     let client_spiffe = spiffe("pre-request-post-call-client");
-    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let hanging = Arc::new(HangingConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         hanging.clone(),
@@ -1843,8 +1906,7 @@ async fn pre_request_connection_budget_does_not_shorten_post_call_outcome_deadli
     let client = StatelessSessionConsumerClient::new_with_resolver(
         Arc::new(move || Box::pin(async move { Ok(address) })),
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority.clone(),
         pki.client_config(&client_spiffe),
     )
     .with_pre_request_connection_timeout(Duration::from_millis(500))
@@ -1871,7 +1933,8 @@ async fn resolver_failure_is_unavailable_and_not_transmitted_for_mutations_and_l
     let pki = TestPki::new();
     let server_spiffe = spiffe("resolver-failure-server");
     let client_spiffe = spiffe("resolver-failure-client");
-    let (_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (_authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let resolutions = Arc::new(AtomicUsize::new(0));
     let resolver: RemoteAddrResolver = {
         let resolutions = Arc::clone(&resolutions);
@@ -1888,8 +1951,7 @@ async fn resolver_failure_is_unavailable_and_not_transmitted_for_mutations_and_l
         rustls_pki_types::ServerName::IpAddress(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
         ),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority.clone(),
         pki.client_config(&client_spiffe),
     );
 
@@ -1923,7 +1985,8 @@ async fn deserialized_structurally_invalid_lease_guards_fail_before_resolve_or_e
     let pki = TestPki::new();
     let server_spiffe = spiffe("invalid-guard-server");
     let client_spiffe = spiffe("invalid-guard-client");
-    let (_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (_authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let resolutions = Arc::new(AtomicUsize::new(0));
     let resolver: RemoteAddrResolver = {
         let resolutions = Arc::clone(&resolutions);
@@ -1940,8 +2003,7 @@ async fn deserialized_structurally_invalid_lease_guards_fail_before_resolve_or_e
         rustls_pki_types::ServerName::IpAddress(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
         ),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority.clone(),
         pki.client_config(&client_spiffe),
     );
     let mut encoded = serde_json::to_value(test_lease().await).expect("encode valid lease guard");
@@ -2029,7 +2091,8 @@ async fn outcome_unknown_is_not_replayed_and_consumer_debug_is_redacted() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("debug-server");
     let client_spiffe = spiffe("debug-client");
-    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let hanging = Arc::new(HangingConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         hanging.clone(),
@@ -2043,8 +2106,7 @@ async fn outcome_unknown_is_not_replayed_and_consumer_debug_is_redacted() {
     let client = StatelessSessionConsumerClient::new_with_resolver(
         Arc::new(move || Box::pin(async move { Ok(address) })),
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority.clone(),
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(1));
@@ -2071,8 +2133,7 @@ async fn outcome_unknown_is_not_replayed_and_consumer_debug_is_redacted() {
         Arc::new(move || Box::pin(async move { Ok(diagnostic_address) })),
         rustls_pki_types::ServerName::try_from(diagnostic_dns.to_owned())
             .expect("diagnostic DNS server name"),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority.clone(),
         pki.client_config(&client_spiffe),
     );
     let client_debug = format!("{diagnostic_client:?}");
@@ -2094,7 +2155,8 @@ async fn lease_call_boundary_classifies_before_and_after_transmission() {
     let server_spiffe = spiffe("server");
     let admitted_spiffe = spiffe("admitted");
     let rejected_spiffe = spiffe("rejected");
-    let (authorizer, scope) = authorizer_from_admitted_store(&admitted_spiffe).await;
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&admitted_spiffe, &server_spiffe).await;
     let service = Arc::new(CountingConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -2106,9 +2168,15 @@ async fn lease_call_boundary_classifies_before_and_after_transmission() {
     .expect("start consumer listener");
 
     let request_id = SessionConsumerRequestId::new();
-    let rejected = consumer_client(&pki, address, &server_spiffe, &rejected_spiffe, scope)
-        .release_with_id(request_id, test_lease().await)
-        .await;
+    let rejected = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &rejected_spiffe,
+        voter_authority,
+    )
+    .release_with_id(request_id, test_lease().await)
+    .await;
     assert!(
         matches!(
             &rejected,
@@ -2122,7 +2190,8 @@ async fn lease_call_boundary_classifies_before_and_after_transmission() {
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
     handle.abort_and_wait().await;
 
-    let (authorizer, scope) = authorizer_from_admitted_store(&admitted_spiffe).await;
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&admitted_spiffe, &server_spiffe).await;
     let hanging = Arc::new(HangingConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         hanging.clone(),
@@ -2132,10 +2201,16 @@ async fn lease_call_boundary_classifies_before_and_after_transmission() {
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
     .await
     .expect("start hanging consumer listener");
-    let uncertain = consumer_client(&pki, address, &server_spiffe, &admitted_spiffe, scope)
-        .with_operation_timeout(Duration::from_secs(1))
-        .release_with_id(request_id, test_lease().await)
-        .await;
+    let uncertain = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &admitted_spiffe,
+        voter_authority,
+    )
+    .with_operation_timeout(Duration::from_secs(1))
+    .release_with_id(request_id, test_lease().await)
+    .await;
     assert!(matches!(
         uncertain,
         Err(SessionConsumerLeaseMutationError::OutcomeUnknown {
@@ -2153,14 +2228,8 @@ async fn twelve_concurrent_stateless_consumers_remain_outside_member_authority()
     let client_spiffes = (0..12)
         .map(|index| spiffe(&format!("concurrent-{index}")))
         .collect::<Vec<_>>();
-    let (_snapshots, store, scope, authorizer) =
-        admitted_store_and_authorizer(client_spiffes.clone()).await;
-    let manifest = store
-        .consumer_authorization_manifest()
-        .await
-        .expect("authoritative member-exclusion manifest");
-    assert_eq!(manifest.consensus_member_identities().count(), 1);
-    assert!(format!("{authorizer:?}").contains("consumer_count: 12"));
+    let (_snapshots, _store, _scope, voter_authority, authorizer) =
+        admitted_store_and_authorizer(client_spiffes.clone(), &server_spiffe).await;
     assert!(format!("{authorizer:?}").contains("consensus_member_count: 1"));
 
     let service = Arc::new(CountingConsumer::default());
@@ -2174,7 +2243,15 @@ async fn twelve_concurrent_stateless_consumers_remain_outside_member_authority()
     .expect("start stateless consumer listener");
     let clients = client_spiffes
         .iter()
-        .map(|client_spiffe| consumer_client(&pki, address, &server_spiffe, client_spiffe, scope))
+        .map(|client_spiffe| {
+            consumer_client(
+                &pki,
+                address,
+                &server_spiffe,
+                client_spiffe,
+                voter_authority.clone(),
+            )
+        })
         .collect::<Vec<_>>();
 
     let results =
@@ -2199,7 +2276,8 @@ async fn consumer_mtls_role_identity_and_server_identity_mismatches_fail_closed(
     let server_spiffe = spiffe("server");
     let admitted_spiffe = spiffe("admitted");
     let member_spiffe = spiffe("member");
-    let (authorizer, scope) = authorizer_from_admitted_store(&admitted_spiffe).await;
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&admitted_spiffe, &server_spiffe).await;
     let service = Arc::new(CountingConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -2215,7 +2293,7 @@ async fn consumer_mtls_role_identity_and_server_identity_mismatches_fail_closed(
         address,
         &server_spiffe,
         &spiffe("not-admitted"),
-        scope,
+        voter_authority.clone(),
     );
     assert_eq!(
         unknown_consumer.capabilities().await,
@@ -2223,20 +2301,27 @@ async fn consumer_mtls_role_identity_and_server_identity_mismatches_fail_closed(
         "the listener must close an unauthorized authenticated connection without a role oracle"
     );
 
-    let consensus_member_as_consumer =
-        consumer_client(&pki, address, &server_spiffe, &member_spiffe, scope);
+    let consensus_member_as_consumer = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &member_spiffe,
+        voter_authority.clone(),
+    );
     assert_eq!(
         consensus_member_as_consumer.capabilities().await,
         Err(SessionConsumerClientError::Unavailable),
         "a consensus-member certificate must not receive a consumer-role oracle"
     );
 
+    let (_wrong_authorizer, _wrong_scope, wrong_voter_authority) =
+        authorizer_from_admitted_store(&admitted_spiffe, &spiffe("different-server")).await;
     let wrong_server_identity = consumer_client(
         &pki,
         address,
-        &spiffe("different-server"),
+        &server_spiffe,
         &admitted_spiffe,
-        scope,
+        wrong_voter_authority,
     );
     assert_eq!(
         wrong_server_identity.capabilities().await,
@@ -2251,7 +2336,8 @@ async fn malformed_and_oversized_consumer_frames_are_rejected_before_dispatch() 
     let pki = TestPki::new();
     let server_spiffe = spiffe("server");
     let client_spiffe = spiffe("client");
-    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, scope, _voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(CountingConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -2329,15 +2415,21 @@ async fn durable_consumer_request_ids_deduplicate_lease_races_and_fence_stale_ow
     let pki = TestPki::new();
     let server_spiffe = spiffe("server");
     let client_spiffe = spiffe("lease-client");
-    let (_snapshots, store, scope, authorizer) =
-        admitted_store_and_authorizer([client_spiffe.clone()]).await;
+    let (_snapshots, store, scope, voter_authority, authorizer) =
+        admitted_store_and_authorizer([client_spiffe.clone()], &server_spiffe).await;
     let service = Arc::new(store.consumer_service());
     let (handle, address) =
         SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
             .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
             .await
             .expect("start durable consumer listener");
-    let client = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope);
+    let client = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
     let first_request = SessionConsumerRequest::new(
         scope,
         SessionConsumerRequestId::from_bytes([1; 16]),
@@ -2468,15 +2560,21 @@ async fn stateless_and_persistent_consumers_accept_shorter_and_zero_ttl_renewals
     let pki = TestPki::new();
     let server_spiffe = spiffe("renewal-server");
     let client_spiffe = spiffe("renewal-client");
-    let (_snapshots, store, scope, authorizer) =
-        admitted_store_and_authorizer([client_spiffe.clone()]).await;
+    let (_snapshots, store, _scope, voter_authority, authorizer) =
+        admitted_store_and_authorizer([client_spiffe.clone()], &server_spiffe).await;
     let service = Arc::new(store.consumer_service());
     let (handle, address) =
         SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
             .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
             .await
             .expect("start renewal consumer listener");
-    let stateless = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope);
+    let stateless = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
 
     let original = stateless
         .acquire_with_id(
@@ -2528,18 +2626,23 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
         ThreeVoterConsumerFleet::start(Arc::clone(&pki), Some(Duration::from_secs(4))).await;
     let (leader, _, _) = fleet.observed_leader();
     let follower = (leader + 1) % THREE_VOTER_COUNT;
-    let server_spiffe = spiffe("three-voter-first-proof-server");
+    let server_spiffe = three_voter_spiffe(follower);
     let client_spiffe = spiffe("three-voter-first-proof-client");
     let manifest = fleet.stores[follower]
-        .consumer_authorization_manifest()
+        .consumer_authorization_manifest([SessionConsumerAuthorizationGrant::try_new(
+            SpiffeId::new(&client_spiffe).expect("first-proof client SPIFFE"),
+            [SessionConsumerTenantNfScope::new(
+                TenantId::new("consumer-test").expect("tenant"),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("first-proof explicit consumer grant")])
         .await
         .expect("first-proof consumer manifest");
-    let scope = manifest.scope();
-    let authorizer = SessionConsumerAuthorizer::try_new(
-        manifest,
-        [SpiffeId::new(&client_spiffe).expect("first-proof client SPIFFE")],
-    )
-    .expect("first-proof consumer authorizer");
+    let _scope = manifest.scope();
+    let authorizer =
+        SessionConsumerAuthorizer::try_new(manifest).expect("first-proof consumer authorizer");
+    let voter_authority = fleet.voter_authority(follower);
     let (server, address) = SessionQuorumConsumerServer::new(
         Arc::new(fleet.stores[follower].consumer_service()),
         pki.server_config(&server_spiffe),
@@ -2556,8 +2659,7 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
         StatelessSessionConsumerClient::new_with_resolver(
             Arc::new(move || Box::pin(async move { Ok(address) })),
             rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-            SpiffeId::new(&server_spiffe).expect("first-proof server SPIFFE"),
-            scope,
+            voter_authority,
             pki.client_config(&client_spiffe),
         ),
         PersistentSessionConsumerConfig::default(),
@@ -2635,19 +2737,8 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
     let pki = Arc::new(TestPki::new());
     let fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
     let client_spiffe = spiffe("prepared-cas-three-voter-client");
-    let manifest = fleet.stores[0]
-        .consumer_authorization_manifest()
-        .await
-        .expect("prepared CAS consumer manifest");
-    let scope = manifest.scope();
-    let authorizer = SessionConsumerAuthorizer::try_new(
-        manifest,
-        [SpiffeId::new(&client_spiffe).expect("prepared CAS client SPIFFE")],
-    )
-    .expect("prepared CAS authorizer");
-    let a_spiffe = spiffe("prepared-cas-three-voter-a");
-    let b_spiffe = spiffe("prepared-cas-three-voter-b");
-    let c_spiffe = spiffe("prepared-cas-three-voter-c");
+    let a_spiffe = three_voter_spiffe(0);
+    let c_spiffe = three_voter_spiffe(2);
     let status_a = Arc::new(CountingPreparedCasStatusConsumer {
         inner: Arc::new(fleet.stores[0].consumer_service()),
         status_calls: AtomicUsize::new(0),
@@ -2655,7 +2746,7 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
     let (a_server, a_address) = SessionQuorumConsumerServer::new(
         Arc::clone(&status_a) as Arc<dyn SessionQuorumConsumer>,
         pki.server_config(&a_spiffe),
-        authorizer.clone(),
+        three_voter_authorizer(&fleet.stores[0], &client_spiffe).await,
     )
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("A listener"))
     .await
@@ -2666,7 +2757,7 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
     let (c_server, c_address) = SessionQuorumConsumerServer::new(
         Arc::clone(&c_loss) as Arc<dyn SessionQuorumConsumer>,
         pki.server_config(&c_spiffe),
-        authorizer,
+        three_voter_authorizer(&fleet.stores[2], &client_spiffe).await,
     )
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("C listener"))
     .await
@@ -2715,8 +2806,7 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
         StatelessSessionConsumerClient::new_with_resolver(
             a_resolver,
             server_name.clone(),
-            SpiffeId::new(&a_spiffe).expect("A SPIFFE"),
-            scope,
+            fleet.voter_authority(0),
             pki.client_config(&client_spiffe),
         ),
     )
@@ -2725,8 +2815,7 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
         StatelessSessionConsumerClient::new_with_resolver(
             b_resolver,
             server_name.clone(),
-            SpiffeId::new(&b_spiffe).expect("B SPIFFE"),
-            scope,
+            fleet.voter_authority(1),
             pki.client_config(&client_spiffe),
         ),
     )
@@ -2735,8 +2824,7 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
         StatelessSessionConsumerClient::new_with_resolver(
             c_resolver,
             server_name,
-            SpiffeId::new(&c_spiffe).expect("C SPIFFE"),
-            scope,
+            fleet.voter_authority(2),
             pki.client_config(&client_spiffe),
         ),
     )
@@ -2844,10 +2932,15 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
     let committed = c_loss.committed.notified();
     tokio::pin!(committed);
     committed.as_mut().enable();
+    let execute_result = prepared.execute_once().await;
     assert_eq!(
-        prepared.execute_once().await,
+        execute_result,
         Err(PreparedCompareAndSetExecuteError::OutcomeUnknown),
-        "C commits once but withholds its consumer response"
+        "C commits once but withholds its consumer response; route calls: A={}, B={}, C={}, mutations={}",
+        a_calls.load(Ordering::SeqCst),
+        b_calls.load(Ordering::SeqCst),
+        c_calls.load(Ordering::SeqCst),
+        c_loss.mutation_calls.load(Ordering::SeqCst),
     );
     tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, &mut committed)
         .await
@@ -2953,17 +3046,20 @@ async fn warm_prepared_cas_response_loss_sample(
     let fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
     let client_spiffe = spiffe("prepared-cas-warm-matrix-client");
     let manifest = fleet.stores[0]
-        .consumer_authorization_manifest()
+        .consumer_authorization_manifest([SessionConsumerAuthorizationGrant::try_new(
+            SpiffeId::new(&client_spiffe).expect("warm matrix client SPIFFE"),
+            [SessionConsumerTenantNfScope::new(
+                TenantId::new("consumer-test").expect("tenant"),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("warm matrix explicit consumer grant")])
         .await
         .expect("warm matrix consumer manifest");
-    let scope = manifest.scope();
-    let authorizer = SessionConsumerAuthorizer::try_new(
-        manifest,
-        [SpiffeId::new(&client_spiffe).expect("warm matrix client SPIFFE")],
-    )
-    .expect("warm matrix authorizer");
-    let a_spiffe = spiffe("prepared-cas-warm-matrix-a");
-    let c_spiffe = spiffe("prepared-cas-warm-matrix-c");
+    let _scope = manifest.scope();
+    let authorizer = SessionConsumerAuthorizer::try_new(manifest).expect("warm matrix authorizer");
+    let a_spiffe = three_voter_spiffe(0);
+    let c_spiffe = three_voter_spiffe(2);
     let status_a = Arc::new(CountingPreparedCasStatusConsumer {
         inner: Arc::new(fleet.stores[0].consumer_service()),
         status_calls: AtomicUsize::new(0),
@@ -3017,8 +3113,7 @@ async fn warm_prepared_cas_response_loss_sample(
         StatelessSessionConsumerClient::new_with_resolver(
             a_resolver,
             server_name.clone(),
-            SpiffeId::new(&a_spiffe).expect("warm A SPIFFE"),
-            scope,
+            fleet.voter_authority(0),
             pki.client_config(&client_spiffe),
         ),
     )
@@ -3027,8 +3122,7 @@ async fn warm_prepared_cas_response_loss_sample(
         StatelessSessionConsumerClient::new_with_resolver(
             c_resolver,
             server_name,
-            SpiffeId::new(&c_spiffe).expect("warm C SPIFFE"),
-            scope,
+            fleet.voter_authority(2),
             pki.client_config(&client_spiffe),
         ),
     )
@@ -3372,25 +3466,16 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         .expect("three-voter tie-break voter");
     assert_ne!(initial_follower, old_leader, "execute starts on a follower");
 
-    let server_spiffe = spiffe("three-voter-server");
+    let server_spiffe = three_voter_spiffe(initial_follower);
     let client_spiffe = spiffe("three-voter-client");
-    let manifest = fleet.stores[initial_follower]
-        .consumer_authorization_manifest()
-        .await
-        .expect("three-voter consumer manifest");
-    let scope = manifest.scope();
-    let authorizer = SessionConsumerAuthorizer::try_new(
-        manifest,
-        [SpiffeId::new(&client_spiffe).expect("three-voter client SPIFFE")],
-    )
-    .expect("three-voter consumer authorizer");
+    let voter_authority = fleet.voter_authority(initial_follower);
     let transition_loss = Arc::new(CommitThenLoseConsumerResponse::transition(Arc::new(
         fleet.stores[initial_follower].consumer_service(),
     )));
     let (transition_server, transition_address) = SessionQuorumConsumerServer::new(
         transition_loss.clone(),
         pki.server_config(&server_spiffe),
-        authorizer.clone(),
+        three_voter_authorizer(&fleet.stores[initial_follower], &client_spiffe).await,
     )
     .listen(
         "127.0.0.1:0"
@@ -3402,10 +3487,11 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     let mut recovery_servers = Vec::with_capacity(THREE_VOTER_COUNT);
     let mut recovery_addresses = Vec::with_capacity(THREE_VOTER_COUNT);
     for index in 0..THREE_VOTER_COUNT {
+        let recovery_spiffe = three_voter_spiffe(index);
         let (server, address) = SessionQuorumConsumerServer::new(
             Arc::new(fleet.stores[index].consumer_service()),
-            pki.server_config(&server_spiffe),
-            authorizer.clone(),
+            pki.server_config(&recovery_spiffe),
+            three_voter_authorizer(&fleet.stores[index], &client_spiffe).await,
         )
         .listen(
             "127.0.0.1:0"
@@ -3430,8 +3516,7 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         StatelessSessionConsumerClient::new_with_resolver(
             resolver,
             rustls_pki_types::ServerName::IpAddress(transition_address.ip().into()),
-            SpiffeId::new(&server_spiffe).expect("three-voter server SPIFFE"),
-            scope,
+            voter_authority,
             pki.client_config(&client_spiffe),
         ),
         PersistentSessionConsumerConfig::default(),
@@ -3466,7 +3551,7 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
             Arc::clone(&provider),
             "consumer-three-voter-protected",
         )
-        .with_fenced_transition_journal(journal),
+        .with_fenced_transition_journal(Arc::clone(&journal)),
     );
     let logical_request = fenced_create_request(0xa1);
     let prepared = outer
@@ -3553,8 +3638,8 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     )));
     let (status_server, status_address) = SessionQuorumConsumerServer::new(
         status_loss.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer.clone(),
+        pki.server_config(&three_voter_spiffe(status_target)),
+        three_voter_authorizer(&fleet.stores[status_target], &client_spiffe).await,
     )
     .listen(
         "127.0.0.1:0"
@@ -3563,9 +3648,39 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     )
     .await
     .expect("start follower status response-loss listener");
+    let status_resolved_address = Arc::new(RwLock::new(status_address));
+    let status_resolver_address = Arc::clone(&status_resolved_address);
+    let status_resolver: RemoteAddrResolver = Arc::new(move || {
+        let address = *status_resolver_address
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Box::pin(async move { Ok(address) })
+    });
+    let persistent_status = PersistentSessionConsumerClient::try_from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            status_resolver,
+            rustls_pki_types::ServerName::IpAddress(status_address.ip().into()),
+            fleet.voter_authority(status_target),
+            pki.client_config(&client_spiffe),
+        ),
+        PersistentSessionConsumerConfig::default(),
+    )
+    .expect("persistent follower-status consumer");
+    let status_physical = Arc::new(
+        SessionConsumerFencedTransitionBackend::persistent(persistent_status.clone())
+            .expect("persistent follower-status fenced-transition backend"),
+    );
+    let status_outer: Arc<dyn SessionBackend> = Arc::new(
+        EncryptingSessionBackend::new(
+            Arc::clone(&status_physical),
+            Arc::clone(&provider),
+            "consumer-three-voter-protected",
+        )
+        .with_fenced_transition_journal(Arc::clone(&journal)),
+    );
     *resolved_address
         .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = status_address;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = recovery_addresses[initial_follower];
     transition_server.abort_and_wait().await;
     assert!(matches!(
         execute.await.expect("execute task joins"),
@@ -3577,10 +3692,13 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     let status_resolved = status_loss.status_resolved.notified();
     tokio::pin!(status_resolved);
     status_resolved.as_mut().enable();
-    let status_outer = Arc::clone(&outer);
+    let status_outer_for_recovery = Arc::clone(&status_outer);
     let status_token = prepared.clone();
-    let recover =
-        tokio::spawn(async move { status_outer.fenced_transition_status(&status_token).await });
+    let recover = tokio::spawn(async move {
+        status_outer_for_recovery
+            .fenced_transition_status(&status_token)
+            .await
+    });
     tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, &mut status_resolved)
         .await
         .expect("status target resolves durable receipt before response loss");
@@ -3593,9 +3711,9 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT + Duration::from_millis(50),
     )
     .await;
-    *resolved_address
+    *status_resolved_address
         .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = recovery_addresses[new_leader];
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = recovery_addresses[status_target];
     status_server.abort_and_wait().await;
     let recorded = recover
         .await
@@ -3606,8 +3724,9 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         FencedTransitionStatus::Recorded(ref result) if result.as_ref().is_ok()
     ));
     assert!(
-        persistent.diagnostics().await.reconnects >= 2,
-        "both response losses retire their persistent lanes before exact status recovery"
+        persistent.diagnostics().await.reconnects >= 1
+            && persistent_status.diagnostics().await.reconnects >= 1,
+        "both response losses retire their exact voter-specific persistent lanes before status recovery"
     );
 
     let transition_log_index = fleet.stores[new_leader]
@@ -3642,7 +3761,7 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     })
     .await
     .expect("committed transition is compacted into a snapshot");
-    let after_compaction = outer
+    let after_compaction = status_outer
         .fenced_transition_status(&prepared)
         .await
         .expect("receipt lookup after snapshot compaction");
@@ -3707,27 +3826,40 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     fleet.restore(old_leader).await;
     fleet.wait_all_ready().await;
     for (index, recovery_address) in recovery_addresses.iter().copied().enumerate() {
-        *resolved_address
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = recovery_address;
-        let before_route = persistent.diagnostics().await;
-        persistent
-            .request_reauthentication()
-            .expect("retire the prior idle lane before routing to each voter");
+        let recovery_client = PersistentSessionConsumerClient::try_from_stateless(
+            StatelessSessionConsumerClient::new(
+                recovery_address,
+                rustls_pki_types::ServerName::IpAddress(recovery_address.ip().into()),
+                fleet.voter_authority(index),
+                pki.client_config(&client_spiffe),
+            ),
+            PersistentSessionConsumerConfig::default(),
+        )
+        .expect("persistent restored-voter consumer");
+        let recovery_physical = Arc::new(
+            SessionConsumerFencedTransitionBackend::persistent(recovery_client.clone())
+                .expect("persistent restored-voter fenced-transition backend"),
+        );
+        let recovery_outer: Arc<dyn SessionBackend> = Arc::new(
+            EncryptingSessionBackend::new(
+                recovery_physical,
+                Arc::clone(&provider),
+                "consumer-three-voter-protected",
+            )
+            .with_fenced_transition_journal(Arc::clone(&journal)),
+        );
         assert_eq!(
             recorded,
-            outer
+            recovery_outer
                 .fenced_transition_status(&prepared)
                 .await
                 .expect("each restored voter returns the exact protected receipt"),
             "voter {index} returns the globally durable receipt without resubmit"
         );
-        assert!(
-            persistent.diagnostics().await.resolve_attempts > before_route.resolve_attempts,
-            "voter {index} uses a fresh persistent mTLS connection after its resolver target changes"
-        );
+        recovery_client.shutdown().await;
     }
     persistent.shutdown().await;
+    persistent_status.shutdown().await;
     for server in recovery_servers {
         server.abort_and_wait().await;
     }
@@ -3742,8 +3874,8 @@ async fn authenticated_consumer_v2_recovers_journaled_protected_transition_after
         let pki = TestPki::new();
         let server_spiffe = spiffe("v2-server");
         let client_spiffe = spiffe("v2-client");
-        let (snapshots, store, scope, authorizer) =
-            admitted_store_and_authorizer([client_spiffe.clone()]).await;
+        let (snapshots, store, _scope, voter_authority, authorizer) =
+            admitted_store_and_authorizer([client_spiffe.clone()], &server_spiffe).await;
         let initial_service = Arc::new(OneShotOutcomeUnknownConsumer::new(Arc::new(
             store.consumer_service(),
         )));
@@ -3783,7 +3915,7 @@ async fn authenticated_consumer_v2_recovers_journaled_protected_transition_after
             initial_address,
             &server_spiffe,
             &client_spiffe,
-            scope,
+            voter_authority.clone(),
         );
         let initial_physical = Arc::clone(&initial_client.backend);
         let initial_provider = CountingKeyProvider::with_active_session_key();
@@ -3860,7 +3992,7 @@ async fn authenticated_consumer_v2_recovers_journaled_protected_transition_after
             replacement_address,
             &server_spiffe,
             &client_spiffe,
-            scope,
+            voter_authority,
         );
         let replacement_physical = Arc::clone(&replacement_client.backend);
         let replacement_provider = CountingKeyProvider::empty();

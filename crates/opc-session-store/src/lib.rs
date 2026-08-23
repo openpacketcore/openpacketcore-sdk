@@ -145,7 +145,9 @@ pub use consensus::{
 };
 pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,
-    session_consumer_batch_result_into_store, SessionConsumerAuthorizationManifest,
+    session_consumer_batch_result_into_store, SessionConsumerAuthorization,
+    SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationGrantError,
+    SessionConsumerAuthorizationManifest, SessionConsumerAuthorizationManifestError,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerChangeItem,
     SessionConsumerChangeKind, SessionConsumerCompareAndSetReceiptOutcome,
     SessionConsumerCompareAndSetRequest, SessionConsumerCompareAndSetStatus,
@@ -155,11 +157,14 @@ pub use consumer::{
     SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
     SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
     SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerRosterCommitment, SessionConsumerRosterMember, SessionConsumerScope,
-    SessionConsumerStoreError, SessionQuorumConsumer, StatelessSessionConsumer,
-    MAX_SESSION_CONSUMER_BATCH_OPERATIONS, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
-    MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES, SESSION_CONSUMER_IDENTITY_MAX_BYTES,
-    SESSION_CONSUMER_REQUEST_ID_BYTES,
+    SessionConsumerRoster, SessionConsumerRosterCommitment, SessionConsumerRosterError,
+    SessionConsumerRosterMember, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerTenantNfScope, SessionConsumerVoterAuthority, SessionQuorumConsumer,
+    StatelessSessionConsumer, MAX_SESSION_CONSUMER_AUTHORIZATION_GRANT_TUPLES,
+    MAX_SESSION_CONSUMER_AUTHORIZATION_IDENTITIES,
+    MAX_SESSION_CONSUMER_AUTHORIZATION_SCOPES_PER_IDENTITY, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
+    SESSION_CONSUMER_IDENTITY_MAX_BYTES, SESSION_CONSUMER_REQUEST_ID_BYTES,
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;

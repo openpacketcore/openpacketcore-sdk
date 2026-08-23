@@ -20,7 +20,8 @@ use opc_session_store::{
     ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
     SessionBackend, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionConsumerIdentity, SessionKey, SessionKeyType, SessionLeaseManager,
+    SessionConsumerAuthorizationGrant, SessionConsumerIdentity, SessionConsumerRejection,
+    SessionConsumerTenantNfScope, SessionKey, SessionKeyType, SessionLeaseManager,
     SessionQuorumConsumer, SessionTopologyAbortAdmissionProof,
     SessionTopologyCandidateRetirementProof, SessionTopologyJointCommitAdmissionProof,
     SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionError,
@@ -31,7 +32,28 @@ use opc_session_store::{
     TopologyAttestationTime, TopologyAttestationVerificationError,
     TopologyAttestationVerificationInput, TopologyCollectorId, ValidatedQuorumTopology,
 };
-use opc_types::{NetworkFunctionKind, TenantId};
+use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+
+fn fixed_consumer_identity() -> SessionConsumerIdentity {
+    SessionConsumerIdentity::new(
+        "spiffe://test/tenant/fixed-consumer/ns/default/sa/store/nf/smf/instance/one",
+    )
+    .expect("canonical fixed consumer identity")
+}
+
+fn fixed_consumer_grant() -> SessionConsumerAuthorizationGrant {
+    SessionConsumerAuthorizationGrant::try_new(
+        SpiffeId::new(
+            "spiffe://test/tenant/fixed-consumer/ns/default/sa/store/nf/smf/instance/one",
+        )
+        .expect("canonical fixed consumer SPIFFE ID"),
+        [SessionConsumerTenantNfScope::new(
+            TenantId::from_static("fixed-consumer"),
+            NetworkFunctionKind::smf(),
+        )],
+    )
+    .expect("fixed consumer grant")
+}
 
 #[derive(Debug)]
 struct UnscopedPeer {
@@ -1053,7 +1075,7 @@ async fn store_issued_consumer_manifest_retains_authoritative_node_to_tls_pairs(
     let (_directory, _database_paths, stores) = open_fixed_cluster(3, placement_policy).await;
 
     let manifest = stores[0]
-        .consumer_authorization_manifest()
+        .consumer_authorization_manifest([fixed_consumer_grant()])
         .await
         .expect("admitted fixed store issues its consumer roster");
     let actual_pairs = manifest
@@ -1070,7 +1092,7 @@ async fn persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority() 
     let (_directory, database_paths, stores) =
         open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
     stores[0]
-        .consumer_authorization_manifest()
+        .consumer_authorization_manifest([fixed_consumer_grant()])
         .await
         .expect("exact fixed store grants consumer authorization");
 
@@ -1109,7 +1131,10 @@ async fn persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority() 
         .expect("persist fixed binding drift");
     drop(connection);
 
-    assert!(stores[0].consumer_authorization_manifest().await.is_err());
+    assert!(stores[0]
+        .consumer_authorization_manifest([fixed_consumer_grant()])
+        .await
+        .is_err());
     let readiness = stores[0]
         .probe_fixed_durable_quorum_readiness_at(TopologyAttestationTime::from_unix_seconds(1))
         .await;
@@ -1157,7 +1182,10 @@ async fn running_fixed_profile_drift_revokes_traffic_authority() {
     }
 
     assert!(
-        stores[0].consumer_authorization_manifest().await.is_err(),
+        stores[0]
+            .consumer_authorization_manifest([fixed_consumer_grant()])
+            .await
+            .is_err(),
         "consumer authority must fail closed after fixed-profile drift"
     );
     assert!(
@@ -1191,7 +1219,7 @@ async fn running_fixed_placement_policy_drift_revokes_live_authority() {
     ] {
         let (_directory, database_paths, stores) = open_fixed_cluster(3, configured_policy).await;
         stores[0]
-            .consumer_authorization_manifest()
+            .consumer_authorization_manifest([fixed_consumer_grant()])
             .await
             .expect("exact fixed policy grants consumer authority");
         assert!(
@@ -1226,7 +1254,10 @@ async fn running_fixed_placement_policy_drift_revokes_live_authority() {
             "status must revoke admission after fixed policy drift"
         );
         assert!(
-            stores[0].consumer_authorization_manifest().await.is_err(),
+            stores[0]
+                .consumer_authorization_manifest([fixed_consumer_grant()])
+                .await
+                .is_err(),
             "consumer authority must fail closed after fixed policy drift"
         );
         assert!(
@@ -1400,8 +1431,8 @@ async fn fixed_majority_loss_terminates_an_idle_generic_watch_without_an_event()
 }
 
 #[tokio::test]
-async fn fixed_majority_loss_terminates_an_idle_consumer_watch_without_an_event() {
-    let (_directory, _database_paths, stores, paths) =
+async fn fixed_scoped_consumer_watch_is_rejected_before_stream_admission() {
+    let (_directory, _database_paths, stores, _paths) =
         open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
     let scope = stores[0]
         .consumer_scope()
@@ -1410,29 +1441,26 @@ async fn fixed_majority_loss_terminates_an_idle_consumer_watch_without_an_event(
         .status()
         .last_log_index
         .map_or(0, |index| index.saturating_add(1));
-    let identity = SessionConsumerIdentity::new("spiffe://test/fixed-consumer")
-        .expect("test consumer identity");
-    let mut watch = stores[0]
-        .consumer_service()
-        .watch(&identity, scope, start_sequence)
+    let identity = fixed_consumer_identity();
+    let manifest = stores[0]
+        .consumer_authorization_manifest([fixed_consumer_grant()])
         .await
-        .expect("open idle consumer watch before majority loss");
-
-    paths
-        .get(&(0, 1))
-        .expect("fixed voter one path")
-        .set_enabled(false);
-    paths
-        .get(&(0, 2))
-        .expect("fixed voter two path")
-        .set_enabled(false);
-
-    assert!(
-        tokio::time::timeout(Duration::from_secs(12), watch.next())
-            .await
-            .expect("idle consumer watch must re-establish majority authority within one bounded operation")
-            .is_none(),
-        "an idle fixed consumer watch must terminate after majority loss without a queued event"
+        .expect("fixed consumer authorization manifest");
+    let authorization = manifest
+        .authorize(&identity)
+        .expect("fixed consumer authorization");
+    let rejection = match stores[0]
+        .consumer_service()
+        .watch(&authorization, scope, start_sequence)
+        .await
+    {
+        Ok(_) => panic!("a global watch must not be admitted for a scoped consumer"),
+        Err(rejection) => rejection,
+    };
+    assert_eq!(
+        rejection,
+        SessionConsumerRejection::Unauthorized,
+        "denial occurs before a stream can expose foreign-tenant timing or sequence movement"
     );
 }
 

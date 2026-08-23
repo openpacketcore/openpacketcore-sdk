@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
+use opc_consensus::derive_configuration_id;
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::{
     PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
@@ -20,15 +21,16 @@ use opc_session_net::{
 use opc_session_store::{
     checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     EncryptedSessionPayload, FakeSessionBackend, FenceToken, Generation, LeaseGuard, OwnerId,
-    RestoreScanCursor, RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
-    RestoreScanScope, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-    SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
+    QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
+    ReplicaId, ReplicaTlsIdentity, RestoreScanCursor, RestoreScanCursorProfile, RestoreScanPage,
+    RestoreScanRequest, RestoreScanScope, SessionConsensusClusterId,
+    SessionConsensusConfigurationEpoch, SessionConsensusIdentity, SessionConsumerBatchResult,
     SessionConsumerChange, SessionConsumerLeaseError, SessionConsumerOperation,
     SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
     SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    StateClass, StateType, StoreError, StoredSessionRecord,
-    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_TTL,
+    SessionConsumerStoreError, SessionConsumerVoterAuthority, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
+    ValidatedQuorumTopology, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_TTL,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
@@ -105,12 +107,37 @@ fn spiffe(name: &str) -> String {
     format!("spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/{name}")
 }
 
-fn scope(marker: u8) -> SessionConsumerScope {
-    SessionConsumerScope::new(SessionConsensusIdentity::new(
-        SessionConsensusClusterId::from_bytes([marker; 32]),
-        SessionConsensusConfigurationId::from_bytes([marker.wrapping_add(1); 32]),
-        SessionConsensusConfigurationEpoch::new(1).expect("nonzero epoch"),
-    ))
+#[derive(Clone)]
+struct ConsumerVoterFixture {
+    scope: SessionConsumerScope,
+    authority: SessionConsumerVoterAuthority,
+}
+
+fn consumer_voter_fixture(marker: u8, server_spiffe: &str) -> ConsumerVoterFixture {
+    let replica_id = ReplicaId::new("persistent-protocol-test").expect("replica ID");
+    let descriptor = QuorumReplicaDescriptor::new(
+        replica_id.clone(),
+        ReplicaEndpoint::new("persistent-protocol.test.invalid", 7443).expect("endpoint"),
+        ReplicaTlsIdentity::new(server_spiffe).expect("server TLS identity"),
+        ReplicaFailureDomain::new("persistent-protocol-zone").expect("failure domain"),
+        ReplicaBackingIdentity::new("persistent-protocol-disk").expect("backing identity"),
+    );
+    let cluster = SessionConsensusClusterId::from_bytes([marker; 32]);
+    let epoch = SessionConsensusConfigurationEpoch::new(1).expect("nonzero epoch");
+    let configuration =
+        derive_configuration_id(cluster, epoch, &[descriptor.configuration_fingerprint()]);
+    let topology = ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+        replica_id,
+        vec![descriptor],
+        SessionConsensusIdentity::new(cluster, configuration, epoch),
+    )
+    .expect("singleton topology");
+    let roster = topology.session_consumer_roster().expect("consumer roster");
+    let scope = roster.scope();
+    let authority = roster
+        .voter(topology.local_consensus_node_id().expect("local node ID"))
+        .expect("local voter authority");
+    ConsumerVoterFixture { scope, authority }
 }
 
 fn mutation_request(
@@ -164,7 +191,7 @@ fn semantic_request(
     request_byte: u8,
 ) -> SessionConsumerRequest {
     SessionConsumerRequest::new(
-        scope(1),
+        consumer_voter_fixture(1, &spiffe("semantic-request-template")).scope,
         SessionConsumerRequestId::from_bytes([request_byte; 16]),
         operation,
     )
@@ -173,16 +200,14 @@ fn semantic_request(
 fn persistent_client(
     pki: &TestPki,
     address: SocketAddr,
-    server_spiffe: &str,
     client_spiffe: &str,
-    scope: SessionConsumerScope,
+    authority: SessionConsumerVoterAuthority,
 ) -> PersistentSessionConsumerClient {
     let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(server_spiffe).expect("server SPIFFE"),
-        scope,
+        authority,
         pki.client_config(client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(1));
@@ -206,16 +231,14 @@ fn persistent_client(
 fn persistent_client_with_short_active_frame_idle(
     pki: &TestPki,
     address: SocketAddr,
-    server_spiffe: &str,
     client_spiffe: &str,
-    scope: SessionConsumerScope,
+    authority: SessionConsumerVoterAuthority,
 ) -> PersistentSessionConsumerClient {
     let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(server_spiffe).expect("server SPIFFE"),
-        scope,
+        authority,
         pki.client_config(client_spiffe),
     )
     .with_idle_timeout(SHORT_ACTIVE_FRAME_IDLE)
@@ -338,6 +361,9 @@ enum CanonicalConsumerWireResponse {
 struct CanonicalConsumerHelloAck {
     transport_revision: u16,
     scope: SessionConsumerScope,
+    server_node_id: u64,
+    voter_count: u16,
+    roster_commitment: [u8; 32],
     request_frame_size: u32,
 }
 
@@ -435,6 +461,12 @@ fn canonical_response_payload(value: &Value) -> Vec<u8> {
             transport_revision: serde_json::from_value(value["body"]["transport_revision"].clone())
                 .expect("HelloAck revision"),
             scope: serde_json::from_value(value["body"]["scope"].clone()).expect("HelloAck scope"),
+            server_node_id: serde_json::from_value(value["body"]["server_node_id"].clone())
+                .expect("HelloAck server node ID"),
+            voter_count: serde_json::from_value(value["body"]["voter_count"].clone())
+                .expect("HelloAck voter count"),
+            roster_commitment: serde_json::from_value(value["body"]["roster_commitment"].clone())
+                .expect("HelloAck roster commitment"),
             request_frame_size: serde_json::from_value(value["body"]["request_frame_size"].clone())
                 .expect("HelloAck request frame size"),
         }),
@@ -477,6 +509,9 @@ fn hello_ack(hello: &Value) -> Value {
         "body": {
             "transport_revision": SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
             "scope": hello["body"]["scope"].clone(),
+            "server_node_id": hello["body"]["expected_server_node_id"].clone(),
+            "voter_count": hello["body"]["voter_count"].clone(),
+            "roster_commitment": hello["body"]["roster_commitment"].clone(),
             "request_frame_size": MAX_NEGOTIATED_FRAME_SIZE,
         },
     })
@@ -613,6 +648,12 @@ async fn assert_malicious_semantic_wire_response_is_unconfirmed(
     let address = listener.local_addr().expect("listener address");
     let authenticated = pki.server_config(&server_spiffe);
     let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+    let voter = consumer_voter_fixture(1, &server_spiffe);
+    let request = SessionConsumerRequest::new(
+        voter.scope,
+        request.request_id(),
+        request.operation().clone(),
+    );
     let expected_request = serde_json::to_value(&request).expect("request encodes");
     let server = tokio::spawn(async move {
         let (mut tls, call) =
@@ -630,7 +671,7 @@ async fn assert_malicious_semantic_wire_response_is_unconfirmed(
         });
         write_value(&mut tls, &response).await;
     });
-    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let client = persistent_client(&pki, address, &client_spiffe, voter.authority);
     let request_id = request.request_id();
     let effectful = match request.operation() {
         SessionConsumerOperation::Capabilities
@@ -675,8 +716,14 @@ async fn assert_malicious_semantic_wire_response_is_unconfirmed(
 }
 
 #[tokio::test]
-async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
-    for wrong in ["frozen-revision-three", "scope"] {
+async fn hello_ack_v6_identity_mismatches_fail_closed_without_a_call() {
+    for wrong in [
+        "revision-five",
+        "scope",
+        "server-node-id",
+        "voter-count",
+        "roster-commitment",
+    ] {
         let pki = TestPki::new();
         let server_spiffe = spiffe(&format!("hello-{wrong}-server"));
         let client_spiffe = spiffe(&format!("hello-{wrong}-client"));
@@ -686,13 +733,25 @@ async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
         let address = listener.local_addr().expect("listener address");
         let authenticated = pki.server_config(&server_spiffe);
         let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+        let wrong_scope = consumer_voter_fixture(9, &server_spiffe).scope;
         let server = tokio::spawn(async move {
             let mut tls = accept_consumer_tls(&listener, &authenticated, &expected_client).await;
             let hello = read_value(&mut tls).await;
             let mut ack = hello_ack(&hello);
             match wrong {
-                "frozen-revision-three" => ack["body"]["transport_revision"] = json!(3_u16),
-                "scope" => ack["body"]["scope"] = serde_json::to_value(scope(9)).expect("scope"),
+                "revision-five" => ack["body"]["transport_revision"] = json!(5_u16),
+                "scope" => ack["body"]["scope"] = serde_json::to_value(wrong_scope).expect("scope"),
+                "server-node-id" => {
+                    ack["body"]["server_node_id"] = json!(ack["body"]["server_node_id"]
+                        .as_u64()
+                        .expect("server node ID")
+                        .wrapping_add(1));
+                }
+                "voter-count" => ack["body"]["voter_count"] = json!(2_u16),
+                "roster-commitment" => {
+                    ack["body"]["roster_commitment"] =
+                        serde_json::to_value([9_u8; 32]).expect("roster commitment")
+                }
                 _ => unreachable!("fixed test cases"),
             }
             write_value(&mut tls, &ack).await;
@@ -701,7 +760,12 @@ async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
                 Ok(Ok(_)) => panic!("a rejected HelloAck must not permit an application call"),
             }
         });
-        let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+        let client = persistent_client(
+            &pki,
+            address,
+            &client_spiffe,
+            consumer_voter_fixture(1, &server_spiffe).authority,
+        );
         assert_typed_protocol_error(client.capabilities().await, &server_spiffe, &client_spiffe);
         server.await.expect("malicious server");
     }
@@ -756,7 +820,12 @@ async fn negotiated_reduced_request_cap_rejects_a_large_mutation_before_transmis
             })
         })
         .collect::<Vec<_>>();
-    let request = semantic_request(SessionConsumerOperation::Batch { ops }, 66);
+    let voter = consumer_voter_fixture(1, &server_spiffe);
+    let request = SessionConsumerRequest::new(
+        voter.scope,
+        SessionConsumerRequestId::from_bytes([66; 16]),
+        SessionConsumerOperation::Batch { ops },
+    );
     let request_bytes = serde_json::to_vec(&request).expect("large request encodes");
     assert!(
         request_bytes.len() > reduced_cap,
@@ -767,7 +836,7 @@ async fn negotiated_reduced_request_cap_rejects_a_large_mutation_before_transmis
         "fixture remains valid at the revision-wide frame cap"
     );
 
-    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let client = persistent_client(&pki, address, &client_spiffe, voter.authority);
     match client.execute(&request).await {
         Err(PersistentSessionConsumerExecuteError::NotTransmitted {
             cause: SessionConsumerClientError::Protocol,
@@ -820,9 +889,8 @@ async fn partial_hello_ack_expires_at_the_active_frame_bound() {
         let client = persistent_client_with_short_active_frame_idle(
             &pki,
             address,
-            &server_spiffe,
             &client_spiffe,
-            scope(1),
+            consumer_voter_fixture(1, &server_spiffe).authority,
         );
         let call = tokio::spawn({
             let client = client.clone();
@@ -885,7 +953,12 @@ async fn zero_future_and_wrong_variant_responses_fail_closed() {
             };
             write_value(&mut tls, &response).await;
         });
-        let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+        let client = persistent_client(
+            &pki,
+            address,
+            &client_spiffe,
+            consumer_voter_fixture(1, &server_spiffe).authority,
+        );
         assert_typed_protocol_error(client.capabilities().await, &server_spiffe, &client_spiffe);
         server.await.expect("malicious server");
     }
@@ -1297,15 +1370,19 @@ async fn local_persistent_validation_failures_are_typed_and_counted_once_before_
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind unused listener");
+    let voter = consumer_voter_fixture(2, &server_spiffe);
     let client = persistent_client(
         &pki,
         listener.local_addr().expect("listener address"),
-        &server_spiffe,
         &client_spiffe,
-        scope(2),
+        voter.authority,
     );
 
-    let wrong_scope = semantic_request(SessionConsumerOperation::Capabilities, 60);
+    let wrong_scope = SessionConsumerRequest::new(
+        consumer_voter_fixture(9, &server_spiffe).scope,
+        SessionConsumerRequestId::from_bytes([60; 16]),
+        SessionConsumerOperation::Capabilities,
+    );
     assert!(matches!(
         client.execute(&wrong_scope).await,
         Err(PersistentSessionConsumerExecuteError::NotTransmitted {
@@ -1314,7 +1391,7 @@ async fn local_persistent_validation_failures_are_typed_and_counted_once_before_
     ));
 
     let watch = SessionConsumerRequest::new(
-        scope(2),
+        voter.scope,
         SessionConsumerRequestId::from_bytes([61; 16]),
         SessionConsumerOperation::Watch { start_sequence: 0 },
     );
@@ -1337,7 +1414,7 @@ async fn local_persistent_validation_failures_are_typed_and_counted_once_before_
         62,
     );
     let malformed = SessionConsumerRequest::new(
-        scope(2),
+        voter.scope,
         malformed.request_id(),
         malformed.operation().clone(),
     );
@@ -1380,7 +1457,7 @@ async fn local_persistent_validation_failures_are_typed_and_counted_once_before_
         ),
     ] {
         let malformed_ttl = SessionConsumerRequest::new(
-            scope(2),
+            voter.scope,
             SessionConsumerRequestId::from_bytes([request_byte; 16]),
             operation,
         );
@@ -1447,7 +1524,12 @@ async fn authenticated_cas_outcome_unavailable_is_typed_unknown_and_evicts_the_l
         )
         .await;
     });
-    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let client = persistent_client(
+        &pki,
+        address,
+        &client_spiffe,
+        consumer_voter_fixture(1, &server_spiffe).authority,
+    );
     let backend = FakeSessionBackend::new();
     let key = semantic_key(b"cas-outcome-unavailable-key");
     let lease = backend
@@ -1550,7 +1632,12 @@ async fn batch_ambiguity_and_all_read_unavailability_use_one_canonical_outcome_r
         .await;
     });
 
-    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let client = persistent_client(
+        &pki,
+        address,
+        &client_spiffe,
+        consumer_voter_fixture(1, &server_spiffe).authority,
+    );
     let key = semantic_key(b"batch-outcome-rule-key");
     let owner = OwnerId::new("batch-outcome-rule-owner").expect("test owner");
     let lease = FakeSessionBackend::new()
@@ -1606,7 +1693,8 @@ async fn authenticated_outer_lease_unknown_is_counted_as_a_failure_not_a_success
     let authenticated = pki.server_config(&server_spiffe);
     let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
     let request_id = SessionConsumerRequestId::new();
-    let request = mutation_request(scope(1), request_id);
+    let voter = consumer_voter_fixture(1, &server_spiffe);
+    let request = mutation_request(voter.scope, request_id);
     let server = tokio::spawn(async move {
         let (mut tls, call) =
             accept_hello_and_call(&listener, &authenticated, &expected_client).await;
@@ -1625,7 +1713,7 @@ async fn authenticated_outer_lease_unknown_is_counted_as_a_failure_not_a_success
         )
         .await;
     });
-    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let client = persistent_client(&pki, address, &client_spiffe, voter.authority);
 
     assert_eq!(
         client.execute(&request).await,
@@ -1667,8 +1755,7 @@ async fn cancelled_initial_watch_accounts_the_exact_call_write_boundary_once() {
                 .expect("loopback IP")
                 .into(),
         ),
-        SpiffeId::new(spiffe("watch-cancel-before-server")).expect("server SPIFFE"),
-        scope(1),
+        consumer_voter_fixture(1, &spiffe("watch-cancel-before-server")).authority,
         pki.client_config(&spiffe("watch-cancel-before-client")),
     )
     .with_operation_timeout(Duration::from_secs(1));
@@ -1719,7 +1806,12 @@ async fn cancelled_initial_watch_accounts_the_exact_call_write_boundary_once() {
             }
         })
     };
-    let after = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let after = persistent_client(
+        &pki,
+        address,
+        &client_spiffe,
+        consumer_voter_fixture(1, &server_spiffe).authority,
+    );
     let after_task = {
         let after = after.clone();
         tokio::spawn(async move { after.open_watch(0).await })
@@ -1761,8 +1853,7 @@ async fn pending_request_setup_separates_logical_inflight_from_physical_active()
                 .expect("loopback IP")
                 .into(),
         ),
-        SpiffeId::new(spiffe("physical-active-server")).expect("server SPIFFE"),
-        scope(1),
+        consumer_voter_fixture(1, &spiffe("physical-active-server")).authority,
         pki.client_config(&spiffe("physical-active-client")),
     )
     .with_operation_timeout(Duration::from_secs(1));
@@ -1833,7 +1924,12 @@ async fn malformed_trailing_and_oversized_response_frames_fail_closed() {
                 _ => unreachable!("fixed test cases"),
             }
         });
-        let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+        let client = persistent_client(
+            &pki,
+            address,
+            &client_spiffe,
+            consumer_voter_fixture(1, &server_spiffe).authority,
+        );
         assert_typed_protocol_error(client.capabilities().await, &server_spiffe, &client_spiffe);
         server.await.expect("malicious server");
     }
@@ -1860,9 +1956,8 @@ async fn partial_read_only_unary_response_expires_at_the_authenticated_idle_boun
         let client = persistent_client_with_short_active_frame_idle(
             &pki,
             address,
-            &server_spiffe,
             &client_spiffe,
-            scope(1),
+            consumer_voter_fixture(1, &server_spiffe).authority,
         );
         assert_eq!(
             tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, client.capabilities())
@@ -1896,7 +1991,8 @@ async fn partial_mutation_unary_response_is_unknown_once_without_auto_replay() {
         let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
         let request_id =
             SessionConsumerRequestId::from_bytes([if boundary == "prefix" { 1 } else { 2 }; 16]);
-        let request = mutation_request(scope(1), request_id);
+        let voter = consumer_voter_fixture(1, &server_spiffe);
+        let request = mutation_request(voter.scope, request_id);
         let expected_request = serde_json::to_value(&request).expect("mutation request encodes");
         let (replay_checked, replay_check_complete) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
@@ -1932,9 +2028,8 @@ async fn partial_mutation_unary_response_is_unknown_once_without_auto_replay() {
         let client = persistent_client_with_short_active_frame_idle(
             &pki,
             address,
-            &server_spiffe,
             &client_spiffe,
-            scope(1),
+            voter.authority,
         );
         let error = tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, client.execute(&request))
             .await
@@ -1999,9 +2094,8 @@ async fn partial_initial_watch_open_response_releases_the_isolated_admission() {
         let client = persistent_client_with_short_active_frame_idle(
             &pki,
             address,
-            &server_spiffe,
             &client_spiffe,
-            scope(1),
+            consumer_voter_fixture(1, &server_spiffe).authority,
         );
         let result = tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, client.open_watch(0))
             .await
@@ -2076,7 +2170,12 @@ async fn correlated_watch_rejections_preserve_their_typed_setup_classification()
             )
             .await;
         });
-        let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+        let client = persistent_client(
+            &pki,
+            address,
+            &client_spiffe,
+            consumer_voter_fixture(1, &server_spiffe).authority,
+        );
 
         let result = client.open_watch(0).await;
         assert!(matches!(result, Err(error) if error == expected));
@@ -2125,9 +2224,8 @@ async fn partial_active_watch_frames_expire_and_release_the_isolated_slot() {
         let client = persistent_client_with_short_active_frame_idle(
             &pki,
             address,
-            &server_spiffe,
             &client_spiffe,
-            scope(1),
+            consumer_voter_fixture(1, &server_spiffe).authority,
         );
         let mut watch = client.open_watch(0).await.expect("WatchOpened is admitted");
         let item = tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, watch.next())
@@ -2185,7 +2283,12 @@ async fn partial_watch_fin_and_reset_are_terminal_on_active_and_replacement_lane
                     "a partial authenticated frame never opens a replacement Watch"
                 );
             });
-            let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+            let client = persistent_client(
+                &pki,
+                address,
+                &client_spiffe,
+                consumer_voter_fixture(1, &server_spiffe).authority,
+            );
             let mut watch = client.open_watch(0).await.expect("WatchOpened is admitted");
             assert!(
                 tokio::time::timeout(Duration::from_millis(500), watch.next())
@@ -2252,7 +2355,12 @@ async fn partial_watch_fin_and_reset_are_terminal_on_active_and_replacement_lane
                     "a truncated replacement cannot begin a third Watch"
                 );
             });
-            let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+            let client = persistent_client(
+                &pki,
+                address,
+                &client_spiffe,
+                consumer_voter_fixture(1, &server_spiffe).authority,
+            );
             let mut watch = client.open_watch(1).await.expect("initial WatchOpened");
             assert_eq!(
                 watch
@@ -2321,9 +2429,8 @@ async fn quiet_authenticated_watch_remains_admitted_until_the_peer_closes() {
     let client = persistent_client_with_short_active_frame_idle(
         &pki,
         address,
-        &server_spiffe,
         &client_spiffe,
-        scope(1),
+        consumer_voter_fixture(1, &server_spiffe).authority,
     );
     let mut watch = client.open_watch(0).await.expect("WatchOpened is admitted");
     quiet_observed
@@ -2394,7 +2501,12 @@ async fn duplicate_response_poisons_lane_and_next_call_uses_a_new_connection() {
         )
         .await;
     });
-    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let client = persistent_client(
+        &pki,
+        address,
+        &client_spiffe,
+        consumer_voter_fixture(1, &server_spiffe).authority,
+    );
 
     assert_eq!(client.capabilities().await, Ok(bounded_capabilities()));
     assert_typed_protocol_error(client.capabilities().await, &server_spiffe, &client_spiffe);
@@ -2480,8 +2592,7 @@ async fn scope_rejection_retires_the_lane_and_resolves_a_fresh_authority() {
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope(1),
+        consumer_voter_fixture(1, &server_spiffe).authority,
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(1));
@@ -2558,7 +2669,12 @@ async fn authenticated_unavailable_rejection_is_typed_counted_and_reuses_a_healt
         )
         .await;
     });
-    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+    let client = persistent_client(
+        &pki,
+        address,
+        &client_spiffe,
+        consumer_voter_fixture(1, &server_spiffe).authority,
+    );
 
     assert_eq!(
         client.capabilities().await,
@@ -2634,8 +2750,7 @@ async fn malformed_rejection_retires_the_lane_before_the_next_request() {
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope(1),
+        consumer_voter_fixture(1, &server_spiffe).authority,
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(1));
@@ -2733,8 +2848,7 @@ async fn unauthorized_rejection_retires_the_lane_and_resolves_a_fresh_authority(
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope(1),
+        consumer_voter_fixture(1, &server_spiffe).authority,
         pki.client_config(&client_spiffe),
     )
     .with_operation_timeout(Duration::from_secs(1));
@@ -2819,8 +2933,7 @@ async fn stateless_capabilities_classifies_every_authenticated_rejection() {
         let client = StatelessSessionConsumerClient::new_with_resolver(
             resolver,
             rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-            SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-            scope(1),
+            consumer_voter_fixture(1, &server_spiffe).authority,
             pki.client_config(&client_spiffe),
         )
         .with_operation_timeout(Duration::from_secs(1));
