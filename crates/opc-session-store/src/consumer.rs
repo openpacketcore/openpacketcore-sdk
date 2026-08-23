@@ -1237,7 +1237,16 @@ impl SessionConsumerAuthorization {
                 .is_none_or(|record| self.permits_key(&record.key))
     }
 
-    pub(crate) fn authorize_operation(
+    /// Check whether this already-authenticated authority grants one complete
+    /// validated operation.
+    ///
+    /// The authority is minted only by a store-issued manifest after the
+    /// transport has authenticated the consumer identity.  This method takes
+    /// no scope argument, so callers cannot substitute a caller-selected
+    /// cluster/configuration scope for the listener's separately validated
+    /// request scope.  Consumers of [`SessionQuorumConsumer`] must invoke it
+    /// before constructing any service execution or watch future.
+    pub fn authorize_operation(
         &self,
         operation: &SessionConsumerOperation,
     ) -> Result<(), SessionConsumerRejection> {

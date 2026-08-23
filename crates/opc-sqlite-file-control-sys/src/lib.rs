@@ -1,16 +1,19 @@
-//! Narrow safe access to SQLite's main-file movement probe.
+//! Narrow safe access to the SQLite file controls needed for pinned snapshots.
 //!
 //! SQLite owns the VFS file handle behind a [`rusqlite::Connection`].  This
-//! crate contains the sole audited raw-handle call required to ask that VFS
-//! whether its main database file has moved.  It exposes neither the handle
-//! nor any file name, and fails closed when the pinned SQLite build does not
-//! implement the opcode.
+//! crate contains the sole audited raw-handle calls used to check file
+//! movement and, on Linux, duplicate the main, named-database, or journal
+//! descriptor after authenticating the bundled Unix VFS.  It exposes neither
+//! SQLite's borrowed handles nor file names, and fails closed when the pinned
+//! SQLite build or platform cannot provide the required authority.
 
 #![allow(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::ffi::{c_void, CStr, CString};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+use std::ffi::{c_void, CStr};
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd as _;
 #[cfg(feature = "test-vfs")]
@@ -18,7 +21,7 @@ use std::sync::OnceLock;
 
 use rusqlite::{ffi, Connection};
 
-/// Failure from the SQLite main-file movement probe.
+/// Failure from the bounded SQLite file-control boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileControlError;
 
@@ -67,6 +70,8 @@ pub fn install_test_temp_path_failure_vfs() -> Result<(), FileControlError> {
 }
 
 #[cfg(feature = "test-vfs")]
+// SAFETY: SQLite invokes this callback only after registration with its
+// documented VFS callback ABI and supplies the callback arguments.
 unsafe extern "C" fn test_temp_path_failure_vfs_open(
     _vfs: *mut ffi::sqlite3_vfs,
     name: ffi::sqlite3_filename,
@@ -76,19 +81,27 @@ unsafe extern "C" fn test_temp_path_failure_vfs_open(
 ) -> libc::c_int {
     // SQLite uses either a null filename or the empty string for the unnamed
     // `ATTACH ''` artifact behind ordinary `VACUUM`.
+    // SAFETY: a non-null SQLite filename points to a NUL-terminated byte string
+    // valid for this callback invocation.
     if name.is_null() || unsafe { *name } == 0 {
         return ffi::SQLITE_IOERR_GETTEMPPATH;
     }
     // SAFETY: registration above preserves the original default VFS as the
     // process default.  SQLite provides the callback arguments for this
     // invocation, and the original xOpen accepts the same ABI and file size.
+    // SAFETY: SQLite exposes the process default VFS pointer for the duration
+    // of this callback invocation.
     let default_vfs = unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) };
     if default_vfs.is_null() {
         return ffi::SQLITE_IOERR;
     }
+    // SAFETY: SQLite owns the default VFS callback table for this callback
+    // invocation, so its `xOpen` field may be read.
     let Some(open) = (unsafe { (*default_vfs).xOpen }) else {
         return ffi::SQLITE_IOERR;
     };
+    // SAFETY: the default VFS callback table and `xOpen` function pointer are
+    // valid for this invocation, and the arguments retain SQLite's ABI.
     unsafe { open(default_vfs, name, file, flags, out_flags) }
 }
 

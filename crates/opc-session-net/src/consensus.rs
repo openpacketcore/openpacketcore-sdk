@@ -2205,6 +2205,10 @@ impl SessionConsensusServer {
         }));
         let sem = Arc::new(Semaphore::new(self.max_connections));
         let handler_executions = Arc::new(Semaphore::new(self.max_connections));
+        #[cfg(feature = "test-control")]
+        let drain_handler_executions = Arc::clone(&handler_executions);
+        #[cfg(feature = "test-control")]
+        let handler_execution_limit = self.max_connections;
         let handler = self.handler;
         let tls_config = self.tls_config;
         let membership = self.membership;
@@ -2271,6 +2275,10 @@ impl SessionConsensusServer {
                 connection_tasks,
                 cancellation,
                 shutdown_tx,
+                #[cfg(feature = "test-control")]
+                handler_executions: drain_handler_executions,
+                #[cfg(feature = "test-control")]
+                handler_execution_limit,
             },
             bound_addr,
         ))
@@ -2290,6 +2298,10 @@ pub struct SessionConsensusServerHandle {
     connection_tasks: Arc<std::sync::Mutex<ConnectionTaskRegistry>>,
     cancellation: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "test-control")]
+    handler_executions: Arc<Semaphore>,
+    #[cfg(feature = "test-control")]
+    handler_execution_limit: usize,
 }
 
 impl SessionConsensusServerHandle {
@@ -2326,6 +2338,10 @@ impl SessionConsensusServerHandle {
     /// work. Such work may complete after this connection barrier while holding
     /// its bounded execution permit and membership lease.
     pub async fn abort_and_wait(mut self) {
+        self.abort_and_join_connections().await;
+    }
+
+    async fn abort_and_join_connections(&mut self) {
         self.abort();
         let _ = (&mut self.accept_handle).await;
         let handles = {
@@ -2340,6 +2356,25 @@ impl SessionConsensusServerHandle {
         }
         for handle in handles {
             let _ = handle.await;
+        }
+    }
+
+    /// Test-only hard transport/core barrier for deterministic election
+    /// qualification. It first prevents any new authenticated request from
+    /// reaching the handler, then waits for every cancellation-unsafe handler
+    /// already admitted to reach its actual terminal result.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub async fn abort_and_drain_handlers_for_test(mut self) {
+        self.abort_and_join_connections().await;
+        let mut permits = Vec::with_capacity(self.handler_execution_limit);
+        for _ in 0..self.handler_execution_limit {
+            permits.push(
+                Arc::clone(&self.handler_executions)
+                    .acquire_owned()
+                    .await
+                    .expect("consensus handler semaphore remains open"),
+            );
         }
     }
 }

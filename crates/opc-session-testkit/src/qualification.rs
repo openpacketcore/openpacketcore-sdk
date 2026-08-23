@@ -1288,6 +1288,28 @@ pub struct SessionHaQualificationProfile {
     pub evidence: QualificationEvidenceRequirements,
 }
 
+/// Frozen v2 profile shape used only to validate the byte-stable v4 and v5
+/// candidate profiles. Keeping this decoder separate prevents compatibility
+/// with historical evidence from making current protocol revisions optional.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenSessionHaQualificationProfileV2 {
+    schema_version: String,
+    profile_id: String,
+    maturity: String,
+    qualification_complete: bool,
+    workspace: QualificationWorkspace,
+    source_build_gate: QualificationSourceBuildGate,
+    artifacts: Vec<QualificationArtifact>,
+    platforms: Vec<QualificationPlatform>,
+    topology: QualificationTopology,
+    protocol: QualificationProtocolV2,
+    consensus_timing: QualificationConsensusTiming,
+    bounds: QualificationBounds,
+    provisional_test_thresholds: QualificationThresholds,
+    evidence: QualificationEvidenceRequirements,
+}
+
 /// Executable real-mTLS warm-call thresholds for the revision-2 persistent
 /// consumer. These qualify only the SDK loopback harness, not a downstream
 /// ePDG deployment SLO.
@@ -1693,6 +1715,32 @@ pub struct QualificationProtocol {
     pub stateless_consumer: Option<QualificationStatelessConsumerProtocol>,
 }
 
+/// Exact protocol inventory retained by the frozen v2, v4, and v5
+/// qualification profiles. The outcome-digest application revision was not
+/// part of those schemas and cannot be retroactively added to their evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationProtocolV2 {
+    /// Consensus transport ALPN.
+    pub consensus_alpn: String,
+    /// Frozen consensus transport revision.
+    pub transport_revision: u16,
+    /// Frozen consensus wire-schema revision.
+    pub wire_schema_revision: u16,
+    /// Frozen closed error-set revision.
+    pub error_set_revision: u16,
+    /// Frozen durable consensus schema version.
+    pub consensus_schema_version: u16,
+    /// Minimum accepted frame size.
+    pub min_frame_bytes: usize,
+    /// Maximum accepted frame size.
+    pub max_frame_bytes: usize,
+    /// Maximum RPC payload size.
+    pub max_rpc_payload_bytes: usize,
+    /// Whether the legacy direct backend was enabled.
+    pub legacy_direct_backend_enabled: bool,
+}
+
 /// Fixed/default bounded v6 contract inventory for the dedicated stateless
 /// session-quorum consumer transport.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1900,7 +1948,7 @@ pub struct SessionHaCandidateQualificationProfileV4 {
     /// Supported quorum topology.
     pub topology: QualificationTopology,
     /// Exact consensus protocol profile.
-    pub protocol: QualificationProtocol,
+    pub protocol: QualificationProtocolV2,
     /// Exact consensus timing profile.
     pub consensus_timing: QualificationConsensusTiming,
     /// Resource and data-shape bounds.
@@ -1932,7 +1980,7 @@ impl SessionHaCandidateQualificationProfileV4 {
         {
             return Err(QualificationCandidateContractError::UnsupportedClaim);
         }
-        let baseline: SessionHaQualificationProfile =
+        let baseline: FrozenSessionHaQualificationProfileV2 =
             serde_json::from_str(FROZEN_SESSION_HA_PROFILE_V2_JSON)
                 .map_err(|_| QualificationCandidateContractError::InvalidProfile)?;
         if self.workspace != baseline.workspace
@@ -2039,7 +2087,7 @@ pub struct SessionHaCandidateQualificationProfileV5 {
     /// Supported quorum topology.
     pub topology: QualificationTopology,
     /// Exact consensus protocol profile.
-    pub protocol: QualificationProtocol,
+    pub protocol: QualificationProtocolV2,
     /// Exact consensus timing profile.
     pub consensus_timing: QualificationConsensusTiming,
     /// Resource and data-shape bounds.
@@ -2071,7 +2119,7 @@ impl SessionHaCandidateQualificationProfileV5 {
         {
             return Err(QualificationCandidateContractError::UnsupportedClaim);
         }
-        let baseline: SessionHaQualificationProfile =
+        let baseline: FrozenSessionHaQualificationProfileV2 =
             serde_json::from_str(FROZEN_SESSION_HA_PROFILE_V2_JSON)
                 .map_err(|_| QualificationCandidateContractError::InvalidProfile)?;
         if self.workspace != baseline.workspace

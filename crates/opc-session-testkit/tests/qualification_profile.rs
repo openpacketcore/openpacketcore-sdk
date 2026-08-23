@@ -25,7 +25,7 @@ use opc_session_net::{
     PERSISTENT_SESSION_CONSUMER_MAINTENANCE_TASKS_PER_POOL,
     RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES, SESSION_CONSENSUS_ALPN,
     SESSION_CONSENSUS_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_ALPN,
-    SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, MAX_REPLICATION_LOG_PAGE_ENTRIES,
@@ -1017,8 +1017,8 @@ fn v7_profile_is_the_closed_revision_2_persistent_consumer_contract() {
         MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
     );
     assert_eq!(
-        consumer.correlation_id_bytes,
-        SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES
+        consumer.correlation_id_bytes, 4,
+        "v7 is frozen at revision 2"
     );
     assert_eq!(
         consumer.max_in_flight_per_connection,
@@ -1486,7 +1486,8 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         serde_json::json!({
             "default": [],
             "insecure-test": [],
-            "legacy-session-net-compat": []
+            "legacy-session-net-compat": [],
+            "test-control": ["opc-session-store/test-control"]
         })
     );
     let testkit = package("opc-session-testkit");

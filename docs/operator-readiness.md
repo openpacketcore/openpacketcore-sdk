@@ -1062,16 +1062,20 @@ test-only. `PersistentSessionConsumerClient` remains the required warm
 fixed-pool primitive for #695/ePDG latency, and production deployments
 requiring warm reuse should use it. Its mutual-TLS ALPN remains
 `opc-session-consumer/1`, while its exact transport
-revision is now 4 with no fallback or dual mode. Drain consumer clients and
+revision is now 6 with no fallback or dual mode. Drain consumer clients and
 listeners for one coordinated cutover; different consumer revisions must never
-coexist. Revision-4 private JSON DTO bytes are
-canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
-and unknown fields fail closed. This does not admit the legacy
+coexist. Revision-6 private JSON DTO bytes, including the complete
+sequence-plus-nonce correlation envelope, are canonical; reordered or otherwise
+noncanonical encodings, aliases, omissions, and unknown fields fail closed. This
+does not admit the legacy
 `RemoteSessionBackend` surface or consensus, replication, snapshot, rebuild,
 membership, or admin authority. Revision 4 retains #696's generic single-record
 atomic fenced-transition capability, observation, execution, and exact-status
 operations, and adds exact retained status recovery for ordinary acquire, renew,
-and release; product composition and ePDG-specific semantics remain excluded.
+and release. Revision 5 retains those operations and adds unpredictable causal
+correlation, exact below-TLS write observation, rolling fresh prewarm, and one
+pool-wide cold-setup recovery lane; product composition and ePDG-specific
+semantics remain excluded.
 
 Before V1 is activated for the exact current consensus voter scope, capability,
 observation, status, and first-transition admission require fresh authenticated
@@ -1122,14 +1126,20 @@ default (at most 16 configured), 64 pending calls by default (hard maximum
 256), and a 250 ms queue wait/age limit. Watches use two separate slots by
 default (at most 16), not request capacity. A request connection has one
 in-flight call only and uses a nonzero monotonically increasing connection-local
-`u32` correlation with no wrap and at most 4,096 sequential calls. That
-sequential contract is required to isolate cancellation and late responses and
-avoid write ambiguity. Keep the 1,500 ms setup ceiling, at most two pre-write
-establishment attempts, resolver use only during establishment or
-re-establishment, one between-attempt lifecycle backoff floor (50 ms by default)
-plus at most 25 ms jitter clipped to the logical deadline, 5-second shutdown
-drain, and the existing 5-second idle, 10-second operation, 16 MiB frame, 256
-listener-connection, and TLS lifecycle bounds.
+`u32` sequence with no wrap, paired with a fresh unpredictable UUID nonce after
+the complete request has been serialized, and at most 4,096 sequential calls.
+The server admits the exact next sequence and the client accepts only the exact
+composite response correlation. That contract isolates cancellation and
+pre-staged or late responses and avoids write ambiguity. Keep the 1,500 ms
+setup ceiling, at most two pre-write establishment attempts, and resolver use
+only during establishment or re-establishment. Every cold request, watch, and
+rolling-prewarm setup enters one pool-wide recovery lane after bounded physical
+admission. One failed setup or proven cached-lane loss publishes the shared
+exponential backoff floor (50 ms by default) plus at most 25 ms jitter, clipped
+to each logical deadline;
+concurrent waiters do not start independent resolver/TCP/TLS/Hello attempts.
+Keep the 5-second shutdown drain and the existing 5-second idle, 10-second
+operation, 16 MiB frame, 256 listener-connection, and TLS lifecycle bounds.
 Verify that each logical pool owns one maintenance task which autonomously
 closes cached lanes at the earliest idle/lifecycle deadline. Accepted material
 epochs assign already-admitted lanes stable directed-edge deadlines within the
@@ -1160,8 +1170,13 @@ exactly one reconnect/replacement accounting outcome. Concurrent shutdown
 callers may advance only the monotonic running-to-draining-to-forced phase.
 
 Only `NotTransmitted` may automatically retry, with the same request ID and
-body. A possibly written call is `OutcomeUnknown`: evict its lane and never
-replay it. Prewarm/readiness establishes authenticated transport capacity only;
+body. Positive ciphertext acceptance is observed below TLS as well as at the
+framed plaintext writer, so an outer TLS error cannot relabel an accepted
+prefix as `NotTransmitted`. A possibly written call is `OutcomeUnknown`: evict
+its lane and never replay it. Each explicit prewarm performs a rolling resolver/
+TCP/TLS/Hello refresh of every configured lane and preserves refreshed plus
+unprocessed healthy capacity on partial failure. Prewarm/readiness establishes
+authenticated transport capacity only;
 it is not quorum or product readiness. Emit only fixed, nonidentifying setup
 phase, pool-wait, active/maximum/idle, reuse/reconnect,
 queue/in-flight/oldest-age, and bounded-outcome diagnostics. Never expose
@@ -1172,8 +1187,9 @@ Any performance evidence is synthetic only and is not an ePDG production-SLO
 claim. Warm accept/reuse assertions gate only that synthetic method; elapsed
 samples are non-gating. The revision-2 persistent-consumer qualification
 contract remains v7, while the published v6 profile remains the unchanged
-revision-1 contract. Revision 4 evidence additionally proves typed one-shot and
-persistent round trips and exact ambiguity recovery for ordinary leases.
+revision-1 contract. The live v8 exact-head schema binds revision 6 but remains
+experimental and fixes `qualification_complete=false`; it does not convert the
+historical loopback samples into a production SLO claim.
 
 ### Legacy direct-backend session-net v5 rollout boundary
 

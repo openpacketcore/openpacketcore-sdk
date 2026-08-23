@@ -12,8 +12,8 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use opc_consensus::{
-    decode_bounded, derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch,
-    ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE,
+    derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+    DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_key::{
@@ -131,14 +131,36 @@ impl TestPki {
 
 const THREE_VOTER_COUNT: usize = 3;
 const THREE_VOTER_READY_TIMEOUT: Duration = Duration::from_secs(20);
-// One split vote can consume an election window; this mirrors the durable
-// profile's recovery qualification bound without changing any production
-// deadline.
+// Retain the durable recovery qualification bound for the one explicitly
+// triggered OpenRaft campaign and its bounded authenticated peer calls without
+// changing any production deadline.
 const THREE_VOTER_ELECTION_RECOVERY_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
         .saturating_mul(2)
         .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
+);
+// After the survivor listeners prove every admitted handler has terminated,
+// the selected successor campaigns only after every possible old-leader lease
+// has expired. Automatic campaigns are disabled during this interval, so the
+// two survivors cannot drift into a scheduler-dependent split vote.
+#[cfg(feature = "test-control")]
+const THREE_VOTER_LEASE_DRAIN: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .election_timeout_max_millis
+        .saturating_add(100),
+);
+
+// A request that passed the path gate immediately before isolation may still
+// be inside the persistent transport's bounded AppendEntries attempt. Let that
+// client-side attempt become terminal before restarting the survivor listeners;
+// the subsequent handler barrier then supplies the last possible old-vote
+// touch from which the complete leader-lease interval is measured.
+#[cfg(feature = "test-control")]
+const THREE_VOTER_APPEND_ATTEMPT_DRAIN: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .append_entries_timeout_millis
+        .saturating_add(100),
 );
 
 /// Keep the consensus transport real while making each authenticated
@@ -205,7 +227,6 @@ struct ThreeVoterConsumerFleet {
     topologies: Vec<ValidatedQuorumTopology>,
     pki: Arc<TestPki>,
     path_enabled: BTreeMap<(usize, usize), Arc<AtomicBool>>,
-    consensus_peers: BTreeMap<(usize, usize), Arc<GatedReadBarrierPeer>>,
     read_barrier_calls: Arc<AtomicUsize>,
     reauthentication: Vec<SessionReauthenticationControl>,
     address_slots: Vec<Arc<RwLock<Option<SocketAddr>>>>,
@@ -262,7 +283,6 @@ impl ThreeVoterConsumerFleet {
             .map(|_| Arc::new(RwLock::new(None)))
             .collect::<Vec<_>>();
         let mut path_enabled = BTreeMap::new();
-        let mut consensus_peers = BTreeMap::new();
         let read_barrier_calls = Arc::new(AtomicUsize::new(0));
         let reauthentication = (0..THREE_VOTER_COUNT)
             .map(|_| SessionReauthenticationControl::new())
@@ -318,7 +338,6 @@ impl ThreeVoterConsumerFleet {
                         calls: Arc::clone(&read_barrier_calls),
                     });
                     path_enabled.insert((index, target), enabled);
-                    consensus_peers.insert((index, target), Arc::clone(&peer));
                     let peer: Arc<dyn SessionConsensusPeer> = peer;
                     (node_id, peer)
                 })
@@ -363,7 +382,6 @@ impl ThreeVoterConsumerFleet {
             topologies,
             pki,
             path_enabled,
-            consensus_peers,
             read_barrier_calls,
             reauthentication,
             address_slots,
@@ -468,6 +486,26 @@ impl ThreeVoterConsumerFleet {
     }
 
     async fn restore(&mut self, node: usize) {
+        self.start_listener(node).await;
+        for peer in 0..THREE_VOTER_COUNT {
+            if peer != node {
+                self.path_enabled
+                    .get(&(node, peer))
+                    .expect("restored outbound three-voter consensus path")
+                    .store(true, Ordering::Release);
+                self.path_enabled
+                    .get(&(peer, node))
+                    .expect("restored inbound three-voter consensus path")
+                    .store(true, Ordering::Release);
+            }
+        }
+    }
+
+    async fn start_listener(&mut self, node: usize) {
+        assert!(
+            self.servers[node].is_none(),
+            "three-voter consensus listener starts only from a stopped state"
+        );
         let binding = self
             .manifest
             .bind_local(three_voter_replica_id(node))
@@ -489,17 +527,30 @@ impl ThreeVoterConsumerFleet {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
         self.servers[node] = Some(server);
-        for peer in 0..THREE_VOTER_COUNT {
-            if peer != node {
-                self.path_enabled
-                    .get(&(node, peer))
-                    .expect("restored outbound three-voter consensus path")
-                    .store(true, Ordering::Release);
-                self.path_enabled
-                    .get(&(peer, node))
-                    .expect("restored inbound three-voter consensus path")
-                    .store(true, Ordering::Release);
-            }
+    }
+
+    #[cfg(feature = "test-control")]
+    async fn quiesce_and_restart_survivors(&mut self, excluded: usize) {
+        let survivors = (0..THREE_VOTER_COUNT)
+            .filter(|index| *index != excluded)
+            .collect::<Vec<_>>();
+        for survivor in &survivors {
+            *self.address_slots[*survivor]
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.servers[*survivor]
+                .take()
+                .expect("surviving consensus listener is running")
+                .abort_and_drain_handlers_for_test()
+                .await;
+        }
+        for survivor in &survivors {
+            self.start_listener(*survivor).await;
+        }
+        for survivor in survivors {
+            self.reauthentication[survivor]
+                .request_reauthentication()
+                .expect("retire the survivor's pre-barrier outbound consensus lanes");
         }
     }
 
@@ -539,115 +590,12 @@ impl ThreeVoterConsumerFleet {
             }
         })
         .await
-        .expect("survivors elect a new leader")
-    }
-
-    async fn wait_for_split_vote(
-        &self,
-        excluded: usize,
-        previous_term: u64,
-        deadline: tokio::time::Instant,
-    ) -> u64 {
-        tokio::time::timeout_at(deadline, async {
-            loop {
-                let statuses = (0..THREE_VOTER_COUNT)
-                    .filter(|index| *index != excluded)
-                    .map(|index| self.stores[index].status())
-                    .collect::<Vec<_>>();
-                let term = statuses.first().expect("surviving voter").term;
-                if term > previous_term
-                    && statuses
-                        .iter()
-                        .all(|status| status.term == term && status.leader_id.is_none())
-                {
-                    return term;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+        .unwrap_or_else(|_| {
+            let statuses = (0..THREE_VOTER_COUNT)
+                .map(|index| self.stores[index].status())
+                .collect::<Vec<_>>();
+            panic!("survivors elect a new leader; final statuses: {statuses:?}")
         })
-        .await
-        .expect("survivors expose the expected split vote")
-    }
-
-    /// Break the test-runtime's observed same-tick split with one valid,
-    /// authenticated Raft Vote request over the production mTLS transport.
-    /// The target persists its ordinary OpenRaft vote, staggering one real
-    /// voter; either survivor must subsequently establish the later normal
-    /// quorum election before this test proceeds.  This never invokes the
-    /// state machine or fabricates an engine response.
-    async fn pregrant_successor_after_split(
-        &self,
-        successor: usize,
-        voter: usize,
-        previous_term: u64,
-        previous_leader: SessionConsensusNodeId,
-        split_term: u64,
-        deadline: tokio::time::Instant,
-    ) {
-        let successor_status = self.stores[successor].status();
-        let voter_status = self.stores[voter].status();
-        let last_log_index = successor_status
-            .last_log_index
-            .expect("successor has committed transition before tie-break");
-        assert_eq!(
-            Some(last_log_index),
-            voter_status.last_log_index,
-            "both surviving voters retain the exact committed log before the tie-break"
-        );
-        assert_eq!(
-            Some(last_log_index),
-            successor_status.applied_index,
-            "the successor has applied the exact advertised log before the tie-break"
-        );
-        assert_eq!(
-            Some(last_log_index),
-            voter_status.applied_index,
-            "the voter has applied the exact advertised log before the tie-break"
-        );
-        let peer = Arc::clone(
-            self.consensus_peers
-                .get(&(successor, voter))
-                .expect("selected successor has the installed mTLS peer"),
-        );
-        let next_term = split_term
-            .checked_add(1)
-            .expect("bounded test election term");
-        let vote = opc_consensus::engine::Vote::new(next_term, successor_status.node_id);
-        let request = opc_consensus::engine::raft::VoteRequest::new(
-            vote,
-            Some(opc_consensus::engine::LogId::new(
-                opc_consensus::engine::CommittedLeaderId::new(previous_term, previous_leader),
-                last_log_index,
-            )),
-        );
-        let wire = SessionConsensusWireRequest::try_new(
-            self.manifest.consensus_identity(),
-            successor_status.node_id,
-            opc_session_store::SessionConsensusRpcFamily::Vote,
-            opc_consensus::encode_bounded(&request).expect("bounded election vote request"),
-        )
-        .expect("scoped election vote request");
-        let payload = peer
-            .call_with_timeout(
-                wire,
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await
-            .expect("tie-break vote reaches surviving mTLS voter")
-            .result
-            .expect("surviving voter accepts authenticated vote envelope");
-        let response = decode_bounded::<
-            Result<
-                opc_consensus::engine::raft::VoteResponse<SessionConsensusNodeId>,
-                opc_consensus::engine::error::RaftError<SessionConsensusNodeId>,
-            >,
-        >(&payload)
-        .expect("decode tie-break vote response")
-        .expect("OpenRaft processes tie-break vote");
-        assert!(
-            response.vote_granted && response.vote == vote,
-            "the target durably pre-grants only the selected successor's next normal campaign"
-        );
     }
 }
 
@@ -1572,8 +1520,7 @@ async fn cloned_stateless_request_connections_fail_fast_at_the_shared_physical_c
 }
 
 #[tokio::test]
-async fn cloned_stateless_watch_connections_have_an_isolated_shared_physical_cap() {
-    const PHYSICAL_CAP: usize = 16;
+async fn production_stateless_watch_is_denied_before_service_dispatch() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("physical-watch-server");
     let client_spiffe = spiffe("physical-watch-client");
@@ -1592,38 +1539,16 @@ async fn cloned_stateless_watch_connections_have_an_isolated_shared_physical_cap
     let (proxy, accepted, proxy_task) = counting_tcp_proxy(upstream).await;
     let client = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, voter_authority);
 
-    let mut watches = Vec::with_capacity(PHYSICAL_CAP);
-    for _ in 0..PHYSICAL_CAP {
-        watches.push(client.watch(0).await.expect("watch reaches exact cap"));
-    }
-    wait_for_dispatches(&service, PHYSICAL_CAP).await;
-    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
+    // The public consumer Watch cursor is global and therefore carries no
+    // exact tenant authority. Production listeners must reject it before the
+    // service callback until the protocol has an identity-and-scope-bound
+    // cursor. The physical Watch-pool machinery is deliberately dormant.
     assert!(matches!(
         client.watch(0).await,
         Err(StoreError::BackendUnavailable(_))
     ));
-    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
-    assert_eq!(service.calls.load(Ordering::SeqCst), PHYSICAL_CAP);
-
-    drop(watches.pop().expect("one held watch"));
-    let replacement = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if let Ok(watch) = client.watch(0).await {
-                break watch;
-            }
-            // Dropping the caller's stream closes its bounded queue. The
-            // physical reader owns the permit and releases it on its next
-            // poll, so wait for that observable release without assuming a
-            // scheduler turn between drop and fail-fast admission.
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("released watch capacity becomes observable within the fixed bound");
-    wait_for_dispatches(&service, PHYSICAL_CAP + 1).await;
-    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP + 1);
-    drop(replacement);
-    drop(watches);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
     proxy_task.abort();
     handle.abort_and_wait().await;
 }
@@ -2348,7 +2273,7 @@ async fn malformed_and_oversized_consumer_frames_are_rejected_before_dispatch() 
     .await
     .expect("start stateless consumer listener");
 
-    // A frozen revision-3 peer completes the same mTLS and ALPN handshake as a
+    // A frozen revision-4 peer completes the same mTLS and ALPN handshake as a
     // real caller, but must be closed before application dispatch. There is no
     // downgrade or upgrade oracle at this boundary.
     let mut wrong_revision =
@@ -2356,7 +2281,7 @@ async fn malformed_and_oversized_consumer_frames_are_rejected_before_dispatch() 
     let wrong_hello = serde_json::to_vec(&serde_json::json!({
         "kind": "hello",
         "body": {
-            "transport_revision": 3_u16,
+            "transport_revision": 4_u16,
             "scope": scope,
             "response_frame_size": opc_session_net::MAX_NEGOTIATED_FRAME_SIZE,
         },
@@ -2721,6 +2646,7 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
     server.abort_and_wait().await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn prepared_cas_three_voter_receipt_converges_after_real_commit_and_lost_response() {
     prepared_cas_three_voter_receipt_converges_with_payload(
@@ -3461,9 +3387,9 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     let mut fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
     let (old_leader, old_leader_id, old_term) = fleet.observed_leader();
     let initial_follower = (old_leader + 1) % THREE_VOTER_COUNT;
-    let tie_break_voter = (0..THREE_VOTER_COUNT)
+    let other_survivor = (0..THREE_VOTER_COUNT)
         .find(|index| *index != old_leader && *index != initial_follower)
-        .expect("three-voter tie-break voter");
+        .expect("three-voter second survivor");
     assert_ne!(initial_follower, old_leader, "execute starts on a follower");
 
     let server_spiffe = three_voter_spiffe(initial_follower);
@@ -3593,38 +3519,47 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         "one physical consumer mutation reached the follower route"
     );
     fleet.wait_all_ready().await;
+    for survivor in [initial_follower, other_survivor] {
+        fleet.stores[survivor].set_automatic_election_for_test(false);
+    }
     assert_eq!(
         (old_leader, old_leader_id, old_term),
         fleet.observed_leader(),
         "every voter still reports the original leader and term immediately before isolation"
     );
     fleet.isolate(old_leader).await;
+    tokio::time::sleep(THREE_VOTER_APPEND_ATTEMPT_DRAIN).await;
+    tokio::time::timeout(
+        THREE_VOTER_READY_TIMEOUT,
+        fleet.quiesce_and_restart_survivors(old_leader),
+    )
+    .await
+    .expect("survivor transports and admitted consensus handlers quiesce");
     let election_deadline = tokio::time::Instant::now() + THREE_VOTER_ELECTION_RECOVERY_TIMEOUT;
-    let split_term = fleet
-        .wait_for_split_vote(old_leader, old_term, election_deadline)
-        .await;
-    assert_eq!(
-        old_term + 1,
-        split_term,
-        "the tie-break runs only after the observed first normal split vote"
-    );
-    fleet
-        .pregrant_successor_after_split(
-            initial_follower,
-            tie_break_voter,
-            old_term,
-            old_leader_id,
-            split_term,
-            election_deadline,
-        )
-        .await;
+    tokio::time::timeout_at(election_deadline, async {
+        tokio::time::sleep(THREE_VOTER_LEASE_DRAIN).await;
+        fleet.stores[initial_follower]
+            .trigger_election_for_test()
+            .await
+            .expect("selected survivor starts a normal Openraft campaign");
+    })
+    .await
+    .expect("old committed-leader lease drains within the recovery deadline");
     let new_leader = fleet
         .wait_for_new_leader(old_leader, old_leader_id, old_term, election_deadline)
         .await;
     assert_ne!(new_leader, old_leader, "leader changes after commit");
-    assert!(
-        fleet.stores[new_leader].status().term > split_term,
-        "the authenticated pre-grant does not itself establish the final leader"
+    for survivor in [initial_follower, other_survivor] {
+        fleet.stores[survivor].set_automatic_election_for_test(true);
+    }
+    assert_eq!(
+        initial_follower, new_leader,
+        "the selected survivor wins its engine-generated campaign"
+    );
+    assert_eq!(
+        old_term + 1,
+        fleet.stores[new_leader].status().term,
+        "exactly one normal Openraft campaign establishes the successor"
     );
     let status_target = (0..THREE_VOTER_COUNT)
         .find(|index| *index != old_leader && *index != new_leader)

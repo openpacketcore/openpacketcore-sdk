@@ -1370,7 +1370,7 @@ async fn build_file_backed_snapshot_database(
     // The owned guard moves into the worker and comes back with its result.
     // Cancelling the async caller cannot detach a second snapshot worker or a
     // second WAL-pinning reader for this consensus core.
-    let (snapshot_guard, captured) = tokio::task::spawn_blocking(move || {
+    let (captured, snapshot_guard) = tokio::task::spawn_blocking(move || {
         let raw_artifact = raw_artifact;
         let vacuum_artifact = vacuum_artifact;
         #[cfg(test)]
@@ -1418,7 +1418,10 @@ async fn build_file_backed_snapshot_database(
             (Err(_), Err(release_error)) | (Ok(_), Err(release_error)) => Err(release_error),
             (Err(error), Ok(())) => Err(error),
         };
-        (snapshot_guard, captured)
+        // If the async caller was cancelled, the detached JoinHandle output is
+        // dropped in tuple-field order. Keep the artifact-bearing result first
+        // so its RAII cleanup completes before the sole snapshot gate reopens.
+        (captured, snapshot_guard)
     })
     .await
     .map_err(|_| {

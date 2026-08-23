@@ -4,7 +4,8 @@
 // so the shared framing code does not fork; its unused compatibility-only
 // branches are intentionally dead unless `legacy-session-net-compat` is set.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::{fmt, marker::PhantomData, time::Duration};
 
 use opc_session_store::backend::{
@@ -3473,15 +3474,61 @@ pub(crate) enum FrameWriteError {
 /// shutdown signals use this token to preserve the exact transport boundary:
 /// cancellation before any byte is accepted remains `BeforeWrite`, while any
 /// accepted prefix or payload byte is permanently `MayHaveWritten`.
-pub(crate) struct FrameWriteProgress(AtomicBool);
+pub(crate) struct FrameWriteProgress {
+    /// Positive acceptance by the writer passed to the frame encoder. This is
+    /// authoritative only when no below-adapter counter is bound.
+    accepted: AtomicBool,
+    transport: Mutex<Option<TransportWriteObservation>>,
+}
+
+struct TransportWriteObservation {
+    accepted_writes: Arc<AtomicU64>,
+    baseline: u64,
+}
 
 impl FrameWriteProgress {
     pub(crate) const fn new() -> Self {
-        Self(AtomicBool::new(false))
+        Self {
+            accepted: AtomicBool::new(false),
+            transport: Mutex::new(None),
+        }
+    }
+
+    /// Observe positive writes accepted by a transport below an adapter such
+    /// as TLS. An adapter may drain ciphertext successfully and then return a
+    /// later error from the same outer poll, hiding that positive write from
+    /// the framed plaintext writer. Binding is replaceable until progress is
+    /// observed so a proven-pre-write connection loss can use another lane.
+    pub(crate) fn bind_transport_counter(&self, accepted_writes: Arc<AtomicU64>) {
+        if self.accepted_any() {
+            return;
+        }
+        let baseline = accepted_writes.load(Ordering::Acquire);
+        *self
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TransportWriteObservation {
+            accepted_writes,
+            baseline,
+        });
     }
 
     pub(crate) fn accepted_any(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        let transport_observation = self
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|observation| {
+                observation.accepted_writes.load(Ordering::Acquire) != observation.baseline
+            });
+        match transport_observation {
+            // TLS may accept plaintext into its own buffer while its lower
+            // socket remains Pending. Once a below-adapter counter is bound,
+            // only a positive change there proves transmission.
+            Some(accepted_below_adapter) => accepted_below_adapter,
+            None => self.accepted.load(Ordering::Acquire),
+        }
     }
 
     fn classify(&self, error: ProtocolError) -> FrameWriteError {
@@ -3511,7 +3558,7 @@ where
         match std::pin::Pin::new(&mut *this.writer).poll_write(context, bytes) {
             std::task::Poll::Ready(Ok(accepted)) => {
                 if accepted != 0 {
-                    this.progress.0.store(true, Ordering::Release);
+                    this.progress.accepted.store(true, Ordering::Release);
                 }
                 std::task::Poll::Ready(Ok(accepted))
             }

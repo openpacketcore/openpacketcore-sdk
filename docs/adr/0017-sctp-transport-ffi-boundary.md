@@ -67,9 +67,15 @@ an SCTP-terminating CNF is in scope:
    crate** permitted to contain `unsafe`; follow-on Linux kernel UAPI exceptions
    such as `opc-linux-xfrm-sys` and `opc-linux-gtpu-sys`, and narrow reviewed
    FFI boundaries such as `opc-sqlite-file-control-sys`, must be separately and
-   explicitly allowlisted by the same mechanical gate. The SQLite boundary is
-   limited to its pinned, value-free `SQLITE_FCNTL_HAS_MOVED` probe and does not
-   authorize general SQLite FFI. Each allowlisted sys crate does **not** inherit
+   explicitly allowlisted by the same mechanical gate. The SQLite production
+   boundary is limited to `SQLITE_FCNTL_HAS_MOVED`, `SQLITE_FCNTL_VFSNAME`,
+   `SQLITE_FCNTL_FILE_POINTER`, and `SQLITE_FCNTL_JOURNAL_POINTER`: it returns
+   only movement state or owned duplicate descriptors after authenticating the
+   bundled Linux Unix VFS. Its opt-in test feature may register one non-default
+   VFS that rejects unnamed temporary opens and delegates named opens to the
+   bundled default VFS. This does not authorize borrowed-handle exposure,
+   pathname authority, file contents, another opcode, a production VFS, or
+   general SQLite FFI. Each allowlisted sys crate does **not** inherit
    `[workspace.lints]` (so the workspace-wide `unsafe_code = "forbid"` stays in
    force for every other crate); it sets its own local crate policy
    (`unsafe_code = "allow"` plus `unsafe_op_in_unsafe_fn = "deny"`, or
@@ -86,7 +92,7 @@ an SCTP-terminating CNF is in scope:
    workspace crate sources and asserts `unsafe` appears only in explicitly
    allowlisted sys crates (`opc-libsctp-sys` and later, reviewed kernel-UAPI
    boundaries such as `opc-linux-xfrm-sys` and `opc-linux-gtpu-sys`, plus the
-   pinned `SQLITE_FCNTL_HAS_MOVED` boundary in
+   pinned file-control and test-only VFS boundary in
    `opc-sqlite-file-control-sys`); the same gate also rejects each allowed sys
    crate if it
    inherits `[workspace.lints]`, rejects it if it lacks the required local unsafe

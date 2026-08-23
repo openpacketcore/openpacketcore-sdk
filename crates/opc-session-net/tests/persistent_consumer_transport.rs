@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::stream::{self, BoxStream, StreamExt};
+use futures_util::stream::{self, BoxStream};
 use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::{
@@ -64,11 +64,23 @@ impl TestPki {
     }
 
     fn client_config(&self, spiffe_id: &str) -> AuthenticatedClientConfig {
+        let (_source, config) = self.rotating_client_config(spiffe_id);
+        config
+    }
+
+    fn rotating_client_config(
+        &self,
+        spiffe_id: &str,
+    ) -> (
+        tokio::sync::watch::Sender<Option<opc_identity::IdentityState>>,
+        AuthenticatedClientConfig,
+    ) {
         let (_source, receiver) = tokio::sync::watch::channel(Some(self.identity_state(spiffe_id)));
-        TlsConfigBuilder::new(receiver)
+        let config = TlsConfigBuilder::new(receiver)
             .allow_any_trusted_peer()
             .build_authenticated_client_config()
-            .expect("test client TLS config")
+            .expect("test client TLS config");
+        (_source, config)
     }
 
     fn server_config(&self, spiffe_id: &str) -> AuthenticatedServerConfig {
@@ -106,23 +118,26 @@ impl TestPki {
 #[derive(Default)]
 struct ControlledConsumer {
     calls: AtomicUsize,
+    active_executes: AtomicUsize,
+    active_executes_changed: Notify,
+    watch_setup_calls: AtomicUsize,
     block: AtomicBool,
     blocked_remaining: AtomicUsize,
     entered: Notify,
     released: Notify,
     request_order: Mutex<Vec<opc_session_store::SessionConsumerRequestId>>,
-    watch_entry: Mutex<Option<SessionConsumerChange>>,
-    watch_entry_limit: AtomicUsize,
-    watch_emitted: Arc<AtomicUsize>,
-    watch_emitted_notify: Arc<Notify>,
-    watch_blocked: Arc<AtomicBool>,
-    watch_released: Arc<Notify>,
-    watch_stays_open: AtomicBool,
-    watch_closes_without_item: AtomicBool,
-    watch_error: Mutex<Option<SessionConsumerStoreError>>,
-    watch_rejection: Mutex<Option<SessionConsumerRejection>>,
-    watch_starts: Mutex<Vec<u64>>,
-    watch_started_at: Mutex<Vec<Instant>>,
+}
+
+struct ActiveServiceCall<'a> {
+    active: &'a AtomicUsize,
+    changed: &'a Notify,
+}
+
+impl Drop for ActiveServiceCall<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
 }
 
 impl ControlledConsumer {
@@ -134,6 +149,18 @@ impl ControlledConsumer {
     async fn wait_until_entered(&self, expected: usize) {
         while self.calls.load(Ordering::SeqCst) < expected {
             tokio::task::yield_now().await;
+        }
+    }
+
+    async fn wait_until_no_active_execute(&self) {
+        loop {
+            let changed = self.active_executes_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.active_executes.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            changed.await;
         }
     }
 
@@ -149,90 +176,8 @@ impl ControlledConsumer {
             .clone()
     }
 
-    fn emit_watch_entries_then_close(&self, entry: SessionConsumerChange, count: usize) {
-        assert!(
-            count > 0,
-            "finite watch fixture must emit at least one entry"
-        );
-        self.watch_entry_limit.store(count, Ordering::SeqCst);
-        self.watch_stays_open.store(false, Ordering::SeqCst);
-        *self
-            .watch_entry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry);
-    }
-
-    fn arm_watch_block(&self) {
-        self.watch_blocked.store(true, Ordering::SeqCst);
-    }
-
-    fn release_watch(&self) {
-        self.watch_blocked.store(false, Ordering::SeqCst);
-        self.watch_released.notify_waiters();
-    }
-
-    fn emit_one_watch_entry_then_pending(&self, entry: SessionConsumerChange) {
-        self.watch_entry_limit.store(1, Ordering::SeqCst);
-        self.watch_stays_open.store(true, Ordering::SeqCst);
-        *self
-            .watch_entry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry);
-    }
-
-    fn close_watch_without_item(&self) {
-        self.watch_closes_without_item.store(true, Ordering::SeqCst);
-    }
-
-    fn emit_watch_entries_then_pending(&self, entry: SessionConsumerChange, count: usize) {
-        assert!(
-            count > 0,
-            "pending watch fixture must emit at least one entry"
-        );
-        self.watch_entry_limit.store(count, Ordering::SeqCst);
-        self.watch_stays_open.store(true, Ordering::SeqCst);
-        *self
-            .watch_entry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry);
-    }
-
-    fn emit_terminal_watch_error(&self, error: SessionConsumerStoreError) {
-        *self
-            .watch_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
-    }
-
-    fn reject_watch(&self, rejection: SessionConsumerRejection) {
-        *self
-            .watch_rejection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
-    }
-
-    fn watch_starts(&self) -> Vec<u64> {
-        self.watch_starts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    fn watch_started_at(&self) -> Vec<Instant> {
-        self.watch_started_at
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    async fn wait_for_watch_emissions(&self, expected: usize) {
-        loop {
-            let notified = self.watch_emitted_notify.notified();
-            if self.watch_emitted.load(Ordering::SeqCst) >= expected {
-                return;
-            }
-            notified.await;
-        }
+    fn watch_setup_calls(&self) -> usize {
+        self.watch_setup_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -243,6 +188,11 @@ impl SessionQuorumConsumer for ControlledConsumer {
         _identity: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
+        self.active_executes.fetch_add(1, Ordering::SeqCst);
+        let _active = ActiveServiceCall {
+            active: &self.active_executes,
+            changed: &self.active_executes_changed,
+        };
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.request_order
             .lock()
@@ -271,278 +221,16 @@ impl SessionQuorumConsumer for ControlledConsumer {
         &self,
         _identity: &SessionConsumerAuthorization,
         _scope: SessionConsumerScope,
-        start_sequence: u64,
+        _start_sequence: u64,
     ) -> Result<
         BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
         SessionConsumerRejection,
     > {
-        self.watch_starts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(start_sequence);
-        self.watch_started_at
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(Instant::now());
-        if let Some(rejection) = *self
-            .watch_rejection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            return Err(rejection);
-        }
-        if let Some(error) = *self
-            .watch_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            return Ok(stream::once(async move { Err(error) }).boxed());
-        }
-        if self.watch_closes_without_item.load(Ordering::SeqCst) {
-            return Ok(stream::empty().boxed());
-        }
-        let entry = self
-            .watch_entry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let Some(entry) = entry else {
-            return Ok(stream::pending().boxed());
-        };
-        // Match the public store cursor contract: zero is the empty-head
-        // sentinel and therefore starts at inclusive sequence one. Do not
-        // rewrite a synthetic entry to sequence zero, which production
-        // backends can never emit.
-        let start_sequence = start_sequence.max(1);
-        if self.watch_blocked.load(Ordering::SeqCst) {
-            let watch_blocked = Arc::clone(&self.watch_blocked);
-            let watch_released = Arc::clone(&self.watch_released);
-            return Ok(stream::once(async move {
-                while watch_blocked.load(Ordering::SeqCst) {
-                    watch_released.notified().await;
-                }
-                Ok::<_, SessionConsumerStoreError>(watch_change_at_sequence(&entry, start_sequence))
-            })
-            .boxed());
-        }
-        if start_sequence == u64::MAX {
-            self.watch_emitted.fetch_add(1, Ordering::SeqCst);
-            self.watch_emitted_notify.notify_waiters();
-            return Ok(stream::once(async move {
-                Ok::<_, SessionConsumerStoreError>(watch_change_at_sequence(&entry, u64::MAX))
-            })
-            .boxed());
-        }
-        let entry_limit = self.watch_entry_limit.load(Ordering::SeqCst);
-        let emitted = Arc::clone(&self.watch_emitted);
-        if entry_limit == 0 {
-            let emitted_notify = Arc::clone(&self.watch_emitted_notify);
-            Ok(stream::iter(start_sequence..)
-                .map(move |sequence| {
-                    emitted.fetch_add(1, Ordering::SeqCst);
-                    emitted_notify.notify_waiters();
-                    Ok::<_, SessionConsumerStoreError>(watch_change_at_sequence(&entry, sequence))
-                })
-                .boxed())
-        } else if self.watch_stays_open.load(Ordering::SeqCst) {
-            let emitted_notify = Arc::clone(&self.watch_emitted_notify);
-            Ok(stream::iter(start_sequence..)
-                .map(move |sequence| {
-                    emitted.fetch_add(1, Ordering::SeqCst);
-                    emitted_notify.notify_waiters();
-                    Ok::<_, SessionConsumerStoreError>(watch_change_at_sequence(&entry, sequence))
-                })
-                .take(entry_limit)
-                .chain(stream::pending())
-                .boxed())
-        } else {
-            let emitted_notify = Arc::clone(&self.watch_emitted_notify);
-            Ok(stream::iter(start_sequence..)
-                .map(move |sequence| {
-                    emitted.fetch_add(1, Ordering::SeqCst);
-                    emitted_notify.notify_waiters();
-                    Ok::<_, SessionConsumerStoreError>(watch_change_at_sequence(&entry, sequence))
-                })
-                .take(entry_limit)
-                .boxed())
-        }
+        self.watch_setup_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(stream::pending::<
+            Result<SessionConsumerChange, SessionConsumerStoreError>,
+        >()))
     }
-}
-
-fn large_watch_change() -> SessionConsumerChange {
-    let key = SessionKey {
-        tenant: TenantId::new("watch-pressure").expect("test tenant"),
-        nf_kind: NetworkFunctionKind::smf(),
-        key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from(vec![7_u8; 64])
-            .try_into()
-            .expect("maximum bounded stable ID"),
-    };
-    let item = serde_json::json!({
-        "key": serde_json::to_value(key).expect("watch key encodes"),
-        "kind": "RecordWritten",
-    });
-    let change: SessionConsumerChange = serde_json::from_value(serde_json::json!({
-        "sequence": 1,
-        "changes": vec![item; 1_700],
-    }))
-    .expect("synthetic bounded watch change decodes");
-    let encoded = serde_json::to_vec(&change).expect("watch change encodes");
-    assert!(
-        (256 * 1024..512 * 1024).contains(&encoded.len()),
-        "fixture must consume over half of the fixed byte queue without exceeding it: {}",
-        encoded.len()
-    );
-    change
-}
-
-fn watch_result_envelope_edge_change() -> SessionConsumerChange {
-    let key = SessionKey {
-        tenant: TenantId::new("watch-envelope-edge").expect("test tenant"),
-        nf_kind: NetworkFunctionKind::smf(),
-        key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from(vec![9_u8; 64])
-            .try_into()
-            .expect("maximum bounded stable ID"),
-    };
-    let item = serde_json::json!({
-        "key": serde_json::to_value(key).expect("watch key encodes"),
-        "kind": "RecordWritten",
-    });
-    let edge_key = SessionKey {
-        tenant: TenantId::new("watch-envelope-edge").expect("test tenant"),
-        nf_kind: NetworkFunctionKind::smf(),
-        key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from(vec![255_u8; 64])
-            .try_into()
-            .expect("maximum bounded stable ID"),
-    };
-    let edge_item = serde_json::json!({
-        "key": serde_json::to_value(edge_key).expect("edge watch key encodes"),
-        "kind": "RecordWritten",
-    });
-    let mut changes = vec![item; 2_121];
-    changes.push(edge_item);
-    let change: SessionConsumerChange = serde_json::from_value(serde_json::json!({
-        "sequence": 1,
-        "changes": changes,
-    }))
-    .expect("synthetic envelope-edge change decodes");
-    let bare = serde_json::to_vec(&change).expect("bare watch entry encodes");
-    let queued = serde_json::to_vec(&Ok::<_, SessionConsumerStoreError>(change.clone()))
-        .expect("queued watch result encodes");
-    assert_eq!(queued.len(), bare.len() + 7, "Result::Ok adds seven bytes");
-    assert!(
-        bare.len() <= 512 * 1024 && queued.len() > 512 * 1024,
-        "fixture must straddle the exact local byte cap: bare={}, queued={}",
-        bare.len(),
-        queued.len(),
-    );
-    change
-}
-
-fn exact_watch_byte_budget_change() -> SessionConsumerChange {
-    const BYTE_CAP: usize = 512 * 1024;
-    let ordinary_key = SessionKey {
-        tenant: TenantId::new("watch-exact-cap").expect("test tenant"),
-        nf_kind: NetworkFunctionKind::smf(),
-        key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from(vec![0_u8; 64])
-            .try_into()
-            .expect("maximum bounded stable ID"),
-    };
-    let ordinary = serde_json::json!({
-        "key": serde_json::to_value(ordinary_key).expect("ordinary watch key encodes"),
-        "kind": "RecordWritten",
-    });
-
-    // Two 64-byte stable IDs provide 256 single-byte JSON-width increments:
-    // `0` -> `10` adds one byte and `0` -> `100` adds two. That covers the
-    // complete spacing between adjacent repeated projections without trial
-    // allocations proportional to the byte cap.
-    for ordinary_count in 2_000..=2_300 {
-        let build = |first: Vec<u8>, second: Vec<u8>| {
-            let edge = |stable_id: Vec<u8>| {
-                let key = SessionKey {
-                    tenant: TenantId::new("watch-exact-cap").expect("test tenant"),
-                    nf_kind: NetworkFunctionKind::smf(),
-                    key_type: SessionKeyType::PduSession,
-                    stable_id: Bytes::from(stable_id)
-                        .try_into()
-                        .expect("maximum bounded stable ID"),
-                };
-                serde_json::json!({
-                    "key": serde_json::to_value(key).expect("edge watch key encodes"),
-                    "kind": "RecordWritten",
-                })
-            };
-            let mut changes = vec![ordinary.clone(); ordinary_count];
-            changes.push(edge(first));
-            changes.push(edge(second));
-            serde_json::from_value::<SessionConsumerChange>(serde_json::json!({
-                "sequence": 1,
-                "changes": changes,
-            }))
-            .expect("synthetic exact-cap watch change decodes")
-        };
-        let baseline = build(vec![0_u8; 64], vec![0_u8; 64]);
-        let baseline_len = serde_json::to_vec(&Ok::<_, SessionConsumerStoreError>(baseline))
-            .expect("baseline queued watch result encodes")
-            .len();
-        let Some(delta) = BYTE_CAP.checked_sub(baseline_len) else {
-            continue;
-        };
-        if delta > 256 {
-            continue;
-        }
-        let mut bytes = [0_u8; 128];
-        let three_digit = delta / 2;
-        for byte in bytes.iter_mut().take(three_digit) {
-            *byte = 100;
-        }
-        if delta % 2 == 1 {
-            bytes[three_digit] = 10;
-        }
-        let exact = build(bytes[..64].to_vec(), bytes[64..].to_vec());
-        assert_eq!(
-            serde_json::to_vec(&Ok::<_, SessionConsumerStoreError>(exact.clone()))
-                .expect("exact queued watch result encodes")
-                .len(),
-            BYTE_CAP,
-            "fixture consumes every local byte permit exactly"
-        );
-        return exact;
-    }
-    panic!("unable to construct the exact fixed watch-byte boundary");
-}
-
-fn small_watch_change_at(sequence: u64) -> SessionConsumerChange {
-    let key = SessionKey {
-        tenant: TenantId::new("watch-queue").expect("test tenant"),
-        nf_kind: NetworkFunctionKind::smf(),
-        key_type: SessionKeyType::PduSession,
-        stable_id: Bytes::from_static(b"opaque-watch-queue")
-            .try_into()
-            .expect("bounded stable ID"),
-    };
-    serde_json::from_value(serde_json::json!({
-        "sequence": sequence,
-        "changes": [{
-            "key": serde_json::to_value(key).expect("watch key encodes"),
-            "kind": "RecordWritten",
-        }],
-    }))
-    .expect("small synthetic watch change decodes")
-}
-
-fn small_watch_change() -> SessionConsumerChange {
-    small_watch_change_at(1)
-}
-
-fn watch_change_at_sequence(entry: &SessionConsumerChange, sequence: u64) -> SessionConsumerChange {
-    let mut encoded = serde_json::to_value(entry).expect("watch fixture encodes");
-    encoded["sequence"] = serde_json::Value::from(sequence);
-    serde_json::from_value(encoded).expect("watch fixture sequence replaces")
 }
 
 fn assert_fixed_zero_diagnostics(diagnostics: PersistentSessionConsumerDiagnostics) {
@@ -666,28 +354,10 @@ async fn authorizer_and_scope(
     let manifest = store
         .consumer_authorization_manifest([SessionConsumerAuthorizationGrant::try_new(
             SpiffeId::new(client_spiffe).expect("client SPIFFE"),
-            [
-                SessionConsumerTenantNfScope::new(
-                    TenantId::new("watch-pressure").expect("tenant"),
-                    NetworkFunctionKind::smf(),
-                ),
-                SessionConsumerTenantNfScope::new(
-                    TenantId::new("watch-envelope-edge").expect("tenant"),
-                    NetworkFunctionKind::smf(),
-                ),
-                SessionConsumerTenantNfScope::new(
-                    TenantId::new("watch-exact-cap").expect("tenant"),
-                    NetworkFunctionKind::smf(),
-                ),
-                SessionConsumerTenantNfScope::new(
-                    TenantId::new("watch-queue").expect("tenant"),
-                    NetworkFunctionKind::smf(),
-                ),
-                SessionConsumerTenantNfScope::new(
-                    TenantId::new("setup-budget").expect("tenant"),
-                    NetworkFunctionKind::smf(),
-                ),
-            ],
+            [SessionConsumerTenantNfScope::new(
+                TenantId::new("setup-budget").expect("tenant"),
+                NetworkFunctionKind::smf(),
+            )],
         )
         .expect("explicit consumer grant")])
         .await
@@ -733,6 +403,368 @@ fn persistent_client(
     .with_operation_timeout(Duration::from_secs(2));
     PersistentSessionConsumerClient::try_from_stateless(stateless, config)
         .expect("persistent client")
+}
+
+struct ResolverAttemptGuard {
+    active: Arc<AtomicUsize>,
+    first_dropped: Arc<AtomicBool>,
+    ordinal: usize,
+}
+
+impl ResolverAttemptGuard {
+    fn enter(
+        active: Arc<AtomicUsize>,
+        peak: &AtomicUsize,
+        first_dropped: Arc<AtomicBool>,
+        ordinal: usize,
+    ) -> Self {
+        let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut observed_peak = peak.load(Ordering::SeqCst);
+        while concurrent > observed_peak {
+            match peak.compare_exchange_weak(
+                observed_peak,
+                concurrent,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => observed_peak = actual,
+            }
+        }
+        Self {
+            active,
+            first_dropped,
+            ordinal,
+        }
+    }
+}
+
+impl Drop for ResolverAttemptGuard {
+    fn drop(&mut self) {
+        if self.ordinal == 1 {
+            self.first_dropped.store(true, Ordering::SeqCst);
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn persistent_pool_shares_one_recovery_probe_across_twelve_callers() {
+    const CALLERS: usize = 12;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("shared-recovery-gate-server");
+    let client_spiffe = spiffe("shared-recovery-gate-client");
+    let (_authorizer, _scope, authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let lifecycle = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+        Duration::from_millis(50),
+        Duration::from_millis(400),
+        Duration::ZERO,
+    )
+    .expect("deterministic reconnect lifecycle");
+    let resolver_attempts = Arc::new(AtomicUsize::new(0));
+    let concurrent_resolvers = Arc::new(AtomicUsize::new(0));
+    let peak_resolvers = Arc::new(AtomicUsize::new(0));
+    let resolver_timestamps = Arc::new(Mutex::new(Vec::new()));
+    let resolver_entered = Arc::new(Notify::new());
+    let release_resolvers = Arc::new(AtomicBool::new(false));
+    let resolver_released = Arc::new(Notify::new());
+    let resolver: RemoteAddrResolver = {
+        let resolver_attempts = Arc::clone(&resolver_attempts);
+        let concurrent_resolvers = Arc::clone(&concurrent_resolvers);
+        let peak_resolvers = Arc::clone(&peak_resolvers);
+        let resolver_timestamps = Arc::clone(&resolver_timestamps);
+        let resolver_entered = Arc::clone(&resolver_entered);
+        let release_resolvers = Arc::clone(&release_resolvers);
+        let resolver_released = Arc::clone(&resolver_released);
+        Arc::new(move || {
+            let resolver_attempts = Arc::clone(&resolver_attempts);
+            let concurrent_resolvers = Arc::clone(&concurrent_resolvers);
+            let peak_resolvers = Arc::clone(&peak_resolvers);
+            let resolver_timestamps = Arc::clone(&resolver_timestamps);
+            let resolver_entered = Arc::clone(&resolver_entered);
+            let release_resolvers = Arc::clone(&release_resolvers);
+            let resolver_released = Arc::clone(&resolver_released);
+            Box::pin(async move {
+                resolver_attempts.fetch_add(1, Ordering::SeqCst);
+                resolver_timestamps
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(tokio::time::Instant::now());
+                let concurrent = concurrent_resolvers.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut observed_peak = peak_resolvers.load(Ordering::SeqCst);
+                while concurrent > observed_peak {
+                    match peak_resolvers.compare_exchange_weak(
+                        observed_peak,
+                        concurrent,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => observed_peak = actual,
+                    }
+                }
+                resolver_entered.notify_waiters();
+                loop {
+                    let released = resolver_released.notified();
+                    tokio::pin!(released);
+                    released.as_mut().enable();
+                    if release_resolvers.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    released.await;
+                }
+                concurrent_resolvers.fetch_sub(1, Ordering::SeqCst);
+                Err(std::io::Error::other("test resolver unavailable"))
+            })
+        })
+    };
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::try_from("persistent-consumer.test.invalid")
+            .expect("test server name"),
+        authority,
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_secs(2))
+    .with_connection_lifecycle(lifecycle);
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        stateless,
+        PersistentSessionConsumerConfig::try_new(
+            CALLERS,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(1_500),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("fixed concurrent recovery config"),
+    )
+    .expect("persistent client");
+    let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+    let mut callers = Vec::with_capacity(CALLERS);
+    for _ in 0..CALLERS {
+        let client = client.clone();
+        let start = Arc::clone(&start);
+        callers.push(tokio::spawn(async move {
+            start.wait().await;
+            client.capabilities().await
+        }));
+    }
+    start.wait().await;
+
+    tokio::time::timeout(Duration::from_millis(25), async {
+        loop {
+            let entered = resolver_entered.notified();
+            if resolver_attempts.load(Ordering::SeqCst) == 1 {
+                return;
+            }
+            entered.await;
+        }
+    })
+    .await
+    .expect("one shared recovery probe starts promptly");
+    for _ in 0..CALLERS {
+        tokio::task::yield_now().await;
+    }
+    let observed_peak = peak_resolvers.load(Ordering::SeqCst);
+    assert_eq!(
+        resolver_attempts.load(Ordering::SeqCst),
+        1,
+        "the blocked outage probe is shared by all twelve callers"
+    );
+
+    release_resolvers.store(true, Ordering::SeqCst);
+    resolver_released.notify_waiters();
+    let mut results = Vec::with_capacity(CALLERS);
+    for caller in callers {
+        results.push(caller.await.expect("bounded caller task completes"));
+    }
+    client.shutdown().await;
+
+    let observed_timestamps = resolver_timestamps
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert!(
+        !observed_timestamps.is_empty(),
+        "recovery fixture records a resolver setup timestamp"
+    );
+    assert_eq!(
+        observed_peak, 1,
+        "one persistent pool must serialize recovery to one resolver probe during the shared cooldown"
+    );
+    assert!(
+        results.into_iter().all(|result| matches!(
+            result,
+            Err(SessionConsumerClientError::Unavailable | SessionConsumerClientError::Deadline)
+        )),
+        "every caller terminates through the bounded typed recovery failure"
+    );
+    let gaps = observed_timestamps
+        .windows(2)
+        .map(|window| window[1].duration_since(window[0]))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        gaps,
+        [50_u64, 100, 200, 400, 400]
+            .into_iter()
+            .map(Duration::from_millis)
+            .collect::<Vec<_>>(),
+        "one pool publishes exact shared 50/100/200/400ms exponential recovery edges"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum SetupEpochPublication {
+    Reauthentication,
+    Material,
+}
+
+async fn assert_single_caller_setup_epoch_supersession(publication: SetupEpochPublication) {
+    let pki = TestPki::new();
+    let suffix = match publication {
+        SetupEpochPublication::Reauthentication => "reauthentication",
+        SetupEpochPublication::Material => "material",
+    };
+    let server_spiffe = spiffe(&format!("superseded-{suffix}-recovery-server"));
+    let client_spiffe = spiffe(&format!("superseded-{suffix}-recovery-client"));
+    let (_authorizer, _scope, authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let resolver_attempts = Arc::new(AtomicUsize::new(0));
+    let active_resolvers = Arc::new(AtomicUsize::new(0));
+    let peak_resolvers = Arc::new(AtomicUsize::new(0));
+    let first_entered = Arc::new(AtomicBool::new(false));
+    let first_dropped = Arc::new(AtomicBool::new(false));
+    let fresh_saw_first_dropped = Arc::new(AtomicBool::new(false));
+    let resolver: RemoteAddrResolver = {
+        let resolver_attempts = Arc::clone(&resolver_attempts);
+        let active_resolvers = Arc::clone(&active_resolvers);
+        let peak_resolvers = Arc::clone(&peak_resolvers);
+        let first_entered = Arc::clone(&first_entered);
+        let first_dropped = Arc::clone(&first_dropped);
+        let fresh_saw_first_dropped = Arc::clone(&fresh_saw_first_dropped);
+        Arc::new(move || {
+            let resolver_attempts = Arc::clone(&resolver_attempts);
+            let active_resolvers = Arc::clone(&active_resolvers);
+            let peak_resolvers = Arc::clone(&peak_resolvers);
+            let first_entered = Arc::clone(&first_entered);
+            let first_dropped = Arc::clone(&first_dropped);
+            let fresh_saw_first_dropped = Arc::clone(&fresh_saw_first_dropped);
+            Box::pin(async move {
+                let ordinal = resolver_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                let _activity = ResolverAttemptGuard::enter(
+                    active_resolvers,
+                    peak_resolvers.as_ref(),
+                    Arc::clone(&first_dropped),
+                    ordinal,
+                );
+                if ordinal == 1 {
+                    first_entered.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    unreachable!("the stale resolver is cancelled by the fresh epoch");
+                }
+                fresh_saw_first_dropped
+                    .store(first_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+                Err(std::io::Error::other(
+                    "fresh-epoch test resolver unavailable",
+                ))
+            })
+        })
+    };
+    let (material_source, client_tls) = pki.rotating_client_config(&client_spiffe);
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::try_from("persistent-consumer.test.invalid")
+            .expect("test server name"),
+        authority,
+        client_tls,
+    )
+    .with_operation_timeout(Duration::from_secs(2));
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        stateless,
+        PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(1_500),
+            2,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("fixed supersession config"),
+    )
+    .expect("persistent client");
+    let caller_client = client.clone();
+    let caller = tokio::spawn(async move { caller_client.capabilities().await });
+    for _ in 0..128 {
+        if first_entered.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        first_entered.load(Ordering::SeqCst),
+        "the first epoch owns the blocked resolver setup"
+    );
+
+    let fresh_epoch_started_at = tokio::time::Instant::now();
+    match publication {
+        SetupEpochPublication::Reauthentication => {
+            client
+                .request_reauthentication()
+                .expect("publish a fresh reauthentication epoch");
+        }
+        SetupEpochPublication::Material => {
+            material_source.send_replace(Some(pki.identity_state(&client_spiffe)));
+        }
+    }
+    for _ in 0..128 {
+        if resolver_attempts.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        resolver_attempts.load(Ordering::SeqCst),
+        2,
+        "the fresh {suffix} epoch must begin without waiting for the stale setup deadline"
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        fresh_epoch_started_at,
+        "credential supersession consumes no virtual setup time"
+    );
+    assert!(
+        first_dropped.load(Ordering::SeqCst),
+        "the stale resolver future is cancelled before the fresh setup begins"
+    );
+    assert!(
+        fresh_saw_first_dropped.load(Ordering::SeqCst),
+        "the serial permit transfers only after stale setup cancellation"
+    );
+    assert_eq!(
+        peak_resolvers.load(Ordering::SeqCst),
+        1,
+        "credential supersession preserves one pool-wide recovery probe"
+    );
+    assert!(matches!(
+        caller.await.expect("superseded caller task completes"),
+        Err(SessionConsumerClientError::Unavailable)
+    ));
+    client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn credential_and_material_epochs_supersede_single_blocked_pool_recovery() {
+    assert_single_caller_setup_epoch_supersession(SetupEpochPublication::Reauthentication).await;
+    assert_single_caller_setup_epoch_supersession(SetupEpochPublication::Material).await;
 }
 
 #[tokio::test]
@@ -970,119 +1002,6 @@ async fn persistent_pools_derived_from_one_stateless_lineage_share_physical_admi
         pool.shutdown().await;
     }
     second_pool.shutdown().await;
-    proxy_task.abort();
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn persistent_watch_preserves_typed_overload_from_shared_physical_admission() {
-    const PHYSICAL_CAP: usize = 16;
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("lineage-watch-cap-server");
-    let client_spiffe = spiffe("lineage-watch-cap-client");
-    let (authorizer, _scope, authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    let (handle, upstream) = SessionQuorumConsumerServer::new(
-        service.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer,
-    )
-    .with_max_connections(64)
-    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-    .await
-    .expect("start lineage-watch-cap listener");
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind counting proxy");
-    let proxy = listener.local_addr().expect("proxy address");
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let active = Arc::new(AtomicUsize::new(0));
-    let proxy_task = {
-        let accepted = Arc::clone(&accepted);
-        let active = Arc::clone(&active);
-        tokio::spawn(async move {
-            loop {
-                let (mut downstream, _) = listener.accept().await.expect("accept consumer TCP");
-                accepted.fetch_add(1, Ordering::SeqCst);
-                active.fetch_add(1, Ordering::SeqCst);
-                let active = Arc::clone(&active);
-                tokio::spawn(async move {
-                    if let Ok(mut upstream_stream) = tokio::net::TcpStream::connect(upstream).await
-                    {
-                        let _ =
-                            tokio::io::copy_bidirectional(&mut downstream, &mut upstream_stream)
-                                .await;
-                    }
-                    active.fetch_sub(1, Ordering::SeqCst);
-                });
-            }
-        })
-    };
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(proxy) }));
-    let stateless = StatelessSessionConsumerClient::new_with_resolver(
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(proxy.ip().into()),
-        authority,
-        pki.client_config(&client_spiffe),
-    )
-    .with_operation_timeout(Duration::from_secs(2));
-    let persistent =
-        PersistentSessionConsumerClient::try_from_stateless(stateless.clone(), config(1, 0, 1))
-            .expect("persistent client");
-
-    let mut held = Vec::with_capacity(PHYSICAL_CAP);
-    for _ in 0..PHYSICAL_CAP {
-        held.push(
-            stateless
-                .watch(0)
-                .await
-                .expect("stateless watch reaches shared physical cap"),
-        );
-    }
-    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
-    assert_eq!(active.load(Ordering::SeqCst), PHYSICAL_CAP);
-    assert_eq!(service.calls.load(Ordering::SeqCst), PHYSICAL_CAP);
-
-    assert!(matches!(
-        persistent.open_watch(0).await,
-        Err(SessionConsumerClientError::Overloaded)
-    ));
-    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP);
-    assert_eq!(service.calls.load(Ordering::SeqCst), PHYSICAL_CAP);
-    let overloaded = persistent.diagnostics().await;
-    assert_eq!(overloaded.setup_attempts, 1);
-    assert_eq!(overloaded.setup_failures, 1);
-    assert_eq!(overloaded.failures, 1);
-    assert_eq!(overloaded.not_transmitted, 1);
-    assert_eq!(overloaded.overload, 1);
-    assert_eq!(overloaded.watch_active, 0);
-
-    drop(held.pop().expect("one held stateless watch"));
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while active.load(Ordering::SeqCst) == PHYSICAL_CAP {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("reader-owned physical watch permit is released within the fixed bound");
-    let replacement = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            match persistent.open_watch(0).await {
-                Ok(watch) => break watch,
-                Err(SessionConsumerClientError::Overloaded) => tokio::task::yield_now().await,
-                Err(error) => panic!("replacement watch failed outside overload: {error}"),
-            }
-        }
-    })
-    .await
-    .expect("released physical capacity becomes observable within the fixed bound");
-    assert_eq!(accepted.load(Ordering::SeqCst), PHYSICAL_CAP + 1);
-    assert_eq!(service.calls.load(Ordering::SeqCst), PHYSICAL_CAP + 1);
-
-    drop(replacement);
-    drop(held);
-    persistent.shutdown().await;
     proxy_task.abort();
     handle.abort_and_wait().await;
 }
@@ -1384,14 +1303,13 @@ async fn pool_admission_consumes_the_original_complete_operation_deadline() {
 }
 
 #[tokio::test]
-async fn persistent_watch_zero_cursor_normalizes_to_the_first_committed_sequence() {
+async fn production_listener_denies_watch_before_service_callbacks() {
     let pki = TestPki::new();
-    let server_spiffe = spiffe("zero-watch-server");
-    let client_spiffe = spiffe("zero-watch-client");
+    let server_spiffe = spiffe("production-watch-denial-server");
+    let client_spiffe = spiffe("production-watch-denial-client");
     let (authorizer, scope, _authority) =
         authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
-    service.emit_watch_entries_then_close(small_watch_change_at(1), 1);
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
         pki.server_config(&server_spiffe),
@@ -1399,50 +1317,7 @@ async fn persistent_watch_zero_cursor_normalizes_to_the_first_committed_sequence
     )
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
     .await
-    .expect("start consumer listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-
-    let mut watch = client.open_watch(0).await.expect("open zero cursor watch");
-    let entry = tokio::time::timeout(Duration::from_secs(1), watch.next())
-        .await
-        .expect("the normalized first entry arrives")
-        .expect("watch remains open for the first entry")
-        .expect("zero cursor accepts sequence one");
-    assert_eq!(entry.sequence(), 1);
-
-    drop(watch);
-    client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn authenticated_persistent_watch_rejection_emits_no_open_or_watch_frame() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-rejection-server");
-    let client_spiffe = spiffe("watch-rejection-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    // This is a service-side watch admission rejection, not a grant-authorizer
-    // denial. The client identity remains validly authenticated and granted.
-    service.reject_watch(SessionConsumerRejection::Unavailable);
-    let (handle, address) = SessionQuorumConsumerServer::new(
-        service.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer,
-    )
-    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-    .await
-    .expect("start consumer listener");
+    .expect("start production consumer listener");
     let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
     let client = persistent_client(
         &pki,
@@ -1456,136 +1331,12 @@ async fn authenticated_persistent_watch_rejection_emits_no_open_or_watch_frame()
 
     assert!(matches!(
         client.open_watch(0).await,
-        Err(SessionConsumerClientError::Unavailable)
+        Err(SessionConsumerClientError::Authentication)
     ));
-    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(service.watch_starts(), vec![1]);
-    assert_eq!(
-        service.watch_emitted.load(Ordering::SeqCst),
-        0,
-        "a rejected watch must not produce an event/cursor frame"
-    );
-    let diagnostics = client.diagnostics().await;
-    assert_eq!(diagnostics.watch_active, 0);
-    assert_eq!(diagnostics.setup_attempts, 1);
-    assert_eq!(diagnostics.setup_successes, 0);
-    assert_eq!(diagnostics.setup_failures, 1);
-    assert_eq!(diagnostics.not_transmitted, 0);
-    assert_eq!(diagnostics.outcome_unknown, 0);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(service.watch_setup_calls(), 0);
 
     client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn slow_lane_does_not_serialize_sixteen_callers_and_watch_capacity_is_isolated() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("parallel-server");
-    let client_spiffe = spiffe("parallel-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    let (handle, address) = SessionQuorumConsumerServer::new(
-        service.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer,
-    )
-    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-    .await
-    .expect("start consumer listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(4, 16, 1),
-    );
-    client.prewarm().await.expect("prewarm");
-
-    service.arm_blocks(1);
-    let slow = {
-        let client = client.clone();
-        tokio::spawn(async move { client.capabilities().await })
-    };
-    service.wait_until_entered(1).await;
-    let callers = (0..15)
-        .map(|_| {
-            let client = client.clone();
-            tokio::spawn(async move { client.capabilities().await })
-        })
-        .collect::<Vec<_>>();
-    // Only the first of the sixteen calls is held. Prove other request
-    // capacity reaches dispatch before releasing it; this is deterministic
-    // evidence that clones are not globally serialized behind the slow call.
-    tokio::time::timeout(Duration::from_millis(250), service.wait_until_entered(4))
-        .await
-        .expect("other request capacity dispatches while one lane remains slow");
-    assert!(
-        !slow.is_finished(),
-        "the deliberately slow lane is still held"
-    );
-    service.release();
-    for (index, caller) in callers.into_iter().enumerate() {
-        let result = tokio::time::timeout(Duration::from_millis(800), caller)
-            .await
-            .expect("unblocked caller must not serialize behind slow lane")
-            .expect("caller task");
-        assert_eq!(
-            result,
-            Ok(transported_capabilities()),
-            "caller {index} failed; diagnostics={:?}",
-            client.diagnostics().await,
-        );
-    }
-    assert_eq!(service.calls.load(Ordering::SeqCst), 16);
-    assert_eq!(
-        slow.await.expect("slow task"),
-        Ok(transported_capabilities())
-    );
-
-    let watch = client
-        .open_watch(0)
-        .await
-        .expect("first isolated watch slot");
-    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
-    assert!(matches!(
-        client.open_watch(0).await,
-        Err(SessionConsumerClientError::Overloaded)
-    ));
-    drop(watch);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if client.diagnostics().await.watch_active == 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("dropping the receiver stops its reader and releases the watch slot");
-    let replacement_watch = client
-        .open_watch(0)
-        .await
-        .expect("dropping a watch releases only its watch slot");
-    drop(replacement_watch);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if client.diagnostics().await.watch_active == 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("dropping the replacement receiver releases its watch slot");
-    let diagnostics = client.diagnostics().await;
-    assert!(diagnostics.max_active >= 2);
-    assert_eq!(diagnostics.max_watch_active, 1);
-    let report = client.shutdown().await;
-    assert_eq!(report.drained_watches, 0);
     handle.abort_and_wait().await;
 }
 
@@ -1707,148 +1458,18 @@ async fn admitted_call_drains_across_rotation_and_hard_deadline_releases_its_lan
 }
 
 #[tokio::test]
-async fn byte_saturated_watch_queue_terminalizes_without_rotation_or_caller_polling() {
+async fn slow_lane_does_not_serialize_sixteen_callers() {
     let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-drain-server");
-    let client_spiffe = spiffe("watch-drain-client");
+    let server_spiffe = spiffe("parallel-server");
+    let client_spiffe = spiffe("parallel-client");
     let (authorizer, scope, _authority) =
         authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
-    service.emit_watch_entries_then_pending(large_watch_change(), 2);
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
         pki.server_config(&server_spiffe),
         authorizer,
     )
-    .with_max_connections(2)
-    .with_operation_timeout(Duration::from_secs(2))
-    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-    .await
-    .expect("start single-slot consumer listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-
-    let mut stale_watch = client.open_watch(0).await.expect("open pressure watch");
-    tokio::time::timeout(Duration::from_millis(250), async {
-        while client.diagnostics().await.watch_active != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("byte admission failure releases the watch slot without rotation or polling");
-    let replacement = client
-        .open_watch(0)
-        .await
-        .expect("released isolated slot admits a replacement watch");
-    drop(replacement);
-    assert!(stale_watch
-        .next()
-        .await
-        .expect("the already-buffered large item remains ordered")
-        .is_ok());
-    assert!(matches!(
-        stale_watch.next().await,
-        Some(Err(opc_session_store::StoreError::BackendUnavailable(_)))
-    ));
-    assert!(stale_watch.next().await.is_none());
-
-    client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn endpoint_loss_at_exact_watch_byte_saturation_releases_without_reconnect() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-exact-byte-loss-server");
-    let client_spiffe = spiffe("watch-exact-byte-loss-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    service.emit_watch_entries_then_close(exact_watch_byte_budget_change(), 1);
-    let (handle, address) = SessionQuorumConsumerServer::new(
-        service.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer,
-    )
-    .with_max_connections(2)
-    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-    .await
-    .expect("start exact-byte consumer listener");
-    let resolutions = Arc::new(AtomicUsize::new(0));
-    let counted = Arc::clone(&resolutions);
-    let resolver: RemoteAddrResolver = Arc::new(move || {
-        counted.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move { Ok(address) })
-    });
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-
-    let mut watch = client.open_watch(0).await.expect("open exact-byte watch");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        service.wait_for_watch_emissions(1).await;
-        while client.diagnostics().await.watch_active != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("endpoint loss releases the byte-saturated isolated lease");
-    assert_eq!(
-        resolutions.load(Ordering::SeqCst),
-        1,
-        "a saturated unpolled queue never starts replacement setup"
-    );
-    assert!(watch
-        .next()
-        .await
-        .expect("exact-cap item remains ordered")
-        .is_ok());
-    assert!(matches!(
-        watch.next().await,
-        Some(Err(opc_session_store::StoreError::BackendUnavailable(_)))
-    ));
-    assert!(watch.next().await.is_none());
-
-    let replacement = client
-        .open_watch(0)
-        .await
-        .expect("released slot admits one explicit replacement");
-    drop(replacement);
-    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
-    client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn sixty_fifth_item_terminalizes_an_unpolled_full_watch_queue() {
-    const WATCH_QUEUE_ITEMS: usize = 64;
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-small-queue-server");
-    let client_spiffe = spiffe("watch-small-queue-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    service.emit_watch_entries_then_pending(small_watch_change(), WATCH_QUEUE_ITEMS + 1);
-    let (handle, address) = SessionQuorumConsumerServer::new(
-        service.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer,
-    )
-    .with_max_connections(2)
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
     .await
     .expect("start consumer listener");
@@ -1860,345 +1481,49 @@ async fn sixty_fifth_item_terminalizes_an_unpolled_full_watch_queue() {
         &server_spiffe,
         &client_spiffe,
         scope,
-        config(1, 0, 1),
+        config(4, 16, 1),
     );
+    client.prewarm().await.expect("prewarm");
 
-    let mut stale_watch = client.open_watch(0).await.expect("open queued watch");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        // Wait on the producer's exact finite emission edge rather than
-        // sleeping while i686 is still scheduling authenticated watch setup.
-        service
-            .wait_for_watch_emissions(WATCH_QUEUE_ITEMS + 1)
-            .await;
-        while client.diagnostics().await.watch_active != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the 65th item releases the unpolled fixed watch lease");
-    let replacement = client
-        .open_watch(0)
+    service.arm_blocks(1);
+    let slow = {
+        let client = client.clone();
+        tokio::spawn(async move { client.capabilities().await })
+    };
+    service.wait_until_entered(1).await;
+    let callers = (0..15)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move { client.capabilities().await })
+        })
+        .collect::<Vec<_>>();
+    // Only the first of the sixteen calls is held. Prove other request
+    // capacity reaches dispatch before releasing it; this is deterministic
+    // evidence that clones are not globally serialized behind the slow call.
+    tokio::time::timeout(Duration::from_millis(250), service.wait_until_entered(4))
         .await
-        .expect("released slot admits a replacement watch");
-    drop(replacement);
-    for expected_sequence in 1..=WATCH_QUEUE_ITEMS as u64 {
+        .expect("other request capacity dispatches while one lane remains slow");
+    assert!(
+        !slow.is_finished(),
+        "the deliberately slow lane is still held"
+    );
+    service.release();
+    for (index, caller) in callers.into_iter().enumerate() {
+        let result = tokio::time::timeout(Duration::from_millis(800), caller)
+            .await
+            .expect("unblocked caller must not serialize behind slow lane")
+            .expect("caller task");
         assert_eq!(
-            stale_watch
-                .next()
-                .await
-                .expect("buffered item precedes rotation terminal")
-                .expect("buffered item remains valid")
-                .sequence(),
-            expected_sequence,
+            result,
+            Ok(transported_capabilities()),
+            "caller {index} failed; diagnostics={:?}",
+            client.diagnostics().await,
         );
     }
-    assert!(matches!(
-        stale_watch.next().await,
-        Some(Err(opc_session_store::StoreError::BackendUnavailable(_)))
-    ));
-    assert!(stale_watch.next().await.is_none());
-
-    client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn wrapped_watch_item_one_byte_over_the_local_cap_is_terminal_not_eof() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-envelope-cap-server");
-    let client_spiffe = spiffe("watch-envelope-cap-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    let edge = watch_result_envelope_edge_change();
-    let actual = serde_json::to_vec(&Ok::<_, SessionConsumerStoreError>(edge.clone()))
-        .expect("queued edge item encodes")
-        .len();
-    service.emit_one_watch_entry_then_pending(edge);
-    let (handle, address) = SessionQuorumConsumerServer::new(
-        service.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer,
-    )
-    .with_max_connections(2)
-    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-    .await
-    .expect("start consumer listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-
-    let mut watch = client.open_watch(0).await.expect("open edge watch");
-    tokio::time::timeout(Duration::from_millis(250), async {
-        while client.diagnostics().await.watch_active != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("oversized queued representation releases the watch lease");
-    assert!(matches!(
-        watch.next().await,
-        Some(Err(opc_session_store::StoreError::PayloadTooLarge {
-            actual: observed,
-            max: 524_288,
-        })) if observed == actual
-    ));
-    assert!(watch.next().await.is_none());
-    assert_eq!(service.watch_starts(), vec![1]);
-    let replacement = client.open_watch(0).await.expect("slot was released");
-    drop(replacement);
-    assert_eq!(service.watch_starts(), vec![1, 1]);
-
-    client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn maximum_watch_sequence_is_delivered_once_then_closes_cleanly() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-max-sequence-server");
-    let client_spiffe = spiffe("watch-max-sequence-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    service.emit_watch_entries_then_close(small_watch_change_at(u64::MAX), 1);
-    let (handle, address) =
-        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
-            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-            .await
-            .expect("start consumer listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-
-    let mut watch = client
-        .open_watch(u64::MAX)
-        .await
-        .expect("open terminal watch");
+    assert_eq!(service.calls.load(Ordering::SeqCst), 16);
     assert_eq!(
-        watch
-            .next()
-            .await
-            .expect("terminal sequence item")
-            .expect("valid item")
-            .sequence(),
-        u64::MAX,
-    );
-    assert!(watch.next().await.is_none());
-    let diagnostics = client.diagnostics().await;
-    assert_eq!(diagnostics.reconnects, 0);
-    assert_eq!(diagnostics.watch_active, 0);
-
-    client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn terminal_watch_error_and_eof_never_advance_the_persistent_cursor() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-error-cursor-server");
-    let client_spiffe = spiffe("watch-error-cursor-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    service.emit_terminal_watch_error(SessionConsumerStoreError::WatchCatchUpRequired);
-    let (handle, address) = SessionQuorumConsumerServer::new(
-        service.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer,
-    )
-    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-    .await
-    .expect("start consumer listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-
-    let mut watch = client.open_watch(0).await.expect("open watch");
-    assert_eq!(
-        watch.next().await.expect("terminal typed watch item"),
-        Err(opc_session_store::StoreError::ReplicationWatchCatchUpRequired),
-    );
-    assert!(watch.next().await.is_none(), "peer EOF remains terminal");
-    assert_eq!(client.diagnostics().await.reconnects, 0);
-
-    // The explicit next watch is a fresh caller decision. It still normalizes
-    // zero to the inclusive first sequence, proving the peer error did not
-    // consume or skip an authoritative change.
-    let replacement = client.open_watch(0).await.expect("fresh watch");
-    drop(replacement);
-    assert_eq!(service.watch_starts(), vec![1, 1]);
-
-    client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn cancelled_watch_reconnect_has_one_terminal_setup_outcome() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-reconnect-cancel-server");
-    let client_spiffe = spiffe("watch-reconnect-cancel-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    service.emit_watch_entries_then_close(small_watch_change_at(1), 1);
-    let (handle, address) =
-        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
-            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-            .await
-            .expect("start consumer listener");
-
-    let resolutions = Arc::new(AtomicUsize::new(0));
-    let reconnect_started = Arc::new(Notify::new());
-    let resolver: RemoteAddrResolver = {
-        let resolutions = Arc::clone(&resolutions);
-        let reconnect_started = Arc::clone(&reconnect_started);
-        Arc::new(move || {
-            let attempt = resolutions.fetch_add(1, Ordering::SeqCst);
-            let reconnect_started = Arc::clone(&reconnect_started);
-            Box::pin(async move {
-                if attempt == 0 {
-                    Ok(address)
-                } else {
-                    reconnect_started.notify_one();
-                    std::future::pending::<std::io::Result<SocketAddr>>().await
-                }
-            })
-        })
-    };
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-
-    let mut watch = client.open_watch(1).await.expect("open watch");
-    assert_eq!(
-        watch
-            .next()
-            .await
-            .expect("first watch item")
-            .expect("valid first watch item")
-            .sequence(),
-        1,
-    );
-    tokio::time::timeout(Duration::from_secs(1), reconnect_started.notified())
-        .await
-        .expect("replacement setup reaches the resolver");
-    drop(watch);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let diagnostics = client.diagnostics().await;
-            if diagnostics.watch_active == 0
-                && diagnostics.setup_attempts
-                    == diagnostics.setup_successes + diagnostics.setup_failures
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("stream cancellation terminates the in-flight replacement setup");
-    let diagnostics = client.diagnostics().await;
-    assert_eq!(diagnostics.setup_attempts, 2);
-    assert_eq!(diagnostics.setup_successes, 1);
-    assert_eq!(diagnostics.setup_failures, 1);
-
-    client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn watch_open_without_item_has_one_paced_bounded_recovery_window() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-no-progress-server");
-    let client_spiffe = spiffe("watch-no-progress-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    service.close_watch_without_item();
-    let (handle, address) = SessionQuorumConsumerServer::new(
-        service.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer,
-    )
-    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-    .await
-    .expect("start no-progress consumer listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-
-    let mut watch = client.open_watch(0).await.expect("initial WatchOpened");
-    let terminal = tokio::time::timeout(Duration::from_secs(1), watch.next())
-        .await
-        .expect("bounded no-progress recovery terminates")
-        .expect("bounded no-progress recovery reports one terminal item");
-    assert!(matches!(
-        terminal,
-        Err(opc_session_store::StoreError::BackendUnavailable(_))
-    ));
-    assert!(watch.next().await.is_none());
-    assert_eq!(service.watch_starts(), vec![1, 1, 1]);
-    let started_at = service.watch_started_at();
-    assert_eq!(started_at.len(), 3);
-    assert!(
-        started_at[1].duration_since(started_at[0]) >= Duration::from_millis(50),
-        "the first successful-but-empty reopen cannot bypass recovery pacing"
-    );
-    assert!(
-        started_at[2].duration_since(started_at[1]) >= Duration::from_millis(50),
-        "the second successful-but-empty reopen retains the same watch-level budget"
-    );
-
-    for _ in 0..1_000 {
-        if client.diagnostics().await.watch_active == 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    let diagnostics = client.diagnostics().await;
-    assert_eq!(diagnostics.watch_active, 0);
-    assert_eq!(diagnostics.reconnects, 2);
-    assert_eq!(diagnostics.setup_attempts, 3);
-    assert_eq!(diagnostics.setup_successes, 3);
-    assert_eq!(diagnostics.setup_failures, 0);
-    assert_eq!(
-        diagnostics.setup_attempts,
-        diagnostics.setup_successes + diagnostics.setup_failures
+        slow.await.expect("slow task"),
+        Ok(transported_capabilities())
     );
 
     client.shutdown().await;
@@ -2206,279 +1531,7 @@ async fn watch_open_without_item_has_one_paced_bounded_recovery_window() {
 }
 
 #[tokio::test]
-async fn persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoint_loss() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-reconnect-server");
-    let client_spiffe = spiffe("watch-reconnect-client");
-    let (first_authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let first_service = Arc::new(ControlledConsumer::default());
-    first_service.arm_watch_block();
-    first_service.emit_watch_entries_then_close(small_watch_change_at(1), 1);
-    let (first_handle, first_address) = SessionQuorumConsumerServer::new(
-        first_service.clone(),
-        pki.server_config(&server_spiffe),
-        first_authorizer,
-    )
-    .with_max_connections(1)
-    .listen(
-        "127.0.0.1:0"
-            .parse::<SocketAddr>()
-            .expect("first listener address"),
-    )
-    .await
-    .expect("start first consumer listener");
-
-    let (second_authorizer, second_scope, _second_authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    assert_eq!(scope, second_scope, "endpoint replacement retains scope");
-    let second_service = Arc::new(ControlledConsumer::default());
-    second_service.emit_watch_entries_then_close(small_watch_change_at(2), 1);
-    let (second_handle, second_address) = SessionQuorumConsumerServer::new(
-        second_service.clone(),
-        pki.server_config(&server_spiffe),
-        second_authorizer,
-    )
-    .with_max_connections(1)
-    .listen(
-        "127.0.0.1:0"
-            .parse::<SocketAddr>()
-            .expect("second listener address"),
-    )
-    .await
-    .expect("start replacement consumer listener");
-
-    let resolved = Arc::new(RwLock::new(first_address));
-    let resolutions = Arc::new(AtomicUsize::new(0));
-    let resolver: RemoteAddrResolver = {
-        let resolved = Arc::clone(&resolved);
-        let resolutions = Arc::clone(&resolutions);
-        Arc::new(move || {
-            let resolved = Arc::clone(&resolved);
-            let resolutions = Arc::clone(&resolutions);
-            Box::pin(async move {
-                resolutions.fetch_add(1, Ordering::SeqCst);
-                Ok(*resolved.read().expect("resolver address lock"))
-            })
-        })
-    };
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-
-    let mut watch = client.open_watch(1).await.expect("open first watch");
-    first_service.wait_until_entered(1).await;
-    *resolved.write().expect("resolver address lock") = second_address;
-    first_service.release_watch();
-
-    let first = tokio::time::timeout(Duration::from_secs(1), watch.next())
-        .await
-        .expect("first entry arrives before bounded reconnect")
-        .expect("watch remains open")
-        .expect("first entry is valid");
-    let second = tokio::time::timeout(Duration::from_secs(1), watch.next())
-        .await
-        .expect("replacement entry arrives")
-        .expect("watch remains open after endpoint replacement")
-        .expect("replacement entry is valid");
-    assert_eq!(first.sequence(), 1);
-    assert_eq!(second.sequence(), 2);
-    assert!(
-        resolutions.load(Ordering::SeqCst) >= 2,
-        "a reconnect refreshes the endpoint resolver"
-    );
-    // The replacement peer intentionally closes after sequence 2, so the
-    // reader may already be attempting the next bounded replacement when the
-    // caller receives that queued item. Closing the caller-visible stream is
-    // the exact terminal event for that in-flight setup; wait for it before
-    // asserting the completed-outcome accounting invariant.
-    drop(watch);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let diagnostics = client.diagnostics().await;
-            if diagnostics.watch_active == 0
-                && diagnostics.setup_attempts
-                    == diagnostics.setup_successes + diagnostics.setup_failures
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("closing the stream terminates any next replacement setup");
-    let diagnostics = client.diagnostics().await;
-    assert!(
-        diagnostics.reconnects >= 1,
-        "the bounded replacement is observable only as a fixed counter"
-    );
-    assert_eq!(
-        diagnostics.setup_successes, 2,
-        "the initial watch and its exact replacement each complete one authenticated setup"
-    );
-    assert_eq!(
-        diagnostics.setup_attempts,
-        diagnostics.setup_successes + diagnostics.setup_failures,
-        "every completed sequential replacement setup has one terminal outcome"
-    );
-
-    client.shutdown().await;
-    first_handle.abort_and_wait().await;
-    second_handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn persistent_watch_reconnects_after_authenticated_rotation() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-rotation-server");
-    let client_spiffe = spiffe("watch-rotation-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    service.emit_one_watch_entry_then_pending(small_watch_change_at(1));
-    let (handle, address) = SessionQuorumConsumerServer::new(
-        service.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer,
-    )
-    .with_max_connections(1)
-    .listen(
-        "127.0.0.1:0"
-            .parse::<SocketAddr>()
-            .expect("listener address"),
-    )
-    .await
-    .expect("start consumer listener");
-    let resolutions = Arc::new(AtomicUsize::new(0));
-    let resolver: RemoteAddrResolver = {
-        let resolutions = Arc::clone(&resolutions);
-        Arc::new(move || {
-            let resolutions = Arc::clone(&resolutions);
-            Box::pin(async move {
-                resolutions.fetch_add(1, Ordering::SeqCst);
-                Ok(address)
-            })
-        })
-    };
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-    let mut watch = client.open_watch(1).await.expect("open rotation watch");
-    let first = tokio::time::timeout(Duration::from_secs(1), watch.next())
-        .await
-        .expect("first entry arrives")
-        .expect("watch remains open")
-        .expect("first entry is valid");
-    assert_eq!(first.sequence(), 1);
-
-    client
-        .request_reauthentication()
-        .expect("retire the authenticated watch connection");
-    let second = tokio::time::timeout(Duration::from_secs(1), watch.next())
-        .await
-        .expect("reconnected entry arrives")
-        .expect("watch remains open after rotation")
-        .expect("reconnected entry is valid");
-    assert_eq!(second.sequence(), 2);
-    assert!(
-        resolutions.load(Ordering::SeqCst) >= 2,
-        "rotation reconnects through the resolver rather than retaining stale transport"
-    );
-
-    drop(watch);
-    client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn peer_terminal_releases_an_unpolled_full_small_item_watch_queue() {
-    const WATCH_QUEUE_ITEMS: usize = 64;
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("watch-peer-terminal-server");
-    let client_spiffe = spiffe("watch-peer-terminal-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    service.emit_watch_entries_then_close(small_watch_change(), WATCH_QUEUE_ITEMS);
-    let (handle, address) = SessionQuorumConsumerServer::new(
-        service.clone(),
-        pki.server_config(&server_spiffe),
-        authorizer,
-    )
-    .with_max_connections(2)
-    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-    .await
-    .expect("start consumer listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-
-    let mut stale_watch = client.open_watch(0).await.expect("open finite watch");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while service.watch_emitted.load(Ordering::SeqCst) < WATCH_QUEUE_ITEMS {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("server emits exactly enough entries to fill the item queue");
-    tokio::time::timeout(Duration::from_millis(500), async {
-        while client.diagnostics().await.watch_active != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("peer terminal releases the fixed watch lease without caller polling");
-
-    // Keep `stale_watch` unpolled and alive while proving that its full local
-    // queue cannot retain either the isolated watch slot or physical permit.
-    let replacement = tokio::time::timeout(Duration::from_millis(500), client.open_watch(0))
-        .await
-        .expect("replacement watch admission remains bounded")
-        .expect("released peer-terminal slot admits a replacement watch");
-    assert!(service.calls.load(Ordering::SeqCst) >= 2);
-    drop(replacement);
-    for expected_sequence in 1..=WATCH_QUEUE_ITEMS as u64 {
-        assert_eq!(
-            stale_watch
-                .next()
-                .await
-                .expect("buffered item precedes peer terminal")
-                .expect("buffered item remains valid")
-                .sequence(),
-            expected_sequence,
-        );
-    }
-    assert!(matches!(
-        stale_watch.next().await,
-        Some(Err(opc_session_store::StoreError::BackendUnavailable(_)))
-    ));
-    assert!(stale_watch.next().await.is_none());
-
-    client.shutdown().await;
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes() {
+async fn saturation_cancellation_and_reauthentication_replace_only_stale_call_lanes() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("replacement-server");
     let client_spiffe = spiffe("replacement-client");
@@ -2579,6 +1632,12 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes()
     );
     active.abort();
     assert!(active.await.is_err(), "active cancellation completes");
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        first_service.wait_until_no_active_execute(),
+    )
+    .await
+    .expect("peer EOF promptly cancels the bounded server execute future");
     tokio::time::timeout(Duration::from_millis(200), async {
         while client.diagnostics().await.queued != 0 || client.diagnostics().await.active != 0 {
             tokio::task::yield_now().await;
@@ -2634,47 +1693,13 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes()
     assert!(diagnostics.overload >= 1);
     assert!(diagnostics.reconnects >= 1);
 
-    // An empty caller-visible queue remains recoverable across authenticated
-    // rotation. The reader retains its one isolated lease while it reconnects;
-    // a full or byte-blocked local queue is covered separately and fails
-    // closed so an unpolled consumer cannot retain capacity forever.
-    let stale_watch = client.open_watch(0).await.expect("open stale watch");
-    let reconnects_before_watch_rotation = client.diagnostics().await.reconnects;
-    client
-        .request_reauthentication()
-        .expect("retire unpolled watch transport");
-    tokio::time::timeout(Duration::from_millis(250), async {
-        while client.diagnostics().await.reconnects <= reconnects_before_watch_rotation {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("rotation reconnects the recoverable unpolled watch");
-    assert_eq!(
-        client.diagnostics().await.watch_active,
-        1,
-        "the reconnect retains exactly the original isolated watch lease"
-    );
-    drop(stale_watch);
-    tokio::time::timeout(Duration::from_millis(250), async {
-        while client.diagnostics().await.watch_active != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("caller stream drop releases the reconnected watch slot");
-    let replacement_watch = client
-        .open_watch(0)
-        .await
-        .expect("released watch slot admits a replacement watch");
-    drop(replacement_watch);
     let report = client.shutdown().await;
     assert_eq!(report.drained_calls, 0);
     second_handle.abort_and_wait().await;
 }
 
 #[tokio::test]
-async fn forced_shutdown_stops_admission_and_bounds_active_calls_and_watches() {
+async fn forced_shutdown_stops_call_admission_and_bounds_active_calls() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("shutdown-server");
     let client_spiffe = spiffe("shutdown-client");
@@ -2705,17 +1730,14 @@ async fn forced_shutdown_stops_admission_and_bounds_active_calls_and_watches() {
         tokio::spawn(async move { client.capabilities().await })
     };
     service.wait_until_entered(1).await;
-    let watch = client.open_watch(0).await.expect("open pending watch");
     let report = tokio::time::timeout(Duration::from_millis(1_500), client.shutdown())
         .await
         .expect("shutdown drain is bounded");
     assert!(report.forced_calls >= 1);
-    assert!(report.forced_watches >= 1);
     assert_eq!(
         client.capabilities().await,
         Err(SessionConsumerClientError::ShuttingDown)
     );
-    drop(watch);
     active.abort();
     let _ = active.await;
     service.release();
@@ -2723,60 +1745,7 @@ async fn forced_shutdown_stops_admission_and_bounds_active_calls_and_watches() {
 }
 
 #[tokio::test]
-async fn cancelled_shutdown_future_still_forces_and_releases_a_quiet_watch() {
-    let pki = TestPki::new();
-    let server_spiffe = spiffe("cancelled-shutdown-server");
-    let client_spiffe = spiffe("cancelled-shutdown-client");
-    let (authorizer, scope, _authority) =
-        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
-    let service = Arc::new(ControlledConsumer::default());
-    let (handle, address) =
-        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
-            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
-            .await
-            .expect("start quiet-watch listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
-    let client = persistent_client(
-        &pki,
-        resolver,
-        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        &server_spiffe,
-        &client_spiffe,
-        scope,
-        config(1, 0, 1),
-    );
-    let quiet_watch = client.open_watch(0).await.expect("open quiet watch");
-    let shutdown_client = client.clone();
-    let shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
-    tokio::time::timeout(Duration::from_millis(250), async {
-        loop {
-            if client.capabilities().await == Err(SessionConsumerClientError::ShuttingDown) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("shutdown enters draining before caller cancellation");
-    shutdown.abort();
-    let _ = shutdown.await;
-
-    tokio::time::timeout(Duration::from_millis(1_500), async {
-        while client.diagnostics().await.watch_active != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("pool-owned forced shutdown releases the quiet watch task");
-    let report = client.shutdown().await;
-    assert_eq!(report.forced_watches, 1);
-    assert_eq!(client.diagnostics().await.watch_active, 0);
-    drop(quiet_watch);
-    handle.abort_and_wait().await;
-}
-
-#[tokio::test]
-async fn shutting_down_one_derived_pool_does_not_rotate_its_live_sibling() {
+async fn shutting_down_one_derived_pool_does_not_rotate_its_live_call_sibling() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("sibling-shutdown-server");
     let client_spiffe = spiffe("sibling-shutdown-client");
@@ -2808,14 +1777,10 @@ async fn shutting_down_one_derived_pool_does_not_rotate_its_live_sibling() {
         .prewarm()
         .await
         .expect("prewarm sibling request lane");
-    let sibling_watch = sibling.open_watch(0).await.expect("open sibling watch");
-
     first.shutdown().await;
     assert_eq!(reauthentication.generation(), initial_generation);
     assert_eq!(sibling.capabilities().await, Ok(transported_capabilities()));
-    assert_eq!(sibling.diagnostics().await.watch_active, 1);
 
-    drop(sibling_watch);
     sibling.shutdown().await;
     handle.abort_and_wait().await;
 }

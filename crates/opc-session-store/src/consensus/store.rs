@@ -571,6 +571,27 @@ impl ConsensusSessionStore {
         }
     }
 
+    /// Enable or disable ticker-driven elections for deterministic integration
+    /// qualification. Explicit engine-triggered campaigns remain enabled.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub fn set_automatic_election_for_test(&self, enabled: bool) {
+        self.inner.raft.runtime_config().elect(enabled);
+    }
+
+    /// Ask Openraft to start one normal campaign for deterministic integration
+    /// qualification. Openraft owns vote creation, persistence, and transport.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub async fn trigger_election_for_test(&self) -> Result<(), StoreError> {
+        self.inner
+            .raft
+            .trigger()
+            .elect()
+            .await
+            .map_err(|_| consensus_unavailable())
+    }
+
     /// Start one durable Openraft node without yet forming pristine membership.
     ///
     /// `topology` contains only immutable member descriptors. `backend` is this
