@@ -17,11 +17,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
-#[cfg(target_os = "linux")]
 use rusqlite::OpenFlags;
 use rusqlite::{
     backup::StepResult, params, Connection, InterruptHandle, OptionalExtension, Transaction,
@@ -1365,6 +1365,584 @@ pub(crate) fn install_migrated_operator_recovery_validation_schema_sync(
 // in the least-dense one-WAL-page-per-write case, without claiming a page
 // bound for larger bounded transactions.
 const PROACTIVE_CHECKPOINT_DURABLE_WRITE_BATCH: u64 = 64;
+/// Physical pruning is deliberately bounded independently of the logical
+/// Openraft purge acknowledgement.  The floor is durable before this lane is
+/// signalled, so a cancelled or failed turn may retain disk space but can
+/// never resurrect a compacted log prefix.
+const CONSENSUS_LOG_PRUNE_ROWS_PER_TURN: usize = 128;
+const CONSENSUS_LOG_PRUNE_BYTES_PER_TURN: usize = 16 * 1024 * 1024;
+/// This deliberately modest delay makes a held SQLite writer yield to the
+/// primary connection and prevents a capacity-one worker from self-spinning.
+const CONSENSUS_LOG_PRUNE_RETRY_PACING: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConsensusLogPruneTurnError {
+    TransientContention,
+    Interrupted,
+    Permanent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConsensusLogPruneTurnCompletion {
+    more: bool,
+    rows_deleted: u64,
+    encoded_bytes_deleted: u64,
+}
+
+fn classify_consensus_log_prune_sqlite_error(
+    error: &rusqlite::Error,
+) -> ConsensusLogPruneTurnError {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            ConsensusLogPruneTurnError::TransientContention
+        }
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            ConsensusLogPruneTurnError::Interrupted
+        }
+        _ => ConsensusLogPruneTurnError::Permanent,
+    }
+}
+
+fn consensus_log_prune_permanent<T>(_error: T) -> ConsensusLogPruneTurnError {
+    ConsensusLogPruneTurnError::Permanent
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ConsensusLogPruneTurnGateState {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+
+/// Test-only, directory-scoped gate for a real lane turn.  It is installed
+/// only after the fixture is durable, so it cannot alter schema setup or any
+/// unrelated temporary database.
+#[cfg(test)]
+struct ConsensusLogPruneTurnGate {
+    state: Mutex<ConsensusLogPruneTurnGateState>,
+    entered: Condvar,
+    released: Condvar,
+}
+
+#[cfg(test)]
+impl ConsensusLogPruneTurnGate {
+    fn wait_before_prune(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed {
+            return false;
+        }
+        state.entered = true;
+        self.entered.notify_all();
+        while !state.released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.armed = false;
+        true
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.released = true;
+        self.released.notify_all();
+    }
+
+    fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, _) = self
+            .entered
+            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.entered
+    }
+}
+
+#[cfg(test)]
+fn consensus_log_prune_turn_gates(
+) -> &'static Mutex<BTreeMap<PathBuf, Weak<ConsensusLogPruneTurnGate>>> {
+    static GATES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<ConsensusLogPruneTurnGate>>>> =
+        OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn consensus_log_prune_turn_gate_for_source(
+    source: &crate::consensus::snapshot::PinnedSqliteFile,
+) -> Option<Arc<ConsensusLogPruneTurnGate>> {
+    let directory = std::fs::canonicalize(source.path().parent()?).ok()?;
+    let mut gates = consensus_log_prune_turn_gates()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let gate = gates.get(&directory).and_then(Weak::upgrade);
+    if gate.is_none() {
+        gates.remove(&directory);
+    }
+    gate
+}
+
+#[cfg(test)]
+struct ConsensusLogPruneTurnGateForTest {
+    directory: PathBuf,
+    gate: Arc<ConsensusLogPruneTurnGate>,
+}
+
+#[cfg(test)]
+impl ConsensusLogPruneTurnGateForTest {
+    fn install(directory: &Path) -> Self {
+        let directory =
+            std::fs::canonicalize(directory).expect("canonicalize prune gate directory");
+        let gate = Arc::new(ConsensusLogPruneTurnGate {
+            state: Mutex::new(ConsensusLogPruneTurnGateState {
+                armed: true,
+                entered: false,
+                released: false,
+            }),
+            entered: Condvar::new(),
+            released: Condvar::new(),
+        });
+        consensus_log_prune_turn_gates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(directory.clone(), Arc::downgrade(&gate));
+        Self { directory, gate }
+    }
+
+    fn release(&self) {
+        self.gate.release();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConsensusLogPruneTurnGateForTest {
+    fn drop(&mut self) {
+        self.release();
+        consensus_log_prune_turn_gates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.directory);
+    }
+}
+
+/// One descriptor-pinned, coalescing physical log-prune lane.  It is only
+/// installed for the fixed durable authority profile; the unsupported
+/// in-memory shape retains the historical synchronous delete path.
+pub(crate) struct ConsensusLogPruneLane {
+    sender: tokio::sync::mpsc::Sender<()>,
+    stop: tokio::sync::watch::Sender<bool>,
+    stopping: AtomicBool,
+    active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
+    worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
+    #[cfg(test)]
+    turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
+}
+
+impl ConsensusLogPruneLane {
+    fn start(
+        source: Arc<crate::consensus::snapshot::PinnedSqliteFile>,
+        vfs_name: Option<Arc<str>>,
+        identity: SessionConsensusIdentity,
+        expected_members: BTreeSet<SessionConsensusNodeId>,
+        expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+        fixed_placement_policy: Option<PlacementResiliencePolicy>,
+        diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
+    ) -> Result<Arc<Self>, SessionConsensusStorageError> {
+        verify_proactive_checkpoint_source(&source)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let connection = match vfs_name {
+            Some(vfs_name) => {
+                Connection::open_with_flags_and_vfs(source.path(), flags, vfs_name.as_ref())
+            }
+            None => Connection::open_with_flags(source.path(), flags),
+        }
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        verify_proactive_checkpoint_connection(&connection, &source)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        configure_consensus_log_prune_connection(&connection)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        verify_proactive_checkpoint_connection(&connection, &source)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (stop, stop_receiver) = tokio::sync::watch::channel(false);
+        let lane = Arc::new(Self {
+            sender,
+            stop,
+            stopping: AtomicBool::new(false),
+            active_interrupt: Mutex::new(None),
+            worker: tokio::sync::Mutex::new(None),
+            diagnostics,
+            #[cfg(test)]
+            turn_gate: consensus_log_prune_turn_gate_for_source(&source),
+        });
+        let worker = tokio::spawn(run_consensus_log_prune_lane(
+            receiver,
+            stop_receiver,
+            connection,
+            source,
+            Arc::downgrade(&lane),
+            identity,
+            expected_members,
+            expected_bindings,
+            fixed_placement_policy,
+        ));
+        *lane
+            .worker
+            .try_lock()
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)? = Some(worker);
+        Ok(lane)
+    }
+
+    pub(crate) fn signal(&self) {
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        if self.sender.try_send(()).is_ok() {
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.observe_consensus_log_prune_signal();
+            }
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Some(interrupt) = self
+            .active_interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            interrupt.interrupt();
+        }
+        let _ = self.stop.send(true);
+        let mut slot = self.worker.lock().await;
+        if let Some(worker) = slot.as_mut() {
+            let _ = worker.await;
+        }
+        slot.take();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_consensus_log_prune_lane(
+    mut receiver: tokio::sync::mpsc::Receiver<()>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut connection: Connection,
+    source: Arc<crate::consensus::snapshot::PinnedSqliteFile>,
+    lane: Weak<ConsensusLogPruneLane>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+) {
+    let Some(first_lane) = lane.upgrade() else {
+        return;
+    };
+    if let Some(diagnostics) = &first_lane.diagnostics {
+        diagnostics.begin_consensus_log_prune_worker();
+    }
+    drop(first_lane);
+    let _worker = ConsensusLogPruneWorkerGuard { lane: lane.clone() };
+    loop {
+        let signal = tokio::select! {
+            changed = stop.changed() => { if changed.is_err() || *stop.borrow() { return; } continue; }
+            signal = receiver.recv() => signal,
+        };
+        if signal.is_none() || *stop.borrow() {
+            return;
+        }
+        let Some(lane) = lane.upgrade() else {
+            return;
+        };
+        if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+            return;
+        }
+        let interrupt = Arc::new(connection.get_interrupt_handle());
+        *lane
+            .active_interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&interrupt));
+        if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+            *lane
+                .active_interrupt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            return;
+        }
+        if let Some(diagnostics) = &lane.diagnostics {
+            diagnostics.begin_consensus_log_prune_turn();
+        }
+        let source_for_turn = Arc::clone(&source);
+        let expected_members_for_turn = expected_members.clone();
+        let expected_bindings_for_turn = expected_bindings.clone();
+        #[cfg(test)]
+        let turn_gate = lane.turn_gate.clone();
+        let turn = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if turn_gate
+                .as_ref()
+                .is_some_and(|gate| gate.wait_before_prune())
+            {
+                return (connection, Err(ConsensusLogPruneTurnError::Interrupted));
+            }
+            let result = prune_consensus_log_turn_sync(
+                &connection,
+                &source_for_turn,
+                identity,
+                &expected_members_for_turn,
+                &expected_bindings_for_turn,
+                fixed_placement_policy,
+            );
+            (connection, result)
+        })
+        .await;
+        *lane
+            .active_interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        match turn {
+            Ok((returned, Ok(completion))) => {
+                connection = returned;
+                if let Some(diagnostics) = &lane.diagnostics {
+                    diagnostics.complete_consensus_log_prune_turn(
+                        completion.rows_deleted,
+                        completion.encoded_bytes_deleted,
+                        completion.more,
+                    );
+                }
+                if completion.more {
+                    if !wait_consensus_log_prune_pacing(&mut stop, &lane).await {
+                        return;
+                    }
+                    if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                        return;
+                    }
+                    lane.signal();
+                }
+            }
+            Ok((returned, Err(ConsensusLogPruneTurnError::TransientContention))) => {
+                connection = returned;
+                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                    if let Some(diagnostics) = &lane.diagnostics {
+                        diagnostics.cancel_consensus_log_prune_turn();
+                    }
+                    return;
+                }
+                if let Some(diagnostics) = &lane.diagnostics {
+                    diagnostics.retry_consensus_log_prune_turn();
+                }
+                if !wait_consensus_log_prune_pacing(&mut stop, &lane).await {
+                    return;
+                }
+                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                    return;
+                }
+                lane.signal();
+            }
+            Ok((returned, Err(ConsensusLogPruneTurnError::Interrupted))) => {
+                let _ = returned;
+                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                    if let Some(diagnostics) = &lane.diagnostics {
+                        diagnostics.cancel_consensus_log_prune_turn();
+                    }
+                    return;
+                }
+                if let Some(diagnostics) = &lane.diagnostics {
+                    diagnostics.fail_consensus_log_prune_turn();
+                }
+                return;
+            }
+            Ok((returned, Err(ConsensusLogPruneTurnError::Permanent))) => {
+                let _ = returned;
+                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                    if let Some(diagnostics) = &lane.diagnostics {
+                        diagnostics.cancel_consensus_log_prune_turn();
+                    }
+                    return;
+                }
+                if let Some(diagnostics) = &lane.diagnostics {
+                    diagnostics.fail_consensus_log_prune_turn();
+                }
+                return;
+            }
+            Err(_) => {
+                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                    if let Some(diagnostics) = &lane.diagnostics {
+                        diagnostics.cancel_consensus_log_prune_turn();
+                    }
+                    return;
+                }
+                if let Some(diagnostics) = &lane.diagnostics {
+                    diagnostics.fail_consensus_log_prune_turn();
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// The physical-prune worker is deliberately a low-priority SQLite client:
+/// SQLite itself must return busy immediately so the lane's one fixed,
+/// stop-selectable pacing point owns every retry delay.  Automatic
+/// checkpointing is disabled on this secondary connection so a bounded prune
+/// transaction cannot add an unbounded main-file checkpoint to its commit.
+fn configure_consensus_log_prune_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
+    apply_pragma_profile(conn, false, false).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    conn.busy_timeout(Duration::ZERO)?;
+    conn.pragma_update(None, "wal_autocheckpoint", 0_i32)?;
+    let wal_autocheckpoint: i32 =
+        conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+    if wal_autocheckpoint != 0 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
+}
+
+struct ConsensusLogPruneWorkerGuard {
+    lane: Weak<ConsensusLogPruneLane>,
+}
+
+impl Drop for ConsensusLogPruneWorkerGuard {
+    fn drop(&mut self) {
+        if let Some(lane) = self.lane.upgrade() {
+            if let Some(diagnostics) = &lane.diagnostics {
+                diagnostics.end_consensus_log_prune_worker();
+            }
+        }
+    }
+}
+
+async fn wait_consensus_log_prune_pacing(
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+    lane: &ConsensusLogPruneLane,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(CONSENSUS_LOG_PRUNE_RETRY_PACING) => !lane.stopping.load(Ordering::Acquire) && !*stop.borrow(),
+        changed = stop.changed() => changed.is_ok() && !*stop.borrow() && !lane.stopping.load(Ordering::Acquire),
+    }
+}
+
+fn prune_consensus_log_turn_sync(
+    conn: &Connection,
+    source: &crate::consensus::snapshot::PinnedSqliteFile,
+    identity: SessionConsensusIdentity,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+) -> Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError> {
+    verify_proactive_checkpoint_connection(conn, source).map_err(consensus_log_prune_permanent)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+    validate_durable_authority_for_raw_access(
+        &tx,
+        identity,
+        ConsensusAuthorityProfile::FixedImmutable,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+    )
+    .map_err(consensus_log_prune_permanent)?;
+    let Some(floor) = read_purged_sync(&tx, identity).map_err(consensus_log_prune_permanent)?
+    else {
+        return Ok(ConsensusLogPruneTurnCompletion {
+            more: false,
+            rows_deleted: 0,
+            encoded_bytes_deleted: 0,
+        });
+    };
+    let completion = prune_consensus_log_rows_in_tx(&tx, &floor)?;
+    verify_proactive_checkpoint_connection(conn, source).map_err(consensus_log_prune_permanent)?;
+    tx.commit()
+        .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+    Ok(completion)
+}
+
+fn prune_consensus_log_rows_in_tx(
+    tx: &Transaction<'_>,
+    floor: &LogId<SessionConsensusNodeId>,
+) -> Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError> {
+    let mut statement = tx.prepare("SELECT log_index, length(entry_json) FROM consensus_log WHERE log_index <= ?1 ORDER BY log_index ASC LIMIT ?2").map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+    let mut rows = statement
+        .query(params![
+            checked_i64(floor.index).map_err(consensus_log_prune_permanent)?,
+            i64::try_from(CONSENSUS_LOG_PRUNE_ROWS_PER_TURN)
+                .map_err(consensus_log_prune_permanent)?
+        ])
+        .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+    let mut selected = Vec::new();
+    let mut bytes = 0_usize;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?
+    {
+        let index: i64 = row
+            .get(0)
+            .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+        let length: i64 = row
+            .get(1)
+            .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+        let length = usize::try_from(length).map_err(consensus_log_prune_permanent)?;
+        if bytes
+            .checked_add(length)
+            .filter(|total| *total <= CONSENSUS_LOG_PRUNE_BYTES_PER_TURN)
+            .is_none()
+        {
+            break;
+        }
+        bytes += length;
+        selected.push(index);
+    }
+    drop(rows);
+    drop(statement);
+    if let Some(last) = selected.last() {
+        tx.execute("DELETE FROM consensus_log WHERE log_index <= ?1", [last])
+            .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+    } else {
+        let retained: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM consensus_log WHERE log_index <= ?1)",
+                [checked_i64(floor.index).map_err(consensus_log_prune_permanent)?],
+                |row| row.get(0),
+            )
+            .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+        if retained {
+            // A row larger than the fixed budget cannot be a supported
+            // durable entry. Refuse a zero-progress requeue loop.
+            return Err(ConsensusLogPruneTurnError::Permanent);
+        }
+    }
+    let more: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM consensus_log WHERE log_index <= ?1)",
+            [checked_i64(floor.index).map_err(consensus_log_prune_permanent)?],
+            |row| row.get(0),
+        )
+        .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+    Ok(ConsensusLogPruneTurnCompletion {
+        more,
+        rows_deleted: u64::try_from(selected.len()).map_err(consensus_log_prune_permanent)?,
+        encoded_bytes_deleted: u64::try_from(bytes).map_err(consensus_log_prune_permanent)?,
+    })
+}
 
 pub(crate) struct ProactiveCheckpointLane {
     sender: tokio::sync::mpsc::Sender<()>,
@@ -1773,6 +2351,9 @@ pub(crate) struct SqliteConsensusCore {
     /// live backing file. It is absent only for the unsupported in-memory
     /// backend shape.
     pub(crate) proactive_checkpoint_lane: Option<Arc<ProactiveCheckpointLane>>,
+    /// Physical deletion follows the durable logical purge floor on this one
+    /// store-scoped worker; it never uses the primary consensus connection.
+    pub(crate) consensus_log_prune_lane: Option<Arc<ConsensusLogPruneLane>>,
     pub(crate) snapshot_observation: Arc<SnapshotBuildObservation>,
     /// Immutable database-incarnation identity used by legacy foreign keys.
     /// The active topology identity lives in `consensus_membership_scope`.
@@ -1813,6 +2394,10 @@ impl SqliteConsensusCore {
     /// join it after Openraft has stopped every storage writer.
     pub(crate) fn proactive_checkpoint_lane(&self) -> Option<Arc<ProactiveCheckpointLane>> {
         self.proactive_checkpoint_lane.clone()
+    }
+
+    pub(crate) fn consensus_log_prune_lane(&self) -> Option<Arc<ConsensusLogPruneLane>> {
+        self.consensus_log_prune_lane.clone()
     }
 
     pub(crate) async fn initialize(
@@ -1889,7 +2474,13 @@ impl SqliteConsensusCore {
         let canonical_snapshot_dir = tokio::fs::canonicalize(&snapshot_dir)
             .await
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-        let (storage_identity, applied, database_file, proactive_checkpoint_lane) = {
+        let (
+            storage_identity,
+            applied,
+            database_file,
+            proactive_checkpoint_lane,
+            consensus_log_prune_lane,
+        ) = {
             let conn = backend.conn.lock().await;
             let storage_identity = initialize_schema_with_storage_anchor_and_pending_and_bindings(
                 &conn,
@@ -1939,19 +2530,40 @@ impl SqliteConsensusCore {
                     )
                 })
                 .transpose()?;
+            let consensus_log_prune_lane =
+                if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                    database_file
+                        .as_ref()
+                        .map(|source| {
+                            ConsensusLogPruneLane::start(
+                                Arc::clone(source),
+                                backend.checkpoint_vfs_name.clone(),
+                                storage_identity,
+                                expected_members.clone(),
+                                expected_bindings.clone(),
+                                fixed_placement_policy,
+                                backend.consensus_diagnostics.clone(),
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
             (
                 storage_identity,
                 applied,
                 database_file,
                 proactive_checkpoint_lane,
+                consensus_log_prune_lane,
             )
         };
         let (applied_progress, _) = tokio::sync::watch::channel(applied);
 
-        Ok(Self {
+        let core = Self {
             conn: Arc::clone(&backend.conn),
             database_file,
             proactive_checkpoint_lane,
+            consensus_log_prune_lane,
             snapshot_observation: backend.snapshot_observation(),
             storage_identity,
             authority_profile,
@@ -1975,7 +2587,11 @@ impl SqliteConsensusCore {
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
             #[cfg(test)]
             snapshot_capture_gate: Arc::clone(&backend.consensus_snapshot_capture_gate),
-        })
+        };
+        if let Some(lane) = &core.consensus_log_prune_lane {
+            lane.signal();
+        }
+        Ok(core)
     }
 }
 
@@ -8786,7 +9402,8 @@ fn replay_unapplied_log_prefix_sync(
                 .ok_or_else(|| invalid_data("session consensus applied index exhausted"))
         })
         .transpose()?
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(logical_log_start(conn, storage_identity, 0)?);
     let target = last_log_sync(conn, storage_identity)?
         .map(|log_id| {
             log_id
@@ -9059,16 +9676,17 @@ pub(crate) fn last_log_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+    let floor = read_purged_sync(conn, identity)?;
     let row = conn
         .query_row(
-            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log ORDER BY log_index DESC LIMIT 1",
-            [],
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index > ?1 ORDER BY log_index DESC LIMIT 1",
+            [floor.as_ref().map(|log| checked_i64(log.index)).transpose()?.unwrap_or(-1)],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Vec<u8>>(3)?)),
         )
         .optional()
         .map_err(db_error)?;
     let Some((epoch, term, index, encoded)) = row else {
-        return read_purged_sync(conn, identity);
+        return Ok(floor);
     };
     validate_epoch(epoch, identity)?;
     let entry: Entry<SessionRaftTypeConfig> = decode_json(&encoded)?;
@@ -9087,7 +9705,15 @@ pub(crate) fn read_log_range_sync(
     end: Option<u64>,
     limit: Option<usize>,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
-    read_log_range_with_batch_sync(conn, identity, start, end, limit, false, false)
+    read_log_range_with_batch_sync(
+        conn,
+        identity,
+        logical_log_start(conn, identity, start)?,
+        end,
+        limit,
+        false,
+        false,
+    )
 }
 
 /// Read a bounded persisted log range during offline recovery. Callers must
@@ -9100,7 +9726,15 @@ pub(crate) fn read_log_range_for_recovery_sync(
     end: Option<u64>,
     limit: Option<usize>,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
-    read_log_range_with_batch_sync(conn, identity, start, end, limit, false, true)
+    read_log_range_with_batch_sync(
+        conn,
+        identity,
+        logical_log_start(conn, identity, start)?,
+        end,
+        limit,
+        false,
+        true,
+    )
 }
 
 pub(crate) fn read_limited_log_range_sync(
@@ -9110,6 +9744,7 @@ pub(crate) fn read_limited_log_range_sync(
     end: u64,
     limit: usize,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+    let start = logical_log_start(conn, identity, start)?;
     let entries =
         read_log_range_with_batch_sync(conn, identity, start, Some(end), Some(limit), true, false)?;
     let purged = read_purged_sync(conn, identity)?;
@@ -9143,6 +9778,22 @@ pub(crate) fn read_limited_log_range_sync(
         }
     }
     Ok(entries)
+}
+
+fn logical_log_start(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    start: u64,
+) -> io::Result<u64> {
+    match read_purged_sync(conn, identity)? {
+        Some(floor) => Ok(start.max(
+            floor
+                .index
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("session consensus purge index exhausted"))?,
+        )),
+        None => Ok(start),
+    }
 }
 
 fn read_log_range_with_batch_sync(
@@ -9420,7 +10071,63 @@ pub(crate) fn purge_logs_sync(
     tx.commit().map_err(db_error)
 }
 
+fn logical_purge_logs_in_tx(
+    tx: &Transaction<'_>,
+    identity: SessionConsensusIdentity,
+    through: &LogId<SessionConsensusNodeId>,
+    _index: i64,
+) -> io::Result<()> {
+    if let Some(current) = read_purged_sync(tx, identity)? {
+        if through.index < current.index || (through.index == current.index && through != &current)
+        {
+            return Err(invalid_data("session consensus purged index regressed"));
+        }
+        if through == &current {
+            return Ok(());
+        }
+    }
+    let applied = read_applied_sync(tx, identity)?
+        .ok_or_else(|| invalid_data("session consensus cannot purge unapplied logs"))?;
+    if through.index > applied.index {
+        return Err(invalid_data(
+            "session consensus cannot purge unapplied logs",
+        ));
+    }
+    save_log_pointer(tx, "consensus_purged", identity, through)
+}
+
 pub(crate) fn purge_logs_with_authority_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    through: &LogId<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    if authority_profile == ConsensusAuthorityProfile::Dynamic {
+        return purge_logs_sync(conn, identity, through);
+    }
+    let (_, index) = validate_log_id(through)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    validate_durable_authority_for_raw_access(
+        &tx,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+    )?;
+    validate_fixed_log_id(through)?;
+    logical_purge_logs_in_tx(&tx, identity, through, index)?;
+    tx.commit().map_err(db_error)
+}
+
+/// Retain the historical physical delete when this fixed store has no
+/// file-backed worker lane (the supported in-memory construction).  The
+/// file-backed fixed profile must use the logical floor plus its descriptor-
+/// pinned lane instead.
+pub(crate) fn purge_logs_without_prune_lane_with_authority_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     authority_profile: ConsensusAuthorityProfile,
@@ -15155,12 +15862,18 @@ fn validate_fixed_live_durable_state_sync(
     for log_id in [&committed, &purged, &applied].into_iter().flatten() {
         validate_fixed_log_id(log_id)?;
     }
-    if let (Some(purged), Some(applied)) = (&purged, &applied) {
-        ensure_log_id_not_after(
+    match (&purged, &applied) {
+        (Some(purged), Some(applied)) => ensure_log_id_not_after(
             purged,
             applied,
             "session consensus fixed purged pointer is beyond applied state",
-        )?;
+        )?,
+        (Some(_), None) => {
+            return Err(invalid_data(
+                "session consensus fixed purged pointer lacks applied state",
+            ))
+        }
+        (None, _) => {}
     }
 
     let membership = read_membership_sync(conn, identity)?;
@@ -15214,12 +15927,26 @@ fn validate_fixed_durable_state_sync(
     expected_members: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<()> {
     validate_fixed_live_durable_state_sync(conn, identity, expected_members)?;
+    let floor = read_purged_sync(conn, identity)?
+        .map(|log| checked_i64(log.index))
+        .transpose()?
+        .unwrap_or(-1);
     let mut statement = conn
         .prepare(
-            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log ORDER BY log_index ASC",
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index > ?1 ORDER BY log_index ASC",
         )
         .map_err(db_error)?;
-    let mut rows = statement.query([]).map_err(db_error)?;
+    let mut rows = statement.query([floor]).map_err(db_error)?;
+    let mut expected = if floor < 0 {
+        0
+    } else {
+        u64::try_from(floor)
+            .map_err(|_| invalid_data("session consensus fixed retained log index is invalid"))?
+            .checked_add(1)
+            .ok_or_else(|| {
+                invalid_data("session consensus fixed retained log index is exhausted")
+            })?
+    };
     while let Some(row) = rows.next().map_err(db_error)? {
         let epoch: i64 = row.get(0).map_err(db_error)?;
         let term: i64 = row.get(1).map_err(db_error)?;
@@ -15237,6 +15964,14 @@ fn validate_fixed_durable_state_sync(
         {
             return Err(invalid_data("session consensus fixed log entry is invalid"));
         }
+        if entry.log_id.index != expected {
+            return Err(invalid_data(
+                "session consensus fixed retained log contains a hole",
+            ));
+        }
+        expected = expected.checked_add(1).ok_or_else(|| {
+            invalid_data("session consensus fixed retained log index is exhausted")
+        })?;
     }
     Ok(())
 }
@@ -18491,6 +19226,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn consensus_log_prune_classifies_only_busy_and_locked_as_transient() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            assert_eq!(
+                classify_consensus_log_prune_sqlite_error(&error),
+                ConsensusLogPruneTurnError::TransientContention
+            );
+        }
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        );
+        assert_eq!(
+            classify_consensus_log_prune_sqlite_error(&error),
+            ConsensusLogPruneTurnError::Permanent
+        );
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+            None,
+        );
+        assert_eq!(
+            classify_consensus_log_prune_sqlite_error(&error),
+            ConsensusLogPruneTurnError::Interrupted
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn consensus_log_prune_connection_returns_competing_writer_busy_without_the_primary_timeout() {
+        let directory = tempfile::tempdir().expect("prune busy directory");
+        let source_path = directory.path().join("prune-busy.sqlite");
+        let primary = Connection::open(&source_path).expect("open competing primary");
+        apply_pragma_profile(&primary, false, true).expect("configure competing primary");
+        primary
+            .execute_batch("CREATE TABLE prune_busy_fixture(value INTEGER);")
+            .expect("create competing writer fixture");
+        let prune = Connection::open(&source_path).expect("open dedicated prune connection");
+        configure_consensus_log_prune_connection(&prune)
+            .expect("configure dedicated prune connection");
+        assert_eq!(
+            prune
+                .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i32>(0))
+                .expect("read dedicated autocheckpoint"),
+            0,
+            "the dedicated prune connection cannot checkpoint as a delete side effect"
+        );
+        primary
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO prune_busy_fixture VALUES (1);")
+            .expect("hold competing writer transaction");
+        let before = std::time::Instant::now();
+        let result = Transaction::new_unchecked(&prune, TransactionBehavior::Immediate);
+        let elapsed = before.elapsed();
+        primary
+            .execute_batch("ROLLBACK;")
+            .expect("release competing writer transaction");
+        let error = result.expect_err("dedicated prune writer sees immediate contention");
+        assert_eq!(
+            classify_consensus_log_prune_sqlite_error(&error),
+            ConsensusLogPruneTurnError::TransientContention
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "the dedicated prune connection must not inherit SQLite's 100ms busy wait"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    #[test]
+    fn consensus_log_prune_connection_commit_does_not_implicitly_checkpoint() {
+        use opc_sqlite_file_control_sys::{
+            block_test_main_sync, install_test_main_sync_block_vfs, TEST_MAIN_SYNC_BLOCK_VFS_NAME,
+        };
+
+        static VFS_GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _vfs_gate = VFS_GATE
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("serialize prune VFS state");
+        install_test_main_sync_block_vfs().expect("register prune VFS");
+        let directory = tempfile::tempdir().expect("prune VFS directory");
+        let source_path = directory.path().join("prune-vfs.sqlite");
+        let primary_flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let primary = Connection::open_with_flags_and_vfs(
+            &source_path,
+            primary_flags,
+            TEST_MAIN_SYNC_BLOCK_VFS_NAME,
+        )
+        .expect("open VFS primary");
+        apply_pragma_profile(&primary, false, true).expect("configure VFS primary");
+        primary
+            .execute_batch("CREATE TABLE prune_vfs_fixture(value INTEGER); INSERT INTO prune_vfs_fixture VALUES (1);")
+            .expect("seed VFS prune fixture");
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let prune =
+            Connection::open_with_flags_and_vfs(&source_path, flags, TEST_MAIN_SYNC_BLOCK_VFS_NAME)
+                .expect("open VFS prune connection");
+        configure_consensus_log_prune_connection(&prune).expect("configure VFS prune connection");
+        let held_main_sync = block_test_main_sync();
+        let tx = Transaction::new_unchecked(&prune, TransactionBehavior::Immediate)
+            .expect("begin bounded VFS prune transaction");
+        tx.execute("DELETE FROM prune_vfs_fixture WHERE value = 1", [])
+            .expect("delete one bounded VFS prune row");
+        tx.commit().expect("commit bounded VFS prune transaction");
+        assert_eq!(
+            held_main_sync.main_sync_count(),
+            0,
+            "the dedicated prune commit must not invoke an automatic main-file checkpoint"
+        );
+        assert!(
+            held_main_sync.wal_sync_count() > 0,
+            "the VFS observed the bounded WAL commit rather than a no-op"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn proactive_checkpoint_start_rejects_replaced_path_before_successor_pragma_mutation() {
@@ -19591,7 +20443,7 @@ mod tests {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let directory = tempfile::tempdir().expect("temporary directory");
         let snapshot_dir = directory.path().join("must-not-exist");
-        let members = expected_members();
+        let members = members(&[7, 8, 9]);
         let error = match SqliteConsensusCore::initialize(
             &backend,
             snapshot_dir.clone(),
@@ -19675,6 +20527,596 @@ mod tests {
             append_logs_sync(&conn, identity(), &entries).expect("append log fixtures");
         }
         backend
+    }
+
+    fn set_test_purge_floor(conn: &Connection, through: &LogId<SessionConsensusNodeId>) {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .expect("begin purge-floor fixture transaction");
+        save_log_pointer(&tx, "consensus_purged", identity(), through)
+            .expect("save purge-floor fixture");
+        tx.commit().expect("commit purge-floor fixture");
+    }
+
+    #[tokio::test]
+    async fn consensus_log_prune_turn_honors_the_fixed_128_row_limit() {
+        let backend = backend_with_blank_logs(129).await;
+        let conn = backend.conn.lock().await;
+        set_test_purge_floor(&conn, &log_id(129));
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin row-limit turn");
+        let completion =
+            prune_consensus_log_rows_in_tx(&tx, &log_id(129)).expect("row-limit turn succeeds");
+        tx.commit().expect("commit row-limit turn");
+        assert_eq!(completion.rows_deleted, 128);
+        assert!(completion.more);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                .get::<_, i64>(0))
+                .expect("count retained rows"),
+            2,
+            "the membership row and exactly one log row remain for the next bounded turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_log_prune_turn_honors_byte_boundary_and_rejects_oversize_stickily() {
+        let backend = backend_with_blank_logs(2).await;
+        let conn = backend.conn.lock().await;
+        conn.execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .expect("remove membership row from byte-budget fixture");
+        set_test_purge_floor(&conn, &log_id(2));
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1",
+            [vec![0x41; CONSENSUS_LOG_PRUNE_BYTES_PER_TURN / 2]],
+        )
+        .expect("install first byte-boundary row");
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 2",
+            [vec![0x42; CONSENSUS_LOG_PRUNE_BYTES_PER_TURN / 2 + 1]],
+        )
+        .expect("install crossing byte-boundary row");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin byte-boundary turn");
+        let completion =
+            prune_consensus_log_rows_in_tx(&tx, &log_id(2)).expect("byte-boundary turn succeeds");
+        tx.commit().expect("commit byte-boundary turn");
+        assert_eq!(completion.rows_deleted, 1);
+        assert_eq!(
+            completion.encoded_bytes_deleted,
+            u64::try_from(CONSENSUS_LOG_PRUNE_BYTES_PER_TURN / 2).expect("budget fits u64")
+        );
+        assert!(completion.more);
+
+        let exact_backend = backend_with_blank_logs(1).await;
+        let exact_conn = exact_backend.conn.lock().await;
+        exact_conn
+            .execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .expect("remove membership row from exact-max fixture");
+        set_test_purge_floor(&exact_conn, &log_id(1));
+        exact_conn
+            .execute(
+                "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1",
+                [vec![0x43; CONSENSUS_LOG_PRUNE_BYTES_PER_TURN]],
+            )
+            .expect("install exact-max row");
+        let tx = Transaction::new_unchecked(&exact_conn, TransactionBehavior::Immediate)
+            .expect("begin exact-max turn");
+        let completion = prune_consensus_log_rows_in_tx(&tx, &log_id(1))
+            .expect("an exact-max row makes progress");
+        tx.commit().expect("commit exact-max turn");
+        assert_eq!(completion.rows_deleted, 1);
+        assert!(!completion.more);
+
+        let oversized_backend = backend_with_blank_logs(1).await;
+        let oversized_conn = oversized_backend.conn.lock().await;
+        oversized_conn
+            .execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .expect("remove membership row from oversize fixture");
+        set_test_purge_floor(&oversized_conn, &log_id(1));
+        oversized_conn
+            .execute(
+                "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1",
+                [vec![0x44; CONSENSUS_LOG_PRUNE_BYTES_PER_TURN + 1]],
+            )
+            .expect("install oversize row");
+        let tx = Transaction::new_unchecked(&oversized_conn, TransactionBehavior::Immediate)
+            .expect("begin oversize turn");
+        assert_eq!(
+            prune_consensus_log_rows_in_tx(&tx, &log_id(1)),
+            Err(ConsensusLogPruneTurnError::Permanent),
+            "an oversize retained row is a sticky nonspinning corruption"
+        );
+        drop(tx);
+        assert_eq!(
+            oversized_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_log WHERE log_index = 1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("oversize row remains after rejected turn"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_purge_masks_all_log_reads_and_rejects_floor_regression() {
+        let backend = backend_with_blank_logs(3).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                blank_entry(1),
+                blank_entry(2),
+                blank_entry(3),
+            ],
+        )
+        .expect("apply log fixture through the floor");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin logical purge");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(1), 1).expect("save first logical floor");
+        tx.commit().expect("commit logical purge");
+
+        assert_eq!(
+            read_log_range_sync(&conn, identity(), 0, Some(4), None)
+                .expect("normal reads mask floor")
+                .iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            read_log_range_for_recovery_sync(&conn, identity(), 0, Some(4), None)
+                .expect("recovery reads mask floor")
+                .iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            read_limited_log_range_sync(
+                &conn,
+                identity(),
+                0,
+                4,
+                opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
+            )
+            .expect("limited reads mask floor")
+            .iter()
+            .map(|entry| entry.log_id.index)
+            .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            last_log_sync(&conn, identity())
+                .expect("last log respects floor")
+                .expect("retained suffix has last log"),
+            log_id(3)
+        );
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin idempotent floor transaction");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(1), 1).expect("same floor is idempotent");
+        assert_eq!(
+            logical_purge_logs_in_tx(&tx, identity(), &log_id(0), 0)
+                .expect_err("floor regression rejects")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let different_id = LogId::new(CommittedLeaderId::new(2, node_id()), 1);
+        assert_eq!(
+            logical_purge_logs_in_tx(&tx, identity(), &different_id, 1)
+                .expect_err("same index with another log id rejects")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(tx);
+
+        let unapplied = backend_with_blank_logs(1).await;
+        let unapplied_conn = unapplied.conn.lock().await;
+        let tx = Transaction::new_unchecked(&unapplied_conn, TransactionBehavior::Immediate)
+            .expect("begin unapplied floor transaction");
+        assert_eq!(
+            logical_purge_logs_in_tx(&tx, identity(), &log_id(1), 1)
+                .expect_err("unapplied floor rejects")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_in_memory_purge_retains_synchronous_physical_delete_without_a_lane() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory backend");
+        let conn = backend.conn.lock().await;
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &conn,
+            identity(),
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed in-memory authority");
+        let membership = membership_entry_at(0, vec![members.clone()], members.clone());
+        append_logs_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            std::slice::from_ref(&membership),
+        )
+        .expect("append fixed membership");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![membership],
+        )
+        .expect("apply fixed membership");
+        append_logs_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &[blank_entry(1)],
+        )
+        .expect("append fixed log");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![blank_entry(1)],
+        )
+        .expect("apply fixed log");
+        purge_logs_without_prune_lane_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &log_id(1),
+        )
+        .expect("in-memory fixed purge keeps synchronous physical delete");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_log WHERE log_index <= 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count physically purged rows"),
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_lane_signals_and_drains_with_one_worker() {
+        let directory = tempfile::tempdir().expect("prune lane directory");
+        let source_path = directory.path().join("prune.sqlite");
+        let backend = SqliteSessionBackend::open(&source_path).expect("open prune backend");
+        let primary = backend.conn.lock().await;
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &primary,
+            identity(),
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed prune authority");
+        let membership = membership_entry_at(0, vec![members.clone()], members.clone());
+        let entries = (1..=129).map(blank_entry).collect::<Vec<_>>();
+        append_logs_with_authority_sync(
+            &primary,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            std::slice::from_ref(&membership),
+        )
+        .expect("append prune membership");
+        apply_entries_with_authority_sync(
+            &primary,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![membership],
+        )
+        .expect("apply prune membership");
+        append_logs_with_authority_sync(
+            &primary,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &entries,
+        )
+        .expect("append prune log");
+        apply_entries_with_authority_sync(
+            &primary,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            entries,
+        )
+        .expect("apply prune log");
+        let tx = Transaction::new_unchecked(&primary, TransactionBehavior::Immediate)
+            .expect("begin logical prune floor");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(129), 129)
+            .expect("save logical prune floor");
+        tx.commit().expect("commit logical prune floor");
+        let pinned = Arc::new(
+            crate::consensus::snapshot::PinnedSqliteFile::from_file(
+                opc_sqlite_file_control_sys::main_file_descriptor(&primary)
+                    .expect("duplicate prune primary descriptor"),
+                source_path,
+            )
+            .expect("pin prune primary descriptor"),
+        );
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let lane = ConsensusLogPruneLane::start(
+            Arc::clone(&pinned),
+            None,
+            identity(),
+            members.clone(),
+            bindings.clone(),
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(Arc::clone(&diagnostics)),
+        )
+        .expect("start prune lane");
+        primary
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
+                [placement_policy_i64(
+                    PlacementResiliencePolicy::AllowReducedResilience,
+                )],
+            )
+            .expect("tamper fixed prune authority");
+        lane.signal();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = diagnostics.snapshot();
+                if snapshot.consensus_log_prune_permanent_failures == 1 {
+                    assert_eq!(snapshot.consensus_log_prune_completed_turns, 0);
+                    assert_eq!(snapshot.consensus_log_prune_rows_deleted, 0);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tampered authority permanently stops the original worker");
+        primary
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
+                [placement_policy_i64(
+                    PlacementResiliencePolicy::RequireIndependentFailureDomains,
+                )],
+            )
+            .expect("restore fixed prune authority");
+        lane.signal();
+        lane.shutdown().await;
+        let reopened = ConsensusLogPruneLane::start(
+            pinned,
+            None,
+            identity(),
+            members,
+            bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(Arc::clone(&diagnostics)),
+        )
+        .expect("reopen prune lane after permanent failure");
+        reopened.signal();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = diagnostics.snapshot();
+                if snapshot.consensus_log_prune_drained_turns == 1 {
+                    assert_eq!(snapshot.consensus_log_prune_signals, 3);
+                    assert_eq!(snapshot.consensus_log_prune_completed_turns, 2);
+                    assert_eq!(snapshot.consensus_log_prune_more_turns, 1);
+                    assert_eq!(snapshot.consensus_log_prune_rows_deleted, 130);
+                    assert_eq!(snapshot.consensus_log_prune_queue_high_water, 1);
+                    assert_eq!(snapshot.consensus_log_prune_active_high_water, 1);
+                    assert_eq!(snapshot.consensus_log_prune_worker_high_water, 1);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reopen startup signal drains retained logical-purge backlog");
+        reopened.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_lane_shutdown_cancels_active_turn_and_reopen_drains_backlog() {
+        let directory = tempfile::tempdir().expect("prune shutdown directory");
+        let source_path = directory.path().join("prune-shutdown.sqlite");
+        let backend =
+            SqliteSessionBackend::open(&source_path).expect("open prune shutdown backend");
+        let primary = backend.conn.lock().await;
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &primary,
+            identity(),
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed prune shutdown authority");
+        let membership = membership_entry_at(0, vec![members.clone()], members.clone());
+        let entries = (1..=129).map(blank_entry).collect::<Vec<_>>();
+        append_logs_with_authority_sync(
+            &primary,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            std::slice::from_ref(&membership),
+        )
+        .expect("append prune shutdown membership");
+        apply_entries_with_authority_sync(
+            &primary,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![membership],
+        )
+        .expect("apply prune shutdown membership");
+        append_logs_with_authority_sync(
+            &primary,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &entries,
+        )
+        .expect("append prune shutdown log");
+        apply_entries_with_authority_sync(
+            &primary,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            entries,
+        )
+        .expect("apply prune shutdown log");
+        let tx = Transaction::new_unchecked(&primary, TransactionBehavior::Immediate)
+            .expect("begin logical prune shutdown floor");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(129), 129)
+            .expect("save logical prune shutdown floor");
+        tx.commit().expect("commit logical prune shutdown floor");
+        let pinned = Arc::new(
+            crate::consensus::snapshot::PinnedSqliteFile::from_file(
+                opc_sqlite_file_control_sys::main_file_descriptor(&primary)
+                    .expect("duplicate prune shutdown primary descriptor"),
+                source_path,
+            )
+            .expect("pin prune shutdown primary descriptor"),
+        );
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let gate = ConsensusLogPruneTurnGateForTest::install(directory.path());
+        let lane = ConsensusLogPruneLane::start(
+            Arc::clone(&pinned),
+            None,
+            identity(),
+            members.clone(),
+            bindings.clone(),
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(Arc::clone(&diagnostics)),
+        )
+        .expect("start prune shutdown lane");
+        assert!(
+            lane.turn_gate.is_some(),
+            "the directory-scoped gate attaches only to this file-backed lane"
+        );
+        lane.signal();
+        let gate_state = Arc::clone(&gate.gate);
+        assert!(
+            tokio::task::spawn_blocking(
+                move || gate_state.wait_until_entered(Duration::from_secs(1))
+            )
+            .await
+            .expect("join prune gate observer"),
+            "the real lane enters its active bounded prune turn"
+        );
+        assert_eq!(
+            diagnostics.consensus_log_prune_gauges_for_test(),
+            (1, 1),
+            "the gated turn holds the sole worker and active-turn admissions"
+        );
+
+        let shutdown_lane = Arc::clone(&lane);
+        let shutdown = tokio::spawn(async move {
+            shutdown_lane.shutdown().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !lane.stopping.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown publishes stop before joining the active worker");
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown joins the interrupted real worker within the bounded budget")
+            .expect("shutdown task completes");
+
+        let stopped = diagnostics.snapshot();
+        assert_eq!(stopped.consensus_log_prune_permanent_failures, 0);
+        assert_eq!(diagnostics.consensus_log_prune_gauges_for_test(), (0, 0));
+        assert_eq!(stopped.consensus_log_prune_active_high_water, 1);
+        assert_eq!(stopped.consensus_log_prune_worker_high_water, 1);
+        assert_eq!(
+            primary
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count retained shutdown backlog"),
+            130,
+            "shutdown cancellation leaves the logically purged physical backlog for reopen"
+        );
+
+        let reopened = ConsensusLogPruneLane::start(
+            pinned,
+            None,
+            identity(),
+            members,
+            bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(Arc::clone(&diagnostics)),
+        )
+        .expect("reopen prune lane after shutdown cancellation");
+        reopened.signal();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = diagnostics.snapshot();
+                if snapshot.consensus_log_prune_drained_turns == 1 {
+                    assert_eq!(snapshot.consensus_log_prune_permanent_failures, 0);
+                    assert_eq!(snapshot.consensus_log_prune_completed_turns, 2);
+                    assert_eq!(snapshot.consensus_log_prune_rows_deleted, 130);
+                    assert_eq!(snapshot.consensus_log_prune_active_high_water, 1);
+                    assert_eq!(snapshot.consensus_log_prune_worker_high_water, 1);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reopened lane drains the retained backlog with its single worker");
+        reopened.shutdown().await;
     }
 
     #[tokio::test]

@@ -305,6 +305,7 @@ struct BoundedScaleProgress {
     phase_name: &'static str,
     target_rate: usize,
     phase_started: Instant,
+    workload_elapsed: Option<Duration>,
     submitted_batches: usize,
     completed_batches: usize,
     peak_unjoined_batch_task_slots: usize,
@@ -329,11 +330,19 @@ fn bounded_scale_observation<'a>(
             phase_name,
             target_rate,
             phase_started,
+            workload_elapsed: None,
             submitted_batches,
             completed_batches,
             peak_unjoined_batch_task_slots,
         },
         latency,
+    }
+}
+
+impl BoundedScaleObservation<'_> {
+    fn with_workload_elapsed(mut self, workload_elapsed: Duration) -> Self {
+        self.progress.workload_elapsed = Some(workload_elapsed);
+        self
     }
 }
 
@@ -350,11 +359,12 @@ fn emit_bounded_scale_stall_observation(
         phase_name,
         target_rate,
         phase_started,
+        workload_elapsed,
         submitted_batches,
         completed_batches,
         peak_unjoined_batch_task_slots,
     } = observation.progress;
-    let elapsed = phase_started.elapsed();
+    let elapsed = workload_elapsed.unwrap_or_else(|| phase_started.elapsed());
     let completed_operations = completed_batches * QUALIFICATION_PACED_BATCH_OPERATIONS;
     let achieved_ops_per_second = if elapsed.is_zero() {
         0.0
@@ -3289,6 +3299,11 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
             completed_batches += 1;
         }
 
+        // The workload ends when the final submitted batch completes. Freeze
+        // its elapsed time before the read-only status/history evidence below
+        // so their convergence work cannot reduce the measured throughput.
+        let workload_elapsed = phase_started.elapsed();
+
         assert_eq!(submitted_batches, BOUNDED_SCALE_STALL_BATCHES_PER_PHASE);
         assert!(in_flight.is_empty());
         assert!(in_flight_session_slots.is_empty());
@@ -3319,7 +3334,8 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
                         completed_batches,
                         peak_unjoined_batch_task_slots,
                         &mut latency,
-                    ),
+                    )
+                    .with_workload_elapsed(workload_elapsed),
                 )
                 .await;
                 unreachable!("bounded scale failure always panics")
@@ -3346,7 +3362,8 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
                     completed_batches,
                     peak_unjoined_batch_task_slots,
                     &mut latency,
-                ),
+                )
+                .with_workload_elapsed(workload_elapsed),
             )
             .await;
             unreachable!("bounded scale failure always panics")
@@ -3372,7 +3389,8 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
                         completed_batches,
                         peak_unjoined_batch_task_slots,
                         &mut latency,
-                    ),
+                    )
+                    .with_workload_elapsed(workload_elapsed),
                 )
                 .await;
                 unreachable!("bounded scale failure always panics")
@@ -3394,7 +3412,8 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
                     completed_batches,
                     peak_unjoined_batch_task_slots,
                     &mut latency,
-                ),
+                )
+                .with_workload_elapsed(workload_elapsed),
             )
             .await;
             unreachable!("bounded scale failure always panics")
@@ -3411,7 +3430,8 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
                 completed_batches,
                 peak_unjoined_batch_task_slots,
                 &mut latency,
-            ),
+            )
+            .with_workload_elapsed(workload_elapsed),
         );
     }
 

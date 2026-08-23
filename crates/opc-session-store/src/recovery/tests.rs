@@ -1579,6 +1579,128 @@ fn append_current_blank_checkpoint(
         .expect("checkpoint current blank checkpoint");
 }
 
+fn install_current_purge_floor(conn: &Connection, floor: &LogId<SessionConsensusNodeId>) {
+    conn.execute(
+        "INSERT OR REPLACE INTO consensus_purged (singleton, configuration_epoch, term, log_index, log_id_json) VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            i64::try_from(identity().configuration_epoch().get()).expect("configuration epoch"),
+            i64::try_from(floor.leader_id.term).expect("floor term"),
+            i64::try_from(floor.index).expect("floor index"),
+            serde_json::to_vec(floor).expect("encode purge floor"),
+        ],
+    )
+    .expect("persist exact purge floor");
+}
+
+fn pad_current_log_entry(conn: &Connection, index: u64, minimum_bytes: usize) {
+    let mut entry: Vec<u8> = conn
+        .query_row(
+            "SELECT entry_json FROM consensus_log WHERE log_index = ?1",
+            [i64::try_from(index).expect("log index")],
+            |row| row.get(0),
+        )
+        .expect("read valid log entry");
+    entry.resize(minimum_bytes, b' ');
+    conn.execute(
+        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+        params![entry, i64::try_from(index).expect("log index")],
+    )
+    .expect("pad valid log entry");
+}
+
+fn bounded_current_recovery_limits(replica: &RecoveryReplica) -> RecoveryLimits {
+    let database_bytes = std::fs::metadata(&replica.database_path)
+        .expect("database metadata")
+        .len();
+    RecoveryLimits::try_new(
+        database_bytes.checked_mul(2).expect("database bound"),
+        database_bytes.checked_mul(2).expect("snapshot bound"),
+        1_000,
+        64 * 1024,
+    )
+    .expect("bounded recovery limits")
+}
+
+#[test]
+fn current_recovery_capacity_masks_retained_purged_prefix() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let id = replica_id("retained-purged-prefix");
+    let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+    let members = node_set(&[id]);
+    let leader = *members.iter().next().expect("member");
+    let floor = LogId::new(CommittedLeaderId::new(1, leader), 0);
+    claim_current_replica(&replica, &members, floor);
+    append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(1, leader), 1));
+
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    install_current_purge_floor(&conn, &floor);
+    pad_current_log_entry(&conn, floor.index, 128 * 1024);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint retained prefix");
+    drop(conn);
+
+    let limits = bounded_current_recovery_limits(&replica);
+    let before = inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica: &replica,
+        identity: identity(),
+        expected_members: &members,
+        limits,
+    })
+    .expect("retained purged prefix does not consume logical recovery capacity");
+
+    let conn = Connection::open(&replica.database_path).expect("open retained prefix");
+    conn.execute("DELETE FROM consensus_log WHERE log_index <= ?1", [0])
+        .expect("physically prune stale prefix");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint physical prune");
+    drop(conn);
+
+    let after = inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica: &replica,
+        identity: identity(),
+        expected_members: &members,
+        limits,
+    })
+    .expect("physically pruned replica remains recoverable");
+    assert_eq!(before.branch_digest(), after.branch_digest());
+    assert_eq!(before.logical_state_digest(), after.logical_state_digest());
+    assert_eq!(before.committed_index(), after.committed_index());
+    assert_eq!(before.applied_index(), after.applied_index());
+    assert_eq!(before.local_head_index(), after.local_head_index());
+}
+
+#[test]
+fn current_recovery_capacity_rejects_an_oversized_authoritative_suffix() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let id = replica_id("oversized-authoritative-suffix");
+    let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+    let members = node_set(&[id]);
+    let leader = *members.iter().next().expect("member");
+    let floor = LogId::new(CommittedLeaderId::new(1, leader), 0);
+    claim_current_replica(&replica, &members, floor);
+    append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(1, leader), 1));
+
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    install_current_purge_floor(&conn, &floor);
+    pad_current_log_entry(&conn, 1, 128 * 1024);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint oversized suffix");
+    drop(conn);
+
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: bounded_current_recovery_limits(&replica),
+        }),
+        Err(RecoveryError::WorkLimitExceeded),
+    );
+}
+
 fn current_receipt_inspection_fixture(
     root: &Path,
 ) -> (RecoveryReplica, BTreeSet<SessionConsensusNodeId>) {

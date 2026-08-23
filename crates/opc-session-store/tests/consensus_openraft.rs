@@ -1929,6 +1929,42 @@ async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_
         SessionStorePlatformProfile::Unknown
     );
 
+    let (leader_index, _, _) = cluster.observed_leader();
+    let readiness_time = TopologyAttestationTime::from_unix_seconds(1_022);
+    let primed = cluster.stores[leader_index]
+        .probe_production_durable_readiness_with_attestation_at(&refreshed, readiness_time)
+        .await;
+    assert_eq!(
+        primed.state(),
+        DurableReadinessState::Ready,
+        "the elected leader must first obtain fresh production quorum evidence"
+    );
+
+    // Disable the actual leader's inbound and outbound paths immediately
+    // after its proof. The next production readiness probe must obtain a
+    // point-in-time quorum proof; it must not reuse the raw-V2 admission
+    // lease while the leader remains in the same term.
+    cluster.isolate(leader_index);
+    let isolated = tokio::time::timeout(
+        DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT + RECOVERY_TIMEOUT,
+        cluster.stores[leader_index]
+            .probe_production_durable_readiness_with_attestation_at(&refreshed, readiness_time),
+    )
+    .await
+    .expect(
+        "post-isolation production readiness probe remains within its declared operation budget",
+    );
+    assert_eq!(
+        isolated.state(),
+        DurableReadinessState::NoQuorum,
+        "a cached leader lease must not satisfy production readiness after immediate isolation"
+    );
+    cluster.heal(leader_index);
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("cluster recovers after the production-readiness isolation proof");
+
     cluster.delay_calls(remote_probe_source, Duration::from_millis(750));
     let older_probe = cluster.stores[remote_probe_source]
         .probe_production_durable_readiness_with_attestation_at(

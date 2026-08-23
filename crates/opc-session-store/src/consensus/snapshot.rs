@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use sha2::Digest as _;
+#[cfg(test)]
+use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd as _, RawFd};
 #[cfg(target_os = "linux")]
@@ -117,6 +120,138 @@ pub(crate) struct PinnedSqliteFile {
 struct ImmutableFileGeneration {
     length: u64,
     digest: [u8; 32],
+}
+
+/// The result of binding an immutable generation while validating a sealed
+/// snapshot envelope through one descriptor-owned sequential read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ImmutableSnapshotEnvelope {
+    pub(crate) payload_length: u64,
+    pub(crate) total_length: u64,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FixedPrepublicationScanObservation {
+    active_boundaries: usize,
+    count: u64,
+    bytes: u64,
+}
+
+/// Test-only, directory-scoped observation of fixed prepublication scans.
+///
+/// The registry is deliberately held only by an RAII test owner. A scan is
+/// recorded only while the builder enters its precise post-seal/pre-metadata
+/// boundary, so later postpublication verification and unrelated directories
+/// cannot affect the observation.
+#[cfg(test)]
+pub(crate) struct FixedPrepublicationScanObserver {
+    snapshot_directory: PathBuf,
+    observation: Arc<std::sync::Mutex<FixedPrepublicationScanObservation>>,
+}
+
+#[cfg(test)]
+impl FixedPrepublicationScanObserver {
+    pub(crate) fn install(snapshot_directory: PathBuf) -> Self {
+        let observation = Arc::new(std::sync::Mutex::new(
+            FixedPrepublicationScanObservation::default(),
+        ));
+        fixed_prepublication_scan_observers()
+            .lock()
+            .expect("install fixed prepublication scan observer")
+            .insert(snapshot_directory.clone(), Arc::clone(&observation));
+        Self {
+            snapshot_directory,
+            observation,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64) {
+        let observation = self
+            .observation
+            .lock()
+            .expect("read fixed prepublication scan observer");
+        (observation.count, observation.bytes)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FixedPrepublicationScanObserver {
+    fn drop(&mut self) {
+        let mut observers = fixed_prepublication_scan_observers()
+            .lock()
+            .expect("remove fixed prepublication scan observer");
+        if observers
+            .get(&self.snapshot_directory)
+            .is_some_and(|installed| Arc::ptr_eq(installed, &self.observation))
+        {
+            observers.remove(&self.snapshot_directory);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct FixedPrepublicationScanBoundary {
+    observation: Arc<std::sync::Mutex<FixedPrepublicationScanObservation>>,
+}
+
+#[cfg(test)]
+impl Drop for FixedPrepublicationScanBoundary {
+    fn drop(&mut self) {
+        let mut observation = self
+            .observation
+            .lock()
+            .expect("leave fixed prepublication scan boundary");
+        observation.active_boundaries = observation.active_boundaries.saturating_sub(1);
+    }
+}
+
+#[cfg(test)]
+fn fixed_prepublication_scan_observers() -> &'static std::sync::Mutex<
+    BTreeMap<PathBuf, Arc<std::sync::Mutex<FixedPrepublicationScanObservation>>>,
+> {
+    static OBSERVERS: std::sync::OnceLock<
+        std::sync::Mutex<
+            BTreeMap<PathBuf, Arc<std::sync::Mutex<FixedPrepublicationScanObservation>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    OBSERVERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn fixed_prepublication_scan_boundary(
+    path: &Path,
+) -> Option<FixedPrepublicationScanBoundary> {
+    let snapshot_directory = path.parent()?;
+    let observation = fixed_prepublication_scan_observers()
+        .lock()
+        .ok()
+        .and_then(|observers| observers.get(snapshot_directory).cloned())?;
+    observation
+        .lock()
+        .expect("enter fixed prepublication scan boundary")
+        .active_boundaries += 1;
+    Some(FixedPrepublicationScanBoundary { observation })
+}
+
+#[cfg(test)]
+pub(crate) fn record_fixed_prepublication_scan(path: &Path, bytes: u64) {
+    let Some(snapshot_directory) = path.parent() else {
+        return;
+    };
+    let observation = fixed_prepublication_scan_observers()
+        .lock()
+        .ok()
+        .and_then(|observers| observers.get(snapshot_directory).cloned());
+    if let Some(observation) = observation {
+        let mut observation = observation
+            .lock()
+            .expect("record fixed prepublication scan");
+        if observation.active_boundaries != 0 {
+            observation.count = observation.count.saturating_add(1);
+            observation.bytes = observation.bytes.saturating_add(bytes);
+        }
+    }
 }
 
 /// Exact ownership of an SDK-created snapshot artifact which is not yet
@@ -327,7 +462,7 @@ impl PinnedSqliteFile {
     /// immutable. Live SQLite descriptors intentionally never use this.
     pub(crate) fn pin_immutable(mut self) -> io::Result<Self> {
         self.verify_identity()?;
-        self.immutable_generation = Some(immutable_file_generation(&self.file)?);
+        self.immutable_generation = Some(immutable_file_generation(&self.file, &self.path)?);
         Ok(self)
     }
 
@@ -340,7 +475,7 @@ impl PinnedSqliteFile {
                 "pinned SQLite file immutable generation is absent",
             )
         })?;
-        if immutable_file_generation(&self.file)? == expected {
+        if immutable_file_generation(&self.file, &self.path)? == expected {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -348,6 +483,188 @@ impl PinnedSqliteFile {
                 "pinned SQLite file immutable generation changed",
             ))
         }
+    }
+
+    /// Validate a sealed snapshot envelope and bind its immutable generation
+    /// from exactly one bounded, sequential descriptor scan.
+    ///
+    /// The trailing footer is retained in a fixed-size buffer while the
+    /// preceding bytes feed the payload digest. The same bytes also feed the
+    /// immutable-generation digest, so fixed-profile publication does not
+    /// first verify an envelope and then rehash it to bind its generation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn verify_snapshot_envelope_and_bind_immutable_generation(
+        &mut self,
+        path: &Path,
+        footer_magic: &[u8; 8],
+        footer_bytes: u64,
+        maximum_payload_bytes: u64,
+        expected_payload_checksum: [u8; 32],
+        expected_total_length: u64,
+    ) -> io::Result<ImmutableSnapshotEnvelope> {
+        self.verify_linked_identity()?;
+        if !self.path_matches_identity(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pinned SQLite file path was replaced",
+            ));
+        }
+        if footer_bytes != 48 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot footer size is invalid",
+            ));
+        }
+        let total_length = self.file.metadata()?.len();
+        if total_length != expected_total_length
+            || total_length <= footer_bytes
+            || total_length > maximum_payload_bytes.saturating_add(footer_bytes)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot size is invalid",
+            ));
+        }
+
+        let footer_len = usize::try_from(footer_bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot footer size is invalid",
+            )
+        })?;
+        let mut reader = self.file.try_clone()?;
+        reader.seek(io::SeekFrom::Start(0))?;
+        let mut envelope_hasher = sha2::Sha256::new();
+        let mut payload_hasher = sha2::Sha256::new();
+        let mut trailing = [0_u8; 48];
+        let mut trailing_len = 0_usize;
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut scanned = 0_u64;
+        while scanned < total_length {
+            let remaining = total_length.checked_sub(scanned).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "snapshot length overflow")
+            })?;
+            let bounded = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(buffer.len());
+            let read = reader.read(&mut buffer[..bounded])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session consensus snapshot changed during verification",
+                ));
+            }
+            scanned = scanned
+                .checked_add(u64::try_from(read).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "snapshot length overflow")
+                })?)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "snapshot length overflow")
+                })?;
+            envelope_hasher.update(&buffer[..read]);
+            if trailing_len + read <= footer_len {
+                trailing[trailing_len..trailing_len + read].copy_from_slice(&buffer[..read]);
+                trailing_len = trailing_len.checked_add(read).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snapshot footer size is invalid",
+                    )
+                })?;
+            } else if trailing_len == footer_len {
+                if read < footer_len {
+                    payload_hasher.update(&trailing[..read]);
+                    trailing.copy_within(read..footer_len, 0);
+                    trailing[footer_len - read..footer_len].copy_from_slice(&buffer[..read]);
+                } else {
+                    payload_hasher.update(trailing);
+                    let payload_from_buffer = read - footer_len;
+                    payload_hasher.update(&buffer[..payload_from_buffer]);
+                    trailing.copy_from_slice(&buffer[payload_from_buffer..read]);
+                }
+            } else {
+                let payload_bytes = trailing_len.checked_add(read).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snapshot footer size is invalid",
+                    )
+                })? - footer_len;
+                if payload_bytes < trailing_len {
+                    payload_hasher.update(&trailing[..payload_bytes]);
+                    let retained_from_trailing = trailing_len - payload_bytes;
+                    trailing.copy_within(payload_bytes..trailing_len, 0);
+                    trailing[retained_from_trailing..footer_len].copy_from_slice(&buffer[..read]);
+                } else {
+                    payload_hasher.update(&trailing[..trailing_len]);
+                    let payload_from_buffer = payload_bytes - trailing_len;
+                    payload_hasher.update(&buffer[..payload_from_buffer]);
+                    trailing.copy_from_slice(&buffer[payload_from_buffer..read]);
+                }
+                trailing_len = footer_len;
+            }
+        }
+        #[cfg(test)]
+        {
+            record_fixed_prepublication_scan(&self.path, scanned);
+        }
+        if trailing_len != footer_len || self.file.metadata()?.len() != total_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot changed during verification",
+            ));
+        }
+
+        let (magic, footer) = trailing.split_at(8);
+        if magic != footer_magic {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot magic is invalid",
+            ));
+        }
+        let encoded_length: [u8; 8] = footer[..8].try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot footer length is invalid",
+            )
+        })?;
+        let payload_length = u64::from_be_bytes(encoded_length);
+        if payload_length == 0
+            || payload_length > maximum_payload_bytes
+            || payload_length.checked_add(footer_bytes) != Some(total_length)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot length is invalid",
+            ));
+        }
+        let footer_checksum: [u8; 32] = footer[8..].try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot footer checksum is invalid",
+            )
+        })?;
+        let payload_checksum: [u8; 32] = payload_hasher.finalize().into();
+        if footer_checksum != expected_payload_checksum || payload_checksum != footer_checksum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot checksum mismatch",
+            ));
+        }
+
+        self.verify_linked_identity()?;
+        if !self.path_matches_identity(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pinned SQLite file path was replaced",
+            ));
+        }
+        self.immutable_generation = Some(ImmutableFileGeneration {
+            length: total_length,
+            digest: envelope_hasher.finalize().into(),
+        });
+        Ok(ImmutableSnapshotEnvelope {
+            payload_length,
+            total_length,
+        })
     }
 
     /// Whether this descriptor was explicitly promoted to an immutable
@@ -404,7 +721,10 @@ impl PinnedSqliteFile {
     }
 }
 
-fn immutable_file_generation(file: &std::fs::File) -> io::Result<ImmutableFileGeneration> {
+fn immutable_file_generation(
+    file: &std::fs::File,
+    _path: &Path,
+) -> io::Result<ImmutableFileGeneration> {
     use sha2::{Digest as _, Sha256};
 
     let mut reader = file.try_clone()?;
@@ -419,6 +739,8 @@ fn immutable_file_generation(file: &std::fs::File) -> io::Result<ImmutableFileGe
         }
         digest.update(&buffer[..read]);
     }
+    #[cfg(test)]
+    record_fixed_prepublication_scan(_path, length);
     Ok(ImmutableFileGeneration {
         length,
         digest: digest.finalize().into(),

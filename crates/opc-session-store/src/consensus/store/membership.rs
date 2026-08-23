@@ -1294,6 +1294,7 @@ impl ConsensusSessionStore {
         )
         .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
+        let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
         let (membership_scope, _) = backend
             .consensus_membership_scope_snapshot(storage_identity)
             .await
@@ -1346,6 +1347,7 @@ impl ConsensusSessionStore {
             raft_handler,
             backend,
             proactive_checkpoint_lane,
+            consensus_log_prune_lane,
             storage_identity,
             local_node_id,
             peer_directory,

@@ -732,6 +732,32 @@ pub struct ConsensusStoreDiagnosticSnapshot {
     pub proactive_checkpoint_queue_high_water: u64,
     /// Maximum simultaneous proactive checkpoint workers; this lane is one.
     pub proactive_checkpoint_worker_high_water: u64,
+    /// Physical log-prune signals accepted by the fixed-capacity lane.
+    pub consensus_log_prune_signals: u64,
+    /// Physical log-prune turns started by this store's one worker.
+    pub consensus_log_prune_attempts: u64,
+    /// Physical log-prune turns which completed their selected delete.
+    pub consensus_log_prune_completed_turns: u64,
+    /// Physical log-prune turns which drained all rows through the floor.
+    pub consensus_log_prune_drained_turns: u64,
+    /// Physical log-prune turns retried after SQLite busy or locked contention.
+    pub consensus_log_prune_busy_retries: u64,
+    /// Permanent physical log-prune failures; the worker stops until reopen.
+    pub consensus_log_prune_permanent_failures: u64,
+    /// Physical consensus-log rows deleted by completed prune turns.
+    pub consensus_log_prune_rows_deleted: u64,
+    /// Encoded consensus-log bytes deleted by completed prune turns.
+    pub consensus_log_prune_encoded_bytes_deleted: u64,
+    /// Completed prune turns that left rows through the logical floor.
+    pub consensus_log_prune_backlog_turns: u64,
+    /// Physical-prune turns which required another bounded turn.
+    pub consensus_log_prune_more_turns: u64,
+    /// Maximum queued physical-prune signals; this lane is capacity one.
+    pub consensus_log_prune_queue_high_water: u64,
+    /// Maximum active physical-prune turns; this lane has one worker.
+    pub consensus_log_prune_active_high_water: u64,
+    /// Maximum physical-prune workers; this lane has one worker.
+    pub consensus_log_prune_worker_high_water: u64,
 }
 
 #[derive(Default)]
@@ -765,6 +791,21 @@ pub(crate) struct ConsensusStoreDiagnosticCounters {
     proactive_checkpoint_queue_high_water: AtomicU64,
     proactive_checkpoint_workers_active: AtomicU64,
     proactive_checkpoint_worker_high_water: AtomicU64,
+    consensus_log_prune_signals: AtomicU64,
+    consensus_log_prune_attempts: AtomicU64,
+    consensus_log_prune_completed_turns: AtomicU64,
+    consensus_log_prune_drained_turns: AtomicU64,
+    consensus_log_prune_busy_retries: AtomicU64,
+    consensus_log_prune_permanent_failures: AtomicU64,
+    consensus_log_prune_rows_deleted: AtomicU64,
+    consensus_log_prune_encoded_bytes_deleted: AtomicU64,
+    consensus_log_prune_backlog_turns: AtomicU64,
+    consensus_log_prune_more_turns: AtomicU64,
+    consensus_log_prune_queue_high_water: AtomicU64,
+    consensus_log_prune_active: AtomicU64,
+    consensus_log_prune_active_high_water: AtomicU64,
+    consensus_log_prune_workers_active: AtomicU64,
+    consensus_log_prune_worker_high_water: AtomicU64,
     // This is not a diagnostic value. Reusing the existing per-store Arc
     // keeps the hint store-scoped across every construction path.
     fixed_raw_v2_warm_route: AtomicBool,
@@ -821,7 +862,94 @@ impl ConsensusStoreDiagnosticCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn snapshot(&self) -> ConsensusStoreDiagnosticSnapshot {
+    pub(crate) fn observe_consensus_log_prune_signal(&self) {
+        self.consensus_log_prune_signals
+            .fetch_add(1, Ordering::Relaxed);
+        self.consensus_log_prune_queue_high_water
+            .fetch_max(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn begin_consensus_log_prune_worker(&self) {
+        let active = self
+            .consensus_log_prune_workers_active
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.consensus_log_prune_worker_high_water
+            .fetch_max(active, Ordering::Relaxed);
+    }
+
+    pub(crate) fn end_consensus_log_prune_worker(&self) {
+        self.consensus_log_prune_workers_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn begin_consensus_log_prune_turn(&self) {
+        self.consensus_log_prune_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let active = self
+            .consensus_log_prune_active
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.consensus_log_prune_active_high_water
+            .fetch_max(active, Ordering::Relaxed);
+    }
+
+    pub(crate) fn complete_consensus_log_prune_turn(
+        &self,
+        rows_deleted: u64,
+        encoded_bytes_deleted: u64,
+        more: bool,
+    ) {
+        self.consensus_log_prune_active
+            .fetch_sub(1, Ordering::Relaxed);
+        self.consensus_log_prune_completed_turns
+            .fetch_add(1, Ordering::Relaxed);
+        self.consensus_log_prune_rows_deleted
+            .fetch_add(rows_deleted, Ordering::Relaxed);
+        self.consensus_log_prune_encoded_bytes_deleted
+            .fetch_add(encoded_bytes_deleted, Ordering::Relaxed);
+        if more {
+            self.consensus_log_prune_backlog_turns
+                .fetch_add(1, Ordering::Relaxed);
+            self.consensus_log_prune_more_turns
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.consensus_log_prune_drained_turns
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn retry_consensus_log_prune_turn(&self) {
+        self.consensus_log_prune_active
+            .fetch_sub(1, Ordering::Relaxed);
+        self.consensus_log_prune_busy_retries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn fail_consensus_log_prune_turn(&self) {
+        self.consensus_log_prune_active
+            .fetch_sub(1, Ordering::Relaxed);
+        self.consensus_log_prune_permanent_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// End an active physical-prune turn cancelled by store shutdown. This is
+    /// intentionally not a failure: shutdown may interrupt any SQLite stage.
+    pub(crate) fn cancel_consensus_log_prune_turn(&self) {
+        self.consensus_log_prune_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn consensus_log_prune_gauges_for_test(&self) -> (u64, u64) {
+        (
+            self.consensus_log_prune_active.load(Ordering::Relaxed),
+            self.consensus_log_prune_workers_active
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn snapshot(&self) -> ConsensusStoreDiagnosticSnapshot {
         ConsensusStoreDiagnosticSnapshot {
             sqlite_worker_permit_deadline: self
                 .sqlite_worker_permit_deadline
@@ -881,6 +1009,41 @@ impl ConsensusStoreDiagnosticCounters {
             proactive_checkpoint_worker_high_water: self
                 .proactive_checkpoint_worker_high_water
                 .load(Ordering::Relaxed),
+            consensus_log_prune_signals: self.consensus_log_prune_signals.load(Ordering::Relaxed),
+            consensus_log_prune_attempts: self.consensus_log_prune_attempts.load(Ordering::Relaxed),
+            consensus_log_prune_completed_turns: self
+                .consensus_log_prune_completed_turns
+                .load(Ordering::Relaxed),
+            consensus_log_prune_drained_turns: self
+                .consensus_log_prune_drained_turns
+                .load(Ordering::Relaxed),
+            consensus_log_prune_busy_retries: self
+                .consensus_log_prune_busy_retries
+                .load(Ordering::Relaxed),
+            consensus_log_prune_permanent_failures: self
+                .consensus_log_prune_permanent_failures
+                .load(Ordering::Relaxed),
+            consensus_log_prune_rows_deleted: self
+                .consensus_log_prune_rows_deleted
+                .load(Ordering::Relaxed),
+            consensus_log_prune_encoded_bytes_deleted: self
+                .consensus_log_prune_encoded_bytes_deleted
+                .load(Ordering::Relaxed),
+            consensus_log_prune_backlog_turns: self
+                .consensus_log_prune_backlog_turns
+                .load(Ordering::Relaxed),
+            consensus_log_prune_more_turns: self
+                .consensus_log_prune_more_turns
+                .load(Ordering::Relaxed),
+            consensus_log_prune_queue_high_water: self
+                .consensus_log_prune_queue_high_water
+                .load(Ordering::Relaxed),
+            consensus_log_prune_active_high_water: self
+                .consensus_log_prune_active_high_water
+                .load(Ordering::Relaxed),
+            consensus_log_prune_worker_high_water: self
+                .consensus_log_prune_worker_high_water
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -890,6 +1053,7 @@ struct ConsensusSessionStoreInner {
     raft_handler: SessionRaftRpcHandler,
     backend: SqliteSessionBackend,
     proactive_checkpoint_lane: Option<Arc<crate::sqlite::consensus::ProactiveCheckpointLane>>,
+    consensus_log_prune_lane: Option<Arc<crate::sqlite::consensus::ConsensusLogPruneLane>>,
     storage_identity: SessionConsensusIdentity,
     local_node_id: SessionConsensusNodeId,
     peer_directory: SessionRaftPeerDirectory,
@@ -1866,6 +2030,7 @@ impl ConsensusSessionStore {
             )
             .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
+        let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
         let (membership_scope, _) = backend
             .consensus_membership_scope_snapshot(storage_identity)
             .await
@@ -1934,6 +2099,7 @@ impl ConsensusSessionStore {
             raft_handler,
             backend,
             proactive_checkpoint_lane,
+            consensus_log_prune_lane,
             storage_identity,
             local_node_id,
             peer_directory,
@@ -2077,6 +2243,7 @@ impl ConsensusSessionStore {
         )
         .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
+        let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
         let (membership_scope, _) = backend
             .consensus_membership_scope_snapshot(storage_identity)
             .await
@@ -2131,6 +2298,7 @@ impl ConsensusSessionStore {
             raft_handler,
             backend,
             proactive_checkpoint_lane,
+            consensus_log_prune_lane,
             storage_identity,
             local_node_id,
             peer_directory,
@@ -2191,6 +2359,9 @@ impl ConsensusSessionStore {
     /// request can enter while the engine drains.
     pub async fn shutdown(&self) -> Result<(), StoreError> {
         let raft = self.inner.raft.shutdown().await;
+        if let Some(lane) = &self.inner.consensus_log_prune_lane {
+            lane.shutdown().await;
+        }
         if let Some(lane) = &self.inner.proactive_checkpoint_lane {
             lane.shutdown().await;
         }
@@ -9483,6 +9654,17 @@ mod membership_tests {
         counters
             .fixed_raw_v2_proposals
             .fetch_add(15, Ordering::Relaxed);
+        counters.observe_consensus_log_prune_signal();
+        counters.begin_consensus_log_prune_worker();
+        counters.begin_consensus_log_prune_turn();
+        counters.complete_consensus_log_prune_turn(16, 32, true);
+        counters.begin_consensus_log_prune_turn();
+        counters.complete_consensus_log_prune_turn(4, 8, false);
+        counters.begin_consensus_log_prune_turn();
+        counters.retry_consensus_log_prune_turn();
+        counters.begin_consensus_log_prune_turn();
+        counters.fail_consensus_log_prune_turn();
+        counters.end_consensus_log_prune_worker();
 
         let snapshot = counters.snapshot();
         assert_eq!(
@@ -9503,6 +9685,19 @@ mod membership_tests {
                 public_raw_v2_history_reads: 13,
                 fixed_raw_v2_acceptance_snapshots: 14,
                 fixed_raw_v2_proposals: 15,
+                consensus_log_prune_signals: 1,
+                consensus_log_prune_attempts: 4,
+                consensus_log_prune_completed_turns: 2,
+                consensus_log_prune_drained_turns: 1,
+                consensus_log_prune_busy_retries: 1,
+                consensus_log_prune_permanent_failures: 1,
+                consensus_log_prune_rows_deleted: 20,
+                consensus_log_prune_encoded_bytes_deleted: 40,
+                consensus_log_prune_backlog_turns: 1,
+                consensus_log_prune_more_turns: 1,
+                consensus_log_prune_queue_high_water: 1,
+                consensus_log_prune_active_high_water: 1,
+                consensus_log_prune_worker_high_water: 1,
                 ..ConsensusStoreDiagnosticSnapshot::default()
             }
         );
@@ -9515,6 +9710,33 @@ mod membership_tests {
         assert!(encoded.contains("sqlite_worker_permit_deadline"));
         assert!(encoded.contains("route_metrics_watch_closed"));
         assert!(encoded.contains("fixed_raw_v2_acceptance_snapshots"));
+        assert!(encoded.contains("consensus_log_prune_permanent_failures"));
+    }
+
+    #[test]
+    fn consensus_log_prune_cancellation_balances_active_and_worker_gauges_without_failure() {
+        let counters = ConsensusStoreDiagnosticCounters::default();
+        counters.begin_consensus_log_prune_worker();
+        counters.begin_consensus_log_prune_turn();
+        counters.cancel_consensus_log_prune_turn();
+        counters.end_consensus_log_prune_worker();
+
+        assert_eq!(
+            counters.consensus_log_prune_active.load(Ordering::Relaxed),
+            0,
+            "shutdown cancellation releases the active turn admission"
+        );
+        assert_eq!(
+            counters
+                .consensus_log_prune_workers_active
+                .load(Ordering::Relaxed),
+            0,
+            "shutdown join releases the one worker admission"
+        );
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.consensus_log_prune_permanent_failures, 0);
+        assert_eq!(snapshot.consensus_log_prune_active_high_water, 1);
+        assert_eq!(snapshot.consensus_log_prune_worker_high_water, 1);
     }
     use crate::{
         FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,

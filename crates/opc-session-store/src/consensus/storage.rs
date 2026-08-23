@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::raft_adapter::{SessionRaftAdapterError, SessionRaftPeerDirectory};
 #[cfg(test)]
-use super::snapshot::SnapshotArtifactGate;
+use super::snapshot::{fixed_prepublication_scan_boundary, SnapshotArtifactGate};
 use super::snapshot::{
     PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact, SNAPSHOT_MAX_BYTES,
 };
@@ -192,6 +192,65 @@ fn in_place_seal_test_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+#[cfg(test)]
+fn fixed_prepublication_verify_gates(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<SnapshotArtifactGate>>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<SnapshotArtifactGate>>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+struct FixedPrepublicationVerifyGateGuard {
+    snapshot_directory: PathBuf,
+    gate: std::sync::Arc<SnapshotArtifactGate>,
+}
+
+#[cfg(test)]
+impl FixedPrepublicationVerifyGateGuard {
+    fn install(snapshot_directory: PathBuf, gate: std::sync::Arc<SnapshotArtifactGate>) -> Self {
+        fixed_prepublication_verify_gates()
+            .lock()
+            .expect("set fixed prepublication verify gate")
+            .insert(snapshot_directory.clone(), Arc::clone(&gate));
+        Self {
+            snapshot_directory,
+            gate,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FixedPrepublicationVerifyGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut gates = fixed_prepublication_verify_gates()
+            .lock()
+            .expect("clear fixed prepublication verify gate");
+        if gates
+            .get(&self.snapshot_directory)
+            .is_some_and(|installed| Arc::ptr_eq(installed, &self.gate))
+        {
+            gates.remove(&self.snapshot_directory);
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_before_fixed_prepublication_verify(final_path: &Path) {
+    let Some(snapshot_directory) = final_path.parent() else {
+        return;
+    };
+    let gate = fixed_prepublication_verify_gates()
+        .lock()
+        .ok()
+        .and_then(|gates| gates.get(snapshot_directory).cloned());
+    if let Some(gate) = gate {
+        gate.block_if_armed().await;
+    }
+}
+
 /// Fail-closed errors emitted while binding an existing SQLite database to a
 /// durable consensus identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -245,6 +304,10 @@ impl SqliteConsensusLogStore {
         &self,
     ) -> Option<Arc<consensus::ProactiveCheckpointLane>> {
         self.core.proactive_checkpoint_lane()
+    }
+
+    pub(crate) fn consensus_log_prune_lane(&self) -> Option<Arc<consensus::ConsensusLogPruneLane>> {
+        self.core.consensus_log_prune_lane()
     }
 }
 
@@ -879,19 +942,36 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
         let result = {
             let conn = self.core.conn.lock().await;
-            consensus::purge_logs_with_authority_sync(
-                &conn,
-                self.core.storage_identity,
-                self.core.authority_profile,
-                &self.core.expected_members,
-                &self.core.expected_bindings,
-                self.core.fixed_placement_policy,
-                &log_id,
-            )
+            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable
+                && self.core.consensus_log_prune_lane().is_none()
+            {
+                consensus::purge_logs_without_prune_lane_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    &log_id,
+                )
+            } else {
+                consensus::purge_logs_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    &log_id,
+                )
+            }
         }
         .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error));
         if result.is_ok() {
             self.core.signal_proactive_checkpoint();
+            if let Some(lane) = self.core.consensus_log_prune_lane() {
+                lane.signal();
+            }
         }
         result
     }
@@ -1668,33 +1748,49 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         sync_directory(&self.core.snapshot_dir).map_err(|error| {
             storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
         })?;
-        let (_, observed_checksum, observed_length) =
-            verify_snapshot_envelope_reader(&mut snapshot)
-                .await
-                .map_err(|error| {
-                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error)
-                })?;
-        if observed_checksum != checksum || observed_length != byte_length {
-            return Err(storage_error(
-                ErrorSubject::Snapshot(None),
-                ErrorVerb::Read,
-                consensus::invalid_data("session consensus sealed snapshot is inconsistent"),
-            ));
+        #[cfg(test)]
+        if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+            // Pause before entering the observed boundary so a mutation test
+            // never leaves an active scan observer while it is gated.
+            wait_before_fixed_prepublication_verify(&final_path).await;
         }
-        snapshot
-            .rewind()
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
+        #[cfg(test)]
+        let fixed_prepublication_scan_boundary = (self.core.authority_profile
+            == ConsensusAuthorityProfile::FixedImmutable)
+            .then(|| fixed_prepublication_scan_boundary(&final_path))
+            .flatten();
+        // Dynamic authority retains its existing post-rename envelope check.
+        // Fixed authority performs that check, immutable-generation binding,
+        // and exact path/link validation in one descriptor pass at the
+        // metadata publication boundary below.
+        if self.core.authority_profile == ConsensusAuthorityProfile::Dynamic {
+            let (_, observed_checksum, observed_length) =
+                verify_snapshot_envelope_reader(&mut snapshot)
+                    .await
+                    .map_err(|error| {
+                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error)
+                    })?;
+            if observed_checksum != checksum || observed_length != byte_length {
+                return Err(storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Read,
+                    consensus::invalid_data("session consensus sealed snapshot is inconsistent"),
+                ));
+            }
+            snapshot.rewind().await.map_err(|error| {
+                storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error)
+            })?;
+        }
         let snapshot_id = format!("session-{}", uuid::Uuid::new_v4());
         let meta = SnapshotMeta {
             last_log_id,
             last_membership,
             snapshot_id,
         };
-        let published_pin =
+        let mut published_pin =
             if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
                 Some(
-                    snapshot_handle_pin(&snapshot, &final_path)
+                    snapshot_handle_unbound_pin(&snapshot, &final_path)
                         .await
                         .map_err(|error| {
                             storage_error(
@@ -1717,9 +1813,16 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                         error,
                     )
                 })?;
-            if let Some(published_pin) = &published_pin {
+            if let Some(published_pin) = &mut published_pin {
                 published_pin
-                    .verify_immutable_generation()
+                    .verify_snapshot_envelope_and_bind_immutable_generation(
+                        &final_path,
+                        SNAPSHOT_FOOTER_MAGIC,
+                        SNAPSHOT_FOOTER_BYTES,
+                        SNAPSHOT_MAX_BYTES,
+                        checksum,
+                        byte_length,
+                    )
                     .map_err(|error| {
                         storage_error(
                             ErrorSubject::Snapshot(Some(meta.signature())),
@@ -1727,24 +1830,6 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                             error,
                         )
                     })?;
-                if !published_pin
-                    .path_matches_identity(&final_path)
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?
-                {
-                    return Err(storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        consensus::invalid_data(
-                            "session consensus published snapshot was replaced",
-                        ),
-                    ));
-                }
             }
             publish_snapshot_metadata_with_readback(
                 &conn,
@@ -1778,6 +1863,8 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             })?;
             previous
         };
+        #[cfg(test)]
+        drop(fixed_prepublication_scan_boundary);
         // The readback helper has disarmed the exact published-file guard.
         // Staging artifacts remain fail-closed after durable metadata commits.
         raw_artifact.remove().await.map_err(|error| {
@@ -1916,6 +2003,18 @@ async fn snapshot_handle_pin(
     PinnedSqliteFile::from_file(cloned.into_std().await?, path.to_path_buf())?.pin_immutable()
 }
 
+/// Clone the already-open snapshot descriptor without scanning it. Fixed
+/// publication later consumes this handle under the SQLite mutex immediately
+/// before metadata publication, so one bounded descriptor pass can verify the
+/// envelope and bind its immutable generation.
+async fn snapshot_handle_unbound_pin(
+    snapshot: &SessionSnapshotFile,
+    path: &Path,
+) -> io::Result<PinnedSqliteFile> {
+    let cloned = snapshot.try_clone().await?;
+    PinnedSqliteFile::from_file(cloned.into_std().await?, path.to_path_buf())
+}
+
 async fn seal_snapshot_database_in_place(
     raw_snapshot: PinnedSqliteFile,
     final_path: &Path,
@@ -2006,10 +2105,9 @@ async fn seal_snapshot_database_in_place(
     Ok((snapshot, checksum, total, output_cleanup))
 }
 
-async fn verify_snapshot_envelope_reader<R>(file: &mut R) -> io::Result<(u64, [u8; 32], u64)>
-where
-    R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
-{
+async fn verify_snapshot_envelope_reader(
+    file: &mut SessionSnapshotFile,
+) -> io::Result<(u64, [u8; 32], u64)> {
     let total_length = file.seek(io::SeekFrom::End(0)).await?;
     if total_length <= SNAPSHOT_FOOTER_BYTES
         || total_length > SNAPSHOT_MAX_BYTES.saturating_add(SNAPSHOT_FOOTER_BYTES)
@@ -2062,6 +2160,8 @@ where
         hasher.update(&buffer[..read]);
     }
     let actual_checksum: [u8; 32] = hasher.finalize().into();
+    #[cfg(test)]
+    super::snapshot::record_fixed_prepublication_scan(file.path(), observed);
     if observed != payload_length || actual_checksum != expected_checksum {
         return Err(consensus::invalid_data(
             "session consensus snapshot checksum mismatch",
@@ -2252,8 +2352,10 @@ mod tests {
         AES_256_GCM_SIV_NONCE_LEN,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+    use sha2::Sha256;
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
+    use super::super::snapshot::FixedPrepublicationScanObserver;
     use super::*;
     use crate::backend::CompareAndSet;
     use crate::consensus::{
@@ -2269,7 +2371,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn publication_identity_check_rejects_atomic_aba_replacement() {
+    async fn publication_identity_check_rejects_atomic_pathname_replacement() {
         let directory = tempfile::tempdir().expect("snapshot directory");
         let published = directory.path().join("snapshot.opc");
         tokio::fs::write(&published, b"verified envelope A")
@@ -3210,6 +3312,318 @@ mod tests {
                 expected_members(),
             )),
         }
+    }
+
+    fn fixed_initial_membership_entry() -> Entry<SessionRaftTypeConfig> {
+        let members = fixed_raw_read_members();
+        Entry {
+            log_id: log_id(0),
+            payload: EntryPayload::Membership(opc_consensus::engine::Membership::new(
+                vec![members.clone()],
+                members,
+            )),
+        }
+    }
+
+    fn write_sealed_snapshot_fixture(
+        path: &Path,
+        payload: &[u8],
+        magic: &[u8; 8],
+        encoded_length: u64,
+        footer_checksum: [u8; 32],
+    ) {
+        let mut file = std::fs::File::create(path).expect("create sealed snapshot fixture");
+        std::io::Write::write_all(&mut file, payload).expect("write fixture payload");
+        std::io::Write::write_all(&mut file, magic).expect("write fixture magic");
+        std::io::Write::write_all(&mut file, &encoded_length.to_be_bytes())
+            .expect("write fixture length");
+        std::io::Write::write_all(&mut file, &footer_checksum).expect("write fixture checksum");
+        file.sync_all().expect("sync sealed snapshot fixture");
+    }
+
+    fn fixture_checksum(payload: &[u8]) -> [u8; 32] {
+        Sha256::digest(payload).into()
+    }
+
+    fn verify_fixed_prepublication_fixture(
+        path: &Path,
+        expected_checksum: [u8; 32],
+        expected_length: u64,
+        maximum_payload: u64,
+    ) -> io::Result<()> {
+        let file = std::fs::File::open(path)?;
+        let mut pinned = PinnedSqliteFile::from_file(file, path.to_path_buf())?;
+        pinned
+            .verify_snapshot_envelope_and_bind_immutable_generation(
+                path,
+                SNAPSHOT_FOOTER_MAGIC,
+                SNAPSHOT_FOOTER_BYTES,
+                maximum_payload,
+                expected_checksum,
+                expected_length,
+            )
+            .map(|_| ())
+    }
+
+    #[test]
+    fn fixed_prepublication_descriptor_scan_accepts_one_valid_bounded_envelope_and_rejects_tampering(
+    ) {
+        let directory = tempfile::tempdir().expect("fixed prepublication fixture directory");
+        let payload = b"fixed prepublication envelope";
+        let checksum = fixture_checksum(payload);
+        let length =
+            u64::try_from(payload.len()).expect("fixture payload length") + SNAPSHOT_FOOTER_BYTES;
+        let path = directory.path().join("valid.opc");
+        write_sealed_snapshot_fixture(
+            &path,
+            payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(payload.len()).expect("fixture payload length"),
+            checksum,
+        );
+        verify_fixed_prepublication_fixture(&path, checksum, length, 1024)
+            .expect("valid descriptor-pinned envelope");
+
+        let chunked_payload = vec![0x5a; 64 * 1024 + 19];
+        let chunked_checksum = fixture_checksum(&chunked_payload);
+        let chunked_length = u64::try_from(chunked_payload.len()).expect("chunked payload length")
+            + SNAPSHOT_FOOTER_BYTES;
+        let chunked = directory.path().join("chunked.opc");
+        write_sealed_snapshot_fixture(
+            &chunked,
+            &chunked_payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(chunked_payload.len()).expect("chunked payload length"),
+            chunked_checksum,
+        );
+        verify_fixed_prepublication_fixture(&chunked, chunked_checksum, chunked_length, 128 * 1024)
+            .expect("chunked descriptor-pinned envelope");
+
+        let truncated = directory.path().join("truncated.opc");
+        std::fs::write(&truncated, payload).expect("write truncated fixture");
+        assert!(verify_fixed_prepublication_fixture(&truncated, checksum, length, 1024).is_err());
+
+        let oversized = directory.path().join("oversized.opc");
+        write_sealed_snapshot_fixture(
+            &oversized,
+            payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(payload.len()).expect("fixture payload length"),
+            checksum,
+        );
+        assert!(verify_fixed_prepublication_fixture(&oversized, checksum, length, 1).is_err());
+
+        let bad_magic = directory.path().join("bad-magic.opc");
+        write_sealed_snapshot_fixture(
+            &bad_magic,
+            payload,
+            b"OPCBAD01",
+            u64::try_from(payload.len()).expect("fixture payload length"),
+            checksum,
+        );
+        assert!(verify_fixed_prepublication_fixture(&bad_magic, checksum, length, 1024).is_err());
+
+        let wrong_length = directory.path().join("wrong-length.opc");
+        write_sealed_snapshot_fixture(
+            &wrong_length,
+            payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(payload.len()).expect("fixture payload length") + 1,
+            checksum,
+        );
+        assert!(
+            verify_fixed_prepublication_fixture(&wrong_length, checksum, length, 1024).is_err()
+        );
+
+        let wrong_checksum = directory.path().join("wrong-checksum.opc");
+        write_sealed_snapshot_fixture(
+            &wrong_checksum,
+            payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(payload.len()).expect("fixture payload length"),
+            [0_u8; 32],
+        );
+        assert!(
+            verify_fixed_prepublication_fixture(&wrong_checksum, checksum, length, 1024).is_err()
+        );
+
+        let same_inode_mutation = directory.path().join("same-inode-mutation.opc");
+        write_sealed_snapshot_fixture(
+            &same_inode_mutation,
+            payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(payload.len()).expect("fixture payload length"),
+            checksum,
+        );
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&same_inode_mutation)
+                .expect("open same-inode fixture");
+            std::io::Write::write_all(&mut file, b"X").expect("mutate same inode");
+            file.sync_all().expect("sync same-inode mutation");
+        }
+        assert!(
+            verify_fixed_prepublication_fixture(&same_inode_mutation, checksum, length, 1024,)
+                .is_err()
+        );
+
+        let pathname_replacement = directory.path().join("pathname-replacement.opc");
+        write_sealed_snapshot_fixture(
+            &pathname_replacement,
+            payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(payload.len()).expect("fixture payload length"),
+            checksum,
+        );
+        let file =
+            std::fs::File::open(&pathname_replacement).expect("open original pathname fixture");
+        let mut pinned = PinnedSqliteFile::from_file(file, pathname_replacement.clone())
+            .expect("pin pathname fixture");
+        let replacement = directory.path().join("pathname-replacement-next.opc");
+        write_sealed_snapshot_fixture(
+            &replacement,
+            payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(payload.len()).expect("fixture payload length"),
+            checksum,
+        );
+        std::fs::rename(&replacement, &pathname_replacement).expect("replace pinned pathname");
+        assert!(pinned
+            .verify_snapshot_envelope_and_bind_immutable_generation(
+                &pathname_replacement,
+                SNAPSHOT_FOOTER_MAGIC,
+                SNAPSHOT_FOOTER_BYTES,
+                1024,
+                checksum,
+                length,
+            )
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_prepublication_same_inode_mutation_fails_before_metadata_and_cleans_up() {
+        let directory = tempfile::tempdir().expect("fixed mutation directory");
+        let (_, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        state_machine
+            .apply([fixed_initial_membership_entry()])
+            .await
+            .expect("apply fixed membership");
+
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let _gate_guard = FixedPrepublicationVerifyGateGuard::install(
+            state_machine.core.snapshot_dir.as_ref().clone(),
+            Arc::clone(&gate),
+        );
+        let observer = FixedPrepublicationScanObserver::install(
+            state_machine.core.snapshot_dir.as_ref().clone(),
+        );
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let build = tokio::spawn(async move { builder.build_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("fixed build reaches prepublication verification");
+        let final_path = std::fs::read_dir(state_machine.core.snapshot_dir.as_ref())
+            .expect("read fixed snapshot directory")
+            .map(|entry| entry.expect("fixed snapshot entry").path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "opc"))
+            .expect("find promoted fixed snapshot");
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&final_path)
+                .expect("open promoted fixed snapshot");
+            std::io::Write::write_all(&mut file, b"X").expect("mutate promoted fixed inode");
+            file.sync_all().expect("sync promoted fixed mutation");
+        }
+        gate.release();
+        assert!(build.await.expect("join fixed mutation build").is_err());
+        let (scan_count, scan_bytes) = observer.snapshot();
+        assert_eq!(
+            1, scan_count,
+            "the fixed build performs exactly one prepublication descriptor scan"
+        );
+        assert!(
+            scan_bytes > 0 && scan_bytes <= SNAPSHOT_MAX_BYTES + SNAPSHOT_FOOTER_BYTES,
+            "the fixed prepublication scan remains bounded by one snapshot envelope"
+        );
+        let conn = state_machine.core.conn.lock().await;
+        assert!(
+            consensus::read_current_snapshot_sync(&conn, state_machine.core.storage_identity)
+                .expect("read fixed current metadata")
+                .is_none(),
+            "same-inode mutation is rejected before snapshot metadata changes"
+        );
+        drop(conn);
+        assert!(
+            std::fs::read_dir(state_machine.core.snapshot_dir.as_ref())
+                .expect("read cleaned fixed snapshot directory")
+                .next()
+                .is_none(),
+            "failed fixed publication cleans the exact mutated candidate and staging artifacts"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_prepublication_observer_is_directory_scoped_and_counts_one_successful_build() {
+        let observed_directory = tempfile::tempdir().expect("observed fixed build directory");
+        let (_, mut observed_state_machine, _) =
+            open_fixed_raw_read_store(&observed_directory).await;
+        observed_state_machine
+            .apply([fixed_initial_membership_entry()])
+            .await
+            .expect("apply observed fixed membership");
+
+        let unrelated_directory = tempfile::tempdir().expect("unrelated fixed build directory");
+        let (_, mut unrelated_state_machine, _) =
+            open_fixed_raw_read_store(&unrelated_directory).await;
+        unrelated_state_machine
+            .apply([fixed_initial_membership_entry()])
+            .await
+            .expect("apply unrelated fixed membership");
+
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let _gate_guard = FixedPrepublicationVerifyGateGuard::install(
+            observed_state_machine.core.snapshot_dir.as_ref().clone(),
+            Arc::clone(&gate),
+        );
+        let observer = FixedPrepublicationScanObserver::install(
+            observed_state_machine.core.snapshot_dir.as_ref().clone(),
+        );
+        let mut observed_builder = observed_state_machine.get_snapshot_builder().await;
+        let observed_build = tokio::spawn(async move { observed_builder.build_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("observed build reaches its prepublication gate");
+
+        let mut unrelated_builder = unrelated_state_machine.get_snapshot_builder().await;
+        let unrelated_snapshot = unrelated_builder
+            .build_snapshot()
+            .await
+            .expect("unrelated fixed build succeeds while observed build is gated");
+        drop(unrelated_snapshot);
+        assert_eq!(
+            (0, 0),
+            observer.snapshot(),
+            "a concurrently completed fixed build in another directory is not observed"
+        );
+
+        gate.release();
+        let observed_snapshot = observed_build
+            .await
+            .expect("join observed fixed build")
+            .expect("observed fixed build succeeds");
+        let observed_length = tokio::fs::metadata(observed_snapshot.snapshot.path())
+            .await
+            .expect("read observed fixed snapshot length")
+            .len();
+        assert_eq!(
+            (1, observed_length),
+            observer.snapshot(),
+            "one successful fixed build has exactly one bounded prepublication scan"
+        );
     }
 
     #[tokio::test]

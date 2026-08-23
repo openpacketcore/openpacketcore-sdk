@@ -398,7 +398,7 @@ fn inspect_current(
     budget: &mut InspectionBudget,
 ) -> Result<RecoveryReplicaEvidence, RecoveryError> {
     budget.check()?;
-    preflight_current_tables(conn, budget)?;
+    let preflight_total_bytes = preflight_current_tables(conn, budget)?;
     validate_exact_recovery_schema(conn, false)?;
     let v2_ledger_layout = consensus::fenced_transition_v2_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
@@ -470,6 +470,7 @@ fn inspect_current(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let purged = consensus::read_purged_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
+    preflight_authoritative_consensus_log(conn, budget, preflight_total_bytes, purged.as_ref())?;
     let last_log = consensus::last_log_sync(conn, storage_identity)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     validate_log_floors(
@@ -547,7 +548,7 @@ fn inspect_current(
 fn preflight_current_tables(
     conn: &Connection,
     budget: &InspectionBudget,
-) -> Result<(), RecoveryError> {
+) -> Result<u64, RecoveryError> {
     let mut total_bytes = 0_u64;
     for query in [
         "SELECT COUNT(*), COALESCE(MAX(MAX(length(cluster_id), length(configuration_id))), 0), COALESCE(SUM(length(cluster_id) + length(configuration_id)), 0) FROM consensus_identity",
@@ -555,7 +556,6 @@ fn preflight_current_tables(
         "SELECT COUNT(*), COALESCE(MAX(length(vote_json)), 0), COALESCE(SUM(length(vote_json)), 0) FROM consensus_vote",
         "SELECT COUNT(*), COALESCE(MAX(length(log_id_json)), 0), COALESCE(SUM(length(log_id_json)), 0) FROM consensus_committed",
         "SELECT COUNT(*), COALESCE(MAX(length(log_id_json)), 0), COALESCE(SUM(length(log_id_json)), 0) FROM consensus_purged",
-        "SELECT COUNT(*), COALESCE(MAX(length(entry_json)), 0), COALESCE(SUM(length(entry_json)), 0) FROM consensus_log",
         "SELECT COUNT(*), COALESCE(MAX(length(log_id_json)), 0), COALESCE(SUM(length(log_id_json)), 0) FROM consensus_applied",
         "SELECT COUNT(*), COALESCE(MAX(MAX(length(meta_json), length(file_name), length(checksum))), 0), COALESCE(SUM(length(meta_json) + length(file_name) + length(checksum)), 0) FROM consensus_snapshot",
         "SELECT COUNT(*), COALESCE(MAX(MAX(length(request_id), length(payload_digest), length(response_json))), 0), COALESCE(SUM(length(request_id) + length(payload_digest) + length(response_json)), 0) FROM consensus_request_outcomes",
@@ -760,6 +760,41 @@ fn preflight_current_tables(
         {
             return Err(RecoveryError::WorkLimitExceeded);
         }
+    }
+    Ok(total_bytes)
+}
+
+/// Bound only the logically authoritative log suffix. A durable purge floor
+/// masks its physical prefix from all recovery reads, so retained cleanup work
+/// must not make an otherwise valid replica exceed its logical work budget.
+fn preflight_authoritative_consensus_log(
+    conn: &Connection,
+    budget: &InspectionBudget,
+    total_bytes: u64,
+    purged: Option<&LogId<SessionConsensusNodeId>>,
+) -> Result<(), RecoveryError> {
+    let floor = purged
+        .map(|log_id| i64::try_from(log_id.index).map_err(|_| RecoveryError::CorruptReplica))
+        .transpose()?
+        .unwrap_or(-1);
+    let (count, maximum, total): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MAX(length(entry_json)), 0), COALESCE(SUM(length(entry_json)), 0) FROM consensus_log WHERE log_index > ?1",
+            [floor],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| inspection_sql_error(error, budget))?;
+    let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+    let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?;
+    let total = u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?;
+    let total_bytes = total_bytes
+        .checked_add(total)
+        .ok_or(RecoveryError::WorkLimitExceeded)?;
+    if count > budget.limits.max_rows()
+        || maximum > budget.limits.max_value_bytes()
+        || total_bytes > budget.limits.max_total_value_bytes()
+    {
+        return Err(RecoveryError::WorkLimitExceeded);
     }
     Ok(())
 }
