@@ -2847,6 +2847,20 @@ impl Fleet {
         }
     }
 
+    fn consumer_tls_peer_credential_rejections(&mut self, node_index: usize) -> u64 {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::ConsumerTlsPeerCredentialRejections)
+        {
+            QualificationNodeReply::ConsumerTlsPeerCredentialRejections { rejections } => {
+                rejections
+            }
+            reply => panic!(
+                "unexpected consumer TLS peer-credential rejection response: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
     fn readiness_reports(&mut self, node_indices: &[usize]) -> Vec<FleetReadiness> {
         self.readiness_reports_by(node_indices, Instant::now() + CHILD_TIMEOUT)
     }
@@ -10316,6 +10330,17 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         Duration::from_secs(5),
     )
     .expect("fixed V2 batch pool and queue configuration");
+    let credential_negative_pool_config = PersistentSessionConsumerConfig::try_new(
+        1,
+        0,
+        Duration::from_millis(250),
+        1,
+        Duration::from_millis(1_500),
+        1,
+        Duration::ZERO,
+        Duration::from_secs(1),
+    )
+    .expect("single-attempt credential-negative pool configuration");
     let mut identity_senders = Vec::with_capacity(V2_BATCH_RELEASE_GATE_CLIENTS);
     let mut clients = Vec::with_capacity(V2_BATCH_RELEASE_GATE_CLIENTS);
     for (consumer_index, consumer_identity) in consumer_identities.iter().enumerate() {
@@ -11196,6 +11221,8 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         replacement_source_before.generation,
         replacement_controller_before.epoch,
     );
+    let old_credential_new_only_server_rejections_before =
+        fleet.consumer_tls_peer_credential_rejections(replacement);
     let (_old_leaf_identity_source, old_leaf_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         replacement,
@@ -11207,24 +11234,34 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             // leaf; only its presented credential is intentionally old.
             TrustGeneration::Overlap,
         ),
-        pool_config,
+        credential_negative_pool_config,
         None,
     );
-    let old_leaf_consumer_setup_rejection = matches!(
-        runtime.block_on(old_leaf_client.prewarm_v2()),
-        Err(SessionConsumerClientError::Unavailable)
-    );
+    let old_credential_new_only_server_result = runtime.block_on(old_leaf_client.prewarm_v2());
     assert!(
-        old_leaf_consumer_setup_rejection,
-        "old-root/new-only-server negative must reach the listener transport rejection"
+        matches!(
+            old_credential_new_only_server_result,
+            Err(SessionConsumerClientError::Authentication | SessionConsumerClientError::Unavailable)
+        ),
+        "old credential/new-only server negative must expose only typed authentication or unavailable"
     );
     runtime.block_on(old_leaf_client.shutdown());
     let old_leaf_diagnostics = old_leaf_client.v2_diagnostics();
-    assert!(old_leaf_diagnostics.setup_attempts > 0);
+    assert_eq!(old_leaf_diagnostics.setup_attempts, 1);
+    assert_eq!(old_leaf_diagnostics.setup_failures, 1);
     assert_eq!(old_leaf_diagnostics.setup_successes, 0);
     assert_eq!(old_leaf_diagnostics.active, 0);
     assert_eq!(old_leaf_diagnostics.idle, 0);
     assert_eq!(old_leaf_diagnostics.pool_wait_current, 0);
+    let old_credential_new_only_server_tls_peer_credential_rejected = fleet
+        .consumer_tls_peer_credential_rejections(replacement)
+        == old_credential_new_only_server_rejections_before
+            .checked_add(1)
+            .expect("release-gate peer-credential rejection counter remains below u64 maximum");
+    assert!(
+        old_credential_new_only_server_tls_peer_credential_rejected,
+        "old credential/new-only server negative produces exactly one local TLS peer-credential rejection"
+    );
 
     let (_delayed_identity_source, delayed_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
@@ -11349,6 +11386,8 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         old_root_source_before.generation,
         old_root_controller_before.epoch,
     );
+    let new_credential_old_root_server_rejections_before =
+        fleet.consumer_tls_peer_credential_rejections(old_root_server);
     let (_new_only_identity_source, new_only_old_root_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         old_root_server,
@@ -11358,21 +11397,35 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             ConsumerCredentialGeneration::NewRoot,
             TrustGeneration::Overlap,
         ),
-        pool_config,
+        credential_negative_pool_config,
         None,
     );
-    let new_only_old_root_consumer_setup_rejection = matches!(
-        runtime.block_on(new_only_old_root_client.prewarm_v2()),
-        Err(SessionConsumerClientError::Unavailable)
+    let new_credential_old_root_server_result =
+        runtime.block_on(new_only_old_root_client.prewarm_v2());
+    assert!(
+        matches!(
+            new_credential_old_root_server_result,
+            Err(SessionConsumerClientError::Authentication | SessionConsumerClientError::Unavailable)
+        ),
+        "new credential/old-root server negative must expose only typed authentication or unavailable"
     );
-    assert!(new_only_old_root_consumer_setup_rejection);
     runtime.block_on(new_only_old_root_client.shutdown());
     let new_only_old_root_diagnostics = new_only_old_root_client.v2_diagnostics();
-    assert!(new_only_old_root_diagnostics.setup_attempts > 0);
+    assert_eq!(new_only_old_root_diagnostics.setup_attempts, 1);
+    assert_eq!(new_only_old_root_diagnostics.setup_failures, 1);
     assert_eq!(new_only_old_root_diagnostics.setup_successes, 0);
     assert_eq!(new_only_old_root_diagnostics.active, 0);
     assert_eq!(new_only_old_root_diagnostics.idle, 0);
     assert_eq!(new_only_old_root_diagnostics.pool_wait_current, 0);
+    let new_credential_old_root_server_tls_peer_credential_rejected = fleet
+        .consumer_tls_peer_credential_rejections(old_root_server)
+        == new_credential_old_root_server_rejections_before
+            .checked_add(1)
+            .expect("release-gate peer-credential rejection counter remains below u64 maximum");
+    assert!(
+        new_credential_old_root_server_tls_peer_credential_rejected,
+        "new credential/old-root server negative produces exactly one local TLS peer-credential rejection"
+    );
     let (restored_old_root_identity_source, restored_old_root_client) =
         qualification_persistent_v2_client(
             Arc::clone(&endpoints),
@@ -11390,6 +11443,12 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .expect("restore old-root pool");
     clients[old_root_seam_client_index] = restored_old_root_client;
     drop(restored_old_root_identity_source);
+
+    runtime.block_on(qualification_assert_v2_active_history(
+        clients[0].clone(),
+        scope,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+    ));
 
     let restored_seam_current = clients[seam_client_index].v2_diagnostics();
     let restored_old_root_current = clients[old_root_seam_client_index].v2_diagnostics();
@@ -11584,26 +11643,29 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         (
             SessionMtlsBatchReleaseGatePoolRoleV1::OldCredentialNewOnlyServer,
             old_leaf_diagnostics,
+            1,
         ),
         (
             SessionMtlsBatchReleaseGatePoolRoleV1::DelayedResponseAmbiguity,
             delayed_after_ambiguity,
+            V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
         ),
         (
             SessionMtlsBatchReleaseGatePoolRoleV1::NewCredentialOldRootServer,
             new_only_old_root_diagnostics,
+            1,
         ),
     ]
     .into_iter()
     .map(
-        |(role, diagnostics)| SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+        |(role, diagnostics, configured_lanes)| SessionMtlsBatchReleaseGatePoolEvidenceV1 {
             role,
             setup_attempts: diagnostics.setup_attempts,
             setup_failures: diagnostics.setup_failures,
             setup_successes: diagnostics.setup_successes,
             pool_wait_current: diagnostics.pool_wait_current,
             pool_wait_max: diagnostics.pool_wait_max,
-            configured_lanes: V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+            configured_lanes,
             active_lanes: diagnostics.active,
             idle_lanes: diagnostics.idle,
         },
@@ -11665,6 +11727,8 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         aggregate_pool_wait_max,
         resource_generations,
         positive_new_credential_new_server_statuses: new_only_client_indices.len(),
+        old_credential_new_only_server_tls_peer_credential_rejected,
+        new_credential_old_root_server_tls_peer_credential_rejected,
     };
     typed_evidence
         .validate()
@@ -11714,13 +11778,13 @@ fn assert_batch_credential_negative_handshake(
         .expect("bounded credential-negative runtime");
     let pool_config = PersistentSessionConsumerConfig::try_new(
         1,
-        V2_BATCH_RELEASE_GATE_PENDING_CALLS,
+        0,
         Duration::from_millis(250),
         1,
         Duration::from_millis(1_500),
         1,
-        Duration::from_millis(25),
-        Duration::from_secs(5),
+        Duration::ZERO,
+        Duration::from_secs(1),
     )
     .expect("single-lane credential-negative pool");
 
@@ -11748,6 +11812,12 @@ fn assert_batch_credential_negative_handshake(
     assert_eq!(positive_diagnostics.setup_attempts, 1);
     assert_eq!(positive_diagnostics.setup_successes, 1);
     runtime.block_on(positive_client.shutdown());
+    assert_eq!(
+        fleet.consumer_tls_peer_credential_rejections(TARGET),
+        0,
+        "matching credential control cannot increment the peer-credential rejection counter: phase={phase}"
+    );
+    let peer_credential_rejections_before = fleet.consumer_tls_peer_credential_rejections(TARGET);
 
     let (_negative_identity_source, negative_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
@@ -11763,8 +11833,11 @@ fn assert_batch_credential_negative_handshake(
     );
     let negative_result = runtime.block_on(negative_client.prewarm_v2());
     assert!(
-        matches!(negative_result, Err(SessionConsumerClientError::Unavailable)),
-        "actual consumer listener rejects the mismatched client credential before setup: phase={phase}, result={negative_result:?}"
+        matches!(
+            negative_result,
+            Err(SessionConsumerClientError::Authentication | SessionConsumerClientError::Unavailable)
+        ),
+        "actual consumer listener mismatched credential result is typed authentication or unavailable: phase={phase}, result={negative_result:?}"
     );
     runtime.block_on(negative_client.shutdown());
     let negative_diagnostics = negative_client.v2_diagnostics();
@@ -11774,6 +11847,13 @@ fn assert_batch_credential_negative_handshake(
     assert_eq!(negative_diagnostics.active, 0);
     assert_eq!(negative_diagnostics.idle, 0);
     assert_eq!(negative_diagnostics.pool_wait_current, 0);
+    assert_eq!(
+        fleet.consumer_tls_peer_credential_rejections(TARGET),
+        peer_credential_rejections_before
+            .checked_add(1)
+            .expect("bounded peer-credential rejection counter remains below u64 maximum"),
+        "the mismatched credential produces exactly one local TLS peer-credential rejection: phase={phase}"
+    );
     fleet.shutdown();
 }
 

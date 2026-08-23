@@ -1253,21 +1253,21 @@ const SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1: &str = concat!(
     "phase-05-leader-loss-restart-reconnect-and-active-history-check=logical-voter-generations:2/1/1\n",
     "phase-06-credential-rotation-and-positive-controls=all-members:old-root-overlap,replacement:new-root-overlap,positive-statuses:4\n",
     "phase-07-release-original-pool=target:replacement,lanes:4,remaining-listener-lanes:12\n",
-    "phase-08-publish-replacement-new-only-and-old-credential-negative=pool-lanes:4,client-trust:overlap\n",
+    "phase-08-publish-replacement-new-only-and-old-credential-negative=pool-lanes:1,client-trust:overlap\n",
     "phase-09-delayed-ambiguity=first-request-index:110001,operations:12,batch-size:12\n",
     "phase-10-restore-replacement-pool-and-resolve-ambiguity-statuses=lanes:4,operations:12\n",
     "phase-11-release-old-root-pool=lanes:4,remaining-listener-lanes:12\n",
-    "phase-12-publish-old-only-and-new-credential-negative=pool-lanes:4,client-trust:overlap\n",
+    "phase-12-publish-old-only-and-new-credential-negative=pool-lanes:1,client-trust:overlap\n",
     "phase-13-restore-old-root-settle-and-resource-validation=normal-lanes:48,active-history-entries:110001\n"
 );
 
 /// Literal SHA-256 binding for the complete batch release-gate schedule.
 pub const SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256: &str =
-    "sha256:0db4b609a65ae9da27ef8840298cf4d14b135d0897254551b396fdd3d6947be2";
+    "sha256:3ac98f84f59dd5cefee5c15d5ae833610402bd6bffa74c7e284cbbad30a10eb2";
 
 /// Literal SHA-256 binding for the closed batch release-gate schema.
 pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_SHA256: &str =
-    "sha256:9924c9d2fd2455882bca67a873d69d7368345d9b1c4d91ff48e63ec9e2e86865";
+    "sha256:2db740bb266c46acebc16890ece9e1f9714271f4f4e88331fea875e97d08a7d2";
 
 /// SHA-256 of the fixed release-gate workload schedule.
 pub fn session_mtls_batch_release_gate_schedule_sha256() -> String {
@@ -1421,6 +1421,10 @@ pub struct SessionMtlsBatchReleaseGateEvidenceV1 {
     pub resource_generations: Vec<SessionMtlsBatchReleaseGateResourceGenerationV1>,
     /// Exact successful new-credential/new-server normal-client statuses.
     pub positive_new_credential_new_server_statuses: usize,
+    /// The old credential was rejected locally by the new-only server TLS boundary.
+    pub old_credential_new_only_server_tls_peer_credential_rejected: bool,
+    /// The new credential was rejected locally by the old-root server TLS boundary.
+    pub new_credential_old_root_server_tls_peer_credential_rejected: bool,
 }
 
 /// Typed rejection reason for batch release-gate evidence.
@@ -1476,6 +1480,8 @@ impl SessionMtlsBatchReleaseGateEvidenceV1 {
             || self.normal_active_lanes != 48
             || self.normal_idle_lanes != 48
             || self.positive_new_credential_new_server_statuses != 4
+            || !self.old_credential_new_only_server_tls_peer_credential_rejected
+            || !self.new_credential_old_root_server_tls_peer_credential_rejected
         {
             return Err(SessionMtlsBatchReleaseGateEvidenceError::Claim);
         }
@@ -1546,14 +1552,18 @@ impl SessionMtlsBatchReleaseGateEvidenceV1 {
         if self.original_fixed_pools.configured_lanes != 48
             || self.original_fixed_pools.active_lanes != 48
             || self.original_fixed_pools.idle_lanes != 48
-            || self.supplemental_pools.iter().any(|pool| {
-                pool.configured_lanes != 4 || pool.active_lanes != 0 || pool.idle_lanes != 0
-            })
+            || self.supplemental_pools[0].configured_lanes != 1
+            || self.supplemental_pools[1].configured_lanes != 4
+            || self.supplemental_pools[2].configured_lanes != 1
+            || self
+                .supplemental_pools
+                .iter()
+                .any(|pool| pool.active_lanes != 0 || pool.idle_lanes != 0)
             || self.supplemental_pools[0].setup_successes != 0
-            || self.supplemental_pools[0].setup_failures == 0
+            || self.supplemental_pools[0].setup_failures != 1
             || self.supplemental_pools[1].setup_successes == 0
             || self.supplemental_pools[2].setup_successes != 0
-            || self.supplemental_pools[2].setup_failures == 0
+            || self.supplemental_pools[2].setup_failures != 1
         {
             return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
         }
@@ -3896,6 +3906,9 @@ pub enum QualificationNodeCommandKind {
     ForgetLease,
     /// Shut down the qualification child.
     Shutdown,
+    /// Read the dedicated consumer listener's locally detected peer-credential
+    /// rejection count.
+    ConsumerTlsPeerCredentialRejections,
 }
 
 impl QualificationNodeCommandKind {
@@ -3934,6 +3947,7 @@ impl QualificationNodeCommandKind {
         Self::Release,
         Self::ForgetLease,
         Self::Shutdown,
+        Self::ConsumerTlsPeerCredentialRejections,
     ];
 }
 
@@ -4058,6 +4072,9 @@ pub enum QualificationNodeCommand {
         lease_handle: String,
     },
     Shutdown,
+    /// Return the scalar counter for local peer-credential rejections at the
+    /// dedicated consumer listener TLS accept boundary.
+    ConsumerTlsPeerCredentialRejections,
 }
 
 impl fmt::Debug for QualificationNodeCommand {
@@ -4168,6 +4185,9 @@ impl fmt::Debug for QualificationNodeCommand {
                 formatter.write_str("QualificationNodeCommand::ForgetLease")
             }
             Self::Shutdown => formatter.write_str("QualificationNodeCommand::Shutdown"),
+            Self::ConsumerTlsPeerCredentialRejections => {
+                formatter.write_str("QualificationNodeCommand::ConsumerTlsPeerCredentialRejections")
+            }
         }
     }
 }
@@ -4221,6 +4241,9 @@ impl QualificationNodeCommand {
             Self::Release { .. } => QualificationNodeCommandKind::Release,
             Self::ForgetLease { .. } => QualificationNodeCommandKind::ForgetLease,
             Self::Shutdown => QualificationNodeCommandKind::Shutdown,
+            Self::ConsumerTlsPeerCredentialRejections => {
+                QualificationNodeCommandKind::ConsumerTlsPeerCredentialRejections
+            }
         }
     }
 
@@ -4248,7 +4271,8 @@ impl QualificationNodeCommand {
             | Self::StopTrafficWatch
             | Self::TrafficStatus
             | Self::TrafficStatusSnapshot
-            | Self::Shutdown => Ok(()),
+            | Self::Shutdown
+            | Self::ConsumerTlsPeerCredentialRejections => Ok(()),
             Self::StartStatelessConsumer {
                 consumer_identities,
             } => {
@@ -4695,6 +4719,11 @@ pub enum QualificationNodeReply {
     ShuttingDown,
     Error {
         code: QualificationNodeErrorCode,
+    },
+    /// Scalar proof of peer credentials rejected locally by the dedicated
+    /// consumer listener's TLS accept boundary.
+    ConsumerTlsPeerCredentialRejections {
+        rejections: u64,
     },
 }
 
@@ -5298,7 +5327,7 @@ mod tests {
                 0,
                 1,
                 1,
-                4,
+                1,
                 0,
                 0,
             ),
@@ -5316,7 +5345,7 @@ mod tests {
                 0,
                 1,
                 1,
-                4,
+                1,
                 0,
                 0,
             ),
@@ -5394,6 +5423,8 @@ mod tests {
                 },
             ],
             positive_new_credential_new_server_statuses: 4,
+            old_credential_new_only_server_tls_peer_credential_rejected: true,
+            new_credential_old_root_server_tls_peer_credential_rejected: true,
         }
     }
 
@@ -5521,6 +5552,22 @@ mod tests {
             Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
         );
 
+        let mut missing_old_credential_rejection = batch_release_gate_evidence_fixture();
+        missing_old_credential_rejection
+            .old_credential_new_only_server_tls_peer_credential_rejected = false;
+        assert_eq!(
+            missing_old_credential_rejection.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+
+        let mut missing_new_credential_rejection = batch_release_gate_evidence_fixture();
+        missing_new_credential_rejection
+            .new_credential_old_root_server_tls_peer_credential_rejected = false;
+        assert_eq!(
+            missing_new_credential_rejection.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+
         let mut unknown = serde_json::to_value(batch_release_gate_evidence_fixture())
             .expect("encode evidence value");
         unknown["unexpected"] = serde_json::Value::Bool(true);
@@ -5591,6 +5638,26 @@ mod tests {
             .expect("closed schema has required fields")
             .iter()
             .any(|field| field == "aggregate_setup_attempts"));
+        assert!(schema["required"]
+            .as_array()
+            .expect("closed schema has required fields")
+            .iter()
+            .any(|field| field == "old_credential_new_only_server_tls_peer_credential_rejected"));
+        assert!(schema["required"]
+            .as_array()
+            .expect("closed schema has required fields")
+            .iter()
+            .any(|field| field == "new_credential_old_root_server_tls_peer_credential_rejected"));
+        assert_eq!(
+            schema["properties"]["old_credential_new_only_server_tls_peer_credential_rejected"]
+                ["const"],
+            true
+        );
+        assert_eq!(
+            schema["properties"]["new_credential_old_root_server_tls_peer_credential_rejected"]
+                ["const"],
+            true
+        );
         assert_local_schema_refs_resolve(&schema);
         for phase in [
             "phase-01-initial-singleton",
@@ -5875,6 +5942,7 @@ mod tests {
                 lease_handle: "lease".to_owned(),
             },
             QualificationNodeCommand::Shutdown,
+            QualificationNodeCommand::ConsumerTlsPeerCredentialRejections,
         ];
         let kinds = commands
             .iter()
@@ -6672,6 +6740,25 @@ mod tests {
         assert!(!rendered.contains("node.sqlite"));
         assert!(!rendered.contains("127.0.0.1"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn consumer_tls_peer_credential_rejection_control_frames_are_closed() {
+        let command = QualificationNodeCommand::ConsumerTlsPeerCredentialRejections;
+        assert_eq!(
+            serde_json::to_string(&command).expect("encode rejection command"),
+            r#"{"command":"consumer_tls_peer_credential_rejections"}"#
+        );
+        assert!(command.validate().is_ok());
+
+        let reply = QualificationNodeReply::ConsumerTlsPeerCredentialRejections { rejections: 7 };
+        let encoded = serde_json::to_vec(&reply).expect("encode rejection reply");
+        let decoded = serde_json::from_slice::<QualificationNodeReply>(&encoded)
+            .expect("round-trip rejection reply");
+        assert!(matches!(
+            decoded,
+            QualificationNodeReply::ConsumerTlsPeerCredentialRejections { rejections: 7 }
+        ));
     }
 
     #[test]

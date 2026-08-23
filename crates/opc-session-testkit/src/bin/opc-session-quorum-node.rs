@@ -1206,6 +1206,16 @@ impl QualificationNode {
                 QualificationNodeReply::LeaseHandleForgotten
             }
             QualificationNodeCommand::Shutdown => QualificationNodeReply::ShuttingDown,
+            QualificationNodeCommand::ConsumerTlsPeerCredentialRejections => {
+                match self.consumer_server.as_ref() {
+                    Some(server) => QualificationNodeReply::ConsumerTlsPeerCredentialRejections {
+                        rejections: server.tls_peer_credential_rejections(),
+                    },
+                    None => QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    },
+                }
+            }
         }
     }
 
