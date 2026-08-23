@@ -813,6 +813,61 @@ impl SessionQuorumConsumer for CommitThenLoseConsumerResponse {
     }
 }
 
+/// Records only wire operations while delegating every authority and physical
+/// transition decision to the concrete consensus consumer service.
+struct CountingFencedConsumerOperations {
+    inner: Arc<dyn SessionQuorumConsumer>,
+    capability_calls: AtomicUsize,
+    transition_calls: AtomicUsize,
+    status_calls: AtomicUsize,
+}
+
+impl CountingFencedConsumerOperations {
+    fn new(inner: Arc<dyn SessionQuorumConsumer>) -> Self {
+        Self {
+            inner,
+            capability_calls: AtomicUsize::new(0),
+            transition_calls: AtomicUsize::new(0),
+            status_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionQuorumConsumer for CountingFencedConsumerOperations {
+    async fn execute(
+        &self,
+        identity: &SessionConsumerAuthorization,
+        request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        match request.operation() {
+            SessionConsumerOperation::FencedTransitionCapability => {
+                self.capability_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            SessionConsumerOperation::FencedTransition { .. } => {
+                self.transition_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            SessionConsumerOperation::FencedTransitionStatus { .. } => {
+                self.status_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        self.inner.execute(identity, request).await
+    }
+
+    async fn watch(
+        &self,
+        identity: &SessionConsumerAuthorization,
+        scope: SessionConsumerScope,
+        start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        self.inner.watch(identity, scope, start_sequence).await
+    }
+}
+
 #[derive(Default)]
 struct CountingConsumer {
     calls: AtomicUsize,
@@ -2644,6 +2699,292 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
     );
     persistent.shutdown().await;
     server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_calls() {
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
+    let (leader, _, _) = fleet.observed_leader();
+    let follower = (leader + 1) % THREE_VOTER_COUNT;
+
+    // This is the state-voter startup action ePDG performs before the
+    // consumer listener becomes Ready. It commits the exact-scope certificate
+    // once and the selected forwarding voter has locally observed it before
+    // this test exposes the protected SWm chain.
+    fleet.stores[follower]
+        .activate_fenced_transition_capability()
+        .await
+        .expect("activate V1 before protected consumer readiness");
+    fleet.wait_all_ready().await;
+    let client_spiffe = spiffe("protected-warmed-transition-client");
+
+    // A worker is a separate process from all state voters. Give it one
+    // authenticated persistent client per public state-voter listener, then
+    // require the concrete physical adapter to prewarm all three exact
+    // bindings before it may be constructed.
+    let mut servers = Vec::with_capacity(THREE_VOTER_COUNT);
+    let mut addresses = Vec::with_capacity(THREE_VOTER_COUNT);
+    let mut counted_services = Vec::with_capacity(THREE_VOTER_COUNT);
+    for index in 0..THREE_VOTER_COUNT {
+        let counted = Arc::new(CountingFencedConsumerOperations::new(Arc::new(
+            fleet.stores[index].consumer_service(),
+        )));
+        let (server, address) = SessionQuorumConsumerServer::new(
+            Arc::clone(&counted) as Arc<dyn SessionQuorumConsumer>,
+            pki.server_config(&three_voter_spiffe(index)),
+            three_voter_authorizer(&fleet.stores[index], &client_spiffe).await,
+        )
+        .listen(
+            "127.0.0.1:0"
+                .parse::<SocketAddr>()
+                .expect("protected warmed listener"),
+        )
+        .await
+        .expect("start protected warmed listener");
+        servers.push(server);
+        addresses.push(address);
+        counted_services.push(counted);
+    }
+    let persistent_voters = addresses
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, address)| {
+            PersistentSessionConsumerClient::try_from_stateless(
+                StatelessSessionConsumerClient::new_with_resolver(
+                    Arc::new(move || Box::pin(async move { Ok(address) })),
+                    rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                    fleet.voter_authority(index),
+                    pki.client_config(&client_spiffe),
+                ),
+                PersistentSessionConsumerConfig::default(),
+            )
+            .expect("persistent protected voter consumer")
+        })
+        .collect::<Vec<_>>();
+
+    let foreign_client_spiffe = spiffe("protected-warmed-foreign-client");
+    let follower_address = addresses[follower];
+    let foreign_identity = PersistentSessionConsumerClient::try_from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            Arc::new(move || Box::pin(async move { Ok(follower_address) })),
+            rustls_pki_types::ServerName::IpAddress(follower_address.ip().into()),
+            fleet.voter_authority(follower),
+            pki.client_config(&foreign_client_spiffe),
+        ),
+        PersistentSessionConsumerConfig::default(),
+    )
+    .expect("foreign-identity persistent consumer");
+    assert!(
+        SessionConsumerFencedTransitionBackend::persistent_exact_voter_prewarm_backends(
+            persistent_voters[..THREE_VOTER_COUNT - 1].iter().cloned(),
+        )
+        .await
+        .is_err(),
+        "a missing exact voter cannot make a worker Ready"
+    );
+    let mut duplicate_voters = persistent_voters.clone();
+    duplicate_voters[follower] = duplicate_voters[leader].clone();
+    assert!(
+        SessionConsumerFencedTransitionBackend::persistent_exact_voter_prewarm_backends(
+            duplicate_voters,
+        )
+        .await
+        .is_err(),
+        "a duplicate voter cannot be substituted for the exact roster"
+    );
+    let mut changed_identity_voters = persistent_voters.clone();
+    changed_identity_voters[follower] = foreign_identity;
+    assert!(
+        SessionConsumerFencedTransitionBackend::persistent_exact_voter_prewarm_backends(
+            changed_identity_voters,
+        )
+        .await
+        .is_err(),
+        "a changed local SPIFFE identity cannot be substituted into the exact worker roster"
+    );
+    assert_eq!(
+        0,
+        counted_services
+            .iter()
+            .map(|service| service.capability_calls.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        "semantic roster validation fails before any capability RPC"
+    );
+    let journal_directory = tempfile::tempdir().expect("protected warmed journal directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(
+            journal_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make protected warmed journal directory private");
+    }
+    let journal = Arc::new(
+        PreparedFencedTransitionJournal::create_new(
+            journal_directory.path().join("prepared.sqlite"),
+            PreparedFencedTransitionJournalKey::from_bytes([0x44; 32]),
+        )
+        .expect("create protected warmed journal"),
+    );
+    let mut physical_backends =
+        SessionConsumerFencedTransitionBackend::persistent_exact_voter_prewarm_backends(
+            persistent_voters.clone(),
+        )
+        .await
+        .expect("prewarmed authenticated physical consumer backends");
+    assert_eq!(
+        THREE_VOTER_COUNT,
+        counted_services
+            .iter()
+            .map(|service| service.capability_calls.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        "worker prewarm makes exactly one authenticated capability query per exact voter"
+    );
+    for backend in &physical_backends {
+        assert_eq!(
+            Some(AtomicFencedTransitionCapability::V1),
+            backend
+                .fenced_transition_capability()
+                .await
+                .expect("each prewarmed adapter has a local V1 readiness result")
+        );
+    }
+    assert_eq!(
+        THREE_VOTER_COUNT,
+        counted_services
+            .iter()
+            .map(|service| service.capability_calls.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        "every returned adapter shares the one exact roster prewarm"
+    );
+    let physical = Arc::new(physical_backends.remove(follower));
+    let outer: Arc<dyn SessionBackend> = Arc::new(
+        EncryptingSessionBackend::new(
+            physical,
+            CountingKeyProvider::with_active_session_key(),
+            "protected-warmed-consumer-chain",
+        )
+        .with_fenced_transition_journal(journal),
+    );
+
+    let before_proposal = fleet.stores[leader]
+        .status()
+        .last_log_index
+        .expect("activation log index");
+    fleet.reset_read_barrier_calls();
+    let prepared = outer
+        .prepare_fenced_transition(fenced_create_request(0xC2))
+        .await
+        .expect("prepare exact protected physical token without a capability RPC");
+    assert_eq!(
+        THREE_VOTER_COUNT,
+        counted_services
+            .iter()
+            .map(|service| service.capability_calls.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        "prepare relies on exact token construction, journal health, and pre-Ready readiness"
+    );
+
+    outer
+        .fenced_transition(&prepared)
+        .await
+        .expect("one real protected physical transition");
+    assert_eq!(
+        1,
+        counted_services[follower]
+            .transition_calls
+            .load(Ordering::SeqCst),
+        "the exact protected token reaches the concrete consumer boundary once"
+    );
+    assert_eq!(
+        THREE_VOTER_COUNT,
+        counted_services
+            .iter()
+            .map(|service| service.capability_calls.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        "execute must not add a standalone capability wire call before its physical B1/P1 path"
+    );
+    assert_eq!(
+        0,
+        fleet.read_barrier_calls(),
+        "the warmed physical transition has no standalone V1 capability wire probes; its one typed B1 stays inside the leader's OpenRaft admission"
+    );
+    assert_eq!(
+        Some(before_proposal + 1),
+        fleet.stores[leader].status().last_log_index,
+        "the warmed physical transition appends exactly one proposal"
+    );
+
+    let before_status_log = fleet.stores[leader].status().last_log_index;
+    let before_status_barriers = fleet.read_barrier_calls();
+    assert!(matches!(
+        outer
+            .fenced_transition_status(&prepared)
+            .await
+            .expect("read exact retained protected receipt"),
+        FencedTransitionStatus::Recorded(ref outcome) if outcome.is_ok()
+    ));
+    assert_eq!(
+        1,
+        counted_services[follower]
+            .status_calls
+            .load(Ordering::SeqCst),
+        "status reaches its separate bounded receipt lookup once"
+    );
+    assert_eq!(
+        THREE_VOTER_COUNT,
+        counted_services
+            .iter()
+            .map(|service| service.capability_calls.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        "status remains a read-only receipt lookup without a capability wire call"
+    );
+    assert_eq!(
+        before_status_barriers + 1,
+        fleet.read_barrier_calls(),
+        "status retains one bounded forwarded leader-linearized read"
+    );
+    assert_eq!(
+        before_status_log,
+        fleet.stores[leader].status().last_log_index,
+        "status remains read-only and never appends a proposal"
+    );
+    persistent_voters[follower]
+        .request_reauthentication()
+        .expect("rotate same semantic client identity");
+    assert!(
+        outer
+            .fenced_transition_capability()
+            .await
+            .expect("same-SPIFFE reauthentication preserves local readiness")
+            .is_some(),
+        "the outer protected wrapper preserves its own capability refinement"
+    );
+    assert_eq!(
+        THREE_VOTER_COUNT,
+        counted_services
+            .iter()
+            .map(|service| service.capability_calls.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        "same-SPIFFE reauthentication does not turn into a hot-path capability call"
+    );
+    assert_eq!(
+        1,
+        counted_services[follower]
+            .transition_calls
+            .load(Ordering::SeqCst),
+        "the reauthentication proof remains prepare-only"
+    );
+    for client in persistent_voters {
+        client.shutdown().await;
+    }
+    for server in servers {
+        server.abort_and_wait().await;
+    }
 }
 
 #[cfg(feature = "test-control")]

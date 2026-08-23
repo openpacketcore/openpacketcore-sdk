@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use opc_consensus::{
-    decode_bounded, derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch,
-    ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    decode_bounded, derive_configuration_id, encode_bounded, ConsensusClusterId,
+    ConsensusConfigurationEpoch, ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
@@ -39,7 +40,7 @@ use opc_session_store::{
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use rusqlite::OptionalExtension;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -264,6 +265,27 @@ struct FencedTransitionCapabilityProbeV1 {
     schema_version: u16,
 }
 
+/// Wire-identical test shape for the private V1 capability reply. This lets
+/// the handler below distinguish a peer's explicit protocol `Unsupported`
+/// result from a transport/protocol call failure.
+#[derive(Serialize)]
+#[allow(dead_code)]
+enum FencedTransitionCapabilityReplyV1 {
+    V1,
+    Unsupported,
+}
+
+/// The activation certificate was added after the signed 36720e58 baseline.
+/// Its probe has two required postcard fields; that baseline's one-field V1
+/// decoder rejects the trailing field. This local handler emulates exactly
+/// that peer behavior while retaining real authenticated Raft and ordinary
+/// read-barrier traffic for the surrounding three-voter cluster.
+#[derive(Deserialize)]
+struct FencedTransitionActivationCapabilityProbeV2 {
+    activation_probe_schema_version: u16,
+    activation_command_schema_version: u16,
+}
+
 struct RejectFencedTransitionCapabilityProbeHandler {
     inner: Arc<dyn SessionConsensusRpcHandler>,
 }
@@ -287,6 +309,46 @@ impl SessionConsensusRpcHandler for RejectFencedTransitionCapabilityProbeHandler
                 Ok(FencedTransitionCapabilityProbeV1 { schema_version: 1 })
             )
         {
+            return SessionConsensusWireResponse {
+                result: Ok(
+                    encode_bounded(&FencedTransitionCapabilityReplyV1::Unsupported)
+                        .expect("bounded explicit unsupported capability reply"),
+                ),
+            };
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
+
+struct Baseline36720ActivationProbeHandler {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+}
+
+impl fmt::Debug for Baseline36720ActivationProbeHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Baseline36720ActivationProbeHandler(<redacted>)")
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for Baseline36720ActivationProbeHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if request.family == SessionConsensusRpcFamily::ReadBarrier
+            && matches!(
+                decode_bounded::<FencedTransitionActivationCapabilityProbeV2>(&request.payload),
+                Ok(FencedTransitionActivationCapabilityProbeV2 {
+                    activation_probe_schema_version: 2,
+                    activation_command_schema_version: 1,
+                })
+            )
+        {
+            // The signed baseline accepts the established unit barrier and
+            // one-field V1 capability probe, but rejects this new complete
+            // activation probe before it can ever see a new log intent.
             return SessionConsensusWireResponse {
                 result: Err(SessionConsensusPeerError::Protocol),
             };
@@ -834,6 +896,15 @@ impl TestCluster {
             .get(&(source, target))
             .expect("outbound path")
             .install(Arc::new(RejectFencedTransitionCapabilityProbeHandler {
+                inner: self.stores[target].rpc_handler(),
+            }));
+    }
+
+    fn emulate_baseline_36720_activation_probe_rejection(&self, source: usize, target: usize) {
+        self.paths
+            .get(&(source, target))
+            .expect("outbound path")
+            .install(Arc::new(Baseline36720ActivationProbeHandler {
                 inner: self.stores[target].rpc_handler(),
             }));
     }
@@ -4231,7 +4302,7 @@ async fn state_voter_activation_avoids_reprobe_on_rejecting_peer_path() {
 }
 
 #[tokio::test]
-async fn state_voter_activation_rejects_a_missing_exact_v1_peer_before_proposal() {
+async fn state_voter_activation_rejects_baseline_36720_peer_before_proposal() {
     let cluster = TestCluster::start().await;
     let (leader, _, _) = cluster.observed_leader();
     let rejected_peer = (leader + 1) % MEMBER_COUNT;
@@ -4242,16 +4313,16 @@ async fn state_voter_activation_rejects_a_missing_exact_v1_peer_before_proposal(
         .expect("formed cluster has a durable log head");
 
     // This preserves ordinary authenticated Raft and read-barrier traffic but
-    // refuses precisely the V1 capability probe from the current leader.
-    cluster.reject_fenced_transition_capability_probe(leader, rejected_peer);
+    // emulates a signed 36720e58 peer that can answer the old V1 probe yet
+    // cannot decode the new activation-command probe or its log intent.
+    cluster.emulate_baseline_36720_activation_probe_rejection(leader, rejected_peer);
     let result = store.activate_fenced_transition_capability().await;
     assert!(
         matches!(
             result,
-            Err(StoreError::CapabilityNotSupported(ref capability))
-                if capability == "atomic_fenced_transition_v1"
+            Err(StoreError::BackendUnavailable(_))
         ),
-        "a missing exact V1 voter fails the startup preflight closed"
+        "a baseline peer's activation-probe decode failure is transiently unavailable and fails closed"
     );
     assert_eq!(
         store.status().last_log_index,
@@ -4259,6 +4330,40 @@ async fn state_voter_activation_rejects_a_missing_exact_v1_peer_before_proposal(
         "a failed unanimous V1 proof cannot append a certificate proposal"
     );
     cluster.restore_current_rpc_handler(leader, rejected_peer);
+}
+
+#[tokio::test]
+async fn state_voter_activation_treats_an_unavailable_exact_probe_as_transient() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let unavailable_peer = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[leader];
+    let before = store
+        .status()
+        .last_log_index
+        .expect("formed cluster has a durable log head");
+
+    // The leader still has the other voter for its typed B1, but activation
+    // requires every exact voter to answer the new command probe. A missing
+    // peer is a retryable inability to establish unanimity, not an explicit
+    // capability declaration.
+    cluster
+        .paths
+        .get(&(leader, unavailable_peer))
+        .expect("leader outbound peer path")
+        .set_enabled(false);
+    let result = store.activate_fenced_transition_capability().await;
+    assert!(matches!(result, Err(StoreError::BackendUnavailable(_))));
+    assert_eq!(
+        store.status().last_log_index,
+        Some(before),
+        "a transient probe failure cannot append an activation proposal"
+    );
+    cluster
+        .paths
+        .get(&(leader, unavailable_peer))
+        .expect("leader outbound peer path")
+        .set_enabled(true);
 }
 
 #[tokio::test]

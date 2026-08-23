@@ -440,11 +440,15 @@ impl<'de> Deserialize<'de> for BoundedRecordExpiryPreflights {
 enum ForwardMutationReply {
     Applied(Box<SessionConsensusResponse>),
     RecordExpiryPreflight(Result<(), StoreError>),
-    FencedTransitionActivation(Result<FencedTransitionActivationReply, StoreError>),
     NotLeader {
         leader: Option<SessionConsensusNodeId>,
     },
     Unavailable,
+    // This is deliberately appended. ForwardMutation is a postcard enum used
+    // by already-deployed state voters, so changing the discriminants of
+    // NotLeader or Unavailable would turn an ordinary mixed-version rejection
+    // into a misinterpreted successful control response.
+    FencedTransitionActivation(Result<FencedTransitionActivationReply, StoreError>),
 }
 
 /// Private forwarding acknowledgement for the state-voter-only V1 startup
@@ -497,6 +501,40 @@ struct FencedTransitionCapabilityProbe {
 enum FencedTransitionCapabilityReply {
     V1,
     Unsupported,
+}
+
+/// Probe for the *new* cluster-scope activation command.  This is distinct
+/// from the V1 transition probe: a peer that can execute a V1 fenced
+/// transition might still predate `ActivateFencedTransitionCapability` and
+/// therefore must not be treated as able to apply its certificate. The added
+/// required field means the baseline V1 decoder rejects this complete
+/// postcard value; the bumped first field also makes a permissive legacy
+/// decoder return Unsupported rather than V1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FencedTransitionActivationCapabilityProbe {
+    activation_probe_schema_version: u16,
+    activation_command_schema_version: u16,
+}
+
+const FENCED_TRANSITION_ACTIVATION_PROBE_SCHEMA_V1: u16 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum FencedTransitionActivationCapabilityReply {
+    V1,
+    Unsupported,
+}
+
+/// One exact peer's response to a pre-activation compatibility probe.
+///
+/// An explicit authenticated `Unsupported` is a permanent protocol fact. A
+/// missing, malformed, timed-out, or otherwise failed RPC is only a transient
+/// inability to establish unanimity and must never be recast as incompatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencedTransitionCapabilityProbeOutcome {
+    V1,
+    Unsupported,
+    Unavailable,
 }
 
 /// Exact V1 admission at one linearizable membership scope.
@@ -1026,7 +1064,7 @@ impl ConsensusSessionStore {
             .map_err(|_| consensus_unavailable())?;
         self.require_application_traffic_authority_before(deadline)
             .await?;
-        self.require_fenced_transition_capability_after_authority(deadline)
+        self.require_fenced_transition_capability_after_authority(false, deadline)
             .await
     }
 
@@ -1037,6 +1075,7 @@ impl ConsensusSessionStore {
     async fn require_fenced_transition_capability_after_read_admit(
         &self,
         read_admit: &LinearizableReadAdmit<SessionConsensusNodeId>,
+        require_activation_command: bool,
         deadline: tokio::time::Instant,
     ) -> Result<FencedTransitionCapabilityAdmission, StoreError> {
         self.require_exact_membership_admission()?;
@@ -1047,8 +1086,11 @@ impl ConsensusSessionStore {
             .map_err(|_| consensus_unavailable())?;
         self.require_application_traffic_authority_before(deadline)
             .await?;
-        self.require_fenced_transition_capability_after_authority(deadline)
-            .await
+        self.require_fenced_transition_capability_after_authority(
+            require_activation_command,
+            deadline,
+        )
+        .await
     }
 
     /// Verify the local V1 capability and, before activation, every exact
@@ -1056,6 +1098,7 @@ impl ConsensusSessionStore {
     /// application-traffic authority.
     async fn require_fenced_transition_capability_after_authority(
         &self,
+        require_activation_command: bool,
         deadline: tokio::time::Instant,
     ) -> Result<FencedTransitionCapabilityAdmission, StoreError> {
         let expected_scope = self.current_scope()?;
@@ -1086,21 +1129,55 @@ impl ConsensusSessionStore {
             .copied()
             .filter(|member| *member != self.inner.local_node_id)
             .map(|member| async move {
-                self.call_peer::<_, FencedTransitionCapabilityReply>(
-                    member,
-                    SessionConsensusRpcFamily::ReadBarrier,
-                    &FencedTransitionCapabilityProbe {
-                        schema_version: FENCED_TRANSITION_SCHEMA_V1,
-                    },
-                    deadline,
-                )
-                .await
+                if require_activation_command {
+                    match self
+                        .call_peer::<_, FencedTransitionActivationCapabilityReply>(
+                            member,
+                            SessionConsensusRpcFamily::ReadBarrier,
+                            &FencedTransitionActivationCapabilityProbe {
+                                activation_probe_schema_version:
+                                    FENCED_TRANSITION_ACTIVATION_PROBE_SCHEMA_V1,
+                                activation_command_schema_version: FENCED_TRANSITION_SCHEMA_V1,
+                            },
+                            deadline,
+                        )
+                        .await
+                    {
+                        Ok(FencedTransitionActivationCapabilityReply::V1) => {
+                            FencedTransitionCapabilityProbeOutcome::V1
+                        }
+                        Ok(FencedTransitionActivationCapabilityReply::Unsupported) => {
+                            FencedTransitionCapabilityProbeOutcome::Unsupported
+                        }
+                        Err(_) => FencedTransitionCapabilityProbeOutcome::Unavailable,
+                    }
+                } else {
+                    match self
+                        .call_peer::<_, FencedTransitionCapabilityReply>(
+                            member,
+                            SessionConsensusRpcFamily::ReadBarrier,
+                            &FencedTransitionCapabilityProbe {
+                                schema_version: FENCED_TRANSITION_SCHEMA_V1,
+                            },
+                            deadline,
+                        )
+                        .await
+                    {
+                        Ok(FencedTransitionCapabilityReply::V1) => {
+                            FencedTransitionCapabilityProbeOutcome::V1
+                        }
+                        Ok(FencedTransitionCapabilityReply::Unsupported) => {
+                            FencedTransitionCapabilityProbeOutcome::Unsupported
+                        }
+                        Err(_) => FencedTransitionCapabilityProbeOutcome::Unavailable,
+                    }
+                }
             });
-        if futures_util::future::join_all(probes)
-            .await
-            .into_iter()
-            .any(|reply| !matches!(reply, Ok(FencedTransitionCapabilityReply::V1)))
-        {
+        let outcomes = futures_util::future::join_all(probes).await;
+        if outcomes.contains(&FencedTransitionCapabilityProbeOutcome::Unavailable) {
+            return Err(consensus_unavailable());
+        }
+        if outcomes.contains(&FencedTransitionCapabilityProbeOutcome::Unsupported) {
             return Err(unsupported_fenced_transition());
         }
         if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
@@ -2942,17 +3019,28 @@ impl ConsensusSessionStore {
 
         let fenced_transition_admission = if let Some(read_admit) = fenced_read_admit {
             let capability = match self
-                .require_fenced_transition_capability_after_read_admit(&read_admit, deadline)
+                .require_fenced_transition_capability_after_read_admit(
+                    &read_admit,
+                    activation_preflight,
+                    deadline,
+                )
                 .await
             {
                 Ok(capability) => capability,
                 Err(error) => {
                     return if activation_preflight {
                         ForwardMutationReply::FencedTransitionActivation(Err(error))
-                    } else {
+                    } else if matches!(error, StoreError::CapabilityNotSupported(_)) {
                         ForwardMutationReply::Applied(Box::new(SessionConsensusResponse::rejected(
                             unsupported_fenced_transition(),
                         )))
+                    } else {
+                        // A stale typed admission, changed scope, or revoked
+                        // application authority is transient.  Classifying it
+                        // as permanent incompatibility would hide the retry
+                        // route and, more importantly, blur the no-proposal
+                        // distinction at this exact pre-write boundary.
+                        ForwardMutationReply::Unavailable
                     };
                 }
             };
@@ -4641,6 +4729,21 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                         .unwrap_or_else(tokio::time::Instant::now);
                     return encode_service_reply(&self.store.local_read_barrier(deadline).await);
                 }
+                if let Ok(probe) =
+                    decode_bounded::<FencedTransitionActivationCapabilityProbe>(&request.payload)
+                {
+                    let reply = if probe.activation_probe_schema_version
+                        == FENCED_TRANSITION_ACTIVATION_PROBE_SCHEMA_V1
+                        && probe.activation_command_schema_version == FENCED_TRANSITION_SCHEMA_V1
+                        && self.store.local_fenced_transition_capability()
+                            == AtomicFencedTransitionCapability::V1
+                    {
+                        FencedTransitionActivationCapabilityReply::V1
+                    } else {
+                        FencedTransitionActivationCapabilityReply::Unsupported
+                    };
+                    return encode_service_reply(&reply);
+                }
                 let probe =
                     match decode_bounded::<FencedTransitionCapabilityProbe>(&request.payload) {
                         Ok(probe) => probe,
@@ -6041,6 +6144,7 @@ mod membership_tests {
         serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
         AES_256_GCM_SIV_NONCE_LEN,
     };
+    use serde::{Deserialize, Serialize};
 
     use super::*;
     use crate::backend::ReplicationOp;
@@ -8216,6 +8320,42 @@ mod membership_tests {
             Some(before),
             "caller-selected scope, voter, or epoch material has no proposal effect"
         );
+    }
+
+    #[test]
+    fn forward_mutation_reply_appends_activation_without_retagging_baseline_control_replies() {
+        // This is the postcard layout at signed baseline 36720e58. The new
+        // acknowledgement must remain appended after Unavailable so a
+        // mixed-version follower never misreads an ordinary control reply.
+        #[derive(Serialize, Deserialize)]
+        enum BaselineForwardMutationReply {
+            Applied(Box<SessionConsensusResponse>),
+            RecordExpiryPreflight(Result<(), StoreError>),
+            NotLeader {
+                leader: Option<SessionConsensusNodeId>,
+            },
+            Unavailable,
+        }
+
+        let baseline_not_leader = encode_bounded(&BaselineForwardMutationReply::NotLeader {
+            leader: Some(node(1)),
+        })
+        .expect("encode baseline NotLeader");
+        assert!(matches!(
+            decode_bounded::<ForwardMutationReply>(&baseline_not_leader)
+                .expect("current decoder preserves baseline NotLeader"),
+            ForwardMutationReply::NotLeader {
+                leader: Some(leader)
+            } if leader == node(1)
+        ));
+
+        let current_unavailable =
+            encode_bounded(&ForwardMutationReply::Unavailable).expect("encode current Unavailable");
+        assert!(matches!(
+            decode_bounded::<BaselineForwardMutationReply>(&current_unavailable)
+                .expect("baseline decoder preserves current Unavailable"),
+            BaselineForwardMutationReply::Unavailable
+        ));
     }
 
     #[tokio::test]

@@ -3981,6 +3981,63 @@ impl SessionConsumerFencedTransitionClient {
     }
 }
 
+/// Stable semantic authority retained after one exact pre-Ready capability
+/// query to every configured state voter. Certificate epochs and explicit
+/// reauthentication are deliberately absent: neither changes the authenticated
+/// SPIFFE contract, and each later physical RPC still completes a fresh mTLS
+/// handshake as required by its transport lifecycle.
+#[derive(Clone, PartialEq, Eq)]
+struct ConsumerFencedTransitionVoterReadiness {
+    scope: SessionConsumerScope,
+    node_id: SessionConsensusNodeId,
+    voter_count: usize,
+    roster_commitment: [u8; 32],
+    voter_tls_identity: String,
+    local_spiffe_identity_commitment: [u8; 32],
+}
+
+/// Opaque, client-owned readiness for the exact canonical consumer roster.
+///
+/// This is intentionally not a store witness and cannot cross a process
+/// boundary. The worker creates it only by querying every exact remote voter
+/// before becoming Ready. The concrete consensus operation remains the final
+/// authority for every transition.
+#[derive(Clone)]
+struct ActivatedConsumerFencedTransitionReadiness {
+    voters: Arc<[ConsumerFencedTransitionVoterReadiness]>,
+}
+
+fn persistent_fenced_transition_voter_readiness(
+    client: &PersistentSessionConsumerClient,
+) -> Option<ConsumerFencedTransitionVoterReadiness> {
+    let voter = &client.pool.client.voter;
+    Some(ConsumerFencedTransitionVoterReadiness {
+        scope: voter.scope(),
+        node_id: voter.node_id(),
+        voter_count: voter.voter_count(),
+        roster_commitment: voter.roster_commitment(),
+        voter_tls_identity: voter.tls_identity().to_owned(),
+        local_spiffe_identity_commitment: client
+            .pool
+            .client
+            .tls_config
+            .local_spiffe_identity_commitment()?,
+    })
+}
+
+impl ActivatedConsumerFencedTransitionReadiness {
+    fn is_current_for(&self, client: &PersistentSessionConsumerClient) -> bool {
+        let Some(current) = persistent_fenced_transition_voter_readiness(client) else {
+            return false;
+        };
+        self.voters.iter().any(|voter| voter == &current)
+    }
+}
+
+fn activated_consumer_fenced_transition_readiness_unavailable() -> StoreError {
+    StoreError::BackendUnavailable("authenticated consumer activation readiness unavailable".into())
+}
+
 /// Narrow [`SessionBackend`] adapter for the atomic fenced-transition subset
 /// of an authenticated consumer client.
 ///
@@ -3994,6 +4051,7 @@ impl SessionConsumerFencedTransitionClient {
 pub struct SessionConsumerFencedTransitionBackend {
     client: SessionConsumerFencedTransitionClient,
     binding_commitment: [u8; 32],
+    activated_readiness: Option<ActivatedConsumerFencedTransitionReadiness>,
 }
 
 /// Redacted construction failure for a protected prepared-checkpoint
@@ -4151,6 +4209,16 @@ fn prepared_router_roster_is_exact(clients: &[PersistentSessionConsumerClient]) 
     })
 }
 
+fn consumer_fenced_transition_readiness_roster_is_exact(
+    voters: &[ConsumerFencedTransitionVoterReadiness],
+) -> bool {
+    let mut node_ids = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    voters.iter().all(|voter| {
+        node_ids.insert(voter.node_id) && identities.insert(voter.voter_tls_identity.as_str())
+    })
+}
+
 #[cfg(test)]
 fn prepared_router_roster_is_distinct<'a>(identities: impl IntoIterator<Item = &'a str>) -> bool {
     let mut seen = BTreeSet::new();
@@ -4176,6 +4244,7 @@ impl SessionConsumerFencedTransitionBackend {
         Ok(Self {
             client: SessionConsumerFencedTransitionClient::Stateless(Box::new(client)),
             binding_commitment,
+            activated_readiness: None,
         })
     }
 
@@ -4195,7 +4264,110 @@ impl SessionConsumerFencedTransitionBackend {
         Ok(Self {
             client: SessionConsumerFencedTransitionClient::Persistent(client),
             binding_commitment,
+            activated_readiness: None,
         })
+    }
+
+    /// Construct one physical backend per voter after one off-hot-path exact
+    /// prewarm of the complete configured state-voter roster.
+    ///
+    /// A worker calls this only after every state voter has durably activated
+    /// the V1 transition certificate and before publishing its own Ready
+    /// state. The supplied persistent clients must be the complete canonical
+    /// voter roster for one scope. This performs precisely one authenticated
+    /// `FencedTransitionCapability` read per voter, all under the clients'
+    /// existing bounded read policy. A missing voter, changed scope/roster or
+    /// any non-V1/error reply refuses construction; it never falls back to a
+    /// hot-path capability probe.
+    ///
+    /// The returned adapters share one client-owned readiness record bound to
+    /// the exact roster; construction therefore performs N (not N²) startup
+    /// queries for N state voters. The retained readiness binds stable semantic
+    /// authority: exact scope, voter identity, roster commitment, expected
+    /// voter SPIFFE identity, and local SPIFFE identity commitment. Ordinary
+    /// same-identity certificate renewal and explicit reauthentication do not
+    /// invalidate it. A semantic authority change requires reconstruction and
+    /// a new prewarm before the worker can be Ready again.
+    pub async fn persistent_exact_voter_prewarm_backends(
+        voters: impl IntoIterator<Item = PersistentSessionConsumerClient>,
+    ) -> Result<Vec<Self>, StoreError> {
+        let voters: Vec<_> = voters.into_iter().collect();
+        if voters.is_empty() || voters.len() > QUORUM_TOPOLOGY_MAX_MEMBERS {
+            return Err(activated_consumer_fenced_transition_readiness_unavailable());
+        }
+
+        let readiness: Vec<_> = voters
+            .iter()
+            .map(persistent_fenced_transition_voter_readiness)
+            .collect::<Option<_>>()
+            .ok_or_else(activated_consumer_fenced_transition_readiness_unavailable)?;
+        let primary = readiness
+            .first()
+            .ok_or_else(activated_consumer_fenced_transition_readiness_unavailable)?;
+        if readiness.len() != primary.voter_count
+            || primary.voter_count > QUORUM_TOPOLOGY_MAX_MEMBERS
+            || readiness.iter().any(|voter| {
+                voter.scope != primary.scope
+                    || voter.voter_count != primary.voter_count
+                    || voter.roster_commitment != primary.roster_commitment
+                    || voter.local_spiffe_identity_commitment
+                        != primary.local_spiffe_identity_commitment
+            })
+            || !consumer_fenced_transition_readiness_roster_is_exact(&readiness)
+        {
+            return Err(activated_consumer_fenced_transition_readiness_unavailable());
+        }
+
+        let capabilities = futures_util::future::join_all(
+            voters
+                .iter()
+                .map(PersistentSessionConsumerClient::fenced_transition_capability),
+        )
+        .await;
+        for capability in capabilities {
+            match capability? {
+                AtomicFencedTransitionCapability::V1 => {}
+                _ => {
+                    return Err(StoreError::CapabilityNotSupported(
+                        "atomic_fenced_transition_v1".into(),
+                    ));
+                }
+            }
+        }
+
+        // The client configuration is immutable, but read it again after the
+        // fan-out so a dynamic credential controller changing semantic SPIFFE
+        // authority cannot race the prewarm into a usable local fast path.
+        if voters
+            .iter()
+            .map(persistent_fenced_transition_voter_readiness)
+            .collect::<Option<Vec<_>>>()
+            .as_deref()
+            != Some(readiness.as_slice())
+        {
+            return Err(activated_consumer_fenced_transition_readiness_unavailable());
+        }
+
+        let activated_readiness = ActivatedConsumerFencedTransitionReadiness {
+            voters: readiness.into(),
+        };
+        voters
+            .into_iter()
+            .map(|client| {
+                let binding = persistent_fenced_transition_voter_readiness(&client)
+                    .ok_or_else(activated_consumer_fenced_transition_readiness_unavailable)?;
+                let binding_commitment = authenticated_consumer_binding(
+                    Some(binding.local_spiffe_identity_commitment),
+                    binding.scope,
+                )
+                .map_err(|_| activated_consumer_fenced_transition_readiness_unavailable())?;
+                Ok(Self {
+                    client: SessionConsumerFencedTransitionClient::Persistent(client),
+                    binding_commitment,
+                    activated_readiness: Some(activated_readiness.clone()),
+                })
+            })
+            .collect()
     }
 
     fn decode_prepared(
@@ -4315,6 +4487,21 @@ impl SessionBackend for SessionConsumerFencedTransitionBackend {
     async fn fenced_transition_capability(
         &self,
     ) -> Result<Option<AtomicFencedTransitionCapability>, StoreError> {
+        if let Some(readiness) = &self.activated_readiness {
+            return match &self.client {
+                SessionConsumerFencedTransitionClient::Persistent(client)
+                    if readiness.is_current_for(client) =>
+                {
+                    Ok(Some(AtomicFencedTransitionCapability::V1))
+                }
+                SessionConsumerFencedTransitionClient::Stateless(_) => {
+                    Err(activated_consumer_fenced_transition_readiness_unavailable())
+                }
+                SessionConsumerFencedTransitionClient::Persistent(_) => {
+                    Err(activated_consumer_fenced_transition_readiness_unavailable())
+                }
+            };
+        }
         match self.client.capability().await? {
             AtomicFencedTransitionCapability::V1 => Ok(Some(AtomicFencedTransitionCapability::V1)),
             _ => Ok(None),
@@ -4728,6 +4915,23 @@ impl StatelessSessionConsumerClient {
     /// Return the exact quorum scope carried on every request.
     pub const fn scope(&self) -> SessionConsumerScope {
         self.voter.scope()
+    }
+
+    /// Return whether this client is bound to this exact canonical voter.
+    ///
+    /// This compares the client's private transport binding with the opaque,
+    /// store-issued authority. It exposes neither endpoint nor credential
+    /// material and does not grant any additional authority.
+    #[must_use]
+    pub fn is_bound_to_voter_authority(
+        &self,
+        voter_authority: &SessionConsumerVoterAuthority,
+    ) -> bool {
+        self.voter.scope() == voter_authority.scope()
+            && self.voter.node_id() == voter_authority.node_id()
+            && self.voter.voter_count() == voter_authority.voter_count()
+            && self.voter.roster_commitment() == *voter_authority.roster_commitment().as_bytes()
+            && self.voter.tls_identity() == voter_authority.tls_identity()
     }
 
     /// Return redaction-safe current mTLS material health.
@@ -11392,9 +11596,9 @@ mod tests {
         ConsumerHello, ConsumerLeaseWireContext, ConsumerOperationKind, ConsumerServerCancellation,
         ConsumerServerSetupTestHooks, ConsumerSessionLeaseMutationResultWire,
         ConsumerSessionLeaseMutationStatusWire, ConsumerSessionResponseWire, ConsumerSetupPhase,
-        ConsumerSetupPhaseAttempt, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
-        ConsumerWireRequest, ConsumerWireResponse, PersistentCheckedOutConnection,
-        PersistentConsumerCounters, PersistentConsumerIoBarrier,
+        ConsumerSetupPhaseAttempt, ConsumerVoterBinding, ConsumerWatchTerminal,
+        ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
+        PersistentCheckedOutConnection, PersistentConsumerCounters, PersistentConsumerIoBarrier,
         PersistentConsumerReconnectControl, PersistentConsumerShutdownIo,
         PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
         PersistentPreparedCompareAndSetToken, PersistentPreparedLeaseAcquireToken,
@@ -11748,6 +11952,98 @@ mod tests {
             .map(|identity| persistent(voter_authority_for_identity(&max_roster, identity)))
             .collect::<Vec<_>>();
         assert!(PreparedConsumerRouter::persistent(max_clients).is_ok());
+    }
+
+    #[test]
+    fn stateless_client_voter_authority_binding_requires_every_exact_field() {
+        let identities = (0..3)
+            .map(|index| material_spiffe(&format!("authority-binding-voter-{index}")))
+            .collect::<Vec<_>>();
+        let roster = test_consumer_roster_for(&identities);
+        let authority = voter_authority_for_identity(&roster, &identities[0]);
+        let other_voter = voter_authority_for_identity(&roster, &identities[1]);
+        let material =
+            RotatableClientMaterial::new(material_spiffe("authority-binding-client").as_str());
+        let mut client = StatelessSessionConsumerClient::new(
+            "127.0.0.1:9".parse().expect("test socket"),
+            rustls_pki_types::ServerName::try_from("consumer.test").expect("test server name"),
+            authority.clone(),
+            material.config(),
+        );
+
+        assert!(client.is_bound_to_voter_authority(&authority));
+        assert!(
+            !client.is_bound_to_voter_authority(&other_voter),
+            "a different canonical voter has a different node and TLS identity"
+        );
+
+        let foreign_identities = (0..5)
+            .map(|index| material_spiffe(&format!("foreign-authority-binding-voter-{index}")))
+            .collect::<Vec<_>>();
+        let foreign_roster = test_consumer_roster_for(&foreign_identities);
+        let foreign_authority =
+            voter_authority_for_identity(&foreign_roster, &foreign_identities[0]);
+        assert!(
+            !client.is_bound_to_voter_authority(&foreign_authority),
+            "a foreign canonical authority never matches"
+        );
+
+        client.voter = ConsumerVoterBinding::Test {
+            scope: authority.scope(),
+            node_id: authority.node_id(),
+            voter_count: authority.voter_count(),
+            roster_commitment: *authority.roster_commitment().as_bytes(),
+            tls_identity: authority.tls_identity().to_owned(),
+        };
+        assert!(client.is_bound_to_voter_authority(&authority));
+
+        client.voter = ConsumerVoterBinding::Test {
+            scope: authority.scope(),
+            node_id: other_voter.node_id(),
+            voter_count: authority.voter_count(),
+            roster_commitment: *authority.roster_commitment().as_bytes(),
+            tls_identity: authority.tls_identity().to_owned(),
+        };
+        assert!(!client.is_bound_to_voter_authority(&authority));
+
+        client.voter = ConsumerVoterBinding::Test {
+            scope: authority.scope(),
+            node_id: authority.node_id(),
+            voter_count: authority.voter_count(),
+            tls_identity: other_voter.tls_identity().to_owned(),
+            roster_commitment: *authority.roster_commitment().as_bytes(),
+        };
+        assert!(!client.is_bound_to_voter_authority(&authority));
+
+        client.voter = ConsumerVoterBinding::Test {
+            scope: authority.scope(),
+            node_id: authority.node_id(),
+            voter_count: foreign_authority.voter_count(),
+            roster_commitment: *authority.roster_commitment().as_bytes(),
+            tls_identity: authority.tls_identity().to_owned(),
+        };
+        assert!(!client.is_bound_to_voter_authority(&authority));
+
+        client.voter = ConsumerVoterBinding::Test {
+            scope: authority.scope(),
+            node_id: authority.node_id(),
+            voter_count: authority.voter_count(),
+            roster_commitment: *foreign_authority.roster_commitment().as_bytes(),
+            tls_identity: authority.tls_identity().to_owned(),
+        };
+        assert!(!client.is_bound_to_voter_authority(&authority));
+
+        client.voter = ConsumerVoterBinding::Test {
+            scope: foreign_authority.scope(),
+            node_id: authority.node_id(),
+            voter_count: authority.voter_count(),
+            roster_commitment: *authority.roster_commitment().as_bytes(),
+            tls_identity: authority.tls_identity().to_owned(),
+        };
+        assert!(
+            !client.is_bound_to_voter_authority(&authority),
+            "a malformed test binding never acquires voter authority"
+        );
     }
 
     #[test]
