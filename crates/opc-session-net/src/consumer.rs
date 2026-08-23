@@ -3412,6 +3412,7 @@ impl PersistentConsumerReconnectControl {
 
 struct PersistentReconnectSetup<'a> {
     attempt: Option<ReconnectAttempt>,
+    reconnect_control: Option<&'a PersistentConsumerReconnectControl>,
     generation: u64,
     material_epoch: opc_tls::TlsMaterialEpoch,
     reauthentication: &'a SessionReauthenticationControl,
@@ -3424,6 +3425,7 @@ impl<'a> PersistentReconnectSetup<'a> {
     fn new(
         reauthentication: &'a SessionReauthenticationControl,
         tls_config: &'a opc_tls::AuthenticatedClientConfig,
+        reconnect_control: Option<&'a PersistentConsumerReconnectControl>,
     ) -> Self {
         // Subscribe before sampling the current epoch so a publication in
         // between is either included in the sample or remains immediately
@@ -3432,6 +3434,7 @@ impl<'a> PersistentReconnectSetup<'a> {
         let material_changes = Some(tls_config.subscribe_material_changes());
         Self {
             attempt: None,
+            reconnect_control,
             generation: reauthentication.generation(),
             material_epoch: tls_config.material_status().epoch(),
             reauthentication,
@@ -3458,9 +3461,33 @@ impl<'a> PersistentReconnectSetup<'a> {
         )
     }
 
+    fn observe_current_reconnect_epoch(&mut self) {
+        if let Some(control) = self.reconnect_control {
+            control.gate.observe_epoch(
+                self.reauthentication.generation(),
+                Some(self.tls_config.material_status().epoch()),
+            );
+        }
+        if let Some(attempt) = self.attempt.take() {
+            attempt.cancel_superseded();
+        }
+    }
+
+    fn reject_if_stale(&mut self) -> Result<(), SessionConsumerClientError> {
+        if self.current() {
+            return Ok(());
+        }
+        // Advance the shared gate before the installed old attempt drops.
+        // Its Drop path then observes a superseded epoch and cannot publish a
+        // stale failure cooldown or advance the fresh epoch's backoff.
+        self.observe_current_reconnect_epoch();
+        Err(SessionConsumerClientError::Deadline)
+    }
+
     async fn superseded(&mut self) {
         loop {
             if !self.current() {
+                self.observe_current_reconnect_epoch();
                 return;
             }
             let attempt = self.attempt.as_ref();
@@ -3497,11 +3524,7 @@ where
         biased;
         _ = reconnect_setup.superseded() => Err(SessionConsumerClientError::Deadline),
         value = &mut future => {
-            if reconnect_setup.current() {
-                Ok(value)
-            } else {
-                Err(SessionConsumerClientError::Deadline)
-            }
+            reconnect_setup.reject_if_stale().map(|()| value)
         },
     }
 }
@@ -4309,10 +4332,14 @@ impl StatelessSessionConsumerClient {
             Some(permit) => permit,
             None => self.physical_admission.try_acquire(watch)?,
         };
-        let mut reconnect_setup =
-            PersistentReconnectSetup::new(&self.reauthentication, &self.tls_config);
+        let reconnect_control = reconnect_control.filter(|_| coordinate_recovery);
+        let mut reconnect_setup = PersistentReconnectSetup::new(
+            &self.reauthentication,
+            &self.tls_config,
+            reconnect_control.map(Arc::as_ref),
+        );
         let (generation, material_epoch) = reconnect_setup.epoch();
-        if let Some(control) = reconnect_control.filter(|_| coordinate_recovery) {
+        if let Some(control) = reconnect_control {
             let attempt = poll_persistent_reconnect_setup(
                 control.acquire(pre_request_deadline, generation, material_epoch),
                 &mut reconnect_setup,
@@ -4499,15 +4526,20 @@ impl StatelessSessionConsumerClient {
                 return Err(SessionConsumerClientError::Protocol);
             }
         };
-        let admission = handshake
-            .admit()
-            .map_err(|_| SessionConsumerClientError::Authentication)?;
+        let admission = match handshake.admit() {
+            Ok(admission) => admission,
+            Err(_) => {
+                reconnect_setup.reject_if_stale()?;
+                return Err(SessionConsumerClientError::Authentication);
+            }
+        };
         if !consumer_fresh_admission_is_current(
             generation,
             admission.epoch(),
             self.reauthentication.generation(),
             self.tls_config.material_status().epoch(),
         ) {
+            reconnect_setup.observe_current_reconnect_epoch();
             return Err(SessionConsumerClientError::Deadline);
         }
         let reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(reader);
@@ -4530,6 +4562,7 @@ impl StatelessSessionConsumerClient {
             _physical_admission: Some(physical_admission),
         };
         if !connection.current(&self.tls_config, &self.reauthentication) {
+            reconnect_setup.observe_current_reconnect_epoch();
             return Err(SessionConsumerClientError::Deadline);
         }
         // This is the fresh-lane publication boundary. A material change
@@ -4546,6 +4579,7 @@ impl StatelessSessionConsumerClient {
             self.reauthentication.generation(),
             self.tls_config.material_status().epoch(),
         ) {
+            reconnect_setup.observe_current_reconnect_epoch();
             return Err(SessionConsumerClientError::Deadline);
         }
         hello_attempt.complete();
@@ -10024,9 +10058,10 @@ mod tests {
         ConsumerSessionLeaseMutationStatusWire, ConsumerSessionResponseWire, ConsumerSetupPhase,
         ConsumerSetupPhaseAttempt, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
         ConsumerWireRequest, ConsumerWireResponse, PersistentCheckedOutConnection,
-        PersistentConsumerCounters, PersistentConsumerIoBarrier, PersistentConsumerShutdownIo,
+        PersistentConsumerCounters, PersistentConsumerIoBarrier,
+        PersistentConsumerReconnectControl, PersistentConsumerShutdownIo,
         PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
-        PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+        PersistentReconnectSetup, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
         PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
         PersistentSetupAttempt, PersistentShutdownPhase, PersistentWatchRecovery,
         QueuedConsumerWatchItem, SessionConsumerAuthorizationError, SessionConsumerAuthorizer,
@@ -10887,6 +10922,63 @@ mod tests {
             0,
             "no lower-transport write crossed the exact effect boundary"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_setup_cannot_publish_old_epoch_reconnect_cooldown() {
+        for material_publication in [false, true] {
+            let reauthentication = SessionReauthenticationControl::new();
+            let (client, material) = stateless_test_client(reauthentication.clone());
+            let reconnect_control =
+                PersistentConsumerReconnectControl::new(client.lifecycle_policy, Duration::ZERO);
+            let mut setup = PersistentReconnectSetup::new(
+                &reauthentication,
+                &client.tls_config,
+                Some(reconnect_control.as_ref()),
+            );
+            let (old_generation, old_material_epoch) = setup.epoch();
+            let attempt = reconnect_control
+                .acquire(
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    old_generation,
+                    old_material_epoch,
+                )
+                .await
+                .expect("the old epoch owns one serialized setup attempt");
+            setup.install_attempt(attempt);
+
+            if material_publication {
+                material.rotate();
+            } else {
+                reauthentication
+                    .request_reauthentication()
+                    .expect("publish a fresh explicit generation");
+            }
+            setup.superseded().await;
+            drop(setup);
+
+            let stale_readmission = reconnect_control.acquire(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                old_generation,
+                old_material_epoch,
+            );
+            tokio::pin!(stale_readmission);
+            tokio::select! {
+                biased;
+                result = &mut stale_readmission => {
+                    assert!(
+                        matches!(result, Err(SessionConsumerClientError::Deadline)),
+                        "the old epoch remains superseded",
+                    );
+                }
+                _ = std::future::ready(()) => {
+                    panic!(
+                        "a cancelled {} setup published an old-epoch reconnect cooldown",
+                        if material_publication { "material" } else { "reauthentication" },
+                    );
+                }
+            }
+        }
     }
 
     #[test]

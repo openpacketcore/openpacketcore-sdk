@@ -24,7 +24,7 @@ independent logical clients, as independent persistent constructors do.
 The closure successor starts exactly at SDK commit
 `f2ed1181c85540cc01ea0b4611fa3620891375fd`, tree
 `945ceab3870d2c1d2d1396aff29e819288fce76a`. It does not contain, rebase, or
-merge the stale qualification branch. Five focused regressions retained the
+merge the stale qualification branch. Six focused regressions retained the
 following current-main RED evidence before the generic correction:
 
 ```text
@@ -38,6 +38,8 @@ credential_and_material_epochs_supersede_single_blocked_pool_recovery
   lone reauthentication resolver calls without advancing the paused clock: observed 1, required 2
 adapter_buffering_above_zero_byte_lower_transport_is_before_write
   observed MayHaveWritten after adapter-only buffering, required BeforeWrite
+stale_setup_cannot_publish_old_epoch_reconnect_cooldown
+  observed pending old-epoch readmission, required immediate Superseded
 ```
 
 The causal correction is consumer transport revision 5. It retains the
@@ -75,7 +77,7 @@ The current-main successor's bounded GREEN gates were run with all
 
 ```text
 cargo test -p opc-session-net --all-features --lib
-  276 passed; 0 failed
+  277 passed; 0 failed
 cargo test -p opc-session-net --all-features \
   --test persistent_consumer_protocol \
   --test persistent_consumer_boundaries \
