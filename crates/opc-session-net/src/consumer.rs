@@ -12286,33 +12286,50 @@ mod tests {
             })
         };
         let server_name = rustls_pki_types::ServerName::IpAddress(a_address.ip().into());
-        let client_a = PersistentSessionConsumerClient::from_stateless(
+        // This sequential router proof observes resolver calls exactly; one
+        // retained request lane is sufficient for its single active call.
+        let one_request_lane = PersistentSessionConsumerConfig {
+            request_connections: 1,
+            ..PersistentSessionConsumerConfig::default()
+        };
+        let client_a = PersistentSessionConsumerClient::try_from_stateless(
             StatelessSessionConsumerClient::new_with_resolver(
                 a_resolver,
                 server_name.clone(),
                 authority_a,
                 client_material.config(),
             ),
+            one_request_lane,
         )
         .expect("A persistent client");
-        let client_b = PersistentSessionConsumerClient::from_stateless(
+        let client_b = PersistentSessionConsumerClient::try_from_stateless(
             StatelessSessionConsumerClient::new_with_resolver(
                 b_resolver,
                 server_name.clone(),
                 authority_b,
                 client_material.config(),
             ),
+            one_request_lane,
         )
         .expect("B persistent client");
-        let client_c = PersistentSessionConsumerClient::from_stateless(
+        let client_c = PersistentSessionConsumerClient::try_from_stateless(
             StatelessSessionConsumerClient::new_with_resolver(
                 c_resolver,
                 server_name,
                 authority_c,
                 client_material.config(),
             ),
+            one_request_lane,
         )
         .expect("C persistent client");
+        // Establish C's authenticated persistent lane before the fixed
+        // physical mutation leg. The scripted execute still owns the only
+        // application dispatch; this is transport readiness only.
+        client_c.prewarm().await.expect("prewarm live C voter");
+        // Keep A's shared pool alive so its receipt lane can be made ready
+        // after the deliberately pre-write first attempt and before the
+        // separate 100ms receipt deadline.
+        let client_a_for_receipt = client_a.clone();
         let router = Arc::new(
             PreparedConsumerRouter::persistent([client_a, client_b, client_c])
                 .expect("three distinct same-scope voters"),
@@ -12346,6 +12363,11 @@ mod tests {
             [expected_request],
             "the sole committed scripted mutation retains the exact ID and body"
         );
+
+        client_a_for_receipt
+            .prewarm()
+            .await
+            .expect("prewarm receipt voter after its scripted pre-write failure");
 
         assert_eq!(
             token
@@ -12690,6 +12712,10 @@ mod tests {
             ),
         )
         .expect("healthy persistent client");
+        client
+            .prewarm()
+            .await
+            .expect("prewarm healthy CAS voter before physical budget");
         let router = Arc::new(
             PreparedConsumerRouter::persistent([client]).expect("one healthy same-scope voter"),
         );
@@ -12783,6 +12809,10 @@ mod tests {
             ),
         )
         .expect("healthy lease persistent client");
+        client
+            .prewarm()
+            .await
+            .expect("prewarm healthy lease voter before physical budget");
         let wrapper = Arc::new(EncryptingSessionBackend::new(
             backend,
             Arc::new(MemoryKeyProvider::new()),
@@ -12849,6 +12879,10 @@ mod tests {
             ),
         )
         .expect("multi-tenant persistent voter");
+        client
+            .prewarm()
+            .await
+            .expect("prewarm composite voter before physical budgets");
         let inner = Arc::new(FakeSessionBackend::new());
         let provider = Arc::new(MemoryKeyProvider::new());
         let wrapper = Arc::new(EncryptingSessionBackend::new(
