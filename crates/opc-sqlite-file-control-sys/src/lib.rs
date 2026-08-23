@@ -275,6 +275,9 @@ pub fn install_test_main_sync_block_vfs() -> Result<(), FileControlError> {
 }
 
 #[cfg(feature = "test-vfs")]
+// SAFETY: callers must pass the live SQLite file handle allocated by the
+// registered test VFS; the function validates the pointer before deriving the
+// aligned metadata location reserved by that VFS.
 unsafe fn main_sync_block_file_metadata(
     file: *mut ffi::sqlite3_file,
 ) -> Result<*mut MainSyncBlockFileState, FileControlError> {
@@ -334,7 +337,10 @@ unsafe extern "C" fn test_main_sync_block_vfs_open(
     } else {
         TEST_SYNC_FILE_OTHER
     };
-    let metadata = match unsafe { main_sync_block_file_metadata(file) } {
+    // SAFETY: successful xOpen supplied the live file handle allocated with the
+    // registered test VFS layout.
+    let metadata_result = unsafe { main_sync_block_file_metadata(file) };
+    let metadata = match metadata_result {
         Ok(metadata) => metadata,
         Err(_) => return ffi::SQLITE_IOERR,
     };
@@ -365,12 +371,15 @@ unsafe extern "C" fn test_main_sync_block_vfs_sync(
     file: *mut ffi::sqlite3_file,
     flags: libc::c_int,
 ) -> libc::c_int {
-    let Ok(metadata) = (unsafe { main_sync_block_file_metadata(file) }) else {
+    // SAFETY: this callback is installed only on file handles initialized by
+    // the registered test VFS xOpen wrapper.
+    let metadata_result = unsafe { main_sync_block_file_metadata(file) };
+    let Ok(metadata) = metadata_result else {
         return ffi::SQLITE_IOERR;
     };
     // SAFETY: xOpen initialized this metadata before installing this xSync.
-    let (original_methods, file_kind) =
-        unsafe { ((*metadata).original_methods, (*metadata).file_kind) };
+    let metadata_fields = unsafe { ((*metadata).original_methods, (*metadata).file_kind) };
+    let (original_methods, file_kind) = metadata_fields;
     if original_methods.is_null() {
         return ffi::SQLITE_IOERR;
     }
