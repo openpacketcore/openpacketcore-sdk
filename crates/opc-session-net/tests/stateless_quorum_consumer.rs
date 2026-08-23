@@ -30,7 +30,8 @@ use opc_session_net::{
     SessionConsumerMutationError, SessionQuorumConsumerServer, SessionReauthenticationControl,
     SessionReplicationManifest, StatelessSessionConsumerClient,
     DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT, MAX_NEGOTIATED_FRAME_SIZE,
-    SESSION_QUORUM_CONSUMER_ALPN,
+    SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_V2_ALPN,
+    SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, ConsensusSessionStore,
@@ -55,7 +56,7 @@ use opc_session_store::{
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 fn transported_capabilities() -> BackendCapabilities {
@@ -794,6 +795,53 @@ impl SessionQuorumConsumer for HangingConsumer {
     }
 }
 
+struct HangingV2Consumer {
+    v2_calls: AtomicUsize,
+    v2_call_started: tokio::sync::Notify,
+}
+
+impl HangingV2Consumer {
+    fn new() -> Self {
+        Self {
+            v2_calls: AtomicUsize::new(0),
+            v2_call_started: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionQuorumConsumer for HangingV2Consumer {
+    async fn execute(
+        &self,
+        _identity: &SessionConsumerIdentity,
+        _request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled())
+    }
+
+    async fn execute_v2(
+        &self,
+        _identity: &SessionConsumerIdentity,
+        _request: SessionConsumerV2Request,
+    ) -> SessionConsumerV2Response {
+        self.v2_calls.fetch_add(1, Ordering::SeqCst);
+        self.v2_call_started.notify_waiters();
+        std::future::pending().await
+    }
+
+    async fn watch(
+        &self,
+        _identity: &SessionConsumerIdentity,
+        _scope: SessionConsumerScope,
+        _start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        Err(SessionConsumerRejection::Unavailable)
+    }
+}
+
 #[async_trait]
 impl SessionQuorumConsumer for CountingConsumer {
     async fn execute(
@@ -914,6 +962,77 @@ fn consumer_client(
         SpiffeId::new(server_spiffe).expect("server SPIFFE"),
         scope,
         pki.client_config(client_spiffe),
+    )
+}
+
+async fn read_json_frame<R>(reader: &mut R) -> serde_json::Value
+where
+    R: AsyncRead + Unpin,
+{
+    let mut length = [0_u8; 4];
+    reader
+        .read_exact(&mut length)
+        .await
+        .expect("read JSON frame length");
+    let mut payload = vec![
+        0_u8;
+        usize::try_from(u32::from_be_bytes(length))
+            .expect("JSON frame length fits usize")
+    ];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .expect("read JSON frame payload");
+    serde_json::from_slice(&payload).expect("decode JSON frame")
+}
+
+async fn accept_v2_tls(
+    listener: &TcpListener,
+    authenticated: &AuthenticatedServerConfig,
+) -> tokio_rustls::server::TlsStream<tokio::net::TcpStream> {
+    let (tcp, _) = listener.accept().await.expect("accept V2 TLS socket");
+    let mut config = authenticated.rustls_config().as_ref().clone();
+    config.alpn_protocols = vec![SESSION_QUORUM_CONSUMER_V2_ALPN.to_vec()];
+    tokio_rustls::TlsAcceptor::from(Arc::new(config))
+        .accept(tcp)
+        .await
+        .expect("complete V2 mTLS")
+}
+
+async fn v2_mutation_request(
+    scope: SessionConsumerScope,
+    nonce: u8,
+    owner: &str,
+) -> (
+    SessionConsumerV2Request,
+    opc_session_store::FencedTransitionV2RequestId,
+) {
+    let timestamp = time::OffsetDateTime::now_utc();
+    let lease: LeaseGuard = serde_json::from_value(serde_json::json!({
+        "key": test_key(),
+        "owner": OwnerId::new(owner).expect("owner"),
+        "fence": FenceToken::new(1),
+        "acquired_at": Timestamp::from_offset_datetime(timestamp),
+        "expires_at": Timestamp::from_offset_datetime(timestamp + time::Duration::minutes(1)),
+        "credential_id": 1,
+    }))
+    .expect("public lease wire shape");
+    let transition = FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(1).expect("nonzero history epoch"),
+        FencedTransitionV2CallerNonce::from_bytes([nonce; 16]),
+        FencedTransitionLease::renew(lease, Duration::from_secs(30)).expect("renew request"),
+        FencedTransitionMutation::delete(Generation::new(1)),
+    )
+    .expect("self-authenticating V2 transition");
+    let request_id = transition.request_id();
+    (
+        SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(transition),
+            },
+        ),
+        request_id,
     )
 }
 
@@ -1327,13 +1446,12 @@ async fn authenticated_v2_consumer_call_reaches_the_listener_on_its_dedicated_al
     .expect("start stateless V2 consumer listener");
     let client = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope);
 
+    let request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Capability,
+    );
     assert_eq!(
-        client
-            .execute_v2(SessionConsumerV2Request::new(
-                scope,
-                SessionConsumerV2Operation::FencedTransitionV2Capability,
-            ))
-            .await,
+        client.execute_v2(&request).await,
         Ok(SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
             FencedTransitionV2Capability::V2,
         ))),
@@ -1386,29 +1504,34 @@ async fn revision_five_v2_status_transports_a_retained_stale_fence_receipt() {
     )
     .expect("self-authenticating V2 transition");
 
-    let request_id = transition.request_id();
-    let execute = client
-        .execute_v2(SessionConsumerV2Request::new(
-            scope,
-            SessionConsumerV2Operation::FencedTransitionV2 {
-                request: Box::new(transition.clone()),
-            },
-        ))
-        .await;
+    let request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2 {
+            request: Box::new(transition),
+        },
+    );
+    let request_id = request.request_id().expect("V2 mutation has full ID");
+    let execute = client.execute_v2(&request).await;
     assert_eq!(
         execute,
         Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id }),
         "the unbound execution error is recovered only through exact V2 status"
     );
 
+    let SessionConsumerV2Operation::FencedTransitionV2 {
+        request: original_transition,
+    } = request.operation()
+    else {
+        panic!("retain the exact V2 mutation request")
+    };
     let status = SessionConsumerV2Request::new(
         scope,
         SessionConsumerV2Operation::FencedTransitionV2Status {
-            request: Box::new(transition),
+            request: Box::new((**original_transition).clone()),
         },
     );
     assert_eq!(
-        client.execute_v2(status.clone()).await,
+        client.execute_v2(&status).await,
         Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
             SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Err(
                 SessionConsumerV2FencedTransitionError::Store(
@@ -1426,13 +1549,126 @@ async fn revision_five_v2_status_transports_a_retained_stale_fence_receipt() {
     let malformed: SessionConsumerV2Request =
         serde_json::from_value(malformed).expect("outer-ID mismatch decodes");
     assert_eq!(
-        client.execute_v2(malformed).await,
+        client.execute_v2(&malformed).await,
         Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
             cause: SessionConsumerClientError::Protocol,
         }),
         "an outer full-ID mismatch remains rejected before dispatch"
     );
     handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn persistent_v2_setup_closes_retry_without_mutation_dispatch() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-setup-close-server");
+    let client_spiffe = spiffe("v2-setup-close-client");
+    let (_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind V2 setup-close listener");
+    let address = listener.local_addr().expect("V2 setup-close address");
+    let setups = Arc::new(AtomicUsize::new(0));
+    let call_frames = Arc::new(AtomicUsize::new(0));
+    let authenticated = pki.server_config(&server_spiffe);
+    let peer = {
+        let setups = Arc::clone(&setups);
+        let call_frames = Arc::clone(&call_frames);
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut tls = accept_v2_tls(&listener, &authenticated).await;
+                let frame = read_json_frame(&mut tls).await;
+                if frame["kind"] == "call" {
+                    call_frames.fetch_add(1, Ordering::SeqCst);
+                }
+                assert_eq!(frame["kind"], "hello");
+                setups.fetch_add(1, Ordering::SeqCst);
+                // Drop before HelloAck: the client cannot establish a lane
+                // or enqueue a mutation Call on this attempt.
+            }
+        })
+    };
+    let persistent = PersistentSessionConsumerClient::try_from_stateless(
+        consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope)
+            .with_operation_timeout(Duration::from_secs(2)),
+        PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(500),
+            2,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("two-attempt V2 config"),
+    )
+    .expect("persistent V2 client");
+    let (request, _) = v2_mutation_request(scope, 0x79, "v2-setup-close-owner").await;
+
+    assert_eq!(
+        persistent.execute_v2(&request).await,
+        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable,
+        }),
+        "TLS and Hello writes are setup only and remain retryable"
+    );
+    peer.await.expect("join setup-close peer");
+    assert_eq!(
+        setups.load(Ordering::SeqCst),
+        2,
+        "only the configured bounded setup retries are attempted"
+    );
+    assert_eq!(
+        call_frames.load(Ordering::SeqCst),
+        0,
+        "no setup attempt dispatches a mutation Call"
+    );
+    persistent.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistent_v2_call_acceptance_then_close_is_exactly_outcome_unknown() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-call-close-server");
+    let client_spiffe = spiffe("v2-call-close-client");
+    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let service = Arc::new(HangingV2Consumer::new());
+    let call_seen = service.v2_call_started.notified();
+    tokio::pin!(call_seen);
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start V2 close-after-Call listener");
+    let persistent = PersistentSessionConsumerClient::from_stateless(
+        consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope)
+            .with_operation_timeout(Duration::from_secs(2)),
+    )
+    .expect("persistent V2 client");
+    let (request, request_id) = v2_mutation_request(scope, 0x7a, "v2-call-close-owner").await;
+    let execute = persistent.execute_v2(&request);
+    tokio::pin!(execute);
+    tokio::select! {
+        result = &mut execute => panic!("Call completed before peer receipt: {result:?}"),
+        _ = &mut call_seen => {},
+    }
+    handle.abort_and_wait().await;
+
+    assert_eq!(
+        execute.await,
+        Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id }),
+        "a lower transport acceptance after Call retains the exact V2 ID"
+    );
+    assert_eq!(
+        service.v2_calls.load(Ordering::SeqCst),
+        1,
+        "the complete mutation Call is dispatched exactly once"
+    );
+    persistent.shutdown().await;
 }
 
 #[tokio::test]
@@ -1782,6 +2018,52 @@ async fn pre_request_connection_budget_expires_during_a_stalled_tls_handshake() 
         "the pre-request budget must expire before the complete operation deadline"
     );
     stalled_tls.abort();
+}
+
+#[tokio::test]
+async fn v2_pre_request_connection_budget_expires_after_hello_before_hello_ack() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-pre-request-stalled-server");
+    let client_spiffe = spiffe("v2-pre-request-stalled-client");
+    let (_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled V2 TLS listener");
+    let address = listener.local_addr().expect("stalled V2 listener address");
+    let hello_seen = Arc::new(AtomicUsize::new(0));
+    let authenticated = pki.server_config(&server_spiffe);
+    let stalled_hello_ack = {
+        let hello_seen = Arc::clone(&hello_seen);
+        tokio::spawn(async move {
+            let mut tls = accept_v2_tls(&listener, &authenticated).await;
+            let hello = read_json_frame(&mut tls).await;
+            assert_eq!(hello["kind"], "hello");
+            hello_seen.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        })
+    };
+    let client = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope)
+        .with_pre_request_connection_timeout(Duration::from_millis(100))
+        .with_operation_timeout(Duration::from_secs(1));
+    let request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Capability,
+    );
+
+    let started_at = tokio::time::Instant::now();
+    assert_eq!(
+        client.execute_v2(&request).await,
+        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable,
+        }),
+        "setup expiry through HelloAck remains proven not transmitted"
+    );
+    assert_eq!(hello_seen.load(Ordering::SeqCst), 1);
+    assert!(
+        started_at.elapsed() < Duration::from_millis(500),
+        "the V2 setup deadline does not consume the operation response budget"
+    );
+    stalled_hello_ack.abort();
 }
 
 #[tokio::test]

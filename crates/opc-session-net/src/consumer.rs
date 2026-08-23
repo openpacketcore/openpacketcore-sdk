@@ -5244,18 +5244,21 @@ impl StatelessSessionConsumerClient {
     /// as [`PersistentSessionConsumerClient::execute_v2`].
     pub async fn execute_v2(
         &self,
-        request: SessionConsumerV2Request,
+        request: &SessionConsumerV2Request,
     ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
         if request.scope() != self.scope || request.validate().is_err() {
             return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             });
         }
-        let deadline = tokio::time::Instant::now()
+        let started_at = tokio::time::Instant::now();
+        let deadline = started_at
             .checked_add(effective_consumer_operation_timeout(self.operation_timeout))
             .ok_or(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Deadline,
             })?;
+        let (pre_request_deadline, pre_request_budget_active) =
+            self.pre_request_deadline(started_at, deadline);
         // Hold the revision-specific physical permit from endpoint resolution
         // through the response. A clone therefore cannot exceed the public
         // V2 lane bound, including while its socket is in TLS or Hello.
@@ -5264,7 +5267,7 @@ impl StatelessSessionConsumerClient {
             .try_acquire_v2()
             .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?;
         let generation = self.reauthentication.generation();
-        let address = tokio::time::timeout_at(deadline, (self.resolve)())
+        let address = tokio::time::timeout_at(pre_request_deadline, (self.resolve)())
             .await
             .map_err(
                 |_| PersistentSessionConsumerV2ExecuteError::NotTransmitted {
@@ -5276,7 +5279,7 @@ impl StatelessSessionConsumerClient {
                     cause: SessionConsumerClientError::Unavailable,
                 },
             )?;
-        let stream = tokio::time::timeout_at(deadline, TcpStream::connect(address))
+        let stream = tokio::time::timeout_at(pre_request_deadline, TcpStream::connect(address))
             .await
             .map_err(
                 |_| PersistentSessionConsumerV2ExecuteError::NotTransmitted {
@@ -5301,9 +5304,9 @@ impl StatelessSessionConsumerClient {
         let connector = tokio_rustls::TlsConnector::from(consumer_client_tls_config_v2(
             handshake.rustls_config(),
         ));
-        // TLS may accept ciphertext below its outer future before reporting an
-        // error. Keep that lower boundary for this exact request so an
-        // effectful V2 caller never mistakes it for a proven no-send.
+        // The Call captures its lower-TLS baseline only after setup succeeds,
+        // so TLS and Hello ciphertext can never classify a request that has
+        // no Call frame as transmitted.
         let accepted_ciphertext_writes = Arc::new(AtomicU64::new(0));
         let stream = PersistentConsumerShutdownIo {
             inner: stream,
@@ -5311,25 +5314,24 @@ impl StatelessSessionConsumerClient {
             accepted_writes: Some(Arc::clone(&accepted_ciphertext_writes)),
         };
         let tls = match tokio::time::timeout_at(
-            deadline,
+            pre_request_deadline,
             connector.connect(self.server_name.clone(), stream),
         )
         .await
         {
             Ok(Ok(tls)) => tls,
             Ok(Err(error)) => {
-                return Err(v2_persistent_error(
-                    &request,
-                    accepted_ciphertext_writes.load(Ordering::Acquire) != 0,
-                    SessionConsumerClientError::from(classify_tls_io_error(error)),
-                ));
+                return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                    cause: pre_request_error(
+                        SessionConsumerClientError::from(classify_tls_io_error(error)),
+                        pre_request_budget_active,
+                    ),
+                });
             }
             Err(_) => {
-                return Err(v2_persistent_error(
-                    &request,
-                    accepted_ciphertext_writes.load(Ordering::Acquire) != 0,
-                    SessionConsumerClientError::Unavailable,
-                ));
+                return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                    cause: pre_request_timeout_error(pre_request_budget_active),
+                });
             }
         };
         if tls.get_ref().1.alpn_protocol() != Some(SESSION_QUORUM_CONSUMER_V2_ALPN) {
@@ -5387,22 +5389,24 @@ impl StatelessSessionConsumerClient {
             &mut writer,
             &hello,
             MAX_NEGOTIATED_FRAME_SIZE,
-            deadline.min(lifecycle.retire_at()),
+            pre_request_deadline.min(lifecycle.retire_at()),
         )
         .await
         .map_err(bootstrap_protocol_error_to_client_error)
+        .map_err(|cause| pre_request_error(cause, pre_request_budget_active))
         .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?;
         let ack = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV2WireResponse>(
             &mut reader,
             MAX_NEGOTIATED_FRAME_SIZE,
-            deadline.min(lifecycle.retire_at()),
+            pre_request_deadline.min(lifecycle.retire_at()),
             effective_consumer_idle_timeout(self.idle_timeout),
         )
         .await
         .map_err(bootstrap_protocol_error_to_client_error)
+        .map_err(|cause| pre_request_error(cause, pre_request_budget_active))
         .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?
         .ok_or(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
-            cause: SessionConsumerClientError::Unavailable,
+            cause: pre_request_timeout_error(pre_request_budget_active),
         })?;
         let request_frame_size = match ack {
             ConsumerV2WireResponse::HelloAck(ack)
@@ -5474,17 +5478,21 @@ impl StatelessSessionConsumerClient {
                 cause: SessionConsumerClientError::Deadline,
             });
         }
+        ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
+            .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?;
         let correlation = NonZeroU32::MIN;
         let attempt_nonce = v2_attempt_nonce().map_err(|_| {
             PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             }
         })?;
-        let request_commitment = v2_request_commitment(&request).map_err(|_| {
+        let request_commitment = v2_request_commitment(request).map_err(|_| {
             PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             }
         })?;
+        // Keep caller ownership of the complete request for exact recovery;
+        // only the private wire envelope is cloned for this fresh connection.
         let call = ConsumerV2WireRequest::Call(ConsumerV2Call {
             correlation,
             attempt_nonce,
@@ -5511,7 +5519,7 @@ impl StatelessSessionConsumerClient {
             loop {
                 let hard_deadline = lifecycle.hard_deadline().map_err(|_| {
                     v2_persistent_error(
-                        &request,
+                        request,
                         write_progress.accepted_any(),
                         SessionConsumerClientError::Protocol,
                     )
@@ -5522,14 +5530,14 @@ impl StatelessSessionConsumerClient {
                         if hard_deadline <= write_deadline && tokio::time::Instant::now() >= hard_deadline {
                             record_consumer_hard_overrun(&lifecycle);
                             if result.is_ok() {
-                                return Err(v2_persistent_error(&request, write_progress.accepted_any(), SessionConsumerClientError::Deadline));
+                                return Err(v2_persistent_error(request, write_progress.accepted_any(), SessionConsumerClientError::Deadline));
                             }
                         }
                         break result;
                     }
                     _ = wait_for_shortened_deadline(hard_deadline, write_deadline) => {
                         record_consumer_hard_overrun(&lifecycle);
-                        return Err(v2_persistent_error(&request, write_progress.accepted_any(), SessionConsumerClientError::Deadline));
+                        return Err(v2_persistent_error(request, write_progress.accepted_any(), SessionConsumerClientError::Deadline));
                     }
                     _ = reauthentication_changes.changed() => {
                         observe_consumer_rotation(&mut lifecycle, tokio::time::Instant::now(), self.reauthentication.generation(), self.tls_config.material_status(), rotation_jitter);
@@ -5542,7 +5550,7 @@ impl StatelessSessionConsumerClient {
         };
         if let Err(error) = write_result {
             return Err(v2_persistent_error(
-                &request,
+                request,
                 write_progress.accepted_any(),
                 match error {
                     FrameWriteError::BeforeWrite(error)
@@ -5554,7 +5562,7 @@ impl StatelessSessionConsumerClient {
         }
         let response = {
             let initial_hard_deadline = lifecycle.hard_deadline().map_err(|_| {
-                v2_persistent_error(&request, true, SessionConsumerClientError::Protocol)
+                v2_persistent_error(request, true, SessionConsumerClientError::Protocol)
             })?;
             let read = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV2WireResponse>(
                 &mut reader,
@@ -5565,7 +5573,7 @@ impl StatelessSessionConsumerClient {
             tokio::pin!(read);
             loop {
                 let hard_deadline = lifecycle.hard_deadline().map_err(|_| {
-                    v2_persistent_error(&request, true, SessionConsumerClientError::Protocol)
+                    v2_persistent_error(request, true, SessionConsumerClientError::Protocol)
                 })?;
                 let response_deadline = deadline.min(hard_deadline);
                 let response = tokio::select! {
@@ -5573,13 +5581,13 @@ impl StatelessSessionConsumerClient {
                     response = &mut read => {
                         if tokio::time::Instant::now() >= response_deadline {
                             if hard_deadline <= deadline { record_consumer_hard_overrun(&lifecycle); }
-                            return Err(v2_persistent_error(&request, true, SessionConsumerClientError::Deadline));
+                            return Err(v2_persistent_error(request, true, SessionConsumerClientError::Deadline));
                         }
                         Some(response)
                     }
                     _ = tokio::time::sleep_until(response_deadline) => {
                         if hard_deadline <= deadline { record_consumer_hard_overrun(&lifecycle); }
-                        return Err(v2_persistent_error(&request, true, SessionConsumerClientError::Deadline));
+                        return Err(v2_persistent_error(request, true, SessionConsumerClientError::Deadline));
                     }
                     _ = reauthentication_changes.changed() => {
                         observe_consumer_rotation(&mut lifecycle, tokio::time::Instant::now(), self.reauthentication.generation(), self.tls_config.material_status(), rotation_jitter);
@@ -5606,21 +5614,21 @@ impl StatelessSessionConsumerClient {
             })) if received == correlation
                 && received_nonce == attempt_nonce
                 && received_commitment == request_commitment
-                && v2_response_matches_request(&request, &response) =>
+                && v2_response_matches_request(request, &response) =>
             {
                 *response
             }
             Ok(_) => {
                 return Err(v2_persistent_error(
-                    &request,
+                    request,
                     true,
                     SessionConsumerClientError::Protocol,
                 ));
             }
-            Err(cause) => return Err(v2_persistent_error(&request, true, cause)),
+            Err(cause) => return Err(v2_persistent_error(request, true, cause)),
         };
         if v2_response_is_outcome_unknown(&response) {
-            return Err(v2_outcome_unknown(&request).unwrap_or(
+            return Err(v2_outcome_unknown(request).unwrap_or(
                 PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                     cause: SessionConsumerClientError::Protocol,
                 },
@@ -7073,7 +7081,7 @@ struct PersistentV2LaneActor {
     retirement: watch::Receiver<Option<RetirementReason>>,
     forced: watch::Receiver<bool>,
     shutdown_io: Arc<PersistentConsumerIoBarrier>,
-    /// Monotonic lower-TLS write acceptance, owned with both TLS halves.
+    /// Per-lane lower-TLS progress. Its Call baseline excludes setup bytes.
     accepted_ciphertext_writes: Arc<AtomicU64>,
     commands: mpsc::Receiver<PersistentV2LaneCall>,
     lifetime: PersistentV2LaneLifetime,
@@ -8080,19 +8088,14 @@ impl PersistentSessionConsumerV2Pool {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
-        self.connect_until_attempts(
-            deadline,
-            self.config.connect_attempts,
-            Arc::new(AtomicU64::new(0)),
-        )
-        .await
+        self.connect_until_attempts(deadline, self.config.connect_attempts)
+            .await
     }
 
     async fn connect_until_attempts(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
         connect_attempts: usize,
-        accepted_ciphertext_writes: Arc<AtomicU64>,
     ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
         let mut last_error = SessionConsumerClientError::Unavailable;
         let mut retry_delay = self.client.lifecycle_policy.reconnect_backoff_min();
@@ -8103,18 +8106,15 @@ impl PersistentSessionConsumerV2Pool {
                 _ = wait_for_v2_forced_shutdown(&mut forced) => {
                     return Err(SessionConsumerClientError::ShuttingDown);
                 }
-                connected = self.connect_once(deadline, Arc::clone(&accepted_ciphertext_writes)) => connected,
+                connected = self.connect_once(deadline) => connected,
             };
             match connected {
                 Ok(connection) => return Ok(connection),
                 Err(error) => last_error = error,
             }
-            // A lower TLS write is an effect boundary for this caller. Do not
-            // let a reconnect turn an outer transport error into a mutation
-            // replay after ciphertext was accepted.
-            if accepted_ciphertext_writes.load(Ordering::Acquire) != 0 {
-                break;
-            }
+            // Setup has no Call frame. TLS and Hello ciphertext therefore
+            // remain proven-not-transmitted and may use the bounded retry
+            // budget under this caller's setup deadline.
             if attempt.saturating_add(1) >= connect_attempts
                 || tokio::time::Instant::now() >= deadline
                 || !matches!(
@@ -8159,7 +8159,6 @@ impl PersistentSessionConsumerV2Pool {
     async fn connect_once(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
-        accepted_ciphertext_writes: Arc<AtomicU64>,
     ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
         let setup_attempt = PersistentV2SetupAttempt::begin(self);
         if self.shutdown.load(Ordering::Acquire) {
@@ -8201,6 +8200,10 @@ impl PersistentSessionConsumerV2Pool {
         let connector = tokio_rustls::TlsConnector::from(consumer_client_tls_config_v2(
             handshake.rustls_config(),
         ));
+        // This counter is per successfully established lane. The actor takes
+        // its baseline immediately before a Call, so TLS/Hello setup bytes
+        // cannot classify a request that was never enqueued on this lane.
+        let accepted_ciphertext_writes = Arc::new(AtomicU64::new(0));
         let tls = tokio::time::timeout_at(
             deadline,
             poll_persistent_consumer_setup_io(
@@ -8427,10 +8430,8 @@ impl PersistentSessionConsumerV2Pool {
         let (mut connection, fresh) = match connection {
             Some(connection) => (connection, false),
             None => {
-                // This exact cold attempt owns its below-TLS counter until an
-                // actor takes over. A TLS outer error after lower acceptance
-                // is therefore never classified as a safe V2 replay.
-                let accepted_ciphertext_writes = Arc::new(AtomicU64::new(0));
+                // Setup has no Call frame, so an unsuccessful setup remains
+                // retryable under this exact caller's bounded setup deadline.
                 (
                     self.connect_until_attempts(
                         self.setup_deadline(started, Some(deadline))
@@ -8438,15 +8439,10 @@ impl PersistentSessionConsumerV2Pool {
                                 PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }
                             })?,
                         connect_attempts,
-                        Arc::clone(&accepted_ciphertext_writes),
                     )
                     .await
                     .map_err(|cause| {
-                        v2_persistent_error(
-                            request,
-                            accepted_ciphertext_writes.load(Ordering::Acquire) != 0,
-                            cause,
-                        )
+                        PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }
                     })?,
                     true,
                 )
