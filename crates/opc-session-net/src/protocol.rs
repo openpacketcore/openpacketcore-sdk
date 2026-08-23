@@ -3457,6 +3457,8 @@ pub(crate) enum FrameWriteError {
 /// cancellation before any byte is accepted remains `BeforeWrite`, while any
 /// accepted prefix or payload byte is permanently `MayHaveWritten`.
 pub(crate) struct FrameWriteProgress {
+    /// Positive acceptance by the writer passed to the frame encoder. This is
+    /// authoritative only when no below-adapter counter is bound.
     accepted: AtomicBool,
     transport: Mutex<Option<TransportWriteObservation>>,
 }
@@ -3494,21 +3496,21 @@ impl FrameWriteProgress {
     }
 
     pub(crate) fn accepted_any(&self) -> bool {
-        if self.accepted.load(Ordering::Acquire) {
-            return true;
-        }
-        let accepted_below_adapter = self
+        let transport_observation = self
             .transport
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .is_some_and(|observation| {
+            .map(|observation| {
                 observation.accepted_writes.load(Ordering::Acquire) != observation.baseline
             });
-        if accepted_below_adapter {
-            self.accepted.store(true, Ordering::Release);
+        match transport_observation {
+            // TLS may accept plaintext into its own buffer while its lower
+            // socket remains Pending. Once a below-adapter counter is bound,
+            // only a positive change there proves transmission.
+            Some(accepted_below_adapter) => accepted_below_adapter,
+            None => self.accepted.load(Ordering::Acquire),
         }
-        accepted_below_adapter
     }
 
     fn classify(&self, error: ProtocolError) -> FrameWriteError {

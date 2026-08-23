@@ -478,16 +478,16 @@ node-local state-machine fault. Exact replay, status, changed-body conflict,
 snapshot/reopen, replica convergence, and a following log entry remain
 deterministic at the boundary.
 
-The public consumer wire revision is `4` for both one-shot and bounded
+The public consumer wire revision is `5` for both one-shot and bounded
 persistent transports. Frozen v7/#695 qualification remains the historical
 revision-2 contract; the live runner emits a separate v8 exact-head evidence
-document whose schema pins revision `4` to the compiled handshake constant.
+document whose schema pins revision `5` to the compiled handshake constant.
 The immutable schema digests are:
 
 ```text
 3ce5f0e622508ba89820742514eddfd2c0575265754c0bdd1a726e5b3335ecca  qualification/v7/session-ha-profile.schema.json
 0b02633f0118283f425c4b60d8540de4503023d3759b7c6939ebaf2d16365772  qualification/v7/session-ha-evidence.schema.json
-37314340ce127dd17eb305b4f60e99415fb0df6e749411462c53a12c29eee114  qualification/v8/session-ha-persistent-consumer-head-evidence.schema.json
+5e3becf5094f3e222b94799e0fb7b6b77c3398aeabae743fc65b409c4cd4adfd  qualification/v8/session-ha-persistent-consumer-head-evidence.schema.json
 ```
 
 Request admission separately requires byte-identical public outer/nested IDs
@@ -506,7 +506,7 @@ returned.
 ## Final integrated candidate: focused and canonical local gates
 
 The following focused gates passed after the activation, counter-exhaustion,
-revision-4 transport, receipt-status recovery, and revoked-envelope corrections
+revision-5 transport, receipt-status recovery, and revoked-envelope corrections
 were combined:
 
 ```text

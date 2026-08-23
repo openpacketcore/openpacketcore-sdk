@@ -24,7 +24,7 @@ independent logical clients, as independent persistent constructors do.
 The closure successor starts exactly at SDK commit
 `f2ed1181c85540cc01ea0b4611fa3620891375fd`, tree
 `945ceab3870d2c1d2d1396aff29e819288fce76a`. It does not contain, rebase, or
-merge the stale qualification branch. Four focused regressions retained the
+merge the stale qualification branch. Five focused regressions retained the
 following current-main RED evidence before the generic correction:
 
 ```text
@@ -34,8 +34,10 @@ persistent_pool_shares_one_recovery_probe_across_twelve_callers
   peak simultaneous resolver calls: observed 12, required 1
 pre_staged_future_rejection_after_a_completed_call_is_outcome_unknown
   observed typed Rejected(Unavailable), required OutcomeUnknown
-credential_epoch_supersedes_blocked_pool_recovery_without_waiting_for_setup_deadline
-  fresh-epoch resolver calls without advancing the paused clock: observed 1, required 2
+credential_and_material_epochs_supersede_single_blocked_pool_recovery
+  lone reauthentication resolver calls without advancing the paused clock: observed 1, required 2
+adapter_buffering_above_zero_byte_lower_transport_is_before_write
+  observed MayHaveWritten after adapter-only buffering, required BeforeWrite
 ```
 
 The causal correction is consumer transport revision 5. It retains the
@@ -54,9 +56,10 @@ while adding five generic guarantees:
 - each connection-local monotonic sequence is paired with a fresh
   unpredictable UUID nonce whose field is serialized only after the complete
   request, and the exact composite value is required in the response; and
-- write classification observes positive ciphertext acceptance below TLS, so
-  a later outer TLS error cannot turn a possibly transmitted mutation into an
-  automatically replayable `NotTransmitted` result.
+- write classification makes positive ciphertext acceptance below TLS
+  authoritative: a later outer TLS error remains ambiguous after a positive
+  lower write, while adapter-only plaintext buffering over zero lower writes
+  remains exactly `NotTransmitted`.
 
 The tracked v8 exact-head evidence schema now binds transport revision 5. It
 continues to require `experimental=true` and
@@ -72,7 +75,7 @@ The current-main successor's bounded GREEN gates were run with all
 
 ```text
 cargo test -p opc-session-net --all-features --lib
-  275 passed; 0 failed
+  276 passed; 0 failed
 cargo test -p opc-session-net --all-features \
   --test persistent_consumer_protocol \
   --test persistent_consumer_boundaries \

@@ -344,10 +344,11 @@ from running to draining to forced, never backwards.
 
 Only `NotTransmitted` may be automatically retried, and only with the identical
 request ID and body. Anything possibly written is `OutcomeUnknown`, evicts the
-lane, and is never replayed. Positive ciphertext acceptance is observed below
-TLS as well as at the framed plaintext writer, so a later outer TLS error cannot
-misclassify a transmitted prefix as `NotTransmitted`; zero/Pending/error before
-positive lower-transport acceptance remains exactly `NotTransmitted`. Each
+lane, and is never replayed. For a production TLS lane, positive ciphertext
+acceptance below TLS is the authoritative effect boundary: a later outer TLS
+error cannot misclassify a transmitted prefix as `NotTransmitted`, while
+adapter-local plaintext buffering over zero/Pending/error lower transport
+remains exactly `NotTransmitted`. Each
 prewarm performs a rolling resolver/TCP/TLS/Hello refresh of every configured
 lane and retains already refreshed plus unprocessed healthy capacity on a
 partial failure. Prewarm and readiness establish authenticated transport

@@ -59,11 +59,23 @@ impl TestPki {
     }
 
     fn client_config(&self, spiffe_id: &str) -> AuthenticatedClientConfig {
+        let (_source, config) = self.rotating_client_config(spiffe_id);
+        config
+    }
+
+    fn rotating_client_config(
+        &self,
+        spiffe_id: &str,
+    ) -> (
+        tokio::sync::watch::Sender<Option<opc_identity::IdentityState>>,
+        AuthenticatedClientConfig,
+    ) {
         let (_source, receiver) = tokio::sync::watch::channel(Some(self.identity_state(spiffe_id)));
-        TlsConfigBuilder::new(receiver)
+        let config = TlsConfigBuilder::new(receiver)
             .allow_any_trusted_peer()
             .build_authenticated_client_config()
-            .expect("test client TLS config")
+            .expect("test client TLS config");
+        (_source, config)
     }
 
     fn server_config(&self, spiffe_id: &str) -> AuthenticatedServerConfig {
@@ -951,32 +963,41 @@ async fn persistent_pool_shares_one_recovery_probe_across_twelve_callers() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn credential_epoch_supersedes_blocked_pool_recovery_without_waiting_for_setup_deadline() {
+#[derive(Clone, Copy)]
+enum SetupEpochPublication {
+    Reauthentication,
+    Material,
+}
+
+async fn assert_single_caller_setup_epoch_supersession(publication: SetupEpochPublication) {
     let pki = TestPki::new();
-    let server_spiffe = spiffe("superseded-recovery-server");
-    let client_spiffe = spiffe("superseded-recovery-client");
+    let suffix = match publication {
+        SetupEpochPublication::Reauthentication => "reauthentication",
+        SetupEpochPublication::Material => "material",
+    };
+    let server_spiffe = spiffe(&format!("superseded-{suffix}-recovery-server"));
+    let client_spiffe = spiffe(&format!("superseded-{suffix}-recovery-client"));
     let (_authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
     let resolver_attempts = Arc::new(AtomicUsize::new(0));
     let active_resolvers = Arc::new(AtomicUsize::new(0));
     let peak_resolvers = Arc::new(AtomicUsize::new(0));
     let first_entered = Arc::new(AtomicBool::new(false));
     let first_dropped = Arc::new(AtomicBool::new(false));
-    let second_saw_first_dropped = Arc::new(AtomicBool::new(false));
+    let fresh_saw_first_dropped = Arc::new(AtomicBool::new(false));
     let resolver: RemoteAddrResolver = {
         let resolver_attempts = Arc::clone(&resolver_attempts);
         let active_resolvers = Arc::clone(&active_resolvers);
         let peak_resolvers = Arc::clone(&peak_resolvers);
         let first_entered = Arc::clone(&first_entered);
         let first_dropped = Arc::clone(&first_dropped);
-        let second_saw_first_dropped = Arc::clone(&second_saw_first_dropped);
+        let fresh_saw_first_dropped = Arc::clone(&fresh_saw_first_dropped);
         Arc::new(move || {
             let resolver_attempts = Arc::clone(&resolver_attempts);
             let active_resolvers = Arc::clone(&active_resolvers);
             let peak_resolvers = Arc::clone(&peak_resolvers);
             let first_entered = Arc::clone(&first_entered);
             let first_dropped = Arc::clone(&first_dropped);
-            let second_saw_first_dropped = Arc::clone(&second_saw_first_dropped);
+            let fresh_saw_first_dropped = Arc::clone(&fresh_saw_first_dropped);
             Box::pin(async move {
                 let ordinal = resolver_attempts.fetch_add(1, Ordering::SeqCst) + 1;
                 let _activity = ResolverAttemptGuard::enter(
@@ -990,7 +1011,7 @@ async fn credential_epoch_supersedes_blocked_pool_recovery_without_waiting_for_s
                     std::future::pending::<()>().await;
                     unreachable!("the stale resolver is cancelled by the fresh epoch");
                 }
-                second_saw_first_dropped
+                fresh_saw_first_dropped
                     .store(first_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
                 Err(std::io::Error::other(
                     "fresh-epoch test resolver unavailable",
@@ -998,32 +1019,33 @@ async fn credential_epoch_supersedes_blocked_pool_recovery_without_waiting_for_s
             })
         })
     };
+    let (material_source, client_tls) = pki.rotating_client_config(&client_spiffe);
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::try_from("persistent-consumer.test.invalid")
             .expect("test server name"),
         SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
         scope,
-        pki.client_config(&client_spiffe),
+        client_tls,
     )
     .with_operation_timeout(Duration::from_secs(2));
     let client = PersistentSessionConsumerClient::try_from_stateless(
         stateless,
         PersistentSessionConsumerConfig::try_new(
-            2,
+            1,
             0,
             Duration::from_millis(250),
             1,
             Duration::from_millis(1_500),
-            1,
+            2,
             Duration::ZERO,
             Duration::from_secs(1),
         )
         .expect("fixed supersession config"),
     )
     .expect("persistent client");
-    let first_client = client.clone();
-    let first = tokio::spawn(async move { first_client.capabilities().await });
+    let caller_client = client.clone();
+    let caller = tokio::spawn(async move { caller_client.capabilities().await });
     for _ in 0..128 {
         if first_entered.load(Ordering::SeqCst) {
             break;
@@ -1035,12 +1057,17 @@ async fn credential_epoch_supersedes_blocked_pool_recovery_without_waiting_for_s
         "the first epoch owns the blocked resolver setup"
     );
 
-    client
-        .request_reauthentication()
-        .expect("publish a fresh credential epoch");
     let fresh_epoch_started_at = tokio::time::Instant::now();
-    let second_client = client.clone();
-    let second = tokio::spawn(async move { second_client.capabilities().await });
+    match publication {
+        SetupEpochPublication::Reauthentication => {
+            client
+                .request_reauthentication()
+                .expect("publish a fresh reauthentication epoch");
+        }
+        SetupEpochPublication::Material => {
+            material_source.send_replace(Some(pki.identity_state(&client_spiffe)));
+        }
+    }
     for _ in 0..128 {
         if resolver_attempts.load(Ordering::SeqCst) >= 2 {
             break;
@@ -1051,7 +1078,7 @@ async fn credential_epoch_supersedes_blocked_pool_recovery_without_waiting_for_s
     assert_eq!(
         resolver_attempts.load(Ordering::SeqCst),
         2,
-        "the fresh epoch must begin without waiting for the stale setup deadline"
+        "the fresh {suffix} epoch must begin without waiting for the stale setup deadline"
     );
     assert_eq!(
         tokio::time::Instant::now(),
@@ -1063,7 +1090,7 @@ async fn credential_epoch_supersedes_blocked_pool_recovery_without_waiting_for_s
         "the stale resolver future is cancelled before the fresh setup begins"
     );
     assert!(
-        second_saw_first_dropped.load(Ordering::SeqCst),
+        fresh_saw_first_dropped.load(Ordering::SeqCst),
         "the serial permit transfers only after stale setup cancellation"
     );
     assert_eq!(
@@ -1072,14 +1099,16 @@ async fn credential_epoch_supersedes_blocked_pool_recovery_without_waiting_for_s
         "credential supersession preserves one pool-wide recovery probe"
     );
     assert!(matches!(
-        first.await.expect("stale caller task completes"),
-        Err(SessionConsumerClientError::Deadline)
-    ));
-    assert!(matches!(
-        second.await.expect("fresh caller task completes"),
+        caller.await.expect("superseded caller task completes"),
         Err(SessionConsumerClientError::Unavailable)
     ));
     client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn credential_and_material_epochs_supersede_single_blocked_pool_recovery() {
+    assert_single_caller_setup_epoch_supersession(SetupEpochPublication::Reauthentication).await;
+    assert_single_caller_setup_epoch_supersession(SetupEpochPublication::Material).await;
 }
 
 #[tokio::test]

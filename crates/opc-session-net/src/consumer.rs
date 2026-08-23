@@ -3410,15 +3410,71 @@ impl PersistentConsumerReconnectControl {
     }
 }
 
-struct PersistentReconnectSetup {
+struct PersistentReconnectSetup<'a> {
     attempt: Option<ReconnectAttempt>,
+    generation: u64,
+    material_epoch: opc_tls::TlsMaterialEpoch,
+    reauthentication: &'a SessionReauthenticationControl,
+    tls_config: &'a opc_tls::AuthenticatedClientConfig,
+    reauthentication_changes: watch::Receiver<u64>,
+    material_changes: Option<opc_tls::TlsMaterialStatusReceiver>,
 }
 
-impl PersistentReconnectSetup {
-    async fn superseded(&self) {
-        match &self.attempt {
-            Some(attempt) => attempt.superseded().await,
-            None => std::future::pending().await,
+impl<'a> PersistentReconnectSetup<'a> {
+    fn new(
+        reauthentication: &'a SessionReauthenticationControl,
+        tls_config: &'a opc_tls::AuthenticatedClientConfig,
+    ) -> Self {
+        // Subscribe before sampling the current epoch so a publication in
+        // between is either included in the sample or remains immediately
+        // observable through the receiver.
+        let reauthentication_changes = reauthentication.subscribe();
+        let material_changes = Some(tls_config.subscribe_material_changes());
+        Self {
+            attempt: None,
+            generation: reauthentication.generation(),
+            material_epoch: tls_config.material_status().epoch(),
+            reauthentication,
+            tls_config,
+            reauthentication_changes,
+            material_changes,
+        }
+    }
+
+    fn epoch(&self) -> (u64, opc_tls::TlsMaterialEpoch) {
+        (self.generation, self.material_epoch)
+    }
+
+    fn install_attempt(&mut self, attempt: ReconnectAttempt) {
+        self.attempt = Some(attempt);
+    }
+
+    fn current(&self) -> bool {
+        consumer_fresh_admission_is_current(
+            self.generation,
+            self.material_epoch,
+            self.reauthentication.generation(),
+            self.tls_config.material_status().epoch(),
+        )
+    }
+
+    async fn superseded(&mut self) {
+        loop {
+            if !self.current() {
+                return;
+            }
+            let attempt = self.attempt.as_ref();
+            tokio::select! {
+                biased;
+                _ = async {
+                    match attempt {
+                        Some(attempt) => attempt.superseded().await,
+                        None => std::future::pending().await,
+                    }
+                } => return,
+                _ = self.reauthentication_changes.changed() => {}
+                _ = wait_consumer_material_change(&mut self.material_changes) => {}
+            }
         }
     }
 
@@ -3431,7 +3487,7 @@ impl PersistentReconnectSetup {
 
 async fn poll_persistent_reconnect_setup<F, T>(
     future: F,
-    reconnect_setup: &PersistentReconnectSetup,
+    reconnect_setup: &mut PersistentReconnectSetup<'_>,
 ) -> Result<T, SessionConsumerClientError>
 where
     F: std::future::Future<Output = T>,
@@ -3440,7 +3496,13 @@ where
     tokio::select! {
         biased;
         _ = reconnect_setup.superseded() => Err(SessionConsumerClientError::Deadline),
-        value = &mut future => Ok(value),
+        value = &mut future => {
+            if reconnect_setup.current() {
+                Ok(value)
+            } else {
+                Err(SessionConsumerClientError::Deadline)
+            }
+        },
     }
 }
 
@@ -4247,19 +4309,17 @@ impl StatelessSessionConsumerClient {
             Some(permit) => permit,
             None => self.physical_admission.try_acquire(watch)?,
         };
-        let generation = self.reauthentication.generation();
-        let material_epoch = self.tls_config.material_status().epoch();
-        let reconnect_attempt = match reconnect_control.filter(|_| coordinate_recovery) {
-            Some(control) => Some(
-                control
-                    .acquire(pre_request_deadline, generation, material_epoch)
-                    .await?,
-            ),
-            None => None,
-        };
-        let reconnect_setup = PersistentReconnectSetup {
-            attempt: reconnect_attempt,
-        };
+        let mut reconnect_setup =
+            PersistentReconnectSetup::new(&self.reauthentication, &self.tls_config);
+        let (generation, material_epoch) = reconnect_setup.epoch();
+        if let Some(control) = reconnect_control.filter(|_| coordinate_recovery) {
+            let attempt = poll_persistent_reconnect_setup(
+                control.acquire(pre_request_deadline, generation, material_epoch),
+                &mut reconnect_setup,
+            )
+            .await??;
+            reconnect_setup.install_attempt(attempt);
+        }
         let resolve_attempt =
             ConsumerSetupPhaseAttempt::begin(setup_counters, ConsumerSetupPhase::Resolve);
         let address = poll_persistent_reconnect_setup(
@@ -4267,7 +4327,7 @@ impl StatelessSessionConsumerClient {
                 pre_request_deadline,
                 poll_persistent_consumer_setup_io((self.resolve)(), shutdown_io.as_ref()),
             ),
-            &reconnect_setup,
+            &mut reconnect_setup,
         )
         .await?
         .map_err(|_| SessionConsumerClientError::Unavailable)?
@@ -4282,7 +4342,7 @@ impl StatelessSessionConsumerClient {
                     shutdown_io.as_ref(),
                 ),
             ),
-            &reconnect_setup,
+            &mut reconnect_setup,
         )
         .await?
         .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
@@ -4311,7 +4371,7 @@ impl StatelessSessionConsumerClient {
                     shutdown_io.as_ref(),
                 ),
             ),
-            &reconnect_setup,
+            &mut reconnect_setup,
         )
         .await?
         .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
@@ -4344,8 +4404,6 @@ impl StatelessSessionConsumerClient {
             Some(handshake.epoch()),
         )
         .map_err(|_| SessionConsumerClientError::Protocol)?;
-        let mut reauthentication_changes = self.reauthentication.subscribe();
-        let mut material_changes = Some(self.tls_config.subscribe_material_changes());
         // Guard the complete TLS/frame poll as well as the nested TCP poll.
         // rustls may satisfy a read from decrypted buffers without polling
         // TCP, so the inner wrapper alone is not a forced-shutdown barrier.
@@ -4377,48 +4435,23 @@ impl StatelessSessionConsumerClient {
                 hello_write_deadline,
             );
             tokio::pin!(hello_write);
-            loop {
-                let setup_deadline = pre_request_deadline.min(lifecycle.retire_at());
-                if tokio::time::Instant::now() >= setup_deadline {
+            let setup_deadline = pre_request_deadline.min(lifecycle.retire_at());
+            if tokio::time::Instant::now() >= setup_deadline {
+                return Err(pre_request_timeout_error(pre_request_budget_active));
+            }
+            let result = tokio::select! {
+                biased;
+                _ = reconnect_setup.superseded() => {
+                    return Err(SessionConsumerClientError::Deadline);
+                }
+                _ = tokio::time::sleep_until(setup_deadline) => {
                     return Err(pre_request_timeout_error(pre_request_budget_active));
                 }
-                let result = tokio::select! {
-                    biased;
-                    _ = reconnect_setup.superseded() => {
-                        return Err(SessionConsumerClientError::Deadline);
-                    }
-                    _ = tokio::time::sleep_until(setup_deadline) => {
-                        return Err(pre_request_timeout_error(pre_request_budget_active));
-                    }
-                    _ = reauthentication_changes.changed() => {
-                        if !consumer_fresh_admission_is_current(
-                            generation,
-                            handshake.epoch(),
-                            self.reauthentication.generation(),
-                            self.tls_config.material_status().epoch(),
-                        ) {
-                            return Err(SessionConsumerClientError::Deadline);
-                        }
-                        continue;
-                    }
-                    _ = wait_consumer_material_change(&mut material_changes) => {
-                        if !consumer_fresh_admission_is_current(
-                            generation,
-                            handshake.epoch(),
-                            self.reauthentication.generation(),
-                            self.tls_config.material_status().epoch(),
-                        ) {
-                            return Err(SessionConsumerClientError::Deadline);
-                        }
-                        continue;
-                    }
-                    result = &mut hello_write => result,
-                };
-                result
-                    .map_err(SessionConsumerClientError::from)
-                    .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
-                break;
-            }
+                result = &mut hello_write => result,
+            };
+            result
+                .map_err(SessionConsumerClientError::from)
+                .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
         }
         let ack = {
             let ack = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerWireResponse>(
@@ -4428,45 +4461,21 @@ impl StatelessSessionConsumerClient {
                 effective_consumer_idle_timeout(self.idle_timeout),
             );
             tokio::pin!(ack);
-            loop {
-                let setup_deadline = pre_request_deadline.min(lifecycle.retire_at());
-                if tokio::time::Instant::now() >= setup_deadline {
+            let setup_deadline = pre_request_deadline.min(lifecycle.retire_at());
+            if tokio::time::Instant::now() >= setup_deadline {
+                return Err(pre_request_timeout_error(pre_request_budget_active));
+            }
+            let result = tokio::select! {
+                biased;
+                _ = reconnect_setup.superseded() => {
+                    return Err(SessionConsumerClientError::Deadline);
+                }
+                _ = tokio::time::sleep_until(setup_deadline) => {
                     return Err(pre_request_timeout_error(pre_request_budget_active));
                 }
-                let result = tokio::select! {
-                    biased;
-                    _ = reconnect_setup.superseded() => {
-                        return Err(SessionConsumerClientError::Deadline);
-                    }
-                    _ = tokio::time::sleep_until(setup_deadline) => {
-                        return Err(pre_request_timeout_error(pre_request_budget_active));
-                    }
-                    _ = reauthentication_changes.changed() => {
-                        if !consumer_fresh_admission_is_current(
-                            generation,
-                            handshake.epoch(),
-                            self.reauthentication.generation(),
-                            self.tls_config.material_status().epoch(),
-                        ) {
-                            return Err(SessionConsumerClientError::Deadline);
-                        }
-                        continue;
-                    }
-                    _ = wait_consumer_material_change(&mut material_changes) => {
-                        if !consumer_fresh_admission_is_current(
-                            generation,
-                            handshake.epoch(),
-                            self.reauthentication.generation(),
-                            self.tls_config.material_status().epoch(),
-                        ) {
-                            return Err(SessionConsumerClientError::Deadline);
-                        }
-                        continue;
-                    }
-                    result = &mut ack => result,
-                };
-                break result.map_err(SessionConsumerClientError::from)?;
-            }
+                result = &mut ack => result,
+            };
+            result.map_err(SessionConsumerClientError::from)?
         };
         // Once an authenticated HelloAck frame has started, preserve its
         // active-frame timeout classification. Only a no-byte setup expiry
@@ -10425,6 +10434,31 @@ mod tests {
         lower: W,
     }
 
+    /// Accepts the complete plaintext frame into an adapter-local buffer but
+    /// proves that no lower-transport write completed before flush failed.
+    struct BufferingTlsLikeWriter;
+
+    impl AsyncWrite for BufferingTlsLikeWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "controlled buffered adapter flush timeout",
+            )))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     impl<W> AsyncWrite for CollapsingTlsLikeWriter<W>
     where
         W: AsyncWrite + Unpin,
@@ -10535,6 +10569,7 @@ mod tests {
 
     struct PartialPendingWriter {
         accepted: Arc<AtomicUsize>,
+        accepted_ciphertext_writes: Option<Arc<AtomicU64>>,
         started: Arc<tokio::sync::Notify>,
         wrote_prefix: bool,
     }
@@ -10550,6 +10585,9 @@ mod tests {
             }
             let accepted = bytes.len().min(2);
             self.accepted.fetch_add(accepted, Ordering::SeqCst);
+            if let Some(accepted_ciphertext_writes) = &self.accepted_ciphertext_writes {
+                accepted_ciphertext_writes.fetch_add(1, Ordering::Release);
+            }
             self.wrote_prefix = true;
             self.started.notify_waiters();
             Poll::Ready(Ok(accepted))
@@ -10819,6 +10857,36 @@ mod tests {
                 "only a proven positive lower-transport write crosses the effect boundary",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn adapter_buffering_above_zero_byte_lower_transport_is_before_write() {
+        let request = mutation_request(SessionConsumerRequestId::new());
+        let outbound = BorrowedConsumerWireRequest::Call(BorrowedConsumerCall {
+            request: &request,
+            correlation: correlation(1),
+        });
+        let accepted_writes = Arc::new(AtomicU64::new(0));
+        let progress = crate::protocol::FrameWriteProgress::new();
+        progress.bind_transport_counter(Arc::clone(&accepted_writes));
+        let error = crate::protocol::write_frame_bounded_until_classified_with_progress(
+            &mut BufferingTlsLikeWriter,
+            &outbound,
+            MAX_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &progress,
+        )
+        .await
+        .expect_err("the adapter-local plaintext buffer fails during flush");
+        assert!(matches!(
+            error,
+            crate::protocol::FrameWriteError::BeforeWrite(_)
+        ));
+        assert_eq!(
+            accepted_writes.load(Ordering::Acquire),
+            0,
+            "no lower-transport write crossed the exact effect boundary"
+        );
     }
 
     #[test]
@@ -14328,6 +14396,7 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_secs(5),
             Box::new(PartialPendingWriter {
                 accepted: Arc::clone(&accepted),
+                accepted_ciphertext_writes: None,
                 started: Arc::clone(&started),
                 wrote_prefix: false,
             }),
@@ -14401,10 +14470,12 @@ mod tests {
             )
             .expect("valid persistent configuration");
             let accepted = Arc::new(AtomicUsize::new(0));
+            let accepted_ciphertext_writes = Arc::new(AtomicU64::new(0));
             let started = Arc::new(tokio::sync::Notify::new());
             let writer: Box<dyn AsyncWrite + Unpin + Send> = if partial {
                 Box::new(PartialPendingWriter {
                     accepted: Arc::clone(&accepted),
+                    accepted_ciphertext_writes: Some(Arc::clone(&accepted_ciphertext_writes)),
                     started: Arc::clone(&started),
                     wrote_prefix: false,
                 })
@@ -14416,6 +14487,7 @@ mod tests {
                 tokio::time::Instant::now() + Duration::from_secs(5),
                 writer,
             );
+            connection.accepted_ciphertext_writes = accepted_ciphertext_writes;
             let request_id = SessionConsumerRequestId::new();
             let request = mutation_request(request_id);
             let write_started = started.notified();
@@ -14498,10 +14570,12 @@ mod tests {
             let persistent = PersistentSessionConsumerClient::from_stateless(client)
                 .expect("valid persistent configuration");
             let accepted = Arc::new(AtomicUsize::new(0));
+            let accepted_ciphertext_writes = Arc::new(AtomicU64::new(0));
             let started = Arc::new(tokio::sync::Notify::new());
             let writer: Box<dyn AsyncWrite + Unpin + Send> = if partial {
                 Box::new(PartialPendingWriter {
                     accepted: Arc::clone(&accepted),
+                    accepted_ciphertext_writes: Some(Arc::clone(&accepted_ciphertext_writes)),
                     started: Arc::clone(&started),
                     wrote_prefix: false,
                 })
@@ -14513,6 +14587,7 @@ mod tests {
                 tokio::time::Instant::now() + Duration::from_secs(5),
                 writer,
             );
+            connection.accepted_ciphertext_writes = accepted_ciphertext_writes;
             let io_barrier = install_shutdown_barrier(&mut connection);
             let request_id = SessionConsumerRequestId::new();
             let request = mutation_request(request_id);
