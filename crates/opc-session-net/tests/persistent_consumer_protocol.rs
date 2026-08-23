@@ -1,4 +1,4 @@
-//! Adversarial wire tests for the revision-4 persistent consumer transport.
+//! Adversarial wire tests for the revision-5 persistent consumer transport.
 //!
 //! The peer in these tests deliberately speaks only JSON values.  That keeps
 //! the private consumer wire DTOs private while still checking that a live
@@ -14,8 +14,9 @@ use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBu
 use opc_session_net::{
     PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
     PersistentSessionConsumerExecuteError, RemoteAddrResolver, SessionConsumerClientError,
-    SessionConsumerMutationError, StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE,
-    SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    SessionConsumerLeaseMutationError, SessionConsumerMutationError,
+    StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
@@ -357,8 +358,15 @@ enum CanonicalTypedConsumerWireResponse {
 
 #[derive(Serialize)]
 struct CanonicalTypedConsumerCallResponse {
-    correlation: Value,
+    correlation: CanonicalConsumerCorrelation,
     response: CanonicalConsumerSessionResponseWire,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalConsumerCorrelation {
+    sequence: Value,
+    nonce: Value,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -382,7 +390,7 @@ struct CanonicalConsumerLeaseGrantWire {
     authority_time: Timestamp,
 }
 
-/// Test-side mirror of the private revision-2 response body. Tests may compose
+/// Test-side mirror of the private response body. Tests may compose
 /// adversarial frames as JSON values, but valid control responses must be
 /// reserialized through this typed mirror so map ordering cannot accidentally
 /// turn the fixture itself into a noncanonical frame.
@@ -412,18 +420,23 @@ enum CanonicalConsumerSessionResponseWire {
 
 #[derive(Serialize)]
 struct CanonicalConsumerWatchEntry {
-    correlation: Value,
+    correlation: CanonicalConsumerCorrelation,
     entry: Result<SessionConsumerChange, SessionConsumerStoreError>,
 }
 
 fn canonical_response_payload(value: &Value) -> Vec<u8> {
     if value["kind"] == "response" {
-        if let Ok(response) = serde_json::from_value::<CanonicalConsumerSessionResponseWire>(
-            value["body"]["response"].clone(),
+        if let (Ok(correlation), Ok(response)) = (
+            serde_json::from_value::<CanonicalConsumerCorrelation>(
+                value["body"]["correlation"].clone(),
+            ),
+            serde_json::from_value::<CanonicalConsumerSessionResponseWire>(
+                value["body"]["response"].clone(),
+            ),
         ) {
             return serde_json::to_vec(&CanonicalTypedConsumerWireResponse::Response(
                 CanonicalTypedConsumerCallResponse {
-                    correlation: value["body"]["correlation"].clone(),
+                    correlation,
                     response,
                 },
             ))
@@ -446,7 +459,8 @@ fn canonical_response_payload(value: &Value) -> Vec<u8> {
         }
         Some("watch_entry") => {
             CanonicalConsumerWireResponse::WatchEntry(CanonicalConsumerWatchEntry {
-                correlation: value["body"]["correlation"].clone(),
+                correlation: serde_json::from_value(value["body"]["correlation"].clone())
+                    .expect("typed watch correlation"),
                 entry: serde_json::from_value(value["body"]["entry"].clone())
                     .expect("typed watch entry"),
             })
@@ -460,7 +474,7 @@ async fn write_value<W>(writer: &mut W, value: &Value)
 where
     W: AsyncWrite + Unpin,
 {
-    // The revision-2 transport owns canonical private DTO bytes. Build those
+    // The current transport owns canonical private DTO bytes. Build those
     // bytes from typed public body values so each adversary reaches the exact
     // correlation/frame condition it intends to test.
     let payload = canonical_response_payload(value);
@@ -491,6 +505,25 @@ fn capability_response(correlation: Value) -> Value {
                 bounded_capabilities(),
             )).expect("capability response encodes"),
         },
+    })
+}
+
+fn correlation_sequence(correlation: &Value) -> u64 {
+    correlation["sequence"]
+        .as_u64()
+        .expect("consumer correlation has a nonzero sequence")
+}
+
+fn correlation_with_sequence(correlation: &Value, sequence: u64) -> Value {
+    let mut changed = correlation.clone();
+    changed["sequence"] = json!(sequence);
+    changed
+}
+
+fn guessed_correlation(sequence: u64) -> Value {
+    json!({
+        "sequence": sequence,
+        "nonce": "00000000-0000-0000-0000-000000000000",
     })
 }
 
@@ -676,7 +709,7 @@ async fn assert_malicious_semantic_wire_response_is_unconfirmed(
 
 #[tokio::test]
 async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
-    for wrong in ["frozen-revision-three", "scope"] {
+    for wrong in ["frozen-revision-four", "scope"] {
         let pki = TestPki::new();
         let server_spiffe = spiffe(&format!("hello-{wrong}-server"));
         let client_spiffe = spiffe(&format!("hello-{wrong}-client"));
@@ -691,7 +724,7 @@ async fn hello_ack_revision_and_scope_mismatches_fail_closed_without_a_call() {
             let hello = read_value(&mut tls).await;
             let mut ack = hello_ack(&hello);
             match wrong {
-                "frozen-revision-three" => ack["body"]["transport_revision"] = json!(3_u16),
+                "frozen-revision-four" => ack["body"]["transport_revision"] = json!(4_u16),
                 "scope" => ack["body"]["scope"] = serde_json::to_value(scope(9)).expect("scope"),
                 _ => unreachable!("fixed test cases"),
             }
@@ -866,8 +899,8 @@ async fn zero_future_and_wrong_variant_responses_fail_closed() {
             let (mut tls, call) =
                 accept_hello_and_call(&listener, &authenticated, &expected_client).await;
             let correlation = match case {
-                "zero" => json!(0),
-                "future" => json!(2),
+                "zero" => correlation_with_sequence(&call["body"]["correlation"], 0),
+                "future" => correlation_with_sequence(&call["body"]["correlation"], 2),
                 "wrong_variant" => call["body"]["correlation"].clone(),
                 _ => unreachable!("fixed test cases"),
             };
@@ -889,6 +922,104 @@ async fn zero_future_and_wrong_variant_responses_fail_closed() {
         assert_typed_protocol_error(client.capabilities().await, &server_spiffe, &client_spiffe);
         server.await.expect("malicious server");
     }
+}
+
+#[tokio::test]
+async fn pre_staged_future_rejection_after_a_completed_call_is_outcome_unknown() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("pre-staged-future-rejection-server");
+    let client_spiffe = spiffe("pre-staged-future-rejection-client");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind malicious listener");
+    let address = listener.local_addr().expect("listener address");
+    let authenticated = pki.server_config(&server_spiffe);
+    let expected_client = SpiffeId::new(&client_spiffe).expect("client SPIFFE");
+    let (effectful_call_received, effectful_call_observed) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut tls, first) =
+            accept_hello_and_call(&listener, &authenticated, &expected_client).await;
+        assert_eq!(
+            first["body"]["request"]["operation"]["operation"], "capabilities",
+            "the harmless first call is Capabilities"
+        );
+        assert_eq!(
+            correlation_sequence(&first["body"]["correlation"]),
+            1,
+            "the first persistent call uses the first correlation"
+        );
+        write_value(
+            &mut tls,
+            &capability_response(first["body"]["correlation"].clone()),
+        )
+        .await;
+        // A response for the next predictable sequence, but without the
+        // unpredictable nonce, is queued before the effectful call is
+        // received or dispatched.
+        let guessed = guessed_correlation(2);
+        write_value(
+            &mut tls,
+            &rejected_response(guessed.clone(), SessionConsumerRejection::Unavailable),
+        )
+        .await;
+
+        let second = tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, read_value(&mut tls))
+            .await
+            .expect("the effectful call reaches the authenticated peer");
+        assert_eq!(
+            second["kind"], "call",
+            "the second frame is a consumer call"
+        );
+        assert_eq!(
+            correlation_sequence(&second["body"]["correlation"]),
+            2,
+            "the effectful call uses the next bounded sequence"
+        );
+        assert_ne!(
+            second["body"]["correlation"], guessed,
+            "the response correlation cannot be pre-staged"
+        );
+        assert_eq!(
+            second["body"]["request"]["operation"]["operation"], "acquire_lease",
+            "the second call is the effectful lease mutation"
+        );
+        effectful_call_received
+            .send(())
+            .expect("publish effectful call receipt");
+        match tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, tls.read_u8()).await {
+            Err(_) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("an outcome-unknown mutation must not be automatically replayed"),
+        }
+    });
+    let client = persistent_client(&pki, address, &server_spiffe, &client_spiffe, scope(1));
+
+    let harmless = client.capabilities().await;
+    assert!(
+        matches!(harmless, Ok(value) if value == bounded_capabilities()),
+        "the harmless first call completes before the effectful mutation: {harmless:?}"
+    );
+    let request_id = SessionConsumerRequestId::from_bytes([0x69; 16]);
+    let key = semantic_key(b"pre-staged-future-rejection-key");
+    let owner = OwnerId::new("pre-staged-future-rejection-owner").expect("test owner");
+    let result = client
+        .acquire_with_id(request_id, &key, &owner, Duration::from_secs(30))
+        .await;
+
+    tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, effectful_call_observed)
+        .await
+        .expect("the peer proves the effectful call was transmitted")
+        .expect("malicious peer publishes the effectful call receipt");
+    server.await.expect("malicious server");
+    client.shutdown().await;
+
+    assert!(
+        matches!(
+            result,
+            Err(SessionConsumerLeaseMutationError::OutcomeUnknown { request_id: returned })
+                if returned == request_id
+        ),
+        "a pre-staged rejection after an effectful transmission remains outcome-unknown"
+    );
 }
 
 #[tokio::test]
@@ -1525,7 +1656,7 @@ async fn batch_ambiguity_and_all_read_unavailability_use_one_canonical_outcome_r
         let (mut replacement, read) =
             accept_hello_and_call(&listener, &authenticated, &expected_client).await;
 
-        assert_eq!(read["body"]["correlation"], json!(1));
+        assert_eq!(correlation_sequence(&read["body"]["correlation"]), 1);
         write_value(
             &mut replacement,
             &json!({
@@ -1542,7 +1673,7 @@ async fn batch_ambiguity_and_all_read_unavailability_use_one_canonical_outcome_r
         .await;
 
         let capability = read_value(&mut replacement).await;
-        assert_eq!(capability["body"]["correlation"], json!(2));
+        assert_eq!(correlation_sequence(&capability["body"]["correlation"]), 2);
         write_value(
             &mut replacement,
             &capability_response(capability["body"]["correlation"].clone()),
@@ -2380,14 +2511,14 @@ async fn duplicate_response_poisons_lane_and_next_call_uses_a_new_connection() {
         let first_correlation = first["body"]["correlation"].clone();
         write_value(&mut tls, &capability_response(first_correlation.clone())).await;
         let second = read_value(&mut tls).await;
-        assert_eq!(second["body"]["correlation"], json!(2));
+        assert_eq!(correlation_sequence(&second["body"]["correlation"]), 2);
         // This is valid JSON but the prior request's correlation: a duplicate
         // and late response while call two is outstanding.
         write_value(&mut tls, &capability_response(first_correlation)).await;
 
         let (mut fresh_tls, fresh) =
             accept_hello_and_call(&listener, &authenticated, &expected_client).await;
-        assert_eq!(fresh["body"]["correlation"], json!(1));
+        assert_eq!(correlation_sequence(&fresh["body"]["correlation"]), 1);
         write_value(
             &mut fresh_tls,
             &capability_response(fresh["body"]["correlation"].clone()),

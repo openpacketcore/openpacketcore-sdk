@@ -19,8 +19,8 @@ use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBu
 use opc_session_net::{
     conservative_payload_budget, ConnectionLifecyclePolicy, PersistentSessionConsumerClient,
     PersistentSessionConsumerConfig, PersistentSessionConsumerExecuteError, RemoteAddrResolver,
-    SessionConsumerAuthorizer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
-    MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
+    SessionConsumerAuthorizer, SessionConsumerClientError, SessionQuorumConsumerServer,
+    StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
     SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::{
@@ -423,6 +423,157 @@ async fn reestablished_lanes_reresolve_exact_endpoint_without_resolving_warm_cal
 
     client.shutdown().await;
     second_handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn prewarm_reresolves_and_reauthenticates_all_lanes_after_server_replacement() {
+    const LANES: usize = 2;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("prewarm-replacement-server");
+    let client_spiffe = spiffe("prewarm-replacement-client");
+    let (first_authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let first_service = Arc::new(RecordingConsumer::default());
+    let (first_handle, first_address) = SessionQuorumConsumerServer::new(
+        first_service,
+        pki.server_config(&server_spiffe),
+        first_authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start first listener");
+
+    let resolved = Arc::new(RwLock::new(first_address));
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolved = Arc::clone(&resolved);
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolved = Arc::clone(&resolved);
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Ok(*resolved.read().expect("resolver address lock"))
+            })
+        })
+    };
+    let client = persistent_client(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
+        &server_spiffe,
+        scope,
+        pki.client_config(&client_spiffe),
+        config(LANES),
+    );
+
+    let first_readiness = client.prewarm().await.expect("first prewarm");
+    assert!(first_readiness.ready);
+    assert_eq!(first_readiness.ready_request_connections, LANES);
+    assert_eq!(resolutions.load(Ordering::SeqCst), LANES);
+    assert_eq!(client.diagnostics().await.setup_successes, LANES as u64);
+
+    first_handle.abort_and_wait().await;
+    let (second_authorizer, second_scope) = authorizer_and_scope(&client_spiffe).await;
+    assert_eq!(
+        second_scope, scope,
+        "replacement preserves the client scope"
+    );
+    let second_service = Arc::new(RecordingConsumer::default());
+    let (second_handle, second_address) = SessionQuorumConsumerServer::new(
+        second_service.clone(),
+        pki.server_config(&server_spiffe),
+        second_authorizer,
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("replacement listen address"),
+    )
+    .await
+    .expect("start replacement listener");
+    *resolved.write().expect("resolver address lock") = second_address;
+
+    let replacement_readiness = client.prewarm().await.expect("replacement prewarm");
+    assert!(replacement_readiness.ready);
+    assert_eq!(replacement_readiness.ready_request_connections, LANES);
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        LANES * 2,
+        "replacement prewarm resolves every replacement lane"
+    );
+    assert_eq!(
+        client.diagnostics().await.setup_successes,
+        (LANES * 2) as u64,
+        "replacement prewarm completes authenticated Hello for every lane"
+    );
+    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
+    assert_eq!(second_service.calls.load(Ordering::SeqCst), 1);
+
+    client.shutdown().await;
+    second_handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn failed_rolling_prewarm_preserves_unprocessed_authenticated_siblings() {
+    const LANES: usize = 3;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("rolling-prewarm-server");
+    let client_spiffe = spiffe("rolling-prewarm-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(RecordingConsumer::default());
+    let (handle, address) =
+        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
+            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+            .await
+            .expect("start rolling-prewarm listener");
+
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                let attempt = resolutions.fetch_add(1, Ordering::SeqCst);
+                if attempt == LANES + 1 {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "one bounded rolling replacement fails",
+                    ))
+                } else {
+                    Ok(address)
+                }
+            })
+        })
+    };
+    let client = persistent_client(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        &server_spiffe,
+        scope,
+        pki.client_config(&client_spiffe),
+        config(LANES),
+    );
+
+    assert!(client.prewarm().await.expect("initial prewarm").ready);
+    assert_eq!(
+        client.prewarm().await,
+        Err(SessionConsumerClientError::Unavailable),
+        "the second rolling replacement fails through the typed setup boundary"
+    );
+    let partial = client.readiness().await;
+    assert!(!partial.ready);
+    assert_eq!(
+        partial.ready_request_connections,
+        LANES - 1,
+        "one successful replacement and one unprocessed original sibling remain usable"
+    );
+
+    let recovered = client.prewarm().await.expect("bounded recovery prewarm");
+    assert!(recovered.ready);
+    assert_eq!(recovered.ready_request_connections, LANES);
+    assert_eq!(resolutions.load(Ordering::SeqCst), LANES + 2 + LANES);
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
 }
 
 #[tokio::test]

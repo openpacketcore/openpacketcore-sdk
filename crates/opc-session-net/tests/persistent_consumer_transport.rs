@@ -59,11 +59,23 @@ impl TestPki {
     }
 
     fn client_config(&self, spiffe_id: &str) -> AuthenticatedClientConfig {
+        let (_source, config) = self.rotating_client_config(spiffe_id);
+        config
+    }
+
+    fn rotating_client_config(
+        &self,
+        spiffe_id: &str,
+    ) -> (
+        tokio::sync::watch::Sender<Option<opc_identity::IdentityState>>,
+        AuthenticatedClientConfig,
+    ) {
         let (_source, receiver) = tokio::sync::watch::channel(Some(self.identity_state(spiffe_id)));
-        TlsConfigBuilder::new(receiver)
+        let config = TlsConfigBuilder::new(receiver)
             .allow_any_trusted_peer()
             .build_authenticated_client_config()
-            .expect("test client TLS config")
+            .expect("test client TLS config");
+        (_source, config)
     }
 
     fn server_config(&self, spiffe_id: &str) -> AuthenticatedServerConfig {
@@ -101,6 +113,12 @@ impl TestPki {
 #[derive(Default)]
 struct ControlledConsumer {
     calls: AtomicUsize,
+    active_executes: AtomicUsize,
+    active_executes_changed: Notify,
+    active_watch_setups: AtomicUsize,
+    active_watch_setups_changed: Notify,
+    block_watch_setup: AtomicBool,
+    watch_setup_released: Notify,
     block: AtomicBool,
     blocked_remaining: AtomicUsize,
     entered: Notify,
@@ -119,6 +137,18 @@ struct ControlledConsumer {
     watch_started_at: Mutex<Vec<Instant>>,
 }
 
+struct ActiveServiceCall<'a> {
+    active: &'a AtomicUsize,
+    changed: &'a Notify,
+}
+
+impl Drop for ActiveServiceCall<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+}
+
 impl ControlledConsumer {
     fn arm_blocks(&self, count: usize) {
         self.blocked_remaining.store(count, Ordering::SeqCst);
@@ -129,6 +159,51 @@ impl ControlledConsumer {
         while self.calls.load(Ordering::SeqCst) < expected {
             tokio::task::yield_now().await;
         }
+    }
+
+    async fn wait_until_no_active_execute(&self) {
+        loop {
+            let changed = self.active_executes_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.active_executes.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn arm_watch_setup_block(&self) {
+        self.block_watch_setup.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_until_watch_setup_entered(&self) {
+        loop {
+            let changed = self.active_watch_setups_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.active_watch_setups.load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    async fn wait_until_no_active_watch_setup(&self) {
+        loop {
+            let changed = self.active_watch_setups_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.active_watch_setups.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn release_watch_setup(&self) {
+        self.block_watch_setup.store(false, Ordering::SeqCst);
+        self.watch_setup_released.notify_waiters();
     }
 
     fn release(&self) {
@@ -230,6 +305,11 @@ impl SessionQuorumConsumer for ControlledConsumer {
         _identity: &SessionConsumerIdentity,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
+        self.active_executes.fetch_add(1, Ordering::SeqCst);
+        let _active = ActiveServiceCall {
+            active: &self.active_executes,
+            changed: &self.active_executes_changed,
+        };
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.request_order
             .lock()
@@ -263,6 +343,15 @@ impl SessionQuorumConsumer for ControlledConsumer {
         BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
         SessionConsumerRejection,
     > {
+        self.active_watch_setups.fetch_add(1, Ordering::SeqCst);
+        self.active_watch_setups_changed.notify_waiters();
+        let _active = ActiveServiceCall {
+            active: &self.active_watch_setups,
+            changed: &self.active_watch_setups_changed,
+        };
+        while self.block_watch_setup.load(Ordering::SeqCst) {
+            self.watch_setup_released.notified().await;
+        }
         self.watch_starts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -658,6 +747,368 @@ fn persistent_client(
     .with_operation_timeout(Duration::from_secs(2));
     PersistentSessionConsumerClient::try_from_stateless(stateless, config)
         .expect("persistent client")
+}
+
+struct ResolverAttemptGuard {
+    active: Arc<AtomicUsize>,
+    first_dropped: Arc<AtomicBool>,
+    ordinal: usize,
+}
+
+impl ResolverAttemptGuard {
+    fn enter(
+        active: Arc<AtomicUsize>,
+        peak: &AtomicUsize,
+        first_dropped: Arc<AtomicBool>,
+        ordinal: usize,
+    ) -> Self {
+        let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut observed_peak = peak.load(Ordering::SeqCst);
+        while concurrent > observed_peak {
+            match peak.compare_exchange_weak(
+                observed_peak,
+                concurrent,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => observed_peak = actual,
+            }
+        }
+        Self {
+            active,
+            first_dropped,
+            ordinal,
+        }
+    }
+}
+
+impl Drop for ResolverAttemptGuard {
+    fn drop(&mut self) {
+        if self.ordinal == 1 {
+            self.first_dropped.store(true, Ordering::SeqCst);
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn persistent_pool_shares_one_recovery_probe_across_twelve_callers() {
+    const CALLERS: usize = 12;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("shared-recovery-gate-server");
+    let client_spiffe = spiffe("shared-recovery-gate-client");
+    let (_authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let lifecycle = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+        Duration::from_millis(50),
+        Duration::from_millis(400),
+        Duration::ZERO,
+    )
+    .expect("deterministic reconnect lifecycle");
+    let resolver_attempts = Arc::new(AtomicUsize::new(0));
+    let concurrent_resolvers = Arc::new(AtomicUsize::new(0));
+    let peak_resolvers = Arc::new(AtomicUsize::new(0));
+    let resolver_timestamps = Arc::new(Mutex::new(Vec::new()));
+    let resolver_entered = Arc::new(Notify::new());
+    let release_resolvers = Arc::new(AtomicBool::new(false));
+    let resolver_released = Arc::new(Notify::new());
+    let resolver: RemoteAddrResolver = {
+        let resolver_attempts = Arc::clone(&resolver_attempts);
+        let concurrent_resolvers = Arc::clone(&concurrent_resolvers);
+        let peak_resolvers = Arc::clone(&peak_resolvers);
+        let resolver_timestamps = Arc::clone(&resolver_timestamps);
+        let resolver_entered = Arc::clone(&resolver_entered);
+        let release_resolvers = Arc::clone(&release_resolvers);
+        let resolver_released = Arc::clone(&resolver_released);
+        Arc::new(move || {
+            let resolver_attempts = Arc::clone(&resolver_attempts);
+            let concurrent_resolvers = Arc::clone(&concurrent_resolvers);
+            let peak_resolvers = Arc::clone(&peak_resolvers);
+            let resolver_timestamps = Arc::clone(&resolver_timestamps);
+            let resolver_entered = Arc::clone(&resolver_entered);
+            let release_resolvers = Arc::clone(&release_resolvers);
+            let resolver_released = Arc::clone(&resolver_released);
+            Box::pin(async move {
+                resolver_attempts.fetch_add(1, Ordering::SeqCst);
+                resolver_timestamps
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(tokio::time::Instant::now());
+                let concurrent = concurrent_resolvers.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut observed_peak = peak_resolvers.load(Ordering::SeqCst);
+                while concurrent > observed_peak {
+                    match peak_resolvers.compare_exchange_weak(
+                        observed_peak,
+                        concurrent,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => observed_peak = actual,
+                    }
+                }
+                resolver_entered.notify_waiters();
+                loop {
+                    let released = resolver_released.notified();
+                    tokio::pin!(released);
+                    released.as_mut().enable();
+                    if release_resolvers.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    released.await;
+                }
+                concurrent_resolvers.fetch_sub(1, Ordering::SeqCst);
+                Err(std::io::Error::other("test resolver unavailable"))
+            })
+        })
+    };
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::try_from("persistent-consumer.test.invalid")
+            .expect("test server name"),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_secs(2))
+    .with_connection_lifecycle(lifecycle);
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        stateless,
+        PersistentSessionConsumerConfig::try_new(
+            CALLERS,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(1_500),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("fixed concurrent recovery config"),
+    )
+    .expect("persistent client");
+    let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+    let mut callers = Vec::with_capacity(CALLERS);
+    for _ in 0..CALLERS {
+        let client = client.clone();
+        let start = Arc::clone(&start);
+        callers.push(tokio::spawn(async move {
+            start.wait().await;
+            client.capabilities().await
+        }));
+    }
+    start.wait().await;
+
+    tokio::time::timeout(Duration::from_millis(25), async {
+        loop {
+            let entered = resolver_entered.notified();
+            if resolver_attempts.load(Ordering::SeqCst) == 1 {
+                return;
+            }
+            entered.await;
+        }
+    })
+    .await
+    .expect("one shared recovery probe starts promptly");
+    for _ in 0..CALLERS {
+        tokio::task::yield_now().await;
+    }
+    let observed_peak = peak_resolvers.load(Ordering::SeqCst);
+    assert_eq!(
+        resolver_attempts.load(Ordering::SeqCst),
+        1,
+        "the blocked outage probe is shared by all twelve callers"
+    );
+
+    release_resolvers.store(true, Ordering::SeqCst);
+    resolver_released.notify_waiters();
+    let mut results = Vec::with_capacity(CALLERS);
+    for caller in callers {
+        results.push(caller.await.expect("bounded caller task completes"));
+    }
+    client.shutdown().await;
+
+    let observed_timestamps = resolver_timestamps
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert!(
+        !observed_timestamps.is_empty(),
+        "recovery fixture records a resolver setup timestamp"
+    );
+    assert_eq!(
+        observed_peak, 1,
+        "one persistent pool must serialize recovery to one resolver probe during the shared cooldown"
+    );
+    assert!(
+        results.into_iter().all(|result| matches!(
+            result,
+            Err(SessionConsumerClientError::Unavailable | SessionConsumerClientError::Deadline)
+        )),
+        "every caller terminates through the bounded typed recovery failure"
+    );
+    let gaps = observed_timestamps
+        .windows(2)
+        .map(|window| window[1].duration_since(window[0]))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        gaps,
+        [50_u64, 100, 200, 400, 400]
+            .into_iter()
+            .map(Duration::from_millis)
+            .collect::<Vec<_>>(),
+        "one pool publishes exact shared 50/100/200/400ms exponential recovery edges"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum SetupEpochPublication {
+    Reauthentication,
+    Material,
+}
+
+async fn assert_single_caller_setup_epoch_supersession(publication: SetupEpochPublication) {
+    let pki = TestPki::new();
+    let suffix = match publication {
+        SetupEpochPublication::Reauthentication => "reauthentication",
+        SetupEpochPublication::Material => "material",
+    };
+    let server_spiffe = spiffe(&format!("superseded-{suffix}-recovery-server"));
+    let client_spiffe = spiffe(&format!("superseded-{suffix}-recovery-client"));
+    let (_authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let resolver_attempts = Arc::new(AtomicUsize::new(0));
+    let active_resolvers = Arc::new(AtomicUsize::new(0));
+    let peak_resolvers = Arc::new(AtomicUsize::new(0));
+    let first_entered = Arc::new(AtomicBool::new(false));
+    let first_dropped = Arc::new(AtomicBool::new(false));
+    let fresh_saw_first_dropped = Arc::new(AtomicBool::new(false));
+    let resolver: RemoteAddrResolver = {
+        let resolver_attempts = Arc::clone(&resolver_attempts);
+        let active_resolvers = Arc::clone(&active_resolvers);
+        let peak_resolvers = Arc::clone(&peak_resolvers);
+        let first_entered = Arc::clone(&first_entered);
+        let first_dropped = Arc::clone(&first_dropped);
+        let fresh_saw_first_dropped = Arc::clone(&fresh_saw_first_dropped);
+        Arc::new(move || {
+            let resolver_attempts = Arc::clone(&resolver_attempts);
+            let active_resolvers = Arc::clone(&active_resolvers);
+            let peak_resolvers = Arc::clone(&peak_resolvers);
+            let first_entered = Arc::clone(&first_entered);
+            let first_dropped = Arc::clone(&first_dropped);
+            let fresh_saw_first_dropped = Arc::clone(&fresh_saw_first_dropped);
+            Box::pin(async move {
+                let ordinal = resolver_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                let _activity = ResolverAttemptGuard::enter(
+                    active_resolvers,
+                    peak_resolvers.as_ref(),
+                    Arc::clone(&first_dropped),
+                    ordinal,
+                );
+                if ordinal == 1 {
+                    first_entered.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    unreachable!("the stale resolver is cancelled by the fresh epoch");
+                }
+                fresh_saw_first_dropped
+                    .store(first_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+                Err(std::io::Error::other(
+                    "fresh-epoch test resolver unavailable",
+                ))
+            })
+        })
+    };
+    let (material_source, client_tls) = pki.rotating_client_config(&client_spiffe);
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::try_from("persistent-consumer.test.invalid")
+            .expect("test server name"),
+        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
+        scope,
+        client_tls,
+    )
+    .with_operation_timeout(Duration::from_secs(2));
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        stateless,
+        PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(1_500),
+            2,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("fixed supersession config"),
+    )
+    .expect("persistent client");
+    let caller_client = client.clone();
+    let caller = tokio::spawn(async move { caller_client.capabilities().await });
+    for _ in 0..128 {
+        if first_entered.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        first_entered.load(Ordering::SeqCst),
+        "the first epoch owns the blocked resolver setup"
+    );
+
+    let fresh_epoch_started_at = tokio::time::Instant::now();
+    match publication {
+        SetupEpochPublication::Reauthentication => {
+            client
+                .request_reauthentication()
+                .expect("publish a fresh reauthentication epoch");
+        }
+        SetupEpochPublication::Material => {
+            material_source.send_replace(Some(pki.identity_state(&client_spiffe)));
+        }
+    }
+    for _ in 0..128 {
+        if resolver_attempts.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        resolver_attempts.load(Ordering::SeqCst),
+        2,
+        "the fresh {suffix} epoch must begin without waiting for the stale setup deadline"
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        fresh_epoch_started_at,
+        "credential supersession consumes no virtual setup time"
+    );
+    assert!(
+        first_dropped.load(Ordering::SeqCst),
+        "the stale resolver future is cancelled before the fresh setup begins"
+    );
+    assert!(
+        fresh_saw_first_dropped.load(Ordering::SeqCst),
+        "the serial permit transfers only after stale setup cancellation"
+    );
+    assert_eq!(
+        peak_resolvers.load(Ordering::SeqCst),
+        1,
+        "credential supersession preserves one pool-wide recovery probe"
+    );
+    assert!(matches!(
+        caller.await.expect("superseded caller task completes"),
+        Err(SessionConsumerClientError::Unavailable)
+    ));
+    client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn credential_and_material_epochs_supersede_single_blocked_pool_recovery() {
+    assert_single_caller_setup_epoch_supersession(SetupEpochPublication::Reauthentication).await;
+    assert_single_caller_setup_epoch_supersession(SetupEpochPublication::Material).await;
 }
 
 #[tokio::test]
@@ -2334,6 +2785,72 @@ async fn peer_terminal_releases_an_unpolled_full_small_item_watch_queue() {
 }
 
 #[tokio::test]
+async fn peer_eof_cancels_blocked_watch_setup_and_releases_isolated_slot() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("watch-setup-eof-server");
+    let client_spiffe = spiffe("watch-setup-eof-client");
+    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    service.arm_watch_setup_block();
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, 1, 1),
+    );
+
+    let opening = {
+        let client = client.clone();
+        tokio::spawn(async move { client.open_watch(0).await })
+    };
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        service.wait_until_watch_setup_entered(),
+    )
+    .await
+    .expect("backend watch setup becomes active");
+    opening.abort();
+    assert!(
+        opening.await.is_err(),
+        "caller watch cancellation completes"
+    );
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        service.wait_until_no_active_watch_setup(),
+    )
+    .await
+    .expect("peer EOF promptly drops the backend watch-setup future");
+    tokio::time::timeout(Duration::from_millis(200), async {
+        while client.diagnostics().await.watch_active != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("caller cancellation releases the isolated watch slot");
+
+    service.release_watch_setup();
+    let replacement = tokio::time::timeout(Duration::from_millis(500), client.open_watch(0))
+        .await
+        .expect("released watch slot admits a replacement")
+        .expect("replacement watch opens");
+    drop(replacement);
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("replacement-server");
@@ -2434,6 +2951,12 @@ async fn saturation_cancellation_and_reauthentication_replace_only_stale_lanes()
     );
     active.abort();
     assert!(active.await.is_err(), "active cancellation completes");
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        first_service.wait_until_no_active_execute(),
+    )
+    .await
+    .expect("peer EOF promptly cancels the bounded server execute future");
     tokio::time::timeout(Duration::from_millis(200), async {
         while client.diagnostics().await.queued != 0 || client.diagnostics().await.active != 0 {
             tokio::task::yield_now().await;

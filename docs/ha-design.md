@@ -440,10 +440,10 @@ least-authority surface required by #649, #688, and #691; it is neither hidden,
 deprecated, nor test-only. `PersistentSessionConsumerClient` remains the
 required warm fixed-pool primitive for #695/ePDG latency, so production
 deployments requiring warm reuse should use it. It retains the
-`opc-session-consumer/1` ALPN and now uses exact consumer transport revision 4.
+`opc-session-consumer/1` ALPN and now uses exact consumer transport revision 5.
 There is no fallback, dual mode, or
 mixed-revision path: clients and listeners must be drained and cut over
-coordinately. Revision-4 private JSON DTO bytes are canonical; reordered or
+coordinately. Revision-5 private JSON DTO bytes are canonical; reordered or
 otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
 closed. This boundary remains separate from consensus and the quarantined
 legacy backend protocol; it exposes no `RemoteSessionBackend`, consensus,
@@ -490,21 +490,28 @@ revoked predecessor cannot observe the receipt. There is no separate
 `BindConsumerRequest` or log entry. `FencedTransitionStorageExhausted` is a
 retained, body-bound deterministic no-effect result after ordinary
 stale-fence/CAS/lease admission;
-consumer revision 4 carries it as a closed `StorageExhausted` error inside
+consumer revision 4 introduced it and revision 5 retains it as a closed
+`StorageExhausted` error inside
 `Recorded` status. Frozen legacy session-net v5 maps it fail-closed as an
 unknown capability without changing its wire enum.
 
 Request connections are deliberately sequential: a nonzero connection-local
-monotonic `u32` correlation never wraps, retires after at most 4,096 calls, and
-permits only one in-flight call. This is required for cancellation/late-response
-isolation and to avoid write-position ambiguity. The fair request pool defaults
+monotonic `u32` sequence never wraps and is paired with a fresh unpredictable
+UUID nonce serialized after the complete request. The server admits the next
+sequence and the client requires the exact composite response correlation. A
+lane retires after at most 4,096 calls and permits only one in-flight call. This
+is required for cancellation, pre-staged/late-response isolation, and exact
+write-position ambiguity. The fair request pool defaults
 to four connections (at most 16 configured), with 64 pending calls by default,
 256 absolutely, and a 250 ms queue wait/age limit. Two default watch slots (at
 most 16 configured) are separate from request capacity. An establishment is
 limited to 1,500 ms and at most two pre-write attempts; resolution happens only
-on establishment/re-establishment. With two attempts there is one
-between-attempt delay: the lifecycle backoff floor (50 ms by default) plus at
-most 25 ms jitter, clipped to its logical deadline. Existing 5-second idle,
+on establishment/re-establishment. One pool-wide gate serializes every cold
+request, watch, and rolling-prewarm setup after bounded physical admission.
+Setup failures and proven cached-lane losses publish one shared exponential
+backoff plus at most 25 ms jitter; the
+first floor is 50 ms by default and all waits are clipped to their logical
+deadline. Existing 5-second idle,
 10-second operation, 16 MiB frame, 256 listener-connection, and TLS lifecycle
 bounds are retained; consumer shutdown drain is at most 5 seconds.
 Exactly one pool-wide maintenance task autonomously removes cached lanes at the
@@ -536,8 +543,12 @@ monotonic phase only (running, draining, then forced) and cannot regress it.
 
 Only `NotTransmitted` may automatically retry, with an identical request ID and
 body. A possibly written call is `OutcomeUnknown`, evicts its lane, and is never
-replayed. Prewarm/readiness proves authenticated transport capacity only, never
-quorum or product readiness. Diagnostics are fixed and nonidentifying (setup
+replayed. Positive ciphertext writes are observed below TLS, so an outer TLS
+error cannot hide an accepted prefix; no positive lower or outer write remains
+exactly `NotTransmitted`. Prewarm rolling-refreshes every configured lane through
+resolver/TCP/TLS/Hello and preserves prior refreshed plus unprocessed healthy
+capacity if a later replacement fails. Prewarm/readiness proves authenticated
+transport capacity only, never quorum or product readiness. Diagnostics are fixed and nonidentifying (setup
 phase, pool wait, active/maximum/idle, reuse/reconnect,
 queue/in-flight/oldest-age, and bounded outcome class); they exclude endpoints,
 identities, scopes, credentials, keys, payloads, request/correlation IDs,
@@ -546,9 +557,10 @@ is leased; isolated watch slots are non-gating. Performance evidence is
 synthetic only and makes no ePDG production-SLO claim. Its warm accept/reuse
 checks gate only the synthetic transport method; elapsed samples are
 non-gating. The revision-2 persistent-consumer qualification contract is v7;
-the published v6 profile remains the unchanged revision-1 contract. Revision 4
-retains that bounded transport and the revision-3 atomic-transition evidence,
-then adds exact retained status recovery for ordinary leases.
+the published v6 profile remains the unchanged revision-1 contract. Revision 5
+retains that bounded transport, the revision-3 atomic-transition evidence, and
+revision-4 retained lease status, then adds causal correlation, below-TLS write
+observation, fresh rolling prewarm, and serialized cold recovery.
 
 ### Legacy backend and restore transport (protocol v5)
 
