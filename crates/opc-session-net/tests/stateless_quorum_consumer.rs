@@ -124,23 +124,35 @@ impl TestPki {
 
 const THREE_VOTER_COUNT: usize = 3;
 const THREE_VOTER_READY_TIMEOUT: Duration = Duration::from_secs(20);
-// One split vote can consume an election window; this mirrors the durable
-// profile's recovery qualification bound without changing any production
-// deadline.
+// Retain the durable recovery qualification bound for the one explicitly
+// triggered OpenRaft campaign and its bounded authenticated peer calls without
+// changing any production deadline.
 const THREE_VOTER_ELECTION_RECOVERY_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
         .saturating_mul(2)
         .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
 );
-// The selected successor campaigns only after every possible old-leader lease
-// and one already-admitted AppendEntries RPC have expired. Automatic campaigns
-// are disabled during this interval, so the two survivors cannot drift into a
-// scheduler-dependent split vote.
+// After the survivor listeners prove every admitted handler has terminated,
+// the selected successor campaigns only after every possible old-leader lease
+// has expired. Automatic campaigns are disabled during this interval, so the
+// two survivors cannot drift into a scheduler-dependent split vote.
+#[cfg(feature = "test-control")]
 const THREE_VOTER_LEASE_DRAIN: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
-        .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis)
+        .saturating_add(100),
+);
+
+// A request that passed the path gate immediately before isolation may still
+// be inside the persistent transport's bounded AppendEntries attempt. Let that
+// client-side attempt become terminal before restarting the survivor listeners;
+// the subsequent handler barrier then supplies the last possible old-vote
+// touch from which the complete leader-lease interval is measured.
+#[cfg(feature = "test-control")]
+const THREE_VOTER_APPEND_ATTEMPT_DRAIN: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE
+        .append_entries_timeout_millis
         .saturating_add(100),
 );
 
@@ -456,6 +468,26 @@ impl ThreeVoterConsumerFleet {
     }
 
     async fn restore(&mut self, node: usize) {
+        self.start_listener(node).await;
+        for peer in 0..THREE_VOTER_COUNT {
+            if peer != node {
+                self.path_enabled
+                    .get(&(node, peer))
+                    .expect("restored outbound three-voter consensus path")
+                    .store(true, Ordering::Release);
+                self.path_enabled
+                    .get(&(peer, node))
+                    .expect("restored inbound three-voter consensus path")
+                    .store(true, Ordering::Release);
+            }
+        }
+    }
+
+    async fn start_listener(&mut self, node: usize) {
+        assert!(
+            self.servers[node].is_none(),
+            "three-voter consensus listener starts only from a stopped state"
+        );
         let binding = self
             .manifest
             .bind_local(three_voter_replica_id(node))
@@ -477,17 +509,30 @@ impl ThreeVoterConsumerFleet {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
         self.servers[node] = Some(server);
-        for peer in 0..THREE_VOTER_COUNT {
-            if peer != node {
-                self.path_enabled
-                    .get(&(node, peer))
-                    .expect("restored outbound three-voter consensus path")
-                    .store(true, Ordering::Release);
-                self.path_enabled
-                    .get(&(peer, node))
-                    .expect("restored inbound three-voter consensus path")
-                    .store(true, Ordering::Release);
-            }
+    }
+
+    #[cfg(feature = "test-control")]
+    async fn quiesce_and_restart_survivors(&mut self, excluded: usize) {
+        let survivors = (0..THREE_VOTER_COUNT)
+            .filter(|index| *index != excluded)
+            .collect::<Vec<_>>();
+        for survivor in &survivors {
+            *self.address_slots[*survivor]
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.servers[*survivor]
+                .take()
+                .expect("surviving consensus listener is running")
+                .abort_and_drain_handlers_for_test()
+                .await;
+        }
+        for survivor in &survivors {
+            self.start_listener(*survivor).await;
+        }
+        for survivor in survivors {
+            self.reauthentication[survivor]
+                .request_reauthentication()
+                .expect("retire the survivor's pre-barrier outbound consensus lanes");
         }
     }
 
@@ -527,7 +572,12 @@ impl ThreeVoterConsumerFleet {
             }
         })
         .await
-        .expect("survivors elect a new leader")
+        .unwrap_or_else(|_| {
+            let statuses = (0..THREE_VOTER_COUNT)
+                .map(|index| self.stores[index].status())
+                .collect::<Vec<_>>();
+            panic!("survivors elect a new leader; final statuses: {statuses:?}")
+        })
     }
 }
 
@@ -2416,6 +2466,7 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
     server.abort_and_wait().await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction() {
     const SNAPSHOT_COMMANDS: usize = 4_300;
@@ -2573,6 +2624,13 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         "every voter still reports the original leader and term immediately before isolation"
     );
     fleet.isolate(old_leader).await;
+    tokio::time::sleep(THREE_VOTER_APPEND_ATTEMPT_DRAIN).await;
+    tokio::time::timeout(
+        THREE_VOTER_READY_TIMEOUT,
+        fleet.quiesce_and_restart_survivors(old_leader),
+    )
+    .await
+    .expect("survivor transports and admitted consensus handlers quiesce");
     let election_deadline = tokio::time::Instant::now() + THREE_VOTER_ELECTION_RECOVERY_TIMEOUT;
     tokio::time::timeout_at(election_deadline, async {
         tokio::time::sleep(THREE_VOTER_LEASE_DRAIN).await;

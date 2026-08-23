@@ -16,6 +16,9 @@ publish = false # experimental: not published until graduation
 [features]
 default = []
 insecure-test = []
+# Non-production controls used only by deterministic consensus integration
+# qualification. Canonical CI enables this through `--all-features`.
+test-control = ["opc-session-store/test-control"]
 # Quarantined protocol-v5 remote-backend RPCs. This compatibility surface
 # includes direct mutations and raw replication-log/rebuild authority and must
 # not be enabled on a production Openraft endpoint.
@@ -45,7 +48,6 @@ time = { workspace = true }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-persist = { path = "../opc-persist", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
-opc-session-store = { path = "../opc-session-store", version = "0.2.0", features = ["test-control"] }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros", "test-util"] }
 bytes = { workspace = true }
 futures-util = "0.3"
