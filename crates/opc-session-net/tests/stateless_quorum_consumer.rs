@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
+use opc_consensus::engine::raft::AppendEntriesRequest;
 use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
     DURABLE_CONSENSUS_TIMING_PROFILE,
@@ -41,21 +42,32 @@ use opc_session_store::{
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
     PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
     RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, SessionBackend, SessionConsensusIdentity,
-    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerAuthorization,
-    SessionConsumerAuthorizationGrant, SessionConsumerChange, SessionConsumerLeaseError,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
-    SessionConsumerVoterAuthority, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    SessionPayloadEncoding, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
-    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, SessionBackend, SessionConsensusCommand,
+    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusResponse, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionConsumerAuthorization, SessionConsumerAuthorizationGrant,
+    SessionConsumerChange, SessionConsumerLeaseError, SessionConsumerOperation,
+    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionConsumerVoterAuthority,
+    SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionPayloadEncoding,
+    SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType, StoreError,
+    StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+opc_consensus::engine::declare_raft_types!(
+    TestSessionRaftTypeConfig:
+        D = SessionConsensusCommand,
+        R = SessionConsensusResponse,
+        NodeId = SessionConsensusNodeId,
+        Node = opc_consensus::engine::EmptyNode,
+        SnapshotData = io::Cursor<Vec<u8>>,
+        AsyncRuntime = opc_consensus::DurableOpenraftRuntime,
+);
 
 fn transported_capabilities() -> BackendCapabilities {
     BackendCapabilities {
@@ -174,6 +186,11 @@ struct GatedReadBarrierPeer {
     enabled: Arc<AtomicBool>,
     delay: Duration,
     calls: Arc<AtomicUsize>,
+    delay_prewrite_empty_append_entries: Arc<AtomicBool>,
+    nonempty_append_entries_seen: Arc<AtomicBool>,
+    prewrite_empty_append_entries_calls: Arc<AtomicUsize>,
+    append_entries_decoded: Arc<AtomicUsize>,
+    append_entries_decode_failures: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -193,7 +210,7 @@ impl SessionConsensusPeer for GatedReadBarrierPeer {
         if !self.enabled.load(Ordering::Acquire) {
             return Err(SessionConsensusPeerError::Unavailable);
         }
-        self.record_request(request.family).await;
+        self.record_request(&request).await;
         self.inner.call(request).await
     }
 
@@ -205,19 +222,48 @@ impl SessionConsensusPeer for GatedReadBarrierPeer {
         if !self.enabled.load(Ordering::Acquire) {
             return Err(SessionConsensusPeerError::Unavailable);
         }
-        self.record_request(request.family).await;
+        self.record_request(&request).await;
         self.inner.call_with_timeout(request, timeout).await
     }
 }
 
 impl GatedReadBarrierPeer {
-    async fn record_request(&self, family: opc_session_store::SessionConsensusRpcFamily) {
+    async fn record_request(&self, request: &SessionConsensusWireRequest) {
         if matches!(
-            family,
+            request.family,
             opc_session_store::SessionConsensusRpcFamily::ReadBarrier
         ) {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
+        }
+        if matches!(
+            request.family,
+            opc_session_store::SessionConsensusRpcFamily::AppendEntries
+        ) {
+            match opc_consensus::decode_bounded::<AppendEntriesRequest<TestSessionRaftTypeConfig>>(
+                &request.payload,
+            ) {
+                Ok(append) => {
+                    self.append_entries_decoded.fetch_add(1, Ordering::SeqCst);
+                    if self
+                        .delay_prewrite_empty_append_entries
+                        .load(Ordering::Acquire)
+                        && append.entries.is_empty()
+                        && !self.nonempty_append_entries_seen.load(Ordering::Acquire)
+                    {
+                        self.prewrite_empty_append_entries_calls
+                            .fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(self.delay).await;
+                    } else if !append.entries.is_empty() {
+                        self.nonempty_append_entries_seen
+                            .store(true, Ordering::Release);
+                    }
+                }
+                Err(_) => {
+                    self.append_entries_decode_failures
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+            }
         }
     }
 }
@@ -228,6 +274,11 @@ struct ThreeVoterConsumerFleet {
     pki: Arc<TestPki>,
     path_enabled: BTreeMap<(usize, usize), Arc<AtomicBool>>,
     read_barrier_calls: Arc<AtomicUsize>,
+    delay_prewrite_empty_append_entries: Arc<AtomicBool>,
+    nonempty_append_entries_seen: Arc<AtomicBool>,
+    prewrite_empty_append_entries_calls: Arc<AtomicUsize>,
+    append_entries_decoded: Arc<AtomicUsize>,
+    append_entries_decode_failures: Arc<AtomicUsize>,
     reauthentication: Vec<SessionReauthenticationControl>,
     address_slots: Vec<Arc<RwLock<Option<SocketAddr>>>>,
     servers: Vec<Option<SessionConsensusServerHandle>>,
@@ -284,6 +335,11 @@ impl ThreeVoterConsumerFleet {
             .collect::<Vec<_>>();
         let mut path_enabled = BTreeMap::new();
         let read_barrier_calls = Arc::new(AtomicUsize::new(0));
+        let delay_prewrite_empty_append_entries = Arc::new(AtomicBool::new(false));
+        let nonempty_append_entries_seen = Arc::new(AtomicBool::new(false));
+        let prewrite_empty_append_entries_calls = Arc::new(AtomicUsize::new(0));
+        let append_entries_decoded = Arc::new(AtomicUsize::new(0));
+        let append_entries_decode_failures = Arc::new(AtomicUsize::new(0));
         let reauthentication = (0..THREE_VOTER_COUNT)
             .map(|_| SessionReauthenticationControl::new())
             .collect::<Vec<_>>();
@@ -336,6 +392,15 @@ impl ThreeVoterConsumerFleet {
                         enabled: Arc::clone(&enabled),
                         delay: read_barrier_delay.unwrap_or(Duration::ZERO),
                         calls: Arc::clone(&read_barrier_calls),
+                        delay_prewrite_empty_append_entries: Arc::clone(
+                            &delay_prewrite_empty_append_entries,
+                        ),
+                        nonempty_append_entries_seen: Arc::clone(&nonempty_append_entries_seen),
+                        prewrite_empty_append_entries_calls: Arc::clone(
+                            &prewrite_empty_append_entries_calls,
+                        ),
+                        append_entries_decoded: Arc::clone(&append_entries_decoded),
+                        append_entries_decode_failures: Arc::clone(&append_entries_decode_failures),
                     });
                     path_enabled.insert((index, target), enabled);
                     let peer: Arc<dyn SessionConsensusPeer> = peer;
@@ -383,6 +448,11 @@ impl ThreeVoterConsumerFleet {
             pki,
             path_enabled,
             read_barrier_calls,
+            delay_prewrite_empty_append_entries,
+            nonempty_append_entries_seen,
+            prewrite_empty_append_entries_calls,
+            append_entries_decoded,
+            append_entries_decode_failures,
             reauthentication,
             address_slots,
             servers,
@@ -438,6 +508,33 @@ impl ThreeVoterConsumerFleet {
 
     fn read_barrier_calls(&self) -> usize {
         self.read_barrier_calls.load(Ordering::SeqCst)
+    }
+
+    fn set_prewrite_empty_append_entries_delay(&self, enabled: bool) {
+        if enabled {
+            self.prewrite_empty_append_entries_calls
+                .store(0, Ordering::SeqCst);
+            self.nonempty_append_entries_seen
+                .store(false, Ordering::Release);
+            self.append_entries_decoded.store(0, Ordering::SeqCst);
+            self.append_entries_decode_failures
+                .store(0, Ordering::SeqCst);
+        }
+        self.delay_prewrite_empty_append_entries
+            .store(enabled, Ordering::Release);
+    }
+
+    fn prewrite_empty_append_entries_calls(&self) -> usize {
+        self.prewrite_empty_append_entries_calls
+            .load(Ordering::SeqCst)
+    }
+
+    fn append_entries_observation(&self) -> (usize, usize, bool) {
+        (
+            self.append_entries_decoded.load(Ordering::SeqCst),
+            self.append_entries_decode_failures.load(Ordering::SeqCst),
+            self.nonempty_append_entries_seen.load(Ordering::Acquire),
+        )
     }
 
     fn observed_leader(&self) -> (usize, SessionConsensusNodeId, u64) {
@@ -2708,6 +2805,104 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
             .expect("application sequence after first transition"),
         "the committed no-effect receipt, its activation proof, and its lookup do not fabricate a user mutation"
     );
+    persistent.shutdown().await;
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum() {
+    // An authenticated consumer mutation is linearized by its Raft write. A
+    // separate read quorum before that write can consume the entire cellular
+    // hot-path budget even though the write quorum itself is healthy.
+    let operation_budget = Duration::from_millis(250);
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start(
+        Arc::clone(&pki),
+        Some(operation_budget + Duration::from_millis(50)),
+    )
+    .await;
+    let (leader, _, _) = fleet.observed_leader();
+    let follower = (leader + 1) % THREE_VOTER_COUNT;
+    let server_spiffe = three_voter_spiffe(follower);
+    let client_spiffe = spiffe("ordinary-write-hot-path-client");
+    let (server, address) = SessionQuorumConsumerServer::new(
+        Arc::new(fleet.stores[follower].consumer_service()),
+        pki.server_config(&server_spiffe),
+        three_voter_authorizer(&fleet.stores[follower], &client_spiffe).await,
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("ordinary-write listener"),
+    )
+    .await
+    .expect("start ordinary-write listener");
+    let persistent = PersistentSessionConsumerClient::try_from_stateless(
+        consumer_client(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            fleet.voter_authority(follower),
+        )
+        .with_operation_timeout(operation_budget),
+        PersistentSessionConsumerConfig::default(),
+    )
+    .expect("persistent ordinary-write client");
+
+    assert!(
+        persistent.capabilities().await.is_ok(),
+        "warm and authenticate the persistent connection before measuring the mutation"
+    );
+    fleet.reset_read_barrier_calls();
+    fleet.set_prewrite_empty_append_entries_delay(true);
+    let started = Instant::now();
+    let key = test_key();
+    let owner = OwnerId::new("ordinary-write-hot-path-owner").expect("ordinary-write owner");
+    let lease = persistent
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xa5; 16]),
+            &key,
+            &owner,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "one healthy write quorum must fit inside the operation budget: {error:?}; delayed empty AppendEntries={}",
+                fleet.prewrite_empty_append_entries_calls()
+            )
+        });
+    let mutation_elapsed = started.elapsed();
+    fleet.set_prewrite_empty_append_entries_delay(false);
+    let observation_deadline = Instant::now() + Duration::from_secs(1);
+    while !fleet.append_entries_observation().2 && Instant::now() < observation_deadline {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        mutation_elapsed < operation_budget,
+        "ordinary consumer write exceeded its complete operation budget"
+    );
+    assert_eq!(
+        fleet.prewrite_empty_append_entries_calls(),
+        0,
+        "the mutation must not issue a separate pre-write empty-AppendEntries quorum round"
+    );
+    let (decoded, decode_failures, nonempty_seen) = fleet.append_entries_observation();
+    assert!(
+        decoded > 0,
+        "the fixture must observe real AppendEntries traffic"
+    );
+    assert_eq!(
+        decode_failures, 0,
+        "the fixture must fail rather than silently ignore an undecodable AppendEntries payload"
+    );
+    assert!(
+        nonempty_seen,
+        "the fixture must observe the actual Raft write, not pass without replication"
+    );
+    assert_eq!(lease.key(), &key);
+
     persistent.shutdown().await;
     server.abort_and_wait().await;
 }

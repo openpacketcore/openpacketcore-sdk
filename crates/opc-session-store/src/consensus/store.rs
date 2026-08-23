@@ -2938,6 +2938,7 @@ impl ConsensusSessionStore {
             &request.intent,
             SessionMutationIntent::PreflightFencedTransitionCapability
         );
+        let consumer_scoped = request.required_consumer_scope.is_consumer_scoped();
         // Once the durable exact V1 certificate is present, every remaining
         // pre-write step below is local and no-effect. The final admission in
         // `propose_on_local_leader` remains immediately before `client_write_ff`
@@ -3043,6 +3044,15 @@ impl ConsensusSessionStore {
                 }
                 Err(_) => return ForwardMutationReply::Unavailable,
             }
+        } else if consumer_scoped {
+            // An authenticated consumer mutation is linearized by the Raft
+            // write below. Running Openraft's read-index quorum first adds a
+            // second network round without strengthening the committed write,
+            // and can exhaust the caller's complete operation deadline before
+            // `client_write_ff` is reached. Keep every authority/scope check
+            // before and immediately at proposal; omit only that redundant
+            // pre-write read quorum for the consumer-scoped mutation path.
+            None
         } else {
             match self
                 .inner
