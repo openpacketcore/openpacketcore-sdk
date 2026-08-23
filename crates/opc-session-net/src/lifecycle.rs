@@ -624,12 +624,6 @@ impl ReconnectAttempt {
         self.finished = true;
     }
 
-    /// Release a setup attempt superseded by a newer authority epoch without
-    /// recording the cancellation as a failed recovery probe.
-    pub(crate) fn cancel_superseded(mut self) {
-        self.finished = true;
-    }
-
     pub(crate) fn failed(mut self) {
         self.gate.finish(self.epoch, false, self.failure_jitter);
         self.finished = true;

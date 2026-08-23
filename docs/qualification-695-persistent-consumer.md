@@ -24,7 +24,7 @@ independent logical clients, as independent persistent constructors do.
 The closure successor starts exactly at SDK commit
 `f2ed1181c85540cc01ea0b4611fa3620891375fd`, tree
 `945ceab3870d2c1d2d1396aff29e819288fce76a`. It does not contain, rebase, or
-merge the stale qualification branch. Six focused regressions retained the
+merge the stale qualification branch. Eight focused regressions retained the
 following current-main RED evidence before the generic correction:
 
 ```text
@@ -40,6 +40,11 @@ adapter_buffering_above_zero_byte_lower_transport_is_before_write
   observed MayHaveWritten after adapter-only buffering, required BeforeWrite
 stale_setup_cannot_publish_old_epoch_reconnect_cooldown
   observed pending old-epoch readmission, required immediate Superseded
+current_setup_lifecycle_rejection_retains_reconnect_cooldown
+  observed immediate same-authority readmission, required shared cooldown
+superseded_setup_drops_losing_io_before_releasing_reconnect_lane
+  observed fresh setup admission while losing old-epoch I/O was blocked in Drop,
+  required serialized admission only after the losing I/O future was destroyed
 ```
 
 The causal correction is consumer transport revision 5. It retains the
@@ -53,8 +58,10 @@ while adding five generic guarantees:
   recovery lane and one coalesced exponential backoff deadline for failed setup
   or proven cached-lane loss;
 - a newer credential/material epoch cancels the stale serialized
-  resolver/TCP/TLS/Hello setup before the fresh setup acquires that lane, with
-  no old-epoch cooldown publication and no setup-deadline wait;
+  resolver/TCP/TLS/Hello setup, retains the serialized permit until the losing
+  I/O future is destroyed, and only then admits a fresh setup, with no
+  old-epoch cooldown publication or setup-deadline wait; ordinary
+  same-authority lifecycle rejection retains the shared failure cooldown;
 - each connection-local monotonic sequence is paired with a fresh
   unpredictable UUID nonce whose field is serialized only after the complete
   request, and the exact composite value is required in the response; and
@@ -77,7 +84,7 @@ The current-main successor's bounded GREEN gates were run with all
 
 ```text
 cargo test -p opc-session-net --all-features --lib
-  277 passed; 0 failed
+  279 passed; 0 failed
 cargo test -p opc-session-net --all-features \
   --test persistent_consumer_protocol \
   --test persistent_consumer_boundaries \

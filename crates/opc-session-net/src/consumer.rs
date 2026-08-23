@@ -3468,9 +3468,11 @@ impl<'a> PersistentReconnectSetup<'a> {
                 Some(self.tls_config.material_status().epoch()),
             );
         }
-        if let Some(attempt) = self.attempt.take() {
-            attempt.cancel_superseded();
-        }
+        // Retain the installed attempt until the complete setup stack
+        // unwinds. Advancing the gate makes its eventual Drop a no-op for
+        // cooldown accounting, while retaining its semaphore permit prevents
+        // a fresh resolver/TCP/TLS/Hello probe from starting before the
+        // losing old-epoch I/O future has been destroyed.
     }
 
     fn reject_if_stale(&mut self) -> Result<(), SessionConsumerClientError> {
@@ -3481,6 +3483,15 @@ impl<'a> PersistentReconnectSetup<'a> {
         // Its Drop path then observes a superseded epoch and cannot publish a
         // stale failure cooldown or advance the fresh epoch's backoff.
         self.observe_current_reconnect_epoch();
+        Err(SessionConsumerClientError::Deadline)
+    }
+
+    fn reject_connection_lifecycle<T>(&mut self) -> Result<T, SessionConsumerClientError> {
+        // A current-authority connection can still cross its ordinary
+        // lifecycle retirement edge immediately before publication. That is
+        // a failed recovery probe and must retain the shared cooldown. Only
+        // an exact authority/material supersession cancels its accounting.
+        self.reject_if_stale()?;
         Err(SessionConsumerClientError::Deadline)
     }
 
@@ -4562,8 +4573,7 @@ impl StatelessSessionConsumerClient {
             _physical_admission: Some(physical_admission),
         };
         if !connection.current(&self.tls_config, &self.reauthentication) {
-            reconnect_setup.observe_current_reconnect_epoch();
-            return Err(SessionConsumerClientError::Deadline);
+            return reconnect_setup.reject_connection_lifecycle();
         }
         // This is the fresh-lane publication boundary. A material change
         // observed after this exact sample belongs to an already-admitted
@@ -10034,6 +10044,8 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use futures_util::FutureExt as _;
+
     use super::{
         authenticated_consumer_binding, classify_call_write_error, complete_before_deadline,
         consumer_connection_current, consumer_execute_into_fenced_transition,
@@ -10044,10 +10056,10 @@ mod tests {
         fenced_transition_response, lease_error_matches_operation,
         lease_mutation_status_matches_request, lease_mutation_status_wire_matches_request,
         lease_response, mutation_response, persistent_execute_error,
-        poll_persistent_consumer_setup_io, publish_monotonic_shutdown_phase,
-        queued_consumer_watch_stream, read_authenticated_consumer_frame_until,
-        read_authenticated_consumer_frame_within, response_is_outcome_unknown,
-        response_matches_operation, response_matches_request,
+        poll_persistent_consumer_setup_io, poll_persistent_reconnect_setup,
+        publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
+        read_authenticated_consumer_frame_until, read_authenticated_consumer_frame_within,
+        response_is_outcome_unknown, response_matches_operation, response_matches_request,
         response_retires_connection_authority, server_connection_current,
         store_error_matches_operation, valid_consumer_operation_timeout, wait_for_forced_shutdown,
         write_consumer_call_rejection_supervised, BorrowedConsumerCall,
@@ -10979,6 +10991,178 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn current_setup_lifecycle_rejection_retains_reconnect_cooldown() {
+        let reauthentication = SessionReauthenticationControl::new();
+        let (client, _material) = stateless_test_client(reauthentication.clone());
+        let reconnect_control =
+            PersistentConsumerReconnectControl::new(client.lifecycle_policy, Duration::ZERO);
+        let mut setup = PersistentReconnectSetup::new(
+            &reauthentication,
+            &client.tls_config,
+            Some(reconnect_control.as_ref()),
+        );
+        let (generation, material_epoch) = setup.epoch();
+        let attempt = reconnect_control
+            .acquire(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                generation,
+                material_epoch,
+            )
+            .await
+            .expect("the current epoch owns one serialized setup attempt");
+        setup.install_attempt(attempt);
+
+        let rejection: Result<(), SessionConsumerClientError> = setup.reject_connection_lifecycle();
+        assert!(matches!(
+            rejection,
+            Err(SessionConsumerClientError::Deadline)
+        ));
+        drop(setup);
+
+        let immediate_readmission = reconnect_control.acquire(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            generation,
+            material_epoch,
+        );
+        assert!(
+            Box::pin(immediate_readmission).now_or_never().is_none(),
+            "an ordinary same-authority lifecycle rejection bypassed the shared cooldown",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn superseded_setup_drops_losing_io_before_releasing_reconnect_lane() {
+        struct BlockingDropPending {
+            drop_started: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl std::future::Future for BlockingDropPending {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+
+        impl Drop for BlockingDropPending {
+            fn drop(&mut self) {
+                let _ = self.drop_started.send(());
+                let _ = self.release.recv();
+            }
+        }
+
+        struct ReleaseOnDrop(Option<std::sync::mpsc::SyncSender<()>>);
+
+        impl ReleaseOnDrop {
+            fn release(&mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let reauthentication = SessionReauthenticationControl::new();
+        let (client, material) = stateless_test_client(reauthentication.clone());
+        let reconnect_control =
+            PersistentConsumerReconnectControl::new(client.lifecycle_policy, Duration::ZERO);
+        let old_generation = reauthentication.generation();
+        let material_epoch = client.tls_config.material_status().epoch();
+        let (installed_sender, installed_receiver) = tokio::sync::oneshot::channel();
+        let (drop_started_sender, drop_started_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let mut release = ReleaseOnDrop(Some(release_sender));
+        let task_reauthentication = reauthentication.clone();
+        let task_reconnect_control = Arc::clone(&reconnect_control);
+        let setup_task = tokio::spawn(async move {
+            let _material = material;
+            let mut setup = PersistentReconnectSetup::new(
+                &task_reauthentication,
+                &client.tls_config,
+                Some(task_reconnect_control.as_ref()),
+            );
+            let attempt = task_reconnect_control
+                .acquire(
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    old_generation,
+                    material_epoch,
+                )
+                .await
+                .expect("the old epoch owns one serialized setup attempt");
+            setup.install_attempt(attempt);
+            let _ = installed_sender.send(());
+            let result = poll_persistent_reconnect_setup(
+                BlockingDropPending {
+                    drop_started: drop_started_sender,
+                    release: release_receiver,
+                },
+                &mut setup,
+            )
+            .await;
+            let attempt_retained_after_io_drop = setup.attempt.is_some();
+            drop(setup);
+            (result, attempt_retained_after_io_drop)
+        });
+
+        installed_receiver
+            .await
+            .expect("the old setup task installs its serialized attempt");
+        reauthentication
+            .request_reauthentication()
+            .expect("publish a fresh explicit generation");
+        tokio::task::spawn_blocking(move || drop_started_receiver.recv())
+            .await
+            .expect("observe the losing I/O future's Drop")
+            .expect("the losing I/O future reaches Drop");
+
+        let current_generation = reauthentication.generation();
+        let premature_admission = Box::pin(reconnect_control.acquire(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            current_generation,
+            material_epoch,
+        ))
+        .now_or_never();
+        let released_before_io_drop = match premature_admission {
+            Some(Ok(attempt)) => {
+                attempt.succeeded();
+                true
+            }
+            Some(Err(_)) => true,
+            None => false,
+        };
+        release.release();
+
+        let (result, attempt_retained_after_io_drop) = setup_task
+            .await
+            .expect("the superseded setup task terminates");
+        assert!(matches!(result, Err(SessionConsumerClientError::Deadline)));
+        assert!(
+            attempt_retained_after_io_drop,
+            "supersession released the serialized attempt before setup I/O unwound",
+        );
+        assert!(
+            !released_before_io_drop,
+            "a fresh setup acquired the reconnect lane while losing old-epoch I/O was in Drop",
+        );
+
+        let fresh_attempt = reconnect_control
+            .acquire(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                current_generation,
+                material_epoch,
+            )
+            .await
+            .expect("the fresh epoch acquires the lane after old I/O and setup are dropped");
+        fresh_attempt.succeeded();
     }
 
     #[test]
