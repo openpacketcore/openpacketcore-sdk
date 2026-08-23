@@ -47,7 +47,8 @@ use opc_session_store::{
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
     SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
     SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionConsumerStoreError, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
     SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
     StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
@@ -392,6 +393,36 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
                 .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
+            tokio::time::sleep(QUALIFICATION_DELAYED_CONSUMER_RESPONSE).await;
+        }
+        response
+    }
+
+    async fn execute_v2(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: SessionConsumerV2Request,
+    ) -> SessionConsumerV2Response {
+        let mutation = matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2 { .. }
+                | SessionConsumerV2Operation::FencedTransitionV2Batch { .. }
+        );
+        let response = self.inner.execute_v2(identity, request).await;
+        if mutation
+            && matches!(
+                &response,
+                SessionConsumerV2Response::FencedTransitionV2(Ok(_))
+                    | SessionConsumerV2Response::FencedTransitionV2Batch(Ok(_))
+            )
+            && self
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            // Withhold the real successful response beyond the caller's
+            // bounded deadline. The qualification seam never fabricates a
+            // server-side ambiguity result or bypasses durable execution.
             tokio::time::sleep(QUALIFICATION_DELAYED_CONSUMER_RESPONSE).await;
         }
         response
@@ -947,6 +978,11 @@ impl QualificationNode {
             QualificationNodeCommand::LifecycleMetrics => {
                 QualificationNodeReply::LifecycleMetrics {
                     metrics: lifecycle_metrics(self.empty_vote_dispatches.load(Ordering::SeqCst)),
+                }
+            }
+            QualificationNodeCommand::ConsensusDiagnostics => {
+                QualificationNodeReply::ConsensusDiagnostics {
+                    metrics: self.store.diagnostic_snapshot(),
                 }
             }
             QualificationNodeCommand::SetConsensusRpcAvailability { availability } => {

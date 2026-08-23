@@ -422,6 +422,12 @@ impl OwnedSessionMutationError {
             StoreError::FencedTransitionHistoryFull => Self::StoreRejected {
                 code: "fenced-transition-history-full",
             },
+            StoreError::FencedTransitionHistoryEpochRetired => Self::StoreRejected {
+                code: "fenced-transition-history-epoch-retired",
+            },
+            StoreError::FencedTransitionHistoryEpochNotActive => Self::StoreRejected {
+                code: "fenced-transition-history-epoch-not-active",
+            },
             StoreError::FencedTransitionRetentionExhausted => Self::StoreRejected {
                 code: "fenced-transition-retention-exhausted",
             },

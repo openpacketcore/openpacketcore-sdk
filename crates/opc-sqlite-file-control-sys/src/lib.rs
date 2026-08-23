@@ -10,7 +10,9 @@
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::ffi::{c_void, CStr, CString};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+use std::ffi::{c_void, CStr};
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd as _;
 #[cfg(feature = "test-vfs")]
@@ -67,6 +69,7 @@ pub fn install_test_temp_path_failure_vfs() -> Result<(), FileControlError> {
 }
 
 #[cfg(feature = "test-vfs")]
+// SAFETY: SQLite calls this callback with arguments matching `sqlite3_vfs::xOpen`.
 unsafe extern "C" fn test_temp_path_failure_vfs_open(
     _vfs: *mut ffi::sqlite3_vfs,
     name: ffi::sqlite3_filename,
@@ -74,8 +77,9 @@ unsafe extern "C" fn test_temp_path_failure_vfs_open(
     flags: libc::c_int,
     out_flags: *mut libc::c_int,
 ) -> libc::c_int {
-    // SQLite uses either a null filename or the empty string for the unnamed
-    // `ATTACH ''` artifact behind ordinary `VACUUM`.
+    // SAFETY: SQLite passes either a null filename or a valid NUL-terminated
+    // filename pointer to `xOpen`; after the null check, reading its first byte
+    // distinguishes the empty `ATTACH ''` artifact behind ordinary `VACUUM`.
     if name.is_null() || unsafe { *name } == 0 {
         return ffi::SQLITE_IOERR_GETTEMPPATH;
     }
@@ -86,9 +90,14 @@ unsafe extern "C" fn test_temp_path_failure_vfs_open(
     if default_vfs.is_null() {
         return ffi::SQLITE_IOERR;
     }
+    // SAFETY: `sqlite3_vfs_find` returned a non-null pointer to SQLite's
+    // registered default VFS, whose callback table remains valid for the
+    // process lifetime.
     let Some(open) = (unsafe { (*default_vfs).xOpen }) else {
         return ffi::SQLITE_IOERR;
     };
+    // SAFETY: `open` is the original VFS callback and SQLite supplied its
+    // ABI-compatible arguments for this invocation.
     unsafe { open(default_vfs, name, file, flags, out_flags) }
 }
 
