@@ -10,7 +10,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use futures_util::StreamExt;
 use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
     DURABLE_CONSENSUS_TIMING_PROFILE,
@@ -20,13 +19,15 @@ use opc_key::{
     KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, Zeroizing,
     AES_256_GCM_SIV_KEY_LEN,
 };
+#[allow(unused_imports)]
 use opc_session_net::{
     conservative_payload_budget, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId,
-    SessionConfigurationGeneration, SessionConsensusServer, SessionConsensusServerHandle,
-    SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
-    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
-    SessionReauthenticationControl, SessionReplicationManifest, StatelessSessionConsumerClient,
+    PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver, RemoteSessionConsensusPeer,
+    SessionClusterId, SessionConfigurationGeneration, SessionConsensusServer,
+    SessionConsensusServerHandle, SessionConsumerAuthorizer, SessionConsumerClientError,
+    SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
+    SessionConsumerMutationError, SessionQuorumConsumerServer, SessionReauthenticationControl,
+    SessionReplicationManifest, StatelessSessionConsumerClient,
     DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT, MAX_NEGOTIATED_FRAME_SIZE,
     SESSION_QUORUM_CONSUMER_ALPN,
 };
@@ -34,22 +35,25 @@ use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, ConsensusSessionStore,
     EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, Generation, OwnerId,
-    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
-    PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
-    RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, SessionBackend, SessionConsensusIdentity,
-    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
-    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
-    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
+    FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2Status,
+    Generation, LeaseGuard, OwnerId, PreparedFencedTransitionJournal,
+    PreparedFencedTransitionJournalKey, PreparedFencedTransitionLookup, QuorumReplicaDescriptor,
+    QuorumTopologyConfig, QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest,
+    SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionConsumerChange, SessionConsumerIdentity, SessionConsumerLeaseError,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
     SessionPayloadEncoding, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
     StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
-use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -215,8 +219,10 @@ impl GatedReadBarrierPeer {
     }
 }
 
+#[allow(dead_code)]
 struct ThreeVoterConsumerFleet {
     manifest: Arc<SessionReplicationManifest>,
+    fixed_durable: bool,
     pki: Arc<TestPki>,
     path_enabled: BTreeMap<(usize, usize), Arc<AtomicBool>>,
     read_barrier_calls: Arc<AtomicUsize>,
@@ -238,8 +244,21 @@ impl Drop for ThreeVoterConsumerFleet {
     }
 }
 
+#[allow(dead_code)]
 impl ThreeVoterConsumerFleet {
     async fn start(pki: Arc<TestPki>, read_barrier_delay: Option<Duration>) -> Self {
+        Self::start_with_topology(pki, read_barrier_delay, false).await
+    }
+
+    async fn start_fixed_durable(pki: Arc<TestPki>) -> Self {
+        Self::start_with_topology(pki, None, true).await
+    }
+
+    async fn start_with_topology(
+        pki: Arc<TestPki>,
+        read_barrier_delay: Option<Duration>,
+        fixed_durable: bool,
+    ) -> Self {
         let members = (0..THREE_VOTER_COUNT)
             .map(three_voter_member)
             .collect::<Vec<_>>();
@@ -256,14 +275,31 @@ impl ThreeVoterConsumerFleet {
         );
         let topologies = (0..THREE_VOTER_COUNT)
             .map(|index| {
-                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                let consensus_identity = if fixed_durable {
+                    manifest.fixed_durable_quorum_consensus_identity()
+                } else {
+                    manifest.consensus_identity()
+                };
+                let config = QuorumTopologyConfig::new_consensus(
                     three_voter_replica_id(index),
                     members.clone(),
-                    manifest.consensus_identity(),
-                ))
-                .expect("validate three-voter topology")
+                    consensus_identity,
+                );
+                if fixed_durable {
+                    ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
+                        config,
+                        manifest.placement_policy(),
+                    )
+                    .expect("validate fixed-durable three-voter topology")
+                } else {
+                    ValidatedQuorumTopology::try_from(config)
+                        .expect("validate three-voter topology")
+                }
             })
             .collect::<Vec<_>>();
+        assert!(topologies.iter().all(|topology| {
+            (topology.summary().mode() == QuorumTopologyMode::FixedDurableQuorum) == fixed_durable
+        }));
         let directory = tempfile::tempdir().expect("three-voter fleet directory");
         let backends = (0..THREE_VOTER_COUNT)
             .map(|index| {
@@ -281,9 +317,12 @@ impl ThreeVoterConsumerFleet {
             .collect::<Vec<_>>();
         let mut stores = Vec::with_capacity(THREE_VOTER_COUNT);
         for index in 0..THREE_VOTER_COUNT {
-            let local = manifest
-                .bind_local(three_voter_replica_id(index))
-                .expect("three-voter local consensus binding");
+            let local = if fixed_durable {
+                manifest.bind_fixed_durable_quorum_local(three_voter_replica_id(index))
+            } else {
+                manifest.bind_local(three_voter_replica_id(index))
+            }
+            .expect("three-voter local consensus binding");
             let peers = (0..THREE_VOTER_COUNT)
                 .filter(|target| *target != index)
                 .map(|target| {
@@ -334,7 +373,15 @@ impl ThreeVoterConsumerFleet {
                     (node_id, peer)
                 })
                 .collect::<BTreeMap<_, _>>();
-            stores.push(
+            let store = if fixed_durable {
+                ConsensusSessionStore::open_fixed_durable_quorum(
+                    topologies[index].clone(),
+                    backends[index].clone(),
+                    directory.path().join(format!("snapshots-{index}")),
+                    peers,
+                )
+                .await
+            } else {
                 ConsensusSessionStore::open_with_operation_timeout(
                     topologies[index].clone(),
                     backends[index].clone(),
@@ -343,14 +390,17 @@ impl ThreeVoterConsumerFleet {
                     opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                 )
                 .await
-                .expect("open three-voter consensus store"),
-            );
+            };
+            stores.push(store.expect("open three-voter consensus store"));
         }
         let mut servers = Vec::with_capacity(THREE_VOTER_COUNT);
         for index in 0..THREE_VOTER_COUNT {
-            let binding = manifest
-                .bind_local(three_voter_replica_id(index))
-                .expect("three-voter consensus server binding");
+            let binding = if fixed_durable {
+                manifest.bind_fixed_durable_quorum_local(three_voter_replica_id(index))
+            } else {
+                manifest.bind_local(three_voter_replica_id(index))
+            }
+            .expect("three-voter consensus server binding");
             let (server, address) = SessionConsensusServer::new(
                 stores[index].rpc_handler(),
                 pki.server_config(&three_voter_spiffe(index)),
@@ -371,6 +421,7 @@ impl ThreeVoterConsumerFleet {
         }
         let fleet = Self {
             manifest,
+            fixed_durable,
             pki,
             path_enabled,
             read_barrier_calls,
@@ -606,6 +657,7 @@ fn three_voter_spiffe(index: usize) -> String {
 /// A real consumer listener wrapper that commits the inner operation then
 /// withholds exactly one response until the test tears down its connection.
 /// It never manufactures an outcome response or invokes a mutation twice.
+#[allow(dead_code)]
 struct CommitThenLoseConsumerResponse {
     inner: Arc<dyn SessionQuorumConsumer>,
     lose_transition: AtomicBool,
@@ -616,6 +668,7 @@ struct CommitThenLoseConsumerResponse {
     status_calls: AtomicUsize,
 }
 
+#[allow(dead_code)]
 impl CommitThenLoseConsumerResponse {
     fn transition(inner: Arc<dyn SessionQuorumConsumer>) -> Self {
         Self {
@@ -1235,6 +1288,89 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
         "a mismatched cluster/configuration/epoch scope must not reach the service"
     );
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn revision_five_v2_status_transports_a_retained_stale_fence_receipt() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-status-error-server");
+    let client_spiffe = spiffe("v2-status-error-client");
+    let (_snapshots, store, scope, authorizer) =
+        admitted_store_and_authorizer([client_spiffe.clone()]).await;
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        Arc::new(store.consumer_service()),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start revision-five consumer listener");
+    let client = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope);
+    let timestamp = time::OffsetDateTime::now_utc();
+    let absent_lease: LeaseGuard = serde_json::from_value(serde_json::json!({
+        "key": test_key(),
+        "owner": OwnerId::new("v2-status-error-owner").expect("owner"),
+        "fence": FenceToken::new(1),
+        "acquired_at": Timestamp::from_offset_datetime(timestamp),
+        "expires_at": Timestamp::from_offset_datetime(timestamp + time::Duration::minutes(1)),
+        "credential_id": 1,
+    }))
+    .expect("public lease wire shape");
+    let transition = FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(1).expect("nonzero history epoch"),
+        FencedTransitionV2CallerNonce::from_bytes([0x78; 16]),
+        FencedTransitionLease::renew(absent_lease, Duration::from_secs(30)).expect("renew request"),
+        FencedTransitionMutation::delete(Generation::new(1)),
+    )
+    .expect("self-authenticating V2 transition");
+
+    let request_id = transition.request_id();
+    let execute = client
+        .execute_v2(SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(transition.clone()),
+            },
+        ))
+        .await;
+    assert_eq!(
+        execute,
+        Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id }),
+        "the unbound execution error is recovered only through exact V2 status"
+    );
+
+    let status = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Status {
+            request: Box::new(transition),
+        },
+    );
+    assert_eq!(
+        client.execute_v2(status.clone()).await,
+        Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Err(
+                SessionConsumerV2FencedTransitionError::Store(
+                    SessionConsumerStoreError::StaleFence,
+                ),
+            ))),
+        )))
+    );
+
+    let mut malformed = serde_json::to_value(status).expect("status request encodes");
+    let serde_json::Value::Object(fields) = &mut malformed else {
+        panic!("V2 status envelope is an object");
+    };
+    fields.insert("request_id".into(), serde_json::Value::Null);
+    let malformed: SessionConsumerV2Request =
+        serde_json::from_value(malformed).expect("outer-ID mismatch decodes");
+    assert_eq!(
+        client.execute_v2(malformed).await,
+        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Protocol,
+        }),
+        "an outer full-ID mismatch remains rejected before dispatch"
+    );
     handle.abort_and_wait().await;
 }
 
@@ -2731,16 +2867,26 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         .last_log_index
         .expect("committed transition log index");
     tokio::time::timeout(Duration::from_secs(5 * 60), async {
-        futures_util::stream::iter(0..SNAPSHOT_COMMANDS)
-            .map(|_| fleet.stores[new_leader].max_replication_sequence())
-            .buffer_unordered(16)
-            .for_each(|result| async {
-                result.expect("commit logical-time entry for snapshot qualification");
-            })
-            .await;
+        // Each command must finish before the next begins. Concurrent
+        // logical-time reads intentionally share one bounded consensus
+        // proposal, while this proof must cross the production snapshot-log
+        // threshold with distinct committed entries.
+        for _ in 0..SNAPSHOT_COMMANDS {
+            fleet.stores[new_leader]
+                .max_replication_sequence()
+                .await
+                .expect("commit logical-time entry for snapshot qualification");
+        }
     })
     .await
     .expect("snapshot qualification command batch completes");
+    assert!(
+        fleet.stores[new_leader]
+            .status()
+            .last_log_index
+            .is_some_and(|index| index >= transition_log_index + SNAPSHOT_COMMANDS as u64),
+        "the qualification workload crosses the production snapshot-log threshold"
+    );
     tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
         loop {
             let progress = fleet.stores[new_leader]
