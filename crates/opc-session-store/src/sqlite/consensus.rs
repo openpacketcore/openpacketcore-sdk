@@ -11,9 +11,7 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -1378,6 +1376,7 @@ const CONSENSUS_LOG_PRUNE_RETRY_PACING: Duration = Duration::from_millis(10);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConsensusLogPruneTurnError {
     TransientContention,
+    PreemptedByPrimary,
     Interrupted,
     Permanent,
 }
@@ -1414,27 +1413,42 @@ fn consensus_log_prune_permanent<T>(_error: T) -> ConsensusLogPruneTurnError {
     ConsensusLogPruneTurnError::Permanent
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 #[derive(Default)]
 struct ConsensusLogPruneTurnGateState {
     armed: bool,
     entered: bool,
     released: bool,
+    preempted: bool,
+    completed: bool,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ConsensusLogPruneTurnGatePoint {
+    BeforeTransaction,
+    BeforeActiveInterrupt,
+    AfterWriterAcquired,
 }
 
 /// Test-only, directory-scoped gate for a real lane turn.  It is installed
 /// only after the fixture is durable, so it cannot alter schema setup or any
 /// unrelated temporary database.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct ConsensusLogPruneTurnGate {
+    point: ConsensusLogPruneTurnGatePoint,
     state: Mutex<ConsensusLogPruneTurnGateState>,
     entered: Condvar,
     released: Condvar,
+    completed: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl ConsensusLogPruneTurnGate {
     fn wait_before_prune(&self) -> bool {
+        if self.point != ConsensusLogPruneTurnGatePoint::BeforeTransaction {
+            return false;
+        }
         let mut state = self
             .state
             .lock()
@@ -1454,6 +1468,51 @@ impl ConsensusLogPruneTurnGate {
         true
     }
 
+    fn wait_before_active_interrupt(&self) {
+        if self.point != ConsensusLogPruneTurnGatePoint::BeforeActiveInterrupt {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.entered = true;
+        self.entered.notify_all();
+        while !state.released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.armed = false;
+    }
+
+    fn wait_after_writer_acquired(&self) -> bool {
+        if self.point != ConsensusLogPruneTurnGatePoint::AfterWriterAcquired {
+            return false;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed {
+            return false;
+        }
+        state.entered = true;
+        self.entered.notify_all();
+        while !state.released && !state.preempted {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.armed = false;
+        state.preempted
+    }
+
     fn release(&self) {
         let mut state = self
             .state
@@ -1461,6 +1520,25 @@ impl ConsensusLogPruneTurnGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.released = true;
         self.released.notify_all();
+    }
+
+    fn notify_preemption(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.preempted = true;
+        self.released.notify_all();
+    }
+
+    fn notify_completion(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.completed = true;
+        drop(state);
+        self.completed.notify_one();
     }
 
     fn wait_until_entered(&self, timeout: Duration) -> bool {
@@ -1474,9 +1552,24 @@ impl ConsensusLogPruneTurnGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.entered
     }
+
+    async fn wait_until_completed(&self) {
+        loop {
+            let notified = self.completed.notified();
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .completed
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn consensus_log_prune_turn_gates(
 ) -> &'static Mutex<BTreeMap<PathBuf, Weak<ConsensusLogPruneTurnGate>>> {
     static GATES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<ConsensusLogPruneTurnGate>>>> =
@@ -1484,7 +1577,7 @@ fn consensus_log_prune_turn_gates(
     GATES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn consensus_log_prune_turn_gate_for_source(
     source: &crate::consensus::snapshot::PinnedSqliteFile,
 ) -> Option<Arc<ConsensusLogPruneTurnGate>> {
@@ -1499,25 +1592,47 @@ fn consensus_log_prune_turn_gate_for_source(
     gate
 }
 
-#[cfg(test)]
-struct ConsensusLogPruneTurnGateForTest {
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ConsensusLogPruneTurnGateForTest {
     directory: PathBuf,
     gate: Arc<ConsensusLogPruneTurnGate>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl ConsensusLogPruneTurnGateForTest {
     fn install(directory: &Path) -> Self {
+        Self::install_at(directory, ConsensusLogPruneTurnGatePoint::BeforeTransaction)
+    }
+
+    pub(crate) fn install_after_writer_acquired(directory: &Path) -> Self {
+        Self::install_at(
+            directory,
+            ConsensusLogPruneTurnGatePoint::AfterWriterAcquired,
+        )
+    }
+
+    pub(crate) fn install_before_active_interrupt(directory: &Path) -> Self {
+        Self::install_at(
+            directory,
+            ConsensusLogPruneTurnGatePoint::BeforeActiveInterrupt,
+        )
+    }
+
+    fn install_at(directory: &Path, point: ConsensusLogPruneTurnGatePoint) -> Self {
         let directory =
             std::fs::canonicalize(directory).expect("canonicalize prune gate directory");
         let gate = Arc::new(ConsensusLogPruneTurnGate {
+            point,
             state: Mutex::new(ConsensusLogPruneTurnGateState {
                 armed: true,
                 entered: false,
                 released: false,
+                preempted: false,
+                completed: false,
             }),
             entered: Condvar::new(),
             released: Condvar::new(),
+            completed: tokio::sync::Notify::new(),
         });
         consensus_log_prune_turn_gates()
             .lock()
@@ -1526,12 +1641,20 @@ impl ConsensusLogPruneTurnGateForTest {
         Self { directory, gate }
     }
 
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         self.gate.release();
+    }
+
+    pub(crate) fn wait_until_entered(&self, timeout: Duration) -> bool {
+        self.gate.wait_until_entered(timeout)
+    }
+
+    pub(crate) async fn wait_until_completed(&self) {
+        self.gate.wait_until_completed().await;
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for ConsensusLogPruneTurnGateForTest {
     fn drop(&mut self) {
         self.release();
@@ -1539,6 +1662,21 @@ impl Drop for ConsensusLogPruneTurnGateForTest {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.directory);
+    }
+}
+
+/// Keeps a store-local primary consensus writer ahead of its physical-prune
+/// lane from admission through completion of the SQLite write.
+#[derive(Default)]
+pub(crate) struct ConsensusLogPrunePrimaryPreemption {
+    primary_writers: Option<Arc<AtomicUsize>>,
+}
+
+impl Drop for ConsensusLogPrunePrimaryPreemption {
+    fn drop(&mut self) {
+        if let Some(primary_writers) = self.primary_writers.take() {
+            primary_writers.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -1552,7 +1690,8 @@ pub(crate) struct ConsensusLogPruneLane {
     active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
-    #[cfg(test)]
+    primary_writers: Arc<AtomicUsize>,
+    #[cfg(all(test, target_os = "linux"))]
     turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
 }
 
@@ -1591,7 +1730,8 @@ impl ConsensusLogPruneLane {
             active_interrupt: Mutex::new(None),
             worker: tokio::sync::Mutex::new(None),
             diagnostics,
-            #[cfg(test)]
+            primary_writers: Arc::new(AtomicUsize::new(0)),
+            #[cfg(all(test, target_os = "linux"))]
             turn_gate: consensus_log_prune_turn_gate_for_source(&source),
         });
         let worker = tokio::spawn(run_consensus_log_prune_lane(
@@ -1620,6 +1760,28 @@ impl ConsensusLogPruneLane {
             if let Some(diagnostics) = &self.diagnostics {
                 diagnostics.observe_consensus_log_prune_signal();
             }
+        }
+    }
+
+    pub(crate) fn request_primary_preemption(&self) -> ConsensusLogPrunePrimaryPreemption {
+        if self.stopping.load(Ordering::Acquire) {
+            return ConsensusLogPrunePrimaryPreemption::default();
+        }
+        let primary_writers = Arc::clone(&self.primary_writers);
+        primary_writers.fetch_add(1, Ordering::AcqRel);
+        let active_interrupt = self
+            .active_interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(interrupt) = active_interrupt.as_ref() {
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(gate) = &self.turn_gate {
+                gate.notify_preemption();
+            }
+            interrupt.interrupt();
+        }
+        ConsensusLogPrunePrimaryPreemption {
+            primary_writers: Some(primary_writers),
         }
     }
 
@@ -1676,11 +1838,44 @@ async fn run_consensus_log_prune_lane(
         if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
             return;
         }
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(gate) = &lane.turn_gate {
+            gate.wait_before_active_interrupt();
+        }
+        if lane.primary_writers.load(Ordering::Acquire) != 0 {
+            if !wait_consensus_log_prune_pacing(&mut stop, &lane).await {
+                return;
+            }
+            if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                return;
+            }
+            lane.signal();
+            continue;
+        }
         let interrupt = Arc::new(connection.get_interrupt_handle());
-        *lane
-            .active_interrupt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&interrupt));
+        let primary_writer_waiting = {
+            let mut active_interrupt = lane
+                .active_interrupt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *active_interrupt = Some(Arc::clone(&interrupt));
+            if lane.primary_writers.load(Ordering::Acquire) != 0 {
+                *active_interrupt = None;
+                true
+            } else {
+                false
+            }
+        };
+        if primary_writer_waiting {
+            if !wait_consensus_log_prune_pacing(&mut stop, &lane).await {
+                return;
+            }
+            if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                return;
+            }
+            lane.signal();
+            continue;
+        }
         if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
             *lane
                 .active_interrupt
@@ -1694,10 +1889,11 @@ async fn run_consensus_log_prune_lane(
         let source_for_turn = Arc::clone(&source);
         let expected_members_for_turn = expected_members.clone();
         let expected_bindings_for_turn = expected_bindings.clone();
-        #[cfg(test)]
+        let primary_writers = Arc::clone(&lane.primary_writers);
+        #[cfg(all(test, target_os = "linux"))]
         let turn_gate = lane.turn_gate.clone();
         let turn = tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             if turn_gate
                 .as_ref()
                 .is_some_and(|gate| gate.wait_before_prune())
@@ -1711,14 +1907,30 @@ async fn run_consensus_log_prune_lane(
                 &expected_members_for_turn,
                 &expected_bindings_for_turn,
                 fixed_placement_policy,
+                ConsensusLogPruneTurnControl {
+                    primary_writers: primary_writers.as_ref(),
+                    #[cfg(all(test, target_os = "linux"))]
+                    turn_gate: turn_gate.as_deref(),
+                },
             );
+            let result = match result {
+                Err(ConsensusLogPruneTurnError::Interrupted)
+                    if primary_writers.load(Ordering::Acquire) != 0 =>
+                {
+                    Err(ConsensusLogPruneTurnError::PreemptedByPrimary)
+                }
+                result => result,
+            };
             (connection, result)
         })
         .await;
-        *lane
-            .active_interrupt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        {
+            let mut active_interrupt = lane
+                .active_interrupt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *active_interrupt = None;
+        }
         match turn {
             Ok((returned, Ok(completion))) => {
                 connection = returned;
@@ -1728,6 +1940,12 @@ async fn run_consensus_log_prune_lane(
                         completion.encoded_bytes_deleted,
                         completion.more,
                     );
+                }
+                #[cfg(all(test, target_os = "linux"))]
+                if !completion.more {
+                    if let Some(gate) = &lane.turn_gate {
+                        gate.notify_completion();
+                    }
                 }
                 if completion.more {
                     if !wait_consensus_log_prune_pacing(&mut stop, &lane).await {
@@ -1739,7 +1957,13 @@ async fn run_consensus_log_prune_lane(
                     lane.signal();
                 }
             }
-            Ok((returned, Err(ConsensusLogPruneTurnError::TransientContention))) => {
+            Ok((
+                returned,
+                Err(
+                    ConsensusLogPruneTurnError::TransientContention
+                    | ConsensusLogPruneTurnError::PreemptedByPrimary,
+                ),
+            )) => {
                 connection = returned;
                 if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
                     if let Some(diagnostics) = &lane.diagnostics {
@@ -1841,6 +2065,12 @@ async fn wait_consensus_log_prune_pacing(
     }
 }
 
+struct ConsensusLogPruneTurnControl<'a> {
+    primary_writers: &'a AtomicUsize,
+    #[cfg(all(test, target_os = "linux"))]
+    turn_gate: Option<&'a ConsensusLogPruneTurnGate>,
+}
+
 fn prune_consensus_log_turn_sync(
     conn: &Connection,
     source: &crate::consensus::snapshot::PinnedSqliteFile,
@@ -1848,10 +2078,19 @@ fn prune_consensus_log_turn_sync(
     expected_members: &BTreeSet<SessionConsensusNodeId>,
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    control: ConsensusLogPruneTurnControl<'_>,
 ) -> Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError> {
     verify_proactive_checkpoint_connection(conn, source).map_err(consensus_log_prune_permanent)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+    #[cfg(all(test, target_os = "linux"))]
+    if control
+        .turn_gate
+        .is_some_and(ConsensusLogPruneTurnGate::wait_after_writer_acquired)
+    {
+        return Err(ConsensusLogPruneTurnError::Interrupted);
+    }
+    preempt_consensus_log_prune_if_requested(control.primary_writers)?;
     validate_durable_authority_for_raw_access(
         &tx,
         identity,
@@ -1861,24 +2100,39 @@ fn prune_consensus_log_turn_sync(
         fixed_placement_policy,
     )
     .map_err(consensus_log_prune_permanent)?;
+    preempt_consensus_log_prune_if_requested(control.primary_writers)?;
     let Some(floor) = read_purged_sync(&tx, identity).map_err(consensus_log_prune_permanent)?
     else {
+        preempt_consensus_log_prune_if_requested(control.primary_writers)?;
         return Ok(ConsensusLogPruneTurnCompletion {
             more: false,
             rows_deleted: 0,
             encoded_bytes_deleted: 0,
         });
     };
-    let completion = prune_consensus_log_rows_in_tx(&tx, &floor)?;
+    preempt_consensus_log_prune_if_requested(control.primary_writers)?;
+    let completion = prune_consensus_log_rows_in_tx(&tx, &floor, control.primary_writers)?;
     verify_proactive_checkpoint_connection(conn, source).map_err(consensus_log_prune_permanent)?;
+    preempt_consensus_log_prune_if_requested(control.primary_writers)?;
     tx.commit()
         .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
     Ok(completion)
 }
 
+fn preempt_consensus_log_prune_if_requested(
+    primary_writers: &AtomicUsize,
+) -> Result<(), ConsensusLogPruneTurnError> {
+    if primary_writers.load(Ordering::Acquire) != 0 {
+        Err(ConsensusLogPruneTurnError::PreemptedByPrimary)
+    } else {
+        Ok(())
+    }
+}
+
 fn prune_consensus_log_rows_in_tx(
     tx: &Transaction<'_>,
     floor: &LogId<SessionConsensusNodeId>,
+    primary_writers: &AtomicUsize,
 ) -> Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError> {
     let mut statement = tx.prepare("SELECT log_index, length(entry_json) FROM consensus_log WHERE log_index <= ?1 ORDER BY log_index ASC LIMIT ?2").map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
     let mut rows = statement
@@ -1913,6 +2167,7 @@ fn prune_consensus_log_rows_in_tx(
     }
     drop(rows);
     drop(statement);
+    preempt_consensus_log_prune_if_requested(primary_writers)?;
     if let Some(last) = selected.last() {
         tx.execute("DELETE FROM consensus_log WHERE log_index <= ?1", [last])
             .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
@@ -1930,6 +2185,7 @@ fn prune_consensus_log_rows_in_tx(
             return Err(ConsensusLogPruneTurnError::Permanent);
         }
     }
+    preempt_consensus_log_prune_if_requested(primary_writers)?;
     let more: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM consensus_log WHERE log_index <= ?1)",
@@ -2398,6 +2654,18 @@ impl SqliteConsensusCore {
 
     pub(crate) fn consensus_log_prune_lane(&self) -> Option<Arc<ConsensusLogPruneLane>> {
         self.consensus_log_prune_lane.clone()
+    }
+
+    /// Keep this core's low-priority physical-prune lane yielded for the
+    /// lifetime of one primary consensus write.
+    pub(crate) fn request_consensus_log_prune_preemption(
+        &self,
+    ) -> ConsensusLogPrunePrimaryPreemption {
+        if let Some(lane) = &self.consensus_log_prune_lane {
+            lane.request_primary_preemption()
+        } else {
+            ConsensusLogPrunePrimaryPreemption::default()
+        }
     }
 
     pub(crate) async fn initialize(
@@ -20544,8 +20812,8 @@ mod tests {
         set_test_purge_floor(&conn, &log_id(129));
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
             .expect("begin row-limit turn");
-        let completion =
-            prune_consensus_log_rows_in_tx(&tx, &log_id(129)).expect("row-limit turn succeeds");
+        let completion = prune_consensus_log_rows_in_tx(&tx, &log_id(129), &AtomicUsize::new(0))
+            .expect("row-limit turn succeeds");
         tx.commit().expect("commit row-limit turn");
         assert_eq!(completion.rows_deleted, 128);
         assert!(completion.more);
@@ -20577,8 +20845,8 @@ mod tests {
         .expect("install crossing byte-boundary row");
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
             .expect("begin byte-boundary turn");
-        let completion =
-            prune_consensus_log_rows_in_tx(&tx, &log_id(2)).expect("byte-boundary turn succeeds");
+        let completion = prune_consensus_log_rows_in_tx(&tx, &log_id(2), &AtomicUsize::new(0))
+            .expect("byte-boundary turn succeeds");
         tx.commit().expect("commit byte-boundary turn");
         assert_eq!(completion.rows_deleted, 1);
         assert_eq!(
@@ -20601,7 +20869,7 @@ mod tests {
             .expect("install exact-max row");
         let tx = Transaction::new_unchecked(&exact_conn, TransactionBehavior::Immediate)
             .expect("begin exact-max turn");
-        let completion = prune_consensus_log_rows_in_tx(&tx, &log_id(1))
+        let completion = prune_consensus_log_rows_in_tx(&tx, &log_id(1), &AtomicUsize::new(0))
             .expect("an exact-max row makes progress");
         tx.commit().expect("commit exact-max turn");
         assert_eq!(completion.rows_deleted, 1);
@@ -20622,7 +20890,7 @@ mod tests {
         let tx = Transaction::new_unchecked(&oversized_conn, TransactionBehavior::Immediate)
             .expect("begin oversize turn");
         assert_eq!(
-            prune_consensus_log_rows_in_tx(&tx, &log_id(1)),
+            prune_consensus_log_rows_in_tx(&tx, &log_id(1), &AtomicUsize::new(0)),
             Err(ConsensusLogPruneTurnError::Permanent),
             "an oversize retained row is a sticky nonspinning corruption"
         );

@@ -23,7 +23,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::raft_adapter::{SessionRaftAdapterError, SessionRaftPeerDirectory};
 #[cfg(test)]
-use super::snapshot::{fixed_prepublication_scan_boundary, SnapshotArtifactGate};
+use super::snapshot::{
+    fixed_prepublication_scan_boundary, FixedPrepublicationScanGateGuard, SnapshotArtifactGate,
+};
 use super::snapshot::{
     PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact, SNAPSHOT_MAX_BYTES,
 };
@@ -798,6 +800,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         vote: &Vote<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let result = {
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::save_vote_with_authority_sync(
                 &conn,
@@ -837,6 +840,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         committed: Option<LogId<SessionConsensusNodeId>>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let result = {
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::save_committed_with_authority_sync(
                 &conn,
@@ -883,6 +887,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         let entries: Vec<_> = entries.into_iter().collect();
         let has_entries = !entries.is_empty();
         let result = {
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::append_logs_with_authority_sync(
                 &conn,
@@ -915,6 +920,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         log_id: LogId<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
         let result = {
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::truncate_logs_with_authority_sync(
                 &conn,
@@ -941,6 +947,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
             .await
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
         let result = {
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable
                 && self.core.consensus_log_prune_lane().is_none()
@@ -1050,6 +1057,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             } else {
                 None
             };
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             let applied = consensus::apply_entries_with_authority_sync(
                 &conn,
@@ -1264,6 +1272,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             } else {
                 None
             };
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
                 .map_err(|error| {
@@ -1688,7 +1697,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         );
         let file_name = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
         let final_path = self.core.snapshot_dir.join(&file_name);
-        let (_snapshot_guard, file_backed, raw_artifact, vacuum_artifact) =
+        let (snapshot_guard, file_backed, raw_artifact, vacuum_artifact) =
             build_file_backed_snapshot_database(
                 &self.core,
                 raw_artifact,
@@ -1760,9 +1769,10 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .then(|| fixed_prepublication_scan_boundary(&final_path))
             .flatten();
         // Dynamic authority retains its existing post-rename envelope check.
-        // Fixed authority performs that check, immutable-generation binding,
-        // and exact path/link validation in one descriptor pass at the
-        // metadata publication boundary below.
+        // Fixed authority performs one descriptor-owned envelope scan and
+        // immutable-generation binding before it takes the SQLite mutex. The
+        // later metadata boundary only performs constant-time descriptor,
+        // pathname, length, and Linux kernel change-time generation rechecks.
         if self.core.authority_profile == ConsensusAuthorityProfile::Dynamic {
             let (_, observed_checksum, observed_length) =
                 verify_snapshot_envelope_reader(&mut snapshot)
@@ -1787,23 +1797,60 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             last_membership,
             snapshot_id,
         };
-        let mut published_pin =
+        let (published_pin, snapshot_guard) =
             if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                Some(
-                    snapshot_handle_unbound_pin(&snapshot, &final_path)
-                        .await
-                        .map_err(|error| {
-                            storage_error(
-                                ErrorSubject::Snapshot(Some(meta.signature())),
-                                ErrorVerb::Read,
-                                error,
-                            )
-                        })?,
-                )
+                let published_pin = snapshot_handle_unbound_pin(&snapshot, &final_path)
+                    .await
+                    .map_err(|error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    })?;
+                let scan_path = final_path.clone();
+                // The scan worker owns the sole snapshot gate while the
+                // caller awaits it. If the caller is cancelled, the worker
+                // finishes its descriptor pass and drops the gate only after
+                // its pinned handle, preserving one-worker ownership.
+                let (scan_result, published_pin, snapshot_guard) =
+                    tokio::task::spawn_blocking(move || {
+                        let mut published_pin = published_pin;
+                        let scan_result = published_pin
+                            .verify_snapshot_envelope_and_bind_immutable_generation(
+                                &scan_path,
+                                SNAPSHOT_FOOTER_MAGIC,
+                                SNAPSHOT_FOOTER_BYTES,
+                                SNAPSHOT_MAX_BYTES,
+                                checksum,
+                                byte_length,
+                            );
+                        (scan_result, published_pin, snapshot_guard)
+                    })
+                    .await
+                    .map_err(|_| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            io::Error::other(
+                                "session consensus snapshot verification worker is unavailable",
+                            ),
+                        )
+                    })?;
+                scan_result.map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                })?;
+                (Some(published_pin), snapshot_guard)
             } else {
-                None
+                (None, snapshot_guard)
             };
+        let _snapshot_guard = snapshot_guard;
         let previous = {
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
                 .map_err(|error| {
@@ -1813,16 +1860,9 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                         error,
                     )
                 })?;
-            if let Some(published_pin) = &mut published_pin {
+            if let Some(published_pin) = &published_pin {
                 published_pin
-                    .verify_snapshot_envelope_and_bind_immutable_generation(
-                        &final_path,
-                        SNAPSHOT_FOOTER_MAGIC,
-                        SNAPSHOT_FOOTER_BYTES,
-                        SNAPSHOT_MAX_BYTES,
-                        checksum,
-                        byte_length,
-                    )
+                    .verify_bound_immutable_snapshot_envelope(&final_path, byte_length)
                     .map_err(|error| {
                         storage_error(
                             ErrorSubject::Snapshot(Some(meta.signature())),
@@ -2004,9 +2044,9 @@ async fn snapshot_handle_pin(
 }
 
 /// Clone the already-open snapshot descriptor without scanning it. Fixed
-/// publication later consumes this handle under the SQLite mutex immediately
-/// before metadata publication, so one bounded descriptor pass can verify the
-/// envelope and bind its immutable generation.
+/// publication sends this handle to a blocking worker for one bounded,
+/// descriptor-owned envelope scan before acquiring the SQLite mutex for
+/// metadata publication.
 async fn snapshot_handle_unbound_pin(
     snapshot: &SessionSnapshotFile,
     path: &Path,
@@ -2344,7 +2384,7 @@ mod tests {
 
     use bytes::Bytes;
     use futures_util::StreamExt;
-    use opc_consensus::engine::storage::{RaftLogStorage, RaftStateMachine};
+    use opc_consensus::engine::storage::{RaftLogStorage, RaftLogStorageExt, RaftStateMachine};
     use opc_consensus::engine::{CommittedLeaderId, EntryPayload, RaftSnapshotBuilder};
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
@@ -3114,6 +3154,130 @@ mod tests {
         )
     }
 
+    async fn prepare_fixed_prune_backlog(
+        log_store: &mut SqliteConsensusLogStore,
+        state_machine: &mut SqliteConsensusStateMachine,
+    ) {
+        let mut entries = Vec::with_capacity(130);
+        entries.push(fixed_initial_membership_entry());
+        entries.extend((1..=129).map(blank_entry));
+        log_store
+            .blocking_append(entries.clone())
+            .await
+            .expect("append fixed prune backlog through the storage adapter");
+        state_machine
+            .apply(entries)
+            .await
+            .expect("apply fixed prune backlog through the storage adapter");
+        log_store
+            .purge(log_id(129))
+            .await
+            .expect("durably record the fixed logical purge floor");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_prune_yields_writer_to_later_adapter_append_and_resumes() {
+        let directory = tempfile::tempdir().expect("fixed prune priority directory");
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
+            directory.path(),
+        );
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+        prepare_fixed_prune_backlog(&mut log_store, &mut state_machine).await;
+        assert!(
+            gate.wait_until_entered(Duration::from_secs(1)),
+            "the prune turn owns SQLite's writer before the primary adapter append arrives"
+        );
+
+        let mut append =
+            tokio::spawn(async move { log_store.blocking_append([blank_entry(130)]).await });
+        let appended = tokio::time::timeout(Duration::from_millis(100), &mut append).await;
+        if appended.is_err() {
+            gate.release();
+            let _ = tokio::time::timeout(Duration::from_secs(1), append).await;
+            lane.shutdown().await;
+        }
+        appended
+            .expect("later primary append must not exhaust its existing SQLite busy deadline")
+            .expect("join later primary adapter append")
+            .expect("later primary adapter append succeeds without SQLITE_BUSY");
+
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+            .await
+            .expect("preempted prune resumes and completes its durable logical backlog");
+        let conn = state_machine.core.conn.lock().await;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_log WHERE log_index <= 129",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count fixed prune backlog"),
+            0,
+            "the completed physical prune drains the durable logical backlog"
+        );
+        drop(conn);
+        lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_prune_defers_for_primary_priority_claimed_before_active_turn() {
+        let directory = tempfile::tempdir().expect("fixed prune pre-active priority directory");
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_before_active_interrupt(
+            directory.path(),
+        );
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+        prepare_fixed_prune_backlog(&mut log_store, &mut state_machine).await;
+        assert!(
+            gate.wait_until_entered(Duration::from_secs(1)),
+            "the dequeued prune turn reaches its pre-active boundary"
+        );
+
+        let mut primary_priority =
+            Some(state_machine.core.request_consensus_log_prune_preemption());
+        gate.release();
+        let mut append =
+            tokio::spawn(async move { log_store.blocking_append([blank_entry(130)]).await });
+        let appended = tokio::time::timeout(Duration::from_millis(100), &mut append).await;
+        if appended.is_err() {
+            gate.release();
+            drop(primary_priority.take());
+            let _ = tokio::time::timeout(Duration::from_secs(1), append).await;
+            lane.shutdown().await;
+        }
+        appended
+            .expect("primary priority claimed before activation must retain the SQLite deadline")
+            .expect("join pre-active primary adapter append")
+            .expect("pre-active primary adapter append succeeds without SQLITE_BUSY");
+        drop(primary_priority.take());
+
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+            .await
+            .expect("deferred prune resumes and completes after the primary write");
+        let conn = state_machine.core.conn.lock().await;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_log WHERE log_index <= 129",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count deferred fixed prune backlog"),
+            0,
+            "the logical purge remains durable while a pre-active priority claim defers pruning"
+        );
+        drop(conn);
+        lane.shutdown().await;
+    }
+
     async fn assert_fixed_raw_reads_fail_closed(
         log_store: &mut SqliteConsensusLogStore,
         state_machine: &mut SqliteConsensusStateMachine,
@@ -3325,6 +3489,13 @@ mod tests {
         }
     }
 
+    fn blank_entry(index: u64) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
     fn write_sealed_snapshot_fixture(
         path: &Path,
         payload: &[u8],
@@ -3499,6 +3670,74 @@ mod tests {
                 length,
             )
             .is_err());
+
+        let post_scan_replacement = directory.path().join("post-scan-replacement.opc");
+        write_sealed_snapshot_fixture(
+            &post_scan_replacement,
+            payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(payload.len()).expect("fixture payload length"),
+            checksum,
+        );
+        let file = std::fs::File::open(&post_scan_replacement)
+            .expect("open post-scan replacement fixture");
+        let mut pinned = PinnedSqliteFile::from_file(file, post_scan_replacement.clone())
+            .expect("pin post-scan replacement fixture");
+        pinned
+            .verify_snapshot_envelope_and_bind_immutable_generation(
+                &post_scan_replacement,
+                SNAPSHOT_FOOTER_MAGIC,
+                SNAPSHOT_FOOTER_BYTES,
+                1024,
+                checksum,
+                length,
+            )
+            .expect("bind post-scan replacement fixture");
+        let replacement = directory.path().join("post-scan-replacement-next.opc");
+        write_sealed_snapshot_fixture(
+            &replacement,
+            payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(payload.len()).expect("fixture payload length"),
+            checksum,
+        );
+        std::fs::rename(&replacement, &post_scan_replacement)
+            .expect("replace bound post-scan pathname");
+        assert!(pinned
+            .verify_bound_immutable_snapshot_envelope(&post_scan_replacement, length)
+            .is_err());
+
+        let post_scan_length_change = directory.path().join("post-scan-length-change.opc");
+        write_sealed_snapshot_fixture(
+            &post_scan_length_change,
+            payload,
+            SNAPSHOT_FOOTER_MAGIC,
+            u64::try_from(payload.len()).expect("fixture payload length"),
+            checksum,
+        );
+        let file =
+            std::fs::File::open(&post_scan_length_change).expect("open post-scan length fixture");
+        let mut pinned = PinnedSqliteFile::from_file(file, post_scan_length_change.clone())
+            .expect("pin post-scan length fixture");
+        pinned
+            .verify_snapshot_envelope_and_bind_immutable_generation(
+                &post_scan_length_change,
+                SNAPSHOT_FOOTER_MAGIC,
+                SNAPSHOT_FOOTER_BYTES,
+                1024,
+                checksum,
+                length,
+            )
+            .expect("bind post-scan length fixture");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&post_scan_length_change)
+            .expect("open bound post-scan length fixture")
+            .set_len(length + 1)
+            .expect("extend bound post-scan length fixture");
+        assert!(pinned
+            .verify_bound_immutable_snapshot_envelope(&post_scan_length_change, length)
+            .is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3562,6 +3801,133 @@ mod tests {
                 .next()
                 .is_none(),
             "failed fixed publication cleans the exact mutated candidate and staging artifacts"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_prepublication_descriptor_scan_does_not_block_consensus_reads_or_writes() {
+        let directory = tempfile::tempdir().expect("fixed scan contention directory");
+        let (_, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        state_machine
+            .apply([fixed_initial_membership_entry()])
+            .await
+            .expect("apply fixed membership");
+
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let _gate_guard = FixedPrepublicationScanGateGuard::install(
+            state_machine.core.snapshot_dir.as_ref().clone(),
+            Arc::clone(&gate),
+        );
+        let observer = FixedPrepublicationScanObserver::install(
+            state_machine.core.snapshot_dir.as_ref().clone(),
+        );
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let build = tokio::spawn(async move { builder.build_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("fixed build reaches its descriptor-scan gate");
+
+        let applied = tokio::time::timeout(
+            SNAPSHOT_APPLY_WAIT,
+            state_machine.apply([normal_entry(1, advance_time_command(identity(1), 1, 1))]),
+        )
+        .await
+        .expect("consensus write completes while the descriptor scan is held")
+        .expect("consensus write succeeds while the descriptor scan is held");
+        assert_eq!(
+            1,
+            applied.len(),
+            "the concurrent consensus write is applied"
+        );
+
+        let (last_applied, _) =
+            tokio::time::timeout(SNAPSHOT_APPLY_WAIT, state_machine.applied_state())
+                .await
+                .expect("consensus read completes while the descriptor scan is held")
+                .expect("consensus read succeeds while the descriptor scan is held");
+        assert_eq!(
+            Some(log_id(1)),
+            last_applied,
+            "the concurrent consensus read observes the completed write"
+        );
+        assert!(
+            !build.is_finished(),
+            "publication cannot pass the deliberately held descriptor scan"
+        );
+
+        gate.release();
+        let published_snapshot = build
+            .await
+            .expect("join fixed descriptor-scan build")
+            .expect("fixed publication succeeds after the descriptor scan is released");
+        let published_length = tokio::fs::metadata(published_snapshot.snapshot.path())
+            .await
+            .expect("read published snapshot length")
+            .len();
+        assert_eq!(
+            (1, published_length),
+            observer.snapshot(),
+            "successful publication performs exactly one bounded descriptor scan"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_fixed_prepublication_scan_retains_snapshot_worker_ownership() {
+        let directory = tempfile::tempdir().expect("fixed scan cancellation directory");
+        let (_, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        state_machine
+            .apply([fixed_initial_membership_entry()])
+            .await
+            .expect("apply fixed membership");
+
+        let core = state_machine.core.clone();
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let _gate_guard = FixedPrepublicationScanGateGuard::install(
+            core.snapshot_dir.as_ref().clone(),
+            Arc::clone(&gate),
+        );
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let build = tokio::spawn(async move { builder.build_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("fixed build reaches its descriptor-scan gate");
+
+        build.abort();
+        assert!(
+            build
+                .await
+                .expect_err("fixed snapshot caller is cancelled")
+                .is_cancelled(),
+            "the fixture must cancel only the asynchronous snapshot caller"
+        );
+        assert!(
+            Arc::clone(&core.snapshot_gate).try_lock_owned().is_err(),
+            "the detached descriptor scan retains the sole snapshot owner"
+        );
+
+        gate.release();
+        let worker_released = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&core.snapshot_gate).lock_owned(),
+        )
+        .await
+        .expect("cancelled descriptor scan exits within the existing bounded test window");
+        drop(worker_released);
+        assert!(
+            std::fs::read_dir(core.snapshot_dir.as_ref())
+                .expect("read cancelled fixed snapshot directory")
+                .next()
+                .is_none(),
+            "a cancelled descriptor scan leaves no unpublished snapshot artifact"
+        );
+        let conn = core.conn.lock().await;
+        assert!(
+            consensus::read_current_snapshot_sync(&conn, core.storage_identity)
+                .expect("read current snapshot after cancellation")
+                .is_none(),
+            "a cancelled descriptor scan cannot publish snapshot metadata"
         );
     }
 

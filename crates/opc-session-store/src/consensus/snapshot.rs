@@ -35,6 +35,8 @@ pub(crate) struct SnapshotArtifactGate {
     started_notify: tokio::sync::Notify,
     released: AtomicBool,
     released_notify: tokio::sync::Notify,
+    blocking_release_lock: std::sync::Mutex<()>,
+    blocking_release: std::sync::Condvar,
 }
 
 #[cfg(test)]
@@ -46,10 +48,16 @@ impl SnapshotArtifactGate {
             started_notify: tokio::sync::Notify::new(),
             released: AtomicBool::new(false),
             released_notify: tokio::sync::Notify::new(),
+            blocking_release_lock: std::sync::Mutex::new(()),
+            blocking_release: std::sync::Condvar::new(),
         }
     }
 
     pub(crate) fn arm(&self) {
+        let _release = self
+            .blocking_release_lock
+            .lock()
+            .expect("arm snapshot artifact gate");
         self.started.store(false, Ordering::Release);
         self.released.store(false, Ordering::Release);
         self.armed.store(true, Ordering::Release);
@@ -57,12 +65,21 @@ impl SnapshotArtifactGate {
 
     pub(crate) async fn wait_started(&self) {
         while !self.started.load(Ordering::Acquire) {
-            self.started_notify.notified().await;
+            let notified = self.started_notify.notified();
+            if self.started.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
         }
     }
 
     pub(crate) fn release(&self) {
+        let _release = self
+            .blocking_release_lock
+            .lock()
+            .expect("release snapshot artifact gate");
         self.released.store(true, Ordering::Release);
+        self.blocking_release.notify_all();
         self.released_notify.notify_waiters();
     }
 
@@ -73,7 +90,32 @@ impl SnapshotArtifactGate {
         self.started.store(true, Ordering::Release);
         self.started_notify.notify_waiters();
         while !self.released.load(Ordering::Acquire) {
-            self.released_notify.notified().await;
+            let notified = self.released_notify.notified();
+            if self.released.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+        self.armed.store(false, Ordering::Release);
+    }
+
+    /// Hold a synchronous descriptor-scan boundary. This is test-only so
+    /// production retains no gate or registry.
+    pub(crate) fn block_if_armed_blocking(&self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        self.started.store(true, Ordering::Release);
+        self.started_notify.notify_waiters();
+        let mut release = self
+            .blocking_release_lock
+            .lock()
+            .expect("wait for snapshot artifact gate release");
+        while !self.released.load(Ordering::Acquire) {
+            release = self
+                .blocking_release
+                .wait(release)
+                .expect("wait for snapshot artifact gate release");
         }
         self.armed.store(false, Ordering::Release);
     }
@@ -112,14 +154,32 @@ pub(crate) struct PinnedSqliteFile {
     cleanup: Option<UnpublishedSnapshotArtifact>,
 }
 
-/// Content and length bound to an immutable snapshot artifact. This is kept
-/// separate from the live SQLite descriptor identity: SQLite legitimately
-/// changes a live database through another descriptor while a published or
-/// install artifact must never change after it is verified.
+/// Content, length, and Linux inode-generation authority bound to an immutable
+/// snapshot artifact. This is kept separate from the live SQLite descriptor
+/// identity: SQLite legitimately changes a live database through another
+/// descriptor while a published or install artifact must never change after it
+/// is verified.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ImmutableFileGeneration {
     length: u64,
     digest: [u8; 32],
+    /// Linux `ctime` is owned by the kernel and changes when the inode is
+    /// modified. It closes the post-scan/pre-publication window without a
+    /// second content scan.
+    #[cfg(target_os = "linux")]
+    change_time: LinuxFileChangeTime,
+}
+
+/// Kernel-owned inode change time used as a constant-time generation fence.
+///
+/// This is intentionally separate from [`FileIdentity`]: device/inode proves
+/// that a handle still names the same object, while `ctime` detects a
+/// same-inode, same-length write through another descriptor.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxFileChangeTime {
+    seconds: i64,
+    nanoseconds: i64,
 }
 
 /// The result of binding an immutable generation while validating a sealed
@@ -251,6 +311,68 @@ pub(crate) fn record_fixed_prepublication_scan(path: &Path, bytes: u64) {
             observation.count = observation.count.saturating_add(1);
             observation.bytes = observation.bytes.saturating_add(bytes);
         }
+    }
+}
+
+/// Test-only, directory-scoped gate at the exact fixed prepublication
+/// descriptor-scan boundary. The RAII owner always releases an in-flight scan
+/// before removing its scoped registration.
+#[cfg(test)]
+pub(crate) struct FixedPrepublicationScanGateGuard {
+    snapshot_directory: PathBuf,
+    gate: Arc<SnapshotArtifactGate>,
+}
+
+#[cfg(test)]
+impl FixedPrepublicationScanGateGuard {
+    pub(crate) fn install(snapshot_directory: PathBuf, gate: Arc<SnapshotArtifactGate>) -> Self {
+        fixed_prepublication_scan_gates()
+            .lock()
+            .expect("install fixed prepublication scan gate")
+            .insert(snapshot_directory.clone(), Arc::clone(&gate));
+        Self {
+            snapshot_directory,
+            gate,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FixedPrepublicationScanGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut gates = fixed_prepublication_scan_gates()
+            .lock()
+            .expect("remove fixed prepublication scan gate");
+        if gates
+            .get(&self.snapshot_directory)
+            .is_some_and(|installed| Arc::ptr_eq(installed, &self.gate))
+        {
+            gates.remove(&self.snapshot_directory);
+        }
+    }
+}
+
+#[cfg(test)]
+fn fixed_prepublication_scan_gates(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn block_fixed_prepublication_scan(path: &Path) {
+    let Some(snapshot_directory) = path.parent() else {
+        return;
+    };
+    let gate = fixed_prepublication_scan_gates()
+        .lock()
+        .ok()
+        .and_then(|gates| gates.get(snapshot_directory).cloned());
+    if let Some(gate) = gate {
+        gate.block_if_armed_blocking();
     }
 }
 
@@ -515,7 +637,10 @@ impl PinnedSqliteFile {
                 "snapshot footer size is invalid",
             ));
         }
-        let total_length = self.file.metadata()?.len();
+        let initial_metadata = self.file.metadata()?;
+        let total_length = initial_metadata.len();
+        #[cfg(target_os = "linux")]
+        let initial_change_time = linux_file_change_time(&initial_metadata);
         if total_length != expected_total_length
             || total_length <= footer_bytes
             || total_length > maximum_payload_bytes.saturating_add(footer_bytes)
@@ -532,6 +657,8 @@ impl PinnedSqliteFile {
                 "snapshot footer size is invalid",
             )
         })?;
+        #[cfg(test)]
+        block_fixed_prepublication_scan(&self.path);
         let mut reader = self.file.try_clone()?;
         reader.seek(io::SeekFrom::Start(0))?;
         let mut envelope_hasher = sha2::Sha256::new();
@@ -606,7 +733,15 @@ impl PinnedSqliteFile {
         {
             record_fixed_prepublication_scan(&self.path, scanned);
         }
-        if trailing_len != footer_len || self.file.metadata()?.len() != total_length {
+        let scanned_metadata = self.file.metadata()?;
+        if trailing_len != footer_len || scanned_metadata.len() != total_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot changed during verification",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if linux_file_change_time(&scanned_metadata) != initial_change_time {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "session consensus snapshot changed during verification",
@@ -657,14 +792,103 @@ impl PinnedSqliteFile {
                 "pinned SQLite file path was replaced",
             ));
         }
+        let bound_metadata = self.file.metadata()?;
+        #[cfg(target_os = "linux")]
+        let bound_change_time = linux_file_change_time(&bound_metadata);
+        if bound_metadata.len() != total_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot changed during verification",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if bound_change_time != initial_change_time {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot changed during verification",
+            ));
+        }
         self.immutable_generation = Some(ImmutableFileGeneration {
             length: total_length,
             digest: envelope_hasher.finalize().into(),
+            #[cfg(target_os = "linux")]
+            change_time: bound_change_time,
         });
         Ok(ImmutableSnapshotEnvelope {
             payload_length,
             total_length,
         })
+    }
+
+    /// Recheck the constant-time authority needed between a completed
+    /// immutable descriptor scan and durable metadata publication.
+    ///
+    /// The bounded scan above remains the sole content authority. This method
+    /// deliberately performs only descriptor identity/link, pathname identity,
+    /// length, and Linux kernel change-time generation checks so SQLite's
+    /// mutex need not cover a second full-file hash.
+    pub(crate) fn verify_bound_immutable_snapshot_envelope(
+        &self,
+        path: &Path,
+        expected_total_length: u64,
+    ) -> io::Result<()> {
+        let immutable_generation = self.immutable_generation.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pinned SQLite file immutable generation is absent",
+            )
+        })?;
+        if immutable_generation.length != expected_total_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot immutable length is inconsistent",
+            ));
+        }
+
+        self.verify_linked_identity()?;
+        self.verify_bound_immutable_metadata(immutable_generation)?;
+        if !self.path_matches_identity(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pinned SQLite file path was replaced",
+            ));
+        }
+
+        // Recheck after resolving the pathname so a replacement or unlink
+        // racing that lookup cannot authorize the metadata write.
+        self.verify_linked_identity()?;
+        self.verify_bound_immutable_metadata(immutable_generation)?;
+        if !self.path_matches_identity(path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pinned SQLite file path was replaced",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check the descriptor metadata bound at the end of the sole content
+    /// scan. This has no content read: it is the constant-time fence used by
+    /// the metadata publication critical section.
+    fn verify_bound_immutable_metadata(
+        &self,
+        immutable_generation: ImmutableFileGeneration,
+    ) -> io::Result<()> {
+        let metadata = self.file.metadata()?;
+        if metadata.len() != immutable_generation.length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot length changed after verification",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if linux_file_change_time(&metadata) != immutable_generation.change_time {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session consensus snapshot generation changed after verification",
+            ));
+        }
+        Ok(())
     }
 
     /// Whether this descriptor was explicitly promoted to an immutable
@@ -729,7 +953,10 @@ fn immutable_file_generation(
 
     let mut reader = file.try_clone()?;
     reader.seek(io::SeekFrom::Start(0))?;
-    let length = reader.metadata()?.len();
+    let initial_metadata = reader.metadata()?;
+    let length = initial_metadata.len();
+    #[cfg(target_os = "linux")]
+    let initial_change_time = linux_file_change_time(&initial_metadata);
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -739,11 +966,29 @@ fn immutable_file_generation(
         }
         digest.update(&buffer[..read]);
     }
+    let scanned_metadata = file.metadata()?;
+    #[cfg(target_os = "linux")]
+    let bound_change_time = linux_file_change_time(&scanned_metadata);
+    if scanned_metadata.len() != length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pinned SQLite file changed during immutable generation scan",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if bound_change_time != initial_change_time {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pinned SQLite file changed during immutable generation scan",
+        ));
+    }
     #[cfg(test)]
     record_fixed_prepublication_scan(_path, length);
     Ok(ImmutableFileGeneration {
         length,
         digest: digest.finalize().into(),
+        #[cfg(target_os = "linux")]
+        change_time: bound_change_time,
     })
 }
 
@@ -1257,6 +1502,14 @@ fn ensure_regular_file(metadata: &std::fs::Metadata) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_file_change_time(metadata: &std::fs::Metadata) -> LinuxFileChangeTime {
+    LinuxFileChangeTime {
+        seconds: metadata.st_ctime(),
+        nanoseconds: metadata.st_ctime_nsec(),
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[allow(dead_code)]
 fn file_identity(metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
     Ok(FileIdentity {
@@ -1520,7 +1773,7 @@ impl AsyncSeek for SessionSnapshotFile {
 mod tests {
     use std::io;
     #[cfg(target_os = "linux")]
-    use std::io::{Read as _, Write as _};
+    use std::io::{Read as _, Seek as _, Write as _};
     use std::pin::Pin;
     use std::sync::Arc;
 
@@ -1529,6 +1782,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::{PinnedSqliteFile, UnpublishedSnapshotArtifact};
     use super::{SessionSnapshotFile, SnapshotArtifactGate, SnapshotReplayRead};
+    #[cfg(target_os = "linux")]
+    use sha2::Digest as _;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncSeek as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
@@ -1901,6 +2156,52 @@ mod tests {
             .err()
             .ok_or("mutated immutable artifact was accepted")?;
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bound_envelope_rejects_same_inode_same_length_mutation_after_scan(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
+        const FOOTER_BYTES: u64 = 48;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("snapshot.opc");
+        let payload = b"descriptor-bound immutable envelope";
+        let payload_length = u64::try_from(payload.len())?;
+        let checksum: [u8; 32] = sha2::Sha256::digest(payload).into();
+        let total_length = payload_length
+            .checked_add(FOOTER_BYTES)
+            .ok_or("fixture length overflow")?;
+        let mut envelope = Vec::from(payload.as_slice());
+        envelope.extend_from_slice(FOOTER_MAGIC);
+        envelope.extend_from_slice(&payload_length.to_be_bytes());
+        envelope.extend_from_slice(&checksum);
+        std::fs::write(&path, envelope)?;
+
+        let mut pinned = PinnedSqliteFile::from_file(std::fs::File::open(&path)?, path.clone())?;
+        pinned.verify_snapshot_envelope_and_bind_immutable_generation(
+            &path,
+            FOOTER_MAGIC,
+            FOOTER_BYTES,
+            1024,
+            checksum,
+            total_length,
+        )?;
+
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
+        writer.seek(io::SeekFrom::Start(0))?;
+        writer.write_all(b"X")?;
+        writer.sync_all()?;
+        assert_eq!(std::fs::metadata(&path)?.len(), total_length);
+        pinned.verify_linked_identity()?;
+        assert!(pinned.path_matches_identity(&path)?);
+
+        let error = pinned
+            .verify_bound_immutable_snapshot_envelope(&path, total_length)
+            .expect_err("same-inode same-length post-scan mutation was accepted");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         Ok(())
     }
 

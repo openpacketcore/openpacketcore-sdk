@@ -15,6 +15,8 @@ use std::time::Duration;
 
 #[cfg(test)]
 use std::sync::Mutex;
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+use std::sync::{Condvar, OnceLock};
 
 use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream, StreamExt};
@@ -940,7 +942,7 @@ impl ConsensusStoreDiagnosticCounters {
             .fetch_sub(1, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn consensus_log_prune_gauges_for_test(&self) -> (u64, u64) {
         (
             self.consensus_log_prune_active.load(Ordering::Relaxed),
@@ -1077,6 +1079,166 @@ struct ConsensusSessionStoreInner {
     diagnostics: Arc<ConsensusStoreDiagnosticCounters>,
     #[cfg(test)]
     accepted_receiver_test_outcomes: Mutex<VecDeque<AcceptedClientWriteReceiverTestOutcome>>,
+}
+
+/// Store-scoped test gate immediately before the real Raft shutdown call.
+///
+/// The guard deliberately does not alter a lane or the Raft engine.  It only
+/// makes the public shutdown phase boundary observable: maintenance lanes
+/// must have stopped and joined before the core shutdown can be held here.
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+struct RaftShutdownGate {
+    state: Mutex<RaftShutdownGateState>,
+    entered: Condvar,
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+#[derive(Default)]
+struct RaftShutdownGateState {
+    armed: bool,
+    entered: bool,
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+impl RaftShutdownGate {
+    fn new() -> Arc<Self> {
+        let (release, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self {
+            state: Mutex::new(RaftShutdownGateState::default()),
+            entered: Condvar::new(),
+            release,
+        })
+    }
+
+    fn arm(self: &Arc<Self>, key: usize) -> RaftShutdownHoldForTest {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !state.armed,
+            "only one Raft shutdown test hold may be armed"
+        );
+        state.armed = true;
+        state.entered = false;
+        self.release.send_replace(false);
+        RaftShutdownHoldForTest {
+            gate: Arc::clone(self),
+            key,
+        }
+    }
+
+    async fn wait_before_raft_shutdown(&self) {
+        let mut release = self.release.subscribe();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.armed {
+                return;
+            }
+            state.entered = true;
+            self.entered.notify_all();
+        }
+        while !*release.borrow() {
+            if release.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, _) = self
+            .entered
+            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.entered
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.armed = false;
+        self.release.send_replace(true);
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+fn raft_shutdown_gates() -> &'static Mutex<BTreeMap<usize, Weak<RaftShutdownGate>>> {
+    static GATES: OnceLock<Mutex<BTreeMap<usize, Weak<RaftShutdownGate>>>> = OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+fn raft_shutdown_gate_key(inner: &Arc<ConsensusSessionStoreInner>) -> usize {
+    Arc::as_ptr(inner) as usize
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+fn install_raft_shutdown_gate_for_test(
+    inner: &Arc<ConsensusSessionStoreInner>,
+) -> RaftShutdownHoldForTest {
+    let key = raft_shutdown_gate_key(inner);
+    let gate = RaftShutdownGate::new();
+    let mut gates = raft_shutdown_gates()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        gates.get(&key).and_then(Weak::upgrade).is_none(),
+        "only one Raft shutdown test hold may be armed"
+    );
+    gates.insert(key, Arc::downgrade(&gate));
+    drop(gates);
+    gate.arm(key)
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+fn raft_shutdown_gate_for_store(
+    inner: &Arc<ConsensusSessionStoreInner>,
+) -> Option<Arc<RaftShutdownGate>> {
+    let key = raft_shutdown_gate_key(inner);
+    let mut gates = raft_shutdown_gates()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let gate = gates.get(&key).and_then(Weak::upgrade);
+    if gate.is_none() {
+        gates.remove(&key);
+    }
+    gate
+}
+
+/// RAII release for one store-scoped Raft shutdown hold.
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+struct RaftShutdownHoldForTest {
+    gate: Arc<RaftShutdownGate>,
+    key: usize,
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+impl Drop for RaftShutdownHoldForTest {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut gates = raft_shutdown_gates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gates
+            .get(&self.key)
+            .is_some_and(|current| current.ptr_eq(&Arc::downgrade(&self.gate)))
+        {
+            gates.remove(&self.key);
+        }
+    }
 }
 
 /// Test-only result injection at the post-acceptance `client_write_ff`
@@ -2356,16 +2518,39 @@ impl ConsensusSessionStore {
     /// Shutdown is clone-wide: every handle to this store observes the same
     /// stopped engine. Callers must remove the store's authenticated RPC
     /// handler from their transport before invoking this method so no new
-    /// request can enter while the engine drains.
+    /// request can enter while the engine drains. The bounded maintenance
+    /// lanes are stopped and joined first, so a Raft shutdown that cannot
+    /// complete cannot retain their workers or checkpoint connections.
     pub async fn shutdown(&self) -> Result<(), StoreError> {
-        let raft = self.inner.raft.shutdown().await;
-        if let Some(lane) = &self.inner.consensus_log_prune_lane {
-            lane.shutdown().await;
+        match (
+            self.inner.consensus_log_prune_lane.as_ref(),
+            self.inner.proactive_checkpoint_lane.as_ref(),
+        ) {
+            (Some(prune), Some(checkpoint)) => {
+                tokio::join!(prune.shutdown(), checkpoint.shutdown());
+            }
+            (Some(prune), None) => prune.shutdown().await,
+            (None, Some(checkpoint)) => checkpoint.shutdown().await,
+            (None, None) => {}
         }
-        if let Some(lane) = &self.inner.proactive_checkpoint_lane {
-            lane.shutdown().await;
+        #[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+        if let Some(gate) = raft_shutdown_gate_for_store(&self.inner) {
+            gate.wait_before_raft_shutdown().await;
         }
-        raft.map_err(|_| consensus_unavailable())
+        self.inner
+            .raft
+            .shutdown()
+            .await
+            .map_err(|_| consensus_unavailable())
+    }
+
+    /// Hold the test-only phase immediately before the real Raft shutdown.
+    ///
+    /// Releasing the returned guard resumes the core shutdown. Production
+    /// construction omits the gate entirely.
+    #[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+    fn hold_raft_shutdown_before_core_for_test(&self) -> RaftShutdownHoldForTest {
+        install_raft_shutdown_gate_for_test(&self.inner)
     }
 
     /// Reset the fixed proactive-checkpoint write cadence for an isolated VFS
@@ -9844,6 +10029,183 @@ mod membership_tests {
             ConsensusIdentity::new(cluster_id, configuration_id, epoch),
         )
         .expect("singleton topology")
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    #[derive(Debug)]
+    struct ShutdownUnavailablePeer {
+        node_id: SessionConsensusNodeId,
+        identity: ConsensusIdentity,
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    #[async_trait]
+    impl SessionConsensusPeer for ShutdownUnavailablePeer {
+        fn node_id(&self) -> SessionConsensusNodeId {
+            self.node_id
+        }
+
+        fn scope_identity(&self) -> Option<ConsensusIdentity> {
+            Some(self.identity)
+        }
+
+        async fn call(
+            &self,
+            _request: SessionConsensusWireRequest,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            Err(SessionConsensusPeerError::Unavailable)
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    fn fixed_shutdown_topology() -> ValidatedQuorumTopology {
+        let members = (0..3)
+            .map(|index| {
+                let replica_id =
+                    ReplicaId::new(format!("shutdown-order-voter-{index}")).expect("replica ID");
+                QuorumReplicaDescriptor::new(
+                    replica_id,
+                    ReplicaEndpoint::new(format!("shutdown-order-{index}.invalid"), 7443)
+                        .expect("endpoint"),
+                    ReplicaTlsIdentity::new(format!(
+                        "spiffe://test/session/shutdown-order/{index}"
+                    ))
+                    .expect("TLS identity"),
+                    ReplicaFailureDomain::new(format!("shutdown-order-zone-{index}"))
+                        .expect("failure domain"),
+                    ReplicaBackingIdentity::new(format!("shutdown-order-backing-{index}"))
+                        .expect("backing identity"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cluster_id =
+            ConsensusClusterId::new("session-shutdown-order-tests").expect("cluster ID");
+        let epoch = ConsensusConfigurationEpoch::new(1).expect("configuration epoch");
+        let placement_policy = PlacementResiliencePolicy::default();
+        let fingerprints = members
+            .iter()
+            .map(QuorumReplicaDescriptor::configuration_fingerprint)
+            .collect::<Vec<_>>();
+        let identity = crate::derive_fixed_durable_quorum_consensus_identity(
+            cluster_id,
+            epoch,
+            &fingerprints,
+            placement_policy,
+        );
+        ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
+            crate::topology::QuorumTopologyConfig::new_consensus(
+                ReplicaId::new("shutdown-order-voter-0").expect("local replica ID"),
+                members,
+                identity,
+            ),
+            placement_policy,
+        )
+        .expect("fixed shutdown topology")
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    fn unavailable_fixed_shutdown_peers(
+        topology: &ValidatedQuorumTopology,
+    ) -> BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusPeer>> {
+        let local_node_id = topology
+            .local_consensus_node_id()
+            .expect("fixed local node ID");
+        let identity = topology.consensus_identity().expect("fixed identity");
+        topology
+            .members()
+            .iter()
+            .filter_map(|descriptor| {
+                let node_id = topology.consensus_node_id(descriptor.replica_id())?;
+                (node_id != local_node_id).then(|| {
+                    let peer: Arc<dyn SessionConsensusPeer> =
+                        Arc::new(ShutdownUnavailablePeer { node_id, identity });
+                    (node_id, peer)
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    #[tokio::test]
+    async fn shutdown_stops_maintenance_lanes_before_a_held_raft_shutdown_and_reopens() {
+        let directory = tempfile::tempdir().expect("shutdown-order directory");
+        let database_path = directory.path().join("store.sqlite");
+        let snapshot_path = directory.path().join("snapshots");
+        let topology = fixed_shutdown_topology();
+        let backend = SqliteSessionBackend::open(&database_path).expect("file-backed backend");
+        let mut checkpoint_workers = backend.proactive_checkpoint_worker_observation_for_test();
+        let store = ConsensusSessionStore::open_fixed_durable_quorum(
+            topology.clone(),
+            backend,
+            &snapshot_path,
+            unavailable_fixed_shutdown_peers(&topology),
+        )
+        .await
+        .expect("open fixed store with both maintenance lanes");
+
+        assert!(
+            store.inner.proactive_checkpoint_lane.is_some(),
+            "fixed durable storage constructs the owned checkpoint lane"
+        );
+        assert!(
+            store.inner.consensus_log_prune_lane.is_some(),
+            "fixed durable storage constructs the owned physical-prune lane"
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            checkpoint_workers.wait_for_worker_count(1),
+        )
+        .await
+        .expect("checkpoint worker starts"));
+
+        let hold = store.hold_raft_shutdown_before_core_for_test();
+        let gate = Arc::clone(&hold.gate);
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.shutdown().await });
+        assert!(
+            tokio::task::spawn_blocking(move || gate.wait_until_entered(Duration::from_secs(1)))
+                .await
+                .expect("join Raft shutdown gate observer"),
+            "the public shutdown reaches the held core phase only after both maintenance joins"
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            checkpoint_workers.wait_for_worker_count(0),
+        )
+        .await
+        .expect("checkpoint worker exits before core shutdown"));
+        assert_eq!(
+            store
+                .inner
+                .diagnostics
+                .consensus_log_prune_gauges_for_test(),
+            (0, 0),
+            "the physical-prune turn and its sole worker join before the held core shutdown"
+        );
+        assert!(
+            !shutdown.is_finished(),
+            "the core shutdown remains held after maintenance lanes have exited"
+        );
+
+        drop(hold);
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("released Raft shutdown completes")
+            .expect("shutdown task completes")
+            .expect("shutdown succeeds after releasing the core gate");
+
+        let reopened = ConsensusSessionStore::open_fixed_durable_quorum(
+            topology.clone(),
+            SqliteSessionBackend::open(&database_path).expect("reopen file-backed backend"),
+            &snapshot_path,
+            unavailable_fixed_shutdown_peers(&topology),
+        )
+        .await
+        .expect("reopen after maintenance joins and core shutdown");
+        reopened
+            .shutdown()
+            .await
+            .expect("shut down reopened fixed store");
     }
 
     #[tokio::test]
