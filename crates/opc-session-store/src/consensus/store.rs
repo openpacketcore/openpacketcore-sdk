@@ -720,7 +720,7 @@ pub(crate) struct ConsensusStoreDiagnosticCounters {
     fixed_raw_v2_proposals: AtomicU64,
     // This is not a diagnostic value. Reusing the existing per-store Arc
     // keeps the hint store-scoped across every construction path.
-    public_fixed_raw_v2_warm_route: AtomicBool,
+    fixed_raw_v2_warm_route: AtomicBool,
 }
 
 impl ConsensusStoreDiagnosticCounters {
@@ -2120,10 +2120,10 @@ impl ConsensusSessionStore {
         )
     }
 
-    /// Select the fixed-quorum consumer warm route from local implementation
-    /// support alone. This is deliberately not an activation or authority
-    /// check: the leader receives the captured consumer scope and consumes its
-    /// uncached atomic snapshot at the sole effect-admission boundary.
+    /// Select the fixed-quorum consumer warm route only after this store has
+    /// observed one definitive V2 result. The bit is a route hint rather than
+    /// activation or authority: the leader still consumes the captured scope
+    /// and its uncached atomic snapshot at the sole effect-admission boundary.
     fn fixed_raw_v2_consumer_warm_route(
         &self,
         required_consumer_scope: Option<&SessionConsensusIdentity>,
@@ -2132,6 +2132,11 @@ impl ConsensusSessionStore {
             && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
             && self.local_fenced_transition_v2_capability()
                 == Some(FencedTransitionV2Capability::V2)
+            && self
+                .inner
+                .diagnostics
+                .fixed_raw_v2_warm_route
+                .load(Ordering::Acquire)
     }
 
     fn fixed_raw_v2_consumer_warm_route_for_intent(
@@ -2157,7 +2162,7 @@ impl ConsensusSessionStore {
         if !self
             .inner
             .diagnostics
-            .public_fixed_raw_v2_warm_route
+            .fixed_raw_v2_warm_route
             .load(Ordering::Acquire)
         {
             return Ok(None);
@@ -2175,14 +2180,14 @@ impl ConsensusSessionStore {
     /// Record only proof obtained by this process for its immutable storage
     /// identity/profile. This is intentionally not a certificate and never
     /// carries subscriber, consumer, or topology authority state.
-    fn seed_public_fixed_raw_v2_warm_route(&self) {
+    fn seed_fixed_raw_v2_warm_route(&self) {
         if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
             && self.local_fenced_transition_v2_capability()
                 == Some(FencedTransitionV2Capability::V2)
         {
             self.inner
                 .diagnostics
-                .public_fixed_raw_v2_warm_route
+                .fixed_raw_v2_warm_route
                 .store(true, Ordering::Release);
         }
     }
@@ -2549,7 +2554,7 @@ impl ConsensusSessionStore {
         // A cold successful singleton either observed the exact durable
         // activation admission or committed the one permitted activation
         // singleton. Only later public batches may consume this route hint.
-        self.seed_public_fixed_raw_v2_warm_route();
+        self.seed_fixed_raw_v2_warm_route();
         Ok(outcome)
     }
 
@@ -2592,6 +2597,9 @@ impl ConsensusSessionStore {
             Ok(_) => Err(StoreError::FencedTransitionOutcomeUnknown),
             Err(error) => Err(error),
         };
+        if committed {
+            self.seed_fixed_raw_v2_warm_route();
+        }
         Ok((result, committed))
     }
 
@@ -2765,7 +2773,7 @@ impl ConsensusSessionStore {
             .await?;
         // A fresh public batch keeps the existing singleton activation shape;
         // only its definitive successful return can warm later public calls.
-        self.seed_public_fixed_raw_v2_warm_route();
+        self.seed_fixed_raw_v2_warm_route();
         Ok(outcomes)
     }
 
@@ -2795,13 +2803,18 @@ impl ConsensusSessionStore {
         requests: Vec<FencedTransitionV2Request>,
         deadline: tokio::time::Instant,
     ) -> Result<(Vec<Result<FencedTransitionOutcome, StoreError>>, bool), StoreError> {
-        self.fenced_transition_v2_batch_execution_before(
-            requests,
-            Some(scope.consensus_identity()),
-            deadline,
-            true,
-        )
-        .await
+        let result = self
+            .fenced_transition_v2_batch_execution_before(
+                requests,
+                Some(scope.consensus_identity()),
+                deadline,
+                true,
+            )
+            .await;
+        if result.is_ok() {
+            self.seed_fixed_raw_v2_warm_route();
+        }
+        result
     }
 
     async fn fenced_transition_v2_batch_execution_before(

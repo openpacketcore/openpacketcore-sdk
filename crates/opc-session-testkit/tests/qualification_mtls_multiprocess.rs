@@ -187,6 +187,7 @@ struct ProcessResourceHighWater {
     samples: u64,
     file_descriptors: usize,
     threads: usize,
+    vm_rss_kib: u64,
     vm_hwm_kib: u64,
 }
 
@@ -207,6 +208,7 @@ impl ResourceSampler {
                         samples: 0,
                         file_descriptors: 0,
                         threads: 0,
+                        vm_rss_kib: 0,
                         vm_hwm_kib: 0,
                     };
                     process_ids.len()
@@ -219,6 +221,7 @@ impl ResourceSampler {
                         current.file_descriptors =
                             current.file_descriptors.max(snapshot.file_descriptors);
                         current.threads = current.threads.max(snapshot.threads);
+                        current.vm_rss_kib = current.vm_rss_kib.max(snapshot.vm_rss_kib);
                         current.vm_hwm_kib = current.vm_hwm_kib.max(snapshot.vm_hwm_kib);
                     }
                     if stop_for_thread.load(Ordering::Acquire) {
@@ -1694,6 +1697,12 @@ fn assert_process_resource_bounds(
             warmed.vm_hwm_kib
         );
         assert!(
+            high_water.vm_rss_kib <= high_water.vm_hwm_kib,
+            "VmRSS high-water exceeds VmHWM: node={node_index}, rss_kib={}, hwm_kib={}",
+            high_water.vm_rss_kib,
+            high_water.vm_hwm_kib
+        );
+        assert!(
             settled.vm_rss_kib
                 <= warmed
                     .vm_rss_kib
@@ -1802,6 +1811,7 @@ struct TestPki {
     old_root_pem: String,
     new_root_pem: String,
     old_intermediate: Issuer,
+    new_intermediate: Issuer,
     members: Vec<MemberCredentials>,
 }
 
@@ -1830,6 +1840,7 @@ impl TestPki {
             old_root_pem: old_root.certified.pem(),
             new_root_pem: new_root.certified.pem(),
             old_intermediate,
+            new_intermediate,
             members,
         }
     }
@@ -1902,13 +1913,31 @@ impl TestPki {
     }
 
     fn consumer_identity_state(&self, identity: &str) -> IdentityState {
-        let credential = self.old_intermediate.issue_workload(identity);
+        self.consumer_identity_state_with_trust(identity, TrustGeneration::OldOnly)
+    }
+
+    fn consumer_identity_state_with_trust(
+        &self,
+        identity: &str,
+        trust_generation: TrustGeneration,
+    ) -> IdentityState {
+        // New-only consumer trust is paired with a leaf issued under the new
+        // root. A successful post-rotation request therefore proves both
+        // directions of mTLS adoption: the client verified the new server
+        // leaf and the overlap-trusting server authenticated a new client
+        // leaf with the original authorized SPIFFE identity.
+        let credential = match trust_generation {
+            TrustGeneration::OldOnly | TrustGeneration::Overlap => {
+                self.old_intermediate.issue_workload(identity)
+            }
+            TrustGeneration::NewOnly => self.new_intermediate.issue_workload(identity),
+        };
         let trust_domain =
             TrustDomain::new("qualification.invalid").expect("qualification trust domain is valid");
         let mut trust_bundles = TrustBundleSet::new();
         trust_bundles.insert(TrustBundle {
             trust_domain,
-            certificates: parse_certs_pem(&self.old_root_pem)
+            certificates: parse_certs_pem(&self.trust_bundle(trust_generation))
                 .expect("parse qualification consumer trust bundle"),
         });
         build_identity_state(
@@ -8268,6 +8297,23 @@ const V2_BATCH_RELEASE_GATE_P999: Duration = Duration::from_millis(100);
 const V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT: usize = 16;
 
+fn assert_v2_batch_release_profile() {
+    let cargo_profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    assert_eq!(
+        cargo_profile, "release",
+        "the V2 batch release gate requires Cargo's release profile"
+    );
+    assert_eq!(
+        option_env!("OPT_LEVEL"),
+        Some("3"),
+        "the V2 batch release gate requires Cargo release opt-level 3"
+    );
+}
+
 fn qualification_v2_batch_percentile(
     samples: &mut [Duration],
     numerator: usize,
@@ -10004,6 +10050,14 @@ fn run_persistent_consumer_v2_multiprocess_qualification() {
 // it is not a cross-host production-capacity claim.
 fn run_persistent_consumer_v2_batch_release_gate() {
     const MEMBER_COUNT: usize = 3;
+    assert_v2_batch_release_profile();
+    assert_eq!(V2_BATCH_RELEASE_GATE_CLIENTS, 12);
+    assert_eq!(V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT, 4);
+    assert_eq!(V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY, 48);
+    assert_eq!(V2_BATCH_RELEASE_GATE_PRELOAD_CREATES, 50_000);
+    assert_eq!(V2_BATCH_RELEASE_GATE_PACED_MUTATIONS, 60_000);
+    assert_eq!(V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND, 1_000);
+    assert_eq!(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES, 1_008);
     let mut fleet = Fleet::start(MEMBER_COUNT);
     let consumer_identities = (0..V2_BATCH_RELEASE_GATE_CLIENTS)
         .map(stateless_consumer_identity)
@@ -10091,11 +10145,27 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .map(PersistentSessionConsumerClient::v2_diagnostics)
         .collect::<Vec<_>>();
     assert!(prewarmed.iter().all(|diagnostics| {
-        diagnostics.setup_successes == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+        diagnostics.setup_attempts == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && diagnostics.setup_failures == 0
+            && diagnostics.setup_successes == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
             && diagnostics.active == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
             && diagnostics.idle == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && diagnostics.pool_wait_current == 0
+            && diagnostics.pool_wait_max == 0
             && diagnostics.reconnects == 0
     }));
+
+    // Establish the overlap generation on every server before the measured
+    // workload. The later replacement is the only member that receives a
+    // new-root leaf, which makes the client trust routing below observable.
+    for node_index in 0..MEMBER_COUNT {
+        fleet.transition_member(
+            node_index,
+            CredentialGeneration::Initial,
+            TrustGeneration::Overlap,
+            &format!("v2-batch-initial-overlap-node-{node_index}"),
+        );
+    }
 
     assert_eq!(
         runtime
@@ -10124,6 +10194,18 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         SessionConsumerV2Response::FencedTransitionV2(Ok(outcome))
             if outcome.matches_v2_request(&first)
     ));
+
+    let process_ids = fleet
+        .nodes
+        .iter()
+        .map(ChildNode::process_id)
+        .collect::<Vec<_>>();
+    let warmed_resources = process_ids
+        .iter()
+        .copied()
+        .map(read_classified_process_resources)
+        .collect::<Vec<_>>();
+    let resource_sampler = ResourceSampler::start(process_ids.clone());
 
     let preload_batches = runtime.block_on(qualification_build_v2_batches(
         MEMBER_COUNT,
@@ -10352,7 +10434,9 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         mut mutation_samples,
         mutation_recovered_unknown,
         mutation_not_transmitted_retries,
-        _mutation_typed_read_unavailable_retries,
+        mutation_typed_read_unavailable_retries,
+        mutation_not_transmitted_retry_high_water,
+        mutation_typed_read_unavailable_retry_high_water,
         mutation_phase_elapsed,
         mutation_scheduled_batches_per_client,
         mutation_max_in_flight_per_client,
@@ -10373,6 +10457,8 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         let mut recovered_unknown = 0usize;
         let mut not_transmitted_retries = 0usize;
         let mut typed_read_unavailable_retries = 0usize;
+        let mut not_transmitted_retry_high_water = 0usize;
+        let mut typed_read_unavailable_retry_high_water = 0usize;
         let mut scheduled_batches_per_client = vec![0usize; clients.len()];
         let mut in_flight_per_client = vec![0usize; clients.len()];
         let mut max_in_flight_per_client = vec![0usize; clients.len()];
@@ -10411,6 +10497,9 @@ fn run_persistent_consumer_v2_batch_release_gate() {
                 recovered_unknown += usize::from(recovered);
                 not_transmitted_retries += retries;
                 typed_read_unavailable_retries += typed_retries;
+                not_transmitted_retry_high_water = not_transmitted_retry_high_water.max(retries);
+                typed_read_unavailable_retry_high_water =
+                    typed_read_unavailable_retry_high_water.max(typed_retries);
             }
             assert!(
                 pending.len() < V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
@@ -10454,6 +10543,9 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             recovered_unknown += usize::from(recovered);
             not_transmitted_retries += retries;
             typed_read_unavailable_retries += typed_retries;
+            not_transmitted_retry_high_water = not_transmitted_retry_high_water.max(retries);
+            typed_read_unavailable_retry_high_water =
+                typed_read_unavailable_retry_high_water.max(typed_retries);
         }
         assert!(
             in_flight_per_client.iter().all(|in_flight| *in_flight == 0),
@@ -10464,6 +10556,8 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             recovered_unknown,
             not_transmitted_retries,
             typed_read_unavailable_retries,
+            not_transmitted_retry_high_water,
+            typed_read_unavailable_retry_high_water,
             phase_started.elapsed(),
             scheduled_batches_per_client,
             max_in_flight_per_client,
@@ -10541,6 +10635,11 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         mutation_max_global_in_flight <= V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
         "the V2 scheduler remains at or below its 48-call global bound: max={mutation_max_global_in_flight}"
     );
+    assert!(
+        mutation_not_transmitted_retry_high_water
+            <= V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT,
+        "no V2 call exceeds its fixed not-transmitted retry bound"
+    );
     // The raw samples include scheduled-submission delay and bounded pool
     // queue dwell through receipt validation; no percentile histogram drops
     // or compresses individual observations.
@@ -10606,6 +10705,11 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             .expect("bounded call count fits u64"),
         "typed measured work reuses the prewarmed V2 pools"
     );
+    assert!(measured_diagnostics.iter().all(|diagnostics| {
+        diagnostics.setup_attempts == diagnostics.setup_successes + diagnostics.setup_failures
+            && diagnostics.pool_wait_current == 0
+            && diagnostics.pool_wait_max <= V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64
+    }));
 
     let all_nodes = (0..MEMBER_COUNT).collect::<Vec<_>>();
     let reports_before_loss = fleet.readiness_reports(&all_nodes);
@@ -10673,25 +10777,50 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)[leader_node_index] = restarted_endpoint;
 
-    // Rotate both a projected voter SVID and the twelve client identity
-    // sources, then drain/re-establish only their fixed V2 pools.
+    // The replacement alone receives a new-root leaf while every member has
+    // already published old+new trust. Exactly the four clients pinned to
+    // that member move to new-root-only trust; the other eight stay
+    // old-root-only and continue to use their old-root server leaves.
     fleet.transition_member(
         replacement,
-        CredentialGeneration::RenewedLeaf,
-        TrustGeneration::OldOnly,
-        "v2-batch-post-measurement-projected-svid-rotation",
+        CredentialGeneration::NewRoot,
+        TrustGeneration::Overlap,
+        "v2-batch-replacement-new-root-overlap",
     );
-    for (sender, identity) in identity_senders.iter().zip(&consumer_identities) {
+    let new_only_client_indices = (0..clients.len())
+        .filter(|client_index| client_index % MEMBER_COUNT == replacement)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        new_only_client_indices.len(),
+        V2_BATCH_RELEASE_GATE_CLIENTS / MEMBER_COUNT,
+        "exactly four fixed V2 clients are routed to the replacement member"
+    );
+    let rotation_before = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    for (client_index, ((sender, identity), client)) in identity_senders
+        .iter()
+        .zip(&consumer_identities)
+        .zip(&clients)
+        .enumerate()
+    {
+        let trust_generation = if client_index % MEMBER_COUNT == replacement {
+            TrustGeneration::NewOnly
+        } else {
+            TrustGeneration::OldOnly
+        };
         sender
-            .send(Some(fleet.pki.consumer_identity_state(identity)))
+            .send(Some(fleet.pki.consumer_identity_state_with_trust(
+                identity,
+                trust_generation,
+            )))
             .expect("live V2 client identity source remains subscribed");
-    }
-    for client in &clients {
         client
             .request_reauthentication()
             .expect("request fixed V2 pool credential drain");
     }
-    runtime.block_on(async {
+    let refreshed_status_samples = runtime.block_on(async {
         futures_util::future::join_all(clients.iter().map(|client| async {
             client
                 .prewarm_v2()
@@ -10705,14 +10834,79 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             )
             .await
         }))
-        .await;
+        .await
     });
+    assert_eq!(
+        refreshed_status_samples.len(),
+        V2_BATCH_RELEASE_GATE_CLIENTS,
+        "every original fixed V2 client completed an exact post-rotation status request"
+    );
+    let rotation_refreshed = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    for client_index in &new_only_client_indices {
+        let before = rotation_before[*client_index];
+        let after = rotation_refreshed[*client_index];
+        assert!(
+            after.setup_successes
+                >= before
+                    .setup_successes
+                    .saturating_add(V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64),
+            "each replacement-routed new-only client must authenticate four fresh new-root credential lanes"
+        );
+        assert_eq!(after.active, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64);
+        assert_eq!(after.idle, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64);
+    }
 
-    let (delayed_identity_source, delayed_identity_receiver) = watch::channel(Some(
-        fleet
-            .pki
-            .consumer_identity_state(&consumer_identities[replacement]),
-    ));
+    // A new-only client can refresh successfully only through the replacement
+    // new-root leaf. A separately routed old-leaf probe must never publish a
+    // usable lane, so this proof cannot be satisfied by stale old-root TLS.
+    let old_root_node = (0..MEMBER_COUNT)
+        .find(|node_index| *node_index != replacement)
+        .expect("one nonreplacement old-root member");
+    let (old_leaf_identity_source, old_leaf_identity_receiver) =
+        watch::channel(Some(fleet.pki.consumer_identity_state_with_trust(
+            &consumer_identities[old_root_node],
+            TrustGeneration::NewOnly,
+        )));
+    let old_leaf_tls = TlsConfigBuilder::new(old_leaf_identity_receiver)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("new-only old-leaf rejection client mTLS configuration");
+    let old_leaf_endpoint = endpoints
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[old_root_node];
+    let old_leaf_stateless = StatelessSessionConsumerClient::new(
+        old_leaf_endpoint,
+        rustls_pki_types::ServerName::IpAddress(old_leaf_endpoint.ip().into()),
+        SpiffeId::new(spiffe_id(old_root_node))
+            .expect("old-leaf rejection exact server SPIFFE identity"),
+        scope,
+        old_leaf_tls,
+    );
+    let old_leaf_client =
+        PersistentSessionConsumerClient::try_from_stateless(old_leaf_stateless, pool_config)
+            .expect("bounded new-only old-leaf rejection client");
+    assert!(
+        runtime.block_on(old_leaf_client.prewarm_v2()).is_err(),
+        "new-only trust must not establish a refreshed V2 lane against an old-root server leaf"
+    );
+    let old_leaf_diagnostics = old_leaf_client.v2_diagnostics();
+    assert!(old_leaf_diagnostics.setup_attempts > 0);
+    assert_eq!(
+        old_leaf_diagnostics.setup_attempts, old_leaf_diagnostics.setup_failures,
+        "old-root server leaf rejection cannot publish a new-only V2 lane"
+    );
+    assert_eq!(old_leaf_diagnostics.setup_successes, 0);
+    runtime.block_on(old_leaf_client.shutdown());
+    drop(old_leaf_identity_source);
+
+    let (delayed_identity_source, delayed_identity_receiver) =
+        watch::channel(Some(fleet.pki.consumer_identity_state_with_trust(
+            &consumer_identities[replacement],
+            TrustGeneration::NewOnly,
+        )));
     let delayed_tls = TlsConfigBuilder::new(delayed_identity_receiver)
         .allow_any_trusted_peer()
         .build_authenticated_client_config()
@@ -10742,6 +10936,29 @@ fn run_persistent_consumer_v2_batch_release_gate() {
     runtime
         .block_on(delayed_client.prewarm_v2())
         .expect("prewarm the delayed-response V2 batch client");
+    let delayed_prewarmed_diagnostics = delayed_client.v2_diagnostics();
+    assert_eq!(
+        delayed_prewarmed_diagnostics.setup_successes,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        "the supplemental delayed probe opens its declared four lanes"
+    );
+    assert_eq!(
+        delayed_prewarmed_diagnostics.active, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        "the supplemental delayed probe owns exactly four authenticated lanes"
+    );
+    let original_active_lanes = clients
+        .iter()
+        .map(|client| client.v2_diagnostics().active)
+        .sum::<u64>();
+    assert_eq!(
+        original_active_lanes, configured_connections,
+        "the original twelve fixed clients retain their 48 authenticated lanes during the delayed probe"
+    );
+    assert_eq!(
+        original_active_lanes + delayed_prewarmed_diagnostics.active,
+        configured_connections + V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        "the delayed probe raises the observed authenticated-lane high-water from 48 to 52"
+    );
     fleet.arm_stateless_consumer_delayed_response(replacement);
     let ambiguous_requests = runtime.block_on(qualification_build_v2_batches(
         MEMBER_COUNT,
@@ -10770,6 +10987,14 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         },
         "ambiguity retains every ordered complete V2 ID and forbids replay"
     );
+    let delayed_after_ambiguity = delayed_client.v2_diagnostics();
+    assert_eq!(
+        delayed_after_ambiguity.setup_attempts,
+        delayed_after_ambiguity.setup_successes + delayed_after_ambiguity.setup_failures,
+        "the supplemental delayed probe accounts for every physical lane setup"
+    );
+    assert_eq!(delayed_after_ambiguity.pool_wait_current, 0);
+    assert!(delayed_after_ambiguity.pool_wait_max <= V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64);
     runtime.block_on(delayed_client.shutdown());
     drop(delayed_identity_source);
     runtime.block_on(async {
@@ -10804,6 +11029,29 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         configured_connections,
         "recovery drains back to the fixed idle V2 width"
     );
+    for (client_index, (before, after)) in prewarmed.iter().zip(&after_recovery).enumerate() {
+        assert!(
+            after.setup_attempts >= before.setup_attempts
+                && after.setup_failures >= before.setup_failures
+                && after.setup_successes >= before.setup_successes
+                && after.reused >= before.reused
+                && after.reconnects >= before.reconnects,
+            "settled V2 counters are monotonic: client_index={client_index}"
+        );
+        assert_eq!(
+            after.setup_attempts,
+            after.setup_successes + after.setup_failures,
+            "settled V2 setup attempts are accounted exactly: client_index={client_index}"
+        );
+        assert_eq!(
+            after.pool_wait_current, 0,
+            "settled V2 pool has no queued callers: client_index={client_index}"
+        );
+        assert!(
+            after.pool_wait_max <= V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+            "V2 pool queue high-water remains within its configured bound: client_index={client_index}"
+        );
+    }
     assert!(
         after_recovery
             .iter()
@@ -10819,6 +11067,179 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             .sum::<u64>()
             <= configured_connections,
         "one bounded recovery cannot discard more than the fixed V2 lanes"
+    );
+    let original_setup_attempt_delta = after_recovery
+        .iter()
+        .zip(&prewarmed)
+        .map(|(after, before)| after.setup_attempts - before.setup_attempts)
+        .sum::<u64>();
+    let original_setup_failure_delta = after_recovery
+        .iter()
+        .zip(&prewarmed)
+        .map(|(after, before)| after.setup_failures - before.setup_failures)
+        .sum::<u64>();
+    let original_setup_success_delta = after_recovery
+        .iter()
+        .zip(&prewarmed)
+        .map(|(after, before)| after.setup_successes - before.setup_successes)
+        .sum::<u64>();
+    let supplemental_setup_attempt_delta = delayed_after_ambiguity
+        .setup_attempts
+        .saturating_add(old_leaf_diagnostics.setup_attempts);
+    let supplemental_setup_failure_delta = delayed_after_ambiguity
+        .setup_failures
+        .saturating_add(old_leaf_diagnostics.setup_failures);
+    let supplemental_setup_success_delta = delayed_after_ambiguity
+        .setup_successes
+        .saturating_add(old_leaf_diagnostics.setup_successes);
+    let setup_attempt_delta =
+        original_setup_attempt_delta.saturating_add(supplemental_setup_attempt_delta);
+    let setup_failure_delta =
+        original_setup_failure_delta.saturating_add(supplemental_setup_failure_delta);
+    let setup_success_delta =
+        original_setup_success_delta.saturating_add(supplemental_setup_success_delta);
+    assert_eq!(
+        setup_attempt_delta,
+        setup_success_delta + setup_failure_delta,
+        "release-gate setup deltas conserve every physical V2 lane attempt"
+    );
+    let (settled_resources, _) =
+        fleet.wait_for_resources_to_settle(&process_ids, &warmed_resources);
+    let resource_high_water = resource_sampler.finish();
+    assert_process_resource_bounds(
+        MEMBER_COUNT,
+        &warmed_resources,
+        &resource_high_water,
+        &settled_resources,
+    );
+    let resources = warmed_resources
+        .iter()
+        .zip(&resource_high_water)
+        .zip(&settled_resources)
+        .enumerate()
+        .map(|(node_index, ((warmed, high_water), settled))| {
+            serde_json::json!({
+                "member_index": node_index,
+                "warmed": {
+                    "file_descriptors": warmed.file_descriptors,
+                    "tasks": warmed.threads,
+                    "vm_rss_kib": warmed.vm_rss_kib,
+                    "vm_hwm_kib": warmed.vm_hwm_kib,
+                },
+                "high_water": {
+                    "samples": high_water.samples,
+                    "file_descriptors": high_water.file_descriptors,
+                    "tasks": high_water.threads,
+                    "vm_rss_kib": high_water.vm_rss_kib,
+                    "vm_hwm_kib": high_water.vm_hwm_kib,
+                },
+                "settled": {
+                    "file_descriptors": settled.file_descriptors,
+                    "tasks": settled.threads,
+                    "vm_rss_kib": settled.vm_rss_kib,
+                    "vm_hwm_kib": settled.vm_hwm_kib,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let pool_wait_max = after_recovery
+        .iter()
+        .map(|diagnostics| diagnostics.pool_wait_max)
+        .max()
+        .expect("fixed V2 client set is nonempty");
+    let evidence = serde_json::json!({
+        "schema_version": "opc-session-v2-batch-release-gate-evidence/v1",
+        "execution_profile": {
+            "cargo_profile": "release",
+            "opt_level": "3",
+            "debug_assertions": false,
+        },
+        "transport": {
+            "mode": "projected_svid_mtls_pinned_loopback",
+            "members": MEMBER_COUNT,
+            "clients": V2_BATCH_RELEASE_GATE_CLIENTS,
+            "lanes_per_client": V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+            "original_authenticated_lanes": configured_connections,
+            "supplemental_delayed_probe_authenticated_lanes": delayed_prewarmed_diagnostics.active,
+            "authenticated_lanes_high_water": configured_connections + delayed_prewarmed_diagnostics.active,
+            "max_in_flight_calls_per_client": V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+            "max_in_flight_calls_global": V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
+        },
+        "load": {
+            "logical_operations_per_second": V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND,
+            "logical_operations_per_second_is_not_concurrency": true,
+            "preload_create_operations": V2_BATCH_RELEASE_GATE_PRELOAD_CREATES,
+            "paced_mutation_operations": V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+            "warm_status_samples": V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES,
+            "mutation_call_samples": mutation_batch_count,
+        },
+        "latency_microseconds": {
+            "warm_p99": warm_p99.as_micros(),
+            "warm_p999": warm_p999.as_micros(),
+            "mutation_p99": mutation_p99.as_micros(),
+            "mutation_p999": mutation_p999.as_micros(),
+        },
+        "scheduler": {
+            "max_in_flight_calls_per_client": mutation_max_in_flight_per_client,
+            "max_in_flight_calls_global": mutation_max_global_in_flight,
+            "not_transmitted_retries": mutation_not_transmitted_retries,
+            "not_transmitted_retries_per_call_high_water": mutation_not_transmitted_retry_high_water,
+            "typed_read_unavailable_retries": mutation_typed_read_unavailable_retries,
+            "typed_read_unavailable_retries_per_call_high_water": mutation_typed_read_unavailable_retry_high_water,
+        },
+        "setup_counter_deltas": {
+            "original_fixed_pools": {
+                "attempts": original_setup_attempt_delta,
+                "failures": original_setup_failure_delta,
+                "successes": original_setup_success_delta,
+            },
+            "supplemental_delayed_and_rejection_probes": {
+                "attempts": supplemental_setup_attempt_delta,
+                "failures": supplemental_setup_failure_delta,
+                "successes": supplemental_setup_success_delta,
+            },
+            "total": {
+                "attempts": setup_attempt_delta,
+                "failures": setup_failure_delta,
+                "successes": setup_success_delta,
+            },
+        },
+        "client_pool": {
+            "wait_current_at_settled": 0,
+            "wait_max": pool_wait_max,
+            "wait_bound": V2_BATCH_RELEASE_GATE_PENDING_CALLS,
+        },
+        "server_queue_high_water": {
+            "measured": false,
+            "exclusion": "server queue high-water is not exposed by this qualification harness",
+        },
+        "rotation": {
+            "all_members_initial_overlap": true,
+            "replacement_new_root_overlap": true,
+            "new_only_clients_routed_to_replacement": new_only_client_indices.len(),
+            "other_clients_old_only": V2_BATCH_RELEASE_GATE_CLIENTS - new_only_client_indices.len(),
+            "new_only_clients_present_new_root_credentials": true,
+            "new_root_client_credentials_server_authenticated_by_exact_status": new_only_client_indices.len(),
+            "old_root_server_leaf_rejected_for_new_only_client": true,
+            "delayed_client_new_only": true,
+        },
+        "resources": {
+            "scope": "voter_child_processes_only",
+            "voter_child_processes": resources,
+            "client_process_resources": {
+                "measured": false,
+                "exclusion": "the test-harness process contains persistent clients and requires downstream full-process resource evidence",
+            },
+        },
+        "privacy": {
+            "fixed_labels_only": true,
+            "identity_payloads_recorded": false,
+            "certificate_fingerprints_recorded": false,
+        },
+    });
+    println!(
+        "V2_BATCH_RELEASE_GATE_EVIDENCE {}",
+        serde_json::to_string(&evidence).expect("bounded V2 batch evidence encodes")
     );
     runtime.block_on(async {
         for client in &clients {

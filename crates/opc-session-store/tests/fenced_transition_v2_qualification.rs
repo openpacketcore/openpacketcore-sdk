@@ -141,6 +141,7 @@ async fn collect_next_release_batch(
     latency: &mut ReleaseLatencySamples,
     sessions: &mut [(FencedTransitionV2Request, FencedTransitionOutcome)],
     representatives: &mut Vec<(FencedTransitionV2Request, FencedTransitionOutcome)>,
+    matched_workload_outcomes: &AtomicU64,
 ) -> usize {
     let completion = in_flight
         .join_next()
@@ -172,10 +173,12 @@ async fn collect_next_release_batch(
             "a completed release batch must own every session slot exactly once"
         );
         let outcome = outcome.expect("paced V2 item result");
+        assert_exact_qualified_v2_success(&request, &outcome);
+        matched_workload_outcomes.fetch_add(1, Ordering::Relaxed);
         if successor_first_item && batch_offset == 0 {
             representatives.push((request.clone(), outcome.clone()));
         }
-        sessions[slot].1 = outcome;
+        sessions[slot] = (request, outcome);
     }
     batch_len
 }
@@ -698,6 +701,77 @@ async fn renew_update_request(
     .expect("self-authenticating update request")
 }
 
+/// Validate the semantic result shape in addition to V2's self-authenticating
+/// request/result correlation. The release workload has only create and
+/// renewal-update operations, so accepting another mutation result here would
+/// make the evidence claim false even if its generic response were valid.
+fn assert_exact_qualified_v2_success(
+    request: &FencedTransitionV2Request,
+    outcome: &FencedTransitionOutcome,
+) {
+    assert!(
+        outcome.matches_v2_request(request),
+        "every qualified V2 outcome must match its complete request"
+    );
+    match (request.lease(), request.mutation()) {
+        (FencedTransitionLease::Acquire { .. }, FencedTransitionMutation::Create { record }) => {
+            assert_eq!(outcome.mutation(), FencedTransitionMutationResult::Created);
+            assert_eq!(outcome.committed_generation(), record.generation);
+        }
+        (
+            FencedTransitionLease::Renew { lease: prior, .. },
+            FencedTransitionMutation::Update {
+                expected_generation,
+                record,
+            },
+        ) => {
+            assert_eq!(outcome.mutation(), FencedTransitionMutationResult::Updated);
+            assert_eq!(outcome.lease().key(), prior.key());
+            assert_eq!(outcome.lease().owner(), prior.owner());
+            assert_eq!(outcome.lease().fence(), prior.fence());
+            assert_eq!(outcome.lease().acquired_at(), prior.acquired_at());
+            assert_eq!(outcome.lease().credential_id(), prior.credential_id());
+            assert_eq!(
+                record.generation,
+                expected_generation
+                    .next()
+                    .expect("qualified update generation has headroom")
+            );
+            assert_eq!(outcome.committed_generation(), record.generation);
+        }
+        _ => panic!("the release qualification admits only create and renewal-update results"),
+    }
+}
+
+fn assert_exact_qualified_update_request(
+    previous: &FencedTransitionOutcome,
+    request: &FencedTransitionV2Request,
+) {
+    match (request.lease(), request.mutation()) {
+        (
+            FencedTransitionLease::Renew { lease, .. },
+            FencedTransitionMutation::Update {
+                expected_generation,
+                record,
+            },
+        ) => {
+            assert_eq!(lease, previous.lease());
+            assert_eq!(*expected_generation, previous.committed_generation());
+            assert_eq!(record.key, *previous.lease().key());
+            assert_eq!(record.owner, *previous.lease().owner());
+            assert_eq!(record.fence, previous.lease().fence());
+            assert_eq!(
+                record.generation,
+                previous
+                    .committed_generation()
+                    .next()
+                    .expect("qualified prior generation has headroom")
+            );
+        }
+        _ => panic!("qualified update request must renew the exact prior outcome"),
+    }
+}
+
 fn request_with_changed_body(request: &FencedTransitionV2Request) -> FencedTransitionV2Request {
     let mut encoded = serde_json::to_value(request).expect("serialize retained V2 request");
     let mutation = encoded
@@ -812,6 +886,7 @@ async fn fixed_quorum_first_v2_transition_activates_and_applies_on_every_voter()
         outcome.mutation(),
         FencedTransitionMutationResult::Created
     ));
+    assert_exact_qualified_v2_success(&transition, &outcome);
 
     for voter in &stores {
         let history = voter
@@ -894,6 +969,9 @@ async fn fixed_quorum_v2_batch_preserves_input_order_and_independent_statuses() 
         renewal_outcome.mutation(),
         FencedTransitionMutationResult::Updated
     ));
+    assert_exact_qualified_v2_success(&first_request, &first_outcome);
+    assert_exact_qualified_v2_success(&second_request, &second_outcome);
+    assert_exact_qualified_v2_success(&renewal_request, &renewal_outcome);
 
     for voter in &stores {
         let history = voter
@@ -1829,6 +1907,16 @@ fn release_qualification_build_profile_validation_matrix() {
     );
 }
 
+#[test]
+fn release_qualification_dimensions_are_fixed() {
+    assert_eq!(QUALIFICATION_SESSIONS, 50_000);
+    assert_eq!(QUALIFICATION_SUSTAINED_TRANSITIONS, 900_000);
+    assert_eq!(QUALIFICATION_BURST_TRANSITIONS, 60_000);
+    assert_eq!(QUALIFICATION_RELEASE_TRANSITIONS, 1_010_000);
+    assert_eq!(QUALIFICATION_HEADROOM_TRANSITIONS, 31_072);
+    assert_eq!(QUALIFICATION_IN_FLIGHT_CLIENTS, 8);
+}
+
 /// Full SDK-702 release workload through a real three-voter OpenRaft quorum.
 ///
 /// This is intentionally ignored: it submits the real 1,010,000 operations
@@ -1852,6 +1940,8 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         fixed_cluster(directory.path(), clock.clone()).await;
     let provider = sealing_provider();
     let transient_retries = Arc::new(AtomicU64::new(0));
+    let matched_workload_outcomes = Arc::new(AtomicU64::new(0));
+    let matched_reclaim_outcomes = AtomicU64::new(0);
     let first_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
 
     assert_eq!(
@@ -1896,6 +1986,8 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
     })
     .await
     .expect("singleton V2 activation");
+    assert_exact_qualified_v2_success(&first_request, &first_outcome);
+    matched_workload_outcomes.fetch_add(1, Ordering::Relaxed);
     let mut sessions = vec![(first_request, first_outcome)];
     for chunk_start in (1..QUALIFICATION_SESSIONS).step_by(QUALIFICATION_PRELOAD_BATCH_OPERATIONS) {
         let chunk_end =
@@ -1927,10 +2019,8 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         assert_eq!(outcomes.len(), requests.len());
         for (request, outcome) in requests.into_iter().zip(outcomes) {
             let outcome = outcome.expect("preload item result");
-            assert!(matches!(
-                outcome.mutation(),
-                FencedTransitionMutationResult::Created
-            ));
+            assert_exact_qualified_v2_success(&request, &outcome);
+            matched_workload_outcomes.fetch_add(1, Ordering::Relaxed);
             sessions.push((request, outcome));
         }
     }
@@ -2011,14 +2101,13 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
                         .expect("pre-floor representative status"),
                         FencedTransitionV2Status::Recorded(result) if result.as_ref() == &Ok(outcome.clone())
                     ));
-                    assert_eq!(
-                        retry_exact_consensus_operation(&transient_retries, || {
-                            stores[leader].fenced_transition_v2(request.clone())
-                        })
-                        .await
-                        .expect("pre-floor exact replay"),
-                        *outcome
-                    );
+                    let replay = retry_exact_consensus_operation(&transient_retries, || {
+                        stores[leader].fenced_transition_v2(request.clone())
+                    })
+                    .await
+                    .expect("pre-floor exact replay");
+                    assert_exact_qualified_v2_success(request, &replay);
+                    assert_eq!(replay, *outcome);
                     let changed = request_with_changed_body(request);
                     assert_eq!(
                         retry_exact_consensus_operation(&transient_retries, || {
@@ -2068,6 +2157,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
                     let update =
                         renew_update_request(nonce, active_epoch, &sessions[slot].1, &provider)
                             .await;
+                    assert_exact_qualified_update_request(&sessions[slot].1, &update);
                     requests.push(update);
                     session_slots.push(slot);
                     nonce += 1;
@@ -2102,6 +2192,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
                 &mut latency,
                 &mut sessions,
                 &mut representatives,
+                &matched_workload_outcomes,
             )
             .await;
             active_entries += batch_len;
@@ -2140,6 +2231,11 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         "the paced workload must use exactly its declared 1,010,000 unique V2 IDs"
     );
     assert_eq!(sessions.len(), QUALIFICATION_SESSIONS);
+    assert_eq!(
+        matched_workload_outcomes.load(Ordering::Relaxed),
+        QUALIFICATION_RELEASE_TRANSITIONS as u64,
+        "every declared workload result must match its exact request and expected mutation"
+    );
     assert_eq!(rotations, 7, "the 1.01m envelope crosses seven successors");
     let leader = ready_leader(&stores).await;
     let history = retry_exact_consensus_operation(&transient_retries, || {
@@ -2175,14 +2271,13 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
             .expect("restart exact status"),
             FencedTransitionV2Status::Recorded(result) if result.as_ref() == &Ok(outcome.clone())
         ));
-        assert_eq!(
-            retry_exact_consensus_operation(&transient_retries, || {
-                stores[leader].fenced_transition_v2(request.clone())
-            })
-            .await
-            .expect("restart exact replay"),
-            *outcome
-        );
+        let replay = retry_exact_consensus_operation(&transient_retries, || {
+            stores[leader].fenced_transition_v2(request.clone())
+        })
+        .await
+        .expect("restart exact replay");
+        assert_exact_qualified_v2_success(request, &replay);
+        assert_eq!(replay, *outcome);
         let changed = request_with_changed_body(request);
         assert_eq!(
             retry_exact_consensus_operation(&transient_retries, || {
@@ -2193,6 +2288,46 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
             FencedTransitionV2Status::RequestConflict
         );
     }
+
+    // The eight epoch representatives above prove retained replay and
+    // conflict classification. Independently sweep the newest request and
+    // result for every active session through only public read surfaces. This
+    // binds the final 50,000 receipts to their exact request bodies and proves
+    // that the corresponding live record/fence survived the durable restart.
+    // These reads occur after the timed 1.01m mutation workload and are not
+    // counted as release operations.
+    let active_integrity_pairs = futures_util::stream::iter(&sessions)
+        .map(|(request, outcome)| {
+            let transient_retries = Arc::clone(&transient_retries);
+            let store = &stores[leader];
+            async move {
+                assert!(matches!(
+                    retry_exact_consensus_operation(&transient_retries, || {
+                        store.fenced_transition_v2_status(request)
+                    })
+                    .await
+                    .expect("restart latest-session exact status"),
+                    FencedTransitionV2Status::Recorded(result)
+                        if result.as_ref() == &Ok(outcome.clone())
+                ));
+                let observation = retry_exact_consensus_operation(&transient_retries, || {
+                    store.observe_fenced_transition(request.lease().key())
+                })
+                .await
+                .expect("restart latest-session public record observation");
+                let expected_record = request
+                    .mutation()
+                    .record()
+                    .expect("latest active request carries its committed record");
+                assert_eq!(observation.record(), Some(expected_record));
+                assert_eq!(observation.current_fence(), expected_record.fence);
+                assert_eq!(observation.current_fence(), outcome.lease().fence());
+            }
+        })
+        .buffer_unordered(QUALIFICATION_IN_FLIGHT_CLIENTS)
+        .count()
+        .await;
+    assert_eq!(active_integrity_pairs, QUALIFICATION_SESSIONS);
 
     let database_bytes_before_reclaim_by_voter = database_paths
         .iter()
@@ -2307,6 +2442,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
     let active_slot = nonce % sessions.len();
     let active_update =
         renew_update_request(nonce, epoch_eight, &sessions[active_slot].1, &provider).await;
+    assert_exact_qualified_update_request(&sessions[active_slot].1, &active_update);
     let active_outcome = retry_exact_consensus_operation(&transient_retries, || {
         stores[leader].fenced_transition_v2_batch(vec![active_update.clone()])
     })
@@ -2316,7 +2452,42 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
     .next()
     .expect("one active batch outcome")
     .expect("active batch item result");
-    sessions[active_slot].1 = active_outcome;
+    assert_exact_qualified_v2_success(&active_update, &active_outcome);
+    matched_reclaim_outcomes.fetch_add(1, Ordering::Relaxed);
+    sessions[active_slot] = (active_update.clone(), active_outcome.clone());
+    let active_status = retry_exact_consensus_operation(&transient_retries, || {
+        stores[leader].fenced_transition_v2_status(&active_update)
+    })
+    .await
+    .expect("active reclaim-time exact receipt status");
+    assert!(matches!(
+        active_status,
+        FencedTransitionV2Status::Recorded(result)
+            if result
+                .as_ref()
+                .as_ref()
+                .is_ok_and(|outcome| outcome.matches_v2_request(&active_update))
+    ));
+    let active_observation = retry_exact_consensus_operation(&transient_retries, || {
+        stores[leader].observe_fenced_transition(active_update.lease().key())
+    })
+    .await
+    .expect("active reclaim-time public record observation");
+    let active_record = active_observation
+        .record()
+        .expect("active reclaim-time record remains present");
+    assert_eq!(
+        active_record,
+        active_update
+            .mutation()
+            .record()
+            .expect("active reclaim-time update carries its replacement record")
+    );
+    assert_eq!(
+        matched_reclaim_outcomes.load(Ordering::Relaxed),
+        1,
+        "the reclaim-time write is separately counted from the 1.01m workload"
+    );
     let during_reclaim = retry_exact_consensus_operation(&transient_retries, || {
         stores[leader].fenced_transition_v2_history_state()
     })
@@ -2345,13 +2516,18 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         .collect::<Vec<_>>();
     let peak_rss_kib = process_peak_rss_kib();
     eprintln!(
-        "sdk-702 successor qualification: cargo_profile_family={} cargo_opt_level={} debug_assertions={} elapsed_ms={} topology_voters={} release_operations_committed={} active_reclaim_operations_committed=1 total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
+        "sdk-702 successor qualification: cargo_profile_family={} cargo_opt_level={} debug_assertions={} elapsed_ms={} topology_voters={} release_operations_committed={} matched_workload_outcomes={} operational_headroom_transitions={} active_integrity_receipts={} active_integrity_records={} active_reclaim_operations_committed=1 matched_reclaim_outcomes={} total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
         build_profile.cargo_profile_family,
         build_profile.cargo_opt_level,
         build_profile.debug_assertions,
         started.elapsed().as_millis(),
         stores.len(),
         QUALIFICATION_RELEASE_TRANSITIONS,
+        matched_workload_outcomes.load(Ordering::Relaxed),
+        QUALIFICATION_HEADROOM_TRANSITIONS,
+        active_integrity_pairs,
+        active_integrity_pairs,
+        matched_reclaim_outcomes.load(Ordering::Relaxed),
         QUALIFICATION_RELEASE_TRANSITIONS + 1,
         rotations,
         FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES,

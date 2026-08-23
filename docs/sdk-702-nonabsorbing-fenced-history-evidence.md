@@ -20,8 +20,9 @@ Required qualification coverage is:
   successor rotations, with one active plus seven replay epochs, exact
   history state/counters, and 31,072-entry per-epoch headroom observed;
 - at the eight-epoch bound, deterministic refusal to open a ninth epoch,
-  ordered reclamation of only the oldest eligible replay epoch, and continued
-  writes through the existing active epoch during every reclaim batch;
+  ordered reclamation of only the oldest eligible replay epoch in exactly two
+  observed 1,024-row batches, and one intervening write through the existing
+  active epoch;
 - delayed old retries before, during, and after replicated retirement: exact
   old body is `Retired`, an old full ID with a changed body is conflict, and
   neither executes;
@@ -74,14 +75,11 @@ eight-epoch/1,010,000-operation check is intentionally part of release
 qualification rather than being silently reduced.
 
 `fenced_transition_v2_qualification::sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity`
-is retained only as the historical reclaim-then-successor three-voter
-artifact. It performed 131,074 unique attempts through Openraft and SQLite apply: 131,072
-admitted into epoch 1, one deterministic one-over rejection, and one
-successor-epoch commit after all 131,072 bindings were reclaimed in ordered
-1,024-row batches. It does not prove
-the current active-plus-seven-replay lifecycle; the successor-scale release
-gate below is authoritative for that contract. Current immediate rotation
-while a replay slot remains free is separate focused evidence from
+is retained only as a superseded, excluded historical reclaim-then-successor
+three-voter artifact. Its former 128-batch reclamation result is not release
+qualification evidence and is not used for the current lifecycle claim. The
+successor-scale release gate below is authoritative for that contract. Current
+immediate rotation while a replay slot remains free is separate focused evidence from
 `fenced_transition_v2_capacity_opens_successor_and_bounds_eight_exact_epochs`;
 it is not attributed retroactively to the historical `cc9ac896` run.
 
@@ -125,8 +123,10 @@ results are never classified as transient.
 
 The continuation makes these linearized assertions, not merely observes row
 counts: the first reclaim command advances only the oldest closed epoch's
-floor, and every ordered 1,024-row batch preserves the existing active epoch.
-A fresh request in that active epoch executes during reclamation. A request
+floor, then the harness performs exactly one active-epoch write, then one
+second reclaim command advances the same oldest epoch by a second ordered
+1,024-row batch. It does not claim completion of the historical 128-batch
+physical reclamation sequence. A request
 for the not-yet-opened immediate successor reports
 `FencedTransitionV2Status::EpochNotActive` until reclamation frees a slot and a
 separate full-active maintenance rotation opens it. The delayed old full-ID
@@ -194,14 +194,15 @@ ACTUAL (passed, focused evidence):
   snapshot-install/reclaim/profile/topology cases listed above: passed in their
   owning source suites.
 
-ACTUAL (passed, release scale at `cc9ac896858d64bc6f6a5424b094fb361a57caea`,
-tree `fbccc8fd5546c6bdefc6aee54bfe0d36b1012f63`):
+EXCLUDED historical artifact (not release-scale or current reclaim evidence; at
+`cc9ac896858d64bc6f6a5424b094fb361a57caea`, tree
+`fbccc8fd5546c6bdefc6aee54bfe0d36b1012f63`):
   cargo test --locked -p opc-session-store --test fenced_transition_v2_qualification --all-features sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity -- --ignored --exact --nocapture
   unique transition attempts: 131,074
   committed unique transitions: 131,073
   epoch-1 bindings admitted: 131,072
   deterministic one-over rejections without business-state effect: 1
-  reclaimed bindings: 131,072 in ordered 1,024-row batches
+  reported reclaimed bindings: 131,072 in ordered 1,024-row batches (128 batches; superseded/excluded)
   successor-epoch transitions committed after reclamation: 1
   transient exact-ID/body retries: 2,214
   database envelope: 2,182,756,256 bytes
@@ -214,7 +215,7 @@ tree `fbccc8fd5546c6bdefc6aee54bfe0d36b1012f63`):
   process exit: 0
 ```
 
-The complete 33-line output is retained on PR #704. Its 1,601 bytes have
+The complete 33-line historical output is retained on PR #704. Its 1,601 bytes have
 SHA-256 `910c98af114164cbee5ce740fab69708aef4f0713d6db847280c6af44040afe4`.
 The database and snapshot measurements are envelope sizes, not steady-state
 resident memory and not a production sizing recommendation. They bound this
@@ -238,14 +239,18 @@ cargo test --locked --release -p opc-session-store --test fenced_transition_v2_q
   -- --ignored --exact --nocapture
 ```
 
-The optimized Cargo `release` profile is part of the evidence contract. The
-test fails closed before allocating voter state when `debug_assertions` are
-enabled, and its fixed-dimension phase and final summaries record
-`cargo_profile=release`. Default unoptimized test-profile output is diagnostic
-only and cannot qualify the performance gate.
+The optimized Cargo `release` profile is part of the evidence contract: its
+actual required values are `cargo_profile_family=release`,
+`cargo_opt_level=3`, and `debug_assertions=false`. The test fails closed before
+allocating voter state when those values are not present, and its fixed-
+dimension phase and final summaries record all three. Default unoptimized
+test-profile output is diagnostic only and cannot qualify the performance gate.
 
 `release_1010000_operation_successor_scale_is_bounded_and_recoverable` opens
-three real fixed durable-quorum OpenRaft voters backed by SQLite. It submits
+three real fixed durable-quorum OpenRaft voters backed by SQLite through
+in-process `ScopedLoopbackPeer` links. Its client `JoinSet` has exactly eight
+task slots, matching durable proposal admission; those slots are unjoined
+client tasks, not a claim about simultaneous consensus calls. It submits
 exactly 1,010,000 public V2 operations: a 50,000-session create preload,
 500 operations/second pacing for 30 minutes, and 1,000 operations/second
 pacing for 60 seconds. The first activation uses the existing singleton V2
@@ -265,8 +270,14 @@ after a batch task is submitted: batch task slots not yet joined, including a
 task that may already have completed. It remains no greater than production
 proposal admission, but does not measure simultaneously executing consensus
 calls.
-The 1,010,000-ID workload is followed by one separately reported fresh active
-epoch write during reclaim, which is lifecycle evidence rather than paced-load
+Every preload, paced collector, and singleton result must match its complete
+request through `outcome.matches_v2_request`, with create/renewal-update
+semantics and prior lease guard/generation checked where applicable. The
+harness retains the newest exact request and outcome for each of the 50,000
+sessions rather than retaining only the result. The final counter must report
+exactly `matched_workload_outcomes=1010000`. The workload is followed by one
+separately reported fresh active-epoch write during reclaim, with
+`matched_reclaim_outcomes=1`; it is lifecycle evidence rather than paced-load
 traffic.
 
 Before logical time advances, the test crosses seven successor rotations and
@@ -274,14 +285,19 @@ asserts the fixed eight-epoch resource contract (1 writable epoch plus at
 most 7 exact-replay epochs, or 1,048,576 receipt bindings). It attests and
 replays one exact request from every retained epoch, rejects each altered body,
 and restarts all three voters through the public constructors before repeating
-those checks. It then advances the injected shared clock by 24 hours plus one
-second, advances only the oldest floor, verifies the ordered 1,024-row reclaim
-limit, and proves the active successor can still mutate. It retains raw
-bounded-batch and per-item scheduled-to-completion latency samples for each
-paced phase, emits achieved rate and p99/p99.9, and asserts the item p99 is at
-most 25 ms and p99.9 at most 100 ms. It also emits topology, committed count,
-rotations, semantic resource bound, retry count, database bytes, snapshot
-bytes, and elapsed duration.
+those checks. After restart it also sweeps all 50,000 newest active
+request/outcome pairs: public exact status must return the retained outcome and
+public observation must return the exact requested record and committed fence.
+Those 100,000 public reads are integrity evidence outside the timed, mutation-
+only 1,010,000-operation count. It then advances the injected shared clock by
+24 hours plus one second, advances only the oldest floor, verifies exactly two
+ordered 1,024-row reclaim batches with the one intervening active write, and
+proves the active successor can still mutate.
+Individual bounded-batch and per-item scheduled-to-completion latency samples
+stay in memory only while calculating p99/p99.9; the emitted record contains
+their counts and aggregates, not the individual samples. The test also emits
+topology, committed and matched-outcome counts, rotations, semantic resource
+bound, retry count, database bytes, snapshot bytes, and elapsed duration.
 
 The isolated three-voter gate enforces fixed physical regression ceilings in
 addition to the 18,469,617,664-byte semantic receipt bound: each voter may use
@@ -295,10 +311,19 @@ not introduce an SDK quota over unrelated session data in a shared production
 database.
 
 Runtime results are intentionally head-addressed PR evidence rather than
-self-referential source text. Merge requires the PR to identify the exact
-signed frozen head/tree, attach this command's complete raw output and SHA-256,
-and report all offered/achieved rates, raw-sample counts, p99/p99.9 values,
-resource ceilings/measurements, topology, restart/replay/conflict/reclaim
-results, and process exit. No artifact may claim 500/s or 1,000/s,
-latency-SLO compliance, or resource compliance before that exact frozen-head
+self-referential source text. Merge requires the final external record to
+identify the exact signed frozen head/tree; attach this command's complete raw
+output and SHA-256; and report the actual release-profile values, in-process
+`ScopedLoopbackPeer` topology, eight task-slot bound, all offered/achieved
+rates, in-memory sample counts and p99/p99.9 values,
+`matched_workload_outcomes=1010000`, `operational_headroom_transitions=31072`,
+`active_integrity_receipts=50000`, `active_integrity_records=50000`,
+`matched_reclaim_outcomes=1`, resource ceilings/measurements, the complete
+latest-active integrity sweep plus bounded retained-epoch replay scope, exactly
+two 1,024-row reclaim batches with the intervening write,
+restart/replay/conflict results, and process exit. Separate projected-mTLS
+release evidence, if submitted, must state exactly 48 lanes with at most 48
+calls in flight and 1,000 logical operations/second; the latter is a rate, not
+concurrency. No artifact may claim 500/s or 1,000/s, latency-SLO compliance,
+mTLS qualification, or resource compliance before its exact frozen-head
 command completes successfully.

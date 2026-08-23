@@ -35,17 +35,17 @@ use opc_session_store::{
     EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
     FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
-    FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, Generation, LeaseGuard, OwnerId,
-    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
-    PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
-    RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, SessionBackend, SessionConsensusIdentity,
-    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
-    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerOperation,
-    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+    FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2Status,
+    Generation, LeaseGuard, OwnerId, PreparedFencedTransitionJournal,
+    PreparedFencedTransitionJournalKey, PreparedFencedTransitionLookup, QuorumReplicaDescriptor,
+    QuorumTopologyConfig, QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest,
+    SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionConsumerChange, SessionConsumerIdentity, SessionConsumerLeaseError,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
     SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
     SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
     SessionPayloadEncoding, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
@@ -198,6 +198,7 @@ impl GatedReadBarrierPeer {
 
 struct ThreeVoterConsumerFleet {
     manifest: Arc<SessionReplicationManifest>,
+    fixed_durable: bool,
     pki: Arc<TestPki>,
     path_enabled: BTreeMap<(usize, usize), Arc<AtomicBool>>,
     consensus_peers: BTreeMap<(usize, usize), Arc<GatedReadBarrierPeer>>,
@@ -222,6 +223,18 @@ impl Drop for ThreeVoterConsumerFleet {
 
 impl ThreeVoterConsumerFleet {
     async fn start(pki: Arc<TestPki>, read_barrier_delay: Option<Duration>) -> Self {
+        Self::start_with_topology(pki, read_barrier_delay, false).await
+    }
+
+    async fn start_fixed_durable(pki: Arc<TestPki>) -> Self {
+        Self::start_with_topology(pki, None, true).await
+    }
+
+    async fn start_with_topology(
+        pki: Arc<TestPki>,
+        read_barrier_delay: Option<Duration>,
+        fixed_durable: bool,
+    ) -> Self {
         let members = (0..THREE_VOTER_COUNT)
             .map(three_voter_member)
             .collect::<Vec<_>>();
@@ -238,14 +251,31 @@ impl ThreeVoterConsumerFleet {
         );
         let topologies = (0..THREE_VOTER_COUNT)
             .map(|index| {
-                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                let consensus_identity = if fixed_durable {
+                    manifest.fixed_durable_quorum_consensus_identity()
+                } else {
+                    manifest.consensus_identity()
+                };
+                let config = QuorumTopologyConfig::new_consensus(
                     three_voter_replica_id(index),
                     members.clone(),
-                    manifest.consensus_identity(),
-                ))
-                .expect("validate three-voter topology")
+                    consensus_identity,
+                );
+                if fixed_durable {
+                    ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
+                        config,
+                        manifest.placement_policy(),
+                    )
+                    .expect("validate fixed-durable three-voter topology")
+                } else {
+                    ValidatedQuorumTopology::try_from(config)
+                        .expect("validate three-voter topology")
+                }
             })
             .collect::<Vec<_>>();
+        assert!(topologies.iter().all(|topology| {
+            (topology.summary().mode() == QuorumTopologyMode::FixedDurableQuorum) == fixed_durable
+        }));
         let directory = tempfile::tempdir().expect("three-voter fleet directory");
         let backends = (0..THREE_VOTER_COUNT)
             .map(|index| {
@@ -264,9 +294,12 @@ impl ThreeVoterConsumerFleet {
             .collect::<Vec<_>>();
         let mut stores = Vec::with_capacity(THREE_VOTER_COUNT);
         for index in 0..THREE_VOTER_COUNT {
-            let local = manifest
-                .bind_local(three_voter_replica_id(index))
-                .expect("three-voter local consensus binding");
+            let local = if fixed_durable {
+                manifest.bind_fixed_durable_quorum_local(three_voter_replica_id(index))
+            } else {
+                manifest.bind_local(three_voter_replica_id(index))
+            }
+            .expect("three-voter local consensus binding");
             let peers = (0..THREE_VOTER_COUNT)
                 .filter(|target| *target != index)
                 .map(|target| {
@@ -318,7 +351,15 @@ impl ThreeVoterConsumerFleet {
                     (node_id, peer)
                 })
                 .collect::<BTreeMap<_, _>>();
-            stores.push(
+            let store = if fixed_durable {
+                ConsensusSessionStore::open_fixed_durable_quorum(
+                    topologies[index].clone(),
+                    backends[index].clone(),
+                    directory.path().join(format!("snapshots-{index}")),
+                    peers,
+                )
+                .await
+            } else {
                 ConsensusSessionStore::open_with_operation_timeout(
                     topologies[index].clone(),
                     backends[index].clone(),
@@ -327,14 +368,17 @@ impl ThreeVoterConsumerFleet {
                     opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                 )
                 .await
-                .expect("open three-voter consensus store"),
-            );
+            };
+            stores.push(store.expect("open three-voter consensus store"));
         }
         let mut servers = Vec::with_capacity(THREE_VOTER_COUNT);
         for index in 0..THREE_VOTER_COUNT {
-            let binding = manifest
-                .bind_local(three_voter_replica_id(index))
-                .expect("three-voter consensus server binding");
+            let binding = if fixed_durable {
+                manifest.bind_fixed_durable_quorum_local(three_voter_replica_id(index))
+            } else {
+                manifest.bind_local(three_voter_replica_id(index))
+            }
+            .expect("three-voter consensus server binding");
             let (server, address) = SessionConsensusServer::new(
                 stores[index].rpc_handler(),
                 pki.server_config(&three_voter_spiffe(index)),
@@ -355,6 +399,7 @@ impl ThreeVoterConsumerFleet {
         }
         let fleet = Self {
             manifest,
+            fixed_durable,
             pki,
             path_enabled,
             consensus_peers,
@@ -453,10 +498,13 @@ impl ThreeVoterConsumerFleet {
     }
 
     async fn restore(&mut self, node: usize) {
-        let binding = self
-            .manifest
-            .bind_local(three_voter_replica_id(node))
-            .expect("three-voter restored consensus server binding");
+        let binding = if self.fixed_durable {
+            self.manifest
+                .bind_fixed_durable_quorum_local(three_voter_replica_id(node))
+        } else {
+            self.manifest.bind_local(three_voter_replica_id(node))
+        }
+        .expect("three-voter restored consensus server binding");
         let (server, address) = SessionConsensusServer::new(
             self.stores[node].rpc_handler(),
             self.pki.server_config(&three_voter_spiffe(node)),
@@ -539,8 +587,13 @@ impl ThreeVoterConsumerFleet {
             opc_consensus::engine::Vote::new(previous_term, source_id),
             None,
         );
+        let consensus_identity = if self.fixed_durable {
+            self.manifest.fixed_durable_quorum_consensus_identity()
+        } else {
+            self.manifest.consensus_identity()
+        };
         let wire = SessionConsensusWireRequest::try_new(
-            self.manifest.consensus_identity(),
+            consensus_identity,
             source_id,
             opc_session_store::SessionConsensusRpcFamily::Vote,
             opc_consensus::encode_bounded(&request).expect("bounded stale vote probe"),
@@ -639,8 +692,13 @@ impl ThreeVoterConsumerFleet {
                         vote,
                         successor_response.last_log_id,
                     );
+                    let consensus_identity = if self.fixed_durable {
+                        self.manifest.fixed_durable_quorum_consensus_identity()
+                    } else {
+                        self.manifest.consensus_identity()
+                    };
                     let wire = SessionConsensusWireRequest::try_new(
-                        self.manifest.consensus_identity(),
+                        consensus_identity,
                         successor_id,
                         opc_session_store::SessionConsensusRpcFamily::Vote,
                         opc_consensus::encode_bounded(&request)
@@ -2649,6 +2707,192 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
     );
     persistent.shutdown().await;
     server.abort_and_wait().await;
+}
+
+async fn persistent_three_voter_v2_batch_bootstraps_pristine_quorum(batch_len: usize) {
+    assert!((1..=2).contains(&batch_len));
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable(Arc::clone(&pki)).await;
+    let (leader, _, _) = fleet.observed_leader();
+    let follower = (leader + 1) % THREE_VOTER_COUNT;
+    let server_spiffe = spiffe(&format!("v2-batch-bootstrap-{batch_len}-server"));
+    let client_spiffe = spiffe(&format!("v2-batch-bootstrap-{batch_len}-client"));
+    let manifest = fleet.stores[follower]
+        .consumer_authorization_manifest()
+        .await
+        .expect("pristine V2 batch consumer manifest");
+    let scope = manifest.scope();
+    let authorizer = SessionConsumerAuthorizer::try_new(
+        manifest,
+        [SpiffeId::new(&client_spiffe).expect("pristine V2 batch client SPIFFE")],
+    )
+    .expect("pristine V2 batch consumer authorizer");
+    let (server, address) = SessionQuorumConsumerServer::new(
+        Arc::new(fleet.stores[follower].consumer_service()),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("pristine V2 batch listener"),
+    )
+    .await
+    .expect("start pristine V2 batch listener");
+    let persistent = PersistentSessionConsumerClient::try_from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            Arc::new(move || Box::pin(async move { Ok(address) })),
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            SpiffeId::new(&server_spiffe).expect("pristine V2 batch server SPIFFE"),
+            scope,
+            pki.client_config(&client_spiffe),
+        ),
+        PersistentSessionConsumerConfig::default(),
+    )
+    .expect("persistent pristine V2 batch client");
+    persistent
+        .prewarm_v2()
+        .await
+        .expect("prewarm pristine V2 mTLS lane");
+
+    let provider = CountingKeyProvider::with_active_session_key();
+    let history_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 history epoch");
+    let mut requests = Vec::with_capacity(batch_len);
+    for index in 0..batch_len {
+        let key = SessionKey {
+            tenant: TenantId::new("consumer-test").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from(format!("pristine-v2-batch-{batch_len}-{index}"))
+                .try_into()
+                .expect("bounded V2 batch stable ID"),
+        };
+        let owner = OwnerId::new(format!("v2-batch-bootstrap-{batch_len}-{index}"))
+            .expect("bounded V2 batch owner");
+        let lease = FencedTransitionLease::acquire(
+            key.clone(),
+            owner.clone(),
+            FenceToken::new(0),
+            Duration::from_secs(30),
+        )
+        .expect("pristine V2 batch lease");
+        let mut record = StoredSessionRecord {
+            key,
+            generation: Generation::new(1),
+            owner,
+            fence: lease.committed_fence().expect("pristine V2 batch fence"),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("consumer-v2-batch-bootstrap"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([index as u8]),
+        };
+        record.payload = EncryptedSessionPayload::encrypt(
+            provider.as_ref(),
+            &record,
+            "consumer-v2-batch-bootstrap",
+        )
+        .await
+        .expect("seal pristine V2 batch record");
+        requests.push(
+            FencedTransitionV2Request::new(
+                history_epoch,
+                FencedTransitionV2CallerNonce::from_bytes(
+                    u128::try_from(index + 1)
+                        .expect("bounded V2 batch index")
+                        .to_be_bytes(),
+                ),
+                lease,
+                FencedTransitionMutation::create(record),
+            )
+            .expect("self-authenticating pristine V2 batch request"),
+        );
+    }
+
+    for store in &fleet.stores {
+        let history = store
+            .fenced_transition_v2_history_state()
+            .await
+            .expect("read pristine V2 history");
+        assert_eq!(history.active_epoch(), Some(history_epoch));
+        assert_eq!(history.generation(), 0);
+        assert_eq!(history.bound_entries(), 0);
+        assert_eq!(
+            store
+                .diagnostic_snapshot()
+                .fixed_raw_v2_acceptance_snapshots,
+            0
+        );
+        for request in &requests {
+            assert_eq!(
+                store
+                    .fenced_transition_v2_status(request)
+                    .await
+                    .expect("read pristine exact V2 status"),
+                FencedTransitionV2Status::NotFound
+            );
+        }
+    }
+
+    let request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Batch {
+            requests: requests.clone(),
+        },
+    );
+    let response = persistent
+        .execute_v2(&request)
+        .await
+        .expect("pristine V2 batch has a definitive response");
+    let SessionConsumerV2Response::FencedTransitionV2Batch(Ok(results)) = response else {
+        panic!("pristine V2 batch returns ordered exact results");
+    };
+    assert_eq!(results.len(), requests.len());
+    for (result, request) in results.iter().zip(&requests) {
+        assert_eq!(result.request_id(), request.request_id());
+        assert!(
+            result
+                .result()
+                .as_ref()
+                .is_ok_and(|outcome| outcome.matches_v2_request(request)),
+            "each pristine V2 batch member returns its exact committed outcome"
+        );
+    }
+
+    for store in &fleet.stores {
+        let history = store
+            .fenced_transition_v2_history_state()
+            .await
+            .expect("read activated V2 history from every voter");
+        assert_eq!(history.active_epoch(), Some(history_epoch));
+        for request in &requests {
+            assert!(matches!(
+                store
+                    .fenced_transition_v2_status(request)
+                    .await
+                    .expect("read exact V2 status from every voter"),
+                FencedTransitionV2Status::Recorded(result)
+                    if result
+                        .as_ref()
+                        .as_ref()
+                        .is_ok_and(|outcome| outcome.matches_v2_request(request))
+            ));
+        }
+    }
+
+    persistent.shutdown().await;
+    server.abort_and_wait().await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn persistent_three_voter_v2_single_member_batch_bootstraps_pristine_quorum() {
+    persistent_three_voter_v2_batch_bootstraps_pristine_quorum(1).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn persistent_three_voter_v2_multi_member_batch_bootstraps_pristine_quorum() {
+    persistent_three_voter_v2_batch_bootstraps_pristine_quorum(2).await;
 }
 
 #[tokio::test]

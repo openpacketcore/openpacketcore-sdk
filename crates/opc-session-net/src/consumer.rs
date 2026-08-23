@@ -6581,6 +6581,10 @@ struct PersistentConsumerCounters {
 /// from the revision-4 pool: a V2 outage must not consume V1's finite queue.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct PersistentSessionConsumerV2Diagnostics {
+    /// Physical V2 lane setup attempts, including cancelled attempts.
+    pub setup_attempts: u64,
+    /// Physical V2 lane setup attempts that did not publish a usable lane.
+    pub setup_failures: u64,
     /// Successfully authenticated and admitted V2 lanes.
     pub setup_successes: u64,
     /// Calls served by an already authenticated V2 lane.
@@ -6591,17 +6595,25 @@ pub struct PersistentSessionConsumerV2Diagnostics {
     pub active: u64,
     /// Currently reusable V2 lanes held by the fixed pool.
     pub idle: u64,
+    /// Calls currently waiting for one of the fixed V2 logical lanes.
+    pub pool_wait_current: u64,
+    /// Maximum concurrent V2 logical-lane waiters observed by this pool.
+    pub pool_wait_max: u64,
 }
 
 impl fmt::Debug for PersistentSessionConsumerV2Diagnostics {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PersistentSessionConsumerV2Diagnostics")
+            .field("setup_attempts", &self.setup_attempts)
+            .field("setup_failures", &self.setup_failures)
             .field("setup_successes", &self.setup_successes)
             .field("reused", &self.reused)
             .field("reconnects", &self.reconnects)
             .field("active", &self.active)
             .field("idle", &self.idle)
+            .field("pool_wait_current", &self.pool_wait_current)
+            .field("pool_wait_max", &self.pool_wait_max)
             .finish()
     }
 }
@@ -7417,13 +7429,71 @@ struct PersistentSessionConsumerV2Pool {
     prewarm_final_publication_hook: StdMutex<Option<Arc<PersistentV2PrewarmFinalPublicationHook>>>,
     #[cfg(test)]
     poison_accounting_hook: StdMutex<Option<Arc<PersistentV2PoisonAccountingHook>>>,
+    setup_attempts: AtomicU64,
+    setup_failures: AtomicU64,
     setup_successes: AtomicU64,
     reused: AtomicU64,
     reconnects: AtomicU64,
     active: AtomicU64,
     healthy_active: AtomicU64,
     poisoned: AtomicU64,
+    pool_wait_current: AtomicU64,
+    pool_wait_max: AtomicU64,
+    reconnect_sequence: AtomicU64,
     live_accounting: StdMutex<()>,
+}
+
+/// Cancellation-safe accounting for one complete revision-5 physical setup.
+/// A success is recorded only after the authenticated actor owns both TLS
+/// halves and its command rendezvous can be published to a caller or prewarm.
+struct PersistentV2SetupAttempt<'a> {
+    pool: &'a PersistentSessionConsumerV2Pool,
+    completed: bool,
+}
+
+impl<'a> PersistentV2SetupAttempt<'a> {
+    fn begin(pool: &'a PersistentSessionConsumerV2Pool) -> Self {
+        counter_increment(&pool.setup_attempts);
+        Self {
+            pool,
+            completed: false,
+        }
+    }
+
+    fn succeed(mut self) {
+        counter_increment(&self.pool.setup_successes);
+        self.completed = true;
+    }
+}
+
+impl Drop for PersistentV2SetupAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            counter_increment(&self.pool.setup_failures);
+        }
+    }
+}
+
+/// Cancellation-safe accounting for callers that actually join the bounded
+/// revision-5 logical-lane wait queue. Immediate acquisitions are not queued.
+struct PersistentV2PoolWait<'a> {
+    current: &'a AtomicU64,
+}
+
+impl<'a> PersistentV2PoolWait<'a> {
+    fn begin(pool: &'a PersistentSessionConsumerV2Pool) -> Self {
+        let current = counter_increment(&pool.pool_wait_current);
+        counter_max(&pool.pool_wait_max, current);
+        Self {
+            current: &pool.pool_wait_current,
+        }
+    }
+}
+
+impl Drop for PersistentV2PoolWait<'_> {
+    fn drop(&mut self) {
+        self.current.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 struct PersistentV2Activity {
@@ -7578,6 +7648,27 @@ impl Drop for PersistentV2ActivityLease {
 }
 
 impl PersistentSessionConsumerV2Pool {
+    fn reconnect_delay(&self) -> Duration {
+        let maximum_millis = duration_millis(self.config.reconnect_jitter);
+        let jitter = if maximum_millis == 0 {
+            Duration::ZERO
+        } else {
+            let sequence = self
+                .reconnect_sequence
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            let mixed = sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17)
+                ^ sequence.rotate_right(11);
+            Duration::from_millis(mixed % maximum_millis.saturating_add(1))
+        };
+        self.client
+            .lifecycle_policy
+            .reconnect_backoff_min()
+            .checked_add(jitter)
+            .unwrap_or_else(|| self.client.lifecycle_policy.reconnect_backoff_max())
+            .min(self.client.lifecycle_policy.reconnect_backoff_max())
+    }
+
     fn register_activity(
         self: &Arc<Self>,
         kind: PersistentV2ActivityKind,
@@ -7773,11 +7864,28 @@ impl PersistentSessionConsumerV2Pool {
         } else {
             (pool_wait_deadline, SessionConsumerClientError::Overloaded)
         };
-        let lane = tokio::time::timeout_at(wait_deadline, Arc::clone(&self.lanes).acquire_owned())
-            .await
-            .map_err(|_| late_error)?
-            .map_err(|_| SessionConsumerClientError::ShuttingDown)?;
-        let lane = complete_before_deadline(lane, wait_deadline, late_error)?;
+        if tokio::time::Instant::now() >= wait_deadline {
+            return Err(late_error);
+        }
+        let lane_wait = Arc::clone(&self.lanes).acquire_owned();
+        tokio::pin!(lane_wait);
+        let lane = match lane_wait.as_mut().now_or_never() {
+            Some(result) => complete_before_deadline(
+                result.map_err(|_| SessionConsumerClientError::ShuttingDown)?,
+                wait_deadline,
+                late_error,
+            )?,
+            None => {
+                let wait = PersistentV2PoolWait::begin(self);
+                let lane = tokio::time::timeout_at(wait_deadline, &mut lane_wait)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .ok_or(late_error);
+                drop(wait);
+                complete_before_deadline(lane?, wait_deadline, late_error)?
+            }
+        };
         if self.shutdown.load(Ordering::Acquire) {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
@@ -7788,10 +7896,19 @@ impl PersistentSessionConsumerV2Pool {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
+        self.connect_until_attempts(deadline, self.config.connect_attempts)
+            .await
+    }
+
+    async fn connect_until_attempts(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        connect_attempts: usize,
+    ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
         let mut last_error = SessionConsumerClientError::Unavailable;
         let mut retry_delay = self.client.lifecycle_policy.reconnect_backoff_min();
         let mut forced = self.shutdown_forced_tx.subscribe();
-        for attempt in 0..self.config.connect_attempts {
+        for attempt in 0..connect_attempts {
             let connected = tokio::select! {
                 biased;
                 _ = wait_for_v2_forced_shutdown(&mut forced) => {
@@ -7803,7 +7920,7 @@ impl PersistentSessionConsumerV2Pool {
                 Ok(connection) => return Ok(connection),
                 Err(error) => last_error = error,
             }
-            if attempt.saturating_add(1) >= self.config.connect_attempts
+            if attempt.saturating_add(1) >= connect_attempts
                 || tokio::time::Instant::now() >= deadline
                 || !matches!(
                     last_error,
@@ -7848,6 +7965,7 @@ impl PersistentSessionConsumerV2Pool {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
+        let setup_attempt = PersistentV2SetupAttempt::begin(self);
         if self.shutdown.load(Ordering::Acquire) {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
@@ -8000,7 +8118,6 @@ impl PersistentSessionConsumerV2Pool {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.healthy.store(true, Ordering::Release);
-            counter_increment(&self.setup_successes);
             counter_increment(&self.active);
             counter_increment(&self.healthy_active);
         }
@@ -8025,14 +8142,16 @@ impl PersistentSessionConsumerV2Pool {
             commands: command_rx,
             lifetime: actor_lifetime,
         }));
-        Ok(PersistentV2Connection {
+        let connection = PersistentV2Connection {
             commands,
             idle_deadline: deadline,
             retirement,
             admitted_generation: generation,
             admitted_material_epoch: admission.epoch(),
             state,
-        })
+        };
+        setup_attempt.succeed();
+        Ok(connection)
     }
 
     async fn execute(
@@ -8053,6 +8172,36 @@ impl PersistentSessionConsumerV2Pool {
             .ok_or(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Deadline,
             })?;
+        if matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2Status { .. }
+        ) {
+            return self
+                .execute_fenced_transition_status(request, deadline)
+                .await;
+        }
+        self.execute_classified_before(request, deadline, self.config.connect_attempts)
+            .await
+    }
+
+    /// Execute the exact V2 envelope within a caller-owned absolute deadline.
+    ///
+    /// Mutations use their configured pre-write setup budget once. Immutable
+    /// receipt status is the sole caller that may re-enter this path after an
+    /// authenticated response loss, always with one setup attempt and the
+    /// original deadline.
+    async fn execute_classified_before(
+        self: &Arc<Self>,
+        request: &SessionConsumerV2Request,
+        deadline: tokio::time::Instant,
+        connect_attempts: usize,
+    ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+        let started = tokio::time::Instant::now();
+        if started >= deadline {
+            return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Deadline,
+            });
+        }
         let (_pending, _lane) = self
             .admit_call(started, deadline)
             .await
@@ -8079,9 +8228,13 @@ impl PersistentSessionConsumerV2Pool {
         let (mut connection, fresh) = match connection {
             Some(connection) => (connection, false),
             None => (
-                self.connect_until(self.setup_deadline(started, Some(deadline)).map_err(
-                    |cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause },
-                )?)
+                self.connect_until_attempts(
+                    self.setup_deadline(started, Some(deadline))
+                        .map_err(|cause| {
+                            PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }
+                        })?,
+                    connect_attempts,
+                )
                 .await
                 .map_err(|cause| {
                     PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }
@@ -8162,6 +8315,52 @@ impl PersistentSessionConsumerV2Pool {
             ));
         }
         Ok(response)
+    }
+
+    /// Recover an exact immutable V2 receipt lookup after an unavailable or
+    /// deadline-classified transport loss. The request is never rebuilt, so
+    /// every retry carries the original scope, complete ID, and body.
+    async fn execute_fenced_transition_status(
+        self: &Arc<Self>,
+        request: &SessionConsumerV2Request,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+        let mut attempts = 0_usize;
+        loop {
+            attempts = attempts.saturating_add(1);
+            match self.execute_classified_before(request, deadline, 1).await {
+                Err(error)
+                    if v2_status_retryable_error(&error)
+                        && attempts < self.config.connect_attempts
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    // The outer status loop owns the full bounded budget.
+                    // Each inner execution gets one setup attempt so retry
+                    // bounds cannot multiply across the two layers. Preserve
+                    // the shared reconnect pacing so the bounded retry budget
+                    // cannot run out before resolver/leader convergence.
+                    let delay = self.reconnect_delay();
+                    if !delay.is_zero() {
+                        let mut forced = self.shutdown_forced_tx.subscribe();
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_v2_forced_shutdown(&mut forced) => {
+                                return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                                    cause: SessionConsumerClientError::ShuttingDown,
+                                });
+                            }
+                            _ = tokio::time::sleep_until(
+                                (tokio::time::Instant::now() + delay).min(deadline),
+                            ) => {}
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn prewarm(self: &Arc<Self>) -> Result<(), SessionConsumerClientError> {
@@ -8407,6 +8606,8 @@ impl PersistentSessionConsumerV2Pool {
             self.healthy_active.load(Ordering::Acquire)
         };
         PersistentSessionConsumerV2Diagnostics {
+            setup_attempts: self.setup_attempts.load(Ordering::Relaxed),
+            setup_failures: self.setup_failures.load(Ordering::Relaxed),
             setup_successes: self.setup_successes.load(Ordering::Relaxed),
             reused: self.reused.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
@@ -8424,6 +8625,8 @@ impl PersistentSessionConsumerV2Pool {
                     )
                 })
                 .count() as u64,
+            pool_wait_current: self.pool_wait_current.load(Ordering::Relaxed),
+            pool_wait_max: self.pool_wait_max.load(Ordering::Relaxed),
         }
     }
 
@@ -8475,6 +8678,17 @@ fn v2_persistent_error(
         return PersistentSessionConsumerV2ExecuteError::ReadUnavailable { cause };
     }
     PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }
+}
+
+fn v2_status_retryable_error(error: &PersistentSessionConsumerV2ExecuteError) -> bool {
+    matches!(
+        error,
+        PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable | SessionConsumerClientError::Deadline,
+        } | PersistentSessionConsumerV2ExecuteError::ReadUnavailable {
+            cause: SessionConsumerClientError::Unavailable | SessionConsumerClientError::Deadline,
+        }
+    )
 }
 
 fn v2_outcome_unknown(
@@ -9747,12 +9961,19 @@ impl PersistentSessionConsumerClient {
             prewarm_final_publication_hook: StdMutex::new(None),
             #[cfg(test)]
             poison_accounting_hook: StdMutex::new(None),
+            setup_attempts: AtomicU64::new(0),
+            setup_failures: AtomicU64::new(0),
             setup_successes: AtomicU64::new(0),
             reused: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
             active: AtomicU64::new(0),
             healthy_active: AtomicU64::new(0),
             poisoned: AtomicU64::new(0),
+            pool_wait_current: AtomicU64::new(0),
+            pool_wait_max: AtomicU64::new(0),
+            reconnect_sequence: AtomicU64::new(
+                jitter_seed_high.rotate_left(7) ^ jitter_seed_low.rotate_right(11),
+            ),
             live_accounting: StdMutex::new(()),
         });
         Ok(Self { pool, v2_pool })
@@ -13642,6 +13863,37 @@ mod tests {
         )
     }
 
+    fn v2_status_requests(request: &SessionConsumerV2Request) -> Vec<SessionConsumerV2Request> {
+        let transitions = match request.operation() {
+            SessionConsumerV2Operation::FencedTransitionV2 { request } => {
+                vec![(**request).clone()]
+            }
+            SessionConsumerV2Operation::FencedTransitionV2Batch { requests } => requests.clone(),
+            _ => panic!("test request is a V2 mutation"),
+        };
+        transitions
+            .into_iter()
+            .map(|transition| {
+                SessionConsumerV2Request::new(
+                    scope(),
+                    SessionConsumerV2Operation::FencedTransitionV2Status {
+                        request: Box::new(transition),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn v2_single_status_request(request: &SessionConsumerV2Request) -> SessionConsumerV2Request {
+        let mut statuses = v2_status_requests(request);
+        assert_eq!(
+            statuses.len(),
+            1,
+            "a singleton status helper cannot discard batch members"
+        );
+        statuses.remove(0)
+    }
+
     fn v2_effectful_batch_request(nonces: &[u8]) -> SessionConsumerV2Request {
         let requests = nonces
             .iter()
@@ -14217,6 +14469,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn persistent_v2_status_retry_classification_is_unavailable_deadline_only() {
+        for error in [
+            PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Unavailable,
+            },
+            PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Deadline,
+            },
+            PersistentSessionConsumerV2ExecuteError::ReadUnavailable {
+                cause: SessionConsumerClientError::Unavailable,
+            },
+            PersistentSessionConsumerV2ExecuteError::ReadUnavailable {
+                cause: SessionConsumerClientError::Deadline,
+            },
+        ] {
+            assert!(super::v2_status_retryable_error(&error));
+        }
+        for error in [
+            PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            },
+            PersistentSessionConsumerV2ExecuteError::ReadUnavailable {
+                cause: SessionConsumerClientError::Authentication,
+            },
+            PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Scope,
+            },
+            PersistentSessionConsumerV2ExecuteError::ReadUnavailable {
+                cause: SessionConsumerClientError::Overloaded,
+            },
+        ] {
+            assert!(!super::v2_status_retryable_error(&error));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_v2_status_retry_never_extends_its_original_deadline() {
+        let config = PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+            2,
+            Duration::ZERO,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+        )
+        .expect("two-attempt V2 status retry configuration");
+        let pool = v2_admission_test_pool(config);
+        let request = v2_single_status_request(&v2_effectful_request(0x67));
+        let deadline = tokio::time::Instant::now();
+
+        assert_eq!(
+            pool.execute_fenced_transition_status(&request, deadline)
+                .await,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Deadline,
+            })
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            deadline,
+            "an expired status retry budget cannot allocate a fresh deadline"
+        );
+    }
+
     #[tokio::test]
     async fn revision_five_wire_dispatches_same_full_id_body_conflicts() {
         let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
@@ -14539,6 +14858,297 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_v2_retries_only_exact_status_after_response_loss() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("persistent-v2-status-retry-client");
+        let server_identity = material_spiffe("persistent-v2-status-retry-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let server_material = material.trusted_server_config(server_identity.as_str());
+        let mut listeners = VecDeque::new();
+        for _ in 0..9 {
+            listeners.push_back(
+                TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind persistent V2 status-retry peer"),
+            );
+        }
+        let address = listeners
+            .front()
+            .expect("initial status-retry listener")
+            .local_addr()
+            .expect("persistent V2 status-retry address");
+        let resolved_address = Arc::new(StdMutex::new(address));
+        let singleton = v2_effectful_request(0x68);
+        let batch = v2_effectful_batch_request(&[0x69, 0x6a]);
+        let singleton_status = v2_single_status_request(&singleton);
+        let batch_statuses = v2_status_requests(&batch);
+        assert_eq!(batch_statuses.len(), 2);
+        let effects = Arc::new(AtomicUsize::new(0));
+        let status_dispatches = Arc::new(AtomicUsize::new(0));
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let resolve_attempts = Arc::new(AtomicUsize::new(0));
+        let resolved_routes = Arc::new(StdMutex::new(Vec::new()));
+        let peer = tokio::spawn({
+            let effects = Arc::clone(&effects);
+            let status_dispatches = Arc::clone(&status_dispatches);
+            let accepted_connections = Arc::clone(&accepted_connections);
+            let singleton = singleton.clone();
+            let singleton_status = singleton_status.clone();
+            let batch = batch.clone();
+            let batch_statuses = batch_statuses.clone();
+            let resolved_address = Arc::clone(&resolved_address);
+            async move {
+                let mut expected_calls = Vec::new();
+                for (mutation, statuses) in [
+                    (singleton.clone(), vec![singleton_status.clone()]),
+                    (batch.clone(), batch_statuses.clone()),
+                ] {
+                    expected_calls.push((mutation, false, false));
+                    for status in statuses {
+                        expected_calls.push((status.clone(), true, false));
+                        expected_calls.push((status, true, true));
+                    }
+                }
+                // The final exact status loses its response and its one
+                // remaining outer retry encounters a real setup failure.
+                // There is no third setup attempt under the fixed bound.
+                expected_calls.push((singleton_status, true, false));
+                for (request_expected, status, respond) in expected_calls {
+                    let listener = listeners
+                        .pop_front()
+                        .expect("one listener per mutation/status attempt");
+                    let (tcp, _) = listener
+                        .accept()
+                        .await
+                        .expect("accept persistent V2 status-retry client");
+                    accepted_connections.fetch_add(1, Ordering::SeqCst);
+                    let handshake = server_material
+                        .begin_handshake()
+                        .expect("status-retry server handshake snapshot");
+                    let acceptor = tokio_rustls::TlsAcceptor::from(
+                        super::consumer_server_tls_config(handshake.rustls_config()),
+                    );
+                    let mut tls = acceptor
+                        .accept(tcp)
+                        .await
+                        .expect("complete persistent V2 status-retry TLS");
+                    handshake.admit().expect("admit status-retry TLS peer");
+                    assert!(matches!(
+                        super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                            &mut tls,
+                            super::MAX_NEGOTIATED_FRAME_SIZE,
+                        )
+                        .await
+                        .expect("read persistent V2 status-retry Hello"),
+                        ConsumerV2WireRequest::Hello(_)
+                    ));
+                    super::write_frame_bounded_until(
+                        &mut tls,
+                        &ConsumerV2WireResponse::HelloAck(ConsumerHelloAck {
+                            transport_revision:
+                                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                            scope: scope(),
+                            request_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                                .expect("test V2 frame cap fits u32"),
+                        }),
+                        super::MAX_NEGOTIATED_FRAME_SIZE,
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                    )
+                    .await
+                    .expect("write persistent V2 status-retry HelloAck");
+                    let ConsumerV2WireRequest::Call(ConsumerV2Call {
+                        correlation,
+                        attempt_nonce,
+                        request_commitment,
+                        request,
+                    }) = super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                        &mut tls,
+                        super::MAX_NEGOTIATED_FRAME_SIZE,
+                    )
+                    .await
+                    .expect("read persistent V2 status-retry Call")
+                    else {
+                        panic!("persistent V2 status-retry peer received control after Hello");
+                    };
+                    assert_eq!(*request, request_expected);
+                    if !status {
+                        effects.fetch_add(1, Ordering::SeqCst);
+                        let next_listener = listeners
+                            .front()
+                            .expect("first status listener follows the mutation listener");
+                        *resolved_address
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = next_listener
+                            .local_addr()
+                            .expect("first status-retry listener address");
+                        // The effect was dispatched but its response is
+                        // lost. Closing also simulates a leader handoff.
+                        continue;
+                    }
+                    status_dispatches.fetch_add(1, Ordering::SeqCst);
+                    if !respond {
+                        let next_address = if let Some(next_listener) = listeners.front() {
+                            next_listener
+                                .local_addr()
+                                .expect("replacement status listener address")
+                        } else {
+                            let dead_listener = TcpListener::bind("127.0.0.1:0")
+                                .await
+                                .expect("reserve status-retry setup-failure address");
+                            let dead_address = dead_listener
+                                .local_addr()
+                                .expect("status-retry setup-failure address");
+                            drop(dead_listener);
+                            dead_address
+                        };
+                        *resolved_address
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = next_address;
+                        drop(tls);
+                        continue;
+                    }
+                    if let Some(next_listener) = listeners.front() {
+                        *resolved_address
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = next_listener
+                            .local_addr()
+                            .expect("next mutation/status listener address");
+                    }
+                    let response = SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                        SessionConsumerV2FencedTransitionStatus::NotFound,
+                    ));
+                    super::write_frame_bounded_until(
+                        &mut tls,
+                        &ConsumerV2WireResponse::Response(ConsumerV2CallResponse {
+                            correlation,
+                            attempt_nonce,
+                            request_commitment,
+                            response: Box::new(response),
+                        }),
+                        super::MAX_NEGOTIATED_FRAME_SIZE,
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                    )
+                    .await
+                    .expect("write converged persistent V2 status response");
+                    tls.shutdown()
+                        .await
+                        .expect("close converged persistent V2 status lane");
+                }
+                assert!(listeners.is_empty());
+            }
+        });
+        let config = PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+            2,
+            Duration::ZERO,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+        )
+        .expect("two-attempt persistent V2 status-retry configuration");
+        let resolver_address = Arc::clone(&resolved_address);
+        let resolver_attempts = Arc::clone(&resolve_attempts);
+        let resolver_routes = Arc::clone(&resolved_routes);
+        let resolver: super::RemoteAddrResolver = Arc::new(move || {
+            let address = *resolver_address
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            resolver_attempts.fetch_add(1, Ordering::SeqCst);
+            resolver_routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((address, tokio::time::Instant::now()));
+            Box::pin(async move { Ok(address) })
+        });
+        let persistent = PersistentSessionConsumerClient::try_from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver(
+                resolver,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                server_identity,
+                scope(),
+                material.config(),
+            )
+            .with_operation_timeout(Duration::from_secs(2)),
+            config,
+        )
+        .expect("persistent V2 status-retry client");
+
+        let singleton_id = singleton.request_id().expect("singleton has full V2 ID");
+        assert_eq!(
+            persistent.execute_v2(&singleton).await,
+            Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown {
+                request_id: singleton_id,
+            })
+        );
+        let singleton_status_started = tokio::time::Instant::now();
+        assert_eq!(
+            persistent.execute_v2(&singleton_status).await,
+            Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                SessionConsumerV2FencedTransitionStatus::NotFound,
+            )))
+        );
+        let minimum_status_recovery = crate::lifecycle::DEFAULT_RECONNECT_BACKOFF_MIN;
+        let singleton_status_elapsed = singleton_status_started.elapsed();
+        assert!(singleton_status_elapsed >= minimum_status_recovery);
+        assert!(singleton_status_elapsed < Duration::from_secs(2));
+        let batch_ids = v2_batch_request_ids(&batch);
+        assert_eq!(
+            persistent.execute_v2(&batch).await,
+            Err(
+                PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch {
+                    request_ids: batch_ids,
+                }
+            )
+        );
+        for batch_status in &batch_statuses {
+            let status_started = tokio::time::Instant::now();
+            assert_eq!(
+                persistent.execute_v2(batch_status).await,
+                Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                    SessionConsumerV2FencedTransitionStatus::NotFound,
+                )))
+            );
+            let status_elapsed = status_started.elapsed();
+            assert!(status_elapsed >= minimum_status_recovery);
+            assert!(status_elapsed < Duration::from_secs(2));
+        }
+        let setup_failure_started = tokio::time::Instant::now();
+        assert_eq!(
+            persistent.execute_v2(&singleton_status).await,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Unavailable,
+            })
+        );
+        let setup_failure_elapsed = setup_failure_started.elapsed();
+        assert!(setup_failure_elapsed >= crate::lifecycle::DEFAULT_RECONNECT_BACKOFF_MIN);
+        assert!(setup_failure_elapsed < Duration::from_secs(2));
+        peer.await.expect("join persistent V2 status-retry peer");
+        assert_eq!(effects.load(Ordering::SeqCst), 2);
+        assert_eq!(status_dispatches.load(Ordering::SeqCst), 7);
+        assert_eq!(accepted_connections.load(Ordering::SeqCst), 9);
+        assert_eq!(resolve_attempts.load(Ordering::SeqCst), 10);
+        {
+            let routes = resolved_routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(routes.len(), 10);
+            assert!(routes.windows(2).all(|routes| routes[0].0 != routes[1].0));
+            for (before, after) in [(1, 2), (4, 5), (6, 7), (8, 9)] {
+                assert!(
+                    routes[after].1.saturating_duration_since(routes[before].1)
+                        >= crate::lifecycle::DEFAULT_RECONNECT_BACKOFF_MIN,
+                    "every status retry preserves the fixed reconnect pacing"
+                );
+            }
+        }
+        let _ = persistent.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn persistent_v2_two_frame_stale_tuple_poisoning_preserves_effect_boundary() {
         let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
             .lock()
@@ -14703,11 +15313,15 @@ mod tests {
         assert_eq!(
             persistent.v2_diagnostics(),
             super::PersistentSessionConsumerV2Diagnostics {
+                setup_attempts: 1,
+                setup_failures: 0,
                 setup_successes: 1,
                 reused: 0,
                 reconnects: 1,
                 active: 0,
                 idle: 0,
+                pool_wait_current: 0,
+                pool_wait_max: 0,
             },
             "the actor installs poison and retires before Call 1 becomes visible"
         );
@@ -14737,11 +15351,15 @@ mod tests {
         assert_eq!(
             persistent.v2_diagnostics(),
             super::PersistentSessionConsumerV2Diagnostics {
+                setup_attempts: 1,
+                setup_failures: 0,
                 setup_successes: 1,
                 reused: 0,
                 reconnects: 1,
                 active: 0,
                 idle: 0,
+                pool_wait_current: 0,
+                pool_wait_max: 0,
             },
             "Call 2 consumes poison before selecting or reconnecting a lane"
         );
@@ -15276,11 +15894,15 @@ mod tests {
         assert_eq!(
             pool.diagnostics(),
             super::PersistentSessionConsumerV2Diagnostics {
+                setup_attempts: 0,
+                setup_failures: 0,
                 setup_successes: 0,
                 reused: 0,
                 reconnects: 0,
                 active: 0,
                 idle: 0,
+                pool_wait_current: 0,
+                pool_wait_max: 0,
             },
             "the source and its poison ticket are not authenticated idle capacity"
         );
@@ -16031,11 +16653,15 @@ mod tests {
         assert_eq!(
             persistent.v2_diagnostics(),
             super::PersistentSessionConsumerV2Diagnostics {
+                setup_attempts: 1,
+                setup_failures: 0,
                 setup_successes: 1,
                 reused: 2,
                 reconnects: 0,
                 active: 1,
                 idle: 1,
+                pool_wait_current: 0,
+                pool_wait_max: 0,
             },
             "the same server-enforced lane accepts correlation 1 then 2"
         );
@@ -16137,11 +16763,15 @@ mod tests {
         assert_eq!(
             persistent.v2_diagnostics(),
             super::PersistentSessionConsumerV2Diagnostics {
+                setup_attempts: 1,
+                setup_failures: 0,
                 setup_successes: 1,
                 reused: 0,
                 reconnects: 0,
                 active: 1,
                 idle: 0,
+                pool_wait_current: 0,
+                pool_wait_max: 0,
             },
             "checking out the published socket before its deadline changes no setup or dispatch count"
         );
@@ -17353,12 +17983,17 @@ mod tests {
             positive_read_reservation_hook: StdMutex::new(None),
             prewarm_final_publication_hook: StdMutex::new(None),
             poison_accounting_hook: StdMutex::new(None),
+            setup_attempts: AtomicU64::new(0),
+            setup_failures: AtomicU64::new(0),
             setup_successes: AtomicU64::new(0),
             reused: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
             active: AtomicU64::new(0),
             healthy_active: AtomicU64::new(0),
             poisoned: AtomicU64::new(0),
+            pool_wait_current: AtomicU64::new(0),
+            pool_wait_max: AtomicU64::new(0),
+            reconnect_sequence: AtomicU64::new(0),
             live_accounting: StdMutex::new(()),
         })
     }
@@ -17533,14 +18168,116 @@ mod tests {
             .try_acquire_owned()
             .expect("occupy the only lane");
         let started = tokio::time::Instant::now();
+        let queued_admission = queued.admit_call(started, started + Duration::from_secs(1));
+        tokio::pin!(queued_admission);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(queued_admission.as_mut(), context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(queued.diagnostics().pool_wait_current, 1);
+        assert_eq!(queued.diagnostics().pool_wait_max, 1);
         assert!(matches!(
-            queued
-                .admit_call(started, started + Duration::from_secs(1))
-                .await,
+            queued_admission.await,
             Err(SessionConsumerClientError::Overloaded)
         ));
         assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(queued.diagnostics().pool_wait_current, 0);
+        assert_eq!(queued.diagnostics().pool_wait_max, 1);
+
+        let cancelled = v2_admission_test_pool(config(1));
+        let _cancelled_pending = Arc::clone(&cancelled.pending)
+            .try_acquire_owned()
+            .expect("occupy the cancelled caller's active admission");
+        let _cancelled_lane = Arc::clone(&cancelled.lanes)
+            .try_acquire_owned()
+            .expect("occupy the cancelled caller's only lane");
+        let cancel_started = tokio::time::Instant::now();
+        let mut cancelled_admission =
+            Box::pin(cancelled.admit_call(cancel_started, cancel_started + Duration::from_secs(1)));
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(cancelled_admission.as_mut(), context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(cancelled.diagnostics().pool_wait_current, 1);
+        drop(cancelled_admission);
+        assert_eq!(cancelled.diagnostics().pool_wait_current, 0);
+        assert_eq!(cancelled.diagnostics().pool_wait_max, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_v2_setup_attempts_terminalize_after_failure_and_cancellation() {
+        let config = PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+            1,
+            Duration::from_secs(1),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("one-lane setup-accounting config");
+
+        let (mut cancelled_stateless, _material) =
+            stateless_test_client(SessionReauthenticationControl::new());
+        cancelled_stateless.resolve =
+            Arc::new(|| Box::pin(std::future::pending::<io::Result<std::net::SocketAddr>>()));
+        let cancelled_client =
+            PersistentSessionConsumerClient::try_from_stateless(cancelled_stateless, config)
+                .expect("cancelled setup client");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut cancelled = Box::pin(cancelled_client.v2_pool.connect_once(deadline));
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(cancelled.as_mut(), context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            cancelled_client.v2_diagnostics(),
+            super::PersistentSessionConsumerV2Diagnostics {
+                setup_attempts: 1,
+                setup_failures: 0,
+                setup_successes: 0,
+                reused: 0,
+                reconnects: 0,
+                active: 0,
+                idle: 0,
+                pool_wait_current: 0,
+                pool_wait_max: 0,
+            },
+            "an in-progress setup is visible without being prematurely terminal"
+        );
+        drop(cancelled);
+        assert_eq!(cancelled_client.v2_diagnostics().setup_attempts, 1);
+        assert_eq!(cancelled_client.v2_diagnostics().setup_successes, 0);
+        assert_eq!(cancelled_client.v2_diagnostics().setup_failures, 1);
+
+        let (mut failed_stateless, _material) =
+            stateless_test_client(SessionReauthenticationControl::new());
+        failed_stateless.resolve = Arc::new(|| {
+            Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "redacted test resolver failure",
+                ))
+            })
+        });
+        let failed_client =
+            PersistentSessionConsumerClient::try_from_stateless(failed_stateless, config)
+                .expect("failed setup client");
+        assert!(matches!(
+            failed_client
+                .v2_pool
+                .connect_once(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            Err(SessionConsumerClientError::Unavailable)
+        ));
+        assert_eq!(failed_client.v2_diagnostics().setup_attempts, 1);
+        assert_eq!(failed_client.v2_diagnostics().setup_successes, 0);
+        assert_eq!(failed_client.v2_diagnostics().setup_failures, 1);
     }
 
     #[tokio::test(start_paused = true)]

@@ -375,6 +375,17 @@ impl PinnedSqliteFile {
         Ok(())
     }
 
+    /// Non-Linux targets retain the private type for compile-time API
+    /// completeness, but cannot authenticate descriptor link identity. Every
+    /// snapshot entry point therefore fails closed on this boundary.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn verify_linked_identity(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "pinned SQLite file link identity requires Linux",
+        ))
+    }
+
     /// Compare a pathname with the pinned identity for diagnostics or cleanup.
     ///
     /// This follows the path at the time of comparison and is intentionally
@@ -1356,7 +1367,13 @@ mod tests {
         let directory = tempdir()?;
         let path = directory.path().join("incoming.part");
         let original = b"exact snapshot retry";
-        let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        let mut snapshot = SessionSnapshotFile::create_with_cleanup_bounded(
+            path.clone(),
+            None,
+            original.len() as u64,
+            None,
+        )
+        .await?;
         snapshot.write_all(original).await?;
         snapshot.sync_all().await?;
         snapshot.rewind().await?;
@@ -1364,6 +1381,7 @@ mod tests {
         snapshot.write_all(original).await?;
         snapshot.sync_all().await?;
 
+        assert_eq!(snapshot.received_bytes, original.len() as u64);
         assert_eq!(snapshot.metadata().await?.len(), original.len() as u64);
         assert_eq!(std::fs::read(path)?, original);
         Ok(())

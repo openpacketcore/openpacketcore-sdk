@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use opc_consensus::engine::error::{InstallSnapshotError, RaftError};
+use opc_consensus::engine::raft::InstallSnapshotResponse;
 use opc_consensus::{
     decode_bounded, derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch,
     ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE,
@@ -122,6 +124,19 @@ fn install_snapshot_observation(
         data_sha256: Sha256::digest(&request.data).into(),
         done: request.done,
     })
+}
+
+fn install_snapshot_engine_accepted(response: &SessionConsensusWireResponse) -> bool {
+    let Ok(payload) = &response.result else {
+        return false;
+    };
+    decode_bounded::<
+        Result<
+            InstallSnapshotResponse<SessionConsensusNodeId>,
+            RaftError<SessionConsensusNodeId, InstallSnapshotError>,
+        >,
+    >(payload)
+    .is_ok_and(|result| result.is_ok())
 }
 
 #[derive(Clone)]
@@ -503,7 +518,9 @@ impl SessionConsensusPeer for LoopbackPeer {
             .flatten();
         let response = handler.handle(sender, request).await;
 
-        if family == SessionConsensusRpcFamily::InstallSnapshot && response.result.is_ok() {
+        if family == SessionConsensusRpcFamily::InstallSnapshot
+            && install_snapshot_engine_accepted(&response)
+        {
             if let Some(observation) = snapshot_observation {
                 let mut observations = self
                     .install_snapshot_observations
@@ -5252,6 +5269,10 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
     let dropped_observation = lagging_snapshot_path
         .dropped_install_snapshot_observation()
         .expect("dropped snapshot response retains a bounded digest observation");
+    assert!(
+        !dropped_observation.done,
+        "the deliberately lost response belongs to a non-final snapshot chunk"
+    );
     tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
         loop {
             if lagging_snapshot_path.observed_install_snapshot_retry(&dropped_observation) {
