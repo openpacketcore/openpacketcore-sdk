@@ -45,6 +45,7 @@ time = { workspace = true }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-persist = { path = "../opc-persist", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
+opc-session-store = { path = "../opc-session-store", version = "0.2.0", features = ["test-control"] }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros", "test-util"] }
 bytes = { workspace = true }
 futures-util = "0.3"
