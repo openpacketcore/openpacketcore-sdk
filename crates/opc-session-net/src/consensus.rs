@@ -3216,7 +3216,7 @@ mod tests {
         SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
         SessionPlacementPolicy, SessionReplicationManifest,
     };
-    use crate::protocol::{write_frame, Request};
+    use crate::protocol::{write_frame, Request, SessionConsensusContractProfile};
 
     #[derive(Debug)]
     struct CountingHandler(AtomicUsize);
@@ -4774,7 +4774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consensus_bootstrap_rejects_the_previous_nested_error_set() {
+    async fn consensus_bootstrap_rejects_prior_transport_or_application_revision_before_handler() {
         let (server_binding, client_binding) = bindings();
         let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
         let server = SessionConsensusServer::from_transport(
@@ -4787,35 +4787,49 @@ mod tests {
             .await
             .expect("listen");
 
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
-        let mut previous_profile = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
-        previous_profile.error_set_revision = 1;
-        let nonce = uuid::Uuid::new_v4();
-        write_frame(
-            &mut stream,
-            &SessionConsensusBootstrapRequest::Hello(SessionConsensusBootstrapHello {
-                transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
-                contract_profile: previous_profile,
-                sender_replica_id: client_binding.local_replica_id().as_str().to_owned(),
-                expected_server_replica_id: client_binding.remote_replica_id().as_str().to_owned(),
-                identity: client_binding.consensus_identity(),
-                sender_node_id: client_binding.local_consensus_node_id(),
-                expected_server_node_id: client_binding.remote_consensus_node_id(),
-                handshake_nonce: nonce,
-                requested_response_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
-            }),
-        )
-        .await
-        .expect("write previous-profile Hello");
-        assert!(matches!(
-            read_frame::<_, SessionConsensusBootstrapResponse>(
+        for (transport_revision, contract_profile) in [
+            (
+                SESSION_CONSENSUS_TRANSPORT_REVISION - 1,
+                CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+            ),
+            (
+                SESSION_CONSENSUS_TRANSPORT_REVISION,
+                SessionConsensusContractProfile {
+                    application_revision: 1,
+                    ..CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
+                },
+            ),
+        ] {
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            write_frame(
                 &mut stream,
-                MAX_HANDSHAKE_FRAME_SIZE
+                &SessionConsensusBootstrapRequest::Hello(SessionConsensusBootstrapHello {
+                    transport_revision,
+                    contract_profile,
+                    sender_replica_id: client_binding.local_replica_id().as_str().to_owned(),
+                    expected_server_replica_id: client_binding
+                        .remote_replica_id()
+                        .as_str()
+                        .to_owned(),
+                    identity: client_binding.consensus_identity(),
+                    sender_node_id: client_binding.local_consensus_node_id(),
+                    expected_server_node_id: client_binding.remote_consensus_node_id(),
+                    handshake_nonce: uuid::Uuid::new_v4(),
+                    requested_response_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
+                }),
             )
             .await
-            .expect("read rejection"),
-            SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Protocol)
-        ));
+            .expect("write incompatible-profile Hello");
+            assert!(matches!(
+                read_frame::<_, SessionConsensusBootstrapResponse>(
+                    &mut stream,
+                    MAX_HANDSHAKE_FRAME_SIZE
+                )
+                .await
+                .expect("read rejection"),
+                SessionConsensusBootstrapResponse::Rejected(SessionConsensusPeerError::Protocol)
+            ));
+        }
         assert_eq!(handler.0.load(Ordering::Relaxed), 0);
         handle.abort_and_wait().await;
     }

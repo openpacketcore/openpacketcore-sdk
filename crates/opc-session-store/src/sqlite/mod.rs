@@ -32,8 +32,7 @@ use crate::{
     model::{OwnerId, SessionKey},
     record::{SessionPayloadEncoding, StoredSessionRecord},
     replication_watch::{
-        prepare_consumer_watch_registration, prepare_watch_registration, watch_backlog_query_limit,
-        ConsumerReplicationWatcher, ReplicationWatcher,
+        prepare_watch_registration, watch_backlog_query_limit, ReplicationWatcher,
     },
     restore::{RestoreScanPage, RestoreScanRequest},
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
@@ -168,7 +167,6 @@ pub struct SqliteSessionBackend {
     #[cfg(test)]
     consensus_operator_recovery_failure: Arc<AtomicBool>,
     watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
-    consumer_watchers: Arc<tokio::sync::Mutex<Vec<ConsumerReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) watch_registration_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -455,7 +453,6 @@ impl SqliteSessionBackend {
             #[cfg(test)]
             consensus_operator_recovery_failure: Arc::new(AtomicBool::new(false)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            consumer_watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             watch_registration_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
@@ -859,6 +856,59 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read one prepared consumer compare-and-set receipt after a
+    /// caller-owned leader-linearizable barrier. This is a read-only query of
+    /// the existing consensus outcome ledger; it opens no prepared-CAS
+    /// journal and performs no schema or migration work.
+    pub(crate) async fn consensus_consumer_compare_and_set_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        lookup: consensus::ConsumerCompareAndSetReceiptLookup,
+    ) -> Result<crate::consumer::SessionConsumerCompareAndSetStatus, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let status = consensus::read_consumer_compare_and_set_status_sync(
+                &tx,
+                storage_identity,
+                lookup,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(status)
+        })
+        .await
+    }
+
+    /// Check one exact consumer binding before the leader decides whether a
+    /// marker proposal is necessary. This is a point read of the outcome
+    /// ledger, not a receipt barrier, mutation, or consensus proposal.
+    pub(crate) async fn consensus_consumer_request_binding_lookup(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        authority_identity: crate::consensus::SessionConsensusIdentity,
+        binding_request_id: crate::consensus::SessionConsensusRequestId,
+        request_commitment: [u8; 32],
+    ) -> Result<consensus::ConsumerRequestBindingLookup, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let lookup = consensus::read_consumer_request_binding_sync(
+                &tx,
+                storage_identity,
+                authority_identity,
+                binding_request_id,
+                request_commitment,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(lookup)
+        })
+        .await
+    }
+
     /// Restore scan at one persisted consensus logical timestamp.
     pub(crate) async fn consensus_scan_restore_records_at(
         &self,
@@ -1181,41 +1231,6 @@ impl SqliteSessionBackend {
         watchers.retain(|watcher| !watcher.is_closed());
         if let Some(watcher) = watcher {
             watchers.push(watcher);
-        }
-        use futures_util::StreamExt;
-        Ok(stream.boxed())
-    }
-
-    /// Subscribe an authenticated consumer to redacted committed changes.
-    ///
-    /// The raw replication backlog is projected while the ordinary watch
-    /// registration lock is held, which closes the capture/register race.
-    /// Live consumers then receive only compact projection envelopes through
-    /// their own byte-bounded registry; no raw replay entry is cloned per
-    /// consumer connection.
-    pub(crate) async fn consensus_consumer_watch(
-        &self,
-        start_sequence: u64,
-    ) -> Result<
-        futures_util::stream::BoxStream<'static, Result<crate::SessionConsumerChange, StoreError>>,
-        StoreError,
-    > {
-        let cursor = ReplicationWatchCursor::new(start_sequence);
-        // The ordinary watcher mutex serializes raw append notification with
-        // backlog capture. Keep it while adding the projected subscriber so a
-        // committed entry can land in neither source.
-        let _raw_watchers = self.watchers.lock().await;
-        let existing = self
-            .consensus_get_replication_log(
-                cursor.first_sequence(),
-                watch_backlog_query_limit(cursor),
-            )
-            .await?;
-        let (stream, watcher) = prepare_consumer_watch_registration(cursor, existing)?;
-        let mut consumer_watchers = self.consumer_watchers.lock().await;
-        consumer_watchers.retain(|watcher| !watcher.is_closed());
-        if let Some(watcher) = watcher {
-            consumer_watchers.push(watcher);
         }
         use futures_util::StreamExt;
         Ok(stream.boxed())
@@ -1548,7 +1563,7 @@ impl SessionBackend for SqliteSessionBackend {
         let caps = self.caps;
         self.run_store_sqlite_task(SqliteStoreWorkKind::CompareAndSet, move |conn| {
             let tx = standalone_transaction(conn)?;
-            let result = ops::compare_and_set_sync(&tx, op, &caps, now)?;
+            let result = ops::compare_and_set_sync(&tx, &op, &caps, now)?;
             tx.commit()
                 .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
             Ok(result)
@@ -1623,7 +1638,7 @@ impl SessionBackend for SqliteSessionBackend {
                     SessionOp::CompareAndSet(cas) => {
                         let run_cas = || {
                             let tx = standalone_transaction(conn)?;
-                            let result = ops::compare_and_set_sync(&tx, cas, &caps, now)?;
+                            let result = ops::compare_and_set_sync(&tx, &cas, &caps, now)?;
                             tx.commit()
                                 .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
                             Ok(result)

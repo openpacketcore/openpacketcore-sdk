@@ -1612,17 +1612,18 @@ umbrella until that fleet evidence passes.
 `StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
 `SessionQuorumConsumerServer` provide the typed least-authority
 application-consumer boundary. They MUST use mutual TLS and the dedicated
-`opc-session-consumer/1` ALPN with transport revision 5. This is a separate
+`opc-session-consumer/1` ALPN with transport revision 6. This is a separate
 exact protocol from both `opc-session-consensus/2` and the quarantined
 `opc-session-net/5` compatibility protocol. A listener MUST NOT offer a
 fallback, negotiate a common revision, or multiplex either other protocol as
-equivalent consumer authority. Revision 5 does not interoperate with revisions
-1, 2, 3, or 4.
+equivalent consumer authority. Revision 6 does not interoperate with revisions
+1, 2, 3, 4, or 5.
 Because this SDK is unreleased, deployments MUST drain consumer clients and
-listeners, then make one coordinated revision-5 cutover; fallback, dual-mode,
-and mixed-revision consumer operation are unsupported. Revision-5 private JSON
-DTO bytes are canonical; reordered or otherwise noncanonical encodings,
-aliases, omissions, and unknown fields MUST fail closed.
+listeners, then make one coordinated revision-6 cutover; fallback, dual-mode,
+and mixed-revision consumer operation are unsupported. Revision-6 private JSON
+DTO bytes, including the complete sequence-plus-nonce correlation envelope, are
+canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
+and unknown fields MUST fail closed.
 
 `StatelessSessionConsumerClient` remains a public, source-compatible
 production/compatibility fresh-authentication typed least-authority surface

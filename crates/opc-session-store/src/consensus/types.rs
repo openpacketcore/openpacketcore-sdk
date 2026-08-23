@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -121,7 +122,11 @@ pub enum SessionMutationIntent {
     /// expired lease or record.
     AdvanceLogicalTime,
     /// Compare and set one record under a fenced lease.
-    CompareAndSet(Box<CompareAndSet>),
+    ///
+    /// The shared ownership is runtime-only: serde still emits exactly the
+    /// wrapped operation.  It lets a forwarding request survive a proven
+    /// before-transmission leader reroute without cloning sealed ciphertext.
+    CompareAndSet(Arc<CompareAndSet>),
     /// Delete one record under a fenced lease.
     DeleteFenced(LeaseGuard),
     /// Refresh a record TTL under a fenced lease.
@@ -251,6 +256,26 @@ pub enum SessionMutationIntent {
     ActivateFencedTransition {
         /// Original caller-owned transition.
         request: Box<FencedTransitionRequest>,
+        /// Exact current authority scope observed during unanimous V1 proof.
+        scope_identity: SessionConsensusIdentity,
+        /// Canonical digest of the exact voter IDs in that scope.
+        voter_set_digest: [u8; 32],
+    },
+    /// SDK-internal request to durably activate V1 for the current exact
+    /// voter scope. Only a concrete state voter can submit this marker; the
+    /// local leader replaces it with the scope-bound activation command after
+    /// one typed quorum admission and unanimous V1 probes.
+    #[doc(hidden)]
+    PreflightFencedTransitionCapability,
+    /// SDK-internal cluster-scope V1 activation certificate.
+    ///
+    /// The leader derives every field from its currently admitted scope after
+    /// the preflight marker has been authenticated. Raw callers must never
+    /// submit this command shape directly.
+    #[doc(hidden)]
+    ActivateFencedTransitionCapability {
+        /// Exact V1 protocol schema admitted by every voter.
+        schema_version: u16,
         /// Exact current authority scope observed during unanimous V1 proof.
         scope_identity: SessionConsensusIdentity,
         /// Canonical digest of the exact voter IDs in that scope.
@@ -582,7 +607,7 @@ mod tests {
         );
         assert_postcard_cross_decode(
             "CompareAndSet",
-            SessionMutationIntent::CompareAndSet(Box::new(cas.clone())),
+            SessionMutationIntent::CompareAndSet(Arc::new(cas.clone())),
             LegacySessionMutationIntent684::CompareAndSet(Box::new(cas)),
         );
         assert_postcard_cross_decode(

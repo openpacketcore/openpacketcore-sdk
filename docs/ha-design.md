@@ -440,12 +440,13 @@ least-authority surface required by #649, #688, and #691; it is neither hidden,
 deprecated, nor test-only. `PersistentSessionConsumerClient` remains the
 required warm fixed-pool primitive for #695/ePDG latency, so production
 deployments requiring warm reuse should use it. It retains the
-`opc-session-consumer/1` ALPN and now uses exact consumer transport revision 5.
+`opc-session-consumer/1` ALPN and now uses exact consumer transport revision 6.
 There is no fallback, dual mode, or
 mixed-revision path: clients and listeners must be drained and cut over
-coordinately. Revision-5 private JSON DTO bytes are canonical; reordered or
-otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
-closed. This boundary remains separate from consensus and the quarantined
+coordinately. Revision-6 private JSON DTO bytes, including the complete
+sequence-plus-nonce correlation envelope, are canonical; reordered or otherwise
+noncanonical encodings, aliases, omissions, and unknown fields fail closed. This
+boundary remains separate from consensus and the quarantined
 legacy backend protocol; it exposes no `RemoteSessionBackend`, consensus,
 replication, snapshot, rebuild, membership, or admin API. Revision 4 retains
 #696's generic one-record atomic fenced-transition capability, observation,

@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::capability::SessionStorePlatformProfile;
 use crate::consensus::{SessionConsensusIdentity, SessionConsensusNodeId};
+use crate::consumer::{SessionConsumerRoster, SessionConsumerRosterError, SessionConsumerScope};
 use crate::readiness::PlacementResiliencePolicy;
 use crate::topology_attestation::{
     verify_topology_attestations, QuorumTopologyAttestor, TopologyAttestationAdmission,
@@ -961,6 +962,34 @@ impl ValidatedQuorumTopology {
             .local_replica_id
             .as_ref()
             .and_then(|replica_id| self.consensus_node_id(replica_id))
+    }
+
+    /// Derive the exact canonical application-consumer voter roster from this
+    /// validated topology. The commitment is identical on every member and
+    /// contains the complete sorted SDK node-to-TLS identity mapping.
+    pub fn session_consumer_roster(
+        &self,
+    ) -> Result<SessionConsumerRoster, SessionConsumerRosterError> {
+        let identity = self
+            .consensus_identity
+            .ok_or(SessionConsumerRosterError::MissingConsensusIdentity)?;
+        let expected_members = self
+            .consensus_node_ids
+            .values()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let descriptors = self.members.iter().map(|descriptor| {
+            let node_id = self
+                .consensus_node_ids
+                .get(descriptor.replica_id())
+                .expect("validated topology retains every member node ID");
+            (node_id.get(), descriptor.clone())
+        });
+        SessionConsumerRoster::try_new(
+            SessionConsumerScope::new(identity),
+            &expected_members,
+            descriptors,
+        )
     }
 }
 

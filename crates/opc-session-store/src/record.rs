@@ -16,6 +16,7 @@ use opc_key::{
     Zeroizing, AEAD_TAG_LEN,
 };
 use opc_types::Timestamp;
+use std::sync::Arc;
 
 use crate::{
     error::StoreError,
@@ -63,9 +64,46 @@ pub enum SessionPayloadEncoding {
     Unclassified,
 }
 
-const PAYLOAD_DESERIALIZE_CHUNK_BYTES: usize = 4 * 1024;
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const PAYLOAD_DESERIALIZE_CHUNK_BYTES: usize = 4 * 1024;
 
 struct WipingPayloadBytes(Zeroizing<Vec<u8>>);
+
+// These are test-only evidence counters for durable payload ownership. They
+// intentionally count actual allocation/adoption and byte-copy boundaries,
+// rather than inferring them from a higher-level request or command counter.
+#[cfg(test)]
+static PAYLOAD_VISIT_BYTES_OWNERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static PAYLOAD_VISIT_BYTES_COPIED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static PAYLOAD_VISIT_BYTE_BUF_OWNERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static PAYLOAD_SEQUENCE_CHUNK_ALLOCATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static PAYLOAD_SEQUENCE_CHUNK_CAPACITY_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static PAYLOAD_SEQUENCE_STAGED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static PAYLOAD_SEQUENCE_FINAL_ALLOCATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static PAYLOAD_SEQUENCE_FINAL_ALLOCATION_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static PAYLOAD_SEQUENCE_FINAL_COPIED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn note(counter: &std::sync::atomic::AtomicU64, value: usize) {
+    counter.fetch_add(value as u64, std::sync::atomic::Ordering::Relaxed);
+}
 
 impl<'de> serde::Deserialize<'de> for WipingPayloadBytes {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -85,6 +123,11 @@ impl<'de> serde::Deserialize<'de> for WipingPayloadBytes {
             where
                 E: serde::de::Error,
             {
+                #[cfg(test)]
+                {
+                    note(&PAYLOAD_VISIT_BYTES_OWNERS, 1);
+                    note(&PAYLOAD_VISIT_BYTES_COPIED_BYTES, value.len());
+                }
                 Ok(WipingPayloadBytes(Zeroizing::new(value.to_vec())))
             }
 
@@ -92,6 +135,8 @@ impl<'de> serde::Deserialize<'de> for WipingPayloadBytes {
             where
                 E: serde::de::Error,
             {
+                #[cfg(test)]
+                note(&PAYLOAD_VISIT_BYTE_BUF_OWNERS, 1);
                 Ok(WipingPayloadBytes(Zeroizing::new(value)))
             }
 
@@ -100,15 +145,33 @@ impl<'de> serde::Deserialize<'de> for WipingPayloadBytes {
                 A: serde::de::SeqAccess<'de>,
             {
                 let mut chunks = Vec::new();
+                #[cfg(test)]
+                {
+                    note(&PAYLOAD_SEQUENCE_CHUNK_ALLOCATIONS, 1);
+                    note(
+                        &PAYLOAD_SEQUENCE_CHUNK_CAPACITY_BYTES,
+                        PAYLOAD_DESERIALIZE_CHUNK_BYTES,
+                    );
+                }
                 let mut current =
                     Zeroizing::new(Vec::with_capacity(PAYLOAD_DESERIALIZE_CHUNK_BYTES));
                 while let Some(byte) = sequence.next_element::<u8>()? {
                     if current.len() == PAYLOAD_DESERIALIZE_CHUNK_BYTES {
                         chunks.push(current);
+                        #[cfg(test)]
+                        {
+                            note(&PAYLOAD_SEQUENCE_CHUNK_ALLOCATIONS, 1);
+                            note(
+                                &PAYLOAD_SEQUENCE_CHUNK_CAPACITY_BYTES,
+                                PAYLOAD_DESERIALIZE_CHUNK_BYTES,
+                            );
+                        }
                         current =
                             Zeroizing::new(Vec::with_capacity(PAYLOAD_DESERIALIZE_CHUNK_BYTES));
                     }
                     current.push(byte);
+                    #[cfg(test)]
+                    note(&PAYLOAD_SEQUENCE_STAGED_BYTES, 1);
                 }
                 let total = chunks
                     .iter()
@@ -116,11 +179,18 @@ impl<'de> serde::Deserialize<'de> for WipingPayloadBytes {
                 let total = total.ok_or_else(|| {
                     serde::de::Error::custom("opaque session payload bytes are invalid")
                 })?;
+                #[cfg(test)]
+                if total != 0 {
+                    note(&PAYLOAD_SEQUENCE_FINAL_ALLOCATIONS, 1);
+                    note(&PAYLOAD_SEQUENCE_FINAL_ALLOCATION_BYTES, total);
+                }
                 let mut bytes = Zeroizing::new(vec![0_u8; total]);
                 let mut offset = 0;
                 for chunk in chunks.iter().chain(std::iter::once(&current)) {
                     let end = offset + chunk.len();
                     bytes[offset..end].copy_from_slice(chunk);
+                    #[cfg(test)]
+                    note(&PAYLOAD_SEQUENCE_FINAL_COPIED_BYTES, chunk.len());
                     offset = end;
                 }
                 Ok(WipingPayloadBytes(bytes))
@@ -152,10 +222,125 @@ impl<'de> serde::Deserialize<'de> for WipingPayloadBytes {
 /// [`EncryptedSessionPayload::new`] is for caller-facing plaintext payloads
 /// above the persistence boundary and must not be used for stored envelope
 /// bytes.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct EncryptedSessionPayload {
-    bytes: Zeroizing<Vec<u8>>,
+    // The sealed bytes are shared only by immutable durable operation and
+    // replication values.  The final Arc drop runs `Zeroizing` exactly once;
+    // cloning a record therefore cannot copy ciphertext while it remains
+    // protected in memory.
+    bytes: Arc<Zeroizing<Vec<u8>>>,
     encoding: SessionPayloadEncoding,
+}
+
+// The prepared-checkpoint maximum-payload regression test observes record
+// ownership separately from the deserializer allocation/copy counters above.
+// A clone must only retain the immutable handle, never copy ciphertext.
+#[cfg(test)]
+static ENCRYPTED_SESSION_PAYLOAD_HANDLE_CLONES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static ENCRYPTED_SESSION_PAYLOAD_DESERIALIZED_OWNERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static ENCRYPTED_SESSION_PAYLOAD_INITIAL_OWNERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static ENCRYPTED_SESSION_PAYLOAD_INITIAL_OWNED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static ENCRYPTED_SESSION_PAYLOAD_OWNERSHIP_TEST_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn note_encrypted_session_payload_initial_bytes(bytes: usize) {
+    use std::sync::atomic::Ordering;
+    ENCRYPTED_SESSION_PAYLOAD_INITIAL_OWNERS.fetch_add(1, Ordering::Relaxed);
+    ENCRYPTED_SESSION_PAYLOAD_INITIAL_OWNED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+impl Clone for EncryptedSessionPayload {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            ENCRYPTED_SESSION_PAYLOAD_HANDLE_CLONES.fetch_add(1, Ordering::Relaxed);
+        }
+        Self {
+            bytes: Arc::clone(&self.bytes),
+            encoding: self.encoding,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_encrypted_session_payload_ownership_counters() {
+    use std::sync::atomic::Ordering;
+    ENCRYPTED_SESSION_PAYLOAD_HANDLE_CLONES.store(0, Ordering::Relaxed);
+    ENCRYPTED_SESSION_PAYLOAD_DESERIALIZED_OWNERS.store(0, Ordering::Relaxed);
+    ENCRYPTED_SESSION_PAYLOAD_INITIAL_OWNERS.store(0, Ordering::Relaxed);
+    ENCRYPTED_SESSION_PAYLOAD_INITIAL_OWNED_BYTES.store(0, Ordering::Relaxed);
+    for counter in [
+        &PAYLOAD_VISIT_BYTES_OWNERS,
+        &PAYLOAD_VISIT_BYTES_COPIED_BYTES,
+        &PAYLOAD_VISIT_BYTE_BUF_OWNERS,
+        &PAYLOAD_SEQUENCE_CHUNK_ALLOCATIONS,
+        &PAYLOAD_SEQUENCE_CHUNK_CAPACITY_BYTES,
+        &PAYLOAD_SEQUENCE_STAGED_BYTES,
+        &PAYLOAD_SEQUENCE_FINAL_ALLOCATIONS,
+        &PAYLOAD_SEQUENCE_FINAL_ALLOCATION_BYTES,
+        &PAYLOAD_SEQUENCE_FINAL_COPIED_BYTES,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_encrypted_session_payload_ownership_test_permit(
+) -> std::sync::MutexGuard<'static, ()> {
+    ENCRYPTED_SESSION_PAYLOAD_OWNERSHIP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EncryptedSessionPayloadOwnershipCounters {
+    pub(crate) initial_owners: u64,
+    pub(crate) initial_owned_bytes: u64,
+    pub(crate) handle_clones: u64,
+    pub(crate) deserialized_owners: u64,
+    pub(crate) visit_bytes_owners: u64,
+    pub(crate) visit_bytes_copied_bytes: u64,
+    pub(crate) visit_byte_buf_owners: u64,
+    pub(crate) sequence_chunk_allocations: u64,
+    pub(crate) sequence_chunk_capacity_bytes: u64,
+    pub(crate) sequence_staged_bytes: u64,
+    pub(crate) sequence_final_allocations: u64,
+    pub(crate) sequence_final_allocation_bytes: u64,
+    pub(crate) sequence_final_copied_bytes: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn encrypted_session_payload_ownership_counters(
+) -> EncryptedSessionPayloadOwnershipCounters {
+    use std::sync::atomic::Ordering;
+    EncryptedSessionPayloadOwnershipCounters {
+        initial_owners: ENCRYPTED_SESSION_PAYLOAD_INITIAL_OWNERS.load(Ordering::Relaxed),
+        initial_owned_bytes: ENCRYPTED_SESSION_PAYLOAD_INITIAL_OWNED_BYTES.load(Ordering::Relaxed),
+        handle_clones: ENCRYPTED_SESSION_PAYLOAD_HANDLE_CLONES.load(Ordering::Relaxed),
+        deserialized_owners: ENCRYPTED_SESSION_PAYLOAD_DESERIALIZED_OWNERS.load(Ordering::Relaxed),
+        visit_bytes_owners: PAYLOAD_VISIT_BYTES_OWNERS.load(Ordering::Relaxed),
+        visit_bytes_copied_bytes: PAYLOAD_VISIT_BYTES_COPIED_BYTES.load(Ordering::Relaxed),
+        visit_byte_buf_owners: PAYLOAD_VISIT_BYTE_BUF_OWNERS.load(Ordering::Relaxed),
+        sequence_chunk_allocations: PAYLOAD_SEQUENCE_CHUNK_ALLOCATIONS.load(Ordering::Relaxed),
+        sequence_chunk_capacity_bytes: PAYLOAD_SEQUENCE_CHUNK_CAPACITY_BYTES
+            .load(Ordering::Relaxed),
+        sequence_staged_bytes: PAYLOAD_SEQUENCE_STAGED_BYTES.load(Ordering::Relaxed),
+        sequence_final_allocations: PAYLOAD_SEQUENCE_FINAL_ALLOCATIONS.load(Ordering::Relaxed),
+        sequence_final_allocation_bytes: PAYLOAD_SEQUENCE_FINAL_ALLOCATION_BYTES
+            .load(Ordering::Relaxed),
+        sequence_final_copied_bytes: PAYLOAD_SEQUENCE_FINAL_COPIED_BYTES.load(Ordering::Relaxed),
+    }
 }
 
 impl serde::Serialize for EncryptedSessionPayload {
@@ -183,6 +368,9 @@ impl<'de> serde::Deserialize<'de> for EncryptedSessionPayload {
             encoding: SessionPayloadEncoding,
         }
         let helper = Helper::deserialize(deserializer)?;
+        #[cfg(test)]
+        ENCRYPTED_SESSION_PAYLOAD_DESERIALIZED_OWNERS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self::try_from_zeroizing_with_encoding(helper.bytes.0, helper.encoding)
             .map_err(serde::de::Error::custom)
     }
@@ -200,8 +388,10 @@ impl EncryptedSessionPayload {
 
     /// Construct caller-facing plaintext payload bytes from a Zeroizing wrapper.
     pub fn new_zeroizing(bytes: Zeroizing<Vec<u8>>) -> Self {
+        #[cfg(test)]
+        note_encrypted_session_payload_initial_bytes(bytes.len());
         Self {
-            bytes,
+            bytes: Arc::new(bytes),
             encoding: SessionPayloadEncoding::Plaintext,
         }
     }
@@ -241,7 +431,12 @@ impl EncryptedSessionPayload {
         bytes: Zeroizing<Vec<u8>>,
         encoding: SessionPayloadEncoding,
     ) -> Result<Self, StoreError> {
-        let payload = Self { bytes, encoding };
+        #[cfg(test)]
+        note_encrypted_session_payload_initial_bytes(bytes.len());
+        let payload = Self {
+            bytes: Arc::new(bytes),
+            encoding,
+        };
         if encoding == SessionPayloadEncoding::EnvelopeV1 {
             payload.decode_valid_session_envelope()?;
         }
@@ -249,8 +444,10 @@ impl EncryptedSessionPayload {
     }
 
     fn from_vec_unchecked(bytes: Vec<u8>, encoding: SessionPayloadEncoding) -> Self {
+        #[cfg(test)]
+        note_encrypted_session_payload_initial_bytes(bytes.len());
         Self {
-            bytes: Zeroizing::new(bytes),
+            bytes: Arc::new(Zeroizing::new(bytes)),
             encoding,
         }
     }
@@ -259,7 +456,7 @@ impl EncryptedSessionPayload {
     /// `EnvelopeV1`, plaintext otherwise. Check `encoding` before
     /// interpreting them.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_ref().as_slice()
     }
 
     /// How `as_bytes` is to be interpreted (and how `decrypt` will treat it).
@@ -313,15 +510,15 @@ impl EncryptedSessionPayload {
         if self.encoding != SessionPayloadEncoding::EnvelopeV1 || self.bytes.is_empty() {
             return Err(invalid_session_envelope());
         }
-        let envelope =
-            CryptoEnvelopeV1::decode(&self.bytes).map_err(|_| invalid_session_envelope())?;
+        let envelope = CryptoEnvelopeV1::decode(self.bytes.as_ref().as_slice())
+            .map_err(|_| invalid_session_envelope())?;
         if envelope.nonce.len() != envelope.algorithm.nonce_len()
             || envelope.ciphertext_and_tag.len() < AEAD_TAG_LEN
             || envelope
                 .encode()
                 .map_err(|_| invalid_session_envelope())?
                 .as_slice()
-                != self.bytes.as_slice()
+                != self.bytes.as_ref().as_slice()
         {
             return Err(invalid_session_envelope());
         }
@@ -430,12 +627,14 @@ impl EncryptedSessionPayload {
         backend_namespace: &str,
     ) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         let envelope = match self.encoding {
-            SessionPayloadEncoding::Plaintext => return Ok(self.bytes.clone()),
-            SessionPayloadEncoding::LegacyPlaintext => return Ok(self.bytes.clone()),
-            SessionPayloadEncoding::Unclassified => match CryptoEnvelopeV1::decode(&self.bytes) {
-                Ok(envelope) => envelope,
-                Err(_) => return Ok(self.bytes.clone()),
-            },
+            SessionPayloadEncoding::Plaintext => return Ok((*self.bytes).clone()),
+            SessionPayloadEncoding::LegacyPlaintext => return Ok((*self.bytes).clone()),
+            SessionPayloadEncoding::Unclassified => {
+                match CryptoEnvelopeV1::decode(self.bytes.as_ref().as_slice()) {
+                    Ok(envelope) => envelope,
+                    Err(_) => return Ok((*self.bytes).clone()),
+                }
+            }
             SessionPayloadEncoding::EnvelopeV1 => {
                 if self.bytes.is_empty() {
                     return Err(StoreError::Crypto(
@@ -443,7 +642,7 @@ impl EncryptedSessionPayload {
                     ));
                 }
 
-                CryptoEnvelopeV1::decode(&self.bytes).map_err(|_| {
+                CryptoEnvelopeV1::decode(self.bytes.as_ref().as_slice()).map_err(|_| {
                     StoreError::Crypto(SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into())
                 })?
             }
@@ -479,12 +678,14 @@ impl EncryptedSessionPayload {
         backend_namespace: &str,
     ) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         let envelope = match self.encoding {
-            SessionPayloadEncoding::Plaintext => return Ok(self.bytes.clone()),
-            SessionPayloadEncoding::LegacyPlaintext => return Ok(self.bytes.clone()),
-            SessionPayloadEncoding::Unclassified => match CryptoEnvelopeV1::decode(&self.bytes) {
-                Ok(envelope) => envelope,
-                Err(_) => return Ok(self.bytes.clone()),
-            },
+            SessionPayloadEncoding::Plaintext => return Ok((*self.bytes).clone()),
+            SessionPayloadEncoding::LegacyPlaintext => return Ok((*self.bytes).clone()),
+            SessionPayloadEncoding::Unclassified => {
+                match CryptoEnvelopeV1::decode(self.bytes.as_ref().as_slice()) {
+                    Ok(envelope) => envelope,
+                    Err(_) => return Ok((*self.bytes).clone()),
+                }
+            }
             SessionPayloadEncoding::EnvelopeV1 => {
                 if self.bytes.is_empty() {
                     return Err(StoreError::Crypto(
@@ -492,7 +693,7 @@ impl EncryptedSessionPayload {
                     ));
                 }
 
-                CryptoEnvelopeV1::decode(&self.bytes).map_err(|_| {
+                CryptoEnvelopeV1::decode(self.bytes.as_ref().as_slice()).map_err(|_| {
                     StoreError::Crypto(SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into())
                 })?
             }
@@ -689,6 +890,58 @@ mod tests {
     use super::WipingPayloadBytes;
     use serde::{de, Deserialize};
 
+    struct BytesOnlyDeserializer<'a>(&'a [u8]);
+
+    impl<'de> serde::Deserializer<'de> for BytesOnlyDeserializer<'de> {
+        type Error = de::value::Error;
+
+        fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: de::Visitor<'de>,
+        {
+            Err(de::Error::custom("expected the sequence data model"))
+        }
+
+        fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: de::Visitor<'de>,
+        {
+            visitor.visit_bytes(self.0)
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct tuple tuple_struct map struct
+            enum identifier ignored_any
+        }
+    }
+
+    struct ByteBufOnlyDeserializer(Vec<u8>);
+
+    impl<'de> serde::Deserializer<'de> for ByteBufOnlyDeserializer {
+        type Error = de::value::Error;
+
+        fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: de::Visitor<'de>,
+        {
+            Err(de::Error::custom("expected the sequence data model"))
+        }
+
+        fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: de::Visitor<'de>,
+        {
+            visitor.visit_byte_buf(self.0)
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct tuple tuple_struct map struct
+            enum identifier ignored_any
+        }
+    }
+
     struct SequenceOnlyDeserializer;
 
     impl<'de> serde::Deserializer<'de> for SequenceOnlyDeserializer {
@@ -706,7 +959,7 @@ mod tests {
             V: de::Visitor<'de>,
         {
             visitor.visit_seq(de::value::SeqDeserializer::<_, Self::Error>::new(
-                std::iter::empty::<u8>(),
+                std::iter::once(0xa5_u8),
             ))
         }
 
@@ -719,8 +972,42 @@ mod tests {
 
     #[test]
     fn payload_deserialization_preserves_the_generic_sequence_wire_contract() {
+        let _permit = super::acquire_encrypted_session_payload_ownership_test_permit();
+        super::reset_encrypted_session_payload_ownership_counters();
         let payload = WipingPayloadBytes::deserialize(SequenceOnlyDeserializer)
             .expect("the payload byte field must request a Serde sequence");
-        assert!(payload.0.is_empty());
+        assert_eq!(payload.0.as_slice(), &[0xa5]);
+        let counters = super::encrypted_session_payload_ownership_counters();
+        assert_eq!(
+            counters.sequence_chunk_allocations, 1,
+            "the generic-sequence decoder retains one zeroizing staging chunk: {counters:?}"
+        );
+        assert_eq!(
+            counters.sequence_final_allocations, 1,
+            "a nonempty generic sequence makes its one final zeroizing output allocation"
+        );
+    }
+
+    #[test]
+    fn payload_deserialization_counts_borrowed_copy_and_owned_adoption() {
+        let _permit = super::acquire_encrypted_session_payload_ownership_test_permit();
+        super::reset_encrypted_session_payload_ownership_counters();
+        let copied = WipingPayloadBytes::deserialize(BytesOnlyDeserializer(b"ciphertext"))
+            .expect("borrowed bytes deserialize");
+        assert_eq!(copied.0.as_slice(), b"ciphertext");
+        let counters = super::encrypted_session_payload_ownership_counters();
+        assert_eq!(counters.visit_bytes_owners, 1);
+        assert_eq!(counters.visit_bytes_copied_bytes, 10);
+        assert_eq!(counters.visit_byte_buf_owners, 0);
+
+        super::reset_encrypted_session_payload_ownership_counters();
+        let adopted =
+            WipingPayloadBytes::deserialize(ByteBufOnlyDeserializer(b"ciphertext".to_vec()))
+                .expect("owned bytes deserialize");
+        assert_eq!(adopted.0.as_slice(), b"ciphertext");
+        let counters = super::encrypted_session_payload_ownership_counters();
+        assert_eq!(counters.visit_bytes_owners, 0);
+        assert_eq!(counters.visit_bytes_copied_bytes, 0);
+        assert_eq!(counters.visit_byte_buf_owners, 1);
     }
 }

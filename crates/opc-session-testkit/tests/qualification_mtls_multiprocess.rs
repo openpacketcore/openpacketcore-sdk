@@ -35,14 +35,15 @@ use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, EncryptedSessionPayload, FenceToken,
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
     FencedTransitionRequestId, Generation, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
-    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
-    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
+    QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
+    ReplicaTlsIdentity, SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
     SessionConsensusWireRequest, SessionConsumerFencedTransitionError,
     SessionConsumerFencedTransitionStatus, SessionConsumerLeaseMutationOperation,
     SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
     SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope, SessionKey,
-    SessionKeyType, StateClass, StateType, StoreError, StoredSessionRecord,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerVoterAuthority, SessionKey, SessionKeyType, StateClass, StateType, StoreError,
+    StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
@@ -98,7 +99,7 @@ use opc_session_testkit::qualification::{
     SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON,
     SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
-use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
+use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
 use rustix::fs::{
     fchmod, fstat, fsync, mkdirat, open, openat, renameat_with, unlinkat, AtFlags, FileType, Mode,
@@ -2664,6 +2665,74 @@ impl Fleet {
                 self.node_stderr(node_index)
             ),
         }
+    }
+
+    /// Derive the exact server authority from the same validated immutable
+    /// qualification topology used by every child. This preserves the node,
+    /// SPIFFE identity, voter count, and roster commitment together rather
+    /// than rebuilding client authority from identity text or consumer scope.
+    fn stateless_consumer_voter_authorities(&self) -> Vec<SessionConsumerVoterAuthority> {
+        let descriptors = self
+            .members
+            .iter()
+            .map(|member| {
+                QuorumReplicaDescriptor::new(
+                    ReplicaId::new(member.replica_id.clone())
+                        .expect("qualification consumer replica ID"),
+                    ReplicaEndpoint::new(member.endpoint_host.clone(), member.endpoint_port)
+                        .expect("qualification consumer endpoint"),
+                    ReplicaTlsIdentity::new(member.tls_identity.clone())
+                        .expect("qualification consumer TLS identity"),
+                    ReplicaFailureDomain::new(member.failure_domain.clone())
+                        .expect("qualification consumer failure domain"),
+                    ReplicaBackingIdentity::new(member.backing_identity.clone())
+                        .expect("qualification consumer backing identity"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let manifest = SessionReplicationManifest::try_new_with_epoch(
+            SessionClusterId::new(format!(
+                "qualification-mtls-{}-cluster",
+                self.member_count()
+            ))
+            .expect("qualification consumer cluster ID"),
+            SessionConfigurationGeneration::new("v1")
+                .expect("qualification consumer configuration generation"),
+            SessionConfigurationEpoch::new(1).expect("qualification consumer configuration epoch"),
+            descriptors.clone(),
+        )
+        .expect("qualification consumer replication manifest");
+        let local_replica = descriptors
+            .first()
+            .expect("qualification consumer local replica")
+            .replica_id()
+            .clone();
+        let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+            local_replica,
+            descriptors,
+            manifest.consensus_identity(),
+        ))
+        .expect("qualification consumer validated topology");
+        let roster = topology
+            .session_consumer_roster()
+            .expect("qualification consumer roster");
+
+        self.members
+            .iter()
+            .map(|member| {
+                let replica_id = ReplicaId::new(member.replica_id.clone())
+                    .expect("qualification consumer replica ID");
+                let node_id = topology
+                    .consensus_node_id(&replica_id)
+                    .expect("qualification consumer consensus node ID");
+                let authority = roster
+                    .voter(node_id)
+                    .expect("qualification consumer voter authority");
+                assert_eq!(authority.tls_identity(), member.tls_identity);
+                assert_eq!(authority.voter_count(), self.member_count());
+                authority
+            })
+            .collect()
     }
 
     fn readiness_reports(&mut self, node_indices: &[usize]) -> Vec<FleetReadiness> {
@@ -8326,6 +8395,10 @@ fn run_consumer_multiprocess_qualification(
         endpoints.push(address);
     }
     let scope = scope.expect("one consumer scope per qualification fleet");
+    let voter_authorities = fleet.stateless_consumer_voter_authorities();
+    assert!(voter_authorities
+        .iter()
+        .all(|authority| authority.scope() == scope));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -8346,9 +8419,7 @@ fn run_consumer_multiprocess_qualification(
             let stateless = StatelessSessionConsumerClient::new(
                 endpoints[node_index],
                 rustls_pki_types::ServerName::IpAddress(endpoints[node_index].ip().into()),
-                SpiffeId::new(spiffe_id(node_index))
-                    .expect("qualification consumer server identity"),
-                scope,
+                voter_authorities[node_index].clone(),
                 tls,
             );
             match mode {
@@ -8760,9 +8831,7 @@ fn run_consumer_multiprocess_qualification(
         rustls_pki_types::ServerName::IpAddress(
             endpoints[replacement_leader_node_index].ip().into(),
         ),
-        SpiffeId::new(spiffe_id(replacement_leader_node_index))
-            .expect("replacement-leader consumer server identity"),
-        scope,
+        voter_authorities[replacement_leader_node_index].clone(),
         replacement_tls,
     );
     let leader_survivor_client = match mode {
@@ -9038,8 +9107,7 @@ fn run_consumer_multiprocess_qualification(
     let delayed_stateless = StatelessSessionConsumerClient::new(
         endpoints[follower_node_index],
         rustls_pki_types::ServerName::IpAddress(endpoints[follower_node_index].ip().into()),
-        SpiffeId::new(spiffe_id(follower_node_index)).expect("follower consumer server identity"),
-        scope,
+        voter_authorities[follower_node_index].clone(),
         delayed_tls,
     )
     .with_operation_timeout(DELAYED_CONSUMER_CLIENT_DEADLINE);

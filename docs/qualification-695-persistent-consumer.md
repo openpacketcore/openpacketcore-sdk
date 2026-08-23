@@ -70,7 +70,7 @@ while adding five generic guarantees:
   lower write, while adapter-only plaintext buffering over zero lower writes
   remains exactly `NotTransmitted`.
 
-The tracked v8 exact-head evidence schema now binds transport revision 5. It
+The tracked v8 exact-head evidence schema now binds transport revision 6. It
 continues to require `experimental=true` and
 `qualification_complete=false`; it is a structural wire-binding schema, not a
 production qualification certificate. No new latency samples were collected

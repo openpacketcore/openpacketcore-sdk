@@ -246,10 +246,11 @@ and compatibility fresh-authentication typed least-authority surface required by
 `PersistentSessionConsumerClient` with `SessionQuorumConsumerServer` is the
 required warm fixed-pool primitive for #695/ePDG latency. Production deployments
 that require warm reuse should use it. Both use mutual TLS with the unchanged
-`opc-session-consumer/1` ALPN and exact consumer transport revision 5. Earlier
+`opc-session-consumer/1` ALPN and exact consumer transport revision 6. Earlier
 revisions will not fall back or interoperate. The unreleased SDK requires one
-coordinated, drained client/listener cutover; there is no dual mode. Revision-4
-features remain present, while revision-5 private JSON DTO bytes are canonical;
+coordinated, drained client/listener cutover; there is no dual mode. Revision-5
+features remain present, while revision-6 private JSON DTO bytes, including the
+complete sequence-plus-nonce correlation envelope, are canonical;
 reordered or otherwise noncanonical encodings, aliases, omissions, and unknown
 fields fail closed. This does not add `RemoteSessionBackend` or any
 consensus/replication/snapshot/rebuild/membership/admin authority, and it
