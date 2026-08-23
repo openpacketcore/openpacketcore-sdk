@@ -62,6 +62,8 @@ const QUALIFICATION_HEADROOM_TRANSITIONS: usize =
 // serialize and durably apply every proposal on the three voters.
 const QUALIFICATION_IN_FLIGHT_CLIENTS: usize = DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS;
 const QUALIFICATION_TRANSIENT_RETRY_LIMIT: usize = 16;
+const QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+const QUALIFICATION_RELEASE_BATCH_DEADLINE: Duration = Duration::from_millis(800);
 const QUALIFICATION_PRELOAD_BATCH_OPERATIONS: usize = 256;
 // At 500 operations/second, an eight-item batch has a 16 ms formation window.
 // That leaves real budget for quorum apply while measuring each item's full
@@ -196,6 +198,7 @@ enum ReleaseBatchFailureStage {
     StatusReadRejected,
     StatusTerminal,
     StatusUnresolved,
+    DeadlineExpired,
 }
 
 impl ReleaseBatchFailureStage {
@@ -214,6 +217,7 @@ impl ReleaseBatchFailureStage {
             Self::StatusReadRejected => "status_read_rejected",
             Self::StatusTerminal => "status_terminal",
             Self::StatusUnresolved => "status_unresolved",
+            Self::DeadlineExpired => "deadline_expired",
         }
     }
 }
@@ -463,15 +467,14 @@ where
     for attempt in 0..=QUALIFICATION_TRANSIENT_RETRY_LIMIT {
         match operation().await {
             Ok(value) => return Ok(value),
-            Err(StoreError::BackendUnavailable(_) | StoreError::FencedTransitionOutcomeUnknown)
+            Err(StoreError::BackendUnavailable(_))
                 if attempt < QUALIFICATION_TRANSIENT_RETRY_LIMIT =>
             {
                 transient_retries.fetch_add(1, Ordering::Relaxed);
-                // The operation-level deadline has already expired. Yield a
-                // fresh scheduling turn before repeating the same read or the
-                // exact same self-authenticating request ID. An ambiguous
-                // write is never replaced with a new ID.
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                // This helper is used only for immutable observations. An
+                // ambiguous mutation must instead converge through its exact
+                // request status without being transmitted again.
+                tokio::time::sleep(QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF).await;
             }
             Err(error) => return Err(error),
         }
@@ -485,6 +488,7 @@ where
 /// crossed the effect boundary, convergence is read-only and retains every
 /// original request body in input order.
 async fn execute_release_batch_effect<Execute, ExecuteFuture, Status, StatusFuture>(
+    deadline: Instant,
     requests: Vec<FencedTransitionV2Request>,
     counters: &ReleaseEffectCounters,
     mut execute: Execute,
@@ -502,8 +506,26 @@ where
         .collect::<Vec<FencedTransitionV2RequestId>>();
 
     for attempt in 0..=QUALIFICATION_TRANSIENT_RETRY_LIMIT {
+        if Instant::now() >= deadline {
+            return Err(ReleaseBatchFailure {
+                stage: ReleaseBatchFailureStage::DeadlineExpired,
+            });
+        }
         counters.mutation_attempts.fetch_add(1, Ordering::Relaxed);
-        match execute(requests.clone()).await {
+        let effect = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            execute(requests.clone()),
+        )
+        .await
+        {
+            Ok(effect) => effect,
+            Err(_) => {
+                return Err(ReleaseBatchFailure {
+                    stage: ReleaseBatchFailureStage::DeadlineExpired,
+                });
+            }
+        };
+        match effect {
             FencedTransitionV2Effect::Resolved(Ok(outcomes)) => {
                 if outcomes.len() != requests.len() {
                     return Err(ReleaseBatchFailure {
@@ -535,10 +557,24 @@ where
             FencedTransitionV2Effect::NotTransmitted(StoreError::BackendUnavailable(_))
                 if attempt < QUALIFICATION_TRANSIENT_RETRY_LIMIT =>
             {
+                let remaining = match deadline.checked_duration_since(Instant::now()) {
+                    Some(remaining) => remaining,
+                    None => {
+                        return Err(ReleaseBatchFailure {
+                            stage: ReleaseBatchFailureStage::DeadlineExpired,
+                        });
+                    }
+                };
+                if remaining <= QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF {
+                    tokio::time::sleep(remaining).await;
+                    return Err(ReleaseBatchFailure {
+                        stage: ReleaseBatchFailureStage::DeadlineExpired,
+                    });
+                }
+                tokio::time::sleep(QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF).await;
                 counters
                     .not_transmitted_retries
                     .fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(25)).await;
             }
             FencedTransitionV2Effect::NotTransmitted(StoreError::BackendUnavailable(_)) => {
                 return Err(ReleaseBatchFailure {
@@ -573,6 +609,11 @@ where
 
     let mut resolved = vec![None; requests.len()];
     for round in 0..=QUALIFICATION_TRANSIENT_RETRY_LIMIT {
+        if Instant::now() >= deadline {
+            return Err(ReleaseBatchFailure {
+                stage: ReleaseBatchFailureStage::DeadlineExpired,
+            });
+        }
         let pending = resolved
             .iter()
             .enumerate()
@@ -581,12 +622,23 @@ where
         counters
             .status_attempts
             .fetch_add(pending.len() as u64, Ordering::Relaxed);
-        let observations = futures_util::future::join_all(pending.into_iter().map(|index| {
-            let request = requests[index].clone();
-            let observation = status(request.clone());
-            async move { (index, request, observation.await) }
-        }))
-        .await;
+        let observations = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            futures_util::future::join_all(pending.into_iter().map(|index| {
+                let request = requests[index].clone();
+                let observation = status(request.clone());
+                async move { (index, request, observation.await) }
+            })),
+        )
+        .await
+        {
+            Ok(observations) => observations,
+            Err(_) => {
+                return Err(ReleaseBatchFailure {
+                    stage: ReleaseBatchFailureStage::DeadlineExpired,
+                });
+            }
+        };
 
         for (index, request, observation) in observations {
             match observation {
@@ -641,23 +693,60 @@ where
             });
         }
         counters.status_retry_rounds.fetch_add(1, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining,
+            None => {
+                return Err(ReleaseBatchFailure {
+                    stage: ReleaseBatchFailureStage::DeadlineExpired,
+                });
+            }
+        };
+        if remaining <= QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF {
+            tokio::time::sleep(remaining).await;
+            return Err(ReleaseBatchFailure {
+                stage: ReleaseBatchFailureStage::DeadlineExpired,
+            });
+        }
+        tokio::time::sleep(QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF).await;
     }
     unreachable!("the bounded status convergence loop returns on its final attempt")
 }
 
 async fn execute_release_store_batch(
+    deadline: Instant,
     store: &ConsensusSessionStore,
     requests: Vec<FencedTransitionV2Request>,
     counters: &ReleaseEffectCounters,
 ) -> Result<ReleaseBatchOutcomes, ReleaseBatchFailure> {
     execute_release_batch_effect(
+        deadline,
         requests,
         counters,
         |requests| SessionBackend::fenced_transition_v2_batch_effect(store, requests),
         |request| async move { store.fenced_transition_v2_status(&request).await },
     )
     .await
+}
+
+/// Execute one mutation-shaped request through the effect boundary. An
+/// ambiguous dispatch converges through only its immutable exact status; it
+/// is never handed to the generic read retry helper.
+async fn execute_release_store_transition(
+    deadline: Instant,
+    store: &ConsensusSessionStore,
+    request: FencedTransitionV2Request,
+    counters: &ReleaseEffectCounters,
+) -> Result<FencedTransitionOutcome, ReleaseBatchFailure> {
+    let outcomes = execute_release_store_batch(deadline, store, vec![request], counters).await?;
+    match outcomes.as_slice() {
+        [Ok(outcome)] => Ok(outcome.clone()),
+        [Err(_)] => Err(ReleaseBatchFailure {
+            stage: ReleaseBatchFailureStage::ResolvedItemError,
+        }),
+        _ => Err(ReleaseBatchFailure {
+            stage: ReleaseBatchFailureStage::ResolvedShapeMismatch,
+        }),
+    }
 }
 
 /// Select the store that can perform local-only maintenance from the newest
@@ -1380,16 +1469,20 @@ async fn release_effect_boundary_never_redispatches_an_ambiguous_batch() {
     ])));
     let execution_calls = Arc::new(AtomicUsize::new(0));
     let observed = execute_release_batch_effect(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
         requests.clone(),
         &counters,
         {
             let steps = Arc::clone(&steps);
             let execution_calls = Arc::clone(&execution_calls);
-            move |_| {
+            let requests = requests.clone();
+            move |received| {
                 let steps = Arc::clone(&steps);
                 let execution_calls = Arc::clone(&execution_calls);
+                let requests = requests.clone();
                 async move {
                     execution_calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(received, requests, "retry retains the exact request bodies");
                     steps
                         .lock()
                         .expect("effect steps lock")
@@ -1415,6 +1508,7 @@ async fn release_effect_boundary_never_redispatches_an_ambiguous_batch() {
         .map(FencedTransitionV2Request::request_id)
         .collect::<Vec<_>>();
     let observed = execute_release_batch_effect(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
         requests.clone(),
         &counters,
         {
@@ -1463,7 +1557,42 @@ async fn release_effect_boundary_never_redispatches_an_ambiguous_batch() {
 
     let counters = ReleaseEffectCounters::default();
     let execution_calls = Arc::new(AtomicUsize::new(0));
+    let expired = execute_release_batch_effect(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF,
+        vec![requests[0].clone()],
+        &counters,
+        {
+            let execution_calls = Arc::clone(&execution_calls);
+            move |_| {
+                let execution_calls = Arc::clone(&execution_calls);
+                async move {
+                    execution_calls.fetch_add(1, Ordering::SeqCst);
+                    FencedTransitionV2Effect::NotTransmitted(StoreError::BackendUnavailable(
+                        "release_test_unavailable".into(),
+                    ))
+                }
+            }
+        },
+        |_| async { Ok(FencedTransitionV2Status::NotFound) },
+    )
+    .await;
+    assert_eq!(
+        expired,
+        Err(ReleaseBatchFailure {
+            stage: ReleaseBatchFailureStage::DeadlineExpired,
+        })
+    );
+    assert_eq!(
+        execution_calls.load(Ordering::SeqCst),
+        1,
+        "deadline expiry must not dispatch another mutation"
+    );
+    assert_eq!(counters.snapshot().not_transmitted_retries, 0);
+
+    let counters = ReleaseEffectCounters::default();
+    let execution_calls = Arc::new(AtomicUsize::new(0));
     let unresolved = execute_release_batch_effect(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
         vec![requests[0].clone()],
         &counters,
         {
@@ -1496,6 +1625,7 @@ async fn release_effect_boundary_never_redispatches_an_ambiguous_batch() {
 
     let counters = ReleaseEffectCounters::default();
     let mismatched = execute_release_batch_effect(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
         requests.clone(),
         &counters,
         {
@@ -2372,6 +2502,7 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     let store = &stores[ready_leader(&stores).await];
     let provider = sealing_provider();
     let transient_retries = Arc::new(AtomicU64::new(0));
+    let effect_counters = Arc::new(ReleaseEffectCounters::default());
     assert_eq!(
         fenced_transition_v2_profile_digest(),
         FIXED_V2_PROFILE_DIGEST
@@ -2405,9 +2536,12 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         &provider,
     )
     .await;
-    let first_outcome = retry_exact_consensus_operation(&transient_retries, || {
-        store.fenced_transition_v2(first_request.clone())
-    })
+    let first_outcome = execute_release_store_transition(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+        store,
+        first_request.clone(),
+        &effect_counters,
+    )
     .await
     .expect("initial capability-activating transition must commit through quorum apply");
     assert!(matches!(
@@ -2415,9 +2549,12 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         FencedTransitionMutationResult::Created
     ));
     let first_update = renew_update_request(1, first_epoch, &first_outcome, &provider).await;
-    let first_updated = retry_exact_consensus_operation(&transient_retries, || {
-        store.fenced_transition_v2(first_update.clone())
-    })
+    let first_updated = execute_release_store_transition(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+        store,
+        first_update.clone(),
+        &effect_counters,
+    )
     .await
     .expect("initial session update must commit through quorum apply");
     assert!(matches!(
@@ -2437,6 +2574,7 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         .map(|session_index| {
             let provider = &provider;
             let transient_retries = Arc::clone(&transient_retries);
+            let effect_counters = Arc::clone(&effect_counters);
             async move {
                 let key = key(session_index);
                 let observation = retry_exact_consensus_operation(&transient_retries, || {
@@ -2453,9 +2591,12 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
                     provider,
                 )
                 .await;
-                let created = retry_exact_consensus_operation(&transient_retries, || {
-                    store.fenced_transition_v2(create.clone())
-                })
+                let created = execute_release_store_transition(
+                    Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+                    store,
+                    create.clone(),
+                    &effect_counters,
+                )
                 .await
                 .expect("session create must commit through quorum apply");
                 assert!(matches!(
@@ -2465,9 +2606,12 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
 
                 let update =
                     renew_update_request(create_index + 1, first_epoch, &created, provider).await;
-                let updated = retry_exact_consensus_operation(&transient_retries, || {
-                    store.fenced_transition_v2(update.clone())
-                })
+                let updated = execute_release_store_transition(
+                    Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+                    store,
+                    update.clone(),
+                    &effect_counters,
+                )
                 .await
                 .expect("session update must commit through quorum apply");
                 assert!(matches!(
@@ -2517,15 +2661,18 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         futures_util::stream::iter(headroom_states.into_iter().enumerate())
             .map(|(headroom_index, state)| {
                 let provider = &provider;
-                let transient_retries = Arc::clone(&transient_retries);
+                let effect_counters = Arc::clone(&effect_counters);
                 async move {
                     let request_index =
                         FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET + headroom_index;
                     let update =
                         renew_update_request(request_index, first_epoch, &state, provider).await;
-                    let updated = retry_exact_consensus_operation(&transient_retries, || {
-                        store.fenced_transition_v2(update.clone())
-                    })
+                    let updated = execute_release_store_transition(
+                        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+                        store,
+                        update.clone(),
+                        &effect_counters,
+                    )
                     .await
                     .expect("headroom update must commit through quorum apply");
                     assert!(matches!(
@@ -2581,27 +2728,20 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     .await
     .expect("open live watch before one-over rejection");
     assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2(one_over_request.clone())
-        })
-        .await,
+        store.fenced_transition_v2(one_over_request.clone()).await,
         Err(StoreError::FencedTransitionHistoryFull),
         "one-over request must not execute"
     );
     assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2(one_over_request.clone())
-        })
-        .await,
+        store.fenced_transition_v2(one_over_request.clone()).await,
         Err(StoreError::FencedTransitionHistoryFull),
         "exact one-over retry must remain a deterministic no-effect rejection"
     );
     let changed_one_over_request = request_with_changed_body(&one_over_request);
     assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2(changed_one_over_request.clone())
-        })
-        .await,
+        store
+            .fenced_transition_v2(changed_one_over_request.clone())
+            .await,
         Err(StoreError::FencedTransitionRequestConflict),
         "same full ID with a changed update body must not acquire capacity or a lease"
     );
@@ -2674,9 +2814,12 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         FencedTransitionV2Status::Recorded(result) if result.as_ref() == &Ok(old_outcome.clone())
     ));
     assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2(old_request.clone())
-        })
+        execute_release_store_transition(
+            Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+            store,
+            old_request.clone(),
+            &effect_counters,
+        )
         .await
         .expect("delayed exact retry before retirement"),
         old_outcome,
@@ -2693,10 +2836,9 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         FencedTransitionV2Status::RequestConflict
     );
     assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2(changed_old_request.clone())
-        })
-        .await,
+        store
+            .fenced_transition_v2(changed_old_request.clone())
+            .await,
         Err(StoreError::FencedTransitionRequestConflict),
         "an altered old body must conflict before retirement"
     );
@@ -2759,18 +2901,14 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         FencedTransitionV2Status::RequestConflict
     );
     assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2(old_request.clone())
-        })
-        .await,
+        store.fenced_transition_v2(old_request.clone()).await,
         Err(StoreError::FencedTransitionRequestExpired),
         "an expired retained binding must never execute again"
     );
     assert_eq!(
-        retry_exact_consensus_operation(&transient_retries, || {
-            store.fenced_transition_v2(changed_old_request.clone())
-        })
-        .await,
+        store
+            .fenced_transition_v2(changed_old_request.clone())
+            .await,
         Err(StoreError::FencedTransitionRequestConflict),
         "body conflict must remain deterministic after successor rotation"
     );
@@ -2789,9 +2927,12 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
             .is_none(),
         "a status read must not install a business record"
     );
-    let next_outcome = retry_exact_consensus_operation(&transient_retries, || {
-        store.fenced_transition_v2(next_request.clone())
-    })
+    let next_outcome = execute_release_store_transition(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+        store,
+        next_request.clone(),
+        &effect_counters,
+    )
     .await
     .expect("active successor epoch must execute without retiring its predecessor");
     assert!(matches!(
@@ -3047,6 +3188,7 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
 
     let first_request = create_requests.remove(0);
     let first_outcomes = match execute_release_store_batch(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
         ingress_store,
         vec![first_request.clone()],
         &effect_counters,
@@ -3100,31 +3242,35 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
     let mut sessions = vec![(first_request, first_outcome)];
     for requests in create_requests.chunks(QUALIFICATION_PACED_BATCH_OPERATIONS) {
         let requests = requests.to_vec();
-        let outcomes =
-            match execute_release_store_batch(ingress_store, requests.clone(), &effect_counters)
-                .await
-            {
-                Ok(outcomes) => outcomes,
-                Err(failure) => {
-                    fail_bounded_scale_stall(
-                        directory,
-                        &peer_slots,
-                        &diagnostics,
-                        failure.stage.as_str(),
-                        &mut bounded_scale_observation(
-                            "setup",
-                            0,
-                            setup_started,
-                            0,
-                            0,
-                            0,
-                            &mut setup_latency,
-                        ),
-                    )
-                    .await;
-                    unreachable!("bounded scale failure always panics")
-                }
-            };
+        let outcomes = match execute_release_store_batch(
+            Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+            ingress_store,
+            requests.clone(),
+            &effect_counters,
+        )
+        .await
+        {
+            Ok(outcomes) => outcomes,
+            Err(failure) => {
+                fail_bounded_scale_stall(
+                    directory,
+                    &peer_slots,
+                    &diagnostics,
+                    failure.stage.as_str(),
+                    &mut bounded_scale_observation(
+                        "setup",
+                        0,
+                        setup_started,
+                        0,
+                        0,
+                        0,
+                        &mut setup_latency,
+                    ),
+                )
+                .await;
+                unreachable!("bounded scale failure always panics")
+            }
+        };
         if outcomes.len() != requests.len() {
             fail_bounded_scale_stall(
                 directory,
@@ -3222,8 +3368,12 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
                 let task_ingress_store = (*ingress_store).clone();
                 let task_effect_counters = Arc::clone(&effect_counters);
                 let batch_started = Instant::now();
+                let batch_deadline = batch_started
+                    .checked_add(QUALIFICATION_RELEASE_BATCH_DEADLINE)
+                    .expect("release batch deadline is representable");
                 in_flight.spawn(async move {
                     let outcomes = execute_release_store_batch(
+                        batch_deadline,
                         &task_ingress_store,
                         requests.clone(),
                         &task_effect_counters,
@@ -3579,14 +3729,18 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         &provider,
     )
     .await;
-    let first_outcome =
-        execute_release_store_batch(ingress_store, vec![first_request.clone()], &effect_counters)
-            .await
-            .expect("singleton V2 activation effect must converge")
-            .into_iter()
-            .next()
-            .expect("singleton V2 activation has one result")
-            .expect("singleton V2 activation");
+    let first_outcome = execute_release_store_batch(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+        ingress_store,
+        vec![first_request.clone()],
+        &effect_counters,
+    )
+    .await
+    .expect("singleton V2 activation effect must converge")
+    .into_iter()
+    .next()
+    .expect("singleton V2 activation has one result")
+    .expect("singleton V2 activation");
     assert_exact_qualified_v2_success(&first_request, &first_outcome);
     matched_workload_outcomes.fetch_add(1, Ordering::Relaxed);
     let mut sessions = vec![(first_request, first_outcome)];
@@ -3612,10 +3766,14 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
                 .await,
             );
         }
-        let outcomes =
-            execute_release_store_batch(ingress_store, requests.clone(), &effect_counters)
-                .await
-                .expect("preload bounded V2 batch effect must converge");
+        let outcomes = execute_release_store_batch(
+            Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+            ingress_store,
+            requests.clone(),
+            &effect_counters,
+        )
+        .await
+        .expect("preload bounded V2 batch effect must converge");
         assert_eq!(outcomes.len(), requests.len());
         for (request, outcome) in requests.into_iter().zip(outcomes) {
             let outcome = outcome.expect("preload item result");
@@ -3703,6 +3861,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
                         FencedTransitionV2Status::Recorded(result) if result.as_ref() == &Ok(outcome.clone())
                     ));
                     let replay = execute_release_store_batch(
+                        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
                         &stores[leader],
                         vec![request.clone()],
                         &effect_counters,
@@ -3772,8 +3931,12 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
                 let task_ingress_store = (*ingress_store).clone();
                 let task_effect_counters = Arc::clone(&effect_counters);
                 let batch_started = Instant::now();
+                let batch_deadline = batch_started
+                    .checked_add(QUALIFICATION_RELEASE_BATCH_DEADLINE)
+                    .expect("release batch deadline is representable");
                 in_flight.spawn(async move {
                     let outcomes = execute_release_store_batch(
+                        batch_deadline,
                         &task_ingress_store,
                         requests.clone(),
                         &task_effect_counters,
@@ -3910,14 +4073,18 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
             .expect("restart exact status"),
             FencedTransitionV2Status::Recorded(result) if result.as_ref() == &Ok(outcome.clone())
         ));
-        let replay =
-            execute_release_store_batch(&stores[leader], vec![request.clone()], &effect_counters)
-                .await
-                .expect("restart exact replay effect must converge")
-                .into_iter()
-                .next()
-                .expect("restart exact replay has one result")
-                .expect("restart exact replay");
+        let replay = execute_release_store_batch(
+            Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+            &stores[leader],
+            vec![request.clone()],
+            &effect_counters,
+        )
+        .await
+        .expect("restart exact replay effect must converge")
+        .into_iter()
+        .next()
+        .expect("restart exact replay has one result")
+        .expect("restart exact replay");
         assert_exact_qualified_v2_success(request, &replay);
         assert_eq!(replay, *outcome);
         let changed = request_with_changed_body(request);
@@ -4086,6 +4253,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         renew_update_request(nonce, epoch_eight, &sessions[active_slot].1, &provider).await;
     assert_exact_qualified_update_request(&sessions[active_slot].1, &active_update);
     let active_outcome = execute_release_store_batch(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
         &stores[leader],
         vec![active_update.clone()],
         &effect_counters,
