@@ -1229,16 +1229,10 @@ pub fn session_mtls_candidate_evidence_v2_schema_sha256() -> String {
 pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_VERSION: &str =
     "opc-session-mtls-batch-release-gate-evidence/v1";
 
-/// SHA-256 of the fixed release-gate workload schedule.
-pub fn session_mtls_batch_release_gate_schedule_sha256() -> String {
+fn sha256_prefixed(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    const SCHEDULE: &str = concat!(
-        "session-mtls-batch-release-gate/v1;members=3;clients=12;lanes=4;",
-        "listener-slots=16;wave=48;preload=50000x256;warm-status=1008x53;",
-        "paced=60000x12@1000;active-history=110001;",
-        "negative=old-credential/new-only-server,new-only-credential/old-root-server"
-    );
-    let digest = Sha256::digest(SCHEDULE.as_bytes());
+
+    let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(71);
     encoded.push_str("sha256:");
     for byte in digest {
@@ -1247,17 +1241,52 @@ pub fn session_mtls_batch_release_gate_schedule_sha256() -> String {
     encoded
 }
 
+const SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1: &str = concat!(
+    "opc-session-mtls-batch-release-gate/v1\n",
+    "topology=members:3,clients:12,lanes-per-client:4,listener-slots:16,wave:48\n",
+    "phase-01-initial-singleton=request-index:0,operations:1\n",
+    "phase-02-preload=first-request-index:1,operations:50000,batch-size:256,concurrency:1,tail:80\n",
+    "phase-03-warm-status=samples:1008,waves:21,wave-size:48,retained-cardinality:1008,",
+    "one-based-index:1+(sample*53%50000),index-min:1,index-max:49980\n",
+    "phase-04-paced-and-active-history-check=first-request-index:50001,operations:60000,batch-size:12,batches:5000,",
+    "logical-operations-per-second:1000,max-in-flight-per-client:4,max-in-flight-global:48\n",
+    "phase-05-leader-loss-restart-reconnect-and-active-history-check=logical-voter-generations:2/1/1\n",
+    "phase-06-credential-rotation-and-positive-controls=all-members:old-root-overlap,replacement:new-root-overlap,positive-statuses:4\n",
+    "phase-07-release-original-pool=target:replacement,lanes:4,remaining-listener-lanes:12\n",
+    "phase-08-publish-replacement-new-only-and-old-credential-negative=pool-lanes:4,client-trust:overlap\n",
+    "phase-09-delayed-ambiguity=first-request-index:110001,operations:12,batch-size:12\n",
+    "phase-10-restore-replacement-pool-and-resolve-ambiguity-statuses=lanes:4,operations:12\n",
+    "phase-11-release-old-root-pool=lanes:4,remaining-listener-lanes:12\n",
+    "phase-12-publish-old-only-and-new-credential-negative=pool-lanes:4,client-trust:overlap\n",
+    "phase-13-restore-old-root-settle-and-resource-validation=normal-lanes:48,active-history-entries:110001\n"
+);
+
+/// Literal SHA-256 binding for the complete batch release-gate schedule.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256: &str =
+    "sha256:0db4b609a65ae9da27ef8840298cf4d14b135d0897254551b396fdd3d6947be2";
+
+/// Literal SHA-256 binding for the closed batch release-gate schema.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_SHA256: &str =
+    "sha256:9924c9d2fd2455882bca67a873d69d7368345d9b1c4d91ff48e63ec9e2e86865";
+
+/// SHA-256 of the fixed release-gate workload schedule.
+pub fn session_mtls_batch_release_gate_schedule_sha256() -> String {
+    assert_eq!(
+        sha256_prefixed(SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1.as_bytes()),
+        SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256,
+        "batch release-gate schedule digest literal must bind the canonical bytes"
+    );
+    SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256.to_owned()
+}
+
 /// SHA-256 of the immutable batch release-gate evidence schema bytes.
 pub fn session_mtls_batch_release_gate_evidence_v1_schema_sha256() -> String {
-    use std::fmt::Write as _;
-
-    let digest = Sha256::digest(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON.as_bytes());
-    let mut encoded = String::with_capacity(71);
-    encoded.push_str("sha256:");
-    for byte in digest {
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
-    encoded
+    assert_eq!(
+        sha256_prefixed(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON.as_bytes()),
+        SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_SHA256,
+        "batch release-gate schema digest literal must bind the closed schema bytes"
+    );
+    SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_SHA256.to_owned()
 }
 
 /// Immutable digest bindings for one batch release-gate observation.
@@ -1286,8 +1315,8 @@ pub struct SessionMtlsBatchReleaseGateBindingsV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionMtlsBatchReleaseGatePoolEvidenceV1 {
-    /// Fixed pool lane role.
-    pub name: String,
+    /// Closed nonidentifying role for this capacity-accounting pool.
+    pub role: SessionMtlsBatchReleaseGatePoolRoleV1,
     /// Every physical connection setup attempt for this pool.
     pub setup_attempts: u64,
     /// Failed setup attempts for this pool.
@@ -1298,6 +1327,34 @@ pub struct SessionMtlsBatchReleaseGatePoolEvidenceV1 {
     pub pool_wait_current: u64,
     /// Largest observed queued-caller count for this pool.
     pub pool_wait_max: u64,
+    /// Declared fixed logical lane count for this pool.
+    pub configured_lanes: u64,
+    /// Open lanes after the pool's evidence settlement point.
+    pub active_lanes: u64,
+    /// Reusable lanes after the pool's evidence settlement point.
+    pub idle_lanes: u64,
+}
+
+/// Closed roles for the normal and sequential supplemental pools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMtlsBatchReleaseGatePoolRoleV1 {
+    OriginalFixedPools,
+    OldCredentialNewOnlyServer,
+    DelayedResponseAmbiguity,
+    NewCredentialOldRootServer,
+}
+
+/// One sampled operating-system process generation for a logical voter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsBatchReleaseGateResourceGenerationV1 {
+    /// Logical voter index, not a subscriber or endpoint identity.
+    pub logical_voter_index: usize,
+    /// Process ID sampled for this generation.
+    pub process_id: u32,
+    /// Number of successful resource samples for this process generation.
+    pub samples: u64,
 }
 
 /// Closed, non-production evidence emitted by the mTLS batch release gate.
@@ -1338,6 +1395,12 @@ pub struct SessionMtlsBatchReleaseGateEvidenceV1 {
     pub warm_status_request_stride: usize,
     /// Exact active-history entry count after preload and paced work.
     pub active_history_entries: usize,
+    /// Declared normal-pool lanes, fixed at 12 clients times four lanes.
+    pub normal_configured_lanes: u64,
+    /// Open normal-pool lanes after recovery settlement.
+    pub normal_active_lanes: u64,
+    /// Idle normal-pool lanes after recovery settlement.
+    pub normal_idle_lanes: u64,
     /// Accounting for the original fixed normal-client pool set.
     pub original_fixed_pools: SessionMtlsBatchReleaseGatePoolEvidenceV1,
     /// Every sequential supplemental pool that reuses released capacity.
@@ -1354,10 +1417,8 @@ pub struct SessionMtlsBatchReleaseGateEvidenceV1 {
     pub typed_read_unavailable_retry_high_water: usize,
     /// Maximum queued-caller high-water across every declared pool.
     pub aggregate_pool_wait_max: u64,
-    /// Old client credential rejected by a new-only server while trusting it.
-    pub old_credential_new_only_server_authentication: bool,
-    /// New-only client credential rejected by an old-root server.
-    pub new_only_credential_old_root_server_authentication: bool,
+    /// Process-generation observations grouped by logical voter index.
+    pub resource_generations: Vec<SessionMtlsBatchReleaseGateResourceGenerationV1>,
     /// Exact successful new-credential/new-server normal-client statuses.
     pub positive_new_credential_new_server_statuses: usize,
 }
@@ -1376,6 +1437,9 @@ pub enum SessionMtlsBatchReleaseGateEvidenceError {
     Binding,
     #[error("mTLS batch evidence pool accounting is invalid")]
     PoolAccounting,
+    /// Resource-generation coverage is absent or internally inconsistent.
+    #[error("mTLS batch evidence resource generations are invalid")]
+    ResourceGeneration,
 }
 
 impl SessionMtlsBatchReleaseGateEvidenceV1 {
@@ -1408,8 +1472,9 @@ impl SessionMtlsBatchReleaseGateEvidenceV1 {
             || self.warm_status_request_index_max != 49_980
             || self.warm_status_request_stride != 53
             || self.active_history_entries != 110_001
-            || !self.old_credential_new_only_server_authentication
-            || !self.new_only_credential_old_root_server_authentication
+            || self.normal_configured_lanes != 48
+            || self.normal_active_lanes != 48
+            || self.normal_idle_lanes != 48
             || self.positive_new_credential_new_server_statuses != 4
         {
             return Err(SessionMtlsBatchReleaseGateEvidenceError::Claim);
@@ -1429,11 +1494,15 @@ impl SessionMtlsBatchReleaseGateEvidenceV1 {
         {
             return Err(SessionMtlsBatchReleaseGateEvidenceError::Binding);
         }
-        if self.original_fixed_pools.name != "original_fixed_pools"
+        if self.original_fixed_pools.role
+            != SessionMtlsBatchReleaseGatePoolRoleV1::OriginalFixedPools
             || self.supplemental_pools.len() != 3
-            || self.supplemental_pools[0].name != "old_credential_new_only_server"
-            || self.supplemental_pools[1].name != "delayed_response_ambiguity"
-            || self.supplemental_pools[2].name != "new_only_credential_old_root_server"
+            || self.supplemental_pools[0].role
+                != SessionMtlsBatchReleaseGatePoolRoleV1::OldCredentialNewOnlyServer
+            || self.supplemental_pools[1].role
+                != SessionMtlsBatchReleaseGatePoolRoleV1::DelayedResponseAmbiguity
+            || self.supplemental_pools[2].role
+                != SessionMtlsBatchReleaseGatePoolRoleV1::NewCredentialOldRootServer
         {
             return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
         }
@@ -1444,24 +1513,69 @@ impl SessionMtlsBatchReleaseGateEvidenceV1 {
         for pool in
             std::iter::once(&self.original_fixed_pools).chain(self.supplemental_pools.iter())
         {
-            if pool.setup_attempts != pool.setup_successes.saturating_add(pool.setup_failures)
+            if pool.setup_attempts == 0
+                || pool.setup_successes.checked_add(pool.setup_failures)
+                    != Some(pool.setup_attempts)
                 || pool.pool_wait_current != 0
+                || pool.pool_wait_max > 64
+                || pool.active_lanes > pool.configured_lanes
+                || pool.idle_lanes > pool.active_lanes
             {
                 return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
             }
-            attempts = attempts.saturating_add(pool.setup_attempts);
-            failures = failures.saturating_add(pool.setup_failures);
-            successes = successes.saturating_add(pool.setup_successes);
+            attempts = attempts
+                .checked_add(pool.setup_attempts)
+                .ok_or(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)?;
+            failures = failures
+                .checked_add(pool.setup_failures)
+                .ok_or(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)?;
+            successes = successes
+                .checked_add(pool.setup_successes)
+                .ok_or(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)?;
             observed_max = observed_max.max(pool.pool_wait_max);
         }
         if attempts != self.aggregate_setup_attempts
             || failures != self.aggregate_setup_failures
             || successes != self.aggregate_setup_successes
-            || attempts != successes.saturating_add(failures)
+            || successes.checked_add(failures) != Some(attempts)
             || self.typed_read_unavailable_retry_high_water > self.typed_read_unavailable_retries
             || observed_max != self.aggregate_pool_wait_max
         {
             return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
+        }
+        if self.original_fixed_pools.configured_lanes != 48
+            || self.original_fixed_pools.active_lanes != 48
+            || self.original_fixed_pools.idle_lanes != 48
+            || self.supplemental_pools.iter().any(|pool| {
+                pool.configured_lanes != 4 || pool.active_lanes != 0 || pool.idle_lanes != 0
+            })
+            || self.supplemental_pools[0].setup_successes != 0
+            || self.supplemental_pools[0].setup_failures == 0
+            || self.supplemental_pools[1].setup_successes == 0
+            || self.supplemental_pools[2].setup_successes != 0
+            || self.supplemental_pools[2].setup_failures == 0
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
+        }
+        let mut generations_by_voter = [0_u8; 3];
+        let mut observed_process_ids = std::collections::BTreeSet::new();
+        for generation in &self.resource_generations {
+            if generation.logical_voter_index >= 3
+                || generation.process_id == 0
+                || generation.samples == 0
+                || !observed_process_ids.insert(generation.process_id)
+            {
+                return Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration);
+            }
+            let count = &mut generations_by_voter[generation.logical_voter_index];
+            *count = count
+                .checked_add(1)
+                .ok_or(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration)?;
+        }
+        if self.resource_generations.len() != 4
+            || !matches!(generations_by_voter, [2, 1, 1] | [1, 2, 1] | [1, 1, 2])
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration);
         }
         Ok(())
     }
@@ -5147,27 +5261,65 @@ mod tests {
     use super::*;
 
     fn batch_release_gate_pool(
-        name: &str,
+        role: SessionMtlsBatchReleaseGatePoolRoleV1,
         successes: u64,
         failures: u64,
         wait_max: u64,
+        configured_lanes: u64,
+        active_lanes: u64,
+        idle_lanes: u64,
     ) -> SessionMtlsBatchReleaseGatePoolEvidenceV1 {
         SessionMtlsBatchReleaseGatePoolEvidenceV1 {
-            name: name.to_owned(),
+            role,
             setup_attempts: successes + failures,
             setup_failures: failures,
             setup_successes: successes,
             pool_wait_current: 0,
             pool_wait_max: wait_max,
+            configured_lanes,
+            active_lanes,
+            idle_lanes,
         }
     }
 
     fn batch_release_gate_evidence_fixture() -> SessionMtlsBatchReleaseGateEvidenceV1 {
-        let original_fixed_pools = batch_release_gate_pool("original_fixed_pools", 48, 0, 2);
+        let original_fixed_pools = batch_release_gate_pool(
+            SessionMtlsBatchReleaseGatePoolRoleV1::OriginalFixedPools,
+            48,
+            0,
+            2,
+            48,
+            48,
+            48,
+        );
         let supplemental_pools = vec![
-            batch_release_gate_pool("old_credential_new_only_server", 0, 1, 1),
-            batch_release_gate_pool("delayed_response_ambiguity", 4, 0, 3),
-            batch_release_gate_pool("new_only_credential_old_root_server", 0, 1, 1),
+            batch_release_gate_pool(
+                SessionMtlsBatchReleaseGatePoolRoleV1::OldCredentialNewOnlyServer,
+                0,
+                1,
+                1,
+                4,
+                0,
+                0,
+            ),
+            batch_release_gate_pool(
+                SessionMtlsBatchReleaseGatePoolRoleV1::DelayedResponseAmbiguity,
+                4,
+                0,
+                3,
+                4,
+                0,
+                0,
+            ),
+            batch_release_gate_pool(
+                SessionMtlsBatchReleaseGatePoolRoleV1::NewCredentialOldRootServer,
+                0,
+                1,
+                1,
+                4,
+                0,
+                0,
+            ),
         ];
         let aggregate_setup_attempts = std::iter::once(&original_fixed_pools)
             .chain(supplemental_pools.iter())
@@ -5208,6 +5360,9 @@ mod tests {
             warm_status_request_index_max: 49_980,
             warm_status_request_stride: 53,
             active_history_entries: 110_001,
+            normal_configured_lanes: 48,
+            normal_active_lanes: 48,
+            normal_idle_lanes: 48,
             original_fixed_pools,
             supplemental_pools,
             aggregate_setup_attempts,
@@ -5216,10 +5371,66 @@ mod tests {
             typed_read_unavailable_retries: 0,
             typed_read_unavailable_retry_high_water: 0,
             aggregate_pool_wait_max: 3,
-            old_credential_new_only_server_authentication: true,
-            new_only_credential_old_root_server_authentication: true,
+            resource_generations: vec![
+                SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                    logical_voter_index: 0,
+                    process_id: 11,
+                    samples: 1,
+                },
+                SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                    logical_voter_index: 0,
+                    process_id: 12,
+                    samples: 1,
+                },
+                SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                    logical_voter_index: 1,
+                    process_id: 13,
+                    samples: 1,
+                },
+                SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                    logical_voter_index: 2,
+                    process_id: 14,
+                    samples: 1,
+                },
+            ],
             positive_new_credential_new_server_statuses: 4,
         }
+    }
+
+    fn assert_local_schema_refs_resolve(schema: &serde_json::Value) {
+        fn visit(
+            value: &serde_json::Value,
+            definitions: &serde_json::Map<String, serde_json::Value>,
+        ) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if let Some(reference) = object.get("$ref").and_then(serde_json::Value::as_str)
+                    {
+                        let definition = reference
+                            .strip_prefix("#/$defs/")
+                            .expect("closed schema contains only local definition references");
+                        assert!(
+                            definitions.contains_key(definition),
+                            "closed schema reference must resolve: {reference}"
+                        );
+                    }
+                    for nested in object.values() {
+                        visit(nested, definitions);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for nested in values {
+                        visit(nested, definitions);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let definitions = schema["$defs"]
+            .as_object()
+            .expect("closed schema has local definitions");
+        visit(schema, definitions);
     }
 
     #[test]
@@ -5232,6 +5443,10 @@ mod tests {
                 .expect("round-trip closed evidence"),
             evidence
         );
+        let schema: serde_json::Value =
+            serde_json::from_str(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON)
+                .expect("closed batch evidence schema parses");
+        assert_local_schema_refs_resolve(&schema);
 
         let mut unsettled = batch_release_gate_evidence_fixture();
         unsettled.supplemental_pools[1].pool_wait_current = 1;
@@ -5246,6 +5461,115 @@ mod tests {
         assert_eq!(
             unaccounted.validate(),
             Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut zero_attempts = batch_release_gate_evidence_fixture();
+        zero_attempts.supplemental_pools[0].setup_attempts = 0;
+        zero_attempts.supplemental_pools[0].setup_failures = 0;
+        assert_eq!(
+            zero_attempts.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut overbound_wait = batch_release_gate_evidence_fixture();
+        overbound_wait.supplemental_pools[1].pool_wait_max = 65;
+        assert_eq!(
+            overbound_wait.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut overflow = batch_release_gate_evidence_fixture();
+        overflow.original_fixed_pools.setup_attempts = u64::MAX;
+        overflow.original_fixed_pools.setup_successes = u64::MAX;
+        assert_eq!(
+            overflow.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut wrong_binding = batch_release_gate_evidence_fixture();
+        wrong_binding.bindings.workload_schedule_sha256 = format!("sha256:{}", "0".repeat(64));
+        assert_eq!(
+            wrong_binding.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Binding)
+        );
+
+        let mut reordered_roles = batch_release_gate_evidence_fixture();
+        reordered_roles.supplemental_pools.swap(0, 1);
+        assert_eq!(
+            reordered_roles.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut duplicate_process = batch_release_gate_evidence_fixture();
+        duplicate_process.resource_generations[1].process_id = 11;
+        assert_eq!(
+            duplicate_process.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration)
+        );
+
+        let mut wrong_generation_distribution = batch_release_gate_evidence_fixture();
+        wrong_generation_distribution.resource_generations[3].logical_voter_index = 1;
+        assert_eq!(
+            wrong_generation_distribution.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration)
+        );
+
+        let mut wrong_claim = batch_release_gate_evidence_fixture();
+        wrong_claim.normal_idle_lanes = 47;
+        assert_eq!(
+            wrong_claim.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+
+        let mut unknown = serde_json::to_value(batch_release_gate_evidence_fixture())
+            .expect("encode evidence value");
+        unknown["unexpected"] = serde_json::Value::Bool(true);
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(
+                &serde_json::to_vec(&unknown).expect("encode unknown field"),
+            ),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::InvalidDocument)
+        );
+
+        let mut arbitrary_role = serde_json::to_value(batch_release_gate_evidence_fixture())
+            .expect("encode evidence value");
+        arbitrary_role["supplemental_pools"][0]["role"] = serde_json::json!("subscriber-123");
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(
+                &serde_json::to_vec(&arbitrary_role).expect("encode arbitrary role"),
+            ),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::InvalidDocument)
+        );
+
+        let mut nested_unknown = serde_json::to_value(batch_release_gate_evidence_fixture())
+            .expect("encode evidence value");
+        nested_unknown["resource_generations"][0]["unexpected"] = serde_json::json!(true);
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(
+                &serde_json::to_vec(&nested_unknown).expect("encode nested unknown"),
+            ),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::InvalidDocument)
+        );
+
+        let mut missing = serde_json::to_value(batch_release_gate_evidence_fixture())
+            .expect("encode evidence value");
+        missing
+            .as_object_mut()
+            .expect("evidence is an object")
+            .remove("resource_generations");
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(
+                &serde_json::to_vec(&missing).expect("encode missing field"),
+            ),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::InvalidDocument)
+        );
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(&vec![
+                b'x';
+                SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_MAX_BYTES
+                    + 1
+            ],),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::DocumentTooLarge)
         );
     }
 
@@ -5267,10 +5591,55 @@ mod tests {
             .expect("closed schema has required fields")
             .iter()
             .any(|field| field == "aggregate_setup_attempts"));
+        assert_local_schema_refs_resolve(&schema);
+        for phase in [
+            "phase-01-initial-singleton",
+            "phase-02-preload",
+            "phase-03-warm-status",
+            "phase-04-paced-and-active-history-check",
+            "phase-05-leader-loss-restart-reconnect-and-active-history-check",
+            "phase-06-credential-rotation-and-positive-controls",
+            "phase-07-release-original-pool",
+            "phase-08-publish-replacement-new-only-and-old-credential-negative",
+            "phase-09-delayed-ambiguity",
+            "phase-10-restore-replacement-pool-and-resolve-ambiguity-statuses",
+            "phase-11-release-old-root-pool",
+            "phase-12-publish-old-only-and-new-credential-negative",
+            "phase-13-restore-old-root-settle-and-resource-validation",
+        ] {
+            assert!(
+                SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1.contains(phase),
+                "canonical schedule binds causal phase {phase}"
+            );
+        }
+        let reordered_schedule = SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1.replacen(
+            "phase-07-release-original-pool",
+            "phase-11-release-old-root-pool",
+            1,
+        );
+        let removed_phase_schedule = SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1
+            .replace("phase-09-delayed-ambiguity", "phase-09-removed");
         assert_ne!(
+            sha256_prefixed(reordered_schedule.as_bytes()),
+            SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256,
+            "reordering causal phases cannot retain the canonical binding"
+        );
+        assert_ne!(
+            sha256_prefixed(removed_phase_schedule.as_bytes()),
+            SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256,
+            "removing a causal phase cannot retain the canonical binding"
+        );
+        assert_eq!(
+            sha256_prefixed(SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1.as_bytes()),
+            SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256
+        );
+        assert_eq!(
+            sha256_prefixed(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON.as_bytes()),
+            SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_SHA256
+        );
+        assert_eq!(
             session_mtls_batch_release_gate_schedule_sha256(),
-            session_mtls_candidate_schedule_sha256(SessionMtlsCandidateCampaign::RotationCore, 3)
-                .expect("rotation-core schedule is defined")
+            SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256
         );
     }
 

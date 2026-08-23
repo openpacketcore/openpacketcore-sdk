@@ -67,7 +67,8 @@ use opc_session_testkit::qualification::{
     QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
     QualificationTrafficStatus, QualificationTransportConfig,
     SessionMtlsBatchReleaseGateBindingsV1, SessionMtlsBatchReleaseGateEvidenceV1,
-    SessionMtlsBatchReleaseGatePoolEvidenceV1, SessionMtlsCandidateCampaign,
+    SessionMtlsBatchReleaseGatePoolEvidenceV1, SessionMtlsBatchReleaseGatePoolRoleV1,
+    SessionMtlsBatchReleaseGateResourceGenerationV1, SessionMtlsCandidateCampaign,
     SessionMtlsCandidateEvidenceV2, SessionMtlsCandidateSourceTreeStatus,
     QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
     QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
@@ -187,6 +188,7 @@ struct ProcessResourceSnapshot {
 
 #[derive(Debug, Clone, Copy)]
 struct ProcessResourceHighWater {
+    process_id: u32,
     samples: u64,
     file_descriptors: usize,
     threads: usize,
@@ -211,19 +213,23 @@ impl ResourceSampler {
         let handle = thread::Builder::new()
             .name("qualification-resource-sampler".to_owned())
             .spawn(move || {
-                let mut high_water = vec![
-                    vec![ProcessResourceHighWater {
-                        samples: 0,
-                        file_descriptors: 0,
-                        threads: 0,
-                        vm_rss_kib: 0,
-                        vm_hwm_kib: 0,
-                    }];
-                    process_ids_for_thread
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .len()
-                ];
+                let initial_process_ids = process_ids_for_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let mut high_water = initial_process_ids
+                    .iter()
+                    .map(|process_id| {
+                        vec![ProcessResourceHighWater {
+                            process_id: process_id.expect("initial sampler PID is present"),
+                            samples: 0,
+                            file_descriptors: 0,
+                            threads: 0,
+                            vm_rss_kib: 0,
+                            vm_hwm_kib: 0,
+                        }]
+                    })
+                    .collect::<Vec<_>>();
                 let mut observed_process_ids = vec![None; high_water.len()];
                 loop {
                     let current_process_ids = process_ids_for_thread
@@ -237,6 +243,7 @@ impl ResourceSampler {
                         if observed_process_ids[index] != Some(process_id) {
                             if observed_process_ids[index].is_some() {
                                 high_water[index].push(ProcessResourceHighWater {
+                                    process_id,
                                     samples: 0,
                                     file_descriptors: 0,
                                     threads: 0,
@@ -313,6 +320,7 @@ fn merge_resource_generation_high_water(
         .map(|voter_generations| {
             voter_generations.iter().copied().fold(
                 ProcessResourceHighWater {
+                    process_id: 0,
                     samples: 0,
                     file_descriptors: 0,
                     threads: 0,
@@ -11171,7 +11179,23 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         "releasing one original replacement-routed pool leaves exactly four of 16 listener slots"
     );
 
-    let old_credential_before = fleet.all_lifecycle_metrics()[replacement];
+    // All consensus-bearing work is complete.  Make this listener genuinely
+    // new-root-only before exercising the old-credential seam: publishing it
+    // directly preserves the already-established cluster peer channels while
+    // changing the listener's independently selected trust generation.
+    let replacement_source_before = fleet.projected_status(replacement);
+    let replacement_controller_before = fleet.material_status(replacement);
+    fleet.publish_known_projected_generation(
+        replacement,
+        CredentialGeneration::NewRoot,
+        TrustGeneration::NewOnly,
+        "v2-batch-replacement-new-only-credential-negative",
+    );
+    fleet.wait_for_member_publication(
+        replacement,
+        replacement_source_before.generation,
+        replacement_controller_before.epoch,
+    );
     let (_old_leaf_identity_source, old_leaf_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         replacement,
@@ -11179,33 +11203,28 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         fleet.pki.consumer_identity_state_with_generations(
             &consumer_identities[seam_client_index],
             ConsumerCredentialGeneration::OldRoot,
-            TrustGeneration::NewOnly,
+            // The client retains overlap trust so it verifies the new server
+            // leaf; only its presented credential is intentionally old.
+            TrustGeneration::Overlap,
         ),
         pool_config,
         None,
     );
-    let old_leaf_authentication_rejection = matches!(
+    let old_leaf_consumer_setup_rejection = matches!(
         runtime.block_on(old_leaf_client.prewarm_v2()),
-        Err(SessionConsumerClientError::Authentication)
+        Err(SessionConsumerClientError::Unavailable)
     );
     assert!(
-        old_leaf_authentication_rejection,
-        "old-root/new-leaf negative must return the typed authentication rejection"
+        old_leaf_consumer_setup_rejection,
+        "old-root/new-only-server negative must reach the listener transport rejection"
     );
+    runtime.block_on(old_leaf_client.shutdown());
     let old_leaf_diagnostics = old_leaf_client.v2_diagnostics();
     assert!(old_leaf_diagnostics.setup_attempts > 0);
     assert_eq!(old_leaf_diagnostics.setup_successes, 0);
+    assert_eq!(old_leaf_diagnostics.active, 0);
+    assert_eq!(old_leaf_diagnostics.idle, 0);
     assert_eq!(old_leaf_diagnostics.pool_wait_current, 0);
-    let old_credential_after = fleet.all_lifecycle_metrics()[replacement];
-    assert!(
-        old_credential_after.connection_failure_authentication
-            > old_credential_before.connection_failure_authentication
-    );
-    assert_eq!(
-        old_credential_after.empty_vote_dispatches,
-        old_credential_before.empty_vote_dispatches
-    );
-    runtime.block_on(old_leaf_client.shutdown());
 
     let (_delayed_identity_source, delayed_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
@@ -11256,15 +11275,17 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         },
         "ambiguity retains every ordered complete V2 ID and forbids replay"
     );
+    runtime.block_on(delayed_client.shutdown());
     let delayed_after_ambiguity = delayed_client.v2_diagnostics();
     assert_eq!(
         delayed_after_ambiguity.setup_attempts,
         delayed_after_ambiguity.setup_successes + delayed_after_ambiguity.setup_failures,
         "the supplemental delayed probe accounts for every physical lane setup"
     );
+    assert_eq!(delayed_after_ambiguity.active, 0);
+    assert_eq!(delayed_after_ambiguity.idle, 0);
     assert_eq!(delayed_after_ambiguity.pool_wait_current, 0);
     assert!(delayed_after_ambiguity.pool_wait_max <= V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64);
-    runtime.block_on(delayed_client.shutdown());
     let (restored_identity_source, restored_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         replacement,
@@ -11281,6 +11302,20 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .expect("restore the released original four-lane replacement pool");
     clients[seam_client_index] = restored_client;
     drop(restored_identity_source);
+    // Resolve the exact retained ambiguity batch while every consensus peer
+    // still has overlap trust. The following listener-only credential probes
+    // deliberately install exclusive roots and do not carry quorum traffic.
+    runtime.block_on(async {
+        for request in ambiguous_requests {
+            qualification_execute_v2_status_sample(
+                clients[replacement].clone(),
+                scope,
+                request,
+                Instant::now(),
+            )
+            .await;
+        }
+    });
     let old_root_server = (replacement + 1) % MEMBER_COUNT;
     let old_root_seam_client_index = (0..clients.len())
         .find(|client_index| client_index % MEMBER_COUNT == old_root_server)
@@ -11298,7 +11333,22 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         old_root_lanes_after_release, 12,
         "releasing one old-root pool leaves exactly four of 16 listener permits for the credential negative"
     );
-    let new_credential_before = fleet.all_lifecycle_metrics()[old_root_server];
+    // Likewise select OldOnly at the second listener only after all quorum
+    // activity has ended.  Its retained old-root clients continue to trust its
+    // old server leaf, while the supplemental client presents only new-root.
+    let old_root_source_before = fleet.projected_status(old_root_server);
+    let old_root_controller_before = fleet.material_status(old_root_server);
+    fleet.publish_known_projected_generation(
+        old_root_server,
+        CredentialGeneration::Initial,
+        TrustGeneration::OldOnly,
+        "v2-batch-old-root-server-credential-negative",
+    );
+    fleet.wait_for_member_publication(
+        old_root_server,
+        old_root_source_before.generation,
+        old_root_controller_before.epoch,
+    );
     let (_new_only_identity_source, new_only_old_root_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         old_root_server,
@@ -11306,30 +11356,23 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         fleet.pki.consumer_identity_state_with_generations(
             &consumer_identities[old_root_seam_client_index],
             ConsumerCredentialGeneration::NewRoot,
-            TrustGeneration::OldOnly,
+            TrustGeneration::Overlap,
         ),
         pool_config,
         None,
     );
-    let new_only_old_root_authentication_rejection = matches!(
+    let new_only_old_root_consumer_setup_rejection = matches!(
         runtime.block_on(new_only_old_root_client.prewarm_v2()),
-        Err(SessionConsumerClientError::Authentication)
+        Err(SessionConsumerClientError::Unavailable)
     );
-    assert!(new_only_old_root_authentication_rejection);
+    assert!(new_only_old_root_consumer_setup_rejection);
+    runtime.block_on(new_only_old_root_client.shutdown());
     let new_only_old_root_diagnostics = new_only_old_root_client.v2_diagnostics();
     assert!(new_only_old_root_diagnostics.setup_attempts > 0);
     assert_eq!(new_only_old_root_diagnostics.setup_successes, 0);
+    assert_eq!(new_only_old_root_diagnostics.active, 0);
+    assert_eq!(new_only_old_root_diagnostics.idle, 0);
     assert_eq!(new_only_old_root_diagnostics.pool_wait_current, 0);
-    let new_credential_after = fleet.all_lifecycle_metrics()[old_root_server];
-    assert!(
-        new_credential_after.connection_failure_authentication
-            > new_credential_before.connection_failure_authentication
-    );
-    assert_eq!(
-        new_credential_after.empty_vote_dispatches,
-        new_credential_before.empty_vote_dispatches
-    );
-    runtime.block_on(new_only_old_root_client.shutdown());
     let (restored_old_root_identity_source, restored_old_root_client) =
         qualification_persistent_v2_client(
             Arc::clone(&endpoints),
@@ -11347,17 +11390,6 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .expect("restore old-root pool");
     clients[old_root_seam_client_index] = restored_old_root_client;
     drop(restored_old_root_identity_source);
-    runtime.block_on(async {
-        for request in ambiguous_requests {
-            qualification_execute_v2_status_sample(
-                clients[replacement].clone(),
-                scope,
-                request,
-                Instant::now(),
-            )
-            .await;
-        }
-    });
 
     let restored_seam_current = clients[seam_client_index].v2_diagnostics();
     let restored_old_root_current = clients[old_root_seam_client_index].v2_diagnostics();
@@ -11498,6 +11530,30 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         &resource_high_water,
         &settled_resources,
     );
+    let mut resource_generations = resource_high_water_generations
+        .iter()
+        .enumerate()
+        .flat_map(|(logical_voter_index, generations)| {
+            generations.iter().map(move |generation| {
+                SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                    logical_voter_index,
+                    process_id: generation.process_id,
+                    samples: generation.samples,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    resource_generations
+        .sort_by_key(|generation| (generation.logical_voter_index, generation.process_id));
+    let distinct_resource_processes = resource_generations
+        .iter()
+        .map(|generation| generation.process_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        distinct_resource_processes.len(),
+        resource_generations.len(),
+        "each logical-voter generation has a distinct nonzero process ID"
+    );
     let pool_wait_max = after_recovery
         .iter()
         .map(|diagnostics| diagnostics.pool_wait_max)
@@ -11508,30 +11564,48 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .verify_unchanged(&fleet.config_paths)
         .expect("candidate inputs remain unchanged before release-gate evidence output");
     let original_pool = SessionMtlsBatchReleaseGatePoolEvidenceV1 {
-        name: "original_fixed_pools".to_owned(),
+        role: SessionMtlsBatchReleaseGatePoolRoleV1::OriginalFixedPools,
         setup_attempts: original_setup_attempt_delta,
         setup_failures: original_setup_failure_delta,
         setup_successes: original_setup_success_delta,
         pool_wait_current: 0,
         pool_wait_max,
+        configured_lanes: configured_connections,
+        active_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.active)
+            .sum(),
+        idle_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.idle)
+            .sum(),
     };
     let supplemental_pools = [
-        ("old_credential_new_only_server", old_leaf_diagnostics),
-        ("delayed_response_ambiguity", delayed_after_ambiguity),
         (
-            "new_only_credential_old_root_server",
+            SessionMtlsBatchReleaseGatePoolRoleV1::OldCredentialNewOnlyServer,
+            old_leaf_diagnostics,
+        ),
+        (
+            SessionMtlsBatchReleaseGatePoolRoleV1::DelayedResponseAmbiguity,
+            delayed_after_ambiguity,
+        ),
+        (
+            SessionMtlsBatchReleaseGatePoolRoleV1::NewCredentialOldRootServer,
             new_only_old_root_diagnostics,
         ),
     ]
     .into_iter()
     .map(
-        |(name, diagnostics)| SessionMtlsBatchReleaseGatePoolEvidenceV1 {
-            name: name.to_owned(),
+        |(role, diagnostics)| SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+            role,
             setup_attempts: diagnostics.setup_attempts,
             setup_failures: diagnostics.setup_failures,
             setup_successes: diagnostics.setup_successes,
             pool_wait_current: diagnostics.pool_wait_current,
             pool_wait_max: diagnostics.pool_wait_max,
+            configured_lanes: V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+            active_lanes: diagnostics.active,
+            idle_lanes: diagnostics.idle,
         },
     )
     .collect::<Vec<_>>();
@@ -11572,6 +11646,15 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         active_history_entries: 1
             + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES
             + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+        normal_configured_lanes: configured_connections,
+        normal_active_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.active)
+            .sum(),
+        normal_idle_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.idle)
+            .sum(),
         original_fixed_pools: original_pool,
         supplemental_pools,
         aggregate_setup_attempts,
@@ -11580,8 +11663,7 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         typed_read_unavailable_retries: mutation_typed_read_unavailable_retries,
         typed_read_unavailable_retry_high_water: mutation_typed_read_unavailable_retry_high_water,
         aggregate_pool_wait_max,
-        old_credential_new_only_server_authentication: old_leaf_authentication_rejection,
-        new_only_credential_old_root_server_authentication: new_only_old_root_authentication_rejection,
+        resource_generations,
         positive_new_credential_new_server_statuses: new_only_client_indices.len(),
     };
     typed_evidence
@@ -11604,6 +11686,116 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         }
     });
     fleet.shutdown();
+}
+
+fn assert_batch_credential_negative_handshake(
+    server_credential: CredentialGeneration,
+    server_trust: TrustGeneration,
+    client_credential: ConsumerCredentialGeneration,
+    client_trust: TrustGeneration,
+    phase: &str,
+) {
+    const MEMBER_COUNT: usize = 3;
+    const TARGET: usize = 0;
+    let mut fleet = Fleet::start(MEMBER_COUNT);
+    let consumer_identities = (0..V2_BATCH_RELEASE_GATE_CLIENTS)
+        .map(stateless_consumer_identity)
+        .collect::<Vec<_>>();
+    let identity = consumer_identities[TARGET].clone();
+    let (endpoint, scope) = fleet.start_stateless_consumer(TARGET, consumer_identities);
+    let source_before = fleet.projected_status(TARGET);
+    let controller_before = fleet.material_status(TARGET);
+    fleet.publish_known_projected_generation(TARGET, server_credential, server_trust, phase);
+    fleet.wait_for_member_publication(TARGET, source_before.generation, controller_before.epoch);
+    let endpoints = Arc::new(Mutex::new(vec![endpoint; MEMBER_COUNT]));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bounded credential-negative runtime");
+    let pool_config = PersistentSessionConsumerConfig::try_new(
+        1,
+        V2_BATCH_RELEASE_GATE_PENDING_CALLS,
+        Duration::from_millis(250),
+        1,
+        Duration::from_millis(1_500),
+        1,
+        Duration::from_millis(25),
+        Duration::from_secs(5),
+    )
+    .expect("single-lane credential-negative pool");
+
+    let positive_credential = match server_trust {
+        TrustGeneration::OldOnly => ConsumerCredentialGeneration::OldRoot,
+        TrustGeneration::NewOnly => ConsumerCredentialGeneration::NewRoot,
+        TrustGeneration::Overlap => panic!("credential-negative server trust must be exclusive"),
+    };
+    let (_positive_identity_source, positive_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        TARGET,
+        scope,
+        fleet.pki.consumer_identity_state_with_generations(
+            &identity,
+            positive_credential,
+            server_trust,
+        ),
+        pool_config,
+        None,
+    );
+    runtime
+        .block_on(positive_client.prewarm_v2())
+        .expect("matching credential is a positive mTLS control");
+    let positive_diagnostics = positive_client.v2_diagnostics();
+    assert_eq!(positive_diagnostics.setup_attempts, 1);
+    assert_eq!(positive_diagnostics.setup_successes, 1);
+    runtime.block_on(positive_client.shutdown());
+
+    let (_negative_identity_source, negative_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        TARGET,
+        scope,
+        fleet.pki.consumer_identity_state_with_generations(
+            &identity,
+            client_credential,
+            client_trust,
+        ),
+        pool_config,
+        None,
+    );
+    let negative_result = runtime.block_on(negative_client.prewarm_v2());
+    assert!(
+        matches!(negative_result, Err(SessionConsumerClientError::Unavailable)),
+        "actual consumer listener rejects the mismatched client credential before setup: phase={phase}, result={negative_result:?}"
+    );
+    runtime.block_on(negative_client.shutdown());
+    let negative_diagnostics = negative_client.v2_diagnostics();
+    assert_eq!(negative_diagnostics.setup_attempts, 1);
+    assert_eq!(negative_diagnostics.setup_successes, 0);
+    assert_eq!(negative_diagnostics.setup_failures, 1);
+    assert_eq!(negative_diagnostics.active, 0);
+    assert_eq!(negative_diagnostics.idle, 0);
+    assert_eq!(negative_diagnostics.pool_wait_current, 0);
+    fleet.shutdown();
+}
+
+#[test]
+fn bounded_batch_credential_negatives_reach_consumer_listener_rejection() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_batch_credential_negative_handshake(
+        CredentialGeneration::NewRoot,
+        TrustGeneration::NewOnly,
+        ConsumerCredentialGeneration::OldRoot,
+        TrustGeneration::Overlap,
+        "batch-negative-new-only-server",
+    );
+    assert_batch_credential_negative_handshake(
+        CredentialGeneration::Initial,
+        TrustGeneration::OldOnly,
+        ConsumerCredentialGeneration::NewRoot,
+        TrustGeneration::Overlap,
+        "batch-negative-old-root-server",
+    );
 }
 
 #[test]
