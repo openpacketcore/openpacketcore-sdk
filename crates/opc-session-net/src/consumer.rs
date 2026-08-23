@@ -15,20 +15,30 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::stream::{self, BoxStream, StreamExt};
 use futures_util::FutureExt;
+use opc_session_store::backend::{
+    PreparedCheckpointAuthorityContext, PreparedCheckpointCompletion, PreparedCheckpointPort,
+    PreparedCompareAndSetToken, PreparedLeaseAcquireToken,
+};
 use opc_session_store::{
     checked_session_deadline, session_consumer_batch_result_into_store,
     validate_stored_record_expiry_profile, AtomicFencedTransitionCapability, BackendCapabilities,
     CompareAndSet, CompareAndSetResult, FencedTransitionExecuteError, FencedTransitionObservation,
     FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-    FencedTransitionStatus, LeaseError, LeaseGuard, OwnerId, PreparedFencedTransition,
-    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionBackend,
-    SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
+    FencedTransitionStatus, LeaseError, LeaseGuard, OwnerId, PreparedCheckpointBudget,
+    PreparedCompareAndSet as StorePreparedCompareAndSet, PreparedCompareAndSetExecuteError,
+    PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError,
+    PreparedCompareAndSetStatus as PreparedCasStatus, PreparedCompareAndSetStatusError,
+    PreparedFencedTransition, PreparedLeaseAcquire, PreparedLeaseAcquireExecuteError,
+    PreparedLeaseAcquirePrepareError, PreparedLeaseAcquireStatusError, RecordExpiryPreflight,
+    RestoreScanPage, RestoreScanRequest, SessionBackend, SessionConsumerAuthorizationManifest,
+    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerCompareAndSetReceiptOutcome,
+    SessionConsumerCompareAndSetRequest, SessionConsumerCompareAndSetStatus,
     SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
     SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerLeaseMutationOperation,
     SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
@@ -36,7 +46,7 @@ use opc_session_store::{
     SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
     SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionOp,
     SessionOpResult, SessionPayloadEncoding, SessionQuorumConsumer, StatelessSessionConsumer,
-    StoreError, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    StoreError, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 use opc_types::SpiffeId;
 use serde::{Deserialize, Serialize};
@@ -67,7 +77,7 @@ use crate::protocol::{
 pub const SESSION_QUORUM_CONSUMER_ALPN: &[u8] = b"opc-session-consumer/1";
 
 /// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_ALPN`].
-pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 4;
+pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 5;
 
 /// Maximum sequential application requests processed on one consumer
 /// connection. Every request has an exact nonzero connection-local
@@ -75,7 +85,7 @@ pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 4;
 pub const MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION: usize = 4096;
 /// Fixed logical width of the nonzero connection-local correlation value.
 pub const SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES: usize = std::mem::size_of::<u32>();
-/// Revision 4 deliberately admits one in-flight request per physical lane.
+/// Revision 5 deliberately admits one in-flight request per physical lane.
 pub const MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION: usize = 1;
 
 /// Default number of authenticated request lanes retained by a persistent
@@ -537,6 +547,7 @@ fn consumer_operation_is_effectful(operation: &SessionConsumerOperation) -> bool
         | SessionConsumerOperation::FencedTransitionCapability
         | SessionConsumerOperation::ObserveFencedTransition { .. }
         | SessionConsumerOperation::LeaseMutationStatus { .. }
+        | SessionConsumerOperation::CompareAndSetStatus { .. }
         | SessionConsumerOperation::FencedTransitionStatus { .. } => false,
         SessionConsumerOperation::Batch { ops } => ops
             .iter()
@@ -552,7 +563,7 @@ fn consumer_operation_is_effectful(operation: &SessionConsumerOperation) -> bool
     }
 }
 
-/// Revision 4 retains the revision-3 rule binding the outer consumer id to the complete
+/// Revision 5 retains the revision-3 rule binding the outer consumer id to the complete
 /// fenced-transition body's stable id byte-for-byte.  Keep this check at both
 /// client and listener boundaries so a hand-built generic request cannot
 /// submit one durable body under a second public identity.
@@ -898,6 +909,11 @@ pub enum SessionConsumerMutationError {
     Store(#[from] StoreError),
 }
 
+/// Hard upper bound for one physical receipt observation. It is transport
+/// policy, deliberately private to the router; callers retain their original
+/// absolute deadline and select subsequent voters themselves.
+const MAX_PREPARED_CONSUMER_VOTERS: usize = QUORUM_TOPOLOGY_MAX_MEMBERS;
+
 impl fmt::Debug for SessionConsumerMutationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self {
@@ -1192,7 +1208,7 @@ struct BorrowedConsumerCall<'a> {
 
 /// Serialization-only view of a call. Keeping the caller-owned request
 /// borrowed avoids copying a potentially maximum-sized payload for every safe
-/// pre-write reconnect attempt while retaining the exact revision-4 encoding.
+/// pre-write reconnect attempt while retaining the exact revision-5 encoding.
 #[derive(Serialize)]
 #[serde(
     tag = "kind",
@@ -1257,11 +1273,12 @@ enum ConsumerSessionResponseWire {
     RenewLease(Result<ConsumerSessionLeaseGrantWire, SessionConsumerLeaseError>),
     ReleaseLease(Result<(), SessionConsumerLeaseError>),
     LeaseMutationStatus(Result<ConsumerSessionLeaseMutationStatusWire, SessionConsumerStoreError>),
+    CompareAndSetStatus(Result<SessionConsumerCompareAndSetStatus, SessionConsumerStoreError>),
     OutcomeUnknown(SessionConsumerOutcomeUnknown),
     Rejected(SessionConsumerRejection),
 }
 
-/// Private revision-4 lease authority envelope. The public store response
+/// Private revision-5 lease authority envelope. The public store response
 /// remains the source-compatible `LeaseGuard`; only this transport validates
 /// the committed authority time before removing the envelope.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1391,6 +1408,9 @@ impl TryFrom<ConsumerSessionResponseWire> for SessionConsumerResponse {
             ConsumerSessionResponseWire::LeaseMutationStatus(value) => Self::LeaseMutationStatus(
                 value.map(ConsumerSessionLeaseMutationStatusWire::into_public),
             ),
+            ConsumerSessionResponseWire::CompareAndSetStatus(value) => {
+                Self::CompareAndSetStatus(value)
+            }
             ConsumerSessionResponseWire::OutcomeUnknown(value) => Self::OutcomeUnknown(value),
             ConsumerSessionResponseWire::Rejected(value) => Self::Rejected(value),
         })
@@ -1545,6 +1565,9 @@ fn consumer_wire_response_from_public(
                 Err(error) => Err(error),
             };
             ConsumerSessionResponseWire::LeaseMutationStatus(value)
+        }
+        SessionConsumerResponse::CompareAndSetStatus(value) => {
+            ConsumerSessionResponseWire::CompareAndSetStatus(value)
         }
         SessionConsumerResponse::OutcomeUnknown(value) => {
             ConsumerSessionResponseWire::OutcomeUnknown(value)
@@ -1727,11 +1750,16 @@ fn consumer_public_response_from_wire(
         | (
             ConsumerSessionResponseWire::LeaseMutationStatus(_),
             SessionConsumerOperation::LeaseMutationStatus { .. },
+        )
+        | (
+            ConsumerSessionResponseWire::CompareAndSetStatus(_),
+            SessionConsumerOperation::CompareAndSetStatus { .. },
         ) => {}
         (ConsumerSessionResponseWire::AcquireLease(_), _)
         | (ConsumerSessionResponseWire::RenewLease(_), _)
         | (ConsumerSessionResponseWire::ReleaseLease(_), _)
-        | (ConsumerSessionResponseWire::LeaseMutationStatus(_), _) => {
+        | (ConsumerSessionResponseWire::LeaseMutationStatus(_), _)
+        | (ConsumerSessionResponseWire::CompareAndSetStatus(_), _) => {
             return Err(ProtocolError::UnexpectedResponse);
         }
         _ => {}
@@ -1799,6 +1827,7 @@ enum ConsumerOperationKind {
     FencedTransition,
     FencedTransitionStatus,
     LeaseMutationStatus,
+    CompareAndSetStatus,
     Get,
     PreflightRecordExpiry,
     CompareAndSet,
@@ -1830,6 +1859,7 @@ impl ConsumerOperationKind {
             SessionConsumerOperation::FencedTransition { .. } => Self::FencedTransition,
             SessionConsumerOperation::FencedTransitionStatus { .. } => Self::FencedTransitionStatus,
             SessionConsumerOperation::LeaseMutationStatus { .. } => Self::LeaseMutationStatus,
+            SessionConsumerOperation::CompareAndSetStatus { .. } => Self::CompareAndSetStatus,
             SessionConsumerOperation::Get { .. } => Self::Get,
             SessionConsumerOperation::PreflightRecordExpiry { .. } => Self::PreflightRecordExpiry,
             SessionConsumerOperation::CompareAndSet { .. } => Self::CompareAndSet,
@@ -1875,6 +1905,9 @@ fn response_matches_operation(
         ) | (
             ConsumerOperationKind::LeaseMutationStatus,
             SessionConsumerResponse::LeaseMutationStatus(_)
+        ) | (
+            ConsumerOperationKind::CompareAndSetStatus,
+            SessionConsumerResponse::CompareAndSetStatus(_)
         ) | (ConsumerOperationKind::Get, SessionConsumerResponse::Get(_))
             | (
                 ConsumerOperationKind::PreflightRecordExpiry,
@@ -1988,6 +2021,12 @@ fn store_error_matches_operation(
                 | SessionConsumerStoreError::ProtectedDataRejected
         ),
         SessionConsumerOperation::LeaseMutationStatus { .. } => matches!(
+            error,
+            SessionConsumerStoreError::Unavailable
+                | SessionConsumerStoreError::InvalidInput
+                | SessionConsumerStoreError::ProtectedDataRejected
+        ),
+        SessionConsumerOperation::CompareAndSetStatus { .. } => matches!(
             error,
             SessionConsumerStoreError::Unavailable
                 | SessionConsumerStoreError::InvalidInput
@@ -2113,7 +2152,7 @@ fn batch_slot_error_matches_operation(
     }
 }
 
-/// Closed revision-4 error family for an already-open watch. These are the
+/// Closed revision-5 error family for an already-open watch. These are the
 /// only failures that can describe observation/catch-up of committed changes;
 /// mutation, request-binding, lease, restore, and TTL errors are impossible on
 /// this stream and therefore poison the authenticated lane.
@@ -2300,6 +2339,14 @@ fn response_matches_request(
         (
             SessionConsumerOperation::LeaseMutationStatus { .. },
             SessionConsumerResponse::LeaseMutationStatus(result),
+        ) => store_result_matches_operation(request.operation(), result),
+        (
+            SessionConsumerOperation::CompareAndSetStatus { request: retained },
+            SessionConsumerResponse::CompareAndSetStatus(Ok(status)),
+        ) => compare_and_set_status_matches_request(retained, status),
+        (
+            SessionConsumerOperation::CompareAndSetStatus { .. },
+            SessionConsumerResponse::CompareAndSetStatus(result),
         ) => store_result_matches_operation(request.operation(), result),
         (SessionConsumerOperation::Get { key }, SessionConsumerResponse::Get(result)) => {
             get_result_matches_key(
@@ -2502,6 +2549,32 @@ fn lease_mutation_status_matches_request(
     }
 }
 
+fn compare_and_set_status_matches_request(
+    _request: &SessionConsumerCompareAndSetRequest,
+    status: &SessionConsumerCompareAndSetStatus,
+) -> bool {
+    match status {
+        SessionConsumerCompareAndSetStatus::Recorded(outcome) => matches!(
+            outcome,
+            SessionConsumerCompareAndSetReceiptOutcome::Applied
+                | SessionConsumerCompareAndSetReceiptOutcome::Conflict
+                | SessionConsumerCompareAndSetReceiptOutcome::Rejected(
+                    SessionConsumerStoreError::NotFound
+                        | SessionConsumerStoreError::StaleFence
+                        | SessionConsumerStoreError::CasConflict
+                        | SessionConsumerStoreError::RequestConflict
+                        | SessionConsumerStoreError::InvalidInput
+                        | SessionConsumerStoreError::PayloadTooLarge
+                        | SessionConsumerStoreError::LeaseUnavailable
+                        | SessionConsumerStoreError::ProtectedDataRejected
+                )
+        ),
+        SessionConsumerCompareAndSetStatus::RequestConflict
+        | SessionConsumerCompareAndSetStatus::NotFound => true,
+        _ => false,
+    }
+}
+
 /// Direct execution can report the complete safe execution-error inventory.
 /// A retained receipt is deliberately stricter: it can contain only an exact
 /// deterministic no-effect result, never an availability or request-binding
@@ -2565,12 +2638,22 @@ fn fenced_transition_recorded_store_error_matches(error: SessionConsumerStoreErr
     )
 }
 
-fn consumer_capability_payload_budget(
+/// Conservative application-payload budget for the negotiated consumer
+/// request and response frame sizes.
+///
+/// Both directions must carry the complete operation envelope, so the
+/// consumer advertises the smaller of their independently bounded budgets.
+pub const fn session_consumer_payload_budget(
     request_frame_size: usize,
     response_frame_size: usize,
 ) -> usize {
-    conservative_payload_budget(request_frame_size)
-        .min(conservative_payload_budget(response_frame_size))
+    let request_budget = conservative_payload_budget(request_frame_size);
+    let response_budget = conservative_payload_budget(response_frame_size);
+    if request_budget < response_budget {
+        request_budget
+    } else {
+        response_budget
+    }
 }
 
 fn response_respects_consumer_capability_budget(
@@ -2581,7 +2664,7 @@ fn response_respects_consumer_capability_budget(
     match response {
         SessionConsumerResponse::Capabilities(capabilities) => {
             capabilities.max_value_bytes
-                <= consumer_capability_payload_budget(request_frame_size, response_frame_size)
+                <= session_consumer_payload_budget(request_frame_size, response_frame_size)
         }
         _ => true,
     }
@@ -2596,7 +2679,7 @@ fn clamp_consumer_capabilities(
         capabilities.max_value_bytes =
             capabilities
                 .max_value_bytes
-                .min(consumer_capability_payload_budget(
+                .min(session_consumer_payload_budget(
                     request_frame_size,
                     response_frame_size,
                 ));
@@ -2715,7 +2798,7 @@ fn response_is_known_failure(response: &SessionConsumerResponse) -> bool {
 /// internal/legacy code and cannot globally enable `deny_unknown_fields`.
 /// `serde_ignored` reports most fields that shared DTO deserializers would
 /// ignore. Internally tagged enums can hide deeper ignored fields from that
-/// adapter, so the decoded revision-4 type is serialized through a streaming
+/// adapter, so the decoded revision-5 type is serialized through a streaming
 /// byte comparator against the bounded received payload. This rejects aliases,
 /// omissions, noncanonical encodings, and unknown nested fields without a
 /// second buffer, a generic JSON tree, or surfacing their content.
@@ -2838,7 +2921,7 @@ where
 }
 
 /// Compare the exact private wire encoding without retaining a second JSON
-/// buffer or materializing generic value trees. Revision 4 is emitted only by
+/// buffer or materializing generic value trees. Revision 5 is emitted only by
 /// this module's private DTOs, so canonical bytes are part of the negotiated
 /// contract; the borrowed/owned wire-equivalence tests seal both writers.
 struct ExactConsumerJson<'a> {
@@ -3224,7 +3307,7 @@ struct ConsumerConnection {
     next_correlation: NonZeroU32,
     calls: usize,
     idle_deadline: tokio::time::Instant,
-    /// Exact server-advertised request-frame ceiling for this revision-4 lane.
+    /// Exact server-advertised request-frame ceiling for this revision-5 lane.
     request_frame_size: usize,
     shutdown_io: Option<Arc<PersistentConsumerIoBarrier>>,
     /// Weak owner used only for exact physical request-lane accounting.
@@ -3599,6 +3682,70 @@ pub struct SessionConsumerFencedTransitionBackend {
     binding_commitment: [u8; 32],
 }
 
+/// Least-authority durable-router adapter for prepared checkpoint requests.
+///
+/// Unlike the legacy [`SessionConsumerFencedTransitionBackend`], this surface
+/// exposes no generic backend operations and therefore cannot accidentally
+/// turn an ambiguous prepared CAS into a row readback or a replay.
+#[derive(Clone)]
+pub struct SessionConsumerPreparedCheckpointRouter {
+    router: Arc<PreparedConsumerRouter>,
+}
+
+/// Redacted construction failure for the fixed prepared-consumer voter set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("prepared consumer voter set has no common authenticated authority")]
+pub struct SessionConsumerPreparedCheckpointRouterError;
+
+impl fmt::Debug for SessionConsumerPreparedCheckpointRouter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerPreparedCheckpointRouter(<redacted>)")
+    }
+}
+
+impl SessionConsumerPreparedCheckpointRouter {
+    /// Adapt an exact configured set of persistent authenticated consumers.
+    ///
+    /// Every voter must retain identical tenant/session scope, configuration
+    /// epoch, cluster identity, and local authenticated client identity. The
+    /// endpoint itself is intentionally excluded, allowing only same-scope
+    /// receipt rotation after an ambiguous dispatch.
+    pub fn persistent(
+        clients: impl IntoIterator<Item = PersistentSessionConsumerClient>,
+    ) -> Result<Self, SessionConsumerPreparedCheckpointRouterError> {
+        let clients: Vec<_> = clients.into_iter().collect();
+        if clients.is_empty() || clients.len() > MAX_PREPARED_CONSUMER_VOTERS {
+            return Err(SessionConsumerPreparedCheckpointRouterError);
+        }
+        let scope = clients[0].scope();
+        let binding = clients[0]
+            .prepared_consumer_binding()
+            .ok_or(SessionConsumerPreparedCheckpointRouterError)?;
+        if clients.iter().any(|client| {
+            client.scope() != scope || client.prepared_consumer_binding() != Some(binding)
+        }) || !prepared_router_roster_is_distinct(
+            clients
+                .iter()
+                .map(|client| client.pool.client.expected_server_identity.as_str()),
+        ) {
+            return Err(SessionConsumerPreparedCheckpointRouterError);
+        }
+        Ok(Self {
+            router: Arc::new(PreparedConsumerRouter {
+                clients: clients.into(),
+                scope,
+                origin_cursor: AtomicUsize::new(0),
+                authority_context: OnceLock::new(),
+            }),
+        })
+    }
+}
+
+fn prepared_router_roster_is_distinct<'a>(identities: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut seen = BTreeSet::new();
+    identities.into_iter().all(|identity| seen.insert(identity))
+}
+
 impl fmt::Debug for SessionConsumerFencedTransitionBackend {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SessionConsumerFencedTransitionBackend(<redacted>)")
@@ -3660,6 +3807,22 @@ fn authenticated_consumer_binding(
     digest.update(b"openpacketcore/session-consumer/fenced-transition-physical/v1\0");
     digest.update(local_identity_commitment);
     digest.update(scope.consensus_identity().cluster_id().as_bytes());
+    Ok(digest.finalize().into())
+}
+
+fn prepared_compare_and_set_binding(
+    local_identity_commitment: Option<[u8; 32]>,
+    scope: SessionConsumerScope,
+) -> Result<[u8; 32], PreparedCompareAndSetPrepareError> {
+    let local_identity_commitment =
+        local_identity_commitment.ok_or(PreparedCompareAndSetPrepareError::Unavailable)?;
+    let identity = scope.consensus_identity();
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-consumer/prepared-cas/v1\0");
+    digest.update(local_identity_commitment);
+    digest.update(identity.cluster_id().as_bytes());
+    digest.update(identity.configuration_id().as_bytes());
+    digest.update(identity.configuration_epoch().get().to_le_bytes());
     Ok(digest.finalize().into())
 }
 
@@ -3948,7 +4111,7 @@ impl StatelessSessionConsumerClient {
     /// Set the finite bootstrap and active-frame idle timeout.
     ///
     /// Zero remains invalid. Source-compatible stateless callers may retain a
-    /// larger legacy value; revision 4 applies its five-second active-frame
+    /// larger legacy value; revision 5 applies its five-second active-frame
     /// ceiling internally. Persistent construction rejects values outside its
     /// explicit bounded profile.
     #[must_use]
@@ -7494,6 +7657,48 @@ impl PersistentSessionConsumerClient {
         }
     }
 
+    /// Perform one physical, read-only retained lease receipt observation.
+    ///
+    /// This intentionally bypasses the ordinary read helper: it preserves the
+    /// caller's absolute deadline and passes `connect_attempts = 1`, leaving
+    /// cross-voter rotation and any later status attempt to the durable
+    /// router. It never submits the retained lease mutation body.
+    pub async fn lease_mutation_status_once(
+        &self,
+        request: &SessionConsumerLeaseMutationRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsumerLeaseMutationStatus, PreparedLeaseAcquireStatusError> {
+        if request.validate().is_err() {
+            return Err(PreparedLeaseAcquireStatusError::Unavailable);
+        }
+        let now = tokio::time::Instant::now();
+        if deadline <= now {
+            return Err(PreparedLeaseAcquireStatusError::Deadline);
+        }
+        let operation = SessionConsumerOperation::LeaseMutationStatus {
+            request: Box::new(request.clone()),
+        };
+        let receipt = match request.prepared_authority() {
+            Some(authority) => SessionConsumerRequest::new_prepared(
+                self.scope(),
+                request.request_id(),
+                operation,
+                authority,
+            ),
+            None => self.request(request.request_id(), operation),
+        };
+        match self.execute_classified_before(&receipt, deadline, 1).await {
+            Ok(SessionConsumerResponse::LeaseMutationStatus(Ok(status))) => Ok(status),
+            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch)) => {
+                Err(PreparedLeaseAcquireStatusError::TopologyAuthorityRevoked)
+            }
+            Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope)) => {
+                Err(PreparedLeaseAcquireStatusError::TopologyAuthorityRevoked)
+            }
+            Ok(_) | Err(_) => Err(PreparedLeaseAcquireStatusError::Unavailable),
+        }
+    }
+
     pub async fn compare_and_set_with_id(
         &self,
         request_id: SessionConsumerRequestId,
@@ -8065,6 +8270,706 @@ impl PersistentSessionConsumerClient {
 
 impl StatelessSessionConsumer for PersistentSessionConsumerClient {}
 
+/// Immutable same-scope voter set shared by the two opaque prepared tokens.
+/// It has no mutating API: requests own their execution state and only borrow
+/// one selected physical client per attempt.
+struct PreparedConsumerRouter {
+    clients: Arc<[PersistentSessionConsumerClient]>,
+    scope: SessionConsumerScope,
+    origin_cursor: AtomicUsize,
+    authority_context: OnceLock<PreparedCheckpointAuthorityContext>,
+}
+
+impl PreparedConsumerRouter {
+    fn mutation_client(&self, cursor: &AtomicUsize) -> &PersistentSessionConsumerClient {
+        let index = prepared_voter_index(cursor.load(Ordering::Acquire), self.clients.len());
+        &self.clients[index]
+    }
+
+    fn receipt_client(&self, cursor: &AtomicUsize) -> &PersistentSessionConsumerClient {
+        let index =
+            prepared_voter_index(cursor.fetch_add(1, Ordering::Relaxed), self.clients.len());
+        &self.clients[index]
+    }
+
+    fn next_origin(&self) -> usize {
+        self.origin_cursor.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn bind_authority_context(&self, context: PreparedCheckpointAuthorityContext) -> bool {
+        *self.authority_context.get_or_init(|| context) == context
+    }
+}
+
+fn prepared_voter_index(cursor: usize, voter_count: usize) -> usize {
+    cursor % voter_count
+}
+
+const PREPARED_READY: u8 = 0;
+const PREPARED_DISPATCHING: u8 = 1;
+const PREPARED_RECEIPT_ONLY: u8 = 2;
+const PREPARED_TERMINAL: u8 = 3;
+
+struct PreparedRequestState {
+    phase: AtomicU8,
+    mutation_cursor: AtomicUsize,
+    status_cursor: AtomicUsize,
+    status_in_flight: AtomicBool,
+    // This exists only to make the status-admission race reproducible.  It
+    // deliberately runs before the in-flight CAS, which is the interval in
+    // which an older implementation had already sampled cache/phase but had
+    // not yet serialized its receipt attempt.
+    #[cfg(test)]
+    status_admission_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl PreparedRequestState {
+    fn new(origin: usize) -> Self {
+        Self {
+            phase: AtomicU8::new(PREPARED_READY),
+            mutation_cursor: AtomicUsize::new(origin),
+            status_cursor: AtomicUsize::new(origin.wrapping_add(1)),
+            status_in_flight: AtomicBool::new(false),
+            #[cfg(test)]
+            status_admission_hook: StdMutex::new(None),
+        }
+    }
+
+    fn begin_dispatch(&self) -> Result<PreparedDispatchGuard<'_>, ()> {
+        self.phase
+            .compare_exchange(
+                PREPARED_READY,
+                PREPARED_DISPATCHING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| PreparedDispatchGuard {
+                state: self,
+                terminal: false,
+            })
+            .map_err(|_| ())
+    }
+
+    fn not_transmitted(&self) {
+        self.mutation_cursor.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn receipt_only(&self) {
+        self.status_cursor.store(
+            self.mutation_cursor.load(Ordering::Acquire).wrapping_add(1),
+            Ordering::Release,
+        );
+        self.phase.store(PREPARED_RECEIPT_ONLY, Ordering::Release);
+    }
+
+    fn status_allowed(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == PREPARED_RECEIPT_ONLY
+    }
+
+    fn terminal(&self) {
+        self.phase.store(PREPARED_TERMINAL, Ordering::Release);
+    }
+
+    fn begin_status(&self) -> Result<PreparedStatusAttempt<'_>, ()> {
+        self.status_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| PreparedStatusAttempt(&self.status_in_flight))
+            .map_err(|_| ())
+    }
+
+    #[cfg(test)]
+    fn pause_next_status_admission(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .status_admission_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_status_admission_hook(&self) {
+        let hook = self
+            .status_admission_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// Owns a dispatch phase while the async execute future is alive. Dropping it
+/// is conservative: a cancellation can race physical write progress, so the
+/// retained request is permanently receipt-only.
+struct PreparedDispatchGuard<'a> {
+    state: &'a PreparedRequestState,
+    terminal: bool,
+}
+
+impl PreparedDispatchGuard<'_> {
+    fn receipt_only(&mut self) {
+        self.state.receipt_only();
+        self.terminal = true;
+    }
+
+    fn terminal(&mut self) {
+        self.state.terminal();
+        self.terminal = true;
+    }
+}
+
+impl Drop for PreparedDispatchGuard<'_> {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.state.receipt_only();
+        }
+    }
+}
+
+struct PreparedStatusAttempt<'a>(&'a AtomicBool);
+
+impl Drop for PreparedStatusAttempt<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+struct PersistentPreparedCompareAndSetToken {
+    router: Arc<PreparedConsumerRouter>,
+    // The dispatch request is the one canonical sealed CAS body. A full
+    // receipt request is materialized only after ambiguity requires a
+    // read-only lookup, never on the healthy terminal path.
+    request: Arc<SessionConsumerRequest>,
+    receipt: OnceLock<SessionConsumerRequest>,
+    budget: PreparedCheckpointBudget,
+    state: PreparedRequestState,
+    terminal_receipt: StdMutex<Option<Result<PreparedCasStatus, PreparedCompareAndSetStatusError>>>,
+}
+
+impl PersistentPreparedCompareAndSetToken {
+    fn receipt_request(&self) -> &SessionConsumerRequest {
+        self.receipt.get_or_init(|| {
+            let SessionConsumerOperation::CompareAndSet { op } = self.request.operation() else {
+                unreachable!("prepared CAS dispatch request has a fixed operation")
+            };
+            let operation = SessionConsumerOperation::CompareAndSetStatus {
+                request: Box::new(match self.request.prepared_authority() {
+                    Some(authority) => SessionConsumerCompareAndSetRequest::new_prepared(
+                        self.request.request_id(),
+                        (**op).clone(),
+                        authority,
+                    ),
+                    // Private router tests may construct a token directly;
+                    // production tokens always arrive through the protected
+                    // port and therefore take the context-bearing branch.
+                    None => SessionConsumerCompareAndSetRequest::new(
+                        self.request.request_id(),
+                        (**op).clone(),
+                    ),
+                }),
+            };
+            match self.request.prepared_authority() {
+                Some(authority) => SessionConsumerRequest::new_prepared(
+                    self.router.scope,
+                    self.request.request_id(),
+                    operation,
+                    authority,
+                ),
+                None => SessionConsumerRequest::new(
+                    self.router.scope,
+                    self.request.request_id(),
+                    operation,
+                ),
+            }
+        })
+    }
+
+    fn cached_terminal_receipt(
+        &self,
+    ) -> Option<Result<PreparedCasStatus, PreparedCompareAndSetStatusError>> {
+        *self
+            .terminal_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn terminal_receipt(
+        &self,
+        result: Result<PreparedCasStatus, PreparedCompareAndSetStatusError>,
+    ) -> Result<PreparedCasStatus, PreparedCompareAndSetStatusError> {
+        let mut receipt = self
+            .terminal_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = *receipt {
+            return cached;
+        }
+        *receipt = Some(result);
+        self.state.terminal();
+        result
+    }
+}
+
+#[async_trait::async_trait]
+impl PreparedCompareAndSetToken for PersistentPreparedCompareAndSetToken {
+    async fn execute_once(
+        &self,
+    ) -> Result<PreparedCompareAndSetOutcome, PreparedCompareAndSetExecuteError> {
+        let mut dispatch = self
+            .state
+            .begin_dispatch()
+            .map_err(|_| PreparedCompareAndSetExecuteError::AlreadyExecuted)?;
+        for _ in 0..self.router.clients.len() {
+            let now = tokio::time::Instant::now();
+            let deadline = self.budget.original_deadline().min(
+                now.checked_add(self.budget.physical_attempt_timeout())
+                    .ok_or(PreparedCompareAndSetExecuteError::NotTransmitted)?,
+            );
+            if deadline <= now {
+                dispatch.terminal();
+                return Err(PreparedCompareAndSetExecuteError::NotTransmitted);
+            }
+            let client = self.router.mutation_client(&self.state.mutation_cursor);
+            match client
+                .execute_classified_before(&self.request, deadline, 1)
+                .await
+            {
+                Ok(SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success))) => {
+                    dispatch.terminal();
+                    return Ok(PreparedCompareAndSetOutcome::Applied);
+                }
+                Ok(SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Conflict {
+                    ..
+                }))) => {
+                    dispatch.terminal();
+                    return Ok(PreparedCompareAndSetOutcome::Conflict);
+                }
+                Ok(SessionConsumerResponse::CompareAndSet(Err(
+                    SessionConsumerStoreError::OutcomeUnavailable,
+                ))) => {
+                    dispatch.receipt_only();
+                    return Err(PreparedCompareAndSetExecuteError::OutcomeUnknown);
+                }
+                Ok(SessionConsumerResponse::CompareAndSet(Err(error))) => {
+                    dispatch.terminal();
+                    return Ok(PreparedCompareAndSetOutcome::Rejected(error));
+                }
+                Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch)) => {
+                    dispatch.terminal();
+                    return Err(PreparedCompareAndSetExecuteError::TopologyAuthorityRevoked);
+                }
+                Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                    dispatch.terminal();
+                    return Ok(PreparedCompareAndSetOutcome::Rejected(
+                        SessionConsumerStoreError::from(rejection_into_store_error(rejection)),
+                    ));
+                }
+                Ok(SessionConsumerResponse::OutcomeUnknown(_))
+                | Ok(_)
+                | Err(SessionConsumerCallError::MayHaveSent(_)) => {
+                    dispatch.receipt_only();
+                    return Err(PreparedCompareAndSetExecuteError::OutcomeUnknown);
+                }
+                Err(SessionConsumerCallError::BeforeCallWrite(
+                    SessionConsumerClientError::Scope,
+                )) => {
+                    dispatch.terminal();
+                    return Err(PreparedCompareAndSetExecuteError::TopologyAuthorityRevoked);
+                }
+                Err(SessionConsumerCallError::BeforeCallWrite(_)) => {
+                    self.state.not_transmitted();
+                    continue;
+                }
+            }
+        }
+        dispatch.terminal();
+        Err(PreparedCompareAndSetExecuteError::NotTransmitted)
+    }
+
+    async fn status_once(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<PreparedCasStatus, PreparedCompareAndSetStatusError> {
+        #[cfg(test)]
+        self.state.run_status_admission_hook();
+        let _attempt = self
+            .state
+            .begin_status()
+            .map_err(|_| PreparedCompareAndSetStatusError::Unavailable)?;
+        // `status_in_flight` serializes terminal receipt publication as well
+        // as physical reads.  A clone that was paused before admission must
+        // not act on a stale cache/phase sample after another clone recorded
+        // an absorbing result.
+        if let Some(result) = self.cached_terminal_receipt() {
+            return result;
+        }
+        if !self.state.status_allowed() {
+            return Err(PreparedCompareAndSetStatusError::NotExecuted);
+        }
+        let now = tokio::time::Instant::now();
+        if deadline <= now || deadline > self.budget.original_deadline() {
+            return Err(PreparedCompareAndSetStatusError::Deadline);
+        }
+        let attempt_deadline = deadline.min(
+            now.checked_add(self.budget.physical_attempt_timeout())
+                .ok_or(PreparedCompareAndSetStatusError::Deadline)?,
+        );
+        let client = self.router.receipt_client(&self.state.status_cursor);
+        let result = match client
+            .execute_classified_before(self.receipt_request(), attempt_deadline, 1)
+            .await
+        {
+            Ok(SessionConsumerResponse::CompareAndSetStatus(Ok(
+                SessionConsumerCompareAndSetStatus::Recorded(
+                    SessionConsumerCompareAndSetReceiptOutcome::Applied,
+                ),
+            ))) => Ok(PreparedCasStatus::Recorded(
+                PreparedCompareAndSetOutcome::Applied,
+            )),
+            Ok(SessionConsumerResponse::CompareAndSetStatus(Ok(
+                SessionConsumerCompareAndSetStatus::Recorded(
+                    SessionConsumerCompareAndSetReceiptOutcome::Conflict,
+                ),
+            ))) => Ok(PreparedCasStatus::Recorded(
+                PreparedCompareAndSetOutcome::Conflict,
+            )),
+            Ok(SessionConsumerResponse::CompareAndSetStatus(Ok(
+                SessionConsumerCompareAndSetStatus::Recorded(
+                    SessionConsumerCompareAndSetReceiptOutcome::Rejected(error),
+                ),
+            ))) => Ok(PreparedCasStatus::Recorded(
+                PreparedCompareAndSetOutcome::Rejected(error),
+            )),
+            Ok(SessionConsumerResponse::CompareAndSetStatus(Ok(
+                SessionConsumerCompareAndSetStatus::RequestConflict,
+            ))) => Ok(PreparedCasStatus::RequestConflict),
+            Ok(SessionConsumerResponse::CompareAndSetStatus(Ok(
+                SessionConsumerCompareAndSetStatus::NotFound,
+            ))) => Ok(PreparedCasStatus::NotFound),
+            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch))
+            | Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope)) => {
+                Err(PreparedCompareAndSetStatusError::TopologyAuthorityRevoked)
+            }
+            Ok(_) | Err(_) => Err(PreparedCompareAndSetStatusError::Unavailable),
+        };
+        match result {
+            Ok(PreparedCasStatus::Recorded(_))
+            | Ok(PreparedCasStatus::RequestConflict)
+            | Err(PreparedCompareAndSetStatusError::TopologyAuthorityRevoked) => {
+                self.terminal_receipt(result)
+            }
+            Ok(PreparedCasStatus::NotFound)
+            | Err(PreparedCompareAndSetStatusError::Unavailable) => result,
+            Err(PreparedCompareAndSetStatusError::NotExecuted)
+            | Err(PreparedCompareAndSetStatusError::Deadline)
+            | Err(_) => result,
+        }
+    }
+}
+
+struct PersistentPreparedLeaseAcquireToken {
+    router: Arc<PreparedConsumerRouter>,
+    request: SessionConsumerLeaseMutationRequest,
+    dispatch_request: SessionConsumerRequest,
+    budget: PreparedCheckpointBudget,
+    state: PreparedRequestState,
+    terminal_receipt: StdMutex<
+        Option<Result<SessionConsumerLeaseMutationStatus, PreparedLeaseAcquireStatusError>>,
+    >,
+}
+
+impl PersistentPreparedLeaseAcquireToken {
+    fn cached_terminal_receipt(
+        &self,
+    ) -> Option<Result<SessionConsumerLeaseMutationStatus, PreparedLeaseAcquireStatusError>> {
+        self.terminal_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn terminal_receipt(
+        &self,
+        result: Result<SessionConsumerLeaseMutationStatus, PreparedLeaseAcquireStatusError>,
+    ) -> Result<SessionConsumerLeaseMutationStatus, PreparedLeaseAcquireStatusError> {
+        let mut receipt = self
+            .terminal_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = receipt.clone() {
+            return cached;
+        }
+        *receipt = Some(result.clone());
+        self.state.terminal();
+        result
+    }
+}
+
+enum PreparedLeaseAcquireDispatchResult {
+    ReceiptOnly,
+    Terminal(PreparedLeaseAcquireExecuteError),
+}
+
+/// Classify a complete acquire response without inspecting or synthesizing
+/// backend strings.  Only the wire's explicit outcome-unavailable marker is
+/// ambiguous; every other typed lease result is a terminal outcome for this
+/// exact prepared request.
+fn classify_prepared_lease_acquire_error(
+    error: SessionConsumerLeaseError,
+) -> PreparedLeaseAcquireDispatchResult {
+    match error {
+        SessionConsumerLeaseError::OutcomeUnavailable => {
+            PreparedLeaseAcquireDispatchResult::ReceiptOnly
+        }
+        SessionConsumerLeaseError::RequestConflict => PreparedLeaseAcquireDispatchResult::Terminal(
+            PreparedLeaseAcquireExecuteError::RequestConflict,
+        ),
+        SessionConsumerLeaseError::Unavailable => PreparedLeaseAcquireDispatchResult::Terminal(
+            PreparedLeaseAcquireExecuteError::Unavailable,
+        ),
+        error => PreparedLeaseAcquireDispatchResult::Terminal(
+            PreparedLeaseAcquireExecuteError::Rejected(error.into_lease_error()),
+        ),
+    }
+}
+
+/// Complete wire rejections are known pre-dispatch outcomes. Keep their
+/// bounded typed classification separate from transport ambiguity.
+fn classify_prepared_lease_acquire_rejection(
+    rejection: SessionConsumerRejection,
+) -> PreparedLeaseAcquireExecuteError {
+    match rejection {
+        SessionConsumerRejection::ScopeMismatch => {
+            PreparedLeaseAcquireExecuteError::TopologyAuthorityRevoked
+        }
+        SessionConsumerRejection::Unavailable => PreparedLeaseAcquireExecuteError::Unavailable,
+        SessionConsumerRejection::Unauthorized | SessionConsumerRejection::MalformedRequest => {
+            PreparedLeaseAcquireExecuteError::Rejected(rejection_into_lease_error(rejection))
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PreparedLeaseAcquireToken for PersistentPreparedLeaseAcquireToken {
+    async fn execute_once(&self) -> Result<LeaseGuard, PreparedLeaseAcquireExecuteError> {
+        let mut dispatch = self
+            .state
+            .begin_dispatch()
+            .map_err(|_| PreparedLeaseAcquireExecuteError::AlreadyExecuted)?;
+        for _ in 0..self.router.clients.len() {
+            let now = tokio::time::Instant::now();
+            let deadline = self.budget.original_deadline().min(
+                now.checked_add(self.budget.physical_attempt_timeout())
+                    .ok_or(PreparedLeaseAcquireExecuteError::NotTransmitted)?,
+            );
+            if deadline <= now {
+                dispatch.terminal();
+                return Err(PreparedLeaseAcquireExecuteError::NotTransmitted);
+            }
+            let client = self.router.mutation_client(&self.state.mutation_cursor);
+            match client
+                .execute_classified_before(&self.dispatch_request, deadline, 1)
+                .await
+            {
+                Ok(SessionConsumerResponse::AcquireLease(Ok(lease))) => {
+                    dispatch.terminal();
+                    return Ok(lease);
+                }
+                Ok(SessionConsumerResponse::AcquireLease(Err(error))) => {
+                    match classify_prepared_lease_acquire_error(error) {
+                        PreparedLeaseAcquireDispatchResult::ReceiptOnly => {
+                            dispatch.receipt_only();
+                            return Err(PreparedLeaseAcquireExecuteError::OutcomeUnknown);
+                        }
+                        PreparedLeaseAcquireDispatchResult::Terminal(error) => {
+                            dispatch.terminal();
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                    dispatch.terminal();
+                    return Err(classify_prepared_lease_acquire_rejection(rejection));
+                }
+                Err(SessionConsumerCallError::BeforeCallWrite(
+                    SessionConsumerClientError::Scope,
+                )) => {
+                    dispatch.terminal();
+                    return Err(PreparedLeaseAcquireExecuteError::TopologyAuthorityRevoked);
+                }
+                Ok(SessionConsumerResponse::OutcomeUnknown(_))
+                | Ok(_)
+                | Err(SessionConsumerCallError::MayHaveSent(_)) => {
+                    dispatch.receipt_only();
+                    return Err(PreparedLeaseAcquireExecuteError::OutcomeUnknown);
+                }
+                Err(SessionConsumerCallError::BeforeCallWrite(_)) => {
+                    self.state.not_transmitted();
+                    continue;
+                }
+            }
+        }
+        dispatch.terminal();
+        Err(PreparedLeaseAcquireExecuteError::NotTransmitted)
+    }
+
+    async fn status_once(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsumerLeaseMutationStatus, PreparedLeaseAcquireStatusError> {
+        #[cfg(test)]
+        self.state.run_status_admission_hook();
+        let _attempt = self
+            .state
+            .begin_status()
+            .map_err(|_| PreparedLeaseAcquireStatusError::Unavailable)?;
+        // See the CAS path above.  The cache/phase observation belongs after
+        // the one-at-a-time status admission so a delayed clone cannot choose
+        // another voter after a sibling publishes a terminal receipt.
+        if let Some(result) = self.cached_terminal_receipt() {
+            return result;
+        }
+        if !self.state.status_allowed() {
+            return Err(PreparedLeaseAcquireStatusError::NotExecuted);
+        }
+        let now = tokio::time::Instant::now();
+        if deadline <= now || deadline > self.budget.original_deadline() {
+            return Err(PreparedLeaseAcquireStatusError::Deadline);
+        }
+        let result = self
+            .router
+            .receipt_client(&self.state.status_cursor)
+            .lease_mutation_status_once(
+                &self.request,
+                deadline.min(
+                    now.checked_add(self.budget.physical_attempt_timeout())
+                        .ok_or(PreparedLeaseAcquireStatusError::Deadline)?,
+                ),
+            )
+            .await;
+        match result {
+            Ok(SessionConsumerLeaseMutationStatus::Recorded(_))
+            | Ok(SessionConsumerLeaseMutationStatus::RequestConflict)
+            | Err(PreparedLeaseAcquireStatusError::TopologyAuthorityRevoked) => {
+                self.terminal_receipt(result)
+            }
+            Ok(SessionConsumerLeaseMutationStatus::NotFound)
+            | Err(PreparedLeaseAcquireStatusError::Unavailable) => result,
+            Err(PreparedLeaseAcquireStatusError::NotExecuted)
+            | Err(PreparedLeaseAcquireStatusError::Deadline)
+            | Ok(_)
+            | Err(_) => result,
+        }
+    }
+}
+
+impl PersistentSessionConsumerClient {
+    fn prepared_consumer_binding(&self) -> Option<[u8; 32]> {
+        prepared_compare_and_set_binding(
+            self.pool
+                .client
+                .tls_config
+                .local_spiffe_identity_commitment(),
+            self.scope(),
+        )
+        .ok()
+    }
+}
+
+impl PreparedCheckpointPort for SessionConsumerPreparedCheckpointRouter {
+    fn prepare_sealed_compare_and_set(
+        &self,
+        completion: PreparedCheckpointCompletion,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<StorePreparedCompareAndSet, PreparedCompareAndSetPrepareError> {
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedCompareAndSetPrepareError::NotTransmitted);
+        }
+        let authority = completion.authority_context();
+        if !self.router.bind_authority_context(authority) {
+            return Err(PreparedCompareAndSetPrepareError::InvalidRequest);
+        }
+        let request = Arc::new(SessionConsumerRequest::new_prepared(
+            self.router.scope,
+            request_id,
+            SessionConsumerOperation::CompareAndSet {
+                op: Box::new(operation),
+            },
+            authority,
+        ));
+        if request.validate().is_err() {
+            return Err(PreparedCompareAndSetPrepareError::InvalidRequest);
+        }
+        Ok(StorePreparedCompareAndSet::from_consumer_port(
+            completion,
+            Arc::new(PersistentPreparedCompareAndSetToken {
+                router: Arc::clone(&self.router),
+                request,
+                receipt: OnceLock::new(),
+                budget,
+                state: PreparedRequestState::new(self.router.next_origin()),
+                terminal_receipt: StdMutex::new(None),
+            }),
+        ))
+    }
+    fn prepare_acquire_with_id(
+        &self,
+        completion: PreparedCheckpointCompletion,
+        request_id: SessionConsumerRequestId,
+        key: opc_session_store::SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquire, PreparedLeaseAcquirePrepareError> {
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedLeaseAcquirePrepareError::NotTransmitted);
+        }
+        let authority = completion.authority_context();
+        if !self.router.bind_authority_context(authority) {
+            return Err(PreparedLeaseAcquirePrepareError::InvalidRequest);
+        }
+        let request = SessionConsumerLeaseMutationRequest::new_prepared(
+            request_id,
+            SessionConsumerLeaseMutationOperation::Acquire { key, owner, ttl },
+            authority,
+        );
+        request
+            .validate()
+            .map_err(|_| PreparedLeaseAcquirePrepareError::InvalidRequest)?;
+        let dispatch_request = match request.operation() {
+            SessionConsumerLeaseMutationOperation::Acquire { key, owner, ttl } => {
+                SessionConsumerRequest::new_prepared(
+                    self.router.scope,
+                    request_id,
+                    SessionConsumerOperation::AcquireLease {
+                        key: key.clone(),
+                        owner: owner.clone(),
+                        ttl: *ttl,
+                    },
+                    authority,
+                )
+            }
+            _ => return Err(PreparedLeaseAcquirePrepareError::InvalidRequest),
+        };
+        if dispatch_request.validate().is_err() {
+            return Err(PreparedLeaseAcquirePrepareError::InvalidRequest);
+        }
+        Ok(PreparedLeaseAcquire::from_consumer_port(
+            completion,
+            Arc::new(PersistentPreparedLeaseAcquireToken {
+                router: Arc::clone(&self.router),
+                request,
+                dispatch_request,
+                budget,
+                state: PreparedRequestState::new(self.router.next_origin()),
+                terminal_receipt: StdMutex::new(None),
+            }),
+        ))
+    }
+}
+
 fn rejection_into_store_error(rejection: SessionConsumerRejection) -> StoreError {
     match rejection {
         SessionConsumerRejection::ScopeMismatch | SessionConsumerRejection::Unauthorized => {
@@ -8355,7 +9260,7 @@ impl SessionQuorumConsumerServer {
     }
 
     /// Set the active authenticated-frame idle deadline. A larger legacy
-    /// stateless value remains source-compatible, while revision 4 applies its
+    /// stateless value remains source-compatible, while revision 5 applies its
     /// five-second active-frame ceiling internally.
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
@@ -8723,7 +9628,7 @@ async fn handle_server_connection(
     #[cfg(test)] setup_test_hooks: Option<Arc<ConsumerServerSetupTestHooks>>,
     #[cfg(test)] expire_at_final_ack_boundary: bool,
 ) -> Result<(), ProtocolError> {
-    // Revision 4 reuses a socket for small request/response frames. Disable
+    // Revision 5 reuses a socket for small request/response frames. Disable
     // Nagle on both peers so a warm exchange cannot inherit the platform's
     // delayed-ACK cadence and consume the bounded fair-pool wait budget.
     stream.set_nodelay(true).map_err(ProtocolError::Io)?;
@@ -9293,7 +10198,7 @@ async fn handle_server_connection(
             (&restore_request, &response)
         {
             // Keep #684's page validation and response-fit replacement before
-            // writing a frame; revision-4 only adds the small correlation
+            // writing a frame; revision-5 only adds the small correlation
             // envelope to the fit calculation.
             if page.validate_for_request(request).is_err()
                 || !consumer_response_fits_for_correlation(
@@ -9625,6 +10530,7 @@ fn consumer_timeout_response(
         | ConsumerOperationKind::ObserveFencedTransition
         | ConsumerOperationKind::FencedTransitionStatus
         | ConsumerOperationKind::LeaseMutationStatus
+        | ConsumerOperationKind::CompareAndSetStatus
         | ConsumerOperationKind::Get
         | ConsumerOperationKind::PreflightRecordExpiry
         | ConsumerOperationKind::Batch {
@@ -9727,21 +10633,24 @@ mod tests {
     use std::num::NonZeroU32;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
     use super::{
-        authenticated_consumer_binding, classify_call_write_error, complete_before_deadline,
-        consumer_connection_current, consumer_execute_into_fenced_transition,
-        consumer_fresh_admission_is_current, consumer_payload_fragments_exceed_frame,
+        authenticated_consumer_binding, classify_call_write_error,
+        classify_prepared_lease_acquire_error, classify_prepared_lease_acquire_rejection,
+        complete_before_deadline, consumer_connection_current,
+        consumer_execute_into_fenced_transition, consumer_fresh_admission_is_current,
+        consumer_operation_is_effectful, consumer_payload_fragments_exceed_frame,
         consumer_public_response_from_wire, consumer_request_has_exact_fenced_transition_id,
-        consumer_response_fits, consumer_watch_error_is_legal, consumer_wire_response_from_public,
-        decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
-        fenced_transition_response, lease_error_matches_operation,
-        lease_mutation_status_matches_request, lease_mutation_status_wire_matches_request,
-        lease_response, mutation_response, persistent_execute_error,
-        poll_persistent_consumer_setup_io, publish_monotonic_shutdown_phase,
+        consumer_response_fits, consumer_timeout_response, consumer_watch_error_is_legal,
+        consumer_wire_response_from_public, decode_consumer_frame_payload,
+        ensure_pre_request_budget_remaining, exact_correlation, fenced_transition_response,
+        lease_error_matches_operation, lease_mutation_status_matches_request,
+        lease_mutation_status_wire_matches_request, lease_response, mutation_response,
+        persistent_execute_error, poll_persistent_consumer_setup_io,
+        prepared_router_roster_is_distinct, prepared_voter_index, publish_monotonic_shutdown_phase,
         queued_consumer_watch_stream, read_authenticated_consumer_frame_until,
         read_authenticated_consumer_frame_within, response_is_outcome_unknown,
         response_matches_operation, response_matches_request,
@@ -9756,17 +10665,20 @@ mod tests {
         ConsumerSetupPhaseAttempt, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
         ConsumerWireRequest, ConsumerWireResponse, PersistentCheckedOutConnection,
         PersistentConsumerCounters, PersistentConsumerIoBarrier, PersistentConsumerShutdownReader,
-        PersistentConsumerShutdownWriter, PersistentSessionConsumerClient,
+        PersistentConsumerShutdownWriter, PersistentPreparedCompareAndSetToken,
+        PersistentPreparedLeaseAcquireToken, PersistentSessionConsumerClient,
         PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
         PersistentSessionConsumerExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
-        PersistentWatchRecovery, QueuedConsumerWatchItem, SessionConsumerAuthorizationError,
+        PersistentWatchRecovery, PreparedConsumerRouter, PreparedLeaseAcquireDispatchResult,
+        PreparedRequestState, QueuedConsumerWatchItem, SessionConsumerAuthorizationError,
         SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
         SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
         SessionConsumerFencedTransitionMutationError, SessionConsumerIdentity,
-        SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionConsumerRejection,
-        SessionQuorumConsumer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
-        DEFAULT_CONSUMER_IDLE_TIMEOUT, DEFAULT_CONSUMER_MAX_CONNECTIONS,
-        DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+        SessionConsumerLeaseMutationError, SessionConsumerMutationError,
+        SessionConsumerPreparedCheckpointRouter, SessionConsumerRejection, SessionQuorumConsumer,
+        SessionQuorumConsumerServer, StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
@@ -9776,28 +10688,34 @@ mod tests {
         DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
         MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
-        MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+        MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS, PREPARED_DISPATCHING,
+        PREPARED_RECEIPT_ONLY,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
     use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
+    use opc_session_store::backend::{PreparedCompareAndSetToken, PreparedLeaseAcquireToken};
     use opc_session_store::{
         checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
         EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedTransitionExecuteError,
         FencedTransitionLease, FencedTransitionMutation, FencedTransitionObservation,
         FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-        FencedTransitionStatus, Generation, LeaseGuard, OwnerId, PreparedFencedTransition,
+        FencedTransitionStatus, Generation, LeaseGuard, OwnerId, PreparedCheckpointBudget,
+        PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
+        PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError, PreparedFencedTransition,
+        PreparedLeaseAcquireExecuteError, PreparedLeaseAcquireStatusError,
         RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionBackend,
         SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
         SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
-        SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
-        SessionConsumerLeaseError, SessionConsumerLeaseMutationOperation,
-        SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
-        SessionConsumerLeaseMutationStatus, SessionConsumerOperation,
-        SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
-        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
-        SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType, StoreError,
-        StoredSessionRecord, MAX_SESSION_TTL,
+        SessionConsumerCompareAndSetReceiptOutcome, SessionConsumerCompareAndSetRequest,
+        SessionConsumerCompareAndSetStatus, SessionConsumerFencedTransitionError,
+        SessionConsumerFencedTransitionStatus, SessionConsumerLeaseError,
+        SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationRequest,
+        SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
+        SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRequest,
+        SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+        SessionConsumerStoreError, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+        StateClass, StateType, StoreError, StoredSessionRecord, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -9812,6 +10730,1017 @@ mod tests {
     };
     use crate::protocol::MAX_NEGOTIATED_FRAME_SIZE;
     use crate::test_support::{RotatableClientMaterial, RotatableServerMaterial};
+
+    #[test]
+    fn prepared_request_state_rotates_only_proven_not_transmitted_dispatches() {
+        let state = PreparedRequestState::new(7);
+        assert_eq!(state.mutation_cursor.load(Ordering::Acquire), 7);
+        assert_eq!(state.status_cursor.load(Ordering::Acquire), 8);
+        let mut dispatch = state.begin_dispatch().expect("dispatch guard");
+        state.not_transmitted();
+        assert_eq!(state.phase.load(Ordering::Acquire), PREPARED_DISPATCHING);
+        assert_eq!(state.mutation_cursor.load(Ordering::Acquire), 8);
+        assert!(!state.status_allowed());
+
+        dispatch.receipt_only();
+        assert_eq!(state.phase.load(Ordering::Acquire), PREPARED_RECEIPT_ONLY);
+        assert!(state.status_allowed());
+        assert!(state.begin_dispatch().is_err());
+        assert!(state.begin_status().is_ok());
+        let held = state.begin_status();
+        assert!(held.is_ok());
+        let first = held.expect("first status guard");
+        assert!(state.begin_status().is_err());
+        drop(first);
+        assert!(state.begin_status().is_ok());
+    }
+
+    // RED: dropping an execute future after dispatch ownership is acquired
+    // currently leaves the token permanently in-flight, even though transport
+    // progress is no longer observable by that future. The replacement guard
+    // must conservatively make it status-only on drop.
+    #[test]
+    fn dropped_in_flight_dispatch_is_conservatively_status_only() {
+        let state = PreparedRequestState::new(0);
+        let dispatch = state.begin_dispatch().expect("dispatch guard");
+        assert_eq!(state.phase.load(Ordering::Acquire), PREPARED_DISPATCHING);
+        drop(dispatch);
+        assert!(state.status_allowed());
+    }
+
+    #[test]
+    fn cancelled_status_admission_releases_only_the_receipt_lane() {
+        let state = PreparedRequestState::new(0);
+        let mut dispatch = state.begin_dispatch().expect("dispatch guard");
+        dispatch.receipt_only();
+        drop(dispatch);
+        let status = state.begin_status().expect("status admission");
+        // Dropping the pending status future releases the RAII admission
+        // guard. The state remains receipt-only, so cancellation cannot make
+        // the canonical mutation dispatchable again.
+        drop(status);
+        assert!(state.begin_status().is_ok());
+        assert!(state.begin_dispatch().is_err());
+        assert_eq!(state.mutation_cursor.load(Ordering::Acquire), 0);
+    }
+
+    // RED: a proven pre-write failure is safe to rotate internally. It must
+    // retain dispatch ownership while the router immediately selects the next
+    // voter, rather than returning ownership to a caller-driven second call.
+    #[test]
+    fn not_transmitted_keeps_router_dispatch_ownership_for_next_voter() {
+        let state = PreparedRequestState::new(4);
+        let _dispatch = state.begin_dispatch().expect("dispatch guard");
+        state.not_transmitted();
+        assert_eq!(state.mutation_cursor.load(Ordering::Acquire), 5);
+        assert_eq!(state.phase.load(Ordering::Acquire), PREPARED_DISPATCHING);
+    }
+
+    #[test]
+    fn possible_send_seals_token_against_later_mutation_dispatch() {
+        let state = PreparedRequestState::new(2);
+        let mut dispatch = state.begin_dispatch().expect("dispatch guard");
+        dispatch.receipt_only();
+        assert!(state.status_allowed());
+        assert!(state.begin_dispatch().is_err());
+        assert_eq!(state.mutation_cursor.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn prepared_acquire_direct_request_conflict_is_typed_terminal() {
+        assert!(matches!(
+            classify_prepared_lease_acquire_error(SessionConsumerLeaseError::RequestConflict),
+            PreparedLeaseAcquireDispatchResult::Terminal(
+                PreparedLeaseAcquireExecuteError::RequestConflict
+            )
+        ));
+    }
+
+    #[test]
+    fn prepared_acquire_direct_unavailable_is_typed_terminal() {
+        assert!(matches!(
+            classify_prepared_lease_acquire_error(SessionConsumerLeaseError::Unavailable),
+            PreparedLeaseAcquireDispatchResult::Terminal(
+                PreparedLeaseAcquireExecuteError::Unavailable
+            )
+        ));
+    }
+
+    #[test]
+    fn prepared_acquire_complete_wire_unavailable_is_typed_terminal() {
+        assert!(matches!(
+            classify_prepared_lease_acquire_rejection(SessionConsumerRejection::Unavailable),
+            PreparedLeaseAcquireExecuteError::Unavailable
+        ));
+        assert!(matches!(
+            classify_prepared_lease_acquire_rejection(SessionConsumerRejection::Unauthorized),
+            PreparedLeaseAcquireExecuteError::Rejected(_)
+        ));
+        assert!(matches!(
+            classify_prepared_lease_acquire_rejection(SessionConsumerRejection::MalformedRequest),
+            PreparedLeaseAcquireExecuteError::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn prepared_acquire_outcome_unavailable_is_receipt_only() {
+        assert!(matches!(
+            classify_prepared_lease_acquire_error(SessionConsumerLeaseError::OutcomeUnavailable),
+            PreparedLeaseAcquireDispatchResult::ReceiptOnly
+        ));
+    }
+
+    #[test]
+    fn receipt_starts_after_exact_last_mutation_voter_for_two_three_and_four_voters() {
+        for voter_count in [2_usize, 3, 4] {
+            let state = PreparedRequestState::new(0);
+            let mut dispatch = state.begin_dispatch().expect("dispatch guard");
+            assert_eq!(
+                prepared_voter_index(state.mutation_cursor.load(Ordering::Acquire), voter_count),
+                0
+            );
+            state.not_transmitted();
+            assert_eq!(
+                prepared_voter_index(state.mutation_cursor.load(Ordering::Acquire), voter_count),
+                1 % voter_count
+            );
+            state.not_transmitted();
+            let attempted =
+                prepared_voter_index(state.mutation_cursor.load(Ordering::Acquire), voter_count);
+            assert_eq!(attempted, 2 % voter_count);
+            dispatch.receipt_only();
+            assert_eq!(
+                prepared_voter_index(state.status_cursor.load(Ordering::Acquire), voter_count),
+                (attempted + 1) % voter_count
+            );
+        }
+    }
+
+    #[test]
+    fn three_voter_router_keeps_dispatch_then_starts_receipt_after_possible_send() {
+        let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        let clients = [
+            PersistentSessionConsumerClient::from_stateless(stateless.clone())
+                .expect("first persistent voter"),
+            PersistentSessionConsumerClient::from_stateless(stateless.clone())
+                .expect("second persistent voter"),
+            PersistentSessionConsumerClient::from_stateless(stateless)
+                .expect("third persistent voter"),
+        ];
+        let router = PreparedConsumerRouter {
+            clients: Arc::from(clients),
+            scope: scope(),
+            origin_cursor: AtomicUsize::new(0),
+            authority_context: OnceLock::new(),
+        };
+        let state = PreparedRequestState::new(0);
+        let mut dispatch = state.begin_dispatch().expect("router owns dispatch");
+
+        // A and B are proven pre-write failures: only the router advances the
+        // mutation cursor, so C receives the sole possible physical mutation.
+        assert!(std::ptr::eq(
+            router.mutation_client(&state.mutation_cursor),
+            &router.clients[0]
+        ));
+        state.not_transmitted();
+        assert!(std::ptr::eq(
+            router.mutation_client(&state.mutation_cursor),
+            &router.clients[1]
+        ));
+        state.not_transmitted();
+        assert!(std::ptr::eq(
+            router.mutation_client(&state.mutation_cursor),
+            &router.clients[2]
+        ));
+
+        // C's response loss is conservatively a possible send. It seals the
+        // mutation path and the first one-attempt receipt starts at A.
+        dispatch.receipt_only();
+        assert!(
+            state.begin_dispatch().is_err(),
+            "no second mutation after C"
+        );
+        assert!(std::ptr::eq(
+            router.receipt_client(&state.status_cursor),
+            &router.clients[0]
+        ));
+    }
+
+    #[test]
+    fn prepared_router_rejects_duplicate_voter_identity_and_accepts_three_distinct() {
+        assert!(!prepared_router_roster_is_distinct([
+            "spiffe://example/voter-a",
+            "spiffe://example/voter-a",
+        ]));
+        assert!(prepared_router_roster_is_distinct([
+            "spiffe://example/voter-a",
+            "spiffe://example/voter-b",
+            "spiffe://example/voter-c",
+        ]));
+    }
+
+    #[test]
+    fn explicit_checkpoint_attempt_budgets_allow_cellular_sweeps_without_default_wait() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        for timeout in [25_u64, 50, 100] {
+            let budget = PreparedCheckpointBudget::new(deadline, Duration::from_millis(timeout))
+                .expect("explicit sub-ceiling attempt budget");
+            assert_eq!(
+                budget.physical_attempt_timeout(),
+                Duration::from_millis(timeout)
+            );
+            assert_eq!(budget.original_deadline(), deadline);
+        }
+        assert!(PreparedCheckpointBudget::new(deadline, Duration::from_millis(251),).is_err());
+    }
+
+    #[test]
+    fn healthy_terminal_outcome_performs_zero_receipt_attempts() {
+        let state = PreparedRequestState::new(11);
+        let mut dispatch = state.begin_dispatch().expect("dispatch guard");
+        dispatch.terminal();
+        assert!(!state.status_allowed());
+        assert_eq!(state.status_cursor.load(Ordering::Acquire), 12);
+        assert!(state.begin_status().is_ok());
+        assert_eq!(state.status_cursor.load(Ordering::Acquire), 12);
+    }
+
+    #[tokio::test]
+    async fn prepared_lease_expired_status_deadline_does_not_advance_the_receipt_cursor() {
+        let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        let router = Arc::new(PreparedConsumerRouter {
+            clients: Arc::from([PersistentSessionConsumerClient::from_stateless(stateless)
+                .expect("persistent test client")]),
+            scope: scope(),
+            origin_cursor: AtomicUsize::new(0),
+            authority_context: OnceLock::new(),
+        });
+        let request_id = SessionConsumerRequestId::new();
+        let key = SessionKey {
+            tenant: TenantId::new("prepared-lease-status-deadline").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"prepared-lease-status-deadline")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("prepared-lease-status-owner").expect("test owner");
+        let request = SessionConsumerLeaseMutationRequest::new(
+            request_id,
+            SessionConsumerLeaseMutationOperation::Acquire {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl: Duration::from_secs(30),
+            },
+        );
+        let token = PersistentPreparedLeaseAcquireToken {
+            router,
+            request,
+            dispatch_request: SessionConsumerRequest::new(
+                scope(),
+                request_id,
+                SessionConsumerOperation::AcquireLease {
+                    key,
+                    owner,
+                    ttl: Duration::from_secs(30),
+                },
+            ),
+            budget: PreparedCheckpointBudget::new(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(25),
+            )
+            .expect("explicit attempt budget"),
+            state: PreparedRequestState::new(7),
+            terminal_receipt: StdMutex::new(None),
+        };
+        let mut dispatch = token.state.begin_dispatch().expect("dispatch guard");
+        dispatch.receipt_only();
+        drop(dispatch);
+        let cursor = token.state.status_cursor.load(Ordering::Acquire);
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() - Duration::from_millis(1))
+                .await,
+            Err(PreparedLeaseAcquireStatusError::Deadline)
+        );
+        assert_eq!(
+            cursor,
+            token.state.status_cursor.load(Ordering::Acquire),
+            "invalid original deadline chooses no receipt voter"
+        );
+
+        // A recorded deterministic lease rejection is authoritative.  It
+        // must remain available even when a later caller supplies an expired
+        // attempt deadline, rather than selecting another voter that could
+        // report an older NotFound/Unavailable observation.
+        let terminal = Ok(SessionConsumerLeaseMutationStatus::Recorded(Box::new(Err(
+            SessionConsumerLeaseError::Expired,
+        ))));
+        *token
+            .terminal_receipt
+            .lock()
+            .expect("terminal receipt mutex") = Some(terminal.clone());
+        token.state.terminal();
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() - Duration::from_millis(1))
+                .await,
+            terminal,
+            "an authoritative lease receipt is absorbing before deadline or voter selection"
+        );
+        assert_eq!(
+            cursor,
+            token.state.status_cursor.load(Ordering::Acquire),
+            "the cached terminal receipt contacts no later voter"
+        );
+    }
+
+    /// A scripted persistent-consumer convergence exercise for the router's
+    /// transport state machine only. It deliberately uses a context-free
+    /// request and private token construction, so it makes no protected
+    /// wrapper/authority claim; those are covered by store-wrapper tests.
+    /// A and B fail before any application bytes can be written, C receives
+    /// the immutable CAS then deliberately withholds its response, and the
+    /// first receipt is read from A (the voter immediately after C).
+    #[tokio::test]
+    async fn prepared_cas_three_voter_response_loss_converges_via_next_receipt_voter() {
+        let client_identity = material_spiffe("prepared-cas-router-client");
+        let voter_a_identity = material_spiffe("prepared-cas-router-a");
+        let voter_c_identity = material_spiffe("prepared-cas-router-c");
+        let client_material = RotatableClientMaterial::new(client_identity.as_str());
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("prepared-router authorizer");
+
+        let a_status_calls = Arc::new(AtomicUsize::new(0));
+        let c_mutation_calls = Arc::new(AtomicUsize::new(0));
+        let c_mutations = Arc::new(StdMutex::new(Vec::new()));
+        let (a_server, a_address) = SessionQuorumConsumerServer::new(
+            Arc::new(RecordedPreparedCasReceiptConsumer {
+                status_calls: Arc::clone(&a_status_calls),
+            }),
+            client_material.trusted_server_config(voter_a_identity.as_str()),
+            authorizer.clone(),
+        )
+        .listen("127.0.0.1:0".parse().expect("A listener"))
+        .await
+        .expect("A listener starts");
+        let (c_server, c_address) = SessionQuorumConsumerServer::new(
+            Arc::new(DroppedPreparedCasResponseConsumer {
+                mutation_calls: Arc::clone(&c_mutation_calls),
+                mutations: Arc::clone(&c_mutations),
+            }),
+            client_material.trusted_server_config(voter_c_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("C listener"))
+        .await
+        .expect("C listener starts");
+
+        // The dynamic resolver is a test-only network seam: no listener is
+        // contacted for A's first call or B's only call, making both failures
+        // provably pre-write. A is admitted only for the first receipt read.
+        let a_resolution_calls = Arc::new(AtomicUsize::new(0));
+        let a_resolver: RemoteAddrResolver = {
+            let calls = Arc::clone(&a_resolution_calls);
+            Arc::new(move || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if call == 0 {
+                        Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "scripted before-call-write A failure",
+                        ))
+                    } else {
+                        Ok(a_address)
+                    }
+                })
+            })
+        };
+        let b_resolution_calls = Arc::new(AtomicUsize::new(0));
+        let b_resolver: RemoteAddrResolver = {
+            let calls = Arc::clone(&b_resolution_calls);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "scripted before-call-write B failure",
+                    ))
+                })
+            })
+        };
+        let c_resolution_calls = Arc::new(AtomicUsize::new(0));
+        let c_resolver: RemoteAddrResolver = {
+            let calls = Arc::clone(&c_resolution_calls);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(c_address) })
+            })
+        };
+        let server_name = rustls_pki_types::ServerName::IpAddress(a_address.ip().into());
+        let client_a = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver(
+                a_resolver,
+                server_name.clone(),
+                voter_a_identity,
+                scope(),
+                client_material.config(),
+            ),
+        )
+        .expect("A persistent client");
+        let client_b = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver(
+                b_resolver,
+                server_name.clone(),
+                material_spiffe("prepared-cas-router-b"),
+                scope(),
+                client_material.config(),
+            ),
+        )
+        .expect("B persistent client");
+        let client_c = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver(
+                c_resolver,
+                server_name,
+                voter_c_identity,
+                scope(),
+                client_material.config(),
+            ),
+        )
+        .expect("C persistent client");
+        let router =
+            SessionConsumerPreparedCheckpointRouter::persistent([client_a, client_b, client_c])
+                .expect("three distinct same-scope voters");
+        let request = unprotected_router_state_test_compare_and_set_request().await;
+        let expected_request = request.clone();
+        let token = PersistentPreparedCompareAndSetToken {
+            router: Arc::clone(&router.router),
+            request: Arc::new(request),
+            receipt: OnceLock::new(),
+            budget: PreparedCheckpointBudget::new(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(100),
+            )
+            .expect("explicit 100ms physical budget"),
+            state: PreparedRequestState::new(0),
+            terminal_receipt: StdMutex::new(None),
+        };
+
+        assert_eq!(
+            token.execute_once().await,
+            Err(PreparedCompareAndSetExecuteError::OutcomeUnknown),
+            "C received the mutation but dropped only its response"
+        );
+        assert_eq!(a_resolution_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(b_resolution_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(c_resolution_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(c_mutation_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            c_mutations.lock().expect("C mutation log").as_slice(),
+            [expected_request],
+            "the sole committed scripted mutation retains the exact ID and body"
+        );
+
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(100))
+                .await,
+            Ok(PreparedCompareAndSetStatus::Recorded(
+                PreparedCompareAndSetOutcome::Applied,
+            )),
+            "the first read-only receipt converges on A"
+        );
+        assert_eq!(a_resolution_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(a_status_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(c_mutation_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() - Duration::from_millis(1))
+                .await,
+            Ok(PreparedCompareAndSetStatus::Recorded(
+                PreparedCompareAndSetOutcome::Applied,
+            )),
+            "the authoritative receipt is cached before any later voter or deadline check"
+        );
+        assert_eq!(a_resolution_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(a_status_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            token.execute_once().await,
+            Err(PreparedCompareAndSetExecuteError::AlreadyExecuted),
+            "possible-send permanently seals the mutation path"
+        );
+        assert_eq!(c_mutation_calls.load(Ordering::SeqCst), 1);
+
+        a_server.abort_and_wait().await;
+        c_server.abort_and_wait().await;
+    }
+
+    // Reproduces the old race precisely: clone A sampled status state but was
+    // paused before `status_in_flight`; clone B then completed the first
+    // receipt read.  A must recheck only after it owns admission, returning
+    // B's absorbing answer without selecting a second voter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepared_cas_paused_pre_admission_clone_uses_published_terminal_receipt() {
+        let client_identity = material_spiffe("prepared-cas-admission-client");
+        let voter_identity = material_spiffe("prepared-cas-admission-voter");
+        let client_material = RotatableClientMaterial::new(client_identity.as_str());
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("prepared CAS admission authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            Arc::new(RecordedPreparedCasReceiptConsumer {
+                status_calls: Arc::clone(&status_calls),
+            }),
+            client_material.trusted_server_config(voter_identity.as_str()),
+            authorizer,
+        )
+        .listen(
+            "127.0.0.1:0"
+                .parse()
+                .expect("prepared CAS admission listener"),
+        )
+        .await
+        .expect("prepared CAS admission listener starts");
+        let client =
+            PersistentSessionConsumerClient::from_stateless(StatelessSessionConsumerClient::new(
+                address,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                voter_identity,
+                scope(),
+                client_material.config(),
+            ))
+            .expect("prepared CAS admission persistent voter");
+        let router = SessionConsumerPreparedCheckpointRouter::persistent([client])
+            .expect("prepared CAS admission router");
+        let token = Arc::new(PersistentPreparedCompareAndSetToken {
+            router: Arc::clone(&router.router),
+            request: Arc::new(unprotected_router_state_test_compare_and_set_request().await),
+            receipt: OnceLock::new(),
+            budget: PreparedCheckpointBudget::new(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(100),
+            )
+            .expect("prepared CAS admission budget"),
+            state: PreparedRequestState::new(0),
+            terminal_receipt: StdMutex::new(None),
+        });
+        let mut dispatch = token.state.begin_dispatch().expect("dispatch guard");
+        dispatch.receipt_only();
+        drop(dispatch);
+        let initial_cursor = token.state.status_cursor.load(Ordering::Acquire);
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let resume_rx = Arc::new(StdMutex::new(resume_rx));
+        token.state.pause_next_status_admission(Arc::new(move || {
+            paused_tx.send(()).expect("publish paused CAS clone");
+            resume_rx
+                .lock()
+                .expect("lock CAS admission resume receiver")
+                .recv()
+                .expect("resume paused CAS clone");
+        }));
+        let paused_clone = Arc::clone(&token);
+        let paused = tokio::spawn(async move {
+            paused_clone
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+                .await
+        });
+        tokio::task::spawn_blocking(move || paused_rx.recv().expect("wait for paused CAS clone"))
+            .await
+            .expect("paused CAS wait task joins");
+
+        let published = token
+            .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+            .await;
+        assert_eq!(
+            published,
+            Ok(PreparedCompareAndSetStatus::Recorded(
+                PreparedCompareAndSetOutcome::Applied
+            ))
+        );
+        assert_eq!(status_calls.load(Ordering::SeqCst), 1);
+        let cursor_after_publish = token.state.status_cursor.load(Ordering::Acquire);
+        assert_ne!(cursor_after_publish, initial_cursor);
+
+        resume_tx.send(()).expect("release paused CAS clone");
+        assert_eq!(paused.await.expect("paused CAS task joins"), published);
+        assert_eq!(
+            status_calls.load(Ordering::SeqCst),
+            1,
+            "the delayed clone must not make a second status request"
+        );
+        assert_eq!(
+            token.state.status_cursor.load(Ordering::Acquire),
+            cursor_after_publish,
+            "the delayed clone must not choose another voter"
+        );
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepared_lease_paused_pre_admission_clone_uses_published_terminal_receipt() {
+        let client_identity = material_spiffe("prepared-lease-admission-client");
+        let voter_identity = material_spiffe("prepared-lease-admission-voter");
+        let client_material = RotatableClientMaterial::new(client_identity.as_str());
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("prepared lease admission authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            Arc::new(RecordedPreparedLeaseReceiptConsumer {
+                status_calls: Arc::clone(&status_calls),
+            }),
+            client_material.trusted_server_config(voter_identity.as_str()),
+            authorizer,
+        )
+        .listen(
+            "127.0.0.1:0"
+                .parse()
+                .expect("prepared lease admission listener"),
+        )
+        .await
+        .expect("prepared lease admission listener starts");
+        let client =
+            PersistentSessionConsumerClient::from_stateless(StatelessSessionConsumerClient::new(
+                address,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                voter_identity,
+                scope(),
+                client_material.config(),
+            ))
+            .expect("prepared lease admission persistent voter");
+        let router = SessionConsumerPreparedCheckpointRouter::persistent([client])
+            .expect("prepared lease admission router");
+        let request_id = SessionConsumerRequestId::new();
+        let key = SessionKey {
+            tenant: TenantId::new("prepared-lease-admission").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"prepared-lease-admission")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("prepared-lease-admission-owner").expect("test owner");
+        let request = SessionConsumerLeaseMutationRequest::new(
+            request_id,
+            SessionConsumerLeaseMutationOperation::Acquire {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl: Duration::from_secs(30),
+            },
+        );
+        let token = Arc::new(PersistentPreparedLeaseAcquireToken {
+            router: Arc::clone(&router.router),
+            request,
+            dispatch_request: SessionConsumerRequest::new(
+                scope(),
+                request_id,
+                SessionConsumerOperation::AcquireLease {
+                    key,
+                    owner,
+                    ttl: Duration::from_secs(30),
+                },
+            ),
+            budget: PreparedCheckpointBudget::new(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(100),
+            )
+            .expect("prepared lease admission budget"),
+            state: PreparedRequestState::new(0),
+            terminal_receipt: StdMutex::new(None),
+        });
+        let mut dispatch = token.state.begin_dispatch().expect("dispatch guard");
+        dispatch.receipt_only();
+        drop(dispatch);
+        let initial_cursor = token.state.status_cursor.load(Ordering::Acquire);
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let resume_rx = Arc::new(StdMutex::new(resume_rx));
+        token.state.pause_next_status_admission(Arc::new(move || {
+            paused_tx.send(()).expect("publish paused lease clone");
+            resume_rx
+                .lock()
+                .expect("lock lease admission resume receiver")
+                .recv()
+                .expect("resume paused lease clone");
+        }));
+        let paused_clone = Arc::clone(&token);
+        let paused = tokio::spawn(async move {
+            paused_clone
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+                .await
+        });
+        tokio::task::spawn_blocking(move || paused_rx.recv().expect("wait for paused lease clone"))
+            .await
+            .expect("paused lease wait task joins");
+
+        let published = token
+            .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+            .await;
+        assert_eq!(
+            published,
+            Ok(SessionConsumerLeaseMutationStatus::Recorded(Box::new(Err(
+                SessionConsumerLeaseError::AlreadyHeld
+            ))))
+        );
+        assert_eq!(status_calls.load(Ordering::SeqCst), 1);
+        let cursor_after_publish = token.state.status_cursor.load(Ordering::Acquire);
+        assert_ne!(cursor_after_publish, initial_cursor);
+
+        resume_tx.send(()).expect("release paused lease clone");
+        assert_eq!(paused.await.expect("paused lease task joins"), published);
+        assert_eq!(
+            status_calls.load(Ordering::SeqCst),
+            1,
+            "the delayed clone must not make a second status request"
+        );
+        assert_eq!(
+            token.state.status_cursor.load(Ordering::Acquire),
+            cursor_after_publish,
+            "the delayed clone must not choose another voter"
+        );
+        server.abort_and_wait().await;
+    }
+
+    /// Context-free input reserved for router state-machine tests. Production
+    /// callers obtain the opaque request/token only from protected wrappers.
+    async fn unprotected_router_state_test_compare_and_set_request() -> SessionConsumerRequest {
+        let key = SessionKey {
+            tenant: TenantId::new("prepared-router-cas").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"prepared-router-cas")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("prepared-router-owner").expect("test owner");
+        let lease = FakeSessionBackend::new()
+            .acquire(&key, owner.clone(), Duration::from_secs(30))
+            .await
+            .expect("test lease");
+        let operation = CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                key,
+                generation: Generation::new(1),
+                owner,
+                fence: lease.fence(),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("prepared-router-cas"),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new([0x33]),
+            },
+        };
+        let request_id = SessionConsumerRequestId::new();
+        SessionConsumerRequest::new(
+            scope(),
+            request_id,
+            SessionConsumerOperation::CompareAndSet {
+                op: Box::new(operation),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn prepared_cas_healthy_persistent_success_never_reads_a_receipt() {
+        let client_identity = material_spiffe("prepared-cas-healthy-client");
+        let voter_identity = material_spiffe("prepared-cas-healthy-voter");
+        let client_material = RotatableClientMaterial::new(client_identity.as_str());
+        let mutation_calls = Arc::new(AtomicUsize::new(0));
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("healthy prepared-router authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            Arc::new(HealthyPreparedCasConsumer {
+                mutation_calls: Arc::clone(&mutation_calls),
+                status_calls: Arc::clone(&status_calls),
+            }),
+            client_material.trusted_server_config(voter_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("healthy listener"))
+        .await
+        .expect("healthy listener starts");
+        let client =
+            PersistentSessionConsumerClient::from_stateless(StatelessSessionConsumerClient::new(
+                address,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                voter_identity,
+                scope(),
+                client_material.config(),
+            ))
+            .expect("healthy persistent client");
+        let router = SessionConsumerPreparedCheckpointRouter::persistent([client])
+            .expect("one healthy same-scope voter");
+        // This is intentionally a router-state test, not a protected
+        // authority test; see the helper's scope note.
+        let request = unprotected_router_state_test_compare_and_set_request().await;
+        let token = PersistentPreparedCompareAndSetToken {
+            router: Arc::clone(&router.router),
+            request: Arc::new(request),
+            receipt: OnceLock::new(),
+            budget: PreparedCheckpointBudget::new(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(100),
+            )
+            .expect("explicit healthy attempt budget"),
+            state: PreparedRequestState::new(0),
+            terminal_receipt: StdMutex::new(None),
+        };
+
+        assert_eq!(
+            token.execute_once().await,
+            Ok(PreparedCompareAndSetOutcome::Applied)
+        );
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(status_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            token.receipt.get().is_none(),
+            "the healthy dispatch path does not allocate a receipt body"
+        );
+        assert_eq!(
+            Arc::strong_count(&token.request),
+            1,
+            "one canonical sealed request is retained after a healthy dispatch"
+        );
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(100))
+                .await,
+            Err(PreparedCompareAndSetStatusError::NotExecuted)
+        );
+        assert_eq!(status_calls.load(Ordering::SeqCst), 0);
+        server.abort_and_wait().await;
+    }
+
+    struct RecordedPreparedCasReceiptConsumer {
+        status_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for RecordedPreparedCasReceiptConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            assert!(matches!(
+                request.operation(),
+                SessionConsumerOperation::CompareAndSetStatus { .. }
+            ));
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            SessionConsumerResponse::CompareAndSetStatus(Ok(
+                SessionConsumerCompareAndSetStatus::Recorded(
+                    SessionConsumerCompareAndSetReceiptOutcome::Applied,
+                ),
+            ))
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
+
+    struct RecordedPreparedLeaseReceiptConsumer {
+        status_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for RecordedPreparedLeaseReceiptConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            assert!(matches!(
+                request.operation(),
+                SessionConsumerOperation::LeaseMutationStatus { .. }
+            ));
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            SessionConsumerResponse::LeaseMutationStatus(Ok(
+                SessionConsumerLeaseMutationStatus::Recorded(Box::new(Err(
+                    SessionConsumerLeaseError::AlreadyHeld,
+                ))),
+            ))
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
+
+    struct DroppedPreparedCasResponseConsumer {
+        mutation_calls: Arc<AtomicUsize>,
+        mutations: Arc<StdMutex<Vec<SessionConsumerRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for DroppedPreparedCasResponseConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            assert!(matches!(
+                request.operation(),
+                SessionConsumerOperation::CompareAndSet { .. }
+            ));
+            self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+            self.mutations.lock().expect("C mutation log").push(request);
+            // The request crossed the authenticated service boundary, but no
+            // response is supplied before the caller's explicit deadline.
+            std::future::pending::<SessionConsumerResponse>().await
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
+
+    struct HealthyPreparedCasConsumer {
+        mutation_calls: Arc<AtomicUsize>,
+        status_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for HealthyPreparedCasConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            match request.operation() {
+                SessionConsumerOperation::CompareAndSet { .. } => {
+                    self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+                    SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success))
+                }
+                SessionConsumerOperation::CompareAndSetStatus { .. } => {
+                    self.status_calls.fetch_add(1, Ordering::SeqCst);
+                    SessionConsumerResponse::CompareAndSetStatus(Ok(
+                        SessionConsumerCompareAndSetStatus::Recorded(
+                            SessionConsumerCompareAndSetReceiptOutcome::Applied,
+                        ),
+                    ))
+                }
+                _ => SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest),
+            }
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
 
     struct RejectingTestConsumer;
 
@@ -10615,6 +12544,74 @@ mod tests {
         );
         assert!(!consumer_payload_fragments_exceed_frame(&batch, 38));
         assert!(consumer_payload_fragments_exceed_frame(&batch, 37));
+    }
+
+    #[tokio::test]
+    async fn compare_and_set_receipt_is_read_only_and_bound_to_the_retained_body() {
+        let key = SessionKey {
+            tenant: TenantId::new("prepared-cas-receipt").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"prepared-cas-receipt")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("prepared-cas-owner").expect("test owner");
+        let lease = FakeSessionBackend::new()
+            .acquire(&key, owner.clone(), Duration::from_secs(30))
+            .await
+            .expect("test lease");
+        let operation = CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                key: key.clone(),
+                generation: Generation::new(1),
+                owner,
+                fence: lease.fence(),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("prepared-cas-receipt"),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new([0x33]),
+            },
+        };
+        let retained =
+            SessionConsumerCompareAndSetRequest::new(SessionConsumerRequestId::new(), operation);
+        let request = SessionConsumerRequest::new(
+            scope(),
+            retained.request_id(),
+            SessionConsumerOperation::CompareAndSetStatus {
+                request: Box::new(retained.clone()),
+            },
+        );
+
+        assert!(!consumer_operation_is_effectful(request.operation()));
+        assert!(matches!(
+            consumer_timeout_response(
+                ConsumerOperationKind::from_operation(request.operation()),
+                request.request_id(),
+            ),
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+        ));
+        for status in [
+            SessionConsumerCompareAndSetStatus::Recorded(
+                SessionConsumerCompareAndSetReceiptOutcome::Applied,
+            ),
+            SessionConsumerCompareAndSetStatus::RequestConflict,
+            SessionConsumerCompareAndSetStatus::NotFound,
+        ] {
+            assert!(response_matches_request(
+                &request,
+                &SessionConsumerResponse::CompareAndSetStatus(Ok(status)),
+            ));
+        }
+        assert!(!response_matches_request(
+            &request,
+            &SessionConsumerResponse::CompareAndSetStatus(
+                Err(SessionConsumerStoreError::NotFound,)
+            ),
+        ));
     }
 
     #[tokio::test]
@@ -11793,7 +13790,7 @@ mod tests {
         let request_frame_size = MAX_NEGOTIATED_FRAME_SIZE / 2;
         let response_frame_size = MAX_NEGOTIATED_FRAME_SIZE / 4;
         let expected =
-            super::consumer_capability_payload_budget(request_frame_size, response_frame_size);
+            super::session_consumer_payload_budget(request_frame_size, response_frame_size);
         let mut response = SessionConsumerResponse::Capabilities(
             opc_session_store::BackendCapabilities::all_enabled(),
         );
@@ -12267,7 +14264,7 @@ mod tests {
         assert_eq!(
             resolver_calls.load(Ordering::SeqCst),
             1,
-            "a legacy stateless timeout above the revision-4 ceiling remains source-compatible; the effective wire operation is internally capped"
+            "a legacy stateless timeout above the revision-5 ceiling remains source-compatible; the effective wire operation is internally capped"
         );
 
         let server_material = RotatableServerMaterial::new(

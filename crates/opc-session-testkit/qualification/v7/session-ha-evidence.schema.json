@@ -46,7 +46,7 @@
         "authenticated_route"
       ],
       "properties": {
-        "profile_sha256": { "const": "sha256:875c4ae37214b39d74ea2afdecfe15656c0de5dc92d813f9a69f0dbd329fe2a7" },
+        "profile_sha256": { "const": "sha256:df2ee6eaac1afbd03c8d4ca9a3267e39d02f33701b07c538baa3de0295f52f87" },
         "transcript_digest_domain": { "const": "opc-session-ha/persistent-consumer-run/v1" },
         "transcript_sha256": {
           "type": "string",

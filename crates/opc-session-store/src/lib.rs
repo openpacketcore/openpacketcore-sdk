@@ -6,6 +6,21 @@
 //! stale-owner protections are intended for 5G CNF session-state boundaries;
 //! production suitability remains specific to the selected backend profile.
 //!
+//! # Protected checkpoint consumption
+//!
+//! Prepared checkpoint authority is obtained only from an SDK-owned
+//! [`ProtectedSessionBackend`] wrapper. Applications retain the returned
+//! opaque handle and may execute it once, then perform read-only receipt
+//! observations; they do not construct transport ports or physical tokens.
+//! The optional transport attachment is an SDK-internal, policy-sealed
+//! cross-crate seam: the store cannot seal a router implemented by its net
+//! dependent. Even at that seam, a private-field completion witness minted by
+//! these wrappers prevents direct plaintext preparation or token minting.
+//!
+//! ```compile_fail
+//! use opc_session_store::{PreparedCheckpointPort, PreparedCompareAndSetToken};
+//! ```
+//!
 //! # Module map
 //!
 //! | Module | Responsibility |
@@ -83,12 +98,17 @@ pub use backend::{
     validate_replication_prefix_owned, validate_session_ops_at, validate_session_ops_profile,
     validate_session_ops_ttls, BackendInstanceIdentity, BackendPeerBinding,
     BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
-    ProtectedSelectorLedgerBase, ProtectedSessionBackend, RecordExpiryPreflight,
-    RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange, ReplicationOp,
-    ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor, SelectorLedgerStorageScope,
-    SessionBackend, SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
-    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
-    MAX_REPLICATION_OPERATION_DEPTH, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
+    PreparedCheckpointBudget, PreparedCheckpointBudgetError, PreparedCompareAndSet,
+    PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
+    PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
+    PreparedCompareAndSetStatusError, PreparedLeaseAcquire, PreparedLeaseAcquireExecuteError,
+    PreparedLeaseAcquirePrepareError, PreparedLeaseAcquireStatusError, ProtectedSelectorLedgerBase,
+    ProtectedSessionBackend, RecordExpiryPreflight, RemoteSealingSessionBackend, ReplicationEntry,
+    ReplicationLogRange, ReplicationOp, ReplicationTxId, ReplicationTxIdError,
+    ReplicationWatchCursor, SelectorLedgerStorageScope, SessionBackend, SessionOp, SessionOpResult,
+    MAX_RECORD_EXPIRY_PREFLIGHTS, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
     REPLICATION_TX_ID_CANONICAL_BYTES, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 pub use capability::{
@@ -117,16 +137,19 @@ pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,
     session_consumer_batch_result_into_store, SessionConsumerAuthorizationManifest,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerChangeItem,
-    SessionConsumerChangeKind, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerIdentityError,
-    SessionConsumerLeaseError, SessionConsumerLeaseMutationOperation,
-    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
-    SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
-    SessionQuorumConsumer, StatelessSessionConsumer, MAX_SESSION_CONSUMER_BATCH_OPERATIONS,
-    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES,
-    SESSION_CONSUMER_IDENTITY_MAX_BYTES, SESSION_CONSUMER_REQUEST_ID_BYTES,
+    SessionConsumerChangeKind, SessionConsumerCompareAndSetReceiptOutcome,
+    SessionConsumerCompareAndSetRequest, SessionConsumerCompareAndSetStatus,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+    SessionConsumerIdentity, SessionConsumerIdentityError, SessionConsumerLeaseError,
+    SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationRequest,
+    SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerRosterCommitment, SessionConsumerRosterMember, SessionConsumerScope,
+    SessionConsumerStoreError, SessionQuorumConsumer, StatelessSessionConsumer,
+    MAX_SESSION_CONSUMER_BATCH_OPERATIONS, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    MAX_SESSION_CONSUMER_WATCH_BUFFER_BYTES, SESSION_CONSUMER_IDENTITY_MAX_BYTES,
+    SESSION_CONSUMER_REQUEST_ID_BYTES,
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;

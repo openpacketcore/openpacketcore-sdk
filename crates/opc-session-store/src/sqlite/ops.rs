@@ -1177,7 +1177,7 @@ pub(crate) fn insert_or_replace_fence_sync(
 
 pub(crate) fn compare_and_set_sync(
     conn: &Connection,
-    op: CompareAndSet,
+    op: &CompareAndSet,
     caps: &BackendCapabilities,
     now: Timestamp,
 ) -> Result<CompareAndSetResult, StoreError> {

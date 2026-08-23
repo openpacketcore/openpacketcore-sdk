@@ -1029,6 +1029,43 @@ async fn fixed_five_voter_store_without_a_majority_reports_no_quorum() {
 }
 
 #[tokio::test]
+async fn store_issued_consumer_manifest_retains_authoritative_node_to_tls_pairs() {
+    let placement_policy = PlacementResiliencePolicy::AllowReducedResilience;
+    let members = fixed_members(3);
+    let topology = fixed_topology_for_local(0, members, placement_policy)
+        .expect("fixed topology with canonical node IDs");
+    let expected_scope = topology
+        .consensus_identity()
+        .expect("fixed consensus identity");
+    let expected_pairs = topology
+        .members()
+        .iter()
+        .map(|descriptor| {
+            (
+                topology
+                    .consensus_node_id(descriptor.replica_id())
+                    .expect("canonical topology node ID")
+                    .get(),
+                descriptor.tls_identity().as_str().to_owned(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let (_directory, _database_paths, stores) = open_fixed_cluster(3, placement_policy).await;
+
+    let manifest = stores[0]
+        .consumer_authorization_manifest()
+        .await
+        .expect("admitted fixed store issues its consumer roster");
+    let actual_pairs = manifest
+        .consensus_members()
+        .map(|member| (member.node_id().get(), member.tls_identity().to_owned()))
+        .collect::<BTreeMap<_, _>>();
+
+    assert_eq!(manifest.scope().consensus_identity(), expected_scope);
+    assert_eq!(actual_pairs, expected_pairs);
+}
+
+#[tokio::test]
 async fn persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority() {
     let (_directory, database_paths, stores) =
         open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;

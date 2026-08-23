@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use futures_util::future::join_all;
 use opc_key::{KeyProvider, RemoteSealProvider};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -34,6 +35,9 @@ use crate::{
         checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at,
         validate_stored_record_expiry_profile,
     },
+};
+use crate::{
+    SessionConsumerLeaseMutationStatus, SessionConsumerRequestId, SessionConsumerStoreError,
 };
 
 /// Per-watcher buffer size for replication watch streams.
@@ -1711,14 +1715,29 @@ pub(crate) mod protected_session_backend_seal {
 /// // Fails: the SDK-owned sealed supertrait is not externally nameable.
 /// impl ProtectedSessionBackend for ProductBackend {}
 /// ```
+#[async_trait]
 pub trait ProtectedSessionBackend:
     SessionBackend + SessionLeaseManager + protected_session_backend_seal::Sealed
 {
-}
+    /// Create the caller-provided-ID acquire authority before any physical
+    /// mutation poll. Implementations are restricted to SDK sealing wrappers.
+    fn prepare_acquire_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquire, PreparedLeaseAcquirePrepareError>;
 
-impl<B> ProtectedSessionBackend for B where
-    B: SessionBackend + SessionLeaseManager + protected_session_backend_seal::Sealed
-{
+    /// Run the wrapper-owned expiry preflight and seal exactly one logical CAS
+    /// body before handing it to the configured prepared transport port.
+    async fn prepare_compare_and_set(
+        &self,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSet, PreparedCompareAndSetPrepareError>;
 }
 
 pub(crate) fn protected_payload_scope_commitment_for<B>(backend: &B) -> Option<[u8; 32]>
@@ -1865,6 +1884,387 @@ impl std::fmt::Debug for BackendPeerBinding {
     }
 }
 
+/// Maximum duration of one physical prepared checkpoint attempt.
+pub const PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT: Duration = Duration::from_millis(250);
+
+/// Immutable caller-owned checkpoint time budget captured before dispatch.
+#[derive(Clone, Copy)]
+pub struct PreparedCheckpointBudget {
+    original_deadline: tokio::time::Instant,
+    physical_attempt_timeout: Duration,
+}
+
+impl PreparedCheckpointBudget {
+    /// Capture an original outer deadline and one shorter physical-attempt cap.
+    pub fn new(
+        original_deadline: tokio::time::Instant,
+        physical_attempt_timeout: Duration,
+    ) -> Result<Self, PreparedCheckpointBudgetError> {
+        if physical_attempt_timeout.is_zero()
+            || physical_attempt_timeout > PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT
+        {
+            return Err(PreparedCheckpointBudgetError);
+        }
+        Ok(Self {
+            original_deadline,
+            physical_attempt_timeout,
+        })
+    }
+
+    /// Return the immutable deadline for the entire logical attempt.
+    pub const fn original_deadline(self) -> tokio::time::Instant {
+        self.original_deadline
+    }
+    /// Return the maximum duration of any one physical attempt.
+    pub const fn physical_attempt_timeout(self) -> Duration {
+        self.physical_attempt_timeout
+    }
+}
+
+impl fmt::Debug for PreparedCheckpointBudget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedCheckpointBudget(<redacted>)")
+    }
+}
+
+/// Invalid physical-attempt budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("prepared checkpoint physical attempt budget is invalid")]
+pub struct PreparedCheckpointBudgetError;
+
+/// Opaque proof that an SDK-owned protected wrapper completed its preflight
+/// and (for CAS) exactly one sealing pass. Its private field prevents callers
+/// from invoking the transport SPI with a plaintext body or minting a token.
+#[doc(hidden)]
+pub struct PreparedCheckpointCompletion {
+    protection_scope_commitment: [u8; 32],
+    tenant_nf_scope_commitment: [u8; 32],
+    _private: (),
+}
+
+impl PreparedCheckpointCompletion {
+    fn after_protected_completion(
+        protection_scope_commitment: [u8; 32],
+        tenant_nf_scope_commitment: [u8; 32],
+    ) -> Self {
+        Self {
+            protection_scope_commitment,
+            tenant_nf_scope_commitment,
+            _private: (),
+        }
+    }
+
+    /// Return the fixed protected authority context for the doc-hidden
+    /// cross-crate transport SPI. Only SDK-owned protected wrappers can mint
+    /// this value; product code cannot construct one.
+    #[doc(hidden)]
+    pub const fn authority_context(&self) -> PreparedCheckpointAuthorityContext {
+        PreparedCheckpointAuthorityContext {
+            protection_scope_commitment: self.protection_scope_commitment,
+            tenant_nf_scope_commitment: self.tenant_nf_scope_commitment,
+        }
+    }
+}
+
+/// Fixed-width authority context attached only to prepared checkpoint
+/// consumer requests.  The two commitments bind a protected sealing boundary
+/// and the tenant/NF namespace without exposing either value in diagnostics.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedCheckpointAuthorityContext {
+    protection_scope_commitment: [u8; 32],
+    tenant_nf_scope_commitment: [u8; 32],
+}
+
+impl fmt::Debug for PreparedCheckpointAuthorityContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedCheckpointAuthorityContext(<redacted>)")
+    }
+}
+
+fn prepared_checkpoint_protection_scope_commitment(
+    namespace: &str,
+    protection_kind: &[u8],
+) -> Option<[u8; 32]> {
+    if namespace.is_empty() || namespace.len() > 128 || namespace.as_bytes().contains(&b'\0') {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"opc/session-store/prepared-checkpoint/protection-scope/v2\0");
+    digest.update((protection_kind.len() as u64).to_be_bytes());
+    digest.update(protection_kind);
+    digest.update((namespace.len() as u64).to_be_bytes());
+    digest.update(namespace.as_bytes());
+    Some(digest.finalize().into())
+}
+
+fn prepared_checkpoint_tenant_nf_scope_commitment(key: &SessionKey) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"opc/session-store/prepared-checkpoint/tenant-nf-scope/v2\0");
+    digest.update((key.tenant.as_str().len() as u64).to_be_bytes());
+    digest.update(key.tenant.as_str().as_bytes());
+    digest.update((key.nf_kind.as_str().len() as u64).to_be_bytes());
+    digest.update(key.nf_kind.as_str().as_bytes());
+    digest.finalize().into()
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_checkpoint_authority_context_for_test(
+    namespace: &str,
+    protection_kind: &[u8],
+    key: &SessionKey,
+) -> PreparedCheckpointAuthorityContext {
+    PreparedCheckpointCompletion::after_protected_completion(
+        prepared_checkpoint_protection_scope_commitment(namespace, protection_kind)
+            .expect("test protection namespace"),
+        prepared_checkpoint_tenant_nf_scope_commitment(key),
+    )
+    .authority_context()
+}
+
+#[derive(Clone)]
+/// Opaque, volatile prepared CAS authority produced only by a configured
+/// consumer port. It has no serialization, journal, or recovery form.
+pub struct PreparedCompareAndSet {
+    inner: Arc<dyn PreparedCompareAndSetToken>,
+}
+
+impl fmt::Debug for PreparedCompareAndSet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedCompareAndSet(<redacted>)")
+    }
+}
+
+impl PreparedCompareAndSet {
+    /// Dispatch the token once. After this call, only [`Self::status_once`]
+    /// is permitted, regardless of the returned effect classification.
+    pub async fn execute_once(
+        &self,
+    ) -> Result<PreparedCompareAndSetOutcome, PreparedCompareAndSetExecuteError> {
+        self.inner.execute_once().await
+    }
+
+    /// Make exactly one read-only receipt observation within the caller's
+    /// original absolute deadline.
+    pub async fn status_once(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError> {
+        self.inner.status_once(deadline).await
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_consumer_port(
+        _completion: PreparedCheckpointCompletion,
+        inner: Arc<dyn PreparedCompareAndSetToken>,
+    ) -> Self {
+        Self { inner }
+    }
+}
+
+/// Redacted terminal result for an exact prepared CAS request.
+///
+/// This deliberately projects no row payload: checkpoint recovery needs only
+/// whether the exact mutation applied, conflicted, or was deterministically
+/// rejected by the authoritative consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedCompareAndSetOutcome {
+    /// The exact request was applied.
+    Applied,
+    /// The exact request lost its compare-and-set predicate.
+    Conflict,
+    /// The exact request reached the authority and was deterministically rejected.
+    Rejected(SessionConsumerStoreError),
+}
+
+/// Read-only receipt projection for one prepared CAS request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedCompareAndSetStatus {
+    /// The authoritative outcome ledger has an exact terminal result.
+    Recorded(PreparedCompareAndSetOutcome),
+    /// The request ID is bound to a different request body.
+    RequestConflict,
+    /// No exact outcome was present at the completed read barrier.
+    NotFound,
+}
+
+/// Synchronous local failure while sealing a prepared CAS request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedCompareAndSetPrepareError {
+    #[error("prepared compare-and-set request is invalid")]
+    InvalidRequest,
+    #[error("prepared compare-and-set was not transmitted")]
+    NotTransmitted,
+    #[error("prepared compare-and-set consumer authority is unavailable")]
+    Unavailable,
+}
+
+/// Redacted effect classification from a one-shot prepared CAS dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedCompareAndSetExecuteError {
+    #[error("prepared compare-and-set was not transmitted")]
+    NotTransmitted,
+    #[error("prepared compare-and-set outcome is unknown")]
+    OutcomeUnknown,
+    #[error("prepared compare-and-set topology authority was revoked")]
+    TopologyAuthorityRevoked,
+    #[error("prepared compare-and-set is unavailable")]
+    Unavailable,
+    #[error("prepared compare-and-set was already executed")]
+    AlreadyExecuted,
+}
+
+/// Failure to make one prepared-CAS receipt observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedCompareAndSetStatusError {
+    #[error("prepared compare-and-set has not been executed")]
+    NotExecuted,
+    #[error("prepared compare-and-set receipt deadline is invalid")]
+    Deadline,
+    #[error("prepared compare-and-set topology authority was revoked")]
+    TopologyAuthorityRevoked,
+    #[error("prepared compare-and-set receipt is unavailable")]
+    Unavailable,
+}
+
+/// Private implementation surface behind an opaque prepared CAS token.
+#[async_trait]
+#[allow(missing_docs)]
+pub trait PreparedCompareAndSetToken: Send + Sync {
+    async fn execute_once(
+        &self,
+    ) -> Result<PreparedCompareAndSetOutcome, PreparedCompareAndSetExecuteError>;
+    async fn status_once(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError>;
+}
+
+/// Opaque, volatile provided-ID acquire authority. The retained canonical
+/// request exists before the first asynchronous transport poll.
+#[derive(Clone)]
+pub struct PreparedLeaseAcquire {
+    inner: Arc<dyn PreparedLeaseAcquireToken>,
+}
+
+impl fmt::Debug for PreparedLeaseAcquire {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedLeaseAcquire(<redacted>)")
+    }
+}
+
+#[allow(missing_docs)]
+impl PreparedLeaseAcquire {
+    pub async fn execute_once(&self) -> Result<LeaseGuard, PreparedLeaseAcquireExecuteError> {
+        self.inner.execute_once().await
+    }
+
+    pub async fn status_once(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsumerLeaseMutationStatus, PreparedLeaseAcquireStatusError> {
+        self.inner.status_once(deadline).await
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_consumer_port(
+        _completion: PreparedCheckpointCompletion,
+        inner: Arc<dyn PreparedLeaseAcquireToken>,
+    ) -> Self {
+        Self { inner }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedLeaseAcquirePrepareError {
+    #[error("prepared lease acquire request is invalid")]
+    InvalidRequest,
+    #[error("prepared lease acquire was not transmitted")]
+    NotTransmitted,
+    #[error("prepared lease acquire consumer authority is unavailable")]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedLeaseAcquireExecuteError {
+    #[error("prepared lease acquire was not transmitted")]
+    NotTransmitted,
+    #[error("prepared lease acquire outcome is unknown")]
+    OutcomeUnknown,
+    #[error("prepared lease acquire request conflicts with its retained request identity")]
+    RequestConflict,
+    #[error("prepared lease acquire was deterministically rejected: {0}")]
+    Rejected(LeaseError),
+    #[error("prepared lease acquire topology authority was revoked")]
+    TopologyAuthorityRevoked,
+    #[error("prepared lease acquire is unavailable")]
+    Unavailable,
+    #[error("prepared lease acquire was already executed")]
+    AlreadyExecuted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum PreparedLeaseAcquireStatusError {
+    #[error("prepared lease acquire has not been executed")]
+    NotExecuted,
+    #[error("prepared lease receipt deadline is invalid")]
+    Deadline,
+    #[error("prepared lease receipt topology authority was revoked")]
+    TopologyAuthorityRevoked,
+    #[error("prepared lease receipt is unavailable")]
+    Unavailable,
+}
+
+#[async_trait]
+#[allow(missing_docs)]
+pub trait PreparedLeaseAcquireToken: Send + Sync {
+    async fn execute_once(&self) -> Result<LeaseGuard, PreparedLeaseAcquireExecuteError>;
+    async fn status_once(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsumerLeaseMutationStatus, PreparedLeaseAcquireStatusError>;
+}
+
+/// One authenticated, same-scope port for all prepared checkpoint requests.
+///
+/// A wrapper accepts one instance so CAS and lease tokens can never be built
+/// from independently validated voter sets.
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub trait PreparedCheckpointPort: Send + Sync {
+    fn prepare_sealed_compare_and_set(
+        &self,
+        completion: PreparedCheckpointCompletion,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSet, PreparedCompareAndSetPrepareError>;
+
+    fn prepare_acquire_with_id(
+        &self,
+        completion: PreparedCheckpointCompletion,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquire, PreparedLeaseAcquirePrepareError>;
+}
+
 /// Session-backend wrapper that encrypts payloads before persistence and
 /// decrypts them on reads using `opc-crypto` / `opc-key`.
 pub struct EncryptingSessionBackend<B: ?Sized, P: ?Sized> {
@@ -1872,6 +2272,7 @@ pub struct EncryptingSessionBackend<B: ?Sized, P: ?Sized> {
     provider: Arc<P>,
     backend_namespace: Arc<str>,
     fenced_transition_journal: Option<Arc<PreparedFencedTransitionJournal>>,
+    prepared_checkpoint_port: Option<Arc<dyn PreparedCheckpointPort>>,
 }
 
 impl<B: ?Sized, P: ?Sized> Clone for EncryptingSessionBackend<B, P> {
@@ -1881,6 +2282,7 @@ impl<B: ?Sized, P: ?Sized> Clone for EncryptingSessionBackend<B, P> {
             provider: Arc::clone(&self.provider),
             backend_namespace: Arc::clone(&self.backend_namespace),
             fenced_transition_journal: self.fenced_transition_journal.clone(),
+            prepared_checkpoint_port: self.prepared_checkpoint_port.clone(),
         }
     }
 }
@@ -1899,6 +2301,7 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
             provider,
             backend_namespace: Arc::<str>::from(backend_namespace.into()),
             fenced_transition_journal: None,
+            prepared_checkpoint_port: None,
         }
     }
 
@@ -1914,6 +2317,14 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
         self
     }
 
+    /// Attach only the two prepared checkpoint consumer ports. The outer
+    /// encryption wrapper remains the sole place that seals CAS payloads.
+    #[must_use]
+    pub fn with_prepared_checkpoint_port(mut self, port: Arc<dyn PreparedCheckpointPort>) -> Self {
+        self.prepared_checkpoint_port = Some(port);
+        self
+    }
+
     /// The key provider used to resolve the tenant's active session key for
     /// encryption and to look up keys by id for decryption.
     pub fn provider(&self) -> &Arc<P> {
@@ -1925,12 +2336,40 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
     pub fn backend_namespace(&self) -> &str {
         &self.backend_namespace
     }
+
+    /// Create a provided-ID acquire token synchronously before any transport
+    /// poll. The configured port captures the physical authenticated scope.
+    pub fn prepare_acquire_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquire, PreparedLeaseAcquirePrepareError> {
+        validate_session_ttl(ttl).map_err(|_| PreparedLeaseAcquirePrepareError::InvalidRequest)?;
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedLeaseAcquirePrepareError::NotTransmitted);
+        }
+        let completion = PreparedCheckpointCompletion::after_protected_completion(
+            prepared_checkpoint_protection_scope_commitment(
+                self.backend_namespace(),
+                b"local-aead",
+            )
+            .ok_or(PreparedLeaseAcquirePrepareError::Unavailable)?,
+            prepared_checkpoint_tenant_nf_scope_commitment(&key),
+        );
+        self.prepared_checkpoint_port
+            .as_ref()
+            .ok_or(PreparedLeaseAcquirePrepareError::Unavailable)?
+            .prepare_acquire_with_id(completion, request_id, key, owner, ttl, budget)
+    }
 }
 
 impl<B, P> EncryptingSessionBackend<B, P>
 where
     B: SessionBackend + ?Sized,
-    P: KeyProvider + ?Sized,
+    P: KeyProvider + ?Sized + 'static,
 {
     async fn encrypt_record(
         &self,
@@ -1962,6 +2401,62 @@ where
             .await?;
         record.payload = EncryptedSessionPayload::new_zeroizing(plaintext);
         Ok(record)
+    }
+
+    /// Seal one CAS body exactly once, then create its opaque volatile
+    /// consumer token before any mutation dispatch. A seal failure is a
+    /// known-not-transmitted result; no token is returned to replay.
+    pub async fn prepare_compare_and_set(
+        &self,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSet, PreparedCompareAndSetPrepareError> {
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedCompareAndSetPrepareError::NotTransmitted);
+        }
+        let port = self
+            .prepared_checkpoint_port
+            .as_ref()
+            .ok_or(PreparedCompareAndSetPrepareError::Unavailable)?;
+        let preflight = RecordExpiryPreflight::from_record(&operation.new_record);
+        tokio::time::timeout_at(
+            budget.original_deadline(),
+            self.inner
+                .preflight_record_expiry(std::slice::from_ref(&preflight)),
+        )
+        .await
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?;
+        let sealed_record = tokio::time::timeout_at(
+            budget.original_deadline(),
+            self.encrypt_record(operation.new_record),
+        )
+        .await
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?;
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedCompareAndSetPrepareError::NotTransmitted);
+        }
+        let completion = PreparedCheckpointCompletion::after_protected_completion(
+            prepared_checkpoint_protection_scope_commitment(
+                self.backend_namespace(),
+                b"local-aead",
+            )
+            .ok_or(PreparedCompareAndSetPrepareError::NotTransmitted)?,
+            prepared_checkpoint_tenant_nf_scope_commitment(&operation.key),
+        );
+        port.prepare_sealed_compare_and_set(
+            completion,
+            request_id,
+            CompareAndSet {
+                key: operation.key,
+                lease: operation.lease,
+                expected_generation: operation.expected_generation,
+                new_record: sealed_record,
+            },
+            budget,
+        )
     }
 
     async fn decrypt_optional_record(
@@ -2596,6 +3091,33 @@ where
     }
 }
 
+#[async_trait]
+impl<B, P> ProtectedSessionBackend for EncryptingSessionBackend<B, P>
+where
+    B: SessionBackend + SessionLeaseManager + Send + Sync + ?Sized + 'static,
+    P: KeyProvider + Send + Sync + ?Sized + 'static,
+{
+    fn prepare_acquire_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquire, PreparedLeaseAcquirePrepareError> {
+        EncryptingSessionBackend::prepare_acquire_with_id(self, request_id, key, owner, ttl, budget)
+    }
+
+    async fn prepare_compare_and_set(
+        &self,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSet, PreparedCompareAndSetPrepareError> {
+        EncryptingSessionBackend::prepare_compare_and_set(self, request_id, operation, budget).await
+    }
+}
+
 /// Session-backend wrapper that delegates payload sealing to a remote KMS/HSM.
 ///
 /// This is an opt-in alternative to [`EncryptingSessionBackend`]. The default
@@ -2613,6 +3135,7 @@ pub struct RemoteSealingSessionBackend<B: ?Sized, S: ?Sized> {
     provider: Arc<S>,
     backend_namespace: Arc<str>,
     fenced_transition_journal: Option<Arc<PreparedFencedTransitionJournal>>,
+    prepared_checkpoint_port: Option<Arc<dyn PreparedCheckpointPort>>,
 }
 
 impl<B: ?Sized, S: ?Sized> Clone for RemoteSealingSessionBackend<B, S> {
@@ -2622,6 +3145,7 @@ impl<B: ?Sized, S: ?Sized> Clone for RemoteSealingSessionBackend<B, S> {
             provider: Arc::clone(&self.provider),
             backend_namespace: Arc::clone(&self.backend_namespace),
             fenced_transition_journal: self.fenced_transition_journal.clone(),
+            prepared_checkpoint_port: self.prepared_checkpoint_port.clone(),
         }
     }
 }
@@ -2635,6 +3159,7 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
             provider,
             backend_namespace: Arc::<str>::from(backend_namespace.into()),
             fenced_transition_journal: None,
+            prepared_checkpoint_port: None,
         }
     }
 
@@ -2650,6 +3175,14 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
         self
     }
 
+    /// Attach only the two prepared checkpoint consumer ports. Remote payload
+    /// sealing remains inside this wrapper before a CAS token is created.
+    #[must_use]
+    pub fn with_prepared_checkpoint_port(mut self, port: Arc<dyn PreparedCheckpointPort>) -> Self {
+        self.prepared_checkpoint_port = Some(port);
+        self
+    }
+
     /// The remote seal provider used for payload seal/unseal.
     pub fn provider(&self) -> &Arc<S> {
         &self.provider
@@ -2659,12 +3192,40 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
     pub fn backend_namespace(&self) -> &str {
         &self.backend_namespace
     }
+
+    /// Create a provided-ID acquire token synchronously before any transport
+    /// poll. The configured port captures the physical authenticated scope.
+    pub fn prepare_acquire_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquire, PreparedLeaseAcquirePrepareError> {
+        validate_session_ttl(ttl).map_err(|_| PreparedLeaseAcquirePrepareError::InvalidRequest)?;
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedLeaseAcquirePrepareError::NotTransmitted);
+        }
+        let completion = PreparedCheckpointCompletion::after_protected_completion(
+            prepared_checkpoint_protection_scope_commitment(
+                self.backend_namespace(),
+                b"remote-seal",
+            )
+            .ok_or(PreparedLeaseAcquirePrepareError::Unavailable)?,
+            prepared_checkpoint_tenant_nf_scope_commitment(&key),
+        );
+        self.prepared_checkpoint_port
+            .as_ref()
+            .ok_or(PreparedLeaseAcquirePrepareError::Unavailable)?
+            .prepare_acquire_with_id(completion, request_id, key, owner, ttl, budget)
+    }
 }
 
 impl<B, S> RemoteSealingSessionBackend<B, S>
 where
     B: SessionBackend + ?Sized,
-    S: RemoteSealProvider + ?Sized,
+    S: RemoteSealProvider + ?Sized + 'static,
 {
     async fn seal_record(
         &self,
@@ -2696,6 +3257,61 @@ where
             .await?;
         record.payload = EncryptedSessionPayload::new_zeroizing(plaintext);
         Ok(record)
+    }
+
+    /// Seal one CAS body exactly once through the configured remote sealer,
+    /// then create its opaque volatile consumer token before dispatch.
+    pub async fn prepare_compare_and_set(
+        &self,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSet, PreparedCompareAndSetPrepareError> {
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedCompareAndSetPrepareError::NotTransmitted);
+        }
+        let port = self
+            .prepared_checkpoint_port
+            .as_ref()
+            .ok_or(PreparedCompareAndSetPrepareError::Unavailable)?;
+        let preflight = RecordExpiryPreflight::from_record(&operation.new_record);
+        tokio::time::timeout_at(
+            budget.original_deadline(),
+            self.inner
+                .preflight_record_expiry(std::slice::from_ref(&preflight)),
+        )
+        .await
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?;
+        let sealed_record = tokio::time::timeout_at(
+            budget.original_deadline(),
+            self.seal_record(operation.new_record),
+        )
+        .await
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?
+        .map_err(|_| PreparedCompareAndSetPrepareError::NotTransmitted)?;
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(PreparedCompareAndSetPrepareError::NotTransmitted);
+        }
+        let completion = PreparedCheckpointCompletion::after_protected_completion(
+            prepared_checkpoint_protection_scope_commitment(
+                self.backend_namespace(),
+                b"remote-seal",
+            )
+            .ok_or(PreparedCompareAndSetPrepareError::NotTransmitted)?,
+            prepared_checkpoint_tenant_nf_scope_commitment(&operation.key),
+        );
+        port.prepare_sealed_compare_and_set(
+            completion,
+            request_id,
+            CompareAndSet {
+                key: operation.key,
+                lease: operation.lease,
+                expected_generation: operation.expected_generation,
+                new_record: sealed_record,
+            },
+            budget,
+        )
     }
 
     async fn unseal_optional_record(
@@ -3235,13 +3851,55 @@ where
     }
 }
 
+#[async_trait]
+impl<B, S> ProtectedSessionBackend for RemoteSealingSessionBackend<B, S>
+where
+    B: SessionBackend + SessionLeaseManager + Send + Sync + ?Sized + 'static,
+    S: RemoteSealProvider + Send + Sync + ?Sized + 'static,
+{
+    fn prepare_acquire_with_id(
+        &self,
+        request_id: SessionConsumerRequestId,
+        key: SessionKey,
+        owner: OwnerId,
+        ttl: Duration,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedLeaseAcquire, PreparedLeaseAcquirePrepareError> {
+        RemoteSealingSessionBackend::prepare_acquire_with_id(
+            self, request_id, key, owner, ttl, budget,
+        )
+    }
+
+    async fn prepare_compare_and_set(
+        &self,
+        request_id: SessionConsumerRequestId,
+        operation: CompareAndSet,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<PreparedCompareAndSet, PreparedCompareAndSetPrepareError> {
+        RemoteSealingSessionBackend::prepare_compare_and_set(self, request_id, operation, budget)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod protected_session_backend_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+    use opc_key::{KeyError, KeyHandle, KeyId, KeyPurpose};
+
+    use crate::{
+        fake::FakeSessionBackend, model::SessionKeyType, EncryptedSessionPayload, StateClass,
+        StateType,
+    };
 
     #[test]
     fn only_sdk_owned_protection_wrappers_satisfy_the_sealed_authority_bound() {
         fn assert_protected<B: ProtectedSessionBackend>() {}
+        fn assert_object_safe(_: &dyn ProtectedSessionBackend) {}
+
+        let _ = assert_object_safe;
 
         assert_protected::<
             EncryptingSessionBackend<crate::fake::FakeSessionBackend, opc_key::MemoryKeyProvider>,
@@ -3252,6 +3910,246 @@ mod protected_session_backend_tests {
                 opc_key::MemoryRemoteSealProvider,
             >,
         >();
+    }
+
+    #[derive(Default)]
+    struct CountingPreparedPort(AtomicUsize);
+
+    impl PreparedCheckpointPort for CountingPreparedPort {
+        fn prepare_sealed_compare_and_set(
+            &self,
+            _completion: PreparedCheckpointCompletion,
+            _request_id: SessionConsumerRequestId,
+            _operation: CompareAndSet,
+            _budget: PreparedCheckpointBudget,
+        ) -> Result<PreparedCompareAndSet, PreparedCompareAndSetPrepareError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(PreparedCompareAndSetPrepareError::Unavailable)
+        }
+
+        fn prepare_acquire_with_id(
+            &self,
+            _completion: PreparedCheckpointCompletion,
+            _request_id: SessionConsumerRequestId,
+            _key: SessionKey,
+            _owner: OwnerId,
+            _ttl: Duration,
+            _budget: PreparedCheckpointBudget,
+        ) -> Result<PreparedLeaseAcquire, PreparedLeaseAcquirePrepareError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(PreparedLeaseAcquirePrepareError::Unavailable)
+        }
+    }
+
+    struct ControlledPreflightBackend {
+        delay: Option<Duration>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SessionBackend for ControlledPreflightBackend {
+        async fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::minimal()
+        }
+
+        async fn preflight_record_expiry(
+            &self,
+            _preflights: &[RecordExpiryPreflight],
+        ) -> Result<(), StoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.delay {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => std::future::pending::<()>().await,
+            }
+            Ok(())
+        }
+
+        async fn get(&self, _key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn compare_and_set(
+            &self,
+            _op: CompareAndSet,
+        ) -> Result<CompareAndSetResult, StoreError> {
+            Err(StoreError::CasConflict)
+        }
+
+        async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Default)]
+    struct NeverReadyKeyProvider(AtomicUsize);
+
+    #[async_trait]
+    impl KeyProvider for NeverReadyKeyProvider {
+        async fn get_active_key(
+            &self,
+            _purpose: KeyPurpose,
+            _tenant: &TenantId,
+        ) -> Result<KeyHandle, KeyError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<KeyHandle, KeyError>>().await
+        }
+
+        async fn get_key_by_id(&self, _key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+            std::future::pending::<Result<KeyHandle, KeyError>>().await
+        }
+
+        async fn rotate_key(
+            &self,
+            _purpose: KeyPurpose,
+            _tenant: &TenantId,
+        ) -> Result<KeyId, KeyError> {
+            std::future::pending::<Result<KeyId, KeyError>>().await
+        }
+    }
+
+    async fn prepared_test_operation() -> CompareAndSet {
+        let backend = FakeSessionBackend::new();
+        let key = SessionKey {
+            tenant: TenantId::new("prepared-deadline-test").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"prepared-deadline-test")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("prepared-deadline-owner").expect("test owner");
+        let lease = backend
+            .acquire(&key, owner.clone(), Duration::from_secs(30))
+            .await
+            .expect("test lease");
+        CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                key,
+                generation: Generation::new(1),
+                owner,
+                fence: lease.fence(),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("prepared-deadline-test"),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new([0x51]),
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepared_cas_preflight_and_seal_share_one_original_deadline() {
+        let port = Arc::new(CountingPreparedPort::default());
+        let pending_preflight = Arc::new(ControlledPreflightBackend {
+            delay: None,
+            calls: AtomicUsize::new(0),
+        });
+        let never_key = Arc::new(NeverReadyKeyProvider::default());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let protected = EncryptingSessionBackend::new(
+            Arc::clone(&pending_preflight),
+            Arc::clone(&never_key),
+            "prepared-deadline-test",
+        )
+        .with_prepared_checkpoint_port(port.clone());
+        let future = protected.prepare_compare_and_set(
+            SessionConsumerRequestId::from_bytes([0x51; 16]),
+            prepared_test_operation().await,
+            PreparedCheckpointBudget::new(deadline, Duration::from_millis(25))
+                .expect("explicit physical cap"),
+        );
+        tokio::pin!(future);
+        std::future::poll_fn(|context| match future.as_mut().poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(result) => {
+                panic!("never-ready preflight returned early: {result:?}")
+            }
+        })
+        .await;
+        assert_eq!(pending_preflight.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            never_key.0.load(Ordering::SeqCst),
+            0,
+            "preflight precedes KMS"
+        );
+        assert_eq!(
+            port.0.load(Ordering::SeqCst),
+            0,
+            "preflight reaches no transport port"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(
+            future.await,
+            Err(PreparedCompareAndSetPrepareError::NotTransmitted)
+        ));
+        assert_eq!(never_key.0.load(Ordering::SeqCst), 0);
+        assert_eq!(port.0.load(Ordering::SeqCst), 0);
+
+        let delayed_preflight = Arc::new(ControlledPreflightBackend {
+            delay: Some(Duration::from_millis(75)),
+            calls: AtomicUsize::new(0),
+        });
+        let port = Arc::new(CountingPreparedPort::default());
+        let never_key = Arc::new(NeverReadyKeyProvider::default());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let protected = EncryptingSessionBackend::new(
+            Arc::clone(&delayed_preflight),
+            Arc::clone(&never_key),
+            "prepared-deadline-test",
+        )
+        .with_prepared_checkpoint_port(port.clone());
+        let future = protected.prepare_compare_and_set(
+            SessionConsumerRequestId::from_bytes([0x52; 16]),
+            prepared_test_operation().await,
+            PreparedCheckpointBudget::new(deadline, Duration::from_millis(50))
+                .expect("explicit physical cap"),
+        );
+        tokio::pin!(future);
+        std::future::poll_fn(|context| match future.as_mut().poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(result) => {
+                panic!("delayed preflight returned early: {result:?}")
+            }
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(76)).await;
+        // This future is deliberately retained by the caller rather than
+        // spawned: poll it once after the preflight timer fires so sealing
+        // reaches the never-ready KMS provider under the *same* deadline.
+        std::future::poll_fn(|context| match future.as_mut().poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(result) => {
+                panic!("KMS unexpectedly completed before the original deadline: {result:?}")
+            }
+        })
+        .await;
+        assert_eq!(delayed_preflight.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            never_key.0.load(Ordering::SeqCst),
+            1,
+            "KMS starts after preflight"
+        );
+        assert_eq!(port.0.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(24)).await;
+        assert!(matches!(
+            future.await,
+            Err(PreparedCompareAndSetPrepareError::NotTransmitted)
+        ));
+        assert_eq!(
+            port.0.load(Ordering::SeqCst),
+            0,
+            "no fresh seal timeout reaches transport"
+        );
     }
 }
 

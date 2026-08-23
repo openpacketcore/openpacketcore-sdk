@@ -14,7 +14,7 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_session_net::{
-    conservative_payload_budget, ConnectionLifecyclePolicy, PersistentSessionConsumerClient,
+    session_consumer_payload_budget, ConnectionLifecyclePolicy, PersistentSessionConsumerClient,
     PersistentSessionConsumerConfig, PersistentSessionConsumerDiagnostics,
     PersistentSessionConsumerExecuteError, RemoteAddrResolver, SessionConsumerAuthorizer,
     SessionConsumerClientError, SessionQuorumConsumerServer, SessionReauthenticationControl,
@@ -36,7 +36,10 @@ use tokio::sync::{Notify, Semaphore};
 
 fn transported_capabilities() -> BackendCapabilities {
     BackendCapabilities {
-        max_value_bytes: conservative_payload_budget(MAX_NEGOTIATED_FRAME_SIZE),
+        max_value_bytes: session_consumer_payload_budget(
+            MAX_NEGOTIATED_FRAME_SIZE,
+            MAX_NEGOTIATED_FRAME_SIZE,
+        ),
         ..BackendCapabilities::all_enabled()
     }
 }

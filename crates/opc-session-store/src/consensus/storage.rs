@@ -2291,7 +2291,7 @@ mod tests {
                 identity: identity(1),
                 request_id: SessionConsensusRequestId::from_bytes([request_byte; 16]),
                 logical_time: timestamp(request_byte),
-                intent: SessionMutationIntent::CompareAndSet(Box::new(CompareAndSet {
+                intent: SessionMutationIntent::CompareAndSet(Arc::new(CompareAndSet {
                     key,
                     lease,
                     expected_generation: None,
@@ -2602,7 +2602,7 @@ mod tests {
             let unsealed = SessionConsensusCommand {
                 request_id: SessionConsensusRequestId::from_bytes([2; 16]),
                 logical_time: timestamp(2),
-                intent: SessionMutationIntent::CompareAndSet(Box::new(CompareAndSet {
+                intent: SessionMutationIntent::CompareAndSet(Arc::new(CompareAndSet {
                     key: key(),
                     lease: guard.clone(),
                     expected_generation: None,
@@ -2685,7 +2685,7 @@ mod tests {
             identity: identity(1),
             request_id: SessionConsensusRequestId::from_bytes([4; 16]),
             logical_time: timestamp(2),
-            intent: SessionMutationIntent::CompareAndSet(Box::new(CompareAndSet {
+            intent: SessionMutationIntent::CompareAndSet(Arc::new(CompareAndSet {
                 key: key(),
                 lease: guard.clone(),
                 expected_generation: None,

@@ -82,10 +82,23 @@ pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/5";
 pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/2";
 /// Fixed revision of the consensus-only bootstrap and operation DTOs.
 ///
-/// Revision 4 makes every forwarded consumer operation carry an explicit
-/// internal-or-consumer scope marker. It therefore rejects revision-3 peers
-/// before they can omit that authorization boundary.
-pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 4;
+/// Revision 5 adds an exact application-semantics gate for outcome-digest v2.
+/// A peer that computes the former digest must never join a voter set that
+/// persists v2 receipts: equal Raft entries could otherwise produce different
+/// durable idempotency evidence on different voters.  The dedicated consensus
+/// bootstrap rejects the older revision before it can exchange Vote,
+/// AppendEntries, snapshot, or forwarded-mutation traffic.
+pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 5;
+
+/// Exact state-machine receipt and command-outcome semantics required for
+/// consensus application.
+///
+/// This is deliberately distinct from a consumer wire revision.  Outcome
+/// digest v2 is computed by every applying voter, so a rolling mixed-binary
+/// voter set is unsafe even when its consumer request DTOs are otherwise
+/// compatible.  There is no fallback or negotiation: bootstrap requires this
+/// exact value before a connection can carry any consensus command.
+pub const SESSION_CONSENSUS_APPLICATION_REVISION: u16 = 2;
 
 /// Exact resource and semantic profile for consensus-only connections.
 ///
@@ -96,6 +109,8 @@ pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 4;
 pub struct SessionConsensusContractProfile {
     /// Revision of the dedicated consensus wire DTOs.
     pub wire_schema_revision: u16,
+    /// Revision of deterministic consensus command and receipt semantics.
+    pub application_revision: u16,
     /// Revision of the fixed transport and nested forwarded-operation errors.
     pub error_set_revision: u16,
     /// Largest decoded private consensus payload accepted in either direction.
@@ -110,6 +125,8 @@ impl SessionConsensusContractProfile {
     /// Whether this is the exact profile implemented by this SDK build.
     pub const fn is_current(self) -> bool {
         self.wire_schema_revision == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.wire_schema_revision
+            && self.application_revision
+                == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.application_revision
             && self.error_set_revision
                 == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision
             && self.max_rpc_payload_bytes
@@ -123,6 +140,7 @@ impl SessionConsensusContractProfile {
 pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractProfile =
     SessionConsensusContractProfile {
         wire_schema_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+        application_revision: SESSION_CONSENSUS_APPLICATION_REVISION,
         error_set_revision: 6,
         max_rpc_payload_bytes: SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES as u32,
         min_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE as u32,
@@ -4479,10 +4497,30 @@ mod tests {
             6
         );
         assert_eq!(SESSION_CONSENSUS_ALPN, b"opc-session-consensus/2");
-        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 4);
+        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 5);
+        assert_eq!(SESSION_CONSENSUS_APPLICATION_REVISION, 2);
+        assert_eq!(
+            serde_json::to_value(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE)
+                .expect("consensus contract serializes"),
+            serde_json::json!({
+                "wire_schema_revision": 5,
+                "application_revision": 2,
+                "error_set_revision": 6,
+                "max_rpc_payload_bytes": SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+                "min_frame_size": MIN_SESSION_CONSENSUS_FRAME_SIZE,
+                "max_frame_size": MAX_NEGOTIATED_FRAME_SIZE,
+            }),
+            "the bootstrap golden binds outcome-digest semantics separately from consumer wire"
+        );
         let mut previous_error_set = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
         previous_error_set.error_set_revision = 1;
         assert!(!previous_error_set.is_current());
+        let mut previous_application = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
+        previous_application.application_revision = 1;
+        assert!(
+            !previous_application.is_current(),
+            "outcome-digest v1 voters cannot pass the consensus application gate"
+        );
         assert_eq!(
             CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.min_frame_size,
             MIN_SESSION_CONSENSUS_FRAME_SIZE as u32

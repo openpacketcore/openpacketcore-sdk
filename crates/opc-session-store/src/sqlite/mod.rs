@@ -859,6 +859,59 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read one prepared consumer compare-and-set receipt after a
+    /// caller-owned leader-linearizable barrier. This is a read-only query of
+    /// the existing consensus outcome ledger; it opens no prepared-CAS
+    /// journal and performs no schema or migration work.
+    pub(crate) async fn consensus_consumer_compare_and_set_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        lookup: consensus::ConsumerCompareAndSetReceiptLookup,
+    ) -> Result<crate::consumer::SessionConsumerCompareAndSetStatus, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let status = consensus::read_consumer_compare_and_set_status_sync(
+                &tx,
+                storage_identity,
+                lookup,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(status)
+        })
+        .await
+    }
+
+    /// Check one exact consumer binding before the leader decides whether a
+    /// marker proposal is necessary. This is a point read of the outcome
+    /// ledger, not a receipt barrier, mutation, or consensus proposal.
+    pub(crate) async fn consensus_consumer_request_binding_lookup(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        authority_identity: crate::consensus::SessionConsensusIdentity,
+        binding_request_id: crate::consensus::SessionConsensusRequestId,
+        request_commitment: [u8; 32],
+    ) -> Result<consensus::ConsumerRequestBindingLookup, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let lookup = consensus::read_consumer_request_binding_sync(
+                &tx,
+                storage_identity,
+                authority_identity,
+                binding_request_id,
+                request_commitment,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(lookup)
+        })
+        .await
+    }
+
     /// Restore scan at one persisted consensus logical timestamp.
     pub(crate) async fn consensus_scan_restore_records_at(
         &self,
@@ -1548,7 +1601,7 @@ impl SessionBackend for SqliteSessionBackend {
         let caps = self.caps;
         self.run_store_sqlite_task(SqliteStoreWorkKind::CompareAndSet, move |conn| {
             let tx = standalone_transaction(conn)?;
-            let result = ops::compare_and_set_sync(&tx, op, &caps, now)?;
+            let result = ops::compare_and_set_sync(&tx, &op, &caps, now)?;
             tx.commit()
                 .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
             Ok(result)
@@ -1623,7 +1676,7 @@ impl SessionBackend for SqliteSessionBackend {
                     SessionOp::CompareAndSet(cas) => {
                         let run_cas = || {
                             let tx = standalone_transaction(conn)?;
-                            let result = ops::compare_and_set_sync(&tx, cas, &caps, now)?;
+                            let result = ops::compare_and_set_sync(&tx, &cas, &caps, now)?;
                             tx.commit()
                                 .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
                             Ok(result)

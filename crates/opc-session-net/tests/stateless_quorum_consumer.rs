@@ -5,7 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -21,20 +21,23 @@ use opc_key::{
     AES_256_GCM_SIV_KEY_LEN,
 };
 use opc_session_net::{
-    conservative_payload_budget, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId,
-    SessionConfigurationGeneration, SessionConsensusServer, SessionConsensusServerHandle,
-    SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
-    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
-    SessionReauthenticationControl, SessionReplicationManifest, StatelessSessionConsumerClient,
-    DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT, MAX_NEGOTIATED_FRAME_SIZE,
-    SESSION_QUORUM_CONSUMER_ALPN,
+    session_consumer_payload_budget, PersistentSessionConsumerClient,
+    PersistentSessionConsumerConfig, RemoteAddrResolver, RemoteSessionConsensusPeer,
+    SessionClusterId, SessionConfigurationGeneration, SessionConsensusServer,
+    SessionConsensusServerHandle, SessionConsumerAuthorizer, SessionConsumerClientError,
+    SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
+    SessionConsumerMutationError, SessionConsumerPreparedCheckpointRouter,
+    SessionQuorumConsumerServer, SessionReauthenticationControl, SessionReplicationManifest,
+    StatelessSessionConsumerClient, DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+    MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
 };
 use opc_session_store::{
-    AtomicFencedTransitionCapability, BackendCapabilities, ConsensusSessionStore,
-    EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
-    FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, Generation, OwnerId,
+    backend::PreparedCheckpointPort, AtomicFencedTransitionCapability, BackendCapabilities,
+    CompareAndSet, ConsensusSessionStore, EncryptedSessionPayload, EncryptingSessionBackend,
+    FenceToken, FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, Generation,
+    OwnerId, PreparedCheckpointBudget, PreparedCompareAndSetExecuteError,
+    PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
     PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
     RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
@@ -55,7 +58,10 @@ use tokio::net::TcpListener;
 
 fn transported_capabilities() -> BackendCapabilities {
     BackendCapabilities {
-        max_value_bytes: conservative_payload_budget(MAX_NEGOTIATED_FRAME_SIZE),
+        max_value_bytes: session_consumer_payload_budget(
+            MAX_NEGOTIATED_FRAME_SIZE,
+            MAX_NEGOTIATED_FRAME_SIZE,
+        ),
         ..BackendCapabilities::all_enabled()
     }
 }
@@ -653,6 +659,101 @@ fn three_voter_member(index: usize) -> QuorumReplicaDescriptor {
 
 fn three_voter_spiffe(index: usize) -> String {
     format!("spiffe://test.example/tenant/test/ns/default/sa/session/nf/consensus/instance/{index}")
+}
+
+/// Script exactly one real CAS commit whose consumer response is lost. The
+/// inner service remains the real SQLite/OpenRaft consumer implementation;
+/// this wrapper changes only the response delivery after a confirmed commit.
+struct CommitThenLosePreparedCasResponse {
+    inner: Arc<dyn SessionQuorumConsumer>,
+    armed: AtomicBool,
+    committed: tokio::sync::Notify,
+    mutation_calls: AtomicUsize,
+}
+
+impl CommitThenLosePreparedCasResponse {
+    fn new(inner: Arc<dyn SessionQuorumConsumer>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(true),
+            committed: tokio::sync::Notify::new(),
+            mutation_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionQuorumConsumer for CommitThenLosePreparedCasResponse {
+    async fn execute(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        let cas = matches!(
+            request.operation(),
+            SessionConsumerOperation::CompareAndSet { .. }
+        );
+        let response = self.inner.execute(identity, request).await;
+        if cas {
+            self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(response, SessionConsumerResponse::CompareAndSet(Ok(_)))
+                && self
+                    .armed
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.committed.notify_waiters();
+                std::future::pending().await
+            }
+        }
+        response
+    }
+
+    async fn watch(
+        &self,
+        identity: &SessionConsumerIdentity,
+        scope: SessionConsumerScope,
+        start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        self.inner.watch(identity, scope, start_sequence).await
+    }
+}
+
+struct CountingPreparedCasStatusConsumer {
+    inner: Arc<dyn SessionQuorumConsumer>,
+    status_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionQuorumConsumer for CountingPreparedCasStatusConsumer {
+    async fn execute(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        if matches!(
+            request.operation(),
+            SessionConsumerOperation::CompareAndSetStatus { .. }
+        ) {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.execute(identity, request).await
+    }
+
+    async fn watch(
+        &self,
+        identity: &SessionConsumerIdentity,
+        scope: SessionConsumerScope,
+        start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        self.inner.watch(identity, scope, start_sequence).await
+    }
 }
 
 /// A real consumer listener wrapper that commits the inner operation then
@@ -2516,6 +2617,789 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
     );
     persistent.shutdown().await;
     server.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn prepared_cas_three_voter_receipt_converges_after_real_commit_and_lost_response() {
+    prepared_cas_three_voter_receipt_converges_with_payload(
+        EncryptedSessionPayload::new([0xc5]),
+        Duration::from_millis(100),
+    )
+    .await;
+}
+
+async fn prepared_cas_three_voter_receipt_converges_with_payload(
+    payload: EncryptedSessionPayload,
+    physical_attempt_timeout: Duration,
+) {
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
+    let client_spiffe = spiffe("prepared-cas-three-voter-client");
+    let manifest = fleet.stores[0]
+        .consumer_authorization_manifest()
+        .await
+        .expect("prepared CAS consumer manifest");
+    let scope = manifest.scope();
+    let authorizer = SessionConsumerAuthorizer::try_new(
+        manifest,
+        [SpiffeId::new(&client_spiffe).expect("prepared CAS client SPIFFE")],
+    )
+    .expect("prepared CAS authorizer");
+    let a_spiffe = spiffe("prepared-cas-three-voter-a");
+    let b_spiffe = spiffe("prepared-cas-three-voter-b");
+    let c_spiffe = spiffe("prepared-cas-three-voter-c");
+    let status_a = Arc::new(CountingPreparedCasStatusConsumer {
+        inner: Arc::new(fleet.stores[0].consumer_service()),
+        status_calls: AtomicUsize::new(0),
+    });
+    let (a_server, a_address) = SessionQuorumConsumerServer::new(
+        Arc::clone(&status_a) as Arc<dyn SessionQuorumConsumer>,
+        pki.server_config(&a_spiffe),
+        authorizer.clone(),
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("A listener"))
+    .await
+    .expect("start A listener");
+    let c_loss = Arc::new(CommitThenLosePreparedCasResponse::new(Arc::new(
+        fleet.stores[2].consumer_service(),
+    )));
+    let (c_server, c_address) = SessionQuorumConsumerServer::new(
+        Arc::clone(&c_loss) as Arc<dyn SessionQuorumConsumer>,
+        pki.server_config(&c_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("C listener"))
+    .await
+    .expect("start C listener");
+
+    let a_calls = Arc::new(AtomicUsize::new(0));
+    let a_resolver: RemoteAddrResolver = {
+        let calls = Arc::clone(&a_calls);
+        Arc::new(move || {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if call == 0 {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "A pre-write",
+                    ))
+                } else {
+                    Ok(a_address)
+                }
+            })
+        })
+    };
+    let b_calls = Arc::new(AtomicUsize::new(0));
+    let b_resolver: RemoteAddrResolver = {
+        let calls = Arc::clone(&b_calls);
+        Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "B pre-write",
+                ))
+            })
+        })
+    };
+    let c_calls = Arc::new(AtomicUsize::new(0));
+    let c_resolver: RemoteAddrResolver = {
+        let calls = Arc::clone(&c_calls);
+        Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(c_address) })
+        })
+    };
+    let server_name = rustls_pki_types::ServerName::IpAddress(a_address.ip().into());
+    let client_a = PersistentSessionConsumerClient::from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            a_resolver,
+            server_name.clone(),
+            SpiffeId::new(&a_spiffe).expect("A SPIFFE"),
+            scope,
+            pki.client_config(&client_spiffe),
+        ),
+    )
+    .expect("A persistent client");
+    let client_b = PersistentSessionConsumerClient::from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            b_resolver,
+            server_name.clone(),
+            SpiffeId::new(&b_spiffe).expect("B SPIFFE"),
+            scope,
+            pki.client_config(&client_spiffe),
+        ),
+    )
+    .expect("B persistent client");
+    let client_c = PersistentSessionConsumerClient::from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            c_resolver,
+            server_name,
+            SpiffeId::new(&c_spiffe).expect("C SPIFFE"),
+            scope,
+            pki.client_config(&client_spiffe),
+        ),
+    )
+    .expect("C persistent client");
+    let router = Arc::new(
+        SessionConsumerPreparedCheckpointRouter::persistent([client_a, client_b, client_c.clone()])
+            .expect("distinct same-scope prepared router"),
+    );
+    let checkpoint_port: Arc<dyn PreparedCheckpointPort> = router;
+
+    let key = test_key();
+    let owner = OwnerId::new("prepared-cas-three-voter-owner").expect("owner");
+    let lease = fleet.stores[2]
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("real quorum lease");
+    let before = fleet.stores[2]
+        .max_replication_sequence()
+        .await
+        .expect("sequence before CAS");
+    let expired_provider = CountingKeyProvider::with_active_session_key();
+    let expired = EncryptingSessionBackend::new(
+        Arc::new(fleet.stores[2].clone()),
+        Arc::clone(&expired_provider),
+        "prepared-cas-three-voter",
+    )
+    .with_prepared_checkpoint_port(Arc::clone(&checkpoint_port));
+    assert!(
+        matches!(
+            expired
+                .prepare_compare_and_set(
+                    SessionConsumerRequestId::from_bytes([0xc4; 16]),
+                    CompareAndSet {
+                        key: key.clone(),
+                        lease: lease.clone(),
+                        expected_generation: None,
+                        new_record: StoredSessionRecord {
+                            key: key.clone(),
+                            generation: Generation::new(1),
+                            owner: owner.clone(),
+                            fence: lease.fence(),
+                            state_class: StateClass::AuthoritativeSession,
+                            state_type: StateType::from_static("prepared-cas-three-voter"),
+                            expires_at: None,
+                            payload: EncryptedSessionPayload::new([0xc4]),
+                        },
+                    },
+                    PreparedCheckpointBudget::new(
+                        tokio::time::Instant::now() - Duration::from_millis(1),
+                        Duration::from_millis(25),
+                    )
+                    .expect("explicit expired physical budget"),
+                )
+                .await,
+            Err(PreparedCompareAndSetPrepareError::NotTransmitted)
+        ),
+        "an expired original deadline reaches neither preflight nor seal"
+    );
+    assert_eq!(
+        expired_provider.calls(),
+        0,
+        "expired prepare performs no KMS call"
+    );
+    let provider = CountingKeyProvider::with_active_session_key();
+    let protected = EncryptingSessionBackend::new(
+        Arc::new(fleet.stores[2].clone()),
+        Arc::clone(&provider),
+        "prepared-cas-three-voter",
+    )
+    .with_prepared_checkpoint_port(Arc::clone(&checkpoint_port));
+    let prepared = protected
+        .prepare_compare_and_set(
+            SessionConsumerRequestId::from_bytes([0xc5; 16]),
+            CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: StoredSessionRecord {
+                    key,
+                    generation: Generation::new(1),
+                    owner,
+                    fence: lease.fence(),
+                    state_class: StateClass::AuthoritativeSession,
+                    state_type: StateType::from_static("prepared-cas-three-voter"),
+                    expires_at: None,
+                    payload,
+                },
+            },
+            PreparedCheckpointBudget::new(
+                tokio::time::Instant::now() + Duration::from_secs(3),
+                physical_attempt_timeout,
+            )
+            .expect("explicit 100ms physical budget"),
+        )
+        .await
+        .expect("one protected prepared CAS");
+    assert_eq!(
+        provider.calls(),
+        1,
+        "preparation seals the canonical CAS exactly once"
+    );
+
+    let committed = c_loss.committed.notified();
+    tokio::pin!(committed);
+    committed.as_mut().enable();
+    assert_eq!(
+        prepared.execute_once().await,
+        Err(PreparedCompareAndSetExecuteError::OutcomeUnknown),
+        "C commits once but withholds its consumer response"
+    );
+    tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, &mut committed)
+        .await
+        .expect("C reaches one real durable CAS commit after the response deadline");
+    assert_eq!(a_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(b_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(c_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(c_loss.mutation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        before + 1,
+        fleet.stores[2]
+            .max_replication_sequence()
+            .await
+            .expect("one real CAS effect"),
+        "only the C route proposed the bound CAS intent"
+    );
+
+    fleet.reset_read_barrier_calls();
+    assert_eq!(
+        prepared
+            .status_once(tokio::time::Instant::now() + physical_attempt_timeout)
+            .await,
+        Ok(PreparedCompareAndSetStatus::Recorded(
+            PreparedCompareAndSetOutcome::Applied,
+        )),
+        "first receipt rotates to A and reads the real durable ledger"
+    );
+    assert_eq!(a_calls.load(Ordering::SeqCst), 2, "first receipt uses A");
+    assert_eq!(status_a.status_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(c_loss.mutation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        before + 1,
+        fleet.stores[2]
+            .max_replication_sequence()
+            .await
+            .expect("receipt does not propose"),
+        "status is a read-only ledger barrier"
+    );
+    assert_eq!(1, fleet.read_barrier_calls(), "one quorum receipt barrier");
+    assert_eq!(
+        provider.calls(),
+        1,
+        "receipt recovery neither reseals nor unseals the protected CAS"
+    );
+    assert!(client_c.diagnostics().await.reconnects >= 1);
+    assert_eq!(
+        prepared.execute_once().await,
+        Err(PreparedCompareAndSetExecuteError::AlreadyExecuted)
+    );
+    let different_namespace = EncryptingSessionBackend::new(
+        Arc::new(fleet.stores[2].clone()),
+        CountingKeyProvider::with_active_session_key(),
+        "prepared-cas-three-voter-different-namespace",
+    )
+    .with_prepared_checkpoint_port(checkpoint_port);
+    assert!(
+        matches!(
+            different_namespace
+                .prepare_compare_and_set(
+                    SessionConsumerRequestId::from_bytes([0xc6; 16]),
+                    CompareAndSet {
+                        key: test_key(),
+                        lease: lease.clone(),
+                        expected_generation: None,
+                        new_record: StoredSessionRecord {
+                            key: test_key(),
+                            generation: Generation::new(2),
+                            owner: OwnerId::new("prepared-cas-three-voter-other-owner")
+                                .expect("owner"),
+                            fence: lease.fence(),
+                            state_class: StateClass::AuthoritativeSession,
+                            state_type: StateType::from_static("prepared-cas-three-voter"),
+                            expires_at: None,
+                            payload: EncryptedSessionPayload::new([0xc6]),
+                        },
+                    },
+                    PreparedCheckpointBudget::new(
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                        Duration::from_millis(25),
+                    )
+                    .expect("explicit 25ms physical budget"),
+                )
+                .await,
+            Err(PreparedCompareAndSetPrepareError::InvalidRequest)
+        ),
+        "one router cannot be rebound to a different protected namespace"
+    );
+    assert_eq!(
+        c_loss.mutation_calls.load(Ordering::SeqCst),
+        1,
+        "namespace rejection reaches no voter mutation"
+    );
+
+    client_c.shutdown().await;
+    a_server.abort_and_wait().await;
+    c_server.abort_and_wait().await;
+}
+
+#[derive(Debug)]
+struct WarmPreparedCasLatencySample {
+    payload_bytes: usize,
+    attempt_budget: Duration,
+    warm_get: Duration,
+    execute_to_ambiguity: Duration,
+    dispatch_outcome: WarmPreparedCasDispatchOutcome,
+    receipt: Duration,
+    receipt_outcome: WarmPreparedCasReceiptOutcome,
+    a_resolves: usize,
+    c_resolves: usize,
+    a_setup_successes: u64,
+    c_setup_successes: u64,
+    c_reconnects: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmPreparedCasDispatchOutcome {
+    OutcomeUnknown,
+    NotTransmitted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmPreparedCasReceiptOutcome {
+    NotAttempted,
+    RecordedApplied,
+    NotFound,
+    Deadline,
+    TopologyAuthorityRevoked,
+    Unavailable,
+    RequestConflict,
+    RecordedOther,
+    OtherError,
+}
+
+fn warm_latency_percentile(samples: &mut [Duration], percentile: usize) -> Duration {
+    assert!(!samples.is_empty(), "latency summary needs one sample");
+    samples.sort_unstable();
+    let index = ((samples.len() - 1) * percentile).div_ceil(100);
+    samples[index]
+}
+
+async fn warm_prepared_cas_response_loss_sample(
+    payload_bytes: usize,
+    attempt_budget: Duration,
+    warm_connections: bool,
+) -> WarmPreparedCasLatencySample {
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start(Arc::clone(&pki), None).await;
+    let client_spiffe = spiffe("prepared-cas-warm-matrix-client");
+    let manifest = fleet.stores[0]
+        .consumer_authorization_manifest()
+        .await
+        .expect("warm matrix consumer manifest");
+    let scope = manifest.scope();
+    let authorizer = SessionConsumerAuthorizer::try_new(
+        manifest,
+        [SpiffeId::new(&client_spiffe).expect("warm matrix client SPIFFE")],
+    )
+    .expect("warm matrix authorizer");
+    let a_spiffe = spiffe("prepared-cas-warm-matrix-a");
+    let c_spiffe = spiffe("prepared-cas-warm-matrix-c");
+    let status_a = Arc::new(CountingPreparedCasStatusConsumer {
+        inner: Arc::new(fleet.stores[0].consumer_service()),
+        status_calls: AtomicUsize::new(0),
+    });
+    let (a_server, a_address) = SessionQuorumConsumerServer::new(
+        Arc::clone(&status_a) as Arc<dyn SessionQuorumConsumer>,
+        pki.server_config(&a_spiffe),
+        authorizer.clone(),
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("warm A listener"),
+    )
+    .await
+    .expect("start warm A listener");
+    let c_loss = Arc::new(CommitThenLosePreparedCasResponse::new(Arc::new(
+        fleet.stores[2].consumer_service(),
+    )));
+    let (c_server, c_address) = SessionQuorumConsumerServer::new(
+        Arc::clone(&c_loss) as Arc<dyn SessionQuorumConsumer>,
+        pki.server_config(&c_spiffe),
+        authorizer,
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("warm C listener"),
+    )
+    .await
+    .expect("start warm C listener");
+
+    let a_resolves = Arc::new(AtomicUsize::new(0));
+    let a_resolver: RemoteAddrResolver = {
+        let resolves = Arc::clone(&a_resolves);
+        Arc::new(move || {
+            resolves.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(a_address) })
+        })
+    };
+    let c_resolves = Arc::new(AtomicUsize::new(0));
+    let c_resolver: RemoteAddrResolver = {
+        let resolves = Arc::clone(&c_resolves);
+        Arc::new(move || {
+            resolves.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(c_address) })
+        })
+    };
+    let server_name = rustls_pki_types::ServerName::IpAddress(a_address.ip().into());
+    let client_a = PersistentSessionConsumerClient::from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            a_resolver,
+            server_name.clone(),
+            SpiffeId::new(&a_spiffe).expect("warm A SPIFFE"),
+            scope,
+            pki.client_config(&client_spiffe),
+        ),
+    )
+    .expect("warm A persistent client");
+    let client_c = PersistentSessionConsumerClient::from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            c_resolver,
+            server_name,
+            SpiffeId::new(&c_spiffe).expect("warm C SPIFFE"),
+            scope,
+            pki.client_config(&client_spiffe),
+        ),
+    )
+    .expect("warm C persistent client");
+    let key = test_key();
+    let warm_get = if warm_connections {
+        let warm_started = Instant::now();
+        assert!(client_c
+            .get(key.clone())
+            .await
+            .expect("warm C Get")
+            .is_none());
+        assert!(client_a
+            .get(key.clone())
+            .await
+            .expect("warm A Get")
+            .is_none());
+        warm_started.elapsed()
+    } else {
+        Duration::ZERO
+    };
+    let a_warm = client_a.diagnostics().await;
+    let c_warm = client_c.diagnostics().await;
+    if warm_connections {
+        assert!(
+            a_warm.setup_successes >= 1,
+            "A authenticated during warm Get"
+        );
+        assert!(
+            c_warm.setup_successes >= 1,
+            "C authenticated during warm Get"
+        );
+        assert_eq!(a_resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(c_resolves.load(Ordering::SeqCst), 1);
+    } else {
+        assert_eq!(a_warm.setup_successes, 0);
+        assert_eq!(c_warm.setup_successes, 0);
+    }
+
+    // C is the first mutation voter; after C's possibly-sent response loss,
+    // the canonical router must make its first read-only receipt attempt at A.
+    let router = Arc::new(
+        SessionConsumerPreparedCheckpointRouter::persistent([client_c.clone(), client_a.clone()])
+            .expect("same-scope warm prepared router"),
+    );
+    let checkpoint_port: Arc<dyn PreparedCheckpointPort> = router;
+    let owner = OwnerId::new("prepared-cas-warm-matrix-owner").expect("owner");
+    let lease = fleet.stores[2]
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("warm matrix lease");
+    let before = fleet.stores[2]
+        .max_replication_sequence()
+        .await
+        .expect("warm matrix sequence before CAS");
+    let provider = CountingKeyProvider::with_active_session_key();
+    let prepared = EncryptingSessionBackend::new(
+        Arc::new(fleet.stores[2].clone()),
+        Arc::clone(&provider),
+        "prepared-cas-warm-matrix",
+    )
+    .with_prepared_checkpoint_port(checkpoint_port)
+    .prepare_compare_and_set(
+        SessionConsumerRequestId::from_bytes([0xd1; 16]),
+        CompareAndSet {
+            key: key.clone(),
+            lease: lease.clone(),
+            expected_generation: None,
+            new_record: StoredSessionRecord {
+                key,
+                generation: Generation::new(1),
+                owner,
+                fence: lease.fence(),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static("prepared-cas-warm-matrix"),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new(vec![0xd1; payload_bytes]),
+            },
+        },
+        PreparedCheckpointBudget::new(
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            attempt_budget,
+        )
+        .expect("explicit warm matrix budget"),
+    )
+    .await
+    .expect("warm matrix prepare");
+    assert_eq!(provider.calls(), 1, "one canonical seal");
+
+    let committed = c_loss.committed.notified();
+    tokio::pin!(committed);
+    committed.as_mut().enable();
+    let execute_started = Instant::now();
+    let dispatch_outcome = match prepared.execute_once().await {
+        Err(PreparedCompareAndSetExecuteError::OutcomeUnknown) => {
+            WarmPreparedCasDispatchOutcome::OutcomeUnknown
+        }
+        Err(PreparedCompareAndSetExecuteError::NotTransmitted) => {
+            WarmPreparedCasDispatchOutcome::NotTransmitted
+        }
+        other => panic!("unexpected warm prepared CAS dispatch result: {other:?}"),
+    };
+    let execute_to_ambiguity = execute_started.elapsed();
+    if dispatch_outcome == WarmPreparedCasDispatchOutcome::NotTransmitted {
+        assert_eq!(c_loss.mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fleet.stores[2]
+                .max_replication_sequence()
+                .await
+                .expect("warm matrix unchanged sequence"),
+            before,
+            "a proven pre-dispatch deadline has no mutation effect"
+        );
+        let a_after = client_a.diagnostics().await;
+        let c_after = client_c.diagnostics().await;
+        client_a.shutdown().await;
+        client_c.shutdown().await;
+        a_server.abort_and_wait().await;
+        c_server.abort_and_wait().await;
+        return WarmPreparedCasLatencySample {
+            payload_bytes,
+            attempt_budget,
+            warm_get,
+            execute_to_ambiguity,
+            dispatch_outcome,
+            receipt: Duration::ZERO,
+            receipt_outcome: WarmPreparedCasReceiptOutcome::NotAttempted,
+            a_resolves: a_resolves.load(Ordering::SeqCst),
+            c_resolves: c_resolves.load(Ordering::SeqCst),
+            a_setup_successes: a_after.setup_successes,
+            c_setup_successes: c_after.setup_successes,
+            c_reconnects: c_after.reconnects,
+        };
+    }
+    tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, &mut committed)
+        .await
+        .expect("C commits one durable CAS");
+    assert_eq!(c_loss.mutation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fleet.stores[2]
+            .max_replication_sequence()
+            .await
+            .expect("warm matrix sequence after CAS"),
+        before + 1,
+        "exactly one mutation effect is durable"
+    );
+
+    fleet.reset_read_barrier_calls();
+    let receipt_started = Instant::now();
+    let receipt_result = prepared
+        .status_once(tokio::time::Instant::now() + attempt_budget)
+        .await;
+    let receipt = receipt_started.elapsed();
+    let receipt_outcome = match receipt_result {
+        Ok(PreparedCompareAndSetStatus::Recorded(PreparedCompareAndSetOutcome::Applied)) => {
+            WarmPreparedCasReceiptOutcome::RecordedApplied
+        }
+        Ok(PreparedCompareAndSetStatus::Recorded(_)) => {
+            WarmPreparedCasReceiptOutcome::RecordedOther
+        }
+        Ok(PreparedCompareAndSetStatus::NotFound) => WarmPreparedCasReceiptOutcome::NotFound,
+        Ok(PreparedCompareAndSetStatus::RequestConflict) => {
+            WarmPreparedCasReceiptOutcome::RequestConflict
+        }
+        Err(opc_session_store::PreparedCompareAndSetStatusError::Deadline) => {
+            WarmPreparedCasReceiptOutcome::Deadline
+        }
+        Err(opc_session_store::PreparedCompareAndSetStatusError::TopologyAuthorityRevoked) => {
+            WarmPreparedCasReceiptOutcome::TopologyAuthorityRevoked
+        }
+        Err(opc_session_store::PreparedCompareAndSetStatusError::Unavailable) => {
+            WarmPreparedCasReceiptOutcome::Unavailable
+        }
+        Err(opc_session_store::PreparedCompareAndSetStatusError::NotExecuted) => {
+            panic!("possible-send token must remain receipt-only")
+        }
+        Err(_) => WarmPreparedCasReceiptOutcome::OtherError,
+    };
+    if receipt_outcome == WarmPreparedCasReceiptOutcome::RecordedApplied {
+        assert_eq!(
+            status_a.status_calls.load(Ordering::SeqCst),
+            1,
+            "the first durable receipt is the warmed A voter"
+        );
+        assert_eq!(
+            fleet.read_barrier_calls(),
+            1,
+            "the recorded receipt performs exactly one linearized barrier"
+        );
+    }
+    assert_eq!(c_loss.mutation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.calls(), 1, "receipt does not reseal or unseal");
+    assert_eq!(
+        prepared.execute_once().await,
+        Err(PreparedCompareAndSetExecuteError::AlreadyExecuted),
+        "possible-send permanently prohibits another mutation"
+    );
+    let a_after = client_a.diagnostics().await;
+    let c_after = client_c.diagnostics().await;
+    assert_eq!(a_resolves.load(Ordering::SeqCst), 1);
+    assert_eq!(c_resolves.load(Ordering::SeqCst), 1);
+
+    client_a.shutdown().await;
+    client_c.shutdown().await;
+    a_server.abort_and_wait().await;
+    c_server.abort_and_wait().await;
+    WarmPreparedCasLatencySample {
+        payload_bytes,
+        attempt_budget,
+        warm_get,
+        execute_to_ambiguity,
+        dispatch_outcome,
+        receipt,
+        receipt_outcome,
+        a_resolves: a_resolves.load(Ordering::SeqCst),
+        c_resolves: c_resolves.load(Ordering::SeqCst),
+        a_setup_successes: a_after.setup_successes,
+        c_setup_successes: c_after.setup_successes,
+        c_reconnects: c_after.reconnects,
+    }
+}
+
+#[tokio::test]
+#[ignore = "release-only warm latency evidence matrix; run explicitly"]
+async fn prepared_cas_warm_response_loss_latency_matrix() {
+    // This is intentionally a bounded evidence lane, not a throughput
+    // benchmark or a product retry policy. Its explicit budgets remain the
+    // physical-attempt ceilings: it does not normalize a 250ms product budget.
+    let payload_kib = std::env::var("OPC_WARM_MATRIX_PAYLOAD_KIB")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("OPC_WARM_MATRIX_PAYLOAD_KIB must be an integer")
+        });
+    let budget_millis = std::env::var("OPC_WARM_MATRIX_BUDGET_MILLIS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .expect("OPC_WARM_MATRIX_BUDGET_MILLIS must be an integer")
+        });
+    let payloads = payload_kib
+        .map(|kib| vec![kib])
+        .unwrap_or_else(|| vec![16, 32, 41, 64, 128]);
+    let budgets = budget_millis
+        .map(|millis| vec![millis])
+        .unwrap_or_else(|| vec![25, 50, 100]);
+    let repetitions = std::env::var("OPC_WARM_MATRIX_REPETITIONS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("OPC_WARM_MATRIX_REPETITIONS must be an integer")
+        })
+        .unwrap_or(1);
+    assert!(repetitions > 0, "warm matrix needs at least one repetition");
+    for payload_bytes in payloads.into_iter().map(|kib| kib * 1024) {
+        for attempt_budget in budgets.iter().copied().map(Duration::from_millis) {
+            let mut samples = Vec::with_capacity(repetitions);
+            for _ in 0..repetitions {
+                samples.push(
+                    warm_prepared_cas_response_loss_sample(payload_bytes, attempt_budget, true)
+                        .await,
+                );
+            }
+            let recorded = samples
+                .iter()
+                .filter(|sample| {
+                    sample.receipt_outcome == WarmPreparedCasReceiptOutcome::RecordedApplied
+                })
+                .count();
+            let ambiguous = samples
+                .iter()
+                .filter(|sample| {
+                    sample.dispatch_outcome == WarmPreparedCasDispatchOutcome::OutcomeUnknown
+                })
+                .count();
+            assert!(samples.iter().all(|sample| {
+                sample.payload_bytes == payload_bytes
+                    && sample.attempt_budget == attempt_budget
+                    && sample.a_resolves == 1
+                    && sample.c_resolves == 1
+                    && sample.a_setup_successes >= 1
+                    && sample.c_setup_successes >= 1
+                    && sample.c_reconnects == 1
+            }));
+            let mut warm_get = samples
+                .iter()
+                .map(|sample| sample.warm_get)
+                .collect::<Vec<_>>();
+            let mut execute = samples
+                .iter()
+                .map(|sample| sample.execute_to_ambiguity)
+                .collect::<Vec<_>>();
+            let mut receipt = samples
+                .iter()
+                .map(|sample| sample.receipt)
+                .collect::<Vec<_>>();
+            eprintln!(
+                "warm prepared CAS n={} ambiguous={}/{} recorded={}/{} payload={}KiB budget={}ms: warm-get(p50/max)={:?}/{:?} execute(p50/p95/p99/max)={:?}/{:?}/{:?}/{:?} receipt(p50/p95/p99/max)={:?}/{:?}/{:?}/{:?}",
+                repetitions,
+                ambiguous,
+                repetitions,
+                recorded,
+                repetitions,
+                payload_bytes / 1024,
+                attempt_budget.as_millis(),
+                warm_latency_percentile(&mut warm_get, 50),
+                *warm_get.last().expect("nonempty warm samples"),
+                warm_latency_percentile(&mut execute, 50),
+                warm_latency_percentile(&mut execute, 95),
+                warm_latency_percentile(&mut execute, 99),
+                *execute.last().expect("nonempty execute samples"),
+                warm_latency_percentile(&mut receipt, 50),
+                warm_latency_percentile(&mut receipt, 95),
+                warm_latency_percentile(&mut receipt, 99),
+                *receipt.last().expect("nonempty receipt samples"),
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "release-only cold comparison for the warm ambiguity matrix"]
+async fn prepared_cas_cold_response_loss_latency_comparison() {
+    let sample =
+        warm_prepared_cas_response_loss_sample(16 * 1024, Duration::from_millis(100), false).await;
+    eprintln!("cold prepared CAS n=1 (single observation; p50/p95/p99 not estimated): {sample:?}");
 }
 
 #[tokio::test]
