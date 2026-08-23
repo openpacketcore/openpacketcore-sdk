@@ -1469,7 +1469,8 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
         serde_json::json!({
             "default": [],
             "insecure-test": [],
-            "legacy-session-net-compat": []
+            "legacy-session-net-compat": [],
+            "test-control": ["opc-session-store/test-control"]
         })
     );
     let testkit = package("opc-session-testkit");
