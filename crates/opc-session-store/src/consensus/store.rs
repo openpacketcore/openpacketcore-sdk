@@ -553,7 +553,10 @@ enum FencedTransitionCapabilityAdmission {
 /// path, so no caller can reuse the proof for a different scope, authority,
 /// or operation.
 struct FencedTransitionProposalAdmission {
-    read_admit: LinearizableReadAdmit<SessionConsensusNodeId>,
+    // A durable exact V1 activation lets an ordinary write quorum establish
+    // linearization for the physical transition itself. Fresh activation and
+    // all non-activated paths retain the read-index admission below.
+    read_admit: Option<LinearizableReadAdmit<SessionConsensusNodeId>>,
     scope_identity: SessionConsensusIdentity,
     voter_set_digest: [u8; 32],
     required_consumer_scope: ForwardConsumerScope,
@@ -1186,10 +1189,36 @@ impl ConsensusSessionStore {
         Ok(FencedTransitionCapabilityAdmission::FreshUnanimous)
     }
 
+    /// Check only the durable exact activation fact. This is intentionally a
+    /// local authority check: the following Raft write is the linearizing
+    /// quorum operation. It must never be used by activation, status, or a
+    /// dynamic capability path, all of which still require a read barrier.
+    async fn activated_fenced_transition_scope_is_current(&self) -> Result<bool, StoreError> {
+        self.require_exact_membership_admission()?;
+        let expected_scope = self.current_scope()?;
+        if self.local_fenced_transition_capability() != AtomicFencedTransitionCapability::V1
+            || !expected_scope.1.contains(&self.inner.local_node_id)
+        {
+            return Ok(false);
+        }
+        let activated = self
+            .inner
+            .backend
+            .consensus_fenced_transition_activation_matches_scope(
+                self.inner.storage_identity,
+                expected_scope.0,
+                expected_scope.1.clone(),
+            )
+            .await?;
+        Ok(activated
+            && self.current_scope()? == expected_scope
+            && self.exact_membership_is_admitted())
+    }
+
     /// Reject a fenced proposal unless every local fact bound to its one
-    /// quorum admission is still exact.  The final barrier revalidation is
-    /// intentionally the last check before `client_write_ff`: it only reads
-    /// local Openraft state and cannot start another quorum round.
+    /// quorum admission is still exact. The final admission revalidation is
+    /// intentionally the last check before `client_write_ff`; only a retained
+    /// read admission performs the local Openraft barrier revalidation.
     async fn revalidate_fenced_transition_proposal_admission_before(
         &self,
         admission: &FencedTransitionProposalAdmission,
@@ -1215,11 +1244,18 @@ impl ConsensusSessionStore {
         // revalidation must remain the final action before proposal.
         self.require_application_traffic_authority_before(deadline)
             .await?;
-        self.inner
-            .read_barrier
-            .revalidate(&admission.read_admit, deadline)
-            .await
-            .map_err(|_| consensus_unavailable())
+        match &admission.read_admit {
+            Some(read_admit) => self
+                .inner
+                .read_barrier
+                .revalidate(read_admit, deadline)
+                .await
+                .map_err(|_| consensus_unavailable()),
+            // The exact activation certificate and all scope/authority
+            // checks above bind this no-read-index path. The immediate Raft
+            // write quorum is its linearization point.
+            None => Ok(()),
+        }
     }
 
     /// Advertise V1 after either the exact durable certificate or a fresh
@@ -2898,7 +2934,26 @@ impl ConsensusSessionStore {
                 Ok(guard) => guard,
                 Err(_) => return ForwardMutationReply::Unavailable,
             };
-        let initial_authority = if allow_operator_recovery {
+        let activation_preflight = matches!(
+            &request.intent,
+            SessionMutationIntent::PreflightFencedTransitionCapability
+        );
+        // Once the durable exact V1 certificate is present, every remaining
+        // pre-write step below is local and no-effect. The final admission in
+        // `propose_on_local_leader` remains immediately before `client_write_ff`
+        // and rechecks recovery, scope, roster, and application authority;
+        // SQLite apply definitively rechecks exact activation under this held
+        // topology gate. Avoid duplicating those SQLite/latch reads on this
+        // hot path, while keeping them for activation and every other mutation.
+        let activated_fenced_transition = !activation_preflight
+            && matches!(&request.intent, SessionMutationIntent::FencedTransition(_))
+            && match self.activated_fenced_transition_scope_is_current().await {
+                Ok(activated) => activated,
+                Err(_) => return ForwardMutationReply::Unavailable,
+            };
+        let initial_authority = if activated_fenced_transition {
+            Ok(())
+        } else if allow_operator_recovery {
             self.require_durable_fixed_quorum_admission_before(deadline)
                 .await
         } else {
@@ -2964,15 +3019,17 @@ impl ConsensusSessionStore {
             Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
         };
 
-        let activation_preflight = matches!(
-            &request.intent,
-            SessionMutationIntent::PreflightFencedTransitionCapability
-        );
         // A physical fenced transition and the state-voter-only V1 activation
         // preflight carry this one typed local read admission through the
         // exact capability probe and into the final proposal. Other mutations
         // retain their established supervisor path.
-        let fenced_read_admit = if matches!(
+        let fenced_read_admit = if activated_fenced_transition {
+            // The durable exact activation and the immediate Raft write quorum
+            // are this physical V1 operation's authority and linearization
+            // path. Do not run either the fenced read barrier or the generic
+            // read-index admission before the proposal.
+            None
+        } else if matches!(
             &request.intent,
             SessionMutationIntent::FencedTransition(_)
                 | SessionMutationIntent::PreflightFencedTransitionCapability
@@ -3006,7 +3063,9 @@ impl ConsensusSessionStore {
             }
         };
 
-        let authority = if allow_operator_recovery {
+        let authority = if activated_fenced_transition {
+            Ok(())
+        } else if allow_operator_recovery {
             self.require_durable_fixed_quorum_admission_before(deadline)
                 .await
         } else {
@@ -3017,7 +3076,18 @@ impl ConsensusSessionStore {
             return ForwardMutationReply::Unavailable;
         }
 
-        let fenced_transition_admission = if let Some(read_admit) = fenced_read_admit {
+        let fenced_transition_admission = if activated_fenced_transition {
+            let (scope_identity, voters) = match self.current_scope() {
+                Ok(scope) => scope,
+                Err(_) => return ForwardMutationReply::Unavailable,
+            };
+            Some(FencedTransitionProposalAdmission {
+                read_admit: None,
+                scope_identity,
+                voter_set_digest: fenced_transition_voter_set_digest(scope_identity, &voters),
+                required_consumer_scope: request.required_consumer_scope.clone(),
+            })
+        } else if let Some(read_admit) = fenced_read_admit {
             let capability = match self
                 .require_fenced_transition_capability_after_read_admit(
                     &read_admit,
@@ -3050,7 +3120,7 @@ impl ConsensusSessionStore {
             };
             let voter_set_digest = fenced_transition_voter_set_digest(scope_identity, &voters);
             let admission = FencedTransitionProposalAdmission {
-                read_admit,
+                read_admit: Some(read_admit),
                 scope_identity,
                 voter_set_digest,
                 required_consumer_scope: request.required_consumer_scope.clone(),
@@ -8248,8 +8318,8 @@ mod membership_tests {
         );
         assert_eq!(
             FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.load(Ordering::Relaxed),
-            1,
-            "the first real transition after activation retains its one admission proof"
+            0,
+            "the durable activation lets the following V1 write quorum linearize without a redundant read admission"
         );
     }
 

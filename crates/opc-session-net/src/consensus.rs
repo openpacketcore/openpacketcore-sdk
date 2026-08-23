@@ -794,6 +794,10 @@ impl ConsensusColdConnector {
                         let tcp = TcpStream::connect(addr)
                             .await
                             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                        // Consensus uses small bidirectional frames on a
+                        // persistent connection; avoid Nagle/ACK latency.
+                        tcp.set_nodelay(true)
+                            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
                         let tls_connector = tokio_rustls::TlsConnector::from(
                             consensus_client_tls_config(attempt.rustls_config()),
                         );
@@ -887,6 +891,10 @@ impl ConsensusColdConnector {
             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
         let tcp = TcpStream::connect(addr)
             .await
+            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+        // Consensus uses small bidirectional frames on a persistent
+        // connection; avoid Nagle/ACK latency.
+        tcp.set_nodelay(true)
             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
         let (mut reader, mut writer) = tokio::io::split(tcp);
         let established_at = tokio::time::Instant::now();
@@ -2556,6 +2564,9 @@ async fn handle_consensus_connection(
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
 ) -> Result<(), ProtocolError> {
+    // Match outbound consensus sockets: requests and replies are small and
+    // bidirectional for the life of this persistent connection.
+    stream.set_nodelay(true).map_err(ProtocolError::Io)?;
     if let Some(tls_config) = tls_config {
         let generation = reauthentication.generation();
         let handshake = tls_config

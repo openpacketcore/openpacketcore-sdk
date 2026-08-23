@@ -1259,7 +1259,18 @@ fn fenced_consumer_backend(
 }
 
 fn fenced_create_request(payload: u8) -> FencedTransitionRequest {
-    let key = test_key();
+    fenced_create_request_with_identity(payload, [0x71; 16], b"opaque-session-reference")
+}
+
+fn fenced_create_request_with_identity(
+    payload: u8,
+    request_id: [u8; 16],
+    stable_id: &'static [u8],
+) -> FencedTransitionRequest {
+    let mut key = test_key();
+    key.stable_id = Bytes::from_static(stable_id)
+        .try_into()
+        .expect("test stable ID");
     let owner = OwnerId::new("x").expect("test owner");
     let lease = FencedTransitionLease::acquire(
         key.clone(),
@@ -1269,7 +1280,7 @@ fn fenced_create_request(payload: u8) -> FencedTransitionRequest {
     )
     .expect("test acquire lease");
     FencedTransitionRequest::new(
-        FencedTransitionRequestId::from_bytes([0x71; 16]),
+        FencedTransitionRequestId::from_bytes(request_id),
         lease.clone(),
         FencedTransitionMutation::create(StoredSessionRecord {
             key,
@@ -2889,10 +2900,13 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
         "prepare relies on exact token construction, journal health, and pre-Ready readiness"
     );
 
-    outer
-        .fenced_transition(&prepared)
-        .await
-        .expect("one real protected physical transition");
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        outer.fenced_transition(&prepared),
+    )
+    .await
+    .expect("prewarmed follower route reaches the elected voter inside the caller budget")
+    .expect("one real protected physical transition");
     assert_eq!(
         1,
         counted_services[follower]
@@ -2906,12 +2920,12 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
             .iter()
             .map(|service| service.capability_calls.load(Ordering::SeqCst))
             .sum::<usize>(),
-        "execute must not add a standalone capability wire call before its physical B1/P1 path"
+        "activated V1 execute must not add a standalone capability wire call before its P1 write quorum"
     );
     assert_eq!(
         0,
         fleet.read_barrier_calls(),
-        "the warmed physical transition has no standalone V1 capability wire probes; its one typed B1 stays inside the leader's OpenRaft admission"
+        "activated V1 adds no B1/read-index; its one P1 Raft write quorum is the linearization point"
     );
     assert_eq!(
         Some(before_proposal + 1),
@@ -2953,6 +2967,33 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
         fleet.stores[leader].status().last_log_index,
         "status remains read-only and never appends a proposal"
     );
+    let warm_prepared = outer
+        .prepare_fenced_transition(fenced_create_request_with_identity(
+            0xC3,
+            [0x72; 16],
+            b"opaque-session-reference-warm",
+        ))
+        .await
+        .expect("prepare a distinct already-warm protected transition");
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        outer.fenced_transition(&warm_prepared),
+    )
+    .await
+    .expect("already-warm follower route remains inside the caller budget")
+    .expect("second protected physical transition");
+    assert_eq!(
+        Some(before_proposal + 2),
+        fleet.stores[leader].status().last_log_index,
+        "each protected transition has exactly one durable proposal"
+    );
+    assert_eq!(
+        2,
+        counted_services[follower]
+            .transition_calls
+            .load(Ordering::SeqCst),
+        "both first and already-warm transitions cross the concrete follower boundary once"
+    );
     persistent_voters[follower]
         .request_reauthentication()
         .expect("rotate same semantic client identity");
@@ -2973,7 +3014,7 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
         "same-SPIFFE reauthentication does not turn into a hot-path capability call"
     );
     assert_eq!(
-        1,
+        2,
         counted_services[follower]
             .transition_calls
             .load(Ordering::SeqCst),
