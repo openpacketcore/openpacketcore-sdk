@@ -10,9 +10,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
+#[cfg(feature = "test-control")]
+use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
 use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
-    DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_key::{
@@ -36,7 +37,7 @@ use opc_session_store::{
     EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
     FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
-    FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2Status,
+    FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
     Generation, LeaseGuard, OwnerId, PreparedFencedTransitionJournal,
     PreparedFencedTransitionJournalKey, PreparedFencedTransitionLookup, QuorumReplicaDescriptor,
     QuorumTopologyConfig, QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity,
@@ -131,6 +132,7 @@ const THREE_VOTER_READY_TIMEOUT: Duration = Duration::from_secs(20);
 // Retain the durable recovery qualification bound for the one explicitly
 // triggered OpenRaft campaign and its bounded authenticated peer calls without
 // changing any production deadline.
+#[cfg(feature = "test-control")]
 const THREE_VOTER_ELECTION_RECOVERY_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
@@ -756,6 +758,7 @@ impl SessionQuorumConsumer for CommitThenLoseConsumerResponse {
 #[derive(Default)]
 struct CountingConsumer {
     calls: AtomicUsize,
+    v2_calls: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -800,6 +803,22 @@ impl SessionQuorumConsumer for CountingConsumer {
     ) -> SessionConsumerResponse {
         self.calls.fetch_add(1, Ordering::SeqCst);
         SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled())
+    }
+
+    async fn execute_v2(
+        &self,
+        _identity: &SessionConsumerIdentity,
+        request: SessionConsumerV2Request,
+    ) -> SessionConsumerV2Response {
+        self.v2_calls.fetch_add(1, Ordering::SeqCst);
+        match request.operation() {
+            SessionConsumerV2Operation::FencedTransitionV2Capability => {
+                SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+                    FencedTransitionV2Capability::V2,
+                ))
+            }
+            _ => SessionConsumerV2Response::Rejected(SessionConsumerRejection::MalformedRequest),
+        }
     }
 
     async fn watch(
@@ -1288,6 +1307,48 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
         "a mismatched cluster/configuration/epoch scope must not reach the service"
     );
     assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn authenticated_v2_consumer_call_reaches_the_listener_on_its_dedicated_alpn() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-server");
+    let client_spiffe = spiffe("v2-client");
+    let service = Arc::new(CountingConsumer::default());
+    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start stateless V2 consumer listener");
+    let client = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope);
+
+    assert_eq!(
+        client
+            .execute_v2(SessionConsumerV2Request::new(
+                scope,
+                SessionConsumerV2Operation::FencedTransitionV2Capability,
+            ))
+            .await,
+        Ok(SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+            FencedTransitionV2Capability::V2,
+        ))),
+        "the V2 client Hello and request reach the V2 listener lane"
+    );
+    assert_eq!(
+        service.v2_calls.load(Ordering::SeqCst),
+        1,
+        "the V2 service method receives exactly one listener-dispatched request"
+    );
+    assert_eq!(
+        service.calls.load(Ordering::SeqCst),
+        0,
+        "the V2 request never enters the V1 DTO service method"
+    );
     handle.abort_and_wait().await;
 }
 

@@ -7108,22 +7108,11 @@ impl PersistentV2LaneLifetime {
         if state.poisoned.swap(true, Ordering::AcqRel) {
             return;
         }
-        #[cfg(test)]
-        let poison_accounting_hook = {
-            pool.poison_accounting_hook
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        };
-        #[cfg(test)]
-        if let Some(hook) = poison_accounting_hook {
-            hook.pause_after_poison_state();
-        }
         if state.healthy.swap(false, Ordering::AcqRel) {
             pool.healthy_active.fetch_sub(1, Ordering::Release);
         }
         counter_increment(&pool.poisoned);
-        let reserved = match idle.front_mut() {
+        match idle.front_mut() {
             Some(PersistentV2PoolEntry::Poison(debt)) => {
                 // The count is fixed-memory and preserves one logical
                 // checkout failure for every newly poisoned lane. If the
@@ -7134,26 +7123,11 @@ impl PersistentV2LaneLifetime {
                         *debt = next;
                     }
                 }
-                true
             }
             Some(PersistentV2PoolEntry::Lane(_)) | None => {
                 idle.push_front(PersistentV2PoolEntry::poison());
-                true
-            }
-        };
-        #[cfg(test)]
-        if reserved {
-            let hook = pool
-                .positive_read_reservation_hook
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(hook) = hook {
-                hook.pause_after_reservation();
             }
         }
-        #[cfg(not(test))]
-        let _ = reserved;
     }
 }
 
@@ -7742,12 +7716,6 @@ struct PersistentSessionConsumerV2Pool {
     idle_reaper_processed: Notify,
     #[cfg(test)]
     shutdown_activity_wait_armed: Notify,
-    #[cfg(test)]
-    positive_read_reservation_hook: StdMutex<Option<Arc<PersistentV2PositiveReadReservationHook>>>,
-    #[cfg(test)]
-    prewarm_final_publication_hook: StdMutex<Option<Arc<PersistentV2PrewarmFinalPublicationHook>>>,
-    #[cfg(test)]
-    poison_accounting_hook: StdMutex<Option<Arc<PersistentV2PoisonAccountingHook>>>,
     setup_attempts: AtomicU64,
     setup_failures: AtomicU64,
     setup_successes: AtomicU64,
@@ -7818,122 +7786,6 @@ impl Drop for PersistentV2PoolWait<'_> {
 struct PersistentV2Activity {
     calls: usize,
     prewarms: usize,
-}
-
-#[cfg(test)]
-struct PersistentV2PositiveReadReservationHook {
-    observed: Notify,
-    released: StdMutex<bool>,
-    release: std::sync::Condvar,
-}
-
-#[cfg(test)]
-impl PersistentV2PositiveReadReservationHook {
-    fn new() -> Self {
-        Self {
-            observed: Notify::new(),
-            released: StdMutex::new(false),
-            release: std::sync::Condvar::new(),
-        }
-    }
-
-    fn pause_after_reservation(&self) {
-        self.observed.notify_waiters();
-        let mut released = self
-            .released
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !*released {
-            released = self
-                .release
-                .wait(released)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-
-    fn resume(&self) {
-        *self
-            .released
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        self.release.notify_all();
-    }
-}
-
-#[cfg(test)]
-struct PersistentV2PrewarmFinalPublicationHook {
-    observed: Notify,
-    released: Semaphore,
-}
-
-#[cfg(test)]
-struct PersistentV2PoisonAccountingHook {
-    transition_observed: Notify,
-    diagnostic_observed: Notify,
-    released: StdMutex<bool>,
-    release: std::sync::Condvar,
-}
-
-#[cfg(test)]
-impl PersistentV2PoisonAccountingHook {
-    fn new() -> Self {
-        Self {
-            transition_observed: Notify::new(),
-            diagnostic_observed: Notify::new(),
-            released: StdMutex::new(false),
-            release: std::sync::Condvar::new(),
-        }
-    }
-
-    fn pause_after_poison_state(&self) {
-        self.transition_observed.notify_waiters();
-        let mut released = self
-            .released
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !*released {
-            released = self
-                .release
-                .wait(released)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-
-    fn diagnostic_started(&self) {
-        self.diagnostic_observed.notify_waiters();
-    }
-
-    fn resume(&self) {
-        *self
-            .released
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        self.release.notify_all();
-    }
-}
-
-#[cfg(test)]
-impl PersistentV2PrewarmFinalPublicationHook {
-    fn new() -> Self {
-        Self {
-            observed: Notify::new(),
-            released: Semaphore::new(0),
-        }
-    }
-
-    async fn pause_before_publication(&self) {
-        self.observed.notify_waiters();
-        let permit = self
-            .released
-            .acquire()
-            .await
-            .expect("test hook release semaphore remains open");
-        drop(permit);
-    }
-
-    fn resume(&self) {
-        self.released.add_permits(1);
-    }
 }
 
 enum PersistentV2ActivityKind {
@@ -8825,17 +8677,6 @@ impl PersistentSessionConsumerV2Pool {
             for connection in &mut staged {
                 connection.idle_deadline = publication_idle_deadline;
             }
-            #[cfg(test)]
-            let final_publication_hook = {
-                self.prewarm_final_publication_hook
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-            };
-            #[cfg(test)]
-            if let Some(hook) = final_publication_hook {
-                hook.pause_before_publication().await;
-            }
             let mut idle = self
                 .idle
                 .lock()
@@ -8934,15 +8775,6 @@ impl PersistentSessionConsumerV2Pool {
     }
 
     fn diagnostics(&self) -> PersistentSessionConsumerV2Diagnostics {
-        #[cfg(test)]
-        if let Some(hook) = self
-            .poison_accounting_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
-            hook.diagnostic_started();
-        }
         let active = {
             let _accounting = self
                 .live_accounting
@@ -10292,12 +10124,6 @@ impl PersistentSessionConsumerClient {
             idle_reaper_processed: Notify::new(),
             #[cfg(test)]
             shutdown_activity_wait_armed: Notify::new(),
-            #[cfg(test)]
-            positive_read_reservation_hook: StdMutex::new(None),
-            #[cfg(test)]
-            prewarm_final_publication_hook: StdMutex::new(None),
-            #[cfg(test)]
-            poison_accounting_hook: StdMutex::new(None),
             setup_attempts: AtomicU64::new(0),
             setup_failures: AtomicU64::new(0),
             setup_successes: AtomicU64::new(0),
@@ -12673,9 +12499,6 @@ async fn handle_server_connection(
         }
     }
     let established_at = tokio::time::Instant::now();
-    if tls.get_ref().1.alpn_protocol() != Some(SESSION_QUORUM_CONSUMER_ALPN) {
-        return Err(ProtocolError::UnexpectedResponse);
-    }
     let peer = opc_tls::peer_tls_identity_from_server_connection(tls.get_ref().1)
         .map_err(|_| ProtocolError::Authentication)?;
     let identity = authorizer
@@ -12701,6 +12524,41 @@ async fn handle_server_connection(
     .map_err(|_| ProtocolError::InvalidWireValue)?;
     let mut reauthentication_changes = reauthentication.subscribe();
     let mut material_changes = Some(tls_config.subscribe_material_changes());
+    // The authenticated identity, lifecycle evidence, and cancellation
+    // ownership are deliberately established before selecting the DTO lane.
+    // ALPN is the sole V1/V2 discriminator: never allow either decoder to
+    // receive the other revision's envelope.
+    if tls.get_ref().1.alpn_protocol() == Some(SESSION_QUORUM_CONSUMER_V2_ALPN) {
+        return handle_server_connection_v2(
+            tls,
+            ConsumerV2ServerConnectionContext {
+                service,
+                identity,
+                scope: authorizer.scope(),
+                max_frame_size,
+                idle_timeout,
+                operation_timeout,
+                setup_deadline,
+                tls_config,
+                handshake,
+                lifecycle,
+                rotation_jitter,
+                generation,
+                reauthentication,
+                reauthentication_changes,
+                material_changes,
+                cancellation,
+                #[cfg(test)]
+                final_admission_test_hook,
+                #[cfg(test)]
+                expire_at_final_ack_boundary,
+            },
+        )
+        .await;
+    }
+    if tls.get_ref().1.alpn_protocol() != Some(SESSION_QUORUM_CONSUMER_ALPN) {
+        return Err(ProtocolError::UnexpectedResponse);
+    }
     let (mut reader, mut writer) = tokio::io::split(tls);
     let hello = {
         let hello = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerWireRequest>(
@@ -13729,6 +13587,7 @@ mod tests {
         MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
         MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+        MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
@@ -17267,27 +17126,57 @@ mod tests {
         let control = SessionReauthenticationControl::new();
         let (client, _material) = stateless_test_client(control);
         let clone = client.clone();
-        let mut requests = Vec::new();
-        for _ in 0..MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS {
-            requests.push(
+        let mut v1_requests = Vec::new();
+        for _ in 0..MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS {
+            v1_requests.push(
                 client
                     .physical_admission
-                    .try_acquire(false)
-                    .expect("configured request cap admits its exact bound"),
+                    .try_acquire_v1()
+                    .expect("configured V1 request cap admits its exact bound"),
             );
         }
         assert!(
             matches!(
-                clone.physical_admission.try_acquire(false),
+                clone.physical_admission.try_acquire_v1(),
                 Err(SessionConsumerClientError::Overloaded)
             ),
-            "clones share request physical admission before resolve or write"
+            "clones share V1 physical admission before resolve or write"
         );
         assert!(
-            clone.physical_admission.try_acquire(true).is_ok(),
+            clone.physical_admission.try_acquire_v2().is_ok(),
+            "V2 physical admission is isolated from saturated V1 lanes"
+        );
+        assert!(
+            clone.physical_admission.try_acquire_watch().is_ok(),
             "watch physical admission is isolated from normal request lanes"
         );
-        drop(requests);
+        drop(v1_requests);
+
+        let mut v2_requests = Vec::new();
+        for _ in 0..MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS {
+            v2_requests.push(
+                client
+                    .physical_admission
+                    .try_acquire_v2()
+                    .expect("configured V2 request cap admits its exact bound"),
+            );
+        }
+        assert!(
+            matches!(
+                clone.physical_admission.try_acquire_v2(),
+                Err(SessionConsumerClientError::Overloaded)
+            ),
+            "clones share V2 physical admission before resolve or write"
+        );
+        assert!(
+            clone.physical_admission.try_acquire_v1().is_ok(),
+            "V1 physical admission is isolated from saturated V2 lanes"
+        );
+        assert!(
+            clone.physical_admission.try_acquire_watch().is_ok(),
+            "watch physical admission remains isolated from V2 lanes"
+        );
+        drop(v2_requests);
     }
 
     #[test]
