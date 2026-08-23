@@ -49,7 +49,7 @@ use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore}
 use tokio::task::JoinSet;
 
 use crate::consensus::RemoteAddrResolver;
-use crate::error::{classify_tls_io_error, ProtocolError};
+use crate::error::{classify_tls_io_error, tls_peer_credential_rejection, ProtocolError};
 use crate::lifecycle::{
     CertificateExpiryEvidence, ConnectionLifecycle, ConnectionLifecyclePolicy, ReconnectAdmission,
     ReconnectAttempt, ReconnectGate, RetirementReason, SessionReauthenticationControl,
@@ -1158,6 +1158,19 @@ impl From<ProtocolError> for SessionConsumerClientError {
             | ProtocolError::InvalidWireValue
             | ProtocolError::UnexpectedResponse => Self::Protocol,
         }
+    }
+}
+
+/// Classify a TLS alert surfaced while exchanging the bootstrap frames.
+///
+/// Rustls can report a server-side client-certificate rejection only when the
+/// client reads the first application frame response. Keep that TLS-specific
+/// interpretation at the bootstrap boundary; ordinary protocol and transport
+/// errors retain the established client mapping.
+fn bootstrap_protocol_error_to_client_error(error: ProtocolError) -> SessionConsumerClientError {
+    match error {
+        ProtocolError::Io(error) => SessionConsumerClientError::from(classify_tls_io_error(error)),
+        error => SessionConsumerClientError::from(error),
     }
 }
 
@@ -4812,7 +4825,7 @@ impl StatelessSessionConsumerClient {
                 result = &mut hello_write => result,
             };
             result
-                .map_err(SessionConsumerClientError::from)
+                .map_err(bootstrap_protocol_error_to_client_error)
                 .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
         }
         let ack = {
@@ -4837,7 +4850,7 @@ impl StatelessSessionConsumerClient {
                 }
                 result = &mut ack => result,
             };
-            result.map_err(SessionConsumerClientError::from)?
+            result.map_err(bootstrap_protocol_error_to_client_error)?
         };
         // Once an authenticated HelloAck frame has started, preserve its
         // active-frame timeout classification. Only a no-byte setup expiry
@@ -5377,7 +5390,7 @@ impl StatelessSessionConsumerClient {
             deadline.min(lifecycle.retire_at()),
         )
         .await
-        .map_err(SessionConsumerClientError::from)
+        .map_err(bootstrap_protocol_error_to_client_error)
         .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?;
         let ack = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV2WireResponse>(
             &mut reader,
@@ -5386,7 +5399,7 @@ impl StatelessSessionConsumerClient {
             effective_consumer_idle_timeout(self.idle_timeout),
         )
         .await
-        .map_err(SessionConsumerClientError::from)
+        .map_err(bootstrap_protocol_error_to_client_error)
         .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?
         .ok_or(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
             cause: SessionConsumerClientError::Unavailable,
@@ -8251,7 +8264,7 @@ impl PersistentSessionConsumerV2Pool {
             deadline.min(lifecycle.retire_at()),
         )
         .await
-        .map_err(SessionConsumerClientError::from)?;
+        .map_err(bootstrap_protocol_error_to_client_error)?;
         let ack = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerV2WireResponse>(
             &mut reader,
             MAX_NEGOTIATED_FRAME_SIZE,
@@ -8259,7 +8272,7 @@ impl PersistentSessionConsumerV2Pool {
             effective_consumer_idle_timeout(self.client.idle_timeout),
         )
         .await
-        .map_err(SessionConsumerClientError::from)?
+        .map_err(bootstrap_protocol_error_to_client_error)?
         .ok_or(SessionConsumerClientError::Unavailable)?;
         let request_frame_size = match ack {
             ConsumerV2WireResponse::HelloAck(ack)
@@ -11634,6 +11647,7 @@ pub struct SessionQuorumConsumerServerHandle {
 struct ConsumerServerCancellation {
     cancelled: AtomicBool,
     notified: Notify,
+    tls_peer_credential_rejections: AtomicU64,
 }
 
 impl ConsumerServerCancellation {
@@ -11641,6 +11655,7 @@ impl ConsumerServerCancellation {
         Self {
             cancelled: AtomicBool::new(false),
             notified: Notify::new(),
+            tls_peer_credential_rejections: AtomicU64::new(0),
         }
     }
 
@@ -11665,6 +11680,18 @@ impl ConsumerServerCancellation {
             notified.await;
         }
     }
+
+    fn record_tls_peer_credential_rejection(&self) {
+        let _ = self.tls_peer_credential_rejections.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| Some(current.saturating_add(1)),
+        );
+    }
+
+    fn tls_peer_credential_rejections(&self) -> u64 {
+        self.tls_peer_credential_rejections.load(Ordering::Acquire)
+    }
 }
 
 impl SessionQuorumConsumerServerHandle {
@@ -11675,6 +11702,12 @@ impl SessionQuorumConsumerServerHandle {
     /// consumer boundary.
     pub fn is_finished(&self) -> bool {
         self.accept_handle.is_finished()
+    }
+
+    /// Return peer credentials rejected locally by this listener's TLS accept
+    /// boundary.
+    pub fn tls_peer_credential_rejections(&self) -> u64 {
+        self.cancellation.tls_peer_credential_rejections()
     }
 
     /// Stop accepting new consumer connections.
@@ -12481,9 +12514,17 @@ async fn handle_server_connection(
         biased;
         _ = cancellation.cancelled() => return Ok(()),
         result = tokio::time::timeout_at(setup_deadline, acceptor.accept(stream)) => {
-            result
+            match result
                 .map_err(|_| consumer_setup_timeout("consumer TLS handshake timed out"))?
-                .map_err(classify_tls_io_error)?
+            {
+                Ok(tls) => tls,
+                Err(error) => {
+                    if tls_peer_credential_rejection(&error) {
+                        cancellation.record_tls_peer_credential_rejection();
+                    }
+                    return Err(classify_tls_io_error(error));
+                }
+            }
         }
     };
     if tokio::time::Instant::now() >= setup_deadline {
