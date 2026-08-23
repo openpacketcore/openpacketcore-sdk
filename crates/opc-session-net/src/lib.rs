@@ -34,6 +34,10 @@
 //! caller-visible sequence. Protocol-profile upgrades remain coordinated
 //! stop/upgrade/start operations; this lifecycle provides seamless credential
 //! rotation only after every participant already runs the same profile.
+//!
+//! ```compile_fail
+//! use opc_session_net::SessionConsumerPreparedCheckpointRouter;
+//! ```
 
 #![forbid(unsafe_code)]
 
@@ -68,8 +72,9 @@ pub use consumer::{
     SessionConsumerAuthorizationError, SessionConsumerAuthorizer, SessionConsumerClientError,
     SessionConsumerFencedTransitionBackend, SessionConsumerFencedTransitionBackendError,
     SessionConsumerFencedTransitionMutationError, SessionConsumerLeaseMutationError,
-    SessionConsumerMutationError, SessionConsumerPreparedCheckpointRouter,
-    SessionConsumerPreparedCheckpointRouterError, SessionQuorumConsumerServer,
+    SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
+    SessionConsumerPreparedCheckpointBackendError, SessionConsumerPreparedCompareAndSet,
+    SessionConsumerPreparedLeaseAcquire, SessionQuorumConsumerServer,
     SessionQuorumConsumerServerHandle, StatelessSessionConsumerClient,
     DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
     DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,

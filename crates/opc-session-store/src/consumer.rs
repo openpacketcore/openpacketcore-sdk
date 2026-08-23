@@ -19,7 +19,6 @@ use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::backend::PreparedCheckpointAuthorityContext;
 use crate::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
@@ -468,10 +467,10 @@ pub enum SessionConsumerOperation {
         /// Complete original lease request retained by the caller.
         request: Box<SessionConsumerLeaseMutationRequest>,
     },
-    /// Recover the exact durable outcome of one prepared compare-and-set.
+    /// Recover the exact durable outcome of one compare-and-set.
     ///
     /// This is a leader-linearizable, read-only operation. The complete
-    /// original request is retained by the caller's volatile prepared token;
+    /// original request is retained by the caller's local affine handle;
     /// it is never replayed or proposed by this status operation.
     CompareAndSetStatus {
         /// Complete original compare-and-set request retained by the caller.
@@ -583,11 +582,6 @@ pub struct SessionConsumerRequest {
     scope: SessionConsumerScope,
     request_id: SessionConsumerRequestId,
     operation: SessionConsumerOperation,
-    /// Present only for SDK-minted prepared checkpoint operations. The fixed
-    /// commitments are authenticated as part of the request shape and never
-    /// expose namespace/protection material.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prepared_authority: Option<PreparedCheckpointAuthorityContext>,
 }
 
 impl SessionConsumerRequest {
@@ -601,23 +595,6 @@ impl SessionConsumerRequest {
             scope,
             request_id,
             operation,
-            prepared_authority: None,
-        }
-    }
-
-    /// Construct a prepared request from the SDK-only authority witness.
-    #[doc(hidden)]
-    pub const fn new_prepared(
-        scope: SessionConsumerScope,
-        request_id: SessionConsumerRequestId,
-        operation: SessionConsumerOperation,
-        prepared_authority: PreparedCheckpointAuthorityContext,
-    ) -> Self {
-        Self {
-            scope,
-            request_id,
-            operation,
-            prepared_authority: Some(prepared_authority),
         }
     }
 
@@ -642,13 +619,6 @@ impl SessionConsumerRequest {
     /// cloning it for validation or receipt bookkeeping.
     pub(crate) fn into_operation(self) -> SessionConsumerOperation {
         self.operation
-    }
-
-    /// Return the SDK-minted prepared authority context, if this is a
-    /// prepared checkpoint request.
-    #[doc(hidden)]
-    pub const fn prepared_authority(&self) -> Option<PreparedCheckpointAuthorityContext> {
-        self.prepared_authority
     }
 
     /// Validate the operation before dispatch.
@@ -680,15 +650,13 @@ impl SessionConsumerRequest {
 /// consensus-outcome recovery.
 ///
 /// The public request ID and immutable body are retained by the volatile
-/// prepared token. This type has no execute operation and cannot mint a new
+/// local affine handle. This type has no execute operation and cannot mint a new
 /// request identity or replay the mutation.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionConsumerCompareAndSetRequest {
     request_id: SessionConsumerRequestId,
     operation: CompareAndSet,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prepared_authority: Option<PreparedCheckpointAuthorityContext>,
 }
 
 impl SessionConsumerCompareAndSetRequest {
@@ -697,21 +665,6 @@ impl SessionConsumerCompareAndSetRequest {
         Self {
             request_id,
             operation,
-            prepared_authority: None,
-        }
-    }
-
-    /// Construct a retained body for an SDK-minted prepared CAS.
-    #[doc(hidden)]
-    pub const fn new_prepared(
-        request_id: SessionConsumerRequestId,
-        operation: CompareAndSet,
-        prepared_authority: PreparedCheckpointAuthorityContext,
-    ) -> Self {
-        Self {
-            request_id,
-            operation,
-            prepared_authority: Some(prepared_authority),
         }
     }
 
@@ -723,11 +676,6 @@ impl SessionConsumerCompareAndSetRequest {
     /// Return the exact original compare-and-set body.
     pub const fn operation(&self) -> &CompareAndSet {
         &self.operation
-    }
-
-    #[doc(hidden)]
-    pub const fn prepared_authority(&self) -> Option<PreparedCheckpointAuthorityContext> {
-        self.prepared_authority
     }
 
     /// Validate the retained body before it reaches the receipt lookup.
@@ -745,12 +693,7 @@ impl SessionConsumerCompareAndSetRequest {
         let operation = SessionConsumerOperation::CompareAndSet {
             op: Box::new(self.operation),
         };
-        match self.prepared_authority {
-            Some(authority) => {
-                SessionConsumerRequest::new_prepared(scope, self.request_id, operation, authority)
-            }
-            None => SessionConsumerRequest::new(scope, self.request_id, operation),
-        }
+        SessionConsumerRequest::new(scope, self.request_id, operation)
     }
 }
 
@@ -846,8 +789,6 @@ impl SessionConsumerLeaseMutationOperation {
 pub struct SessionConsumerLeaseMutationRequest {
     request_id: SessionConsumerRequestId,
     operation: SessionConsumerLeaseMutationOperation,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prepared_authority: Option<PreparedCheckpointAuthorityContext>,
 }
 
 impl SessionConsumerLeaseMutationRequest {
@@ -860,21 +801,6 @@ impl SessionConsumerLeaseMutationRequest {
         Self {
             request_id,
             operation,
-            prepared_authority: None,
-        }
-    }
-
-    /// Construct a retained body for an SDK-minted prepared lease acquire.
-    #[doc(hidden)]
-    pub const fn new_prepared(
-        request_id: SessionConsumerRequestId,
-        operation: SessionConsumerLeaseMutationOperation,
-        prepared_authority: PreparedCheckpointAuthorityContext,
-    ) -> Self {
-        Self {
-            request_id,
-            operation,
-            prepared_authority: Some(prepared_authority),
         }
     }
 
@@ -888,11 +814,6 @@ impl SessionConsumerLeaseMutationRequest {
         &self.operation
     }
 
-    #[doc(hidden)]
-    pub const fn prepared_authority(&self) -> Option<PreparedCheckpointAuthorityContext> {
-        self.prepared_authority
-    }
-
     /// Validate the retained body before it reaches the receipt lookup.
     pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
         self.operation.validate()
@@ -903,12 +824,7 @@ impl SessionConsumerLeaseMutationRequest {
         scope: SessionConsumerScope,
     ) -> SessionConsumerRequest {
         let operation = self.operation.into_consumer_operation();
-        match self.prepared_authority {
-            Some(authority) => {
-                SessionConsumerRequest::new_prepared(scope, self.request_id, operation, authority)
-            }
-            None => SessionConsumerRequest::new(scope, self.request_id, operation),
-        }
+        SessionConsumerRequest::new(scope, self.request_id, operation)
     }
 }
 
@@ -1618,10 +1534,10 @@ pub(crate) fn consumer_request_commitment(
         CONSUMER_REQUEST_COMMITMENT_V2_SERIALIZED_BYTES.fetch_add(encoded.len(), Ordering::Relaxed);
     }
     let mut digest = Sha256::new();
-    // Prepared requests carry the SDK-minted protection and tenant/NF
-    // commitments in their serialized shape.  Versioning this domain makes a
-    // reused v1 binding ID conflict closed instead of accepting a permissive
-    // legacy interpretation.
+    // Keep the ordinary request commitment domain at v2 after the removed
+    // prepared wire field changed the serialized shape. A reused legacy
+    // binding can therefore only conflict closed; no v1 interpretation is
+    // accepted.
     digest.update(b"openpacketcore/session-consumer/request-commitment/v2\\0");
     digest.update(encoded);
     Ok(digest.finalize().into())
@@ -2088,6 +2004,16 @@ mod tests {
         };
         fields.insert("unexpected".into(), serde_json::Value::Bool(true));
         assert!(serde_json::from_value::<SessionConsumerRequest>(root_unknown).is_err());
+
+        let mut legacy_prepared_authority = encoded.clone();
+        let serde_json::Value::Object(fields) = &mut legacy_prepared_authority else {
+            panic!("request is an object");
+        };
+        fields.insert("prepared_authority".into(), serde_json::Value::Bool(true));
+        assert!(
+            serde_json::from_value::<SessionConsumerRequest>(legacy_prepared_authority).is_err(),
+            "legacy prepared wire authority is an unknown field"
+        );
 
         let mut operation_unknown = encoded;
         let serde_json::Value::Object(fields) = &mut operation_unknown else {

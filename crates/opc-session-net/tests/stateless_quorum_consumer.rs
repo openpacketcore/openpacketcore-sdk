@@ -26,18 +26,18 @@ use opc_session_net::{
     SessionClusterId, SessionConfigurationGeneration, SessionConsensusServer,
     SessionConsensusServerHandle, SessionConsumerAuthorizer, SessionConsumerClientError,
     SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
-    SessionConsumerMutationError, SessionConsumerPreparedCheckpointRouter,
+    SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
     SessionQuorumConsumerServer, SessionReauthenticationControl, SessionReplicationManifest,
     StatelessSessionConsumerClient, DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
     MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
 };
 use opc_session_store::{
-    backend::PreparedCheckpointPort, AtomicFencedTransitionCapability, BackendCapabilities,
-    CompareAndSet, ConsensusSessionStore, EncryptedSessionPayload, EncryptingSessionBackend,
-    FenceToken, FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
-    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, Generation,
-    OwnerId, PreparedCheckpointBudget, PreparedCompareAndSetExecuteError,
-    PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
+    AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, ConsensusSessionStore,
+    EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
+    FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
+    FencedTransitionRequestId, FencedTransitionStatus, Generation, OwnerId,
+    PreparedCheckpointBudget, PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
+    PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
     PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
     RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
@@ -2741,12 +2741,6 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
         ),
     )
     .expect("C persistent client");
-    let router = Arc::new(
-        SessionConsumerPreparedCheckpointRouter::persistent([client_a, client_b, client_c.clone()])
-            .expect("distinct same-scope prepared router"),
-    );
-    let checkpoint_port: Arc<dyn PreparedCheckpointPort> = router;
-
     let key = test_key();
     let owner = OwnerId::new("prepared-cas-three-voter-owner").expect("owner");
     let lease = fleet.stores[2]
@@ -2758,12 +2752,16 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
         .await
         .expect("sequence before CAS");
     let expired_provider = CountingKeyProvider::with_active_session_key();
-    let expired = EncryptingSessionBackend::new(
+    let expired_wrapper = Arc::new(EncryptingSessionBackend::new(
         Arc::new(fleet.stores[2].clone()),
         Arc::clone(&expired_provider),
         "prepared-cas-three-voter",
+    ));
+    let expired = SessionConsumerPreparedCheckpointBackend::persistent(
+        expired_wrapper,
+        [client_a.clone(), client_b.clone(), client_c.clone()],
     )
-    .with_prepared_checkpoint_port(Arc::clone(&checkpoint_port));
+    .expect("distinct same-scope protected composite");
     assert!(
         matches!(
             expired
@@ -2801,13 +2799,17 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
         "expired prepare performs no KMS call"
     );
     let provider = CountingKeyProvider::with_active_session_key();
-    let protected = EncryptingSessionBackend::new(
+    let protected_wrapper = Arc::new(EncryptingSessionBackend::new(
         Arc::new(fleet.stores[2].clone()),
         Arc::clone(&provider),
         "prepared-cas-three-voter",
+    ));
+    let protected = SessionConsumerPreparedCheckpointBackend::persistent(
+        protected_wrapper,
+        [client_a.clone(), client_b.clone(), client_c.clone()],
     )
-    .with_prepared_checkpoint_port(Arc::clone(&checkpoint_port));
-    let prepared = protected
+    .expect("distinct same-scope protected composite");
+    let mut prepared = protected
         .prepare_compare_and_set(
             SessionConsumerRequestId::from_bytes([0xc5; 16]),
             CompareAndSet {
@@ -2895,50 +2897,6 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
         prepared.execute_once().await,
         Err(PreparedCompareAndSetExecuteError::AlreadyExecuted)
     );
-    let different_namespace = EncryptingSessionBackend::new(
-        Arc::new(fleet.stores[2].clone()),
-        CountingKeyProvider::with_active_session_key(),
-        "prepared-cas-three-voter-different-namespace",
-    )
-    .with_prepared_checkpoint_port(checkpoint_port);
-    assert!(
-        matches!(
-            different_namespace
-                .prepare_compare_and_set(
-                    SessionConsumerRequestId::from_bytes([0xc6; 16]),
-                    CompareAndSet {
-                        key: test_key(),
-                        lease: lease.clone(),
-                        expected_generation: None,
-                        new_record: StoredSessionRecord {
-                            key: test_key(),
-                            generation: Generation::new(2),
-                            owner: OwnerId::new("prepared-cas-three-voter-other-owner")
-                                .expect("owner"),
-                            fence: lease.fence(),
-                            state_class: StateClass::AuthoritativeSession,
-                            state_type: StateType::from_static("prepared-cas-three-voter"),
-                            expires_at: None,
-                            payload: EncryptedSessionPayload::new([0xc6]),
-                        },
-                    },
-                    PreparedCheckpointBudget::new(
-                        tokio::time::Instant::now() + Duration::from_secs(1),
-                        Duration::from_millis(25),
-                    )
-                    .expect("explicit 25ms physical budget"),
-                )
-                .await,
-            Err(PreparedCompareAndSetPrepareError::InvalidRequest)
-        ),
-        "one router cannot be rebound to a different protected namespace"
-    );
-    assert_eq!(
-        c_loss.mutation_calls.load(Ordering::SeqCst),
-        1,
-        "namespace rejection reaches no voter mutation"
-    );
-
     client_c.shutdown().await;
     a_server.abort_and_wait().await;
     c_server.abort_and_wait().await;
@@ -3112,11 +3070,6 @@ async fn warm_prepared_cas_response_loss_sample(
 
     // C is the first mutation voter; after C's possibly-sent response loss,
     // the canonical router must make its first read-only receipt attempt at A.
-    let router = Arc::new(
-        SessionConsumerPreparedCheckpointRouter::persistent([client_c.clone(), client_a.clone()])
-            .expect("same-scope warm prepared router"),
-    );
-    let checkpoint_port: Arc<dyn PreparedCheckpointPort> = router;
     let owner = OwnerId::new("prepared-cas-warm-matrix-owner").expect("owner");
     let lease = fleet.stores[2]
         .acquire(&key, owner.clone(), Duration::from_secs(30))
@@ -3127,37 +3080,42 @@ async fn warm_prepared_cas_response_loss_sample(
         .await
         .expect("warm matrix sequence before CAS");
     let provider = CountingKeyProvider::with_active_session_key();
-    let prepared = EncryptingSessionBackend::new(
+    let protected_wrapper = Arc::new(EncryptingSessionBackend::new(
         Arc::new(fleet.stores[2].clone()),
         Arc::clone(&provider),
         "prepared-cas-warm-matrix",
+    ));
+    let protected = SessionConsumerPreparedCheckpointBackend::persistent(
+        protected_wrapper,
+        [client_c.clone(), client_a.clone()],
     )
-    .with_prepared_checkpoint_port(checkpoint_port)
-    .prepare_compare_and_set(
-        SessionConsumerRequestId::from_bytes([0xd1; 16]),
-        CompareAndSet {
-            key: key.clone(),
-            lease: lease.clone(),
-            expected_generation: None,
-            new_record: StoredSessionRecord {
-                key,
-                generation: Generation::new(1),
-                owner,
-                fence: lease.fence(),
-                state_class: StateClass::AuthoritativeSession,
-                state_type: StateType::from_static("prepared-cas-warm-matrix"),
-                expires_at: None,
-                payload: EncryptedSessionPayload::new(vec![0xd1; payload_bytes]),
+    .expect("same-scope warm protected composite");
+    let mut prepared = protected
+        .prepare_compare_and_set(
+            SessionConsumerRequestId::from_bytes([0xd1; 16]),
+            CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: StoredSessionRecord {
+                    key,
+                    generation: Generation::new(1),
+                    owner,
+                    fence: lease.fence(),
+                    state_class: StateClass::AuthoritativeSession,
+                    state_type: StateType::from_static("prepared-cas-warm-matrix"),
+                    expires_at: None,
+                    payload: EncryptedSessionPayload::new(vec![0xd1; payload_bytes]),
+                },
             },
-        },
-        PreparedCheckpointBudget::new(
-            tokio::time::Instant::now() + Duration::from_secs(3),
-            attempt_budget,
+            PreparedCheckpointBudget::new(
+                tokio::time::Instant::now() + Duration::from_secs(3),
+                attempt_budget,
+            )
+            .expect("explicit warm matrix budget"),
         )
-        .expect("explicit warm matrix budget"),
-    )
-    .await
-    .expect("warm matrix prepare");
+        .await
+        .expect("warm matrix prepare");
     assert_eq!(provider.calls(), 1, "one canonical seal");
 
     let committed = c_loss.committed.notified();

@@ -6943,7 +6943,7 @@ mod membership_tests {
         clippy::await_holding_lock,
         reason = "the test-only counter permit makes process-global allocation evidence deterministic"
     )]
-    async fn prepared_cas_authority_context_is_bound_v2_and_conflicts_fail_without_effect() {
+    async fn consumer_cas_body_is_bound_v2_and_conflicts_fail_without_effect() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let _ownership_permit =
             crate::record::acquire_encrypted_session_payload_ownership_test_permit();
@@ -6960,23 +6960,17 @@ mod membership_tests {
                 crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
             ),
         };
-        let authority = crate::backend::prepared_checkpoint_authority_context_for_test(
-            "consumer-boundary-protected",
-            b"local-aead",
-            &key,
-        );
         crate::consumer::reset_consumer_request_commitment_v2_test_counters();
         reset_consumer_compare_and_set_command_encoding_count();
-        let prepared_request = SessionConsumerRequest::new_prepared(
+        let request = SessionConsumerRequest::new(
             scope,
             request_id,
             SessionConsumerOperation::CompareAndSet {
                 op: Box::new(operation.clone()),
             },
-            authority,
         );
         crate::record::reset_encrypted_session_payload_ownership_counters();
-        let applied = service.execute(&identity, prepared_request).await;
+        let applied = service.execute(&identity, request).await;
         assert_eq!(
             applied,
             SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success))
@@ -7025,7 +7019,7 @@ mod membership_tests {
                 sequence_final_copied_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES
                     as u64,
             },
-            "the healthy prepared CAS makes one shallow replication handle clone; durable JSON sequence decoding owns one staged and one final maximum-sized ciphertext buffer"
+            "the healthy consumer CAS makes one shallow replication handle clone; durable JSON sequence decoding owns one staged and one final maximum-sized ciphertext buffer"
         );
         let after_applied_effect = store
             .max_replication_sequence()
@@ -7033,67 +7027,40 @@ mod membership_tests {
             .expect("applied effect sequence");
         reset_consumer_consensus_proposal_count();
 
-        let different_protection = crate::backend::prepared_checkpoint_authority_context_for_test(
-            "consumer-boundary-other-protection",
-            b"local-aead",
-            &key,
+        let changed = CompareAndSet {
+            expected_generation: Some(Generation::new(99)),
+            ..operation
+        };
+        let response = service
+            .execute(
+                &identity,
+                SessionConsumerRequest::new(
+                    scope,
+                    request_id,
+                    SessionConsumerOperation::CompareAndSet {
+                        op: Box::new(changed),
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(
+            response,
+            SessionConsumerResponse::CompareAndSet(Err(SessionConsumerStoreError::RequestConflict)),
+            "a changed ordinary v2 request cannot reuse a durable request identity"
         );
-        let mut different_scope_key = key.clone();
-        different_scope_key.tenant =
-            TenantId::new("consumer-boundary-other-tenant").expect("other tenant");
-        let different_tenant_nf = crate::backend::prepared_checkpoint_authority_context_for_test(
-            "consumer-boundary-protected",
-            b"local-aead",
-            &different_scope_key,
+        assert_eq!(
+            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a changed request reaches no consensus proposal"
         );
-        let attempts = [
-            SessionConsumerRequest::new_prepared(
-                scope,
-                request_id,
-                SessionConsumerOperation::CompareAndSet {
-                    op: Box::new(operation.clone()),
-                },
-                different_protection,
-            ),
-            SessionConsumerRequest::new_prepared(
-                scope,
-                request_id,
-                SessionConsumerOperation::CompareAndSet {
-                    op: Box::new(operation.clone()),
-                },
-                different_tenant_nf,
-            ),
-            SessionConsumerRequest::new(
-                scope,
-                request_id,
-                SessionConsumerOperation::CompareAndSet {
-                    op: Box::new(operation),
-                },
-            ),
-        ];
-        for attempt in attempts {
-            let response = service.execute(&identity, attempt).await;
-            assert_eq!(
-                response,
-                SessionConsumerResponse::CompareAndSet(Err(
-                    SessionConsumerStoreError::RequestConflict,
-                )),
-                "v2 context changes and legacy omission cannot fall back to the recorded binding"
-            );
-            assert_eq!(
-                CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-                0,
-                "a changed v2 authority context reaches no consensus proposal"
-            );
-            assert_eq!(
-                store
-                    .max_replication_sequence()
-                    .await
-                    .expect("conflict effect sequence"),
-                after_applied_effect,
-                "a conflict applies no second session mutation"
-            );
-        }
+        assert_eq!(
+            store
+                .max_replication_sequence()
+                .await
+                .expect("conflict effect sequence"),
+            after_applied_effect,
+            "a conflict applies no second session mutation"
+        );
     }
 
     #[tokio::test]

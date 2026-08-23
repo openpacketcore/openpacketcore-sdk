@@ -8,17 +8,27 @@
 //!
 //! # Protected checkpoint consumption
 //!
-//! Prepared checkpoint authority is obtained only from an SDK-owned
-//! [`ProtectedSessionBackend`] wrapper. Applications retain the returned
-//! opaque handle and may execute it once, then perform read-only receipt
-//! observations; they do not construct transport ports or physical tokens.
-//! The optional transport attachment is an SDK-internal, policy-sealed
-//! cross-crate seam: the store cannot seal a router implemented by its net
-//! dependent. Even at that seam, a private-field completion witness minted by
-//! these wrappers prevents direct plaintext preparation or token minting.
+//! Prepared checkpoint requests are obtained only from an SDK-owned
+//! [`ProtectedSessionBackend`] wrapper. The returned affine request captures
+//! its exact scope, caller request ID, sealed mutation, and deadline budget;
+//! only the net-owned consumer composite can turn it into an execution handle.
+//! Prepared is local type-state, never a wire or server authorization marker.
 //!
 //! ```compile_fail
-//! use opc_session_store::{PreparedCheckpointPort, PreparedCompareAndSetToken};
+//! use opc_session_store::{
+//!     PreparedCheckpointAuthorityContext, PreparedCheckpointCompletion,
+//!     PreparedCheckpointPort, PreparedCompareAndSetToken, PreparedLeaseAcquireToken,
+//! };
+//! ```
+//!
+//! ```compile_fail
+//! use opc_session_store::{EncryptingSessionBackend, PreparedCompareAndSetRequest};
+//!
+//! let _ = PreparedCompareAndSetRequest::from_consumer_port;
+//!
+//! fn removed_attachment<B: ?Sized, P: ?Sized>(wrapper: EncryptingSessionBackend<B, P>) {
+//!     let _ = wrapper.with_prepared_checkpoint_port(());
+//! }
 //! ```
 //!
 //! # Module map
@@ -98,11 +108,11 @@ pub use backend::{
     validate_replication_prefix_owned, validate_session_ops_at, validate_session_ops_profile,
     validate_session_ops_ttls, BackendInstanceIdentity, BackendPeerBinding,
     BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
-    PreparedCheckpointBudget, PreparedCheckpointBudgetError, PreparedCompareAndSet,
-    PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
-    PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
-    PreparedCompareAndSetStatusError, PreparedLeaseAcquire, PreparedLeaseAcquireExecuteError,
-    PreparedLeaseAcquirePrepareError, PreparedLeaseAcquireStatusError, ProtectedSelectorLedgerBase,
+    PreparedCheckpointBudget, PreparedCheckpointBudgetError, PreparedCompareAndSetExecuteError,
+    PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetRequest,
+    PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError,
+    PreparedLeaseAcquireExecuteError, PreparedLeaseAcquirePrepareError,
+    PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError, ProtectedSelectorLedgerBase,
     ProtectedSessionBackend, RecordExpiryPreflight, RemoteSealingSessionBackend, ReplicationEntry,
     ReplicationLogRange, ReplicationOp, ReplicationTxId, ReplicationTxIdError,
     ReplicationWatchCursor, SelectorLedgerStorageScope, SessionBackend, SessionOp, SessionOpResult,
