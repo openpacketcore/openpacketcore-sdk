@@ -3605,43 +3605,6 @@ where
         .map_err(FrameWriteError::into_protocol_error)
 }
 
-/// Test/qualification helper: encode two bounded frames and write their
-/// length-prefixed bytes in one transport write sequence, exercising TCP/TLS
-/// coalescing without allowing an inter-frame scheduler gap.
-#[cfg(test)]
-pub(crate) async fn write_two_frames_coalesced<W, A, B>(
-    writer: &mut W,
-    first: &A,
-    second: &B,
-    max_frame_size: usize,
-    deadline: tokio::time::Instant,
-) -> Result<(), ProtocolError>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-    A: Serialize,
-    B: Serialize,
-{
-    let control = EncodingControl {
-        deadline: Some(deadline),
-        cancellation: &NEVER_CANCELLED,
-    };
-    let first = encode_frame_bounded(first, max_frame_size, control)?;
-    let second = encode_frame_bounded(second, max_frame_size, control)?;
-    let mut bytes = Vec::with_capacity(8 + first.encoded_len + second.encoded_len);
-    bytes.extend_from_slice(&(first.encoded_len as u32).to_be_bytes());
-    for chunk in &first.chunks {
-        bytes.extend_from_slice(chunk.initialized_bytes());
-    }
-    bytes.extend_from_slice(&(second.encoded_len as u32).to_be_bytes());
-    for chunk in &second.chunks {
-        bytes.extend_from_slice(chunk.initialized_bytes());
-    }
-    tokio::time::timeout_at(deadline, writer.write_all(&bytes))
-        .await
-        .map_err(|_| ProtocolError::UnexpectedResponse)?
-        .map_err(ProtocolError::Io)
-}
-
 /// Write one frame while preserving whether the transport effect boundary was
 /// crossed. Mutation clients use this to distinguish a request proven not
 /// sent from an outcome that requires exact-ID recovery.
