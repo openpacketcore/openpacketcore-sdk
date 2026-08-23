@@ -16,6 +16,9 @@ publish = false # experimental: not published until graduation
 [features]
 default = []
 insecure-test = []
+# Non-production controls used only by deterministic consensus integration
+# qualification. Canonical CI enables this through `--all-features`.
+test-control = ["opc-session-store/test-control"]
 # Quarantined protocol-v5 remote-backend RPCs. This compatibility surface
 # includes direct mutations and raw replication-log/rebuild authority and must
 # not be enabled on a production Openraft endpoint.

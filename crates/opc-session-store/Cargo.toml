@@ -14,6 +14,13 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-session-store"
 keywords = ["5g", "cnf", "session", "telecom", "packet-core"]
 categories = ["network-programming", "data-structures"]
+
+[features]
+default = []
+# Enables non-production consensus election controls used only by integration
+# tests that must deterministically exercise a real authenticated campaign.
+test-control = []
+
 [dependencies]
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }

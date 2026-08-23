@@ -81,7 +81,7 @@ const CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES: i64 = 16 * 1024;
 static ACTIVATED_CONSENSUS_IDENTITY_SCHEMA_FORMS: OnceLock<BTreeSet<String>> = OnceLock::new();
 const OPERATOR_RECOVERY_LATCH_MAGIC: &[u8; 8] = b"OPCRL001";
 const OPERATOR_RECOVERY_LATCH_BYTES: usize = 8 + 32 + 32 + 8 + 8 + 32 + 1;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 static SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11295,7 +11295,7 @@ fn pinned_snapshot_uri(
 // A child unit-test process enables the feature-gated safe VFS registration in
 // `opc-sqlite-file-control-sys` and flips this local selector.  Production
 // never builds or selects that VFS.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn snapshot_test_vfs_uri_parameter() -> String {
     if SNAPSHOT_TEST_TEMP_PATH_FAILURE_VFS.load(Ordering::Acquire) {
         format!(
@@ -11307,7 +11307,7 @@ fn snapshot_test_vfs_uri_parameter() -> String {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "linux"))]
 fn snapshot_test_vfs_uri_parameter() -> String {
     String::new()
 }
@@ -11652,7 +11652,7 @@ fn backup_snapshot_reader_bounded(
 /// The hook is intentionally internal: production supplies a zero-work
 /// closure, while deterministic tests inject WAL growth between two bounded
 /// steps without scheduling or timing assumptions.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn backup_snapshot_reader_bounded_with_hook<F>(
     reader: &SnapshotReadConnection,
     destination: &mut Connection,
