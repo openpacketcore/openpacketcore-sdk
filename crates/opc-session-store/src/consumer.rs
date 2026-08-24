@@ -1988,8 +1988,9 @@ pub(crate) fn consumer_request_commitment(
         serde_json::to_vec(request).map_err(|_| SessionConsumerRejection::MalformedRequest)?;
     #[cfg(test)]
     {
-        CONSUMER_REQUEST_COMMITMENT_V2_SERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
-        CONSUMER_REQUEST_COMMITMENT_V2_SERIALIZED_BYTES.fetch_add(encoded.len(), Ordering::Relaxed);
+        let _ = CONSUMER_REQUEST_COMMITMENT_V2_TEST_COUNTERS.try_with(|counters| {
+            counters.record(encoded.len());
+        });
     }
     let mut digest = Sha256::new();
     // Keep the ordinary request commitment domain at v2 after the removed
@@ -2002,17 +2003,37 @@ pub(crate) fn consumer_request_commitment(
 }
 
 /// Test-only accounting for whole-request v2 commitment serialization. The
-/// production path retains no metrics labels, request IDs, or payload copies.
+/// task-local scope keeps allocation evidence isolated when the test runner
+/// executes unrelated consumer calls concurrently. The production path
+/// retains no metrics labels, request IDs, or payload copies.
 #[cfg(test)]
-pub(crate) static CONSUMER_REQUEST_COMMITMENT_V2_SERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-pub(crate) static CONSUMER_REQUEST_COMMITMENT_V2_SERIALIZED_BYTES: AtomicUsize =
-    AtomicUsize::new(0);
+#[derive(Default)]
+pub(crate) struct ConsumerRequestCommitmentV2TestCounters {
+    serializations: AtomicUsize,
+    serialized_bytes: AtomicUsize,
+}
 
 #[cfg(test)]
-pub(crate) fn reset_consumer_request_commitment_v2_test_counters() {
-    CONSUMER_REQUEST_COMMITMENT_V2_SERIALIZATIONS.store(0, Ordering::Relaxed);
-    CONSUMER_REQUEST_COMMITMENT_V2_SERIALIZED_BYTES.store(0, Ordering::Relaxed);
+impl ConsumerRequestCommitmentV2TestCounters {
+    fn record(&self, encoded_bytes: usize) {
+        self.serializations.fetch_add(1, Ordering::Relaxed);
+        self.serialized_bytes
+            .fetch_add(encoded_bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn serializations(&self) -> usize {
+        self.serializations.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn serialized_bytes(&self) -> usize {
+        self.serialized_bytes.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static CONSUMER_REQUEST_COMMITMENT_V2_TEST_COUNTERS:
+        Arc<ConsumerRequestCommitmentV2TestCounters>;
 }
 
 /// Derive the operation-specific durable consensus request ID from an

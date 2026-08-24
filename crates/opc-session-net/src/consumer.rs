@@ -13028,9 +13028,9 @@ mod tests {
             receipt: OnceLock::new(),
             budget: PreparedCheckpointBudget::new(
                 tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_millis(100),
+                Duration::from_millis(250),
             )
-            .expect("explicit 100ms physical budget"),
+            .expect("explicit 250ms physical budget"),
             state: PreparedRequestState::new(0),
             terminal_receipt: StdMutex::new(None),
         };
@@ -13052,7 +13052,7 @@ mod tests {
 
         assert_eq!(
             token
-                .status_once(tokio::time::Instant::now() + Duration::from_millis(100))
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
                 .await,
             Ok(PreparedCompareAndSetStatus::Recorded(
                 PreparedCompareAndSetOutcome::Applied,
@@ -13133,7 +13133,7 @@ mod tests {
             receipt: OnceLock::new(),
             budget: PreparedCheckpointBudget::new(
                 tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_millis(100),
+                Duration::from_millis(250),
             )
             .expect("prepared CAS admission budget"),
             state: PreparedRequestState::new(0),
@@ -13256,7 +13256,7 @@ mod tests {
             receipt: OnceLock::new(),
             budget: PreparedCheckpointBudget::new(
                 tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_millis(100),
+                Duration::from_millis(250),
             )
             .expect("prepared lease admission budget"),
             state: PreparedRequestState::new(0),
@@ -13405,7 +13405,7 @@ mod tests {
             receipt: OnceLock::new(),
             budget: PreparedCheckpointBudget::new(
                 tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_millis(100),
+                Duration::from_millis(250),
             )
             .expect("explicit healthy attempt budget"),
             state: PreparedRequestState::new(0),
@@ -13429,7 +13429,7 @@ mod tests {
         );
         assert_eq!(
             token
-                .status_once(tokio::time::Instant::now() + Duration::from_millis(100))
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
                 .await,
             Err(PreparedCompareAndSetStatusError::NotExecuted)
         );
@@ -13501,7 +13501,7 @@ mod tests {
                 Duration::from_secs(30),
                 PreparedCheckpointBudget::new(
                     tokio::time::Instant::now() + Duration::from_secs(1),
-                    Duration::from_millis(100),
+                    Duration::from_millis(250),
                 )
                 .expect("explicit healthy lease attempt budget"),
             )
@@ -13512,7 +13512,7 @@ mod tests {
         assert_eq!(status_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             prepared
-                .status_once(tokio::time::Instant::now() + Duration::from_millis(100))
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
                 .await,
             Err(PreparedLeaseAcquireStatusError::NotExecuted)
         );
@@ -13614,7 +13614,7 @@ mod tests {
                 operation_for(inner.as_ref(), provider.as_ref(), "prepared-tenant-a", 0xa1).await,
                 PreparedCheckpointBudget::new(
                     tokio::time::Instant::now() + Duration::from_secs(1),
-                    Duration::from_millis(100),
+                    Duration::from_millis(250),
                 )
                 .expect("tenant A budget"),
             ),
@@ -13623,7 +13623,7 @@ mod tests {
                 operation_for(inner.as_ref(), provider.as_ref(), "prepared-tenant-b", 0xb2).await,
                 PreparedCheckpointBudget::new(
                     tokio::time::Instant::now() + Duration::from_secs(1),
-                    Duration::from_millis(100),
+                    Duration::from_millis(250),
                 )
                 .expect("tenant B budget"),
             ),

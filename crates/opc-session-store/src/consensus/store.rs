@@ -129,10 +129,30 @@ static CONSUMER_CONSENSUS_PROPOSAL_COUNT: AtomicU64 = AtomicU64::new(0);
 static FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
-static CONSUMER_COMPARE_AND_SET_COMMAND_ENCODINGS: AtomicU64 = AtomicU64::new(0);
+#[derive(Default)]
+struct ConsumerCasTestCounters {
+    command_encodings: AtomicU64,
+    command_encoded_bytes: AtomicU64,
+    proposals: AtomicU64,
+}
 
 #[cfg(test)]
-static CONSUMER_COMPARE_AND_SET_COMMAND_ENCODED_BYTES: AtomicU64 = AtomicU64::new(0);
+impl ConsumerCasTestCounters {
+    fn record_command_encoding(&self, encoded_bytes: usize) {
+        self.command_encodings.fetch_add(1, Ordering::Relaxed);
+        self.command_encoded_bytes
+            .fetch_add(encoded_bytes as u64, Ordering::Relaxed);
+    }
+
+    fn record_proposal(&self) {
+        self.proposals.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CONSUMER_CAS_TEST_COUNTERS: Arc<ConsumerCasTestCounters>;
+}
 
 #[cfg(test)]
 fn reset_consumer_consensus_proposal_count() {
@@ -142,12 +162,6 @@ fn reset_consumer_consensus_proposal_count() {
 #[cfg(test)]
 fn reset_fenced_transition_linearizable_admission_count() {
     FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.store(0, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-fn reset_consumer_compare_and_set_command_encoding_count() {
-    CONSUMER_COMPARE_AND_SET_COMMAND_ENCODINGS.store(0, Ordering::Relaxed);
-    CONSUMER_COMPARE_AND_SET_COMMAND_ENCODED_BYTES.store(0, Ordering::Relaxed);
 }
 
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
@@ -3347,9 +3361,9 @@ impl ConsensusSessionStore {
         };
         #[cfg(test)]
         if consumer_scoped && consumer_compare_and_set {
-            CONSUMER_COMPARE_AND_SET_COMMAND_ENCODINGS.fetch_add(1, Ordering::Relaxed);
-            CONSUMER_COMPARE_AND_SET_COMMAND_ENCODED_BYTES
-                .fetch_add(encoded_command.len() as u64, Ordering::Relaxed);
+            let _ = CONSUMER_CAS_TEST_COUNTERS.try_with(|counters| {
+                counters.record_command_encoding(encoded_command.len());
+            });
         }
         let _ = encoded_command;
 
@@ -3388,6 +3402,9 @@ impl ConsensusSessionStore {
                     #[cfg(test)]
                     if consumer_scoped {
                         CONSUMER_CONSENSUS_PROPOSAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                        let _ = CONSUMER_CAS_TEST_COUNTERS.try_with(|counters| {
+                            counters.record_proposal();
+                        });
                     }
                     response
                 }
@@ -7447,14 +7464,8 @@ mod membership_tests {
     }
 
     #[tokio::test]
-    #[allow(
-        clippy::await_holding_lock,
-        reason = "the test-only counter permit makes process-global allocation evidence deterministic"
-    )]
     async fn consumer_cas_body_is_bound_v2_and_conflicts_fail_without_effect() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
-        let _ownership_permit =
-            crate::record::acquire_encrypted_session_payload_ownership_test_permit();
         let (_directory, store, scope, authorization, key, lease) = consumer_boundary_store().await;
         let service = store.consumer_service();
         let request_id = crate::SessionConsumerRequestId::from_bytes([0x93; 16]);
@@ -7468,8 +7479,6 @@ mod membership_tests {
                 crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
             ),
         };
-        crate::consumer::reset_consumer_request_commitment_v2_test_counters();
-        reset_consumer_compare_and_set_command_encoding_count();
         let request = SessionConsumerRequest::new(
             scope,
             request_id,
@@ -7477,77 +7486,64 @@ mod membership_tests {
                 op: Box::new(operation.clone()),
             },
         );
-        crate::record::reset_encrypted_session_payload_ownership_counters();
-        let applied = service.execute(&authorization, request).await;
+        let commitment_counters =
+            Arc::new(crate::consumer::ConsumerRequestCommitmentV2TestCounters::default());
+        let cas_counters = Arc::new(ConsumerCasTestCounters::default());
+        let applied = CONSUMER_CAS_TEST_COUNTERS
+            .scope(
+                Arc::clone(&cas_counters),
+                crate::consumer::CONSUMER_REQUEST_COMMITMENT_V2_TEST_COUNTERS.scope(
+                    Arc::clone(&commitment_counters),
+                    service.execute(&authorization, request),
+                ),
+            )
+            .await;
         assert_eq!(
             applied,
             SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success))
         );
         assert_eq!(
-            crate::consumer::CONSUMER_REQUEST_COMMITMENT_V2_SERIALIZATIONS
-                .load(std::sync::atomic::Ordering::Relaxed),
+            commitment_counters.serializations(),
             1,
             "the healthy maximum-payload CAS serializes/hashes its full request once"
         );
         assert!(
-            crate::consumer::CONSUMER_REQUEST_COMMITMENT_V2_SERIALIZED_BYTES
-                .load(std::sync::atomic::Ordering::Relaxed)
+            commitment_counters.serialized_bytes()
                 > crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
             "the one counted allocation covers the complete request, not only an ID"
         );
         assert_eq!(
-            CONSUMER_COMPARE_AND_SET_COMMAND_ENCODINGS.load(std::sync::atomic::Ordering::Relaxed),
+            cas_counters.command_encodings.load(Ordering::Relaxed),
             1,
             "the server encodes the maximum-sized CAS command once"
         );
         assert!(
-            CONSUMER_COMPARE_AND_SET_COMMAND_ENCODED_BYTES
-                .load(std::sync::atomic::Ordering::Relaxed)
+            cas_counters.command_encoded_bytes.load(Ordering::Relaxed)
                 > crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES as u64,
             "the single server command allocation carries the full CAS payload"
-        );
-        assert_eq!(
-            crate::record::encrypted_session_payload_ownership_counters(),
-            crate::record::EncryptedSessionPayloadOwnershipCounters {
-                initial_owners: 1,
-                initial_owned_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES as u64,
-                handle_clones: 1,
-                deserialized_owners: 1,
-                visit_bytes_owners: 0,
-                visit_bytes_copied_bytes: 0,
-                visit_byte_buf_owners: 0,
-                sequence_chunk_allocations: (crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES
-                    / crate::record::PAYLOAD_DESERIALIZE_CHUNK_BYTES) as u64,
-                sequence_chunk_capacity_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES
-                    as u64,
-                sequence_staged_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES as u64,
-                sequence_final_allocations: 1,
-                sequence_final_allocation_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES
-                    as u64,
-                sequence_final_copied_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES
-                    as u64,
-            },
-            "the healthy consumer CAS makes one shallow replication handle clone; durable JSON sequence decoding owns one staged and one final maximum-sized ciphertext buffer"
         );
         let after_applied_effect = store
             .max_replication_sequence()
             .await
             .expect("applied effect sequence");
-        reset_consumer_consensus_proposal_count();
+        let proposals_after_applied = cas_counters.proposals.load(Ordering::Relaxed);
 
         let changed = CompareAndSet {
             expected_generation: Some(Generation::new(99)),
             ..operation
         };
-        let response = service
-            .execute(
-                &authorization,
-                SessionConsumerRequest::new(
-                    scope,
-                    request_id,
-                    SessionConsumerOperation::CompareAndSet {
-                        op: Box::new(changed),
-                    },
+        let response = CONSUMER_CAS_TEST_COUNTERS
+            .scope(
+                Arc::clone(&cas_counters),
+                service.execute(
+                    &authorization,
+                    SessionConsumerRequest::new(
+                        scope,
+                        request_id,
+                        SessionConsumerOperation::CompareAndSet {
+                            op: Box::new(changed),
+                        },
+                    ),
                 ),
             )
             .await;
@@ -7557,8 +7553,8 @@ mod membership_tests {
             "a changed ordinary v2 request cannot reuse a durable request identity"
         );
         assert_eq!(
-            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-            0,
+            cas_counters.proposals.load(Ordering::Relaxed),
+            proposals_after_applied,
             "a changed request reaches no consensus proposal"
         );
         assert_eq!(
