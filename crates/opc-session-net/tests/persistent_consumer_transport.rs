@@ -910,6 +910,254 @@ async fn prewarm_opens_fixed_lanes_reuses_them_and_keeps_diagnostics_redacted() 
 }
 
 #[tokio::test]
+async fn ensure_warm_request_lane_coalesces_one_cold_setup_and_reuses_it() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("ensure-warm-server");
+    let client_spiffe = spiffe("ensure-warm-client");
+    let (authorizer, _scope, authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver_attempts = Arc::new(AtomicUsize::new(0));
+    let first_resolve_started = Arc::new(Notify::new());
+    let release_first_resolve = Arc::new(Notify::new());
+    let resolver: RemoteAddrResolver = {
+        let resolver_attempts = Arc::clone(&resolver_attempts);
+        let first_resolve_started = Arc::clone(&first_resolve_started);
+        let release_first_resolve = Arc::clone(&release_first_resolve);
+        Arc::new(move || {
+            let resolver_attempts = Arc::clone(&resolver_attempts);
+            let first_resolve_started = Arc::clone(&first_resolve_started);
+            let release_first_resolve = Arc::clone(&release_first_resolve);
+            Box::pin(async move {
+                if resolver_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first_resolve_started.notify_one();
+                    release_first_resolve.notified().await;
+                }
+                Ok(address)
+            })
+        })
+    };
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        authority,
+        pki.client_config(&client_spiffe),
+    )
+    // A warm proof is setup administration, not an application operation.
+    .with_operation_timeout(Duration::from_millis(100));
+    let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config(2, 1, 1))
+        .expect("persistent client");
+
+    let started = first_resolve_started.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
+    let leader_client = client.clone();
+    let leader = tokio::spawn(async move { leader_client.ensure_warm_request_lane().await });
+    started.await;
+    let follower_client = client.clone();
+    let follower = tokio::spawn(async move { follower_client.ensure_warm_request_lane().await });
+    tokio::task::yield_now().await;
+    assert_eq!(
+        resolver_attempts.load(Ordering::SeqCst),
+        1,
+        "follower joins the bounded leader setup instead of resolving independently"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    release_first_resolve.notify_one();
+    assert_eq!(leader.await.expect("leader task"), Ok(()));
+    assert_eq!(follower.await.expect("follower task"), Ok(()));
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_successes, 1);
+    assert_eq!(diagnostics.idle, 1);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+
+    client
+        .ensure_warm_request_lane()
+        .await
+        .expect("already warm lane remains a resolver-validated proof");
+    assert_eq!(
+        client.diagnostics().await.setup_successes,
+        1,
+        "an already current warm lane does not open another connection"
+    );
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn ensure_warm_request_lane_shares_resolver_failure_and_shutdown_fails_closed() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("ensure-warm-failure-server");
+    let client_spiffe = spiffe("ensure-warm-failure-client");
+    let (_authorizer, _scope, authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let resolver_attempts = Arc::new(AtomicUsize::new(0));
+    let first_resolve_started = Arc::new(Notify::new());
+    let release_first_resolve = Arc::new(Notify::new());
+    let resolver: RemoteAddrResolver = {
+        let resolver_attempts = Arc::clone(&resolver_attempts);
+        let first_resolve_started = Arc::clone(&first_resolve_started);
+        let release_first_resolve = Arc::clone(&release_first_resolve);
+        Arc::new(move || {
+            let resolver_attempts = Arc::clone(&resolver_attempts);
+            let first_resolve_started = Arc::clone(&first_resolve_started);
+            let release_first_resolve = Arc::clone(&release_first_resolve);
+            Box::pin(async move {
+                resolver_attempts.fetch_add(1, Ordering::SeqCst);
+                first_resolve_started.notify_one();
+                release_first_resolve.notified().await;
+                Err(std::io::Error::other("test resolver unavailable"))
+            })
+        })
+    };
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::try_from("persistent-consumer.test.invalid")
+            .expect("test server name"),
+        authority,
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_millis(100));
+    let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config(1, 0, 1))
+        .expect("persistent client");
+
+    let started = first_resolve_started.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
+    let leader_client = client.clone();
+    let leader = tokio::spawn(async move { leader_client.ensure_warm_request_lane().await });
+    started.await;
+    let follower_client = client.clone();
+    let follower = tokio::spawn(async move { follower_client.ensure_warm_request_lane().await });
+    tokio::task::yield_now().await;
+    release_first_resolve.notify_one();
+    assert_eq!(
+        leader.await.expect("leader task"),
+        Err(SessionConsumerClientError::Unavailable)
+    );
+    assert_eq!(
+        follower.await.expect("follower task"),
+        Err(SessionConsumerClientError::Unavailable)
+    );
+    assert_eq!(resolver_attempts.load(Ordering::SeqCst), 1);
+
+    let started = first_resolve_started.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
+    // A fresh call is safely retryable and is interrupted by shutdown rather
+    // than leaving the failed setup detached.
+    let retry_client = client.clone();
+    let retry = tokio::spawn(async move { retry_client.ensure_warm_request_lane().await });
+    started.await;
+    let shutdown_client = client.clone();
+    let shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
+    assert_eq!(
+        retry.await.expect("retry task"),
+        Err(SessionConsumerClientError::ShuttingDown)
+    );
+    shutdown.await.expect("shutdown task");
+}
+
+#[tokio::test]
+async fn ensure_warm_request_lane_retires_rotated_and_checked_out_targets() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("ensure-warm-rotation-server");
+    let client_spiffe = spiffe("ensure-warm-rotation-client");
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    let (first_handle, first_address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer.clone(),
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("first listen address"),
+    )
+    .await
+    .expect("start first consumer listener");
+    let (second_handle, second_address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("second listen address"),
+    )
+    .await
+    .expect("start replacement consumer listener");
+    let use_second = Arc::new(AtomicBool::new(false));
+    let resolver: RemoteAddrResolver = {
+        let use_second = Arc::clone(&use_second);
+        Arc::new(move || {
+            let use_second = Arc::clone(&use_second);
+            Box::pin(async move {
+                Ok(if use_second.load(Ordering::SeqCst) {
+                    second_address
+                } else {
+                    first_address
+                })
+            })
+        })
+    };
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, 1, 1),
+    );
+
+    client
+        .ensure_warm_request_lane()
+        .await
+        .expect("warm first target");
+    service.arm_blocks(1);
+    let checked_out_client = client.clone();
+    let checked_out = tokio::spawn(async move { checked_out_client.capabilities().await });
+    service.wait_until_entered(1).await;
+
+    use_second.store(true, Ordering::SeqCst);
+    let ensure_client = client.clone();
+    let ensure = tokio::spawn(async move { ensure_client.ensure_warm_request_lane().await });
+    tokio::task::yield_now().await;
+    service.release();
+    assert_eq!(
+        checked_out.await.expect("checked-out request"),
+        Ok(transported_capabilities())
+    );
+    assert_eq!(ensure.await.expect("replacement ensure"), Ok(()));
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_successes, 2);
+    assert_eq!(diagnostics.active, 1, "old target was not republished");
+    assert_eq!(diagnostics.idle, 1);
+    assert_eq!(
+        service.calls.load(Ordering::SeqCst),
+        1,
+        "only the deliberately checked-out application request dispatched"
+    );
+
+    client.shutdown().await;
+    first_handle.abort_and_wait().await;
+    second_handle.abort_and_wait().await;
+}
+
+#[tokio::test]
 async fn persistent_pools_derived_from_one_stateless_lineage_share_physical_admission() {
     const PHYSICAL_CAP: usize = 16;
     let pki = TestPki::new();

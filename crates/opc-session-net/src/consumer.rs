@@ -3404,6 +3404,10 @@ struct ConsumerConnection {
     idle_deadline: tokio::time::Instant,
     /// Exact server-advertised request-frame ceiling for this revision-6 lane.
     request_frame_size: usize,
+    /// Concrete resolver result used to establish this physical lane. This is
+    /// intentionally not diagnostic data; it is only an in-memory binding
+    /// used by targeted warm-capacity maintenance.
+    resolved_address: SocketAddr,
     shutdown_io: Option<Arc<PersistentConsumerIoBarrier>>,
     /// Monotonic positive ciphertext-write observation from below TLS.
     accepted_ciphertext_writes: Arc<AtomicU64>,
@@ -5238,6 +5242,7 @@ impl StatelessSessionConsumerClient {
             // stamp their active-response deadline before writing.
             idle_deadline: pre_request_deadline,
             request_frame_size,
+            resolved_address: address,
             shutdown_io,
             accepted_ciphertext_writes,
             pool_connection: None,
@@ -7134,6 +7139,12 @@ struct PersistentSessionConsumerPool {
     pending: Arc<Semaphore>,
     watches: Arc<Semaphore>,
     prewarm: Arc<Semaphore>,
+    warm_lane: StdMutex<PersistentWarmLaneState>,
+    warm_lane_changed: Notify,
+    /// The resolver result most recently proven by `ensure_warm_request_lane`.
+    /// Lanes connected to a prior target are retired instead of being reused
+    /// or republished after that proof.
+    warm_target: StdMutex<Option<SocketAddr>>,
     idle: StdMutex<VecDeque<ConsumerConnection>>,
     idle_reaper: PersistentIdleReaper,
     wait_started: StdMutex<Vec<Option<tokio::time::Instant>>>,
@@ -7150,6 +7161,44 @@ struct PersistentSessionConsumerPool {
     drained_notify: Notify,
     #[cfg(test)]
     test_hooks: PersistentConsumerTestHooks,
+}
+
+#[derive(Default)]
+struct PersistentWarmLaneState {
+    next_generation: u64,
+    in_progress: Option<u64>,
+    completed: Option<(u64, Result<(), SessionConsumerClientError>)>,
+}
+
+struct PersistentWarmLaneLeader {
+    pool: Arc<PersistentSessionConsumerPool>,
+    generation: u64,
+    completed: bool,
+}
+
+impl PersistentWarmLaneLeader {
+    fn complete(
+        mut self,
+        result: Result<(), SessionConsumerClientError>,
+    ) -> Result<(), SessionConsumerClientError> {
+        self.pool.complete_warm_lane(self.generation, result);
+        self.completed = true;
+        result
+    }
+}
+
+impl Drop for PersistentWarmLaneLeader {
+    fn drop(&mut self) {
+        if !self.completed {
+            // The setup future owns all its I/O and is cancelled with this
+            // future. Wake joiners with a pre-dispatch failure instead of
+            // leaving them attached to a detached setup task.
+            self.pool.complete_warm_lane(
+                self.generation,
+                Err(SessionConsumerClientError::Unavailable),
+            );
+        }
+    }
 }
 
 async fn reap_persistent_consumer_idle(
@@ -7388,6 +7437,90 @@ impl PersistentSessionConsumerPool {
         PersistentShutdownPhase::load(&self.shutdown_phase)
     }
 
+    fn idle_has_current_lane(&self) -> bool {
+        let target = *self
+            .warm_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prune_idle_for_target(&mut idle, target);
+        self.phase() == PersistentShutdownPhase::Running && !idle.is_empty()
+    }
+
+    fn publish_warm_target(&self, target: SocketAddr) {
+        // Retain this lock through pruning so an old checked-out lane cannot
+        // race a target update and republish itself after the new target has
+        // been proven.
+        let mut current = self
+            .warm_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Some(target);
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prune_idle_for_target(&mut idle, *current);
+    }
+
+    fn clear_warm_target(&self) {
+        *self
+            .warm_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn begin_warm_lane(
+        self: &Arc<Self>,
+    ) -> Result<Result<PersistentWarmLaneLeader, u64>, SessionConsumerClientError> {
+        if self.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        let mut state = self
+            .warm_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(generation) = state.in_progress {
+            return Ok(Err(generation));
+        }
+        state.next_generation = state.next_generation.wrapping_add(1);
+        let generation = state.next_generation;
+        state.in_progress = Some(generation);
+        Ok(Ok(PersistentWarmLaneLeader {
+            pool: Arc::clone(self),
+            generation,
+            completed: false,
+        }))
+    }
+
+    fn complete_warm_lane(&self, generation: u64, result: Result<(), SessionConsumerClientError>) {
+        let mut state = self
+            .warm_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.in_progress == Some(generation) {
+            state.in_progress = None;
+            state.completed = Some((generation, result));
+            drop(state);
+            self.warm_lane_changed.notify_waiters();
+        }
+    }
+
+    fn completed_warm_lane(
+        &self,
+        generation: u64,
+    ) -> Option<Result<(), SessionConsumerClientError>> {
+        self.warm_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .completed
+            .as_ref()
+            .and_then(|(completed, result)| (*completed == generation).then_some(*result))
+    }
+
     fn ensure_idle_reaper(self: &Arc<Self>) {
         if self.phase() != PersistentShutdownPhase::Running {
             return;
@@ -7606,6 +7739,10 @@ impl PersistentSessionConsumerPool {
     }
 
     fn take_idle(&self) -> Option<ConsumerConnection> {
+        let target = *self
+            .warm_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut idle = self
             .idle
             .lock()
@@ -7613,6 +7750,7 @@ impl PersistentSessionConsumerPool {
         while let Some(mut connection) = idle.pop_front() {
             if connection.reusable()
                 && connection.current(&self.client.tls_config, &self.client.reauthentication)
+                && target.is_none_or(|target| connection.resolved_address == target)
             {
                 return Some(connection);
             }
@@ -7644,6 +7782,16 @@ impl PersistentSessionConsumerPool {
             connection.idle_deadline = tokio::time::Instant::now()
                 .checked_add(effective_consumer_idle_timeout(self.client.idle_timeout))
                 .expect("validated consumer idle timeout has a bounded deadline");
+        }
+        // Hold the target binding while publishing. A resolver rotation that
+        // starts after this check waits to prune the just-published lane; one
+        // that completed before it cannot admit an old target here.
+        let target = *self
+            .warm_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if target.is_some_and(|target| connection.resolved_address != target) {
+            return Some(connection);
         }
         let mut idle = self
             .idle
@@ -7688,10 +7836,19 @@ impl PersistentSessionConsumerPool {
     }
 
     fn prune_idle(&self, idle: &mut VecDeque<ConsumerConnection>) {
+        self.prune_idle_for_target(idle, None);
+    }
+
+    fn prune_idle_for_target(
+        &self,
+        idle: &mut VecDeque<ConsumerConnection>,
+        target: Option<SocketAddr>,
+    ) {
         let before = idle.len();
         idle.retain_mut(|connection| {
             connection.reusable()
                 && connection.current(&self.client.tls_config, &self.client.reauthentication)
+                && target.is_none_or(|target| connection.resolved_address == target)
         });
         for _ in idle.len()..before {
             counter_increment(&self.counters.reconnects);
@@ -7990,6 +8147,9 @@ impl PersistentSessionConsumerClient {
                 )),
                 watches: Arc::new(Semaphore::new(config.watch_connections)),
                 prewarm: Arc::new(Semaphore::new(1)),
+                warm_lane: StdMutex::new(PersistentWarmLaneState::default()),
+                warm_lane_changed: Notify::new(),
+                warm_target: StdMutex::new(None),
                 idle: StdMutex::new(VecDeque::with_capacity(config.request_connections)),
                 idle_reaper: PersistentIdleReaper::new(),
                 wait_started: StdMutex::new(vec![None; config.pending_calls]),
@@ -8894,6 +9054,10 @@ impl PersistentSessionConsumerClient {
             .try_acquire_owned()
             .map_err(|_| SessionConsumerClientError::Overloaded)?;
         let _activity = self.pool.register_prewarm()?;
+        // Full prewarm remains its original rolling-refresh authority. It
+        // deliberately supersedes a one-lane endpoint proof so it can resolve
+        // and refresh every configured lane independently.
+        self.pool.clear_warm_target();
         let mut shutdown = self.pool.shutdown_tx.subscribe();
         let reservation_deadline = tokio::time::Instant::now()
             .checked_add(self.pool.config.pool_wait_timeout)
@@ -8996,6 +9160,139 @@ impl PersistentSessionConsumerClient {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
         Ok(self.readiness().await)
+    }
+
+    async fn acquire_warm_permit(
+        &self,
+        permits: &Arc<Semaphore>,
+        deadline: tokio::time::Instant,
+        shutdown: &mut watch::Receiver<PersistentShutdownPhase>,
+    ) -> Result<OwnedSemaphorePermit, SessionConsumerClientError> {
+        let acquire = Arc::clone(permits).acquire_owned();
+        tokio::pin!(acquire);
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(shutdown) => Err(SessionConsumerClientError::ShuttingDown),
+            result = tokio::time::timeout_at(deadline, &mut acquire) => match result {
+                Ok(Ok(permit)) => complete_before_deadline(
+                    permit,
+                    deadline,
+                    SessionConsumerClientError::Deadline,
+                ),
+                Ok(Err(_)) if self.pool.phase() != PersistentShutdownPhase::Running => {
+                    Err(SessionConsumerClientError::ShuttingDown)
+                }
+                Ok(Err(_)) => Err(SessionConsumerClientError::Unavailable),
+                Err(_) => Err(SessionConsumerClientError::Deadline),
+            }
+        }
+    }
+
+    async fn establish_one_warm_request_lane(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionConsumerClientError> {
+        let mut shutdown = self.pool.shutdown_tx.subscribe();
+        let _gate = self
+            .acquire_warm_permit(&self.pool.prewarm, deadline, &mut shutdown)
+            .await?;
+        let _activity = self.pool.register_prewarm()?;
+
+        // Resolve before consulting idle capacity. This makes a stable
+        // resolver result a concrete part of the proof and retires pooled
+        // lanes connected to a replaced endpoint within the setup budget.
+        let resolve = (self.pool.client.resolve)();
+        tokio::pin!(resolve);
+        let target = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
+            result = tokio::time::timeout_at(deadline, &mut resolve) => match result {
+                Ok(Ok(target)) if tokio::time::Instant::now() < deadline => target,
+                Ok(Ok(_)) | Err(_) => return Err(SessionConsumerClientError::Deadline),
+                Ok(Err(_)) => return Err(SessionConsumerClientError::Unavailable),
+            }
+        };
+        self.pool.publish_warm_target(target);
+        if self.pool.idle_has_current_lane() {
+            return Ok(());
+        }
+
+        // One administrative permit of each bounded pool is sufficient to
+        // establish one lane. Unlike full prewarm, this never reserves or
+        // refreshes the configured width.
+        let _pending = self
+            .acquire_warm_permit(&self.pool.pending, deadline, &mut shutdown)
+            .await?;
+        let _lane = self
+            .acquire_warm_permit(&self.pool.lanes, deadline, &mut shutdown)
+            .await?;
+        if self.pool.idle_has_current_lane() {
+            return Ok(());
+        }
+        let connection = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
+            result = self.pool.connect_with_physical_admission(deadline, None, true) => result?,
+        };
+        // `connect_with_physical_admission` resolves immediately before TCP.
+        // Publish that exact final resolver result too, so a change between
+        // the initial probe and connection cannot republish an old target.
+        self.pool.publish_warm_target(connection.resolved_address);
+        self.pool.return_idle(connection);
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        self.pool
+            .idle_has_current_lane()
+            .then_some(())
+            .ok_or(SessionConsumerClientError::Unavailable)
+    }
+
+    async fn join_warm_request_lane(
+        &self,
+        generation: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionConsumerClientError> {
+        let mut shutdown = self.pool.shutdown_tx.subscribe();
+        loop {
+            let changed = self.pool.warm_lane_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(result) = self.pool.completed_warm_lane(generation) {
+                return match result {
+                    Ok(()) if self.pool.idle_has_current_lane() => Ok(()),
+                    Ok(()) => Err(SessionConsumerClientError::Unavailable),
+                    Err(error) => Err(error),
+                };
+            }
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
+                _ = tokio::time::sleep_until(deadline) => return Err(SessionConsumerClientError::Deadline),
+                _ = &mut changed => {}
+            }
+        }
+    }
+
+    /// Ensure that at least one authenticated, idle request lane is available
+    /// without dispatching an application operation.
+    ///
+    /// Concurrent callers join one bounded resolver/TLS/Hello setup. The
+    /// leader uses only this pool's validated `setup_timeout` and opens at
+    /// most one missing lane; it neither creates request IDs nor reserves the
+    /// whole fixed pool. A returned error is therefore conclusive before an
+    /// application request is written.
+    pub async fn ensure_warm_request_lane(&self) -> Result<(), SessionConsumerClientError> {
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.pool.config.setup_timeout)
+            .ok_or(SessionConsumerClientError::Deadline)?;
+        match self.pool.begin_warm_lane()? {
+            Ok(leader) => leader.complete(self.establish_one_warm_request_lane(deadline).await),
+            Err(generation) => self.join_warm_request_lane(generation, deadline).await,
+        }
     }
 
     /// Return a conservative local authenticated-idle-capacity snapshot.
@@ -14156,6 +14453,7 @@ mod tests {
                 calls: 0,
                 idle_deadline,
                 request_frame_size: super::MAX_NEGOTIATED_FRAME_SIZE,
+                resolved_address: "127.0.0.1:1".parse().expect("synthetic address"),
                 shutdown_io: None,
                 accepted_ciphertext_writes: Arc::new(AtomicU64::new(0)),
                 pool_connection: None,
