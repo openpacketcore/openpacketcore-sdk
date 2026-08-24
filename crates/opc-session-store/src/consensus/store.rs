@@ -7568,14 +7568,8 @@ mod membership_tests {
     }
 
     #[tokio::test]
-    #[allow(
-        clippy::await_holding_lock,
-        reason = "the test-only counter permit makes process-global allocation evidence deterministic"
-    )]
     async fn prepared_cas_remote_forwarding_borrows_the_canonical_body_without_payload_clone() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
-        let _ownership_permit =
-            crate::record::acquire_encrypted_session_payload_ownership_test_permit();
         let (_directory, store, _scope, _authorization, key, lease) =
             consumer_boundary_store().await;
         let request = ForwardMutationRequest {
@@ -7594,18 +7588,28 @@ mod membership_tests {
         };
         let owned = encode_bounded(&ForwardRequest::Mutation(request.clone()))
             .expect("owned prepared CAS forwarding encodes");
-        crate::record::reset_encrypted_session_payload_ownership_counters();
-        let encoded = encode_bounded(&BorrowedForwardRequest::Mutation(&request))
+        let owned_counters =
+            Arc::new(crate::record::EncryptedSessionPayloadOwnershipTestCounters::default());
+        let encoded = crate::record::ENCRYPTED_SESSION_PAYLOAD_OWNERSHIP_TEST_COUNTERS
+            .scope(Arc::clone(&owned_counters), async {
+                encode_bounded(&BorrowedForwardRequest::Mutation(&request))
+            })
+            .await
             .expect("borrowed prepared CAS forwarding encodes");
         assert_eq!(
             encoded, owned,
             "borrowed forwarding remains byte-for-byte golden-compatible with ForwardRequest"
         );
         let decoded_owned: ForwardRequest =
-            decode_bounded(&owned).expect("consumer peer decodes the owned request");
+            crate::record::ENCRYPTED_SESSION_PAYLOAD_OWNERSHIP_TEST_COUNTERS
+                .scope(Arc::clone(&owned_counters), async {
+                    decode_bounded(&owned)
+                })
+                .await
+                .expect("consumer peer decodes the owned request");
         assert_eq!(decoded_owned, ForwardRequest::Mutation(request.clone()));
         assert_eq!(
-            crate::record::encrypted_session_payload_ownership_counters(),
+            owned_counters.snapshot(),
             crate::record::EncryptedSessionPayloadOwnershipCounters {
                 initial_owners: 1,
                 initial_owned_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES as u64,
@@ -7628,13 +7632,19 @@ mod membership_tests {
             "owned bytes decode through the same durable generic-sequence ownership path"
         );
 
-        crate::record::reset_encrypted_session_payload_ownership_counters();
+        let borrowed_counters =
+            Arc::new(crate::record::EncryptedSessionPayloadOwnershipTestCounters::default());
         let decoded: ForwardRequest =
-            decode_bounded(&encoded).expect("consumer peer decodes the borrowed wire bytes");
+            crate::record::ENCRYPTED_SESSION_PAYLOAD_OWNERSHIP_TEST_COUNTERS
+                .scope(Arc::clone(&borrowed_counters), async {
+                    decode_bounded(&encoded)
+                })
+                .await
+                .expect("consumer peer decodes the borrowed wire bytes");
 
         assert_eq!(decoded, ForwardRequest::Mutation(request));
         assert_eq!(
-            crate::record::encrypted_session_payload_ownership_counters(),
+            borrowed_counters.snapshot(),
             crate::record::EncryptedSessionPayloadOwnershipCounters {
                 initial_owners: 1,
                 initial_owned_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES as u64,
