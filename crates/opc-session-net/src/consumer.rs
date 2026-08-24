@@ -7109,6 +7109,7 @@ struct PersistentConsumerTestHooks {
     queued_wait_pause_once: AtomicBool,
     queued_wait_registered: Arc<Notify>,
     queued_wait_release: Arc<Notify>,
+    warm_full_observed: Arc<Notify>,
 }
 
 #[cfg(test)]
@@ -7126,6 +7127,7 @@ impl PersistentConsumerTestHooks {
             queued_wait_pause_once: AtomicBool::new(false),
             queued_wait_registered: Arc::new(Notify::new()),
             queued_wait_release: Arc::new(Notify::new()),
+            warm_full_observed: Arc::new(Notify::new()),
         }
     }
 }
@@ -9546,6 +9548,8 @@ impl PersistentSessionConsumerClient {
             // for it to retire before opening a replacement; otherwise A
             // checked out plus two B idles could exceed a width-two pool.
             if total >= self.pool.config.request_connections {
+                #[cfg(test)]
+                self.pool.test_hooks.warm_full_observed.notify_waiters();
                 tokio::select! {
                     biased;
                     _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
@@ -18941,6 +18945,89 @@ mod tests {
             "pending releases before wake"
         );
         persistent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_cancellation_wakes_real_warm_capacity_refill() {
+        let client_identity = material_spiffe("warm-cancel-client");
+        let voter_identity = material_spiffe("warm-cancel-voter");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            Arc::new(RejectingTestConsumer),
+            material.trusted_server_config(voter_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("listener"))
+        .await
+        .expect("server");
+        let config = PersistentSessionConsumerConfig::try_new(
+            1,
+            1,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(600),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("config");
+        let persistent = PersistentSessionConsumerClient::try_from_stateless(
+            StatelessSessionConsumerClient::new_unattested_for_test(
+                address,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                voter_identity,
+                scope(),
+                material.config(),
+            ),
+            config,
+        )
+        .expect("persistent");
+        let holder_pending = Arc::clone(&persistent.pool.pending)
+            .try_acquire_owned()
+            .expect("holder pending");
+        let holder_lane = Arc::clone(&persistent.pool.lanes)
+            .try_acquire_owned()
+            .expect("holder lane");
+        persistent
+            .pool
+            .test_hooks
+            .queued_wait_pause_once
+            .store(true, Ordering::SeqCst);
+        let registered = persistent.pool.test_hooks.queued_wait_registered.notified();
+        tokio::pin!(registered);
+        registered.as_mut().enable();
+        let pool = Arc::clone(&persistent.pool);
+        let queued = tokio::spawn(async move {
+            pool.admit_call(
+                tokio::time::Instant::now(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        });
+        registered.await;
+        let full = persistent.pool.test_hooks.warm_full_observed.notified();
+        tokio::pin!(full);
+        full.as_mut().enable();
+        let ensure_client = persistent.clone();
+        let ensure =
+            tokio::spawn(async move { ensure_client.ensure_warm_request_capacity().await });
+        tokio::task::yield_now().await;
+        drop(holder_lane);
+        drop(holder_pending);
+        persistent.pool.warm_capacity_changed.notify_waiters();
+        full.await;
+        queued.abort();
+        assert_eq!(ensure.await.expect("ensure"), Ok(()));
+        assert_eq!(persistent.pool.current_warm_capacity(), 1);
+        assert_eq!(persistent.diagnostics().await.overload, 0);
+        persistent.shutdown().await;
+        server.abort_and_wait().await;
     }
 
     #[tokio::test]
