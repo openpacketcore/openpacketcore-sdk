@@ -13288,7 +13288,11 @@ mod tests {
                             "scripted before-call-write A failure",
                         ))
                     } else {
-                        tokio::time::sleep(Duration::from_millis(75)).await;
+                        // Keep setup observably longer than the unchanged
+                        // 250 ms physical-operation budget.  The wider test
+                        // orchestration window below accommodates 32-bit CI
+                        // TLS setup without weakening that production cap.
+                        tokio::time::sleep(Duration::from_millis(300)).await;
                         Ok(a_address)
                     }
                 })
@@ -13358,10 +13362,10 @@ mod tests {
             request: Arc::new(request),
             receipt: OnceLock::new(),
             budget: PreparedCheckpointBudget::new(
-                tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_millis(25),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                Duration::from_millis(250),
             )
-            .expect("explicit 25ms physical budget"),
+            .expect("explicit 250ms physical budget"),
             state: PreparedRequestState::new(0),
             terminal_receipt: StdMutex::new(None),
         };
@@ -13387,7 +13391,7 @@ mod tests {
 
         assert_eq!(
             token
-                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+                .status_once(tokio::time::Instant::now() + Duration::from_secs(2))
                 .await,
             Ok(PreparedCompareAndSetStatus::Recorded(
                 PreparedCompareAndSetOutcome::Applied,
@@ -13657,7 +13661,7 @@ mod tests {
             request: Arc::new(unprotected_router_state_test_compare_and_set_request(scope()).await),
             receipt: OnceLock::new(),
             budget: PreparedCheckpointBudget::new(
-                tokio::time::Instant::now() + Duration::from_secs(1),
+                tokio::time::Instant::now() + Duration::from_secs(5),
                 Duration::from_millis(250),
             )
             .expect("prepared CAS admission budget"),
@@ -13683,7 +13687,7 @@ mod tests {
         let paused_clone = Arc::clone(&token);
         let paused = tokio::spawn(async move {
             paused_clone
-                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+                .status_once(tokio::time::Instant::now() + Duration::from_secs(2))
                 .await
         });
         tokio::task::spawn_blocking(move || paused_rx.recv().expect("wait for paused CAS clone"))
@@ -13691,7 +13695,7 @@ mod tests {
             .expect("paused CAS wait task joins");
 
         let published = token
-            .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+            .status_once(tokio::time::Instant::now() + Duration::from_secs(2))
             .await;
         assert_eq!(
             published,
@@ -13780,7 +13784,7 @@ mod tests {
             )),
             receipt: OnceLock::new(),
             budget: PreparedCheckpointBudget::new(
-                tokio::time::Instant::now() + Duration::from_secs(1),
+                tokio::time::Instant::now() + Duration::from_secs(5),
                 Duration::from_millis(250),
             )
             .expect("prepared lease admission budget"),
@@ -13806,7 +13810,7 @@ mod tests {
         let paused_clone = Arc::clone(&token);
         let paused = tokio::spawn(async move {
             paused_clone
-                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+                .status_once(tokio::time::Instant::now() + Duration::from_secs(2))
                 .await
         });
         tokio::task::spawn_blocking(move || paused_rx.recv().expect("wait for paused lease clone"))
@@ -13814,7 +13818,7 @@ mod tests {
             .expect("paused lease wait task joins");
 
         let published = token
-            .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+            .status_once(tokio::time::Instant::now() + Duration::from_secs(2))
             .await;
         assert_eq!(
             published,

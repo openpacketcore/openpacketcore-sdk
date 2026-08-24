@@ -3400,6 +3400,7 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
         [client_a.clone(), client_b.clone(), client_c.clone()],
     )
     .expect("distinct same-scope protected composite");
+    let original_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let mut prepared = protected
         .prepare_compare_and_set(
             SessionConsumerRequestId::from_bytes([0xc5; 16]),
@@ -3418,11 +3419,8 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
                     payload,
                 },
             },
-            PreparedCheckpointBudget::new(
-                tokio::time::Instant::now() + Duration::from_secs(3),
-                physical_attempt_timeout,
-            )
-            .expect("explicit 100ms physical budget"),
+            PreparedCheckpointBudget::new(original_deadline, physical_attempt_timeout)
+                .expect("explicit 100ms physical budget"),
         )
         .await
         .expect("one protected prepared CAS");
@@ -3463,9 +3461,7 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
 
     fleet.reset_read_barrier_calls();
     assert_eq!(
-        prepared
-            .status_once(tokio::time::Instant::now() + physical_attempt_timeout)
-            .await,
+        prepared.status_once(original_deadline).await,
         Ok(PreparedCompareAndSetStatus::Recorded(
             PreparedCompareAndSetOutcome::Applied,
         )),
