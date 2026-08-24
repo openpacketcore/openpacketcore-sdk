@@ -8424,7 +8424,17 @@ impl PersistentSessionConsumerClient {
     /// Request reauthentication; stale idle lanes fail the current check and
     /// are never leased again.
     pub fn request_reauthentication(&self) -> Result<u64, crate::ConnectionLifecycleError> {
+        // Serialize credential invalidation with warm-capacity snapshots in
+        // their target -> idle lock order.  A snapshot must never observe the
+        // new reauthentication epoch together with the old warm generation
+        // and count a draining checked-out lane as proven current.
+        let mut warm_target = self
+            .pool
+            .warm_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = self.pool.client.request_reauthentication()?;
+        warm_target.generation = warm_target.generation.wrapping_add(1);
         let mut idle = self
             .pool
             .idle
@@ -8432,16 +8442,6 @@ impl PersistentSessionConsumerClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.pool.prune_idle(&mut idle);
         drop(idle);
-        // Checked-out lanes from the prior credential epoch must not satisfy
-        // a later warm-capacity proof while they drain. Their return path is
-        // already fail-closed on target generation, so advance that binding
-        // with explicit reauthentication as well.
-        let mut warm_target = self
-            .pool
-            .warm_target
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        warm_target.generation = warm_target.generation.wrapping_add(1);
         drop(warm_target);
         self.pool.warm_capacity_changed.notify_waiters();
         Ok(generation)
@@ -18686,6 +18686,36 @@ mod tests {
             1,
             "only the current A target remains after A -> B -> A"
         );
+        persistent.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reauthentication_invalidates_checked_out_warm_capacity_atomically() {
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let persistent = PersistentSessionConsumerClient::from_stateless(stateless)
+            .expect("valid persistent configuration");
+        let address: SocketAddr = "127.0.0.1:1".parse().expect("target");
+        let generation = persistent.pool.publish_warm_target(address);
+        let (mut connection, _) = synthetic_consumer_connection(
+            &persistent.pool.client,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Box::new(tokio::io::sink()),
+        );
+        connection.resolved_address = address;
+        connection.warm_target_generation = generation;
+        let checked_out =
+            PersistentCheckedOutConnection::new(Arc::clone(&persistent.pool), connection);
+        assert_eq!(persistent.pool.current_warm_capacity(), 1);
+        persistent
+            .request_reauthentication()
+            .expect("rotate test credentials");
+        assert_eq!(
+            persistent.pool.current_warm_capacity(),
+            0,
+            "a post-reauth snapshot cannot accept a prior checked-out lease"
+        );
+        drop(checked_out);
         persistent.shutdown().await;
     }
 
