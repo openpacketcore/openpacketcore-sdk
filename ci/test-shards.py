@@ -54,6 +54,16 @@ SELECTION = ["cargo", "test", *PACKAGES, "--quiet"]
 EXAMPLES = ["cargo", "build", *PACKAGES, "--quiet", "--examples"]
 HARNESS = ["--test-threads=4"]
 
+# This test intentionally proves that an ordinary write fits inside the public
+# 250 ms operation budget. Running it beside unrelated Tokio runtimes makes the
+# assertion measure process scheduling and unawaited fixture teardown instead
+# of the request path. Keep the production deadline exact and give this one
+# timing contract its own process.
+QUIESCENT_INTEGRATION_TARGET = "stateless_quorum_consumer"
+QUIESCENT_INTEGRATION_TEST = (
+    "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum"
+)
+
 # A partition that collapses to a handful of targets would still be "total and
 # disjoint" if metadata were misread, so hold a floor on the real inventory
 # (249 today).
@@ -166,7 +176,32 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
     selected = [arg for name in buckets[shard] for arg in ("--test", name)]
     if not selected:
         sys.exit(f"shard {shard} selected no targets; the plan is broken")
-    return [SELECTION + selected + ["--", *HARNESS]]
+    if QUIESCENT_INTEGRATION_TARGET not in buckets[shard]:
+        return [SELECTION + selected + ["--", *HARNESS]]
+
+    # libtest's skip filter is substring-based unless --exact is present. The
+    # ordinary invocation still runs every other test in this target, while a
+    # fresh process runs the timing contract alone with no competing runtime.
+    return [
+        SELECTION
+        + selected
+        + [
+            "--",
+            *HARNESS,
+            "--exact",
+            "--skip",
+            QUIESCENT_INTEGRATION_TEST,
+        ],
+        SELECTION
+        + [
+            "--test",
+            QUIESCENT_INTEGRATION_TARGET,
+            "--",
+            "--test-threads=1",
+            "--exact",
+            QUIESCENT_INTEGRATION_TEST,
+        ],
+    ]
 
 
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -236,6 +271,46 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
             # `--exact` with no names disables filtering, so an empty group
             # would silently re-run the entire heavy target.
             sys.exit(f"heavy-{index} names no tests; remove the group instead")
+
+    buckets = assign(plan, targets)
+    owners = [
+        shard
+        for shard, names in buckets.items()
+        if QUIESCENT_INTEGRATION_TARGET in names
+    ]
+    if len(owners) != 1:
+        sys.exit(
+            f"{QUIESCENT_INTEGRATION_TARGET!r} must belong to exactly one "
+            f"integration shard, found {owners}"
+        )
+    owner_commands = commands(plan, owners[0], targets)
+    isolated = SELECTION + [
+        "--test",
+        QUIESCENT_INTEGRATION_TARGET,
+        "--",
+        "--test-threads=1",
+        "--exact",
+        QUIESCENT_INTEGRATION_TEST,
+    ]
+    if owner_commands.count(isolated) != 1:
+        sys.exit(
+            f"{owners[0]} no longer runs {QUIESCENT_INTEGRATION_TEST!r} "
+            "exactly once in its isolated process"
+        )
+    skip = ["--exact", "--skip", QUIESCENT_INTEGRATION_TEST]
+    ordinary = [
+        command
+        for command in owner_commands
+        if any(
+            command[index : index + len(skip)] == skip
+            for index in range(len(command) - len(skip) + 1)
+        )
+    ]
+    if len(ordinary) != 1:
+        sys.exit(
+            f"{owners[0]} must skip {QUIESCENT_INTEGRATION_TEST!r} exactly "
+            "once in its ordinary multi-test process"
+        )
     print(f"shard commands ok: misc issues {len(misc)} invocations")
 
 
@@ -298,6 +373,26 @@ def list_heavy_tests(plan: dict, extra: list[str]) -> set[str]:
     }
 
 
+def list_quiescent_integration_test() -> list[str]:
+    """Resolve the isolated timing contract using its exact CI invocation."""
+    command = SELECTION + [
+        "--test",
+        QUIESCENT_INTEGRATION_TARGET,
+        "--",
+        "--list",
+        "--exact",
+        QUIESCENT_INTEGRATION_TEST,
+    ]
+    out = subprocess.run(
+        command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
+    ).stdout
+    return [
+        line.rsplit(":", 1)[0]
+        for line in out.splitlines()
+        if line.endswith(": test")
+    ]
+
+
 def precheck(plan: dict, shard: str) -> None:
     """Fail a heavy shard whose named tests no longer resolve.
 
@@ -310,7 +405,21 @@ def precheck(plan: dict, shard: str) -> None:
     # Every shard re-checks the plan itself: rust-tests legs start alongside
     # rust-gates rather than after it, so without this a broken plan would
     # burn six runners before the gates job reported it.
-    verify(plan, integration_targets())
+    targets = integration_targets()
+    verify(plan, targets)
+    buckets = assign(plan, targets)
+    if (
+        shard in buckets
+        and QUIESCENT_INTEGRATION_TARGET in buckets[shard]
+    ):
+        selected = list_quiescent_integration_test()
+        if selected != [QUIESCENT_INTEGRATION_TEST]:
+            sys.exit(
+                f"{shard} cannot resolve isolated test "
+                f"{QUIESCENT_INTEGRATION_TEST!r} exactly once; selected "
+                f"{selected}"
+            )
+        print(f"{shard} isolated timing contract resolves exactly once")
     if not shard.startswith("heavy-"):
         return
     group = plan["heavy"]["shards"][int(shard.split("-", 1)[1])]
