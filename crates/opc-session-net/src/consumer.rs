@@ -7106,6 +7106,9 @@ struct PersistentConsumerTestHooks {
     queued_lane_pause_once: AtomicBool,
     queued_lane_assigned: Arc<Notify>,
     queued_lane_release: Arc<Notify>,
+    queued_wait_pause_once: AtomicBool,
+    queued_wait_registered: Arc<Notify>,
+    queued_wait_release: Arc<Notify>,
 }
 
 #[cfg(test)]
@@ -7120,6 +7123,9 @@ impl PersistentConsumerTestHooks {
             queued_lane_pause_once: AtomicBool::new(false),
             queued_lane_assigned: Arc::new(Notify::new()),
             queued_lane_release: Arc::new(Notify::new()),
+            queued_wait_pause_once: AtomicBool::new(false),
+            queued_wait_registered: Arc::new(Notify::new()),
+            queued_wait_release: Arc::new(Notify::new()),
         }
     }
 }
@@ -7893,6 +7899,15 @@ impl PersistentSessionConsumerPool {
                 late_error,
             )?,
             None => {
+                #[cfg(test)]
+                if self
+                    .test_hooks
+                    .queued_wait_pause_once
+                    .swap(false, Ordering::SeqCst)
+                {
+                    self.test_hooks.queued_wait_registered.notify_waiters();
+                    self.test_hooks.queued_wait_release.notified().await;
+                }
                 let mut shutdown = self.shutdown_tx.subscribe();
                 if self.phase() != PersistentShutdownPhase::Running {
                     return Err(SessionConsumerClientError::ShuttingDown);
@@ -18891,11 +18906,11 @@ mod tests {
         persistent
             .pool
             .test_hooks
-            .queued_lane_pause_once
+            .queued_wait_pause_once
             .store(true, Ordering::SeqCst);
-        let assigned = persistent.pool.test_hooks.queued_lane_assigned.notified();
-        tokio::pin!(assigned);
-        assigned.as_mut().enable();
+        let registered = persistent.pool.test_hooks.queued_wait_registered.notified();
+        tokio::pin!(registered);
+        registered.as_mut().enable();
         let pool = Arc::clone(&persistent.pool);
         let queued = tokio::spawn(async move {
             pool.admit_call(
@@ -18907,10 +18922,12 @@ mod tests {
         tokio::task::yield_now().await;
         drop(holder_lane);
         drop(holder_pending);
-        assigned.await;
+        registered.await;
         let changed = persistent.pool.warm_capacity_changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
+        // The waiter owns an assigned lane permit but is paused before any
+        // subsequent poll can move it out of its semaphore future.
         queued.abort();
         changed.await;
         assert_eq!(
