@@ -656,7 +656,7 @@ impl LinuxRouteSteeringBackend {
     /// The lock is acquired for one cursor datagram or at most the hard step
     /// mutation cap, then released before this future returns. `budget`
     /// controls the maximum number of units, subject to a production hard cap
-    /// of [`MAX_OWNED_RECONCILE_STEP_UNITS`]. A budget of one is the strict
+    /// of 16 units. A budget of one is the strict
     /// latency setting. Callers must not hold external publication locks
     /// across a step; release them whenever [`OwnedRouteRuleReconcileStep::Yielded`]
     /// is returned. Dropping this future therefore leaves no detached
