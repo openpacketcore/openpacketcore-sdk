@@ -7417,6 +7417,38 @@ struct PersistentCapacityAdmission {
     lane: Option<OwnedSemaphorePermit>,
 }
 
+/// Owns pending admission while a caller is waiting for its FIFO lane.  It is
+/// declared before the lane future, so cancellation drops an assigned lane
+/// permit first and only then wakes warm-capacity maintenance.
+struct PersistentPendingAdmission {
+    pool: Arc<PersistentSessionConsumerPool>,
+    pending: Option<OwnedSemaphorePermit>,
+}
+
+impl PersistentPendingAdmission {
+    fn new(pool: Arc<PersistentSessionConsumerPool>, pending: OwnedSemaphorePermit) -> Self {
+        Self {
+            pool,
+            pending: Some(pending),
+        }
+    }
+
+    fn into_pending(mut self) -> OwnedSemaphorePermit {
+        self.pending
+            .take()
+            .expect("pending admission is extracted once after lane admission")
+    }
+}
+
+impl Drop for PersistentPendingAdmission {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            drop(pending);
+            self.pool.warm_capacity_changed.notify_waiters();
+        }
+    }
+}
+
 impl PersistentCapacityAdmission {
     fn new(
         pool: Arc<PersistentSessionConsumerPool>,
@@ -7820,7 +7852,7 @@ impl PersistentSessionConsumerPool {
     }
 
     async fn admit_call(
-        &self,
+        self: &Arc<Self>,
         started: tokio::time::Instant,
         operation_deadline: tokio::time::Instant,
     ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), SessionConsumerClientError> {
@@ -7834,6 +7866,7 @@ impl PersistentSessionConsumerPool {
         let pending = Arc::clone(&self.pending)
             .try_acquire_owned()
             .map_err(|_| SessionConsumerClientError::Overloaded)?;
+        let pending_admission = PersistentPendingAdmission::new(Arc::clone(self), pending);
         let pool_wait_deadline = started
             .checked_add(self.config.pool_wait_timeout)
             .ok_or(SessionConsumerClientError::Overloaded)?;
@@ -7900,7 +7933,7 @@ impl PersistentSessionConsumerPool {
         if self.phase() != PersistentShutdownPhase::Running {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
-        Ok((pending, lane))
+        Ok((pending_admission.into_pending(), lane))
     }
 
     fn take_idle(self: &Arc<Self>) -> Option<PersistentCheckedOutConnection> {
