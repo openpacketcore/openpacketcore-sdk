@@ -168,8 +168,8 @@ before invoking reconciliation; the SDK does not persist intent. Protocol
 `242` is still only a namespace-local reservation, not authentication, so safe
 cleanup depends on one orchestrated exclusive writer for each declared scope
 and external coordination for overlapping scopes or deliberate marker reuse.
-Legacy static routes, untagged rules, singleton convergence, and their existing
-migration requirements remain unchanged. Scripted Linux tests cover
+Legacy static routes, untagged rules, and their existing migration requirements
+remain unchanged. Scripted Linux tests cover
 same-priority sibling install, exact retry, and targeted removal; foreign
 conflict and cross-set prefix-overlap rejection without mutation, including an
 exact retry; marker omission/substitution rollback preserving owned state;
