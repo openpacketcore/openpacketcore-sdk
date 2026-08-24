@@ -7100,6 +7100,9 @@ struct PersistentIdleReaper {
 struct PersistentConsumerTestHooks {
     material_reaper_processed: Arc<Notify>,
     idle_reaper_armed_deadline: Arc<StdMutex<Option<tokio::time::Instant>>>,
+    warm_probe_pause_once: AtomicBool,
+    warm_probe_entered: Arc<Notify>,
+    warm_probe_release: Arc<Notify>,
 }
 
 #[cfg(test)]
@@ -7108,6 +7111,9 @@ impl PersistentConsumerTestHooks {
         Self {
             material_reaper_processed: Arc::new(Notify::new()),
             idle_reaper_armed_deadline: Arc::new(StdMutex::new(None)),
+            warm_probe_pause_once: AtomicBool::new(false),
+            warm_probe_entered: Arc::new(Notify::new()),
+            warm_probe_release: Arc::new(Notify::new()),
         }
     }
 }
@@ -7996,6 +8002,11 @@ impl PersistentSessionConsumerPool {
             Self::remove_checked_out(&mut checked_out, &connection);
             return Some(connection);
         }
+        // Remove the lease using the generation captured at checkout before a
+        // normal cold connection is allowed to advance the target below.
+        // Mutating first would search for the new generation and leak the old
+        // checked-out entry indefinitely.
+        Self::remove_checked_out(&mut checked_out, &connection);
         if target
             .address
             .is_some_and(|address| connection.resolved_address != address)
@@ -8010,10 +8021,8 @@ impl PersistentSessionConsumerPool {
         }
         connection.warm_target_generation = target.generation;
         if idle.len() < self.config.request_connections {
-            Self::remove_checked_out(&mut checked_out, &connection);
             idle.push_back(connection);
         } else {
-            Self::remove_checked_out(&mut checked_out, &connection);
             return Some(connection);
         }
         drop(idle);
@@ -8422,6 +8431,19 @@ impl PersistentSessionConsumerClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.pool.prune_idle(&mut idle);
+        drop(idle);
+        // Checked-out lanes from the prior credential epoch must not satisfy
+        // a later warm-capacity proof while they drain. Their return path is
+        // already fail-closed on target generation, so advance that binding
+        // with explicit reauthentication as well.
+        let mut warm_target = self
+            .pool
+            .warm_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        warm_target.generation = warm_target.generation.wrapping_add(1);
+        drop(warm_target);
+        self.pool.warm_capacity_changed.notify_waiters();
         Ok(generation)
     }
 
@@ -9468,6 +9490,16 @@ impl PersistentSessionConsumerClient {
                     _ = &mut capacity_changed => continue,
                 }
             }
+            #[cfg(test)]
+            if self
+                .pool
+                .test_hooks
+                .warm_probe_pause_once
+                .swap(false, Ordering::SeqCst)
+            {
+                self.pool.test_hooks.warm_probe_entered.notify_waiters();
+                self.pool.test_hooks.warm_probe_release.notified().await;
+            }
             // Normal callers are never queued behind maintenance. Acquire at
             // most one slot without joining the FIFO queue, then re-snapshot:
             // a concurrent caller may have consumed or published capacity
@@ -9490,12 +9522,15 @@ impl PersistentSessionConsumerClient {
                 Ok(permit) => permit,
                 Err(_) if self.pool.phase() != PersistentShutdownPhase::Running => {
                     drop(pending);
-                    self.pool.warm_capacity_changed.notify_waiters();
                     return Err(SessionConsumerClientError::ShuttingDown);
                 }
                 Err(_) => {
                     drop(pending);
-                    self.pool.warm_capacity_changed.notify_waiters();
+                    // `capacity_changed` was armed before the snapshot. Do
+                    // not self-wake it after releasing only our pending
+                    // permit: that would spin and repeatedly contend with
+                    // normal admission instead of waiting for the external
+                    // lane holder to change capacity.
                     tokio::select! {
                         biased;
                         _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
@@ -18600,6 +18635,60 @@ mod tests {
         persistent.shutdown().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn normal_target_advances_remove_the_original_checked_out_lease() {
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let persistent = PersistentSessionConsumerClient::from_stateless(stateless)
+            .expect("valid persistent configuration");
+        let address_a: SocketAddr = "127.0.0.1:1".parse().expect("first target");
+        let address_b: SocketAddr = "127.0.0.1:2".parse().expect("second target");
+        let generation_a = persistent.pool.publish_warm_target(address_a);
+
+        let (mut to_b, _) = synthetic_consumer_connection(
+            &persistent.pool.client,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Box::new(tokio::io::sink()),
+        );
+        to_b.resolved_address = address_b;
+        to_b.warm_target_generation = generation_a;
+        PersistentCheckedOutConnection::new(Arc::clone(&persistent.pool), to_b).return_idle();
+        assert!(persistent
+            .pool
+            .checked_out
+            .lock()
+            .expect("checked out")
+            .is_empty());
+
+        let generation_b = persistent
+            .pool
+            .warm_target
+            .lock()
+            .expect("target")
+            .generation;
+        let (mut to_a, _) = synthetic_consumer_connection(
+            &persistent.pool.client,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Box::new(tokio::io::sink()),
+        );
+        to_a.resolved_address = address_a;
+        to_a.warm_target_generation = generation_b;
+        PersistentCheckedOutConnection::new(Arc::clone(&persistent.pool), to_a).return_idle();
+        assert!(persistent
+            .pool
+            .checked_out
+            .lock()
+            .expect("checked out")
+            .is_empty());
+        assert_eq!(persistent.pool.current_warm_capacity(), 1);
+        assert_eq!(
+            persistent.pool.idle.lock().expect("idle").len(),
+            1,
+            "only the current A target remains after A -> B -> A"
+        );
+        persistent.shutdown().await;
+    }
+
     #[tokio::test]
     async fn cancelled_cold_admission_releases_before_waking_warm_capacity() {
         let control = SessionReauthenticationControl::new();
@@ -18635,6 +18724,65 @@ mod tests {
                 .config
                 .request_connections
                 .saturating_add(persistent.pool.config.pending_calls),
+        );
+        persistent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn warm_lane_probe_yields_pending_admission_until_external_lane_release() {
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let config = PersistentSessionConsumerConfig::try_new(
+            1,
+            1,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(600),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("bounded one-lane test configuration");
+        let persistent = PersistentSessionConsumerClient::try_from_stateless(stateless, config)
+            .expect("valid persistent configuration");
+        persistent
+            .pool
+            .test_hooks
+            .warm_probe_pause_once
+            .store(true, Ordering::SeqCst);
+        let entered = persistent.pool.test_hooks.warm_probe_entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        let ensure_client = persistent.clone();
+        let ensure =
+            tokio::spawn(async move { ensure_client.ensure_warm_request_capacity().await });
+        entered.await;
+
+        // Simulate a normal cold caller claiming the final logical lane after
+        // the warm snapshot but before its nonqueued probe.
+        let holder_pending = Arc::clone(&persistent.pool.pending)
+            .try_acquire_owned()
+            .expect("normal caller pending admission");
+        let holder_lane = Arc::clone(&persistent.pool.lanes)
+            .try_acquire_owned()
+            .expect("normal caller final lane");
+        persistent
+            .pool
+            .test_hooks
+            .warm_probe_release
+            .notify_waiters();
+        tokio::task::yield_now().await;
+        let other_pending = Arc::clone(&persistent.pool.pending)
+            .try_acquire_owned()
+            .expect("maintenance released its pending permit instead of spinning on it");
+        drop(other_pending);
+        drop(holder_lane);
+        drop(holder_pending);
+        persistent.pool.warm_capacity_changed.notify_waiters();
+        assert_eq!(
+            ensure.await.expect("warm task"),
+            Err(SessionConsumerClientError::Unavailable),
+            "the external release wakes one bounded cold setup attempt"
         );
         persistent.shutdown().await;
     }
