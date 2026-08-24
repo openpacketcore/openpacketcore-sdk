@@ -1784,7 +1784,7 @@ async fn typed_consumer_watch_is_rejected_before_resolution_or_global_cursor_exp
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         Arc::clone(&resolver),
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        voter_authority(scope.clone(), &server_spiffe),
+        voter_authority(scope, &server_spiffe),
         pki.client_config(&client_spiffe),
     );
     assert!(matches!(

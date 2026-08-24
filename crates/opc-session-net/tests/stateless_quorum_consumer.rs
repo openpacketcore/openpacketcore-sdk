@@ -1691,6 +1691,7 @@ async fn cloned_stateless_request_connections_fail_fast_at_the_shared_physical_c
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn production_stateless_watch_is_denied_before_service_dispatch() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("physical-watch-server");
