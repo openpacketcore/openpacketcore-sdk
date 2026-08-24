@@ -59,7 +59,28 @@ jobs:
         run: cargo clippy --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common -p opc-session-net --all-targets --all-features -- -D warnings
 
       - name: Run conformance tests
-        run: cargo test --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common -p opc-session-net --all-features --quiet -- --test-threads=4
+        run: |
+          set -euo pipefail
+          timing_contract=persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
+          cargo test --locked \
+            -p opc-ipsec-lb \
+            -p opc-ipsec-lb-ebpf-common \
+            -p opc-session-net \
+            --all-features \
+            --quiet \
+            -- \
+            --test-threads=4 \
+            --exact \
+            --skip "$timing_contract"
+          cargo test --locked \
+            -p opc-session-net \
+            --all-features \
+            --quiet \
+            --test stateless_quorum_consumer \
+            -- \
+            --test-threads=1 \
+            --exact \
+            "$timing_contract"
 
   docs:
     name: Rust docs
