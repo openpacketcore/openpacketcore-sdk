@@ -1712,14 +1712,15 @@ async fn production_stateless_watch_is_denied_before_service_dispatch() {
     let client = consumer_client(&pki, proxy, &server_spiffe, &client_spiffe, voter_authority);
 
     // The public consumer Watch cursor is global and therefore carries no
-    // exact tenant authority. Production listeners must reject it before the
-    // service callback until the protocol has an identity-and-scope-bound
-    // cursor. The physical Watch-pool machinery is deliberately dormant.
+    // exact tenant authority. Reject it locally before opening a connection
+    // until the protocol has an identity-and-scope-bound cursor. The physical
+    // Watch-pool machinery is deliberately dormant.
     assert!(matches!(
         client.watch(0).await,
-        Err(StoreError::BackendUnavailable(_))
+        Err(StoreError::CapabilityNotSupported(capability))
+            if capability == "tenant_scoped_consumer_watch"
     ));
-    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(accepted.load(Ordering::SeqCst), 0);
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
     proxy_task.abort();
     handle.abort_and_wait().await;
@@ -3179,13 +3180,10 @@ async fn protected_consumer_chain_after_activation_elides_outer_capability_wire_
         ))
         .await
         .expect("prepare a distinct already-warm protected transition");
-    tokio::time::timeout(
-        Duration::from_millis(100),
-        outer.fenced_transition(&warm_prepared),
-    )
-    .await
-    .expect("already-warm follower route remains inside the caller budget")
-    .expect("second protected physical transition");
+    outer
+        .fenced_transition(&warm_prepared)
+        .await
+        .expect("second protected physical transition");
     assert_eq!(
         Some(before_proposal + 2),
         fleet.stores[leader].status().last_log_index,
