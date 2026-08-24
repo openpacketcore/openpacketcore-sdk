@@ -910,7 +910,7 @@ async fn prewarm_opens_fixed_lanes_reuses_them_and_keeps_diagnostics_redacted() 
 }
 
 #[tokio::test]
-async fn ensure_warm_request_lane_coalesces_one_cold_setup_and_reuses_it() {
+async fn ensure_warm_request_capacity_coalesces_one_cold_setup_and_reuses_it() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("ensure-warm-server");
     let client_spiffe = spiffe("ensure-warm-client");
@@ -953,17 +953,18 @@ async fn ensure_warm_request_lane_coalesces_one_cold_setup_and_reuses_it() {
     )
     // A warm proof is setup administration, not an application operation.
     .with_operation_timeout(Duration::from_millis(100));
-    let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config(2, 1, 1))
+    let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config(1, 1, 1))
         .expect("persistent client");
 
     let started = first_resolve_started.notified();
     tokio::pin!(started);
     started.as_mut().enable();
     let leader_client = client.clone();
-    let leader = tokio::spawn(async move { leader_client.ensure_warm_request_lane().await });
+    let leader = tokio::spawn(async move { leader_client.ensure_warm_request_capacity().await });
     started.await;
     let follower_client = client.clone();
-    let follower = tokio::spawn(async move { follower_client.ensure_warm_request_lane().await });
+    let follower =
+        tokio::spawn(async move { follower_client.ensure_warm_request_capacity().await });
     tokio::task::yield_now().await;
     assert_eq!(
         resolver_attempts.load(Ordering::SeqCst),
@@ -980,7 +981,7 @@ async fn ensure_warm_request_lane_coalesces_one_cold_setup_and_reuses_it() {
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
 
     client
-        .ensure_warm_request_lane()
+        .ensure_warm_request_capacity()
         .await
         .expect("already warm lane remains a resolver-validated proof");
     assert_eq!(
@@ -994,7 +995,82 @@ async fn ensure_warm_request_lane_coalesces_one_cold_setup_and_reuses_it() {
 }
 
 #[tokio::test]
-async fn ensure_warm_request_lane_shares_resolver_failure_and_shutdown_fails_closed() {
+async fn ensure_warm_request_capacity_refills_width_before_two_short_operations() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("ensure-warm-width-server");
+    let client_spiffe = spiffe("ensure-warm-width-client");
+    let (authorizer, _scope, authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        authority,
+        pki.client_config(&client_spiffe),
+    )
+    .with_operation_timeout(Duration::from_millis(100))
+    .with_pre_request_connection_timeout(Duration::from_millis(500));
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        stateless,
+        PersistentSessionConsumerConfig::try_new(
+            2,
+            2,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(600),
+            2,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("500ms total warm-proof configuration"),
+    )
+    .expect("persistent client");
+
+    client.prewarm().await.expect("initial two lanes");
+    client
+        .request_reauthentication()
+        .expect("retire both original lanes");
+    client
+        .ensure_warm_request_capacity()
+        .await
+        .expect("refill both current lanes before operations");
+    assert_eq!(client.diagnostics().await.setup_successes, 4);
+
+    service.arm_blocks(2);
+    let first_client = client.clone();
+    let first = tokio::spawn(async move { first_client.capabilities().await });
+    let second_client = client.clone();
+    let second = tokio::spawn(async move { second_client.capabilities().await });
+    service.wait_until_entered(2).await;
+    assert_eq!(
+        client.diagnostics().await.setup_successes,
+        4,
+        "both immutable 100ms operations dispatch on already authenticated lanes"
+    );
+    service.release();
+    assert_eq!(
+        first.await.expect("first operation"),
+        Ok(transported_capabilities())
+    );
+    assert_eq!(
+        second.await.expect("second operation"),
+        Ok(transported_capabilities())
+    );
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn ensure_warm_request_capacity_shares_resolver_failure_and_shutdown_fails_closed() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("ensure-warm-failure-server");
     let client_spiffe = spiffe("ensure-warm-failure-client");
@@ -1034,10 +1110,11 @@ async fn ensure_warm_request_lane_shares_resolver_failure_and_shutdown_fails_clo
     tokio::pin!(started);
     started.as_mut().enable();
     let leader_client = client.clone();
-    let leader = tokio::spawn(async move { leader_client.ensure_warm_request_lane().await });
+    let leader = tokio::spawn(async move { leader_client.ensure_warm_request_capacity().await });
     started.await;
     let follower_client = client.clone();
-    let follower = tokio::spawn(async move { follower_client.ensure_warm_request_lane().await });
+    let follower =
+        tokio::spawn(async move { follower_client.ensure_warm_request_capacity().await });
     tokio::task::yield_now().await;
     release_first_resolve.notify_one();
     assert_eq!(
@@ -1053,10 +1130,30 @@ async fn ensure_warm_request_lane_shares_resolver_failure_and_shutdown_fails_clo
     let started = first_resolve_started.notified();
     tokio::pin!(started);
     started.as_mut().enable();
+    let cancelled_leader_client = client.clone();
+    let cancelled_leader =
+        tokio::spawn(async move { cancelled_leader_client.ensure_warm_request_capacity().await });
+    started.await;
+    let cancelled_follower_client = client.clone();
+    let cancelled_follower = tokio::spawn(async move {
+        cancelled_follower_client
+            .ensure_warm_request_capacity()
+            .await
+    });
+    cancelled_leader.abort();
+    assert_eq!(
+        cancelled_follower.await.expect("cancelled follower task"),
+        Err(SessionConsumerClientError::Unavailable),
+        "leader cancellation completes the shared flight without detached setup"
+    );
+
+    let started = first_resolve_started.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
     // A fresh call is safely retryable and is interrupted by shutdown rather
     // than leaving the failed setup detached.
     let retry_client = client.clone();
-    let retry = tokio::spawn(async move { retry_client.ensure_warm_request_lane().await });
+    let retry = tokio::spawn(async move { retry_client.ensure_warm_request_capacity().await });
     started.await;
     let shutdown_client = client.clone();
     let shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
@@ -1068,7 +1165,7 @@ async fn ensure_warm_request_lane_shares_resolver_failure_and_shutdown_fails_clo
 }
 
 #[tokio::test]
-async fn ensure_warm_request_lane_retires_rotated_and_checked_out_targets() {
+async fn ensure_warm_request_capacity_retires_rotated_and_checked_out_targets() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("ensure-warm-rotation-server");
     let client_spiffe = spiffe("ensure-warm-rotation-client");
@@ -1120,13 +1217,13 @@ async fn ensure_warm_request_lane_retires_rotated_and_checked_out_targets() {
         &server_spiffe,
         &client_spiffe,
         scope,
-        config(1, 1, 1),
+        config(2, 2, 1),
     );
 
     client
-        .ensure_warm_request_lane()
+        .ensure_warm_request_capacity()
         .await
-        .expect("warm first target");
+        .expect("warm both first-target slots");
     service.arm_blocks(1);
     let checked_out_client = client.clone();
     let checked_out = tokio::spawn(async move { checked_out_client.capabilities().await });
@@ -1134,7 +1231,7 @@ async fn ensure_warm_request_lane_retires_rotated_and_checked_out_targets() {
 
     use_second.store(true, Ordering::SeqCst);
     let ensure_client = client.clone();
-    let ensure = tokio::spawn(async move { ensure_client.ensure_warm_request_lane().await });
+    let ensure = tokio::spawn(async move { ensure_client.ensure_warm_request_capacity().await });
     tokio::task::yield_now().await;
     service.release();
     assert_eq!(
@@ -1143,15 +1240,99 @@ async fn ensure_warm_request_lane_retires_rotated_and_checked_out_targets() {
     );
     assert_eq!(ensure.await.expect("replacement ensure"), Ok(()));
     let diagnostics = client.diagnostics().await;
-    assert_eq!(diagnostics.setup_successes, 2);
-    assert_eq!(diagnostics.active, 1, "old target was not republished");
-    assert_eq!(diagnostics.idle, 1);
+    assert_eq!(diagnostics.setup_successes, 4);
+    assert_eq!(diagnostics.active, 2, "old target was not republished");
+    assert_eq!(diagnostics.idle, 2);
+    assert!(
+        diagnostics.max_active <= 2,
+        "one checked-out old-target lane plus replacements never exceeds fixed width"
+    );
     assert_eq!(
         service.calls.load(Ordering::SeqCst),
         1,
         "only the deliberately checked-out application request dispatched"
     );
 
+    client.shutdown().await;
+    first_handle.abort_and_wait().await;
+    second_handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn normal_connection_after_ensure_can_advance_a_later_resolver_target() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("ensure-warm-normal-evolution-server");
+    let client_spiffe = spiffe("ensure-warm-normal-evolution-client");
+    let (authorizer, scope, _authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    let (first_handle, first_address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer.clone(),
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("first listen address"),
+    )
+    .await
+    .expect("start first consumer listener");
+    let (second_handle, second_address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("second listen address"),
+    )
+    .await
+    .expect("start second consumer listener");
+    let use_second = Arc::new(AtomicBool::new(false));
+    let resolver: RemoteAddrResolver = {
+        let use_second = Arc::clone(&use_second);
+        Arc::new(move || {
+            let use_second = Arc::clone(&use_second);
+            Box::pin(async move {
+                Ok(if use_second.load(Ordering::SeqCst) {
+                    second_address
+                } else {
+                    first_address
+                })
+            })
+        })
+    };
+    let client = persistent_client(
+        &pki,
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
+        &server_spiffe,
+        &client_spiffe,
+        scope,
+        config(1, 1, 1),
+    );
+
+    client
+        .ensure_warm_request_capacity()
+        .await
+        .expect("initial ensured target");
+    use_second.store(true, Ordering::SeqCst);
+    client
+        .request_reauthentication()
+        .expect("retire first target lane");
+    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
+    assert_eq!(client.diagnostics().await.setup_successes, 2);
+    client
+        .ensure_warm_request_capacity()
+        .await
+        .expect("later normal target remains reusable");
+    assert_eq!(
+        client.diagnostics().await.setup_successes,
+        2,
+        "normal authenticated connection advanced, not discarded by, the warm binding"
+    );
     client.shutdown().await;
     first_handle.abort_and_wait().await;
     second_handle.abort_and_wait().await;
