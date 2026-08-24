@@ -1864,6 +1864,8 @@ async fn authenticated_outer_lease_unknown_is_counted_as_a_failure_not_a_success
 }
 
 #[tokio::test]
+#[ignore = "global consumer Watch awaits a scope-bound cursor protocol"]
+#[allow(deprecated)]
 async fn cancelled_initial_watch_accounts_the_exact_call_write_boundary_once() {
     // Cancellation while resolve is pending is proven locally
     // NotTransmitted and terminalizes both setup and outcome accounting.
@@ -2190,6 +2192,8 @@ async fn partial_mutation_unary_response_is_unknown_once_without_auto_replay() {
 }
 
 #[tokio::test]
+#[ignore = "global consumer Watch awaits a scope-bound cursor protocol"]
+#[allow(deprecated)]
 async fn partial_initial_watch_open_response_releases_the_isolated_admission() {
     for boundary in ["prefix", "payload"] {
         let pki = TestPki::new();
@@ -2257,6 +2261,8 @@ async fn partial_initial_watch_open_response_releases_the_isolated_admission() {
 }
 
 #[tokio::test]
+#[ignore = "global consumer Watch awaits a scope-bound cursor protocol"]
+#[allow(deprecated)]
 async fn correlated_watch_rejections_preserve_their_typed_setup_classification() {
     for (name, rejection, expected) in [
         (
@@ -2331,6 +2337,8 @@ async fn correlated_watch_rejections_preserve_their_typed_setup_classification()
 }
 
 #[tokio::test]
+#[ignore = "global consumer Watch awaits a scope-bound cursor protocol"]
+#[allow(deprecated)]
 async fn partial_active_watch_frames_expire_and_release_the_isolated_slot() {
     for boundary in ["prefix", "payload"] {
         let pki = TestPki::new();
@@ -2379,6 +2387,7 @@ async fn partial_active_watch_frames_expire_and_release_the_isolated_slot() {
 }
 
 #[tokio::test]
+#[ignore = "global consumer Watch awaits a scope-bound cursor protocol"]
 #[allow(deprecated)] // Test-only SO_LINGER(0) is the deterministic TCP-reset adversary.
 async fn partial_watch_fin_and_reset_are_terminal_on_active_and_replacement_lanes() {
     for boundary in ["prefix", "payload"] {
@@ -2526,6 +2535,8 @@ async fn partial_watch_fin_and_reset_are_terminal_on_active_and_replacement_lane
 }
 
 #[tokio::test]
+#[ignore = "global consumer Watch awaits a scope-bound cursor protocol"]
+#[allow(deprecated)]
 async fn quiet_authenticated_watch_remains_admitted_until_the_peer_closes() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("quiet-watch-server");

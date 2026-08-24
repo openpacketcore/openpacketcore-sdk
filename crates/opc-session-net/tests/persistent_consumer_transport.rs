@@ -1754,7 +1754,8 @@ async fn pool_admission_consumes_the_original_complete_operation_deadline() {
 }
 
 #[tokio::test]
-async fn production_listener_denies_watch_before_service_callbacks() {
+#[allow(deprecated)]
+async fn typed_consumer_watch_is_rejected_before_resolution_or_global_cursor_exposure() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("production-watch-denial-server");
     let client_spiffe = spiffe("production-watch-denial-client");
@@ -1769,7 +1770,28 @@ async fn production_listener_denies_watch_before_service_callbacks() {
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
     .await
     .expect("start production consumer listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let resolve_calls = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolve_calls = Arc::clone(&resolve_calls);
+        Arc::new(move || {
+            let resolve_calls = Arc::clone(&resolve_calls);
+            Box::pin(async move {
+                resolve_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(address)
+            })
+        })
+    };
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        Arc::clone(&resolver),
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        voter_authority(scope.clone(), &server_spiffe),
+        pki.client_config(&client_spiffe),
+    );
+    assert!(matches!(
+        stateless.watch(0).await,
+        Err(opc_session_store::StoreError::CapabilityNotSupported(capability))
+            if capability == "tenant_scoped_consumer_watch"
+    ));
     let client = persistent_client(
         &pki,
         resolver,
@@ -1782,10 +1804,23 @@ async fn production_listener_denies_watch_before_service_callbacks() {
 
     assert!(matches!(
         client.open_watch(0).await,
-        Err(SessionConsumerClientError::Authentication)
+        Err(SessionConsumerClientError::Unsupported)
     ));
+    assert!(matches!(
+        client.watch(u64::MAX).await,
+        Err(opc_session_store::StoreError::CapabilityNotSupported(capability))
+            if capability == "tenant_scoped_consumer_watch"
+    ));
+    assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
     assert_eq!(service.watch_setup_calls(), 0);
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_attempts, 0);
+    assert_eq!(diagnostics.resolve_attempts, 0);
+    assert_eq!(diagnostics.tcp_attempts, 0);
+    assert_eq!(diagnostics.tls_attempts, 0);
+    assert_eq!(diagnostics.hello_attempts, 0);
+    assert_eq!(diagnostics.watch_active, 0);
 
     client.shutdown().await;
     handle.abort_and_wait().await;

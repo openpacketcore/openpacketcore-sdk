@@ -429,6 +429,10 @@ pub enum SessionConsumerClientError {
     /// A malformed or unexpected typed frame was received.
     #[error("session consumer protocol failed")]
     Protocol,
+    /// The requested consumer feature is deliberately unavailable for the
+    /// authenticated tenant/NF scope.
+    #[error("session consumer feature is unsupported for this scope")]
+    Unsupported,
     /// The quorum endpoint was unavailable.
     #[error("session consumer endpoint is unavailable")]
     Unavailable,
@@ -701,7 +705,11 @@ impl PersistentSessionConsumerConfig {
     pub const fn pool_wait_timeout(&self) -> Duration {
         self.pool_wait_timeout
     }
-    /// Return the isolated watch capacity.
+    /// Return the reserved Watch transport capacity.
+    ///
+    /// Tenant/NF-scoped consumer Watch is currently unsupported, so public
+    /// consumer calls do not acquire this capacity. It is retained for a
+    /// future reviewed scope-bound cursor protocol.
     pub const fn watch_connections(&self) -> usize {
         self.watch_connections
     }
@@ -866,6 +874,16 @@ const fn consumer_rejection_into_client_error(
         SessionConsumerRejection::Unauthorized => SessionConsumerClientError::Authentication,
         SessionConsumerRejection::Unavailable => SessionConsumerClientError::Unavailable,
     }
+}
+
+fn consumer_watch_unsupported_store_error() -> StoreError {
+    StoreError::CapabilityNotSupported("tenant_scoped_consumer_watch".into())
+}
+
+// Kept as a separate policy seam so the retained transport machinery can only
+// be enabled alongside a reviewed identity-and-scope-bound cursor protocol.
+fn tenant_scoped_consumer_watch_is_supported() -> bool {
+    false
 }
 
 fn complete_before_deadline<T, E>(
@@ -5992,16 +6010,21 @@ impl StatelessSessionConsumerClient {
         })
     }
 
-    /// Open a bounded committed-change watch without exposing a raw log-read,
-    /// append, or rebuild API.
+    /// Attempt to open a committed-change Watch.
+    ///
+    /// This source-compatible method currently returns
+    /// [`StoreError::CapabilityNotSupported`] locally. The consumer protocol
+    /// has only a global cursor; admitting or filtering it for a tenant/NF
+    /// grant would disclose foreign activity.
+    #[deprecated(
+        note = "tenant/NF-scoped consumer Watch is unsupported until a scope-bound cursor protocol exists"
+    )]
     pub async fn watch(
         &self,
         start_sequence: u64,
     ) -> Result<BoxStream<'static, Result<SessionConsumerChange, StoreError>>, StoreError> {
-        let write_progress = FrameWriteProgress::new();
-        self.watch_with_counters(start_sequence, None, None, &write_progress)
-            .await
-            .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))
+        let _ = start_sequence;
+        Err(consumer_watch_unsupported_store_error())
     }
 
     #[cfg(test)]
@@ -7853,7 +7876,9 @@ impl PersistentSessionConsumerPool {
             SessionConsumerClientError::ShuttingDown => {
                 counter_increment(&self.counters.shutdown);
             }
-            SessionConsumerClientError::Unavailable => {}
+            // Unsupported is a local capability decision, not an
+            // authenticated transport failure. `failures` still records it.
+            SessionConsumerClientError::Unsupported | SessionConsumerClientError::Unavailable => {}
         }
     }
 
@@ -9146,11 +9171,19 @@ impl PersistentSessionConsumerClient {
         )
     }
 
-    /// Open a watch using slots isolated from normal request lanes.
+    /// Attempt to open a tenant/NF-scoped Watch.
     ///
-    /// Exhaustion of either this pool's watch slots or the shared physical
-    /// admission for its stateless clone lineage is reported as
-    /// [`SessionConsumerClientError::Overloaded`].
+    /// Tenant/NF-scoped consumer grants currently reject this operation with
+    /// [`SessionConsumerClientError::Unsupported`]. The only available cursor
+    /// is global, so filtering it would disclose foreign-tenant activity via
+    /// sequence movement and timing. A scope-bound cursor protocol is required
+    /// before this method can be admitted in production.
+    ///
+    /// The reserved Watch transport slots are not admitted by this public API
+    /// while that protocol is unavailable.
+    #[deprecated(
+        note = "tenant/NF-scoped consumer Watch is unsupported until a scope-bound cursor protocol exists"
+    )]
     pub async fn open_watch(
         &self,
         start_sequence: u64,
@@ -9158,6 +9191,14 @@ impl PersistentSessionConsumerClient {
         BoxStream<'static, Result<SessionConsumerChange, StoreError>>,
         SessionConsumerClientError,
     > {
+        if !tenant_scoped_consumer_watch_is_supported() {
+            // The consumer protocol's only Watch cursor is global. Failing
+            // before a permit, resolve, TCP, TLS, or request frame prevents
+            // an application consumer observing any cross-tenant cursor fact.
+            self.pool
+                .record_error(SessionConsumerClientError::Unsupported, false, false);
+            return Err(SessionConsumerClientError::Unsupported);
+        }
         if self.pool.phase() != PersistentShutdownPhase::Running {
             self.pool
                 .record_error(SessionConsumerClientError::ShuttingDown, false, false);
@@ -9237,13 +9278,21 @@ impl PersistentSessionConsumerClient {
         .boxed())
     }
 
+    /// Attempt to open a committed-change Watch.
+    ///
+    /// This source-compatible method currently returns
+    /// [`StoreError::CapabilityNotSupported`] locally; use the generic
+    /// [`SessionBackend`] Watch only where its backend-specific scope contract
+    /// is available.
+    #[deprecated(
+        note = "tenant/NF-scoped consumer Watch is unsupported until a scope-bound cursor protocol exists"
+    )]
     pub async fn watch(
         &self,
         start_sequence: u64,
     ) -> Result<BoxStream<'static, Result<SessionConsumerChange, StoreError>>, StoreError> {
-        self.open_watch(start_sequence)
-            .await
-            .map_err(|_| StoreError::BackendUnavailable("consumer watch unavailable".into()))
+        let _ = start_sequence;
+        Err(consumer_watch_unsupported_store_error())
     }
 
     async fn execute_admitted(
