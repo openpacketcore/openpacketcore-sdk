@@ -119,9 +119,15 @@ the prefixes are provably disjoint. Overlap, exact duplicates, destination or
 firewall-mark siblings, wildcard selectors, foreign collisions, ownership-
 tagged objects that cannot be represented, and ambiguous resident state fail
 closed before destructive cleanup. This preserves the conservative singleton
-contract, where multiple candidates at the broad family/priority collision key
-remain ambiguous, while providing an exact collection-level removal target
-that preserves disjoint siblings.
+contract except for one narrow Linux-only singleton readback/removal exception:
+stock, protocol-`242`-owned, same-table, source-only rules with provably
+disjoint non-`/0` source prefixes may coexist as siblings. Linux then proves
+the exact target absent after deletion while preserving those siblings; it does
+not claim the entire broad family/priority key is absent. Every other sibling,
+including malformed, unknown, unrepresentable, foreign, overlapping,
+wildcard, destination-qualified, or firewall-mark-qualified state remains
+fail-closed rather than being excluded from the broad collision key. Collection
+reconciliation remains the authoritative complete-set path for siblings.
 
 Linux and mock reconciliation perform one authoritative workflow serialized
 among clones of the same backend: validate a complete bounded resident
