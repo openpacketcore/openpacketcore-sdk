@@ -44,13 +44,14 @@ use opc_session_store::{
     RestoreScanCursorProfile, RestoreScanRequest, RestoreScanScope, SessionBackend,
     SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
     SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
-    SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionConsumerV2Operation, SessionConsumerV2Request,
-    SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
-    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerAuthorization,
+    SessionConsumerAuthorizationGrant, SessionConsumerChange, SessionConsumerOperation,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
+    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response, SessionKey,
+    SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer,
+    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
+    ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_key_bytes_sha256, qualification_owner_sha256, qualification_state_type_sha256,
@@ -482,7 +483,7 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
 
     async fn execute_v2(
         &self,
-        identity: &SessionConsumerIdentity,
+        authorization: &SessionConsumerAuthorization,
         request: SessionConsumerV2Request,
     ) -> SessionConsumerV2Response {
         let mutation = matches!(
@@ -490,7 +491,7 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
             SessionConsumerV2Operation::FencedTransitionV2 { .. }
                 | SessionConsumerV2Operation::FencedTransitionV2Batch { .. }
         );
-        let response = self.inner.execute_v2(identity, request).await;
+        let response = self.inner.execute_v2(authorization, request).await;
         if mutation
             && matches!(
                 &response,

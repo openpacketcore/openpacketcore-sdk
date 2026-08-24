@@ -1310,11 +1310,11 @@ const SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1: &str = concat!(
 
 /// Literal SHA-256 binding for the complete batch release-gate schedule.
 pub const SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256: &str =
-    "sha256:3ac98f84f59dd5cefee5c15d5ae833610402bd6bffa74c7e284cbbad30a10eb2";
+    "sha256:c57da080669b553520658b731c755fa397da0bd89415ec2443b0492d3edb4e03";
 
 /// Literal SHA-256 binding for the closed batch release-gate schema.
 pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_SHA256: &str =
-    "sha256:fc4c2e37fd96719c08905c62b61c5adc68d1d6d23e1314fbf31998b0deb400c3";
+    "sha256:48acb2db97408811347024c3c4e6d7119fc45b00a81cf56e1704564eeb3bf527";
 
 /// SHA-256 of the fixed release-gate workload schedule.
 pub fn session_mtls_batch_release_gate_schedule_sha256() -> String {
@@ -5802,6 +5802,12 @@ mod tests {
             saturated_client_skips: 1,
             slow_lane_completed_batches: 1,
             over_capacity_typed_backpressure_events: 1,
+            held_response_count: 4,
+            queued_caller_count: 64,
+            cross_client_fair_progress: 1,
+            released_response_count: 4,
+            recovered_queued_caller_count: 64,
+            durable_status_cardinality: 12,
             not_transmitted_retries: 0,
             recovered_unknown: 0,
             server_queue_depth_measured: false,
@@ -6166,6 +6172,22 @@ mod tests {
     }
 
     #[test]
+    fn batch_release_gate_complete_evidence_validates_against_full_closed_schema() {
+        let evidence = batch_release_gate_evidence_fixture();
+        evidence
+            .validate()
+            .expect("representative evidence is valid");
+        let encoded = serde_json::to_vec(&evidence).expect("serialize complete evidence");
+        let instance: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("serialized evidence is JSON");
+        let schema: serde_json::Value =
+            serde_json::from_str(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON)
+                .expect("closed batch evidence schema parses");
+        opc_schema_validate::validate(&schema, &instance)
+            .expect("serialized complete evidence satisfies the full closed schema");
+    }
+
+    #[test]
     fn batch_release_gate_schema_and_schedule_are_closed() {
         let schema: serde_json::Value =
             serde_json::from_str(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON)
@@ -6202,6 +6224,21 @@ mod tests {
                 .expect("closed schema has required fields")
                 .iter()
                 .any(|required| required == field));
+        }
+        for (field, expected) in [
+            ("held_response_count", 4),
+            ("queued_caller_count", 64),
+            ("cross_client_fair_progress", 1),
+            ("released_response_count", 4),
+            ("recovered_queued_caller_count", 64),
+            ("durable_status_cardinality", 12),
+        ] {
+            assert!(schema["required"]
+                .as_array()
+                .expect("closed schema has required fields")
+                .iter()
+                .any(|required| required == field));
+            assert_eq!(schema["properties"][field]["const"], expected);
         }
         assert_eq!(
             schema["properties"]["paced_operations"]["const"],
@@ -6285,8 +6322,8 @@ mod tests {
             "phase-06-credential-rotation-and-positive-controls",
             "phase-07-release-original-pool",
             "phase-08-publish-replacement-new-only-and-old-credential-negative",
-            "phase-09-delayed-ambiguity",
-            "phase-10-restore-replacement-pool-and-resolve-ambiguity-statuses",
+            "phase-09-four-response-hold-and-client-queue-pressure",
+            "phase-10-release-four-holds-and-recover-exact-statuses",
             "phase-11-release-old-root-pool",
             "phase-12-publish-old-only-and-new-credential-negative",
             "phase-13-restore-old-root-settle-and-resource-validation",
@@ -6301,8 +6338,10 @@ mod tests {
             "phase-11-release-old-root-pool",
             1,
         );
-        let removed_phase_schedule = SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1
-            .replace("phase-09-delayed-ambiguity", "phase-09-removed");
+        let removed_phase_schedule = SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1.replace(
+            "phase-09-four-response-hold-and-client-queue-pressure",
+            "phase-09-removed",
+        );
         assert_ne!(
             sha256_prefixed(reordered_schedule.as_bytes()),
             SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256,

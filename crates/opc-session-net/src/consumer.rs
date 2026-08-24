@@ -27,18 +27,25 @@ use opc_session_store::{
     CompareAndSet, CompareAndSetResult, FencedTransitionExecuteError, FencedTransitionObservation,
     FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
     FencedTransitionStatus, FencedTransitionV2RequestId, LeaseError, LeaseGuard, OwnerId,
-    PreparedFencedTransition, RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest,
-    SessionBackend, SessionConsumerAuthorizationManifest, SessionConsumerBatchResult,
-    SessionConsumerChange, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerLeaseError,
-    SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationRequest,
-    SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2Operation,
-    SessionConsumerV2Request, SessionConsumerV2Response, SessionOp, SessionOpResult,
-    SessionPayloadEncoding, SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
-    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    PreparedCheckpointBudget, PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
+    PreparedCompareAndSetPrepareError, PreparedCompareAndSetRequest,
+    PreparedCompareAndSetStatus as PreparedCasStatus, PreparedCompareAndSetStatusError,
+    PreparedFencedTransition, PreparedLeaseAcquireExecuteError, PreparedLeaseAcquirePrepareError,
+    PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError, ProtectedSessionBackend,
+    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionBackend,
+    SessionConsensusNodeId, SessionConsumerAuthorization, SessionConsumerAuthorizationManifest,
+    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerCompareAndSetReceiptOutcome,
+    SessionConsumerCompareAndSetRequest, SessionConsumerCompareAndSetStatus,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerLeaseMutationOperation,
+    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
+    SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+    SessionConsumerVoterAuthority, SessionOp, SessionOpResult, SessionPayloadEncoding,
+    SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 use opc_types::SpiffeId;
 use serde::{Deserialize, Serialize};
@@ -5957,7 +5964,7 @@ impl StatelessSessionConsumerClient {
         &self,
         request: &SessionConsumerV2Request,
     ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
-        if request.scope() != self.scope || request.validate().is_err() {
+        if request.scope() != self.scope() || request.validate().is_err() {
             return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             });
@@ -6057,7 +6064,7 @@ impl StatelessSessionConsumerClient {
                     cause: SessionConsumerClientError::Authentication,
                 }
             })?;
-        if peer.spiffe_id() != &self.expected_server_identity {
+        if peer.spiffe_id().as_str() != self.voter.tls_identity() {
             return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Authentication,
             });
@@ -6090,7 +6097,14 @@ impl StatelessSessionConsumerClient {
         let (mut reader, mut writer) = tokio::io::split(tls);
         let hello = ConsumerV2WireRequest::Hello(ConsumerHello {
             transport_revision: SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
-            scope: self.scope,
+            scope: self.scope(),
+            expected_server_node_id: self.voter.node_id().get(),
+            voter_count: u16::try_from(self.voter.voter_count()).map_err(|_| {
+                PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol,
+                }
+            })?,
+            roster_commitment: self.voter.roster_commitment(),
             response_frame_size: consumer_wire_frame_size(MAX_NEGOTIATED_FRAME_SIZE)
                 .map_err(SessionConsumerClientError::from)
                 .map_err(
@@ -6123,7 +6137,10 @@ impl StatelessSessionConsumerClient {
         let request_frame_size = match ack {
             ConsumerV2WireResponse::HelloAck(ack)
                 if ack.transport_revision == SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION
-                    && ack.scope == self.scope =>
+                    && ack.scope == self.scope()
+                    && ack.server_node_id == self.voter.node_id().get()
+                    && usize::from(ack.voter_count) == self.voter.voter_count()
+                    && ack.roster_commitment == self.voter.roster_commitment() =>
             {
                 checked_consumer_frame_size(ack.request_frame_size)
                     .map_err(SessionConsumerClientError::from)
@@ -8582,6 +8599,21 @@ struct PersistentSessionConsumerV2Pool {
     live_accounting: StdMutex<()>,
 }
 
+/// Immutable execution facts for one persistent V2 attempt.
+///
+/// Keeping these values together prevents a retry from accidentally adopting
+/// a new operation deadline or pre-request window. `admission_started` is the
+/// sole per-attempt value; all other timing values remain caller-owned across
+/// retries.
+struct PersistentV2CallAttempt<'a> {
+    operation_started: tokio::time::Instant,
+    admission_started: tokio::time::Instant,
+    pre_request_deadline: tokio::time::Instant,
+    pre_request_budget_active: bool,
+    deadline: tokio::time::Instant,
+    status_write_accepted: Option<&'a AtomicBool>,
+}
+
 /// Cancellation-safe accounting for one complete revision-5 physical setup.
 /// A success is recorded only after the authenticated actor owns both TLS
 /// halves and its command rendezvous can be published to a caller or prewarm.
@@ -9056,7 +9088,7 @@ impl PersistentSessionConsumerV2Pool {
         }
         let peer = opc_tls::peer_tls_identity_from_client_connection(tls.get_ref().1)
             .map_err(|_| SessionConsumerClientError::Authentication)?;
-        if peer.spiffe_id() != &self.client.expected_server_identity {
+        if peer.spiffe_id().as_str() != self.client.voter.tls_identity() {
             return Err(SessionConsumerClientError::Authentication);
         }
         let established_at = tokio::time::Instant::now();
@@ -9089,7 +9121,11 @@ impl PersistentSessionConsumerV2Pool {
             &mut writer,
             &ConsumerV2WireRequest::Hello(ConsumerHello {
                 transport_revision: SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
-                scope: self.client.scope,
+                scope: self.client.scope(),
+                expected_server_node_id: self.client.voter.node_id().get(),
+                voter_count: u16::try_from(self.client.voter.voter_count())
+                    .map_err(|_| SessionConsumerClientError::Protocol)?,
+                roster_commitment: self.client.voter.roster_commitment(),
                 response_frame_size: consumer_wire_frame_size(MAX_NEGOTIATED_FRAME_SIZE)
                     .map_err(SessionConsumerClientError::from)?,
             }),
@@ -9110,7 +9146,10 @@ impl PersistentSessionConsumerV2Pool {
         let request_frame_size = match ack {
             ConsumerV2WireResponse::HelloAck(ack)
                 if ack.transport_revision == SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION
-                    && ack.scope == self.client.scope =>
+                    && ack.scope == self.client.scope()
+                    && ack.server_node_id == self.client.voter.node_id().get()
+                    && usize::from(ack.voter_count) == self.client.voter.voter_count()
+                    && ack.roster_commitment == self.client.voter.roster_commitment() =>
             {
                 checked_consumer_frame_size(ack.request_frame_size)
                     .map_err(SessionConsumerClientError::from)?
@@ -9197,7 +9236,7 @@ impl PersistentSessionConsumerV2Pool {
         request: &SessionConsumerV2Request,
     ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
         self.ensure_idle_reaper();
-        if request.scope() != self.client.scope || request.validate().is_err() {
+        if request.scope() != self.client.scope() || request.validate().is_err() {
             return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             });
@@ -9234,13 +9273,16 @@ impl PersistentSessionConsumerV2Pool {
     async fn execute_classified_once(
         self: &Arc<Self>,
         request: &SessionConsumerV2Request,
-        operation_started: tokio::time::Instant,
-        admission_started: tokio::time::Instant,
-        pre_request_deadline: tokio::time::Instant,
-        pre_request_budget_active: bool,
-        deadline: tokio::time::Instant,
-        status_write_accepted: Option<&AtomicBool>,
+        attempt: PersistentV2CallAttempt<'_>,
     ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+        let PersistentV2CallAttempt {
+            operation_started,
+            admission_started,
+            pre_request_deadline,
+            pre_request_budget_active,
+            deadline,
+            status_write_accepted,
+        } = attempt;
         if tokio::time::Instant::now() >= deadline {
             return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Deadline,
@@ -9425,12 +9467,14 @@ impl PersistentSessionConsumerV2Pool {
             let result = self
                 .execute_classified_once(
                     request,
-                    started,
-                    admission_started,
-                    pre_request_deadline,
-                    pre_request_budget_active,
-                    deadline,
-                    status_retry.then_some(&status_write_accepted),
+                    PersistentV2CallAttempt {
+                        operation_started: started,
+                        admission_started,
+                        pre_request_deadline,
+                        pre_request_budget_active,
+                        deadline,
+                        status_write_accepted: status_retry.then_some(&status_write_accepted),
+                    },
                 )
                 .await;
             if status_retry
@@ -11448,6 +11492,10 @@ impl PersistentSessionConsumerClient {
             )),
             watches: Arc::new(Semaphore::new(config.watch_connections)),
             prewarm: Arc::new(Semaphore::new(1)),
+            warm_lane: StdMutex::new(None),
+            warm_target: StdMutex::new(PersistentWarmTarget::default()),
+            checked_out: StdMutex::new(Vec::with_capacity(config.request_connections)),
+            warm_capacity_changed: Notify::new(),
             idle: StdMutex::new(VecDeque::with_capacity(config.request_connections)),
             idle_reaper: PersistentIdleReaper::new(),
             wait_started: StdMutex::new(vec![None; config.pending_calls]),
@@ -11565,6 +11613,10 @@ impl PersistentSessionConsumerClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         v2_idle.retain_mut(|entry| self.v2_pool.retainable_entry(entry));
+        drop(v2_idle);
+        drop(idle);
+        drop(warm_target);
+        self.pool.warm_capacity_changed.notify_waiters();
         Ok(generation)
     }
 
@@ -12583,6 +12635,224 @@ impl PersistentSessionConsumerClient {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
         Ok(self.readiness().await)
+    }
+
+    async fn acquire_warm_permit(
+        &self,
+        permits: &Arc<Semaphore>,
+        deadline: tokio::time::Instant,
+        shutdown: &mut watch::Receiver<PersistentShutdownPhase>,
+    ) -> Result<OwnedSemaphorePermit, SessionConsumerClientError> {
+        let acquire = Arc::clone(permits).acquire_owned();
+        tokio::pin!(acquire);
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(shutdown) => Err(SessionConsumerClientError::ShuttingDown),
+            result = tokio::time::timeout_at(deadline, &mut acquire) => match result {
+                Ok(Ok(permit)) => complete_before_deadline(
+                    permit,
+                    deadline,
+                    SessionConsumerClientError::Deadline,
+                ),
+                Ok(Err(_)) if self.pool.phase() != PersistentShutdownPhase::Running => {
+                    Err(SessionConsumerClientError::ShuttingDown)
+                }
+                Ok(Err(_)) => Err(SessionConsumerClientError::Unavailable),
+                Err(_) => Err(SessionConsumerClientError::Deadline),
+            }
+        }
+    }
+
+    async fn establish_one_warm_request_lane(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionConsumerClientError> {
+        let mut shutdown = self.pool.shutdown_tx.subscribe();
+        let _gate = self
+            .acquire_warm_permit(&self.pool.prewarm, deadline, &mut shutdown)
+            .await?;
+        let _activity = self.pool.register_prewarm()?;
+
+        // Bind a concrete resolver result into the proof before deciding
+        // whether existing lanes supply the requested capacity.
+        let resolve = (self.pool.client.resolve)();
+        tokio::pin!(resolve);
+        let target = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
+            result = tokio::time::timeout_at(deadline, &mut resolve) => match result {
+                Ok(Ok(target)) if tokio::time::Instant::now() < deadline => target,
+                Ok(Ok(_)) | Err(_) => return Err(SessionConsumerClientError::Deadline),
+                Ok(Err(_)) => return Err(SessionConsumerClientError::Unavailable),
+            }
+        };
+        let target_generation = self.pool.publish_warm_target(target);
+        loop {
+            let capacity_changed = self.pool.warm_capacity_changed.notified();
+            tokio::pin!(capacity_changed);
+            capacity_changed.as_mut().enable();
+            let (current, total) = self.pool.warm_capacity_snapshot(0);
+            if current == self.pool.config.request_connections {
+                break;
+            }
+            if total >= self.pool.config.request_connections {
+                #[cfg(test)]
+                self.pool.test_hooks.warm_full_observed.notify_waiters();
+                tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
+                    _ = tokio::time::sleep_until(deadline) => return Err(SessionConsumerClientError::Deadline),
+                    _ = &mut capacity_changed => continue,
+                }
+            }
+            #[cfg(test)]
+            if self
+                .pool
+                .test_hooks
+                .warm_probe_pause_once
+                .swap(false, Ordering::SeqCst)
+            {
+                self.pool.test_hooks.warm_probe_entered.notify_waiters();
+                self.pool.test_hooks.warm_probe_release.notified().await;
+            }
+            // Maintenance never joins the normal request queue. It yields
+            // until a slot is immediately available and then rechecks.
+            let pending = match Arc::clone(&self.pool.pending).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) if self.pool.phase() != PersistentShutdownPhase::Running => {
+                    return Err(SessionConsumerClientError::ShuttingDown);
+                }
+                Err(_) => {
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
+                        _ = tokio::time::sleep_until(deadline) => return Err(SessionConsumerClientError::Deadline),
+                        _ = &mut capacity_changed => continue,
+                    }
+                }
+            };
+            let lane = match Arc::clone(&self.pool.lanes).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) if self.pool.phase() != PersistentShutdownPhase::Running => {
+                    drop(pending);
+                    return Err(SessionConsumerClientError::ShuttingDown);
+                }
+                Err(_) => {
+                    drop(pending);
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
+                        _ = tokio::time::sleep_until(deadline) => return Err(SessionConsumerClientError::Deadline),
+                        _ = &mut capacity_changed => continue,
+                    }
+                }
+            };
+            let admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+            let (current, total) = self.pool.warm_capacity_snapshot(1);
+            if current == self.pool.config.request_connections {
+                drop(admission);
+                break;
+            }
+            if total >= self.pool.config.request_connections {
+                drop(admission);
+                continue;
+            }
+            let connection = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => Err(SessionConsumerClientError::ShuttingDown),
+                result = self.pool.connect_with_physical_admission(deadline, None, true, Some(target)) => result,
+            };
+            let connection = match connection {
+                Ok(connection) => connection,
+                Err(error) => {
+                    drop(admission);
+                    return Err(error);
+                }
+            };
+            let mut connection = connection;
+            connection.warm_target_generation = target_generation;
+            self.pool.return_idle(connection);
+            drop(admission);
+        }
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        (self.pool.current_warm_capacity() == self.pool.config.request_connections)
+            .then_some(())
+            .ok_or(SessionConsumerClientError::Unavailable)
+    }
+
+    async fn join_warm_request_lane(
+        &self,
+        flight: Arc<PersistentWarmLaneFlight>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionConsumerClientError> {
+        let mut shutdown = self.pool.shutdown_tx.subscribe();
+        loop {
+            let changed = flight.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(result) = flight.result() {
+                return result;
+            }
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => return Err(SessionConsumerClientError::ShuttingDown),
+                _ = tokio::time::sleep_until(deadline) => return Err(SessionConsumerClientError::Deadline),
+                _ = &mut changed => {}
+            }
+        }
+    }
+
+    async fn ensure_warm_request_capacity_before(
+        &self,
+        caller_deadline: tokio::time::Instant,
+    ) -> Result<(), SessionConsumerClientError> {
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        let started = tokio::time::Instant::now();
+        let mut deadline = caller_deadline.min(
+            started
+                .checked_add(self.pool.config.setup_timeout)
+                .ok_or(SessionConsumerClientError::Deadline)?,
+        );
+        if let Some(pre_request_deadline) = self
+            .pool
+            .client
+            .pre_request_connection_timeout
+            .and_then(|timeout| started.checked_add(timeout))
+        {
+            deadline = deadline.min(pre_request_deadline);
+        }
+        if deadline <= started {
+            return Err(SessionConsumerClientError::Deadline);
+        }
+        let result = match self.pool.begin_warm_lane()? {
+            Ok(leader) => leader.complete(self.establish_one_warm_request_lane(deadline).await),
+            Err(flight) => self.join_warm_request_lane(flight, deadline).await,
+        };
+        #[cfg(test)]
+        if result.is_ok()
+            && self
+                .pool
+                .test_hooks
+                .warm_return_pause_once
+                .swap(false, Ordering::SeqCst)
+        {
+            self.pool.test_hooks.warm_return_entered.notify_waiters();
+            self.pool.test_hooks.warm_return_release.notified().await;
+        }
+        result
+    }
+
+    /// Ensure the configured request capacity is authenticated for the current
+    /// resolver target before a caller consumes its immutable request budget.
+    pub async fn ensure_warm_request_capacity(&self) -> Result<(), SessionConsumerClientError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.pool.config.setup_timeout)
+            .ok_or(SessionConsumerClientError::Deadline)?;
+        self.ensure_warm_request_capacity_before(deadline).await
     }
 
     /// Return a conservative authenticated-idle-capacity snapshot.
@@ -14224,8 +14494,11 @@ where
 /// decoder cannot emit V1 responses or watch frames.
 struct ConsumerV2ServerConnectionContext {
     service: Arc<dyn SessionQuorumConsumer>,
-    identity: SessionConsumerIdentity,
+    authorization: SessionConsumerAuthorization,
     scope: SessionConsumerScope,
+    server_node_id: u64,
+    voter_count: usize,
+    roster_commitment: [u8; 32],
     max_frame_size: usize,
     idle_timeout: Duration,
     operation_timeout: Duration,
@@ -14367,6 +14640,9 @@ where
 async fn write_consumer_v2_hello_ack_supervised<W>(
     writer: &mut W,
     scope: SessionConsumerScope,
+    server_node_id: u64,
+    voter_count: usize,
+    roster_commitment: [u8; 32],
     response_frame_size: usize,
     max_frame_size: usize,
     setup_deadline: tokio::time::Instant,
@@ -14389,6 +14665,9 @@ where
     let hello_ack_response = ConsumerV2WireResponse::HelloAck(ConsumerHelloAck {
         transport_revision: SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
         scope,
+        server_node_id,
+        voter_count: u16::try_from(voter_count).map_err(|_| ProtocolError::InvalidWireValue)?,
+        roster_commitment,
         request_frame_size: consumer_wire_frame_size(max_frame_size)?,
     });
     let hello_ack = write_frame_bounded_until(
@@ -14479,8 +14758,11 @@ async fn handle_server_connection_v2(
 ) -> Result<(), ProtocolError> {
     let ConsumerV2ServerConnectionContext {
         service,
-        identity,
+        authorization,
         scope,
+        server_node_id,
+        voter_count,
+        roster_commitment,
         max_frame_size,
         idle_timeout,
         operation_timeout,
@@ -14560,10 +14842,20 @@ async fn handle_server_connection_v2(
     }
     let response_frame_size =
         checked_consumer_frame_size(hello.response_frame_size)?.min(max_frame_size);
-    if hello.scope != scope {
+    let hello_rejection = if hello.scope != scope {
+        Some(SessionConsumerRejection::ScopeMismatch)
+    } else if hello.expected_server_node_id != server_node_id
+        || usize::from(hello.voter_count) != voter_count
+        || hello.roster_commitment != roster_commitment
+    {
+        Some(SessionConsumerRejection::Unauthorized)
+    } else {
+        None
+    };
+    if let Some(hello_rejection) = hello_rejection {
         let _ = write_consumer_v2_response_supervised(
             &mut writer,
-            ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch),
+            ConsumerV2WireResponse::HelloRejected(hello_rejection),
             response_frame_size,
             setup_deadline,
             idle_timeout,
@@ -14611,6 +14903,9 @@ async fn handle_server_connection_v2(
     if !write_consumer_v2_hello_ack_supervised(
         &mut writer,
         scope,
+        server_node_id,
+        voter_count,
+        roster_commitment,
         response_frame_size,
         max_frame_size,
         setup_deadline,
@@ -14738,8 +15033,10 @@ async fn handle_server_connection_v2(
             Some(SessionConsumerV2Response::Rejected(
                 SessionConsumerRejection::MalformedRequest,
             ))
+        } else if let Err(rejection) = authorization.authorize_v2_operation(request.operation()) {
+            Some(SessionConsumerV2Response::Rejected(rejection))
         } else {
-            let execute = service.execute_v2(&identity, request.clone());
+            let execute = service.execute_v2(&authorization, request.clone());
             tokio::pin!(execute);
             loop {
                 let hard_deadline = lifecycle
@@ -14940,8 +15237,11 @@ async fn handle_server_connection(
             tls,
             ConsumerV2ServerConnectionContext {
                 service,
-                identity,
+                authorization,
                 scope: authorizer.scope(),
+                server_node_id: authorizer.local_node_id().get(),
+                voter_count: authorizer.voter_count(),
+                roster_commitment: *authorizer.roster_commitment().as_bytes(),
                 max_frame_size,
                 idle_timeout,
                 operation_timeout,
@@ -16048,7 +16348,6 @@ mod tests {
         SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
         SessionConsumerFencedTransitionMutationError, SessionConsumerLeaseMutationError,
         SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
-        SessionConsumerIdentity,
         SessionConsumerRejection, SessionQuorumConsumer, SessionQuorumConsumerServer,
         StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
         DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
@@ -16063,7 +16362,8 @@ mod tests {
         MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
         MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
-        MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+        MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS, PREPARED_DISPATCHING,
+        PREPARED_PREPARING, PREPARED_READY, PREPARED_RECEIPT_ONLY, PREPARED_TERMINAL,
     };
     use bytes::Bytes;
     use futures_util::FutureExt as _;
@@ -16074,8 +16374,10 @@ mod tests {
         EncryptedSessionPayload, EncryptingSessionBackend, FakeSessionBackend, FenceToken,
         FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
         FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
-        FencedTransitionRequestId, FencedTransitionStatus, Generation, LeaseGuard, OwnerId,
-        PreparedCheckpointBudget, PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
+        FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
+        FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
+        Generation, LeaseGuard, OwnerId, PreparedCheckpointBudget,
+        PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
         PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError, PreparedFencedTransition,
         PreparedLeaseAcquireExecuteError, PreparedLeaseAcquireStatusError,
         RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionBackend,
@@ -16088,13 +16390,11 @@ mod tests {
         SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
         SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRequest,
         SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-        SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionKey, SessionKeyType,
-        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
-        MAX_SESSION_TTL,
-        FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
-        FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
+        SessionConsumerStoreError, SessionConsumerTenantNfScope,
         SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
         SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+        SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType,
+        StoreError, StoredSessionRecord, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
@@ -18279,7 +18579,7 @@ mod tests {
 
         async fn execute_v2(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             request: SessionConsumerV2Request,
         ) -> SessionConsumerV2Response {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -18332,7 +18632,7 @@ mod tests {
 
         async fn execute_v2(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             request: SessionConsumerV2Request,
         ) -> SessionConsumerV2Response {
             match request.operation() {
@@ -18414,7 +18714,7 @@ mod tests {
 
         async fn execute_v2(
             &self,
-            _identity: &SessionConsumerIdentity,
+            _authorization: &SessionConsumerAuthorization,
             request: SessionConsumerV2Request,
         ) -> SessionConsumerV2Response {
             if matches!(
@@ -22177,7 +22477,11 @@ mod tests {
         .listen("127.0.0.1:0".parse().expect("loopback address"))
         .await
         .expect("listen for V2 call-boundary test");
-        let stateless = StatelessSessionConsumerClient::new(
+        // This transport-boundary fixture supplies its own ephemeral server
+        // certificate. Keep the production roster assertions elsewhere; here
+        // the test seam binds the client's mTLS peer expectation to that exact
+        // certificate so the lane can reach the controlled pre-Call hook.
+        let stateless = StatelessSessionConsumerClient::new_unattested_for_test(
             address,
             rustls_pki_types::ServerName::IpAddress(address.ip().into()),
             server_identity,
@@ -22246,7 +22550,7 @@ mod tests {
         .listen("127.0.0.1:0".parse().expect("loopback address"))
         .await
         .expect("listen for V2 reused-boundary test");
-        let stateless = StatelessSessionConsumerClient::new(
+        let stateless = StatelessSessionConsumerClient::new_unattested_for_test(
             address,
             rustls_pki_types::ServerName::IpAddress(address.ip().into()),
             server_identity,
@@ -22326,8 +22630,7 @@ mod tests {
                 })
             }),
             rustls_pki_types::ServerName::try_from("consumer.test").expect("test TLS server name"),
-            material_spiffe("v2-outer-attempt-server"),
-            scope(),
+            test_consumer_voter_authority(),
             material.config(),
         )
         .with_operation_timeout(Duration::from_secs(1));
@@ -22405,7 +22708,7 @@ mod tests {
             .listen("127.0.0.1:0".parse().expect("loopback address"))
             .await
             .expect("listen for V2 status recovery");
-            let stateless = StatelessSessionConsumerClient::new(
+            let stateless = StatelessSessionConsumerClient::new_unattested_for_test(
                 address,
                 rustls_pki_types::ServerName::IpAddress(address.ip().into()),
                 server_identity,
@@ -22532,7 +22835,7 @@ mod tests {
         .listen("127.0.0.1:0".parse().expect("loopback address"))
         .await
         .expect("listen for V2 status pool-wait retry");
-        let stateless = StatelessSessionConsumerClient::new(
+        let stateless = StatelessSessionConsumerClient::new_unattested_for_test(
             address,
             rustls_pki_types::ServerName::IpAddress(address.ip().into()),
             server_identity,
@@ -22645,7 +22948,7 @@ mod tests {
         .await
         .expect("listen for V2 stalled status");
         let persistent = PersistentSessionConsumerClient::from_stateless(
-            StatelessSessionConsumerClient::new(
+            StatelessSessionConsumerClient::new_unattested_for_test(
                 address,
                 rustls_pki_types::ServerName::IpAddress(address.ip().into()),
                 server_identity,

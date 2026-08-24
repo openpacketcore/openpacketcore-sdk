@@ -22,9 +22,10 @@ use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError}
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
     decode_bounded, durable_openraft_config, encode_bounded, DurableOpenraftDomain,
-    EnsureLinearizableOutcome, EnsureLinearizableSupervisor, LinearizableReadBarrier,
-    LinearizableReadBarrierError, LinearizableReadLease, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
-    DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    EnsureLinearizableOutcome, EnsureLinearizableSupervisor, LinearizableReadAdmit,
+    LinearizableReadBarrier, LinearizableReadBarrierError, LinearizableReadLease,
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
@@ -69,7 +70,7 @@ use crate::consumer::{
     SessionConsumerFencedTransitionError, SessionConsumerIdentity,
     SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationStatus,
     SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerRoster, SessionConsumerScope,
     SessionConsumerStoreError, SessionConsumerV2FencedTransitionBatchError,
     SessionConsumerV2FencedTransitionBatchResult, SessionConsumerV2FencedTransitionError,
     SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
@@ -183,7 +184,6 @@ fn reset_fenced_transition_linearizable_admission_count() {
 
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const FENCED_TRANSITION_V2_STATUS_LEADER_COLLECTION_WINDOW: Duration = Duration::from_micros(500);
-const CONSUMER_WATCH_SCOPE_RECHECK_INTERVAL: Duration = Duration::from_millis(50);
 const GENERIC_WATCH_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(50);
 const TOPOLOGY_ENDPOINT_BINDING_DOMAIN: &[u8] =
     b"openpacketcore/session-store/topology-endpoint-binding/v1\0";
@@ -214,6 +214,23 @@ fn fenced_transition_v2_batch_request_id(
     requests: &[FencedTransitionV2Request],
 ) -> Result<SessionConsensusRequestId, StoreError> {
     fenced_transition_v2_batch_outer_request_id(requests).map(SessionConsensusRequestId::from_bytes)
+}
+
+/// Derive a stable private activation request identity from one exact voter
+/// scope. It accepts no caller material, so concurrent state-voter startups
+/// coalesce to one certificate proposal for the same scope.
+fn fenced_transition_activation_request_id(
+    scope: SessionConsensusIdentity,
+) -> SessionConsensusRequestId {
+    let mut hasher = Sha256::new();
+    hasher.update(FENCED_TRANSITION_ACTIVATION_REQUEST_ID_DOMAIN);
+    hasher.update(scope.cluster_id().as_bytes());
+    hasher.update(scope.configuration_id().as_bytes());
+    hasher.update(scope.configuration_epoch().get().to_be_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut request_id = [0_u8; 16];
+    request_id.copy_from_slice(&digest[..16]);
+    SessionConsensusRequestId::from_bytes(request_id)
 }
 
 fn topology_node_bindings(
@@ -505,6 +522,19 @@ enum ForwardMutationReply {
     /// A forwarded write or local proposal crossed a boundary after which the
     /// command may exist and must be resolved by its retained ID.
     OutcomeUnknown,
+    // This is deliberately appended. ForwardMutation is a postcard enum used
+    // by already-deployed state voters, so changing the discriminants of
+    // NotLeader or Unavailable would turn an ordinary mixed-version rejection
+    // into a misinterpreted successful control response.
+    FencedTransitionActivation(Result<FencedTransitionActivationReply, StoreError>),
+}
+
+/// Private forwarding acknowledgement for the state-voter-only V1 startup
+/// preflight. The applied index makes a follower wait until its own SQLite
+/// state machine has durably observed the certificate before reporting ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct FencedTransitionActivationReply {
+    applied_log_index: u64,
 }
 
 // Postcard encodes enum discriminants by declaration order. These test-only
@@ -627,14 +657,6 @@ struct LocalProposalExecution {
     cohort_freeze: Option<Arc<AtomicBool>>,
 }
 
-/// Ownership that must survive until Openraft resolves a proposed command.
-/// Bundling the two guards also makes it impossible for a new proposal path to
-/// accidentally release one admission control before the other.
-struct LocalProposalResources {
-    proposal_permit: tokio::sync::OwnedSemaphorePermit,
-    operation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct ReadBarrierRequest;
 
@@ -651,6 +673,34 @@ struct FencedTransitionCapabilityProbe {
 enum FencedTransitionCapabilityReply {
     V1,
     Unsupported,
+}
+
+/// Probe for the V1 cluster-scope activation command. This is distinct from
+/// the transition probe: a voter that can execute a transition might predate
+/// the activation command, and therefore cannot establish its certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FencedTransitionActivationCapabilityProbe {
+    activation_probe_schema_version: u16,
+    activation_command_schema_version: u16,
+}
+
+const FENCED_TRANSITION_ACTIVATION_PROBE_SCHEMA_V1: u16 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum FencedTransitionActivationCapabilityReply {
+    V1,
+    Unsupported,
+}
+
+/// An explicit authenticated unsupported response is a protocol fact. A
+/// timeout, malformed response, or failed RPC is only a transient failure to
+/// establish unanimity and must never be reported as incompatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencedTransitionCapabilityProbeOutcome {
+    V1,
+    Unsupported,
+    Unavailable,
 }
 
 /// V2's exact-profile probe is a separate payload from V1's frozen probe.
@@ -697,6 +747,16 @@ fn fenced_transition_v2_capability_probe_reply(
 enum FencedTransitionCapabilityAdmission {
     Activated,
     FreshUnanimous,
+}
+
+/// The one local quorum proof that a physical V1 transition or V1 activation
+/// preflight carries into its eventual Raft proposal. It is leader-local, so
+/// it cannot be reused for another scope, authority, or operation.
+struct FencedTransitionProposalAdmission {
+    read_admit: Option<LinearizableReadAdmit<SessionConsensusNodeId>>,
+    scope_identity: SessionConsensusIdentity,
+    voter_set_digest: [u8; 32],
+    required_consumer_scope: ForwardConsumerScope,
 }
 
 /// Exact V2 admission at one linearizable membership scope.
@@ -2998,6 +3058,68 @@ impl ConsensusSessionStore {
         Ok(FencedTransitionCapabilityAdmission::FreshUnanimous)
     }
 
+    /// Check only the durable exact V1 activation fact. The following Raft
+    /// write is the linearizing quorum operation, so activation, status, and
+    /// dynamic capability paths must continue to use their read barriers.
+    async fn activated_fenced_transition_scope_is_current(&self) -> Result<bool, StoreError> {
+        self.require_exact_membership_admission()?;
+        let expected_scope = self.current_scope()?;
+        if self.local_fenced_transition_capability() != AtomicFencedTransitionCapability::V1
+            || !expected_scope.1.contains(&self.inner.local_node_id)
+        {
+            return Ok(false);
+        }
+        let activated = self
+            .inner
+            .backend
+            .consensus_fenced_transition_activation_matches_scope(
+                self.inner.storage_identity,
+                expected_scope.0,
+                expected_scope.1.clone(),
+            )
+            .await?;
+        Ok(activated
+            && self.current_scope()? == expected_scope
+            && self.exact_membership_is_admitted())
+    }
+
+    /// Revalidate every local fact bound to one V1 quorum admission. The
+    /// revalidation is intentionally the final action before `client_write_ff`.
+    async fn revalidate_fenced_transition_proposal_admission_before(
+        &self,
+        admission: &FencedTransitionProposalAdmission,
+        required_consumer_scope: &ForwardConsumerScope,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        self.require_exact_membership_admission()?;
+        if admission.required_consumer_scope != *required_consumer_scope {
+            return Err(consensus_unavailable());
+        }
+        let (current_scope, current_voters) = self.current_scope()?;
+        if current_scope != admission.scope_identity
+            || fenced_transition_voter_set_digest(current_scope, &current_voters)
+                != admission.voter_set_digest
+            || required_consumer_scope
+                .consumer_scope()
+                .is_some_and(|scope| *scope != current_scope)
+        {
+            return Err(consensus_unavailable());
+        }
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        match &admission.read_admit {
+            Some(read_admit) => self
+                .inner
+                .read_barrier
+                .revalidate(read_admit, deadline)
+                .await
+                .map_err(|_| consensus_unavailable()),
+            // The exact activation certificate and the checks above bind this
+            // no-read-index path; the immediate write quorum linearizes it.
+            None => Ok(()),
+        }
+    }
+
     /// Admit V2 for one exact linearizable voter scope and one immutable
     /// fixed-profile digest. V1 activation evidence is deliberately never
     /// consulted here: a V2 receipt/history change requires every exact voter
@@ -3142,6 +3264,18 @@ impl ConsensusSessionStore {
         self.require_fenced_transition_capability_before(deadline)
             .await
             .map(|_| Some(AtomicFencedTransitionCapability::V1))
+    }
+
+    /// Durably activate V1 for this concrete state voter before it accepts
+    /// external traffic. The operation follows the authenticated internal
+    /// forwarding path and returns only after this replica has applied the
+    /// current-scope certificate.
+    pub async fn activate_fenced_transition_capability(&self) -> Result<(), StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.activate_fenced_transition_capability_before(deadline)
+            .await
     }
 
     /// Advertise V2 only after the exact durable V2 certificate or a fresh,
@@ -4130,7 +4264,8 @@ impl ConsensusSessionStore {
             ForwardMutationReply::NotLeader { .. }
             | ForwardMutationReply::OutcomeUnknown
             | ForwardMutationReply::Unavailable
-            | ForwardMutationReply::RecordExpiryPreflight(_) => Err(consensus_unavailable()),
+            | ForwardMutationReply::RecordExpiryPreflight(_)
+            | ForwardMutationReply::FencedTransitionActivation(_) => Err(consensus_unavailable()),
         }
     }
 
@@ -5546,7 +5681,7 @@ impl ConsensusSessionStore {
                     return ConsensusSubmissionEffect::OutcomeUnknown;
                 }
                 ForwardMutationReply::FencedTransitionActivation(_) => {
-                    return Err(consensus_outcome_unavailable(&request.intent));
+                    return ConsensusSubmissionEffect::OutcomeUnknown;
                 }
             }
         }
@@ -5641,7 +5776,8 @@ impl ConsensusSessionStore {
                     self.wait_for_route_refresh(leader, deadline).await?;
                 }
                 ForwardMutationReply::Applied(_)
-                | ForwardMutationReply::RecordExpiryPreflight(_) => {
+                | ForwardMutationReply::RecordExpiryPreflight(_)
+                | ForwardMutationReply::OutcomeUnknown => {
                     return Err(consensus_unavailable());
                 }
             }
@@ -5731,6 +5867,9 @@ impl ConsensusSessionStore {
                 ForwardMutationReply::Applied(_) => {
                     return Err(consensus_unavailable());
                 }
+                ForwardMutationReply::FencedTransitionActivation(_) => {
+                    return Err(consensus_unavailable());
+                }
             }
         }
     }
@@ -5788,7 +5927,8 @@ impl ConsensusSessionStore {
             }
             ForwardMutationReply::OutcomeUnknown
             | ForwardMutationReply::Unavailable
-            | ForwardMutationReply::RecordExpiryPreflight(_) => {
+            | ForwardMutationReply::RecordExpiryPreflight(_)
+            | ForwardMutationReply::FencedTransitionActivation(_) => {
                 FencedTransitionV2StatusLogicalTimeTicketReply::Unavailable
             }
         }
@@ -5819,15 +5959,28 @@ impl ConsensusSessionStore {
                 Ok(guard) => guard,
                 Err(_) => return ForwardMutationReply::Unavailable,
             };
+        let activation_preflight = matches!(
+            &request.intent,
+            SessionMutationIntent::PreflightFencedTransitionCapability
+        );
+        let consumer_scoped = request.required_consumer_scope.is_consumer_scoped();
         let raw_v2_mutation =
             is_raw_fenced_transition_v2_mutation(&request.intent, allow_operator_recovery);
         let fixed_raw_v2_mutation =
             raw_v2_mutation && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum;
-        let initial_authority = if fixed_raw_v2_mutation {
+        // A durable exact V1 activation can be linearized by the immediate
+        // Raft write quorum. It must not relax the distinct V2 authority path.
+        let activated_fenced_transition = !activation_preflight
+            && matches!(&request.intent, SessionMutationIntent::FencedTransition(_))
+            && match self.activated_fenced_transition_scope_is_current().await {
+                Ok(activated) => activated,
+                Err(_) => return ForwardMutationReply::Unavailable,
+            };
+        let initial_authority = if fixed_raw_v2_mutation || activated_fenced_transition {
             // The operation gate remains held, and the exact durable
-            // authority is consumed once in the atomic post-barrier snapshot
-            // below. Reading it here as well would serialize an avoidable
-            // SQLite job without strengthening the acceptance boundary.
+            // authority is consumed at its respective final acceptance
+            // boundary. Reading it here as well would only add an avoidable
+            // SQLite job without strengthening the proposal.
             Ok(())
         } else if allow_operator_recovery {
             self.require_durable_fixed_quorum_admission_before(deadline)
@@ -5901,14 +6054,31 @@ impl ConsensusSessionStore {
             }
         };
 
-        // Raw V2 mutations own one local leader/read-index fence. It retains
-        // exact membership before and after the barrier, then immediately
-        // enters V2 activation/scope validation below. In a fixed quorum, the
-        // next atomic SQLite snapshot is the sole final durable authority
-        // check. Other topology modes retain their initial and final
-        // authority checks. Activation wrappers and every other intent keep
-        // generic leader admission.
-        if requires_generic_leader_admission(&request.intent, allow_operator_recovery) {
+        // A physical V1 transition and the state-voter-only V1 activation
+        // preflight carry this one typed admission through the capability
+        // probe and final proposal. Consumer writes are linearized by the
+        // write itself; raw V2 owns the stronger barrier immediately below.
+        let fenced_read_admit = if activated_fenced_transition {
+            None
+        } else if matches!(
+            &request.intent,
+            SessionMutationIntent::FencedTransition(_)
+                | SessionMutationIntent::PreflightFencedTransitionCapability
+        ) {
+            #[cfg(test)]
+            FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
+            match self.inner.read_barrier.admit(deadline).await {
+                Ok(admit) => Some(admit),
+                Err(LinearizableReadBarrierError::NotLeader { leader }) => {
+                    return ForwardMutationReply::NotLeader { leader };
+                }
+                Err(_) => return ForwardMutationReply::Unavailable,
+            }
+        } else if consumer_scoped
+            || !requires_generic_leader_admission(&request.intent, allow_operator_recovery)
+        {
+            None
+        } else {
             match self
                 .inner
                 .linearizability
@@ -5937,7 +6107,8 @@ impl ConsensusSessionStore {
                 }
                 _ => return ForwardMutationReply::Unavailable,
             }
-        }
+            None
+        };
 
         if raw_v2_mutation {
             if let Err(reply) = self
@@ -6006,30 +6177,9 @@ impl ConsensusSessionStore {
                         .fetch_add(1, Ordering::Relaxed);
                     return ForwardMutationReply::Unavailable;
                 }
-                Err(_) => return ForwardMutationReply::Unavailable,
             }
         } else {
             None
-        };
-
-        if matches!(&request.intent, SessionMutationIntent::FencedTransition(_)) {
-            match self
-                .inner
-                .linearizability
-                .ensure_linearizable(deadline)
-                .await
-            {
-                EnsureLinearizableOutcome::Ready { .. } => None,
-                EnsureLinearizableOutcome::Retry { leader_hint } => {
-                    return ForwardMutationReply::NotLeader {
-                        leader: leader_hint,
-                    };
-                }
-                EnsureLinearizableOutcome::Unavailable => {
-                    return ForwardMutationReply::Unavailable;
-                }
-                _ => return ForwardMutationReply::Unavailable,
-            }
         };
 
         let authority = if activated_fenced_transition {
@@ -6144,7 +6294,10 @@ impl ConsensusSessionStore {
                 }
                 (false, FencedTransitionCapabilityAdmission::Activated) => {}
             }
-        }
+            Some(admission)
+        } else {
+            None
+        };
         if matches!(
             &request.intent,
             SessionMutationIntent::FencedTransitionV2(_)
@@ -6228,6 +6381,7 @@ impl ConsensusSessionStore {
         // non-raw intent.
         if !is_raw_fenced_transition_v2_mutation(&request.intent, allow_operator_recovery)
             && !allow_operator_recovery
+            && fenced_transition_admission.is_none()
             && self
                 .require_application_traffic_authority_before(deadline)
                 .await
@@ -6245,8 +6399,8 @@ impl ConsensusSessionStore {
             let Ok((current_identity, current_voters)) = self.current_scope() else {
                 return ForwardMutationReply::Unavailable;
             };
-            if scope_identity != current_identity
-                || voter_set_digest
+            if *scope_identity != current_identity
+                || *voter_set_digest
                     != fenced_transition_voter_set_digest(current_identity, &current_voters)
                 || profile_digest.is_some_and(|profile_digest| {
                     *profile_digest
@@ -6256,22 +6410,55 @@ impl ConsensusSessionStore {
                 return ForwardMutationReply::Unavailable;
             }
         }
-        self.propose_on_local_leader(
-            request,
-            LocalProposalAuthority {
-                origin,
-                allows_operator_recovery: allow_operator_recovery,
-                fixed_raw_v2_snapshot: fixed_v2_snapshot_logical_time.is_some(),
-            },
-            logical_time,
-            LocalProposalExecution {
-                proposal_permit,
-                operation_guard,
-                cohort_freeze,
-            },
-            deadline,
-        )
-        .await
+        let reply = self
+            .propose_on_local_leader(
+                request,
+                LocalProposalAuthority {
+                    origin,
+                    allows_operator_recovery: allow_operator_recovery,
+                    fixed_raw_v2_snapshot: fixed_v2_snapshot_logical_time.is_some(),
+                },
+                logical_time,
+                LocalProposalExecution {
+                    proposal_permit,
+                    operation_guard,
+                    cohort_freeze,
+                },
+                fenced_transition_admission,
+                deadline,
+            )
+            .await;
+        if activation_preflight {
+            return match reply {
+                ForwardMutationReply::Applied(response)
+                    if matches!(response.result, Ok(SessionMutationOutcome::Unit))
+                        && response.raft_log_index != 0 =>
+                {
+                    ForwardMutationReply::FencedTransitionActivation(Ok(
+                        FencedTransitionActivationReply {
+                            applied_log_index: response.raft_log_index,
+                        },
+                    ))
+                }
+                ForwardMutationReply::Applied(response) => {
+                    ForwardMutationReply::FencedTransitionActivation(Err(response
+                        .result
+                        .err()
+                        .unwrap_or_else(consensus_unavailable)))
+                }
+                ForwardMutationReply::NotLeader { leader } => {
+                    ForwardMutationReply::NotLeader { leader }
+                }
+                ForwardMutationReply::Unavailable | ForwardMutationReply::OutcomeUnknown => {
+                    ForwardMutationReply::Unavailable
+                }
+                ForwardMutationReply::RecordExpiryPreflight(_)
+                | ForwardMutationReply::FencedTransitionActivation(_) => {
+                    ForwardMutationReply::Unavailable
+                }
+            };
+        }
+        reply
     }
 
     async fn propose_on_local_leader(
@@ -6280,6 +6467,7 @@ impl ConsensusSessionStore {
         authority: LocalProposalAuthority,
         logical_time: Timestamp,
         execution: LocalProposalExecution,
+        fenced_transition_admission: Option<FencedTransitionProposalAdmission>,
         deadline: tokio::time::Instant,
     ) -> ForwardMutationReply {
         let LocalProposalExecution {
@@ -6312,6 +6500,12 @@ impl ConsensusSessionStore {
                 return ForwardMutationReply::Unavailable;
             }
         }
+        #[cfg(test)]
+        let consumer_scoped = request.required_consumer_scope.is_consumer_scoped();
+        #[cfg(test)]
+        let consumer_compare_and_set =
+            matches!(&request.intent, SessionMutationIntent::CompareAndSet(_));
+        let required_consumer_scope = request.required_consumer_scope.clone();
         let reroute_receiver_forward_to_leader =
             !mutation_requires_exact_status_resolution(&request);
         let intent = match request.intent {
@@ -6359,7 +6553,19 @@ impl ConsensusSessionStore {
         }
         let _ = encoded_command;
 
-        if !authority.allows_operator_recovery
+        if let Some(admission) = fenced_transition_admission.as_ref() {
+            if self
+                .revalidate_fenced_transition_proposal_admission_before(
+                    admission,
+                    &required_consumer_scope,
+                    deadline,
+                )
+                .await
+                .is_err()
+            {
+                return ForwardMutationReply::Unavailable;
+            }
+        } else if !authority.allows_operator_recovery
             && !authority.fixed_raw_v2_snapshot
             && self
                 .require_application_traffic_authority_before(deadline)
@@ -6399,6 +6605,13 @@ impl ConsensusSessionStore {
                     return ForwardMutationReply::Unavailable;
                 }
                 Ok(Ok(response)) => {
+                    #[cfg(test)]
+                    if consumer_scoped {
+                        CONSUMER_CONSENSUS_PROPOSAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                        let _ = CONSUMER_CAS_TEST_COUNTERS.try_with(|counters| {
+                            counters.record_proposal();
+                        });
+                    }
                     if status_ticket_proposal {
                         self.inner
                             .diagnostics
@@ -6610,6 +6823,7 @@ impl ConsensusSessionStore {
                     operation_guard,
                     cohort_freeze: None,
                 },
+                None,
                 deadline,
             )
             .await;
@@ -6675,7 +6889,8 @@ impl ConsensusSessionStore {
             }
             ForwardMutationReply::OutcomeUnknown
             | ForwardMutationReply::Unavailable
-            | ForwardMutationReply::RecordExpiryPreflight(_) => {
+            | ForwardMutationReply::RecordExpiryPreflight(_)
+            | ForwardMutationReply::FencedTransitionActivation(_) => {
                 Err(OperatorRecoveryCommitError::Unavailable)
             }
         }
@@ -7828,6 +8043,11 @@ fn fenced_transition_activation_scope(
             scope_identity,
             voter_set_digest,
             ..
+        }
+        | SessionMutationIntent::ActivateFencedTransitionCapability {
+            scope_identity,
+            voter_set_digest,
+            ..
         } => Some((scope_identity, voter_set_digest, None)),
         SessionMutationIntent::ActivateFencedTransitionV2 {
             scope_identity,
@@ -7860,6 +8080,8 @@ fn mutation_requires_exact_status_resolution(request: &ForwardMutationRequest) -
         || matches!(
             &request.intent,
             SessionMutationIntent::FencedTransition(_)
+                | SessionMutationIntent::PreflightFencedTransitionCapability
+                | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
                 | SessionMutationIntent::FencedTransitionV2(_)
                 | SessionMutationIntent::FencedTransitionV2Batch(_)
                 | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
@@ -9645,7 +9867,7 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
 
     async fn execute_v2(
         &self,
-        _identity: &SessionConsumerIdentity,
+        authorization: &SessionConsumerAuthorization,
         request: SessionConsumerV2Request,
     ) -> SessionConsumerV2Response {
         let deadline = match self.operation_deadline() {
@@ -9654,6 +9876,9 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
         };
         if request.validate().is_err() {
             return SessionConsumerV2Response::Rejected(SessionConsumerRejection::MalformedRequest);
+        }
+        if let Err(rejection) = authorization.authorize_v2_operation(request.operation()) {
+            return SessionConsumerV2Response::Rejected(rejection);
         }
         if let Some(transition) =
             fixed_durable_v2_status_for_batch_dispatch(self.store.inner.topology.mode(), &request)
@@ -10353,6 +10578,7 @@ mod membership_tests {
 
     use super::*;
     use crate::backend::ReplicationOp;
+    use crate::consumer::SessionConsumerTenantNfScope;
     use crate::model::{FenceToken, Generation, SessionKeyType, StateClass, StateType};
     use crate::record::EncryptedSessionPayload;
     use crate::topology::{
@@ -10536,27 +10762,6 @@ mod membership_tests {
                 logical_time: Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH),
             },
         ))
-    }
-
-    #[test]
-    fn permanent_consumer_watch_setup_errors_remain_typed_terminals() {
-        assert_eq!(
-            consumer_watch_setup_terminal(StoreError::ReplicationWatchCatchUpRequired),
-            Some(SessionConsumerStoreError::WatchCatchUpRequired)
-        );
-        assert_eq!(
-            consumer_watch_setup_terminal(StoreError::ReplicationLogCursorCompacted {
-                resume_from: 7,
-            }),
-            Some(SessionConsumerStoreError::InvalidInput)
-        );
-        assert_eq!(
-            consumer_watch_setup_terminal(StoreError::BackendUnavailable(
-                "fixed test unavailable".into(),
-            )),
-            None,
-            "only coherent permanent cursor decisions bypass transient setup rejection"
-        );
     }
 
     #[derive(Debug)]
@@ -12721,6 +12926,7 @@ mod membership_tests {
                     operation_guard,
                     cohort_freeze: None,
                 },
+                None,
                 deadline,
             )
             .await;
@@ -14524,6 +14730,7 @@ mod membership_tests {
                     operation_guard,
                     cohort_freeze: None,
                 },
+                None,
                 tokio::time::Instant::now() + Duration::from_secs(1),
             )
             .await;

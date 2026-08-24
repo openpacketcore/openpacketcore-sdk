@@ -3538,6 +3538,7 @@ dependencies = [
 name = "opc-schema-validate"
 version = "0.2.0"
 dependencies = [
+ "regex",
  "serde_json",
 ]
 

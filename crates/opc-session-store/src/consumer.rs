@@ -31,11 +31,12 @@ use crate::{
     FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
     FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2Capability,
     FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2RequestId,
-    FencedTransitionV2Status, LeaseError, LeaseGuard, OwnerId, RecordExpiryPreflight,
-    RestoreScanPage, RestoreScanRequest, SessionConsensusIdentity, SessionConsensusRequestId,
-    SessionKey, SessionOp, SessionOpResult, StoreError, StoredSessionRecord,
-    FENCED_TRANSITION_REQUEST_ID_BYTES, FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
-    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    FencedTransitionV2Status, LeaseError, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
+    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusRequestId, SessionKey, SessionOp, SessionOpResult,
+    StoreError, StoredSessionRecord, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
+    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 
 #[cfg(test)]
@@ -1256,6 +1257,14 @@ impl SessionConsumerAuthorization {
                 .is_none_or(|record| self.permits_key(&record.key))
     }
 
+    fn permits_fenced_transition_v2(&self, request: &FencedTransitionV2Request) -> bool {
+        self.permits_key(request.lease().key())
+            && request
+                .mutation()
+                .record()
+                .is_none_or(|record| self.permits_key(&record.key))
+    }
+
     /// Check whether this already-authenticated authority grants one complete
     /// validated operation.
     ///
@@ -1311,6 +1320,29 @@ impl SessionConsumerAuthorization {
             | SessionConsumerOperation::FencedTransitionStatus { request } => {
                 self.permits_fenced_transition(request)
             }
+        };
+        authorized
+            .then_some(())
+            .ok_or(SessionConsumerRejection::Unauthorized)
+    }
+
+    /// Check whether this manifest-issued authority grants one complete V2
+    /// fenced-transition operation. V2 uses a distinct wire envelope, but it
+    /// never bypasses the same tenant/NF authority boundary as V1.
+    pub fn authorize_v2_operation(
+        &self,
+        operation: &SessionConsumerV2Operation,
+    ) -> Result<(), SessionConsumerRejection> {
+        let authorized = match operation {
+            SessionConsumerV2Operation::FencedTransitionV2Capability
+            | SessionConsumerV2Operation::FencedTransitionV2HistoryState => true,
+            SessionConsumerV2Operation::FencedTransitionV2 { request }
+            | SessionConsumerV2Operation::FencedTransitionV2Status { request } => {
+                self.permits_fenced_transition_v2(request)
+            }
+            SessionConsumerV2Operation::FencedTransitionV2Batch { requests } => requests
+                .iter()
+                .all(|request| self.permits_fenced_transition_v2(request)),
         };
         authorized
             .then_some(())
@@ -2498,7 +2530,7 @@ pub trait SessionQuorumConsumer: Send + Sync {
     /// durable leader checks as [`Self::execute`].
     async fn execute_v2(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _authorization: &SessionConsumerAuthorization,
         _request: SessionConsumerV2Request,
     ) -> SessionConsumerV2Response {
         SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
@@ -2745,21 +2777,26 @@ pub trait StatelessSessionConsumer: Send + Sync {}
 mod tests {
     use super::{
         derive_consumer_consensus_request_id, derive_consumer_fenced_transition_request,
-        SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
-        SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
-        SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerScope,
-        SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
-        SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation,
-        SessionConsumerV2Request, SessionConsumerV2Response,
+        SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationGrantError,
+        SessionConsumerAuthorizationManifestError, SessionConsumerFencedTransitionError,
+        SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerOperation,
+        SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+        SessionConsumerRoster, SessionConsumerRosterError, SessionConsumerScope,
+        SessionConsumerStoreError, SessionConsumerTenantNfScope,
+        SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
+        SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+        SESSION_CONSUMER_IDENTITY_MAX_BYTES,
     };
     use crate::{
         AtomicFencedTransitionCapability, FenceToken, FencedTransitionLease,
         FencedTransitionMutation, FencedTransitionRequest, FencedTransitionRequestId,
         FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
         FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2Status,
-        Generation, OwnerId, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionKey, SessionKeyType,
-        StableId, StoreError,
+        Generation, OwnerId, QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint,
+        ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, RestoreScanScope,
+        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsensusNodeId,
+        SessionKey, SessionKeyType, SessionOp, StableId, StoreError, QUORUM_TOPOLOGY_MAX_MEMBERS,
     };
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
@@ -2772,6 +2809,357 @@ mod tests {
             SessionConsensusConfigurationId::from_bytes([configuration; 32]),
             SessionConsensusConfigurationEpoch::new(epoch).expect("non-zero configuration epoch"),
         ))
+    }
+
+    fn roster_scope(cluster: u8, configuration: u8, epoch: u64) -> SessionConsumerScope {
+        SessionConsumerScope::new(SessionConsensusIdentity::new(
+            SessionConsensusClusterId::from_bytes([cluster; 32]),
+            SessionConsensusConfigurationId::from_bytes([configuration; 32]),
+            SessionConsensusConfigurationEpoch::new(epoch).expect("non-zero configuration epoch"),
+        ))
+    }
+
+    fn roster_nodes(values: &[u64]) -> BTreeSet<SessionConsensusNodeId> {
+        values
+            .iter()
+            .copied()
+            .map(|value| SessionConsensusNodeId::new(value).expect("valid roster node ID"))
+            .collect()
+    }
+
+    fn roster_descriptor(node: u64, tls_identity: impl Into<String>) -> QuorumReplicaDescriptor {
+        QuorumReplicaDescriptor::new(
+            ReplicaId::new(format!("consumer-roster-node-{node}")).expect("replica ID"),
+            ReplicaEndpoint::new(format!("consumer-roster-node-{node}.test.invalid"), 7443)
+                .expect("endpoint"),
+            ReplicaTlsIdentity::new(tls_identity).expect("TLS identity"),
+            ReplicaFailureDomain::new(format!("consumer-roster-zone-{node}"))
+                .expect("failure domain"),
+            ReplicaBackingIdentity::new(format!("consumer-roster-backing-{node}"))
+                .expect("backing identity"),
+        )
+    }
+
+    fn roster_descriptors() -> Vec<(u64, QuorumReplicaDescriptor)> {
+        vec![
+            (
+                1,
+                roster_descriptor(1, "spiffe://test.invalid/consumer-roster/one"),
+            ),
+            (
+                2,
+                roster_descriptor(2, "spiffe://test.invalid/consumer-roster/two"),
+            ),
+        ]
+    }
+
+    fn authorization_fixture() -> (super::SessionConsumerAuthorization, SessionKey) {
+        let scope = roster_scope(9, 8, 7);
+        let node_id = SessionConsensusNodeId::new(1).expect("roster node");
+        let roster = SessionConsumerRoster::try_new(
+            scope,
+            &roster_nodes(&[1]),
+            vec![(
+                (node_id.get()),
+                roster_descriptor(1, "spiffe://test.invalid/consumer-roster/voter"),
+            )],
+        )
+        .expect("validated roster");
+        let identity = SessionConsumerIdentity::new(
+            "spiffe://test.invalid/tenant/tenant-a/ns/default/sa/app/nf/smf/instance/one",
+        )
+        .expect("consumer identity");
+        let grant = SessionConsumerAuthorizationGrant::try_new(
+            SpiffeId::new(identity.as_str()).expect("canonical SPIFFE ID"),
+            [SessionConsumerTenantNfScope::new(
+                TenantId::from_static("tenant-a"),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("consumer grant");
+        let manifest = roster
+            .authorization_manifest(node_id, [grant])
+            .expect("authorization manifest");
+        let key = SessionKey {
+            tenant: TenantId::from_static("tenant-a"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from_static(b"authorized-key")).expect("stable ID"),
+        };
+        (
+            manifest.authorize(&identity).expect("authorization token"),
+            key,
+        )
+    }
+
+    #[test]
+    fn explicit_grants_reject_duplicate_scopes_and_identities() {
+        let identity = SpiffeId::new(
+            "spiffe://test.invalid/tenant/tenant-a/ns/default/sa/app/nf/smf/instance/one",
+        )
+        .expect("canonical SPIFFE ID");
+        let scope = SessionConsumerTenantNfScope::new(
+            TenantId::from_static("tenant-a"),
+            NetworkFunctionKind::smf(),
+        );
+        assert!(matches!(
+            SessionConsumerAuthorizationGrant::try_new(identity.clone(), [scope.clone(), scope]),
+            Err(SessionConsumerAuthorizationGrantError::DuplicateScope)
+        ));
+
+        let roster_scope = roster_scope(9, 8, 7);
+        let node_id = SessionConsensusNodeId::new(1).expect("roster node");
+        let roster = SessionConsumerRoster::try_new(
+            roster_scope,
+            &roster_nodes(&[1]),
+            vec![(
+                1,
+                roster_descriptor(1, "spiffe://test.invalid/consumer-roster/voter"),
+            )],
+        )
+        .expect("validated roster");
+        let grant = || {
+            SessionConsumerAuthorizationGrant::try_new(
+                identity.clone(),
+                [SessionConsumerTenantNfScope::new(
+                    TenantId::from_static("tenant-a"),
+                    NetworkFunctionKind::smf(),
+                )],
+            )
+            .expect("grant")
+        };
+        assert!(matches!(
+            roster.authorization_manifest(node_id, [grant(), grant()]),
+            Err(SessionConsumerAuthorizationManifestError::DuplicateIdentity)
+        ));
+    }
+
+    #[test]
+    fn authorization_requires_exact_scope_and_denies_global_watch() {
+        let (authorization, key) = authorization_fixture();
+        let foreign = SessionKey {
+            tenant: TenantId::from_static("tenant-z"),
+            ..key.clone()
+        };
+        assert_eq!(
+            authorization.authorize_operation(&SessionConsumerOperation::Get {
+                key: foreign.clone()
+            }),
+            Err(SessionConsumerRejection::Unauthorized),
+            "an ungranted third tenant is never inferred from the SPIFFE ID"
+        );
+        assert_eq!(
+            authorization.authorize_operation(&SessionConsumerOperation::Batch {
+                ops: vec![
+                    SessionOp::Get { key: key.clone() },
+                    SessionOp::Get {
+                        key: foreign.clone()
+                    }
+                ],
+            }),
+            Err(SessionConsumerRejection::Unauthorized),
+            "every bounded batch slot is checked before dispatch"
+        );
+        assert_eq!(
+            authorization.authorize_operation(&SessionConsumerOperation::ScanRestoreRecords {
+                request: RestoreScanRequest {
+                    scope: RestoreScanScope {
+                        tenant: Some(key.tenant.clone()),
+                        ..RestoreScanScope::all()
+                    },
+                    cursor: None,
+                    limit: 1,
+                },
+            }),
+            Err(SessionConsumerRejection::Unauthorized),
+            "restore requires both exact tenant and NF instead of a prefix filter"
+        );
+        assert!(authorization
+            .authorize_operation(&SessionConsumerOperation::ScanRestoreRecords {
+                request: RestoreScanRequest {
+                    scope: RestoreScanScope {
+                        tenant: Some(key.tenant.clone()),
+                        nf_kind: Some(key.nf_kind.clone()),
+                        ..RestoreScanScope::all()
+                    },
+                    cursor: None,
+                    limit: 1,
+                },
+            })
+            .is_ok());
+        assert_eq!(
+            authorization.authorize_operation(&SessionConsumerOperation::Watch { start_sequence: 77 }),
+            Err(SessionConsumerRejection::Unauthorized),
+            "a global sequence would reveal foreign-tenant mutation timing even after item filtering"
+        );
+    }
+
+    #[test]
+    fn consumer_roster_is_sorted_and_commits_every_scope_and_member_component() {
+        let scope = roster_scope(1, 2, 3);
+        let expected_nodes = roster_nodes(&[1, 2]);
+        let roster = SessionConsumerRoster::try_new(
+            scope,
+            &expected_nodes,
+            vec![
+                (
+                    2,
+                    roster_descriptor(2, "spiffe://test.invalid/consumer-roster/two"),
+                ),
+                (
+                    1,
+                    roster_descriptor(1, "spiffe://test.invalid/consumer-roster/one"),
+                ),
+            ],
+        )
+        .expect("complete roster");
+        let reordered =
+            SessionConsumerRoster::try_new(scope, &expected_nodes, roster_descriptors())
+                .expect("reordered complete roster");
+
+        assert_eq!(
+            roster
+                .consensus_members()
+                .map(|member| (member.node_id().get(), member.tls_identity().to_owned()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "spiffe://test.invalid/consumer-roster/one".to_owned()),
+                (2, "spiffe://test.invalid/consumer-roster/two".to_owned()),
+            ]
+        );
+        assert_eq!(roster.roster_commitment(), reordered.roster_commitment());
+        let commitment = roster.roster_commitment();
+        for changed_scope in [
+            roster_scope(4, 2, 3),
+            roster_scope(1, 5, 3),
+            roster_scope(1, 2, 6),
+        ] {
+            assert_ne!(
+                commitment,
+                SessionConsumerRoster::try_new(
+                    changed_scope,
+                    &expected_nodes,
+                    roster_descriptors()
+                )
+                .expect("changed scope roster")
+                .roster_commitment()
+            );
+        }
+        assert_ne!(
+            commitment,
+            SessionConsumerRoster::try_new(
+                scope,
+                &expected_nodes,
+                vec![
+                    (
+                        1,
+                        roster_descriptor(1, "spiffe://test.invalid/consumer-roster/replaced")
+                    ),
+                    (
+                        2,
+                        roster_descriptor(2, "spiffe://test.invalid/consumer-roster/two")
+                    ),
+                ],
+            )
+            .expect("changed TLS roster")
+            .roster_commitment()
+        );
+        let changed_nodes = roster_nodes(&[1, 7]);
+        assert_ne!(
+            commitment,
+            SessionConsumerRoster::try_new(
+                scope,
+                &changed_nodes,
+                vec![
+                    (
+                        1,
+                        roster_descriptor(1, "spiffe://test.invalid/consumer-roster/one")
+                    ),
+                    (
+                        7,
+                        roster_descriptor(7, "spiffe://test.invalid/consumer-roster/two")
+                    ),
+                ],
+            )
+            .expect("changed node roster")
+            .roster_commitment()
+        );
+        assert!(!format!("{roster:?}").contains("consumer-roster/one"));
+        assert_eq!(
+            format!("{:?}", roster.roster_commitment()),
+            "SessionConsumerRosterCommitment(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn consumer_roster_rejects_invalid_duplicate_and_scope_mismatched_bindings() {
+        let scope = roster_scope(1, 2, 3);
+        let one_member = roster_nodes(&[1]);
+        let two_members = roster_nodes(&[1, 2]);
+        let valid = roster_descriptor(1, "spiffe://test.invalid/consumer-roster/one");
+
+        assert!(matches!(
+            SessionConsumerRoster::try_new(scope, &BTreeSet::new(), std::iter::empty()),
+            Err(SessionConsumerRosterError::Empty)
+        ));
+        let oversized_values = (1..=(QUORUM_TOPOLOGY_MAX_MEMBERS as u64 + 1)).collect::<Vec<_>>();
+        assert!(matches!(
+            SessionConsumerRoster::try_new(
+                scope,
+                &roster_nodes(&oversized_values),
+                std::iter::empty()
+            ),
+            Err(SessionConsumerRosterError::MemberCountTooLarge)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(
+                scope,
+                &one_member,
+                vec![
+                    (1, valid.clone()),
+                    (
+                        1,
+                        roster_descriptor(1, "spiffe://test.invalid/consumer-roster/other")
+                    ),
+                ],
+            ),
+            Err(SessionConsumerRosterError::DuplicateNodeId)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(
+                scope,
+                &two_members,
+                vec![(1, valid.clone()), (2, valid.clone())],
+            ),
+            Err(SessionConsumerRosterError::DuplicateTlsIdentity)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(scope, &one_member, vec![(0, valid.clone())]),
+            Err(SessionConsumerRosterError::InvalidNodeId)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(
+                scope,
+                &one_member,
+                vec![(i64::MAX as u64 + 1, valid.clone())],
+            ),
+            Err(SessionConsumerRosterError::InvalidNodeId)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(
+                scope,
+                &one_member,
+                vec![(
+                    1,
+                    roster_descriptor(1, "x".repeat(SESSION_CONSUMER_IDENTITY_MAX_BYTES + 1)),
+                )],
+            ),
+            Err(SessionConsumerRosterError::InvalidTlsIdentity)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(scope, &two_members, vec![(1, valid)]),
+            Err(SessionConsumerRosterError::ScopeMismatch)
+        ));
     }
 
     #[test]

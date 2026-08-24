@@ -2915,8 +2915,6 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
     pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ReplicationWatcher>>>,
     #[cfg(test)]
-    pub(crate) consumer_watch_projection_count: Arc<AtomicUsize>,
-    #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) snapshot_capture_gate: Arc<SnapshotCaptureGate>,
@@ -3132,8 +3130,6 @@ impl SqliteConsensusCore {
             snapshot_receive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             applied_progress,
             watchers: Arc::clone(&backend.watchers),
-            #[cfg(test)]
-            consumer_watch_projection_count: Arc::clone(&backend.consumer_watch_projection_count),
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
             #[cfg(test)]
@@ -8620,6 +8616,22 @@ pub(crate) fn validate_command_for_log(
             "session consensus authorized intent nesting is invalid",
         ));
     }
+    match semantic_intent {
+        SessionMutationIntent::PreflightFencedTransitionCapability => {
+            return Err(invalid_data(
+                "session consensus activation preflight reached the log",
+            ));
+        }
+        SessionMutationIntent::ActivateFencedTransitionCapability { schema_version, .. }
+            if *schema_version != FENCED_TRANSITION_SCHEMA_V1
+                || !matches!(command.intent, SessionMutationIntent::Authorized { .. }) =>
+        {
+            return Err(invalid_data(
+                "session consensus activation certificate is invalid",
+            ));
+        }
+        _ => {}
+    }
     // Maintenance has no self-authenticated request body, but its logical
     // time is still part of the profiled V2 command wire shape.  Reject it
     // before follower admission can project a clock advance or lifecycle
@@ -9951,6 +9963,8 @@ impl MembershipLogProjection {
             | SessionMutationIntent::ReadConsumerRecord { .. }
             | SessionMutationIntent::FencedTransition(_)
             | SessionMutationIntent::ActivateFencedTransition { .. }
+            | SessionMutationIntent::PreflightFencedTransitionCapability
+            | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
             | SessionMutationIntent::FencedTransitionV2(_)
             | SessionMutationIntent::FencedTransitionV2Batch(_)
             | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
@@ -10275,32 +10289,6 @@ pub(crate) fn last_log_sync(
         return Err(invalid_data("persisted session consensus log row mismatch"));
     }
     Ok(Some(entry.log_id))
-}
-
-/// Read only the tail index for a bounded range decision.  Unlike
-/// [`last_log_sync`], this deliberately does not hydrate an entry: the range
-/// consumer immediately below decodes and validates every entry it is going
-/// to use, while this probe otherwise makes an avoidable second maximum-size
-/// ciphertext allocation on every apply-log read.
-fn last_log_index_sync(
-    conn: &Connection,
-    identity: SessionConsensusIdentity,
-) -> io::Result<Option<u64>> {
-    let row = conn
-        .query_row(
-            "SELECT configuration_epoch, log_index FROM consensus_log ORDER BY log_index DESC LIMIT 1",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(db_error)?;
-    let Some((epoch, index)) = row else {
-        return Ok(read_purged_sync(conn, identity)?.map(|log_id| log_id.index));
-    };
-    validate_epoch(epoch, identity)?;
-    checked_u64(index)
-        .map(Some)
-        .map_err(|_| invalid_data("persisted session consensus log index is invalid"))
 }
 
 pub(crate) fn read_log_range_sync(
@@ -15484,6 +15472,7 @@ fn execute_application_intent_sync(
         | SessionMutationIntent::FenceTopologyAuthority { .. }
         | SessionMutationIntent::AbortTopologyTransition { .. }
         | SessionMutationIntent::FinalizeTopologyTransition { .. }
+        | SessionMutationIntent::PreflightFencedTransitionCapability
         | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
         | SessionMutationIntent::FencedTransitionV2Batch(_)
         | SessionMutationIntent::Authorized { .. } => Err(StoreError::BackendUnavailable(
@@ -15544,6 +15533,7 @@ fn fenced_transition_access_is_authorized_sync(
             mutation.as_ref(),
             SessionMutationIntent::FencedTransition(_)
                 | SessionMutationIntent::ActivateFencedTransition { .. }
+                | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
                 | SessionMutationIntent::FencedTransitionV2(_)
                 | SessionMutationIntent::FencedTransitionV2Batch(_)
                 | SessionMutationIntent::ActivateFencedTransitionV2 { .. }

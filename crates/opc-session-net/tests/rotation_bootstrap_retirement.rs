@@ -657,7 +657,7 @@ async fn consensus_client_material_epoch_successor_bypasses_authenticated_retire
     let identity = binding.consensus_identity();
     let remote_node_id = binding.remote_consensus_node_id();
     let request = SessionConsensusWireRequest::try_new(
-        identity.clone(),
+        identity,
         binding.local_consensus_node_id(),
         SessionConsensusRpcFamily::Vote,
         b"material-epoch-successor".to_vec(),
@@ -681,7 +681,10 @@ async fn consensus_client_material_epoch_successor_bypasses_authenticated_retire
     let old_epoch = client_config.material_status().epoch();
     client_source.send_replace(Some(pki.identity_state(CLIENT_REPLICA)));
     wait_for_material_epoch(|| client_config.material_status(), old_epoch).await;
-    assert_eq!(identity, request.identity, "authority remains exact across material rotation");
+    assert_eq!(
+        identity, request.identity,
+        "authority remains exact across material rotation"
+    );
     assert_eq!(
         remote_node_id,
         manifest
@@ -982,6 +985,10 @@ fn authenticated_pre_hello_rotation_is_explicit_bounded_and_metric_clean() {
         generic_client_retries_authenticated_bootstrap_retirement(&pki, &manifest).await;
         consensus_client_defers_authenticated_bootstrap_retirement_to_later_call(&pki, &manifest)
             .await;
+        consensus_client_material_epoch_successor_bypasses_authenticated_retirement_gate(
+            &pki, &manifest,
+        )
+        .await;
         generic_unsigned_eof_remains_a_failure(&pki, &manifest).await;
         consensus_partial_retirement_control_eof_remains_a_failure(&pki, &manifest).await;
         assert_generic_server_pre_hello_rotation(&pki, &manifest, RotationRace::Material).await;

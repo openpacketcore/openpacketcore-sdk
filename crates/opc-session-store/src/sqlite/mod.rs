@@ -541,8 +541,6 @@ pub struct SqliteSessionBackend {
     pub(crate) fixed_quorum_durable_check_count: Arc<AtomicUsize>,
     watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
     #[cfg(test)]
-    pub(crate) consumer_watch_projection_count: Arc<AtomicUsize>,
-    #[cfg(test)]
     pub(crate) watch_registration_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) watch_backlog_captured: Arc<AtomicBool>,
@@ -1082,8 +1080,6 @@ impl SqliteSessionBackend {
             #[cfg(test)]
             fixed_quorum_durable_check_count: Arc::new(AtomicUsize::new(0)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            #[cfg(test)]
-            consumer_watch_projection_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             watch_registration_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
@@ -2084,6 +2080,59 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read one prepared consumer compare-and-set receipt after a
+    /// caller-owned leader-linearizable barrier. This is a read-only query of
+    /// the existing consensus outcome ledger; it opens no prepared-CAS
+    /// journal and performs no schema or migration work.
+    pub(crate) async fn consensus_consumer_compare_and_set_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        lookup: consensus::ConsumerCompareAndSetReceiptLookup,
+    ) -> Result<crate::consumer::SessionConsumerCompareAndSetStatus, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let status = consensus::read_consumer_compare_and_set_status_sync(
+                &tx,
+                storage_identity,
+                lookup,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(status)
+        })
+        .await
+    }
+
+    /// Check one exact consumer binding before the leader decides whether a
+    /// marker proposal is necessary. This is a point read of the outcome
+    /// ledger, not a receipt barrier, mutation, or consensus proposal.
+    pub(crate) async fn consensus_consumer_request_binding_lookup(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        authority_identity: crate::consensus::SessionConsensusIdentity,
+        binding_request_id: crate::consensus::SessionConsensusRequestId,
+        request_commitment: [u8; 32],
+    ) -> Result<consensus::ConsumerRequestBindingLookup, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let lookup = consensus::read_consumer_request_binding_sync(
+                &tx,
+                storage_identity,
+                authority_identity,
+                binding_request_id,
+                request_commitment,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(lookup)
+        })
+        .await
+    }
+
     /// Read one exact V2 receipt after a caller-owned barrier.
     pub(crate) async fn consensus_fenced_transition_v2_status(
         &self,
@@ -2484,43 +2533,6 @@ impl SqliteSessionBackend {
         watchers.retain(|watcher| !watcher.is_closed());
         if let Some(watcher) = watcher {
             watchers.push(watcher);
-        }
-        use futures_util::StreamExt;
-        Ok(stream.boxed())
-    }
-
-    /// Subscribe an authenticated consumer to redacted committed changes.
-    ///
-    /// The raw replication backlog is projected while the ordinary watch
-    /// registration lock is held, which closes the capture/register race.
-    /// Live consumers then receive only compact projection envelopes through
-    /// their own byte-bounded registry; no raw replay entry is cloned per
-    /// consumer connection.
-    pub(crate) async fn consensus_consumer_watch(
-        &self,
-        start_sequence: u64,
-    ) -> Result<
-        futures_util::stream::BoxStream<'static, Result<crate::SessionConsumerChange, StoreError>>,
-        StoreError,
-    > {
-        let cursor = ReplicationWatchCursor::new(start_sequence);
-        // The ordinary watcher mutex serializes raw append notification with
-        // backlog capture. Keep it while adding the projected subscriber so a
-        // committed entry can land in neither source.
-        let _raw_watchers = self.watchers.lock().await;
-        let existing = self
-            .consensus_get_replication_log(
-                cursor.first_sequence(),
-                watch_backlog_query_limit(cursor),
-            )
-            .await?;
-        #[cfg(test)]
-        self.pause_after_watch_backlog_capture().await?;
-        let (stream, watcher) = prepare_consumer_watch_registration(cursor, existing)?;
-        let mut consumer_watchers = self.consumer_watchers.lock().await;
-        consumer_watchers.retain(|watcher| !watcher.is_closed());
-        if let Some(watcher) = watcher {
-            consumer_watchers.push(watcher);
         }
         use futures_util::StreamExt;
         Ok(stream.boxed())

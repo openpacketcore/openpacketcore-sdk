@@ -10,28 +10,27 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-#[cfg(feature = "test-control")]
-use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
+use opc_consensus::engine::raft::AppendEntriesRequest;
 use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+    DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_key::{
     KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, Zeroizing,
     AES_256_GCM_SIV_KEY_LEN,
 };
-#[allow(unused_imports)]
 use opc_session_net::{
-    conservative_payload_budget, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver, RemoteSessionConsensusPeer,
-    SessionClusterId, SessionConfigurationGeneration, SessionConsensusServer,
-    SessionConsensusServerHandle, SessionConsumerAuthorizer, SessionConsumerClientError,
-    SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
-    SessionConsumerMutationError, SessionQuorumConsumerServer, SessionReauthenticationControl,
-    SessionReplicationManifest, StatelessSessionConsumerClient,
+    session_consumer_payload_budget, PersistentSessionConsumerClient,
+    PersistentSessionConsumerConfig, PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver,
+    RemoteSessionConsensusPeer, SessionClusterId, SessionConfigurationGeneration,
+    SessionConsensusServer, SessionConsensusServerHandle, SessionConsumerAuthorizer,
+    SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+    SessionConsumerLeaseMutationError, SessionConsumerMutationError,
+    SessionConsumerPreparedCheckpointBackend, SessionQuorumConsumerServer,
+    SessionReauthenticationControl, SessionReplicationManifest, StatelessSessionConsumerClient,
     DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT, MAX_NEGOTIATED_FRAME_SIZE,
     SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_V2_ALPN,
-    SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
 };
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, ConsensusSessionStore,
@@ -39,18 +38,22 @@ use opc_session_store::{
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
     FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
     FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
-    Generation, LeaseGuard, OwnerId, PreparedFencedTransitionJournal,
-    PreparedFencedTransitionJournalKey, PreparedFencedTransitionLookup, QuorumReplicaDescriptor,
-    QuorumTopologyConfig, QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest,
-    SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionConsumerChange, SessionConsumerIdentity, SessionConsumerLeaseError,
+    Generation, LeaseGuard, OwnerId, PreparedCheckpointBudget, PreparedCompareAndSetExecuteError,
+    PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
+    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
+    PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, SessionBackend,
+    SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusResponse,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerAuthorization,
+    SessionConsumerAuthorizationGrant, SessionConsumerChange, SessionConsumerLeaseError,
     SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
     SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
-    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
-    SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
+    SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
+    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+    SessionConsumerVoterAuthority, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
     SessionPayloadEncoding, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
     StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
@@ -270,9 +273,13 @@ impl GatedReadBarrierPeer {
 }
 
 #[allow(dead_code)]
+static THREE_VOTER_FLEET_TEST_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+#[allow(dead_code)]
 struct ThreeVoterConsumerFleet {
     manifest: Arc<SessionReplicationManifest>,
     fixed_durable: bool,
+    topologies: Vec<ValidatedQuorumTopology>,
     pki: Arc<TestPki>,
     path_enabled: BTreeMap<(usize, usize), Arc<AtomicBool>>,
     read_barrier_calls: Arc<AtomicUsize>,
@@ -315,6 +322,10 @@ impl ThreeVoterConsumerFleet {
         read_barrier_delay: Option<Duration>,
         fixed_durable: bool,
     ) -> Self {
+        let test_gate = THREE_VOTER_FLEET_TEST_GATE
+            .acquire()
+            .await
+            .expect("three-voter test gate remains open");
         let members = (0..THREE_VOTER_COUNT)
             .map(three_voter_member)
             .collect::<Vec<_>>();
@@ -492,6 +503,7 @@ impl ThreeVoterConsumerFleet {
         let fleet = Self {
             manifest,
             fixed_durable,
+            topologies,
             pki,
             path_enabled,
             read_barrier_calls,
@@ -1072,7 +1084,7 @@ impl HangingV2Consumer {
 impl SessionQuorumConsumer for HangingV2Consumer {
     async fn execute(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _authorization: &SessionConsumerAuthorization,
         _request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled())
@@ -1080,7 +1092,7 @@ impl SessionQuorumConsumer for HangingV2Consumer {
 
     async fn execute_v2(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _authorization: &SessionConsumerAuthorization,
         _request: SessionConsumerV2Request,
     ) -> SessionConsumerV2Response {
         self.v2_calls.fetch_add(1, Ordering::SeqCst);
@@ -1090,7 +1102,7 @@ impl SessionQuorumConsumer for HangingV2Consumer {
 
     async fn watch(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _identity: &SessionConsumerAuthorization,
         _scope: SessionConsumerScope,
         _start_sequence: u64,
     ) -> Result<
@@ -1114,7 +1126,7 @@ impl SessionQuorumConsumer for CountingConsumer {
 
     async fn execute_v2(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _identity: &SessionConsumerAuthorization,
         request: SessionConsumerV2Request,
     ) -> SessionConsumerV2Response {
         self.v2_calls.fetch_add(1, Ordering::SeqCst);
@@ -1737,7 +1749,8 @@ async fn authenticated_v2_consumer_call_reaches_the_listener_on_its_dedicated_al
     let server_spiffe = spiffe("v2-server");
     let client_spiffe = spiffe("v2-client");
     let service = Arc::new(CountingConsumer::default());
-    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
         pki.server_config(&server_spiffe),
@@ -1746,7 +1759,13 @@ async fn authenticated_v2_consumer_call_reaches_the_listener_on_its_dedicated_al
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
     .await
     .expect("start stateless V2 consumer listener");
-    let client = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope);
+    let client = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
 
     let request = SessionConsumerV2Request::new(
         scope,
@@ -1777,8 +1796,8 @@ async fn revision_five_v2_status_transports_a_retained_stale_fence_receipt() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("v2-status-error-server");
     let client_spiffe = spiffe("v2-status-error-client");
-    let (_snapshots, store, scope, authorizer) =
-        admitted_store_and_authorizer([client_spiffe.clone()]).await;
+    let (_snapshots, store, scope, voter_authority, authorizer) =
+        admitted_store_and_authorizer([client_spiffe.clone()], &server_spiffe).await;
     let (handle, address) = SessionQuorumConsumerServer::new(
         Arc::new(store.consumer_service()),
         pki.server_config(&server_spiffe),
@@ -1787,7 +1806,13 @@ async fn revision_five_v2_status_transports_a_retained_stale_fence_receipt() {
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
     .await
     .expect("start revision-five consumer listener");
-    let client = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope);
+    let client = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
     let timestamp = time::OffsetDateTime::now_utc();
     let absent_lease: LeaseGuard = serde_json::from_value(serde_json::json!({
         "key": test_key(),
@@ -1865,7 +1890,8 @@ async fn persistent_v2_setup_closes_retry_without_mutation_dispatch() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("v2-setup-close-server");
     let client_spiffe = spiffe("v2-setup-close-client");
-    let (_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (_authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind V2 setup-close listener");
@@ -1891,8 +1917,14 @@ async fn persistent_v2_setup_closes_retry_without_mutation_dispatch() {
         })
     };
     let persistent = PersistentSessionConsumerClient::try_from_stateless(
-        consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope)
-            .with_operation_timeout(Duration::from_secs(2)),
+        consumer_client(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            voter_authority,
+        )
+        .with_operation_timeout(Duration::from_secs(2)),
         PersistentSessionConsumerConfig::try_new(
             1,
             0,
@@ -1934,7 +1966,8 @@ async fn persistent_v2_call_acceptance_then_close_is_exactly_outcome_unknown() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("v2-call-close-server");
     let client_spiffe = spiffe("v2-call-close-client");
-    let (authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(HangingV2Consumer::new());
     let call_seen = service.v2_call_started.notified();
     tokio::pin!(call_seen);
@@ -1947,8 +1980,14 @@ async fn persistent_v2_call_acceptance_then_close_is_exactly_outcome_unknown() {
     .await
     .expect("start V2 close-after-Call listener");
     let persistent = PersistentSessionConsumerClient::from_stateless(
-        consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope)
-            .with_operation_timeout(Duration::from_secs(2)),
+        consumer_client(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            voter_authority,
+        )
+        .with_operation_timeout(Duration::from_secs(2)),
     )
     .expect("persistent V2 client");
     let (request, request_id) = v2_mutation_request(scope, 0x7a, "v2-call-close-owner").await;
@@ -2323,7 +2362,8 @@ async fn v2_pre_request_connection_budget_expires_after_hello_before_hello_ack()
     let pki = TestPki::new();
     let server_spiffe = spiffe("v2-pre-request-stalled-server");
     let client_spiffe = spiffe("v2-pre-request-stalled-client");
-    let (_authorizer, scope) = authorizer_from_admitted_store(&client_spiffe).await;
+    let (_authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind stalled V2 TLS listener");
@@ -2340,9 +2380,15 @@ async fn v2_pre_request_connection_budget_expires_after_hello_before_hello_ack()
             std::future::pending::<()>().await;
         })
     };
-    let client = consumer_client(&pki, address, &server_spiffe, &client_spiffe, scope)
-        .with_pre_request_connection_timeout(Duration::from_millis(100))
-        .with_operation_timeout(Duration::from_secs(1));
+    let client = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    )
+    .with_pre_request_connection_timeout(Duration::from_millis(100))
+    .with_operation_timeout(Duration::from_secs(1));
     let request = SessionConsumerV2Request::new(
         scope,
         SessionConsumerV2Operation::FencedTransitionV2Capability,

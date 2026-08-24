@@ -37,17 +37,19 @@ use opc_session_store::{
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
     FencedTransitionRequestId, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
     FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, Generation, LeaseGuard, OwnerId,
-    QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcFamily, SessionConsensusWireRequest, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerLeaseMutationOperation,
-    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
-    SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+    QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusWireRequest,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+    SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationRequest,
+    SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
+    SessionConsumerOperation, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
+    SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
     SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
-    SessionConsumerV2Response, SessionKey, SessionKeyType, StateClass, StateType, StoreError,
-    StoredSessionRecord, MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+    SessionConsumerV2Response, SessionConsumerVoterAuthority, SessionKey, SessionKeyType,
+    StateClass, StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
 };
@@ -3116,6 +3118,74 @@ impl Fleet {
                 self.node_stderr(node_index)
             ),
         }
+    }
+
+    /// Derive the exact server authority from the same validated immutable
+    /// qualification topology used by every child. This preserves the node,
+    /// SPIFFE identity, voter count, and roster commitment together rather
+    /// than rebuilding client authority from identity text or consumer scope.
+    fn stateless_consumer_voter_authorities(&self) -> Vec<SessionConsumerVoterAuthority> {
+        let descriptors = self
+            .members
+            .iter()
+            .map(|member| {
+                QuorumReplicaDescriptor::new(
+                    ReplicaId::new(member.replica_id.clone())
+                        .expect("qualification consumer replica ID"),
+                    ReplicaEndpoint::new(member.endpoint_host.clone(), member.endpoint_port)
+                        .expect("qualification consumer endpoint"),
+                    ReplicaTlsIdentity::new(member.tls_identity.clone())
+                        .expect("qualification consumer TLS identity"),
+                    ReplicaFailureDomain::new(member.failure_domain.clone())
+                        .expect("qualification consumer failure domain"),
+                    ReplicaBackingIdentity::new(member.backing_identity.clone())
+                        .expect("qualification consumer backing identity"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let manifest = SessionReplicationManifest::try_new_with_epoch(
+            SessionClusterId::new(format!(
+                "qualification-mtls-{}-cluster",
+                self.member_count()
+            ))
+            .expect("qualification consumer cluster ID"),
+            SessionConfigurationGeneration::new("v1")
+                .expect("qualification consumer configuration generation"),
+            SessionConfigurationEpoch::new(1).expect("qualification consumer configuration epoch"),
+            descriptors.clone(),
+        )
+        .expect("qualification consumer replication manifest");
+        let local_replica = descriptors
+            .first()
+            .expect("qualification consumer local replica")
+            .replica_id()
+            .clone();
+        let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+            local_replica,
+            descriptors,
+            manifest.consensus_identity(),
+        ))
+        .expect("qualification consumer validated topology");
+        let roster = topology
+            .session_consumer_roster()
+            .expect("qualification consumer roster");
+
+        self.members
+            .iter()
+            .map(|member| {
+                let replica_id = ReplicaId::new(member.replica_id.clone())
+                    .expect("qualification consumer replica ID");
+                let node_id = topology
+                    .consensus_node_id(&replica_id)
+                    .expect("qualification consumer consensus node ID");
+                let authority = roster
+                    .voter(node_id)
+                    .expect("qualification consumer voter authority");
+                assert_eq!(authority.tls_identity(), member.tls_identity);
+                assert_eq!(authority.voter_count(), self.member_count());
+                authority
+            })
+            .collect()
     }
 
     fn arm_stateless_consumer_response_holds(&mut self, node_index: usize) {
@@ -9065,7 +9135,7 @@ async fn qualification_execute_v2_status_sample(
 fn qualification_persistent_v2_client(
     endpoints: Arc<Mutex<Vec<SocketAddr>>>,
     node_index: usize,
-    scope: SessionConsumerScope,
+    voter_authority: SessionConsumerVoterAuthority,
     identity: IdentityState,
     pool_config: PersistentSessionConsumerConfig,
     operation_timeout: Option<Duration>,
@@ -9091,8 +9161,7 @@ fn qualification_persistent_v2_client(
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(initial_endpoint.ip().into()),
-        SpiffeId::new(spiffe_id(node_index)).expect("bounded V2 seam server identity"),
-        scope,
+        voter_authority,
         tls,
     );
     let stateless = match operation_timeout {
@@ -10256,6 +10325,10 @@ fn run_persistent_consumer_v2_multiprocess_qualification() {
         endpoints.push(endpoint);
     }
     let scope = scope.expect("one V2 consumer scope per qualification fleet");
+    let voter_authorities = fleet.stateless_consumer_voter_authorities();
+    assert!(voter_authorities
+        .iter()
+        .all(|authority| authority.scope() == scope));
     let endpoints = Arc::new(Mutex::new(endpoints));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -10282,8 +10355,7 @@ fn run_persistent_consumer_v2_multiprocess_qualification() {
         let stateless = StatelessSessionConsumerClient::new_with_resolver(
             resolver,
             rustls_pki_types::ServerName::IpAddress(initial_endpoint.ip().into()),
-            SpiffeId::new(spiffe_id(node_index)).expect("V2 consumer server identity"),
-            scope,
+            voter_authorities[node_index].clone(),
             tls,
         );
         let stateless = match operation_timeout {
@@ -10634,6 +10706,10 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         endpoints.push(endpoint);
     }
     let scope = scope.expect("three V2 batch consumer scopes");
+    let voter_authorities = fleet.stateless_consumer_voter_authorities();
+    assert!(voter_authorities
+        .iter()
+        .all(|authority| authority.scope() == scope));
     let endpoints = Arc::new(Mutex::new(endpoints));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -10689,8 +10765,7 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         let stateless = StatelessSessionConsumerClient::new_with_resolver(
             resolver,
             rustls_pki_types::ServerName::IpAddress(initial_endpoint.ip().into()),
-            SpiffeId::new(spiffe_id(node_index)).expect("V2 batch exact server SPIFFE identity"),
-            scope,
+            voter_authorities[node_index].clone(),
             tls,
         );
         identity_senders.push(identity_sender);
@@ -11652,7 +11727,7 @@ fn run_persistent_consumer_v2_batch_release_gate() {
     let (_old_leaf_identity_source, old_leaf_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         replacement,
-        scope,
+        voter_authorities[replacement].clone(),
         fleet.pki.consumer_identity_state_with_generations(
             &consumer_identities[seam_client_index],
             ConsumerCredentialGeneration::OldRoot,
@@ -11692,7 +11767,7 @@ fn run_persistent_consumer_v2_batch_release_gate() {
     let (_delayed_identity_source, delayed_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         replacement,
-        scope,
+        voter_authorities[replacement].clone(),
         fleet.pki.consumer_identity_state_with_trust(
             &consumer_identities[seam_client_index],
             TrustGeneration::NewOnly,
@@ -11748,18 +11823,18 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         pressure_holders.push(runtime.spawn(async move { client.execute_v2(&request).await }));
     }
     let hold_ack_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
-    loop {
+    let held_response_count = loop {
         let (armed_responses, held_responses) =
             fleet.stateless_consumer_response_hold_status(replacement);
         if armed_responses == 0 && held_responses == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
-            break;
+            break held_responses;
         }
         assert!(
             Instant::now() < hold_ack_deadline,
             "cross-process response-hold acknowledgement did not observe all four durable V2 executions: armed={armed_responses}, held={held_responses}"
         );
         thread::sleep(Duration::from_millis(10));
-    }
+    };
     let non_slow_client_index = (seam_client_index + 1) % clients.len();
     runtime.block_on(qualification_execute_v2_status_sample(
         clients[non_slow_client_index].clone(),
@@ -11767,12 +11842,14 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         ambiguous_requests[0].clone(),
         Instant::now(),
     ));
+    let cross_client_fair_progress = 1;
     let mut queued_pressure_calls = Vec::with_capacity(V2_BATCH_RELEASE_GATE_PENDING_CALLS);
     for _ in 0..V2_BATCH_RELEASE_GATE_PENDING_CALLS {
         let client = delayed_client.clone();
         let request = pressure_request.clone();
         queued_pressure_calls.push(runtime.spawn(async move { client.execute_v2(&request).await }));
     }
+    let queued_caller_count = queued_pressure_calls.len();
     let queue_pressure_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
     let pressure_queued = loop {
         let diagnostics = delayed_client.v2_diagnostics();
@@ -11811,6 +11888,8 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         "the 69th fixed-pool caller is rejected as typed not-transmitted overload"
     );
     fleet.release_stateless_consumer_response_holds(replacement);
+    let released_response_count = pressure_holders.len();
+    let recovered_queued_caller_count = queued_pressure_calls.len();
     let pressure_results = runtime.block_on(async {
         let holders = futures_util::future::join_all(pressure_holders).await;
         let queued = futures_util::future::join_all(queued_pressure_calls).await;
@@ -11827,7 +11906,9 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }) => {
                 assert!(matches!(cause, SessionConsumerClientError::Overloaded));
             }
-            Err(error) => panic!("released V2 caller returned a disallowed typed outcome: {error:?}"),
+            Err(error) => {
+                panic!("released V2 caller returned a disallowed typed outcome: {error:?}")
+            }
         }
     }
     runtime.block_on(async {
@@ -11841,6 +11922,7 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             .await;
         }
     });
+    let durable_status_cardinality = ambiguous_requests.len();
     let pressure_settled = delayed_client.v2_diagnostics();
     assert_eq!(pressure_settled.pool_wait_current, 0);
     assert_eq!(
@@ -11890,7 +11972,7 @@ fn run_persistent_consumer_v2_batch_release_gate() {
     let (restored_identity_source, restored_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         replacement,
-        scope,
+        voter_authorities[replacement].clone(),
         fleet.pki.consumer_identity_state_with_trust(
             &consumer_identities[seam_client_index],
             TrustGeneration::NewOnly,
@@ -11955,7 +12037,7 @@ fn run_persistent_consumer_v2_batch_release_gate() {
     let (_new_only_identity_source, new_only_old_root_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         old_root_server,
-        scope,
+        voter_authorities[old_root_server].clone(),
         fleet.pki.consumer_identity_state_with_generations(
             &consumer_identities[old_root_seam_client_index],
             ConsumerCredentialGeneration::NewRoot,
@@ -11994,7 +12076,7 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         qualification_persistent_v2_client(
             Arc::clone(&endpoints),
             old_root_server,
-            scope,
+            voter_authorities[old_root_server].clone(),
             fleet.pki.consumer_identity_state_with_trust(
                 &consumer_identities[old_root_seam_client_index],
                 TrustGeneration::OldOnly,
@@ -12405,6 +12487,12 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         saturated_client_skips: mutation_saturated_client_skips,
         slow_lane_completed_batches: min_completed_batches,
         over_capacity_typed_backpressure_events: 1,
+        held_response_count,
+        queued_caller_count,
+        cross_client_fair_progress,
+        released_response_count,
+        recovered_queued_caller_count,
+        durable_status_cardinality,
         not_transmitted_retries: mutation_not_transmitted_retries,
         recovered_unknown: mutation_recovered_unknown,
         // No server queue depth is sampled by this client-side harness.
@@ -12450,7 +12538,12 @@ fn assert_batch_credential_negative_handshake(
         .map(stateless_consumer_identity)
         .collect::<Vec<_>>();
     let identity = consumer_identities[TARGET].clone();
-    let (endpoint, scope) = fleet.start_stateless_consumer(TARGET, consumer_identities);
+    let (endpoint, _scope) = fleet.start_stateless_consumer(TARGET, consumer_identities);
+    let voter_authority = fleet
+        .stateless_consumer_voter_authorities()
+        .into_iter()
+        .nth(TARGET)
+        .expect("qualification target voter authority");
     let source_before = fleet.projected_status(TARGET);
     let controller_before = fleet.material_status(TARGET);
     fleet.publish_known_projected_generation(TARGET, server_credential, server_trust, phase);
@@ -12480,7 +12573,7 @@ fn assert_batch_credential_negative_handshake(
     let (_positive_identity_source, positive_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         TARGET,
-        scope,
+        voter_authority.clone(),
         fleet.pki.consumer_identity_state_with_generations(
             &identity,
             positive_credential,
@@ -12506,7 +12599,7 @@ fn assert_batch_credential_negative_handshake(
     let (_negative_identity_source, negative_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         TARGET,
-        scope,
+        voter_authority,
         fleet.pki.consumer_identity_state_with_generations(
             &identity,
             client_credential,

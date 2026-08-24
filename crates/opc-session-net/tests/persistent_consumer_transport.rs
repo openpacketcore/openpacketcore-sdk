@@ -803,7 +803,8 @@ async fn persistent_v2_prewarm_proves_server_peer_credential_rejection() {
     let client_pki = TestPki::new_named("persistent consumer unknown-CA client root");
     let server_spiffe = spiffe("v2-unknown-ca-server");
     let client_spiffe = spiffe("v2-unknown-ca-client");
-    let (authorizer, scope) = authorizer_and_scope(&client_spiffe).await;
+    let (authorizer, _scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
@@ -818,8 +819,7 @@ async fn persistent_v2_prewarm_proves_server_peer_credential_rejection() {
         StatelessSessionConsumerClient::new_with_resolver(
             Arc::clone(&resolver),
             rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-            SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-            scope,
+            voter_authority.clone(),
             server_pki.client_config(&client_spiffe),
         )
         .with_operation_timeout(Duration::from_secs(2)),
@@ -850,8 +850,7 @@ async fn persistent_v2_prewarm_proves_server_peer_credential_rejection() {
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
-        SpiffeId::new(&server_spiffe).expect("server SPIFFE"),
-        scope,
+        voter_authority,
         client_pki.client_config_trusting(&client_spiffe, &server_pki),
     )
     .with_operation_timeout(Duration::from_secs(2));

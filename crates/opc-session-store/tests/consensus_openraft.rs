@@ -10,8 +10,8 @@ use bytes::Bytes;
 use opc_consensus::engine::error::{InstallSnapshotError, RaftError};
 use opc_consensus::engine::raft::InstallSnapshotResponse;
 use opc_consensus::{
-    decode_bounded, derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch,
-    ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE,
+    decode_bounded, derive_configuration_id, encode_bounded, ConsensusClusterId,
+    ConsensusConfigurationEpoch, ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
@@ -43,7 +43,7 @@ use opc_session_store::{
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use rusqlite::OptionalExtension;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -155,7 +155,10 @@ struct LoopbackPeer {
     rpc_delay_millis: Arc<AtomicU64>,
     delayed_calls: Arc<AtomicUsize>,
     fenced_transition_v2_capability_probe_calls: Arc<AtomicUsize>,
+    capture_payloads: Arc<AtomicBool>,
     captured_payloads: Arc<StdMutex<Vec<Bytes>>>,
+    forward_mutation_max_payload_bytes: Arc<AtomicUsize>,
+    append_entries_max_payload_bytes: Arc<AtomicUsize>,
     install_snapshot_responses_to_drop: Arc<AtomicUsize>,
     dropped_install_snapshot_responses: Arc<AtomicUsize>,
     install_snapshot_observations: Arc<StdMutex<Vec<InstallSnapshotObservation>>>,
@@ -180,7 +183,10 @@ impl LoopbackPeer {
             rpc_delay_millis: Arc::new(AtomicU64::new(0)),
             delayed_calls: Arc::new(AtomicUsize::new(0)),
             fenced_transition_v2_capability_probe_calls: Arc::new(AtomicUsize::new(0)),
+            capture_payloads: Arc::new(AtomicBool::new(true)),
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
+            forward_mutation_max_payload_bytes: Arc::new(AtomicUsize::new(0)),
+            append_entries_max_payload_bytes: Arc::new(AtomicUsize::new(0)),
             install_snapshot_responses_to_drop: Arc::new(AtomicUsize::new(0)),
             dropped_install_snapshot_responses: Arc::new(AtomicUsize::new(0)),
             install_snapshot_observations: Arc::new(StdMutex::new(Vec::new())),
@@ -297,6 +303,19 @@ impl LoopbackPeer {
             "consensus payload qualification capture was saturated"
         );
         captured
+    }
+
+    fn set_capture_payloads(&self, capture: bool) {
+        self.capture_payloads.store(capture, Ordering::SeqCst);
+    }
+
+    fn forward_mutation_max_payload_bytes(&self) -> usize {
+        self.forward_mutation_max_payload_bytes
+            .load(Ordering::SeqCst)
+    }
+
+    fn append_entries_max_payload_bytes(&self) -> usize {
+        self.append_entries_max_payload_bytes.load(Ordering::SeqCst)
     }
 
     fn arm_one_install_snapshot_response_loss(&self) {
@@ -1103,6 +1122,15 @@ impl TestCluster {
             .get(&(source, target))
             .expect("outbound path")
             .install(Arc::new(RejectFencedTransitionCapabilityProbeHandler {
+                inner: self.stores[target].rpc_handler(),
+            }));
+    }
+
+    fn emulate_baseline_36720_activation_probe_rejection(&self, source: usize, target: usize) {
+        self.paths
+            .get(&(source, target))
+            .expect("outbound path")
+            .install(Arc::new(Baseline36720ActivationProbeHandler {
                 inner: self.stores[target].rpc_handler(),
             }));
     }

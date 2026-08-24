@@ -1974,32 +1974,6 @@ async fn notify_watchers(core: &SqliteConsensusCore, notifications: &[Replicatio
     for notification in notifications {
         watchers.retain_mut(|watcher| watcher.notify(notification));
     }
-    drop(watchers);
-
-    let mut consumer_watchers = core.consumer_watchers.lock().await;
-    consumer_watchers.retain(|watcher| !watcher.is_closed());
-    if consumer_watchers.is_empty() {
-        return;
-    }
-    for notification in notifications {
-        #[cfg(test)]
-        core.consumer_watch_projection_count
-            .fetch_add(1, Ordering::SeqCst);
-        let projected = crate::consumer::session_consumer_change(notification);
-        let Ok(projected) = projected else {
-            // Invalid replay shape cannot be safely projected. Closing the
-            // affected consumers forces coherent catch-up instead of exposing
-            // raw state or retaining it in an unbounded queue.
-            consumer_watchers.clear();
-            return;
-        };
-        let Ok(encoded_bytes) = crate::consumer::session_consumer_change_encoded_bytes(&projected)
-        else {
-            consumer_watchers.clear();
-            return;
-        };
-        consumer_watchers.retain_mut(|watcher| watcher.notify(&projected, encoded_bytes));
-    }
 }
 
 fn secure_snapshot_create_file(path: &Path) -> io::Result<std::fs::File> {
@@ -2383,7 +2357,6 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use futures_util::StreamExt;
     use opc_consensus::engine::storage::{RaftLogStorage, RaftLogStorageExt, RaftStateMachine};
     use opc_consensus::engine::{CommittedLeaderId, EntryPayload, RaftSnapshotBuilder};
     use opc_crypto::CryptoEnvelopeV1;
@@ -3360,35 +3333,6 @@ mod tests {
         }
     }
 
-    fn consumer_watch_acquire_command(
-        identity: SessionConsensusIdentity,
-        request_byte: u8,
-    ) -> SessionConsensusCommand {
-        let stable_id = match request_byte {
-            1 => Bytes::from_static(b"consumer-watch-one"),
-            2 => Bytes::from_static(b"consumer-watch-two"),
-            _ => Bytes::from_static(b"consumer-watch-three"),
-        };
-        SessionConsensusCommand {
-            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
-            identity,
-            request_id: SessionConsensusRequestId::from_bytes([request_byte; 16]),
-            logical_time: timestamp(request_byte),
-            intent: SessionMutationIntent::AcquireLease {
-                key: SessionKey {
-                    tenant: TenantId::from_static("consumer-watch"),
-                    nf_kind: NetworkFunctionKind::from_static("smf"),
-                    key_type: SessionKeyType::PduSession,
-                    stable_id: stable_id
-                        .try_into()
-                        .expect("bounded consumer watch stable ID"),
-                },
-                owner: OwnerId::new("consumer-watch-owner").expect("consumer watch owner"),
-                ttl: Duration::from_secs(300),
-            },
-        }
-    }
-
     fn normal_entry(index: u64, command: SessionConsensusCommand) -> Entry<SessionRaftTypeConfig> {
         normal_entry_with_term(1, index, command)
     }
@@ -3991,156 +3935,6 @@ mod tests {
             (1, observed_length),
             observer.snapshot(),
             "one successful fixed build has exactly one bounded prepublication scan"
-        );
-    }
-
-    #[tokio::test]
-    async fn consumer_notifications_skip_projection_without_watchers_and_preserve_handoff() {
-        let directory = tempfile::tempdir().expect("consumer watch directory");
-        let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
-            .expect("consumer watch backend");
-        let (_, mut state_machine) = open(
-            &backend,
-            directory.path().join("snapshots"),
-            identity(1),
-            expected_members(),
-        )
-        .await
-        .expect("consumer watch storage");
-        state_machine
-            .apply([initial_membership_entry()])
-            .await
-            .expect("apply initial membership");
-        state_machine
-            .apply([normal_entry(
-                1,
-                consumer_watch_acquire_command(identity(1), 1),
-            )])
-            .await
-            .expect("apply unwatched committed change");
-        assert_eq!(
-            backend
-                .consumer_watch_projection_count
-                .load(Ordering::SeqCst),
-            0,
-            "an empty consumer registry must not project or encode committed changes"
-        );
-
-        let mut existing = backend
-            .consensus_consumer_watch(1)
-            .await
-            .expect("register existing consumer watch");
-        assert_eq!(
-            existing
-                .next()
-                .await
-                .expect("existing consumer backlog")
-                .expect("valid existing consumer backlog")
-                .sequence(),
-            1
-        );
-        state_machine
-            .apply([normal_entry(
-                2,
-                consumer_watch_acquire_command(identity(1), 2),
-            )])
-            .await
-            .expect("apply existing-consumer live change");
-        assert_eq!(
-            existing
-                .next()
-                .await
-                .expect("existing consumer live change")
-                .expect("valid existing consumer live change")
-                .sequence(),
-            2
-        );
-
-        backend
-            .watch_backlog_captured
-            .store(false, Ordering::SeqCst);
-        let held_registration = Arc::clone(&backend.watch_registration_gate)
-            .acquire_owned()
-            .await
-            .expect("hold consumer registration after backlog capture");
-        let registering_backend = backend.clone();
-        let registering =
-            tokio::spawn(async move { registering_backend.consensus_consumer_watch(1).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !backend.watch_backlog_captured.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("new consumer captures backlog while raw watcher lock is held");
-
-        let applying = tokio::spawn(async move {
-            state_machine
-                .apply([normal_entry(
-                    3,
-                    consumer_watch_acquire_command(identity(1), 3),
-                )])
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if backend
-                    .consensus_get_replication_log(1, 3)
-                    .await
-                    .expect("read durable consumer watch head")
-                    .len()
-                    == 3
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("third consumer change commits before registration releases raw lock");
-        drop(held_registration);
-        let mut new = registering
-            .await
-            .expect("new consumer registration task")
-            .expect("new consumer registration");
-        applying
-            .await
-            .expect("consumer live apply task")
-            .expect("consumer live apply");
-
-        for sequence in [1, 2, 3] {
-            assert_eq!(
-                new.next()
-                    .await
-                    .expect("new consumer handoff item")
-                    .expect("valid new consumer handoff item")
-                    .sequence(),
-                sequence,
-                "the new consumer receives each backlog/live change exactly once"
-            );
-        }
-        assert_eq!(
-            existing
-                .next()
-                .await
-                .expect("existing consumer final live change")
-                .expect("valid existing consumer final live change")
-                .sequence(),
-            3,
-            "the existing consumer retains the exact live change"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), new.next())
-                .await
-                .is_err(),
-            "consumer registration handoff must not duplicate the concurrent change"
-        );
-        assert_eq!(
-            backend
-                .consumer_watch_projection_count
-                .load(Ordering::SeqCst),
-            2,
-            "one projected live change is shared by all registered consumer watchers"
         );
     }
 

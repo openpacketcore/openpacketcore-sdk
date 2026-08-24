@@ -381,6 +381,24 @@ pub enum SessionMutationIntent {
     /// results, and singleton status identities. This is not an inter-item
     /// conditional or all-or-nothing distributed transaction.
     FencedTransitionV2Batch(Vec<FencedTransitionV2Request>),
+    /// SDK-internal request to durably activate V1 for the current exact voter
+    /// scope. This is appended after V2 to preserve every already-published
+    /// V2 postcard discriminant.
+    #[doc(hidden)]
+    PreflightFencedTransitionCapability,
+    /// SDK-internal cluster-scope V1 activation certificate, also appended to
+    /// preserve V2 wire compatibility. The leader derives these fields from
+    /// its exact scope after the preflight's typed admission and unanimous
+    /// probes; raw callers cannot submit this shape.
+    #[doc(hidden)]
+    ActivateFencedTransitionCapability {
+        /// Exact V1 protocol schema admitted by every voter.
+        schema_version: u16,
+        /// Exact current authority scope observed during unanimous V1 proof.
+        scope_identity: SessionConsensusIdentity,
+        /// Canonical digest of the exact voter IDs in that scope.
+        voter_set_digest: [u8; 32],
+    },
 }
 
 impl fmt::Debug for SessionMutationIntent {
