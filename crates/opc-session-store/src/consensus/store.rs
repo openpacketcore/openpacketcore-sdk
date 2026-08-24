@@ -10,11 +10,9 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-#[cfg(test)]
-use std::sync::Mutex;
 #[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
 use std::sync::{Condvar, OnceLock};
 
@@ -1142,8 +1140,92 @@ struct ConsensusSessionStoreInner {
     fenced_transition_v2_status_batch: FencedTransitionV2StatusBatchSupervisor,
     proposal_admission: Arc<tokio::sync::Semaphore>,
     diagnostics: Arc<ConsensusStoreDiagnosticCounters>,
+    shutdown: ConsensusShutdownCoordinator,
     #[cfg(test)]
     accepted_receiver_test_outcomes: Mutex<VecDeque<AcceptedClientWriteReceiverTestOutcome>>,
+}
+
+/// The one clone-wide shutdown drain.  A caller timing out must not cancel the
+/// actual engine drain: OpenRaft has already signalled its core before it
+/// joins that core's tasks, so dropping that future can strand its tick
+/// cleanup.  All clones therefore observe this single background operation.
+struct ConsensusShutdownCoordinator {
+    completion: Mutex<Option<tokio::sync::watch::Receiver<ConsensusShutdownCompletion>>>,
+}
+
+#[derive(Clone)]
+enum ConsensusShutdownCompletion {
+    Running,
+    Finished(Result<(), StoreError>),
+}
+
+impl ConsensusShutdownCoordinator {
+    const fn new() -> Self {
+        Self {
+            completion: Mutex::new(None),
+        }
+    }
+
+    fn start_or_subscribe(
+        &self,
+        inner: Arc<ConsensusSessionStoreInner>,
+    ) -> tokio::sync::watch::Receiver<ConsensusShutdownCompletion> {
+        let mut completion = self
+            .completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(receiver) = completion.as_ref() {
+            return receiver.clone();
+        }
+        let (sender, receiver) = tokio::sync::watch::channel(ConsensusShutdownCompletion::Running);
+        *completion = Some(receiver.clone());
+        tokio::spawn(async move {
+            let result = shutdown_consensus_session_store(inner).await;
+            sender.send_replace(ConsensusShutdownCompletion::Finished(result));
+        });
+        receiver
+    }
+}
+
+async fn shutdown_consensus_session_store(
+    inner: Arc<ConsensusSessionStoreInner>,
+) -> Result<(), StoreError> {
+    match (
+        inner.consensus_log_prune_lane.as_ref(),
+        inner.proactive_checkpoint_lane.as_ref(),
+    ) {
+        (Some(prune), Some(checkpoint)) => {
+            tokio::join!(prune.shutdown(), checkpoint.shutdown());
+        }
+        (Some(prune), None) => prune.shutdown().await,
+        (None, Some(checkpoint)) => checkpoint.shutdown().await,
+        (None, None) => {}
+    }
+    #[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
+    if let Some(gate) = raft_shutdown_gate_for_store(&inner) {
+        gate.wait_before_raft_shutdown().await;
+    }
+    inner
+        .raft
+        .shutdown()
+        .await
+        .map_err(|_| consensus_unavailable())
+}
+
+async fn await_consensus_session_store_shutdown(
+    mut completion: tokio::sync::watch::Receiver<ConsensusShutdownCompletion>,
+) -> Result<(), StoreError> {
+    loop {
+        let state = completion.borrow_and_update().clone();
+        match state {
+            ConsensusShutdownCompletion::Finished(result) => return result,
+            ConsensusShutdownCompletion::Running => {
+                if completion.changed().await.is_err() {
+                    return Err(consensus_unavailable());
+                }
+            }
+        }
+    }
 }
 
 /// Store-scoped test gate immediately before the real Raft shutdown call.
@@ -2351,6 +2433,7 @@ impl ConsensusSessionStore {
                 DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
             )),
             diagnostics,
+            shutdown: ConsensusShutdownCoordinator::new(),
             #[cfg(test)]
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
@@ -2550,6 +2633,7 @@ impl ConsensusSessionStore {
                 DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
             )),
             diagnostics,
+            shutdown: ConsensusShutdownCoordinator::new(),
             #[cfg(test)]
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
@@ -2577,36 +2661,30 @@ impl ConsensusSessionStore {
         })
     }
 
-    /// Stop this store's consensus engine and wait for every engine-owned
-    /// task to exit.
+    /// Start this store's clone-wide consensus shutdown and wait for every
+    /// engine-owned task to exit.
     ///
     /// Shutdown is clone-wide: every handle to this store observes the same
     /// stopped engine. Callers must remove the store's authenticated RPC
     /// handler from their transport before invoking this method so no new
     /// request can enter while the engine drains. The bounded maintenance
     /// lanes are stopped and joined first, so a Raft shutdown that cannot
-    /// complete cannot retain their workers or checkpoint connections.
+    /// complete cannot retain their workers or checkpoint connections. This
+    /// call is bounded by the configured complete-operation deadline. On its
+    /// fixed `consensus_unavailable` timeout error, shutdown continues in the
+    /// shared background drain; callers must not reopen the durable store
+    /// until a later clone-wide `shutdown` call observes successful drain.
     pub async fn shutdown(&self) -> Result<(), StoreError> {
-        match (
-            self.inner.consensus_log_prune_lane.as_ref(),
-            self.inner.proactive_checkpoint_lane.as_ref(),
-        ) {
-            (Some(prune), Some(checkpoint)) => {
-                tokio::join!(prune.shutdown(), checkpoint.shutdown());
-            }
-            (Some(prune), None) => prune.shutdown().await,
-            (None, Some(checkpoint)) => checkpoint.shutdown().await,
-            (None, None) => {}
-        }
-        #[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
-        if let Some(gate) = raft_shutdown_gate_for_store(&self.inner) {
-            gate.wait_before_raft_shutdown().await;
-        }
-        self.inner
-            .raft
-            .shutdown()
-            .await
-            .map_err(|_| consensus_unavailable())
+        let completion = self
+            .inner
+            .shutdown
+            .start_or_subscribe(Arc::clone(&self.inner));
+        tokio::time::timeout(
+            self.inner.operation_timeout,
+            await_consensus_session_store_shutdown(completion),
+        )
+        .await
+        .unwrap_or_else(|_| Err(consensus_unavailable()))
     }
 
     /// Hold the test-only phase immediately before the real Raft shutdown.
@@ -10710,6 +10788,77 @@ mod membership_tests {
             .shutdown()
             .await
             .expect("shut down reopened fixed store");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    #[tokio::test]
+    async fn shutdown_deadline_is_clone_wide_while_a_held_core_continues_draining() {
+        let directory = tempfile::tempdir().expect("clone-wide shutdown directory");
+        let database_path = directory.path().join("store.sqlite");
+        let snapshot_path = directory.path().join("snapshots");
+        let topology = fixed_shutdown_topology();
+        let backend = SqliteSessionBackend::open(&database_path).expect("file-backed backend");
+        let mut checkpoint_workers = backend.proactive_checkpoint_worker_observation_for_test();
+        let store = ConsensusSessionStore::open_fixed_durable_quorum_with_clock(
+            topology.clone(),
+            backend,
+            &snapshot_path,
+            unavailable_fixed_shutdown_peers(&topology),
+            Arc::new(SystemClock),
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("open fixed store with bounded shutdown deadline");
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            checkpoint_workers.wait_for_worker_count(1),
+        )
+        .await
+        .expect("checkpoint worker starts"));
+
+        let hold = store.hold_raft_shutdown_before_core_for_test();
+        let gate = Arc::clone(&hold.gate);
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let first = tokio::spawn(async move { first_store.shutdown().await });
+        let second = tokio::spawn(async move { second_store.shutdown().await });
+        assert!(
+            tokio::task::spawn_blocking(move || gate.wait_until_entered(Duration::from_secs(1)))
+                .await
+                .expect("join Raft shutdown gate observer"),
+            "the shared shutdown reaches the deliberately stalled core"
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            checkpoint_workers.wait_for_worker_count(0),
+        )
+        .await
+        .expect("checkpoint worker exits before either caller times out"));
+
+        let first = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first shutdown obeys its configured deadline")
+            .expect("first shutdown task completes");
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("second shutdown obeys its configured deadline")
+            .expect("second shutdown task completes");
+        assert_eq!(first, Err(consensus_unavailable()));
+        assert_eq!(second, Err(consensus_unavailable()));
+        assert_eq!(
+            store
+                .inner
+                .diagnostics
+                .consensus_log_prune_gauges_for_test(),
+            (0, 0),
+            "the shared background drain stops every SDK maintenance lane despite a stuck core"
+        );
+
+        drop(hold);
+        tokio::time::timeout(Duration::from_secs(1), store.shutdown())
+            .await
+            .expect("a later clone can observe the same completed shutdown")
+            .expect("released shared shutdown succeeds");
     }
 
     #[tokio::test]

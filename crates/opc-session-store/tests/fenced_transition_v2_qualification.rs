@@ -10,7 +10,7 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -33,14 +33,15 @@ use opc_session_store::{
     SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusStatus,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
     SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord, Timestamp,
-    ValidatedQuorumTopology, FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS,
-    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES,
+    ValidatedQuorumTopology, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS, FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES,
     FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES, FENCED_TRANSITION_V2_RECLAIM_BATCH,
     FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 const VOTERS: usize = 3;
 const QUALIFICATION_SESSIONS: usize = 50_000;
@@ -55,15 +56,25 @@ const QUALIFICATION_BURST_TRANSITIONS: usize =
 const QUALIFICATION_RELEASE_TRANSITIONS: usize =
     QUALIFICATION_SESSIONS + QUALIFICATION_SUSTAINED_TRANSITIONS + QUALIFICATION_BURST_TRANSITIONS;
 const QUALIFICATION_TRANSITIONS: usize = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES + 1;
-const QUALIFICATION_HEADROOM_TRANSITIONS: usize =
+// This is the remaining capacity of the active epoch after the 100,000
+// transition operational target. It is not the release workload's remaining
+// capacity within the eight-epoch retained envelope.
+const QUALIFICATION_OPERATIONAL_HEADROOM_TRANSITIONS: usize =
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET;
+// This is the remaining capacity of the complete retained envelope after the
+// 1,010,000-operation release workload.
+const QUALIFICATION_RETAINED_ENVELOPE_HEADROOM_TRANSITIONS: usize =
+    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES - QUALIFICATION_RELEASE_TRANSITIONS;
 // Match the fixed durable quorum's bounded proposal-admission capacity. This
 // represents a small, realistic client burst while leaving consensus itself to
 // serialize and durably apply every proposal on the three voters.
 const QUALIFICATION_IN_FLIGHT_CLIENTS: usize = DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS;
 const QUALIFICATION_TRANSIENT_RETRY_LIMIT: usize = 16;
 const QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF: Duration = Duration::from_millis(25);
-const QUALIFICATION_RELEASE_BATCH_DEADLINE: Duration = Duration::from_millis(800);
+// Every release-batch convergence attempt uses the same caller-owned absolute
+// deadline as the fixed durable store operation. This avoids stacking a test
+// retry budget on top of the production operation envelope.
+const QUALIFICATION_RELEASE_BATCH_DEADLINE: Duration = DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
 const QUALIFICATION_PRELOAD_BATCH_OPERATIONS: usize = 256;
 // At 500 operations/second, an eight-item batch has a 16 ms formation window.
 // That leaves real budget for quorum apply while measuring each item's full
@@ -106,6 +117,7 @@ const _: () = {
     assert!(QUALIFICATION_IN_FLIGHT_CLIENTS >= 1);
     assert!(BOUNDED_SCALE_STALL_SESSION_SLOTS >= QUALIFICATION_PACED_BATCH_OPERATIONS);
     assert!(FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES > 0);
+    assert!(FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES >= QUALIFICATION_RELEASE_TRANSITIONS);
 };
 const FIXED_V2_PROFILE_DIGEST: [u8; 32] = [
     0x8a, 0x0b, 0x70, 0xb5, 0x46, 0x54, 0xc7, 0x25, 0x0c, 0xf5, 0x46, 0x9d, 0xb6, 0xe1, 0xe5, 0x45,
@@ -160,6 +172,11 @@ struct ReleaseEffectCounters {
     outcome_unknown_batches: AtomicU64,
     status_attempts: AtomicU64,
     status_retry_rounds: AtomicU64,
+    mutation_deadline_before_dispatch: AtomicU64,
+    not_transmitted_deadline: AtomicU64,
+    deadline_after_backoff: AtomicU64,
+    status_deadline_before_dispatch: AtomicU64,
+    status_deadline_timeout: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +186,11 @@ struct ReleaseEffectCounterSnapshot {
     outcome_unknown_batches: u64,
     status_attempts: u64,
     status_retry_rounds: u64,
+    mutation_deadline_before_dispatch: u64,
+    not_transmitted_deadline: u64,
+    deadline_after_backoff: u64,
+    status_deadline_before_dispatch: u64,
+    status_deadline_timeout: u64,
 }
 
 impl ReleaseEffectCounters {
@@ -179,6 +201,15 @@ impl ReleaseEffectCounters {
             outcome_unknown_batches: self.outcome_unknown_batches.load(Ordering::Relaxed),
             status_attempts: self.status_attempts.load(Ordering::Relaxed),
             status_retry_rounds: self.status_retry_rounds.load(Ordering::Relaxed),
+            mutation_deadline_before_dispatch: self
+                .mutation_deadline_before_dispatch
+                .load(Ordering::Relaxed),
+            not_transmitted_deadline: self.not_transmitted_deadline.load(Ordering::Relaxed),
+            deadline_after_backoff: self.deadline_after_backoff.load(Ordering::Relaxed),
+            status_deadline_before_dispatch: self
+                .status_deadline_before_dispatch
+                .load(Ordering::Relaxed),
+            status_deadline_timeout: self.status_deadline_timeout.load(Ordering::Relaxed),
         }
     }
 }
@@ -192,13 +223,25 @@ enum ReleaseBatchFailureStage {
     OutcomeIdentityMismatch,
     ResolvedBatchError,
     ResolvedItemError,
+    RecordedItemError,
     ResolvedShapeMismatch,
     RecordedOutcomeMismatch,
-    RecordedItemError,
     StatusReadRejected,
-    StatusTerminal,
     StatusUnresolved,
-    DeadlineExpired,
+    MutationDeadlineBeforeDispatch,
+    NotTransmittedDeadline,
+    DeadlineAfterBackoff,
+    StatusDeadlineBeforeDispatch,
+    StatusDeadlineTimeout,
+}
+
+fn release_batch_expected_no_effect_error(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::FencedTransitionHistoryFull
+            | StoreError::FencedTransitionRequestConflict
+            | StoreError::FencedTransitionRequestExpired
+    )
 }
 
 impl ReleaseBatchFailureStage {
@@ -211,13 +254,16 @@ impl ReleaseBatchFailureStage {
             Self::OutcomeIdentityMismatch => "outcome_identity_mismatch",
             Self::ResolvedBatchError => "resolved_batch_error",
             Self::ResolvedItemError => "resolved_item_error",
+            Self::RecordedItemError => "recorded_item_error",
             Self::ResolvedShapeMismatch => "resolved_shape_mismatch",
             Self::RecordedOutcomeMismatch => "recorded_outcome_mismatch",
-            Self::RecordedItemError => "recorded_item_error",
             Self::StatusReadRejected => "status_read_rejected",
-            Self::StatusTerminal => "status_terminal",
             Self::StatusUnresolved => "status_unresolved",
-            Self::DeadlineExpired => "deadline_expired",
+            Self::MutationDeadlineBeforeDispatch => "mutation_deadline_before_dispatch",
+            Self::NotTransmittedDeadline => "not_transmitted_deadline",
+            Self::DeadlineAfterBackoff => "deadline_after_backoff",
+            Self::StatusDeadlineBeforeDispatch => "status_deadline_before_dispatch",
+            Self::StatusDeadlineTimeout => "status_deadline_timeout",
         }
     }
 }
@@ -302,6 +348,7 @@ async fn collect_next_release_batch(
 struct BoundedScaleDiagnostics<'a> {
     stores: &'a [ConsensusSessionStore],
     effect_counters: &'a ReleaseEffectCounters,
+    read_backend_unavailable_retries: &'a AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -392,6 +439,9 @@ fn emit_bounded_scale_stall_observation(
         .map(ConsensusSessionStore::diagnostic_snapshot)
         .collect::<Vec<_>>();
     let effect_snapshot = diagnostics.effect_counters.snapshot();
+    let read_backend_unavailable_retries = diagnostics
+        .read_backend_unavailable_retries
+        .load(Ordering::Relaxed);
     let (batch_p99_us, batch_p999_us, item_p99_us, item_p999_us) = latency_summary
         .map(|(batch_p99, batch_p999, item_p99, item_p999)| {
             (
@@ -403,7 +453,7 @@ fn emit_bounded_scale_stall_observation(
         })
         .unwrap_or((None, None, None, None));
     eprintln!(
-        "sdk-704 bounded snapshot scale: phase={phase_name} stage={stage} offered_ops_per_second={target_rate} submitted_batches={submitted_batches} completed_batches={completed_batches} completed_operations={completed_operations} achieved_ops_per_second={achieved_ops_per_second:.6} peak_unjoined_batch_task_slots={peak_unjoined_batch_task_slots} batch_p99_us={batch_p99_us:?} batch_p999_us={batch_p999_us:?} item_p99_us={item_p99_us:?} item_p999_us={item_p999_us:?} elapsed_ms={} effect_counters={effect_snapshot:?} completed_snapshot_count_by_voter={completed_snapshot_count_by_voter:?} voter_status={voter_status:?} voter_diagnostics={voter_diagnostics:?}",
+        "sdk-704 bounded snapshot scale: phase={phase_name} stage={stage} offered_ops_per_second={target_rate} submitted_batches={submitted_batches} completed_batches={completed_batches} completed_operations={completed_operations} achieved_ops_per_second={achieved_ops_per_second:.6} peak_unjoined_batch_task_slots={peak_unjoined_batch_task_slots} batch_p99_us={batch_p99_us:?} batch_p999_us={batch_p999_us:?} item_p99_us={item_p99_us:?} item_p999_us={item_p999_us:?} elapsed_ms={} read_backend_unavailable_retries={read_backend_unavailable_retries} effect_counters={effect_snapshot:?} completed_snapshot_count_by_voter={completed_snapshot_count_by_voter:?} voter_status={voter_status:?} voter_diagnostics={voter_diagnostics:?}",
         elapsed.as_millis(),
     );
 }
@@ -467,6 +517,12 @@ where
     for attempt in 0..=QUALIFICATION_TRANSIENT_RETRY_LIMIT {
         match operation().await {
             Ok(value) => return Ok(value),
+            // This generic helper is deliberately read-only-only. Keep the
+            // ambiguous mutation outcome explicit so a future broad retry
+            // arm cannot silently retransmit a mutation-shaped operation.
+            Err(StoreError::FencedTransitionOutcomeUnknown) => {
+                return Err(StoreError::FencedTransitionOutcomeUnknown);
+            }
             Err(StoreError::BackendUnavailable(_))
                 if attempt < QUALIFICATION_TRANSIENT_RETRY_LIMIT =>
             {
@@ -507,24 +563,18 @@ where
 
     for attempt in 0..=QUALIFICATION_TRANSIENT_RETRY_LIMIT {
         if Instant::now() >= deadline {
+            counters
+                .mutation_deadline_before_dispatch
+                .fetch_add(1, Ordering::Relaxed);
             return Err(ReleaseBatchFailure {
-                stage: ReleaseBatchFailureStage::DeadlineExpired,
+                stage: ReleaseBatchFailureStage::MutationDeadlineBeforeDispatch,
             });
         }
         counters.mutation_attempts.fetch_add(1, Ordering::Relaxed);
-        let effect = match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            execute(requests.clone()),
-        )
-        .await
-        {
-            Ok(effect) => effect,
-            Err(_) => {
-                return Err(ReleaseBatchFailure {
-                    stage: ReleaseBatchFailureStage::DeadlineExpired,
-                });
-            }
-        };
+        // A dispatched mutation owns its complete effect classification. Do
+        // not cancel it at this caller deadline and accidentally treat a
+        // possible transmission as a retry-safe absence of transmission.
+        let effect = execute(requests.clone()).await;
         match effect {
             FencedTransitionV2Effect::Resolved(Ok(outcomes)) => {
                 if outcomes.len() != requests.len() {
@@ -540,6 +590,11 @@ where
                                 stage: ReleaseBatchFailureStage::ResolvedShapeMismatch,
                             });
                         }
+                        // A completed effect may also be a deterministic
+                        // no-effect rejection. It is still resolved and must
+                        // not be retried or discarded for a deadline that
+                        // elapsed after the mutation returned.
+                        Err(error) if release_batch_expected_no_effect_error(error) => {}
                         Err(_) => {
                             return Err(ReleaseBatchFailure {
                                 stage: ReleaseBatchFailureStage::ResolvedItemError,
@@ -557,21 +612,34 @@ where
             FencedTransitionV2Effect::NotTransmitted(StoreError::BackendUnavailable(_))
                 if attempt < QUALIFICATION_TRANSIENT_RETRY_LIMIT =>
             {
+                if Instant::now() >= deadline {
+                    counters
+                        .not_transmitted_deadline
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(ReleaseBatchFailure {
+                        stage: ReleaseBatchFailureStage::NotTransmittedDeadline,
+                    });
+                }
                 let remaining = match deadline.checked_duration_since(Instant::now()) {
                     Some(remaining) => remaining,
                     None => {
+                        counters
+                            .not_transmitted_deadline
+                            .fetch_add(1, Ordering::Relaxed);
                         return Err(ReleaseBatchFailure {
-                            stage: ReleaseBatchFailureStage::DeadlineExpired,
+                            stage: ReleaseBatchFailureStage::NotTransmittedDeadline,
                         });
                     }
                 };
-                if remaining <= QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF {
-                    tokio::time::sleep(remaining).await;
+                tokio::time::sleep(remaining.min(QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF)).await;
+                if Instant::now() >= deadline {
+                    counters
+                        .deadline_after_backoff
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(ReleaseBatchFailure {
-                        stage: ReleaseBatchFailureStage::DeadlineExpired,
+                        stage: ReleaseBatchFailureStage::DeadlineAfterBackoff,
                     });
                 }
-                tokio::time::sleep(QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF).await;
                 counters
                     .not_transmitted_retries
                     .fetch_add(1, Ordering::Relaxed);
@@ -610,8 +678,11 @@ where
     let mut resolved = vec![None; requests.len()];
     for round in 0..=QUALIFICATION_TRANSIENT_RETRY_LIMIT {
         if Instant::now() >= deadline {
+            counters
+                .status_deadline_before_dispatch
+                .fetch_add(1, Ordering::Relaxed);
             return Err(ReleaseBatchFailure {
-                stage: ReleaseBatchFailureStage::DeadlineExpired,
+                stage: ReleaseBatchFailureStage::StatusDeadlineBeforeDispatch,
             });
         }
         let pending = resolved
@@ -619,23 +690,37 @@ where
             .enumerate()
             .filter_map(|(index, result)| result.is_none().then_some(index))
             .collect::<Vec<_>>();
-        counters
-            .status_attempts
-            .fetch_add(pending.len() as u64, Ordering::Relaxed);
+        let mut pending_observations = Vec::with_capacity(pending.len());
+        for index in pending {
+            // Status is immutable and can be cancelled by `timeout_at`, but
+            // it still must not begin once the caller's convergence budget
+            // has elapsed.
+            if Instant::now() >= deadline {
+                counters
+                    .status_deadline_before_dispatch
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(ReleaseBatchFailure {
+                    stage: ReleaseBatchFailureStage::StatusDeadlineBeforeDispatch,
+                });
+            }
+            let request = requests[index].clone();
+            let observation = status(request.clone());
+            counters.status_attempts.fetch_add(1, Ordering::Relaxed);
+            pending_observations.push(async move { (index, request, observation.await) });
+        }
         let observations = match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            futures_util::future::join_all(pending.into_iter().map(|index| {
-                let request = requests[index].clone();
-                let observation = status(request.clone());
-                async move { (index, request, observation.await) }
-            })),
+            deadline,
+            futures_util::future::join_all(pending_observations),
         )
         .await
         {
             Ok(observations) => observations,
             Err(_) => {
+                counters
+                    .status_deadline_timeout
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(ReleaseBatchFailure {
-                    stage: ReleaseBatchFailureStage::DeadlineExpired,
+                    stage: ReleaseBatchFailureStage::StatusDeadlineTimeout,
                 });
             }
         };
@@ -651,6 +736,7 @@ where
                                 stage: ReleaseBatchFailureStage::RecordedOutcomeMismatch,
                             });
                         }
+                        Err(error) if release_batch_expected_no_effect_error(error) => {}
                         Err(_) => {
                             return Err(ReleaseBatchFailure {
                                 stage: ReleaseBatchFailureStage::RecordedItemError,
@@ -661,17 +747,23 @@ where
                 }
                 Ok(FencedTransitionV2Status::NotFound) | Err(StoreError::BackendUnavailable(_)) => {
                 }
-                Ok(
-                    FencedTransitionV2Status::RequestConflict
-                    | FencedTransitionV2Status::Expired
-                    | FencedTransitionV2Status::Retired
-                    | FencedTransitionV2Status::HistoryFull
-                    | FencedTransitionV2Status::EpochNotActive
-                    | FencedTransitionV2Status::RetentionExhausted,
-                ) => {
-                    return Err(ReleaseBatchFailure {
-                        stage: ReleaseBatchFailureStage::StatusTerminal,
-                    });
+                Ok(FencedTransitionV2Status::RequestConflict) => {
+                    resolved[index] = Some(Err(StoreError::FencedTransitionRequestConflict));
+                }
+                Ok(FencedTransitionV2Status::Expired) => {
+                    resolved[index] = Some(Err(StoreError::FencedTransitionRequestExpired));
+                }
+                Ok(FencedTransitionV2Status::Retired) => {
+                    resolved[index] = Some(Err(StoreError::FencedTransitionHistoryEpochRetired));
+                }
+                Ok(FencedTransitionV2Status::HistoryFull) => {
+                    resolved[index] = Some(Err(StoreError::FencedTransitionHistoryFull));
+                }
+                Ok(FencedTransitionV2Status::EpochNotActive) => {
+                    resolved[index] = Some(Err(StoreError::FencedTransitionHistoryEpochNotActive));
+                }
+                Ok(FencedTransitionV2Status::RetentionExhausted) => {
+                    resolved[index] = Some(Err(StoreError::FencedTransitionRetentionExhausted));
                 }
                 Err(_) => {
                     return Err(ReleaseBatchFailure {
@@ -696,18 +788,23 @@ where
         let remaining = match deadline.checked_duration_since(Instant::now()) {
             Some(remaining) => remaining,
             None => {
+                counters
+                    .status_deadline_before_dispatch
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(ReleaseBatchFailure {
-                    stage: ReleaseBatchFailureStage::DeadlineExpired,
+                    stage: ReleaseBatchFailureStage::StatusDeadlineBeforeDispatch,
                 });
             }
         };
-        if remaining <= QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF {
-            tokio::time::sleep(remaining).await;
+        tokio::time::sleep(remaining.min(QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF)).await;
+        if Instant::now() >= deadline {
+            counters
+                .deadline_after_backoff
+                .fetch_add(1, Ordering::Relaxed);
             return Err(ReleaseBatchFailure {
-                stage: ReleaseBatchFailureStage::DeadlineExpired,
+                stage: ReleaseBatchFailureStage::DeadlineAfterBackoff,
             });
         }
-        tokio::time::sleep(QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF).await;
     }
     unreachable!("the bounded status convergence loop returns on its final attempt")
 }
@@ -1049,7 +1146,7 @@ async fn fixed_cluster(
                 &snapshot_paths[source],
                 peers,
                 Arc::clone(&clock),
-                Duration::from_secs(10),
+                DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
             )
             .await
             .expect("open fixed voter"),
@@ -1223,6 +1320,18 @@ async fn create_request(
         FencedTransitionMutation::create(record),
     )
     .expect("self-authenticating request")
+}
+
+async fn effect_deadline_test_request() -> FencedTransitionV2Request {
+    let provider = sealing_provider();
+    create_request(
+        0,
+        FencedTransitionV2HistoryEpoch::new(1).expect("deadline-test V2 epoch"),
+        key(0),
+        FenceToken::new(0),
+        &provider,
+    )
+    .await
 }
 
 async fn renew_update_request(
@@ -1579,7 +1688,7 @@ async fn release_effect_boundary_never_redispatches_an_ambiguous_batch() {
     assert_eq!(
         expired,
         Err(ReleaseBatchFailure {
-            stage: ReleaseBatchFailureStage::DeadlineExpired,
+            stage: ReleaseBatchFailureStage::DeadlineAfterBackoff,
         })
     );
     assert_eq!(
@@ -1650,7 +1759,237 @@ async fn release_effect_boundary_never_redispatches_an_ambiguous_batch() {
     );
     assert_eq!(counters.snapshot().status_attempts, 0);
 
+    let unexpected_resolved_error = execute_release_batch_effect(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+        vec![requests[0].clone()],
+        &ReleaseEffectCounters::default(),
+        |_| async {
+            FencedTransitionV2Effect::Resolved(Ok(vec![Err(StoreError::BackendUnavailable(
+                "release_test_unexpected_item_error".into(),
+            ))]))
+        },
+        |_| async { Ok(FencedTransitionV2Status::NotFound) },
+    )
+    .await;
+    assert_eq!(
+        unexpected_resolved_error,
+        Err(ReleaseBatchFailure {
+            stage: ReleaseBatchFailureStage::ResolvedItemError,
+        }),
+        "a string-bearing resolved item error must collapse to a fixed diagnostic stage"
+    );
+
+    let request_id = requests[0].request_id();
+    let unexpected_recorded_error = execute_release_batch_effect(
+        Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+        vec![requests[0].clone()],
+        &ReleaseEffectCounters::default(),
+        move |_| async move {
+            FencedTransitionV2Effect::OutcomeUnknown {
+                request_ids: vec![request_id],
+            }
+        },
+        |_| async {
+            Ok(FencedTransitionV2Status::Recorded(Box::new(Err(
+                StoreError::BackendUnavailable("release_test_unexpected_status_error".into()),
+            ))))
+        },
+    )
+    .await;
+    assert_eq!(
+        unexpected_recorded_error,
+        Err(ReleaseBatchFailure {
+            stage: ReleaseBatchFailureStage::RecordedItemError,
+        }),
+        "a string-bearing recorded item error must collapse to a fixed diagnostic stage"
+    );
+
     shutdown_fixed_cluster(&stores, &peer_slots).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_effect_deadline_accepts_a_resolved_mutation_that_completes_late() {
+    let request = effect_deadline_test_request().await;
+    let counters = ReleaseEffectCounters::default();
+    let mutation_calls = Arc::new(AtomicUsize::new(0));
+    let status_calls = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + Duration::from_millis(1);
+    let result = tokio::join!(
+        execute_release_batch_effect(
+            deadline,
+            vec![request],
+            &counters,
+            {
+                let mutation_calls = Arc::clone(&mutation_calls);
+                move |_| {
+                    let mutation_calls = Arc::clone(&mutation_calls);
+                    async move {
+                        mutation_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        FencedTransitionV2Effect::Resolved(Err(
+                            StoreError::FencedTransitionHistoryFull,
+                        ))
+                    }
+                }
+            },
+            {
+                let status_calls = Arc::clone(&status_calls);
+                move |_| {
+                    let status_calls = Arc::clone(&status_calls);
+                    async move {
+                        status_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(FencedTransitionV2Status::NotFound)
+                    }
+                }
+            },
+        ),
+        async {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(2)).await;
+        },
+    )
+    .0;
+    assert_eq!(
+        result,
+        Err(ReleaseBatchFailure {
+            stage: ReleaseBatchFailureStage::ResolvedBatchError,
+        }),
+        "the post-deadline classification is accepted as resolved, never recast as a timeout"
+    );
+    assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.snapshot().mutation_deadline_before_dispatch, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_effect_deadline_does_not_redispatch_not_transmitted_after_expiry() {
+    let request = effect_deadline_test_request().await;
+    let counters = ReleaseEffectCounters::default();
+    let mutation_calls = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + Duration::from_millis(1);
+    let result = tokio::join!(
+        execute_release_batch_effect(
+            deadline,
+            vec![request],
+            &counters,
+            {
+                let mutation_calls = Arc::clone(&mutation_calls);
+                move |_| {
+                    let mutation_calls = Arc::clone(&mutation_calls);
+                    async move {
+                        mutation_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        FencedTransitionV2Effect::NotTransmitted(StoreError::BackendUnavailable(
+                            "deadline-test-unavailable".into(),
+                        ))
+                    }
+                }
+            },
+            |_| async { Ok(FencedTransitionV2Status::NotFound) },
+        ),
+        async {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(2)).await;
+        },
+    )
+    .0;
+    assert_eq!(
+        result,
+        Err(ReleaseBatchFailure {
+            stage: ReleaseBatchFailureStage::NotTransmittedDeadline,
+        })
+    );
+    assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.snapshot().not_transmitted_deadline, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_effect_deadline_times_out_one_immutable_status_without_a_second_read() {
+    let request = effect_deadline_test_request().await;
+    let request_id = request.request_id();
+    let counters = ReleaseEffectCounters::default();
+    let status_calls = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + Duration::from_millis(1);
+    let result = tokio::join!(
+        execute_release_batch_effect(
+            deadline,
+            vec![request],
+            &counters,
+            move |_| {
+                let request_id = request_id;
+                async move {
+                    FencedTransitionV2Effect::OutcomeUnknown {
+                        request_ids: vec![request_id],
+                    }
+                }
+            },
+            {
+                let status_calls = Arc::clone(&status_calls);
+                move |_| {
+                    let status_calls = Arc::clone(&status_calls);
+                    async move {
+                        status_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        Ok(FencedTransitionV2Status::NotFound)
+                    }
+                }
+            },
+        ),
+        async {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(1)).await;
+        },
+    )
+    .0;
+    assert_eq!(
+        result,
+        Err(ReleaseBatchFailure {
+            stage: ReleaseBatchFailureStage::StatusDeadlineTimeout,
+        })
+    );
+    assert_eq!(status_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.snapshot().status_deadline_timeout, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_effect_deadline_clipped_backoff_cannot_start_post_deadline_mutation() {
+    let request = effect_deadline_test_request().await;
+    let counters = ReleaseEffectCounters::default();
+    let mutation_calls = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF;
+    let result = tokio::join!(
+        execute_release_batch_effect(
+            deadline,
+            vec![request],
+            &counters,
+            {
+                let mutation_calls = Arc::clone(&mutation_calls);
+                move |_| {
+                    let mutation_calls = Arc::clone(&mutation_calls);
+                    async move {
+                        mutation_calls.fetch_add(1, Ordering::SeqCst);
+                        FencedTransitionV2Effect::NotTransmitted(StoreError::BackendUnavailable(
+                            "deadline-test-unavailable".into(),
+                        ))
+                    }
+                }
+            },
+            |_| async { Ok(FencedTransitionV2Status::NotFound) },
+        ),
+        async {
+            tokio::task::yield_now().await;
+            tokio::time::advance(QUALIFICATION_RELEASE_BATCH_RETRY_BACKOFF).await;
+        },
+    )
+    .0;
+    assert_eq!(
+        result,
+        Err(ReleaseBatchFailure {
+            stage: ReleaseBatchFailureStage::DeadlineAfterBackoff,
+        })
+    );
+    assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.snapshot().deadline_after_backoff, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2513,8 +2852,8 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         "the downstream contract is two unique transitions for each of 50,000 sessions"
     );
     assert_eq!(
-        QUALIFICATION_HEADROOM_TRANSITIONS, 31_072,
-        "qualification must exercise every declared transition of headroom"
+        QUALIFICATION_OPERATIONAL_HEADROOM_TRANSITIONS, 31_072,
+        "qualification must exercise every declared active-epoch operational transition of headroom"
     );
     let first_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("first epoch");
 
@@ -2640,7 +2979,7 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     let (first_request, first_outcome) = (first_request.clone(), first_outcome.clone());
     let headroom_states = session_states
         .iter()
-        .take(QUALIFICATION_HEADROOM_TRANSITIONS)
+        .take(QUALIFICATION_OPERATIONAL_HEADROOM_TRANSITIONS)
         .map(|(_, _, _, updated)| updated.clone())
         .collect::<Vec<_>>();
     let target_history = retry_exact_consensus_operation(&transient_retries, || {
@@ -2688,8 +3027,8 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     completed_headroom_states.sort_unstable_by_key(|(headroom_index, _)| *headroom_index);
     assert_eq!(
         completed_headroom_states.len(),
-        QUALIFICATION_HEADROOM_TRANSITIONS,
-        "every declared transition of headroom must commit through fixed quorum"
+        QUALIFICATION_OPERATIONAL_HEADROOM_TRANSITIONS,
+        "every declared active-epoch operational transition of headroom must commit through fixed quorum"
     );
     let headroom_states = completed_headroom_states
         .into_iter()
@@ -2728,21 +3067,40 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
     .await
     .expect("open live watch before one-over rejection");
     assert_eq!(
-        store.fenced_transition_v2(one_over_request.clone()).await,
-        Err(StoreError::FencedTransitionHistoryFull),
+        execute_release_store_batch(
+            Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+            store,
+            vec![one_over_request.clone()],
+            &effect_counters,
+        )
+        .await
+        .expect("one-over exact effect must resolve"),
+        vec![Err(StoreError::FencedTransitionHistoryFull)],
         "one-over request must not execute"
     );
     assert_eq!(
-        store.fenced_transition_v2(one_over_request.clone()).await,
-        Err(StoreError::FencedTransitionHistoryFull),
+        execute_release_store_batch(
+            Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+            store,
+            vec![one_over_request.clone()],
+            &effect_counters,
+        )
+        .await
+        .expect("one-over exact replay effect must resolve"),
+        vec![Err(StoreError::FencedTransitionHistoryFull)],
         "exact one-over retry must remain a deterministic no-effect rejection"
     );
     let changed_one_over_request = request_with_changed_body(&one_over_request);
     assert_eq!(
-        store
-            .fenced_transition_v2(changed_one_over_request.clone())
-            .await,
-        Err(StoreError::FencedTransitionRequestConflict),
+        execute_release_store_batch(
+            Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+            store,
+            vec![changed_one_over_request.clone()],
+            &effect_counters,
+        )
+        .await
+        .expect("one-over changed-body effect must resolve"),
+        vec![Err(StoreError::FencedTransitionRequestConflict)],
         "same full ID with a changed update body must not acquire capacity or a lease"
     );
     let observation_after_rejection = retry_exact_consensus_operation(&transient_retries, || {
@@ -2836,10 +3194,15 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         FencedTransitionV2Status::RequestConflict
     );
     assert_eq!(
-        store
-            .fenced_transition_v2(changed_old_request.clone())
-            .await,
-        Err(StoreError::FencedTransitionRequestConflict),
+        execute_release_store_batch(
+            Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+            store,
+            vec![changed_old_request.clone()],
+            &effect_counters,
+        )
+        .await
+        .expect("altered old-body effect must resolve before retirement"),
+        vec![Err(StoreError::FencedTransitionRequestConflict)],
         "an altered old body must conflict before retirement"
     );
     clock.set(
@@ -2901,15 +3264,27 @@ async fn sustained_131073_unique_v2_transitions_bind_exact_epoch_capacity() {
         FencedTransitionV2Status::RequestConflict
     );
     assert_eq!(
-        store.fenced_transition_v2(old_request.clone()).await,
-        Err(StoreError::FencedTransitionRequestExpired),
+        execute_release_store_batch(
+            Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+            store,
+            vec![old_request.clone()],
+            &effect_counters,
+        )
+        .await
+        .expect("expired old request effect must resolve"),
+        vec![Err(StoreError::FencedTransitionRequestExpired)],
         "an expired retained binding must never execute again"
     );
     assert_eq!(
-        store
-            .fenced_transition_v2(changed_old_request.clone())
-            .await,
-        Err(StoreError::FencedTransitionRequestConflict),
+        execute_release_store_batch(
+            Instant::now() + QUALIFICATION_RELEASE_BATCH_DEADLINE,
+            store,
+            vec![changed_old_request.clone()],
+            &effect_counters,
+        )
+        .await
+        .expect("expired changed-body effect must resolve"),
+        vec![Err(StoreError::FencedTransitionRequestConflict)],
         "body conflict must remain deterministic after successor rotation"
     );
     assert_eq!(
@@ -3104,7 +3479,27 @@ fn release_qualification_dimensions_are_fixed() {
     assert_eq!(QUALIFICATION_SUSTAINED_TRANSITIONS, 900_000);
     assert_eq!(QUALIFICATION_BURST_TRANSITIONS, 60_000);
     assert_eq!(QUALIFICATION_RELEASE_TRANSITIONS, 1_010_000);
-    assert_eq!(QUALIFICATION_HEADROOM_TRANSITIONS, 31_072);
+    assert_eq!(
+        QUALIFICATION_OPERATIONAL_HEADROOM_TRANSITIONS, 31_072,
+        "operational headroom is per active epoch after the 100,000-operation target"
+    );
+    assert_eq!(
+        QUALIFICATION_RETAINED_ENVELOPE_HEADROOM_TRANSITIONS, 38_576,
+        "retained-envelope headroom is after the 1,010,000-operation release workload"
+    );
+    assert_eq!(
+        QUALIFICATION_OPERATIONAL_HEADROOM_TRANSITIONS,
+        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES - FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET
+    );
+    assert_eq!(
+        QUALIFICATION_RETAINED_ENVELOPE_HEADROOM_TRANSITIONS,
+        FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES - QUALIFICATION_RELEASE_TRANSITIONS
+    );
+    assert_ne!(
+        QUALIFICATION_OPERATIONAL_HEADROOM_TRANSITIONS,
+        QUALIFICATION_RETAINED_ENVELOPE_HEADROOM_TRANSITIONS,
+        "active-epoch operational headroom and retained-envelope release headroom are distinct dimensions"
+    );
     assert_eq!(QUALIFICATION_IN_FLIGHT_CLIENTS, 8);
 }
 
@@ -3137,6 +3532,7 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
     let diagnostics = BoundedScaleDiagnostics {
         stores: &stores,
         effect_counters: effect_counters.as_ref(),
+        read_backend_unavailable_retries: &transient_retries,
     };
     let history_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
     let setup_started = Instant::now();
@@ -3184,6 +3580,17 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
             )
             .await,
         );
+    }
+    if transient_retries.load(Ordering::Relaxed) != 0 {
+        fail_bounded_scale_stall(
+            directory,
+            &peer_slots,
+            &diagnostics,
+            "setup_backend_unavailable",
+            &mut bounded_scale_observation("setup", 0, setup_started, 0, 0, 0, &mut setup_latency),
+        )
+        .await;
+        unreachable!("bounded scale failure always panics")
     }
 
     let first_request = create_requests.remove(0);
@@ -3646,8 +4053,27 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
         .iter()
         .map(|status| status.completed_snapshot_count)
         .sum::<u64>();
+    if transient_retries.load(Ordering::Relaxed) != 0 {
+        fail_bounded_scale_stall(
+            directory,
+            &peer_slots,
+            &diagnostics,
+            "read_backend_unavailable",
+            &mut bounded_scale_observation(
+                "snapshot-threshold-summary",
+                0,
+                Instant::now(),
+                0,
+                0,
+                0,
+                &mut ReleaseLatencySamples::default(),
+            ),
+        )
+        .await;
+        unreachable!("bounded scale failure always panics")
+    }
     eprintln!(
-        "sdk-704 bounded snapshot scale summary: cargo_profile_family={} cargo_opt_level={} debug_assertions={} topology_voters={} session_slots={} batches_per_phase={} total_batches={} total_exact_outcomes={} required_completed_snapshots_per_voter=2 completed_snapshot_count_by_voter={:?} total_completed_snapshots={completed_snapshot_count}",
+        "sdk-704 bounded snapshot scale summary: cargo_profile_family={} cargo_opt_level={} debug_assertions={} topology_voters={} session_slots={} batches_per_phase={} total_batches={} total_exact_outcomes={} required_completed_snapshots_per_voter=2 read_backend_unavailable_retries={} completed_snapshot_count_by_voter={:?} total_completed_snapshots={completed_snapshot_count}",
         build_profile.cargo_profile_family,
         build_profile.cargo_opt_level,
         build_profile.debug_assertions,
@@ -3656,6 +4082,7 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
         BOUNDED_SCALE_STALL_BATCHES_PER_PHASE,
         cumulative_completed_batches,
         matched_workload_outcomes.load(Ordering::Relaxed),
+        transient_retries.load(Ordering::Relaxed),
         final_statuses
             .iter()
             .map(|status| status.completed_snapshot_count)
@@ -4329,7 +4756,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
     let peak_rss_kib = process_peak_rss_kib();
     let effect_snapshot = effect_counters.snapshot();
     eprintln!(
-        "sdk-702 successor qualification: cargo_profile_family={} cargo_opt_level={} debug_assertions={} elapsed_ms={} topology_voters={} release_operations_committed={} matched_workload_outcomes={} operational_headroom_transitions={} active_integrity_receipts={} active_integrity_records={} active_reclaim_operations_committed=1 matched_reclaim_outcomes={} total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} mutation_attempts={} not_transmitted_retries={} outcome_unknown_batches={} status_attempts={} status_retry_rounds={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
+        "sdk-702 successor qualification: cargo_profile_family={} cargo_opt_level={} debug_assertions={} elapsed_ms={} topology_voters={} release_operations_committed={} matched_workload_outcomes={} operational_headroom_transitions={} retained_envelope_headroom_transitions={} active_integrity_receipts={} active_integrity_records={} active_reclaim_operations_committed=1 matched_reclaim_outcomes={} total_operations_committed={} rotations={} semantic_history_ceiling_bytes={} transient_exact_retries={} mutation_attempts={} not_transmitted_retries={} outcome_unknown_batches={} status_attempts={} status_retry_rounds={} pre_reclaim_db_bytes_by_voter={database_bytes_before_reclaim_by_voter:?} pre_reclaim_snapshot_bytes_by_voter={snapshot_bytes_before_reclaim_by_voter:?} post_reclaim_db_bytes_by_voter={database_bytes_by_voter:?} post_reclaim_snapshot_bytes_by_voter={snapshot_bytes_by_voter:?} reclaimed_entries={} reclaim_remaining={} peak_rss_kib={peak_rss_kib}",
         build_profile.cargo_profile_family,
         build_profile.cargo_opt_level,
         build_profile.debug_assertions,
@@ -4337,7 +4764,8 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         stores.len(),
         QUALIFICATION_RELEASE_TRANSITIONS,
         matched_workload_outcomes.load(Ordering::Relaxed),
-        QUALIFICATION_HEADROOM_TRANSITIONS,
+        QUALIFICATION_OPERATIONAL_HEADROOM_TRANSITIONS,
+        QUALIFICATION_RETAINED_ENVELOPE_HEADROOM_TRANSITIONS,
         active_integrity_pairs,
         active_integrity_pairs,
         matched_reclaim_outcomes.load(Ordering::Relaxed),

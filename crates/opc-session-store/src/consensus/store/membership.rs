@@ -1372,6 +1372,7 @@ impl ConsensusSessionStore {
                 DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
             )),
             diagnostics,
+            shutdown: ConsensusShutdownCoordinator::new(),
             #[cfg(test)]
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });

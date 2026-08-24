@@ -102,6 +102,14 @@ binding for every submitted item. The 1,010,000-operation count excludes the
 separately reported intervening active-epoch reclaim write. Resource and
 latency samples are evidence outputs, not inferred from the offered rate.
 
+The emitted headroom dimensions are intentionally distinct. The
+`operational_headroom_transitions` value is 31,072 per active epoch
+(131,072 - 100,000): it belongs to the separate active-epoch operational
+target qualification. The successor-scale release workload instead has
+`retained_envelope_headroom_transitions` of 38,576
+(1,048,576 - 1,010,000) within the complete one-active-plus-seven-replay-epoch
+retained envelope. Neither value is a substitute for the other.
+
 ### Final-head status: pending
 
 No final-head 1.01M result is recorded in this source document. It remains

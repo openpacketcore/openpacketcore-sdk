@@ -22,8 +22,8 @@ use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rusqlite::OpenFlags;
 use rusqlite::{
-    backup::StepResult, params, Connection, InterruptHandle, OptionalExtension, Transaction,
-    TransactionBehavior,
+    backup::StepResult, params, Connection, DropBehavior, InterruptHandle, OptionalExtension,
+    Transaction, TransactionBehavior,
 };
 use sha2::{Digest, Sha256};
 
@@ -1428,6 +1428,9 @@ struct ConsensusLogPruneTurnGateState {
     entered: bool,
     released: bool,
     preempted: bool,
+    progress_preempted: bool,
+    progress_steps_before_preempt: usize,
+    progress_steps_seen: usize,
     completed: bool,
 }
 
@@ -1437,6 +1440,11 @@ enum ConsensusLogPruneTurnGatePoint {
     BeforeTransaction,
     BeforeActiveInterrupt,
     AfterWriterAcquired,
+    BeforeAuthorityRead,
+    BeforeReadPurged,
+    BeforeDelete,
+    MidDelete,
+    BeforeCommit,
 }
 
 /// Test-only, directory-scoped gate for a real lane turn.  It is installed
@@ -1521,6 +1529,31 @@ impl ConsensusLogPruneTurnGate {
         state.preempted
     }
 
+    fn wait_at(&self, point: ConsensusLogPruneTurnGatePoint) {
+        if self.point != point
+            && !(self.point == ConsensusLogPruneTurnGatePoint::MidDelete
+                && point == ConsensusLogPruneTurnGatePoint::BeforeDelete)
+        {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.entered = true;
+        self.entered.notify_all();
+        while !state.released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.armed = false;
+    }
+
     fn release(&self) {
         let mut state = self
             .state
@@ -1537,6 +1570,38 @@ impl ConsensusLogPruneTurnGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.preempted = true;
         self.released.notify_all();
+    }
+
+    fn notify_progress_preemption(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.progress_preempted = true;
+        self.released.notify_all();
+    }
+
+    fn permit_progress_preemption(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.progress_steps_seen = state.progress_steps_seen.saturating_add(1);
+        state.progress_steps_seen > state.progress_steps_before_preempt
+    }
+
+    fn progress_preempted(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .progress_preempted
+    }
+
+    fn progress_steps_seen(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .progress_steps_seen
     }
 
     fn notify_completion(&self) {
@@ -1626,6 +1691,29 @@ impl ConsensusLogPruneTurnGateForTest {
         )
     }
 
+    pub(crate) fn install_before_delete(directory: &Path) -> Self {
+        Self::install_at(directory, ConsensusLogPruneTurnGatePoint::BeforeDelete)
+    }
+
+    pub(crate) fn install_before_authority_read(directory: &Path) -> Self {
+        Self::install_at(
+            directory,
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+        )
+    }
+
+    pub(crate) fn install_mid_delete(directory: &Path) -> Self {
+        Self::install_at(directory, ConsensusLogPruneTurnGatePoint::MidDelete)
+    }
+
+    pub(crate) fn install_before_read_purged(directory: &Path) -> Self {
+        Self::install_at(directory, ConsensusLogPruneTurnGatePoint::BeforeReadPurged)
+    }
+
+    pub(crate) fn install_before_commit(directory: &Path) -> Self {
+        Self::install_at(directory, ConsensusLogPruneTurnGatePoint::BeforeCommit)
+    }
+
     fn install_at(directory: &Path, point: ConsensusLogPruneTurnGatePoint) -> Self {
         let directory =
             std::fs::canonicalize(directory).expect("canonicalize prune gate directory");
@@ -1636,6 +1724,11 @@ impl ConsensusLogPruneTurnGateForTest {
                 entered: false,
                 released: false,
                 preempted: false,
+                progress_preempted: false,
+                progress_steps_before_preempt: usize::from(
+                    point == ConsensusLogPruneTurnGatePoint::MidDelete,
+                ) * 8,
+                progress_steps_seen: 0,
                 completed: false,
             }),
             entered: Condvar::new(),
@@ -1655,6 +1748,14 @@ impl ConsensusLogPruneTurnGateForTest {
 
     pub(crate) fn wait_until_entered(&self, timeout: Duration) -> bool {
         self.gate.wait_until_entered(timeout)
+    }
+
+    pub(crate) fn progress_preempted(&self) -> bool {
+        self.gate.progress_preempted()
+    }
+
+    pub(crate) fn progress_steps_seen(&self) -> usize {
+        self.gate.progress_steps_seen()
     }
 
     pub(crate) async fn wait_until_completed(&self) {
@@ -1916,9 +2017,9 @@ async fn run_consensus_log_prune_lane(
                 &expected_bindings_for_turn,
                 fixed_placement_policy,
                 ConsensusLogPruneTurnControl {
-                    primary_writers: primary_writers.as_ref(),
+                    primary_writers: Arc::clone(&primary_writers),
                     #[cfg(all(test, target_os = "linux"))]
-                    turn_gate: turn_gate.as_deref(),
+                    turn_gate: turn_gate.clone(),
                 },
             );
             let result = match result {
@@ -2073,10 +2174,55 @@ async fn wait_consensus_log_prune_pacing(
     }
 }
 
-struct ConsensusLogPruneTurnControl<'a> {
-    primary_writers: &'a AtomicUsize,
+struct ConsensusLogPruneTurnControl {
+    primary_writers: Arc<AtomicUsize>,
     #[cfg(all(test, target_os = "linux"))]
-    turn_gate: Option<&'a ConsensusLogPruneTurnGate>,
+    turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
+}
+
+/// Interrupt every SQLite VM step in a prune turn once a primary writer has
+/// announced itself. The lane publishes the connection interrupt handle
+/// before entering this scope; this callback closes the interval where that
+/// cross-thread interrupt arrives with no VDBE active and SQLite clears it.
+struct ConsensusLogPruneProgressGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> ConsensusLogPruneProgressGuard<'a> {
+    fn install(
+        conn: &'a Connection,
+        primary_writers: Arc<AtomicUsize>,
+        observed_preemption: Arc<AtomicBool>,
+        #[cfg(all(test, target_os = "linux"))] turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
+    ) -> Self {
+        conn.progress_handler(
+            1,
+            Some(move || {
+                let preempt = primary_writers.load(Ordering::Acquire) != 0;
+                if preempt {
+                    #[cfg(all(test, target_os = "linux"))]
+                    if let Some(gate) = &turn_gate {
+                        if !gate.permit_progress_preemption() {
+                            return false;
+                        }
+                    }
+                    observed_preemption.store(true, Ordering::Release);
+                    #[cfg(all(test, target_os = "linux"))]
+                    if let Some(gate) = &turn_gate {
+                        gate.notify_progress_preemption();
+                    }
+                }
+                preempt
+            }),
+        );
+        Self { conn }
+    }
+}
+
+impl Drop for ConsensusLogPruneProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
 }
 
 fn prune_consensus_log_turn_sync(
@@ -2086,45 +2232,134 @@ fn prune_consensus_log_turn_sync(
     expected_members: &BTreeSet<SessionConsensusNodeId>,
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
-    control: ConsensusLogPruneTurnControl<'_>,
+    control: ConsensusLogPruneTurnControl,
 ) -> Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError> {
-    verify_proactive_checkpoint_connection(conn, source).map_err(consensus_log_prune_permanent)?;
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
-    #[cfg(all(test, target_os = "linux"))]
-    if control
-        .turn_gate
-        .is_some_and(ConsensusLogPruneTurnGate::wait_after_writer_acquired)
-    {
-        return Err(ConsensusLogPruneTurnError::Interrupted);
+    let observed_preemption = Arc::new(AtomicBool::new(false));
+    let progress = ConsensusLogPruneProgressGuard::install(
+        conn,
+        Arc::clone(&control.primary_writers),
+        Arc::clone(&observed_preemption),
+        #[cfg(all(test, target_os = "linux"))]
+        control.turn_gate.clone(),
+    );
+    let pre_transaction = (|| {
+        verify_proactive_checkpoint_connection(conn, source)
+            .map_err(consensus_log_prune_permanent)?;
+        // Recheck after publication and handler installation. A primary that
+        // arrived during that handoff must yield before BEGIN IMMEDIATE.
+        preempt_consensus_log_prune_if_requested(control.primary_writers.as_ref())
+    })();
+    if let Err(error) = pre_transaction {
+        drop(progress);
+        return Err(error);
     }
-    preempt_consensus_log_prune_if_requested(control.primary_writers)?;
-    validate_durable_authority_for_raw_access(
-        &tx,
-        identity,
-        ConsensusAuthorityProfile::FixedImmutable,
-        expected_members,
-        expected_bindings,
-        fixed_placement_policy,
-    )
-    .map_err(consensus_log_prune_permanent)?;
-    preempt_consensus_log_prune_if_requested(control.primary_writers)?;
-    let Some(floor) = read_purged_sync(&tx, identity).map_err(consensus_log_prune_permanent)?
-    else {
-        preempt_consensus_log_prune_if_requested(control.primary_writers)?;
-        return Ok(ConsensusLogPruneTurnCompletion {
-            more: false,
-            rows_deleted: 0,
-            encoded_bytes_deleted: 0,
-        });
+    let mut tx = match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+        Ok(tx) => tx,
+        Err(error) => {
+            drop(progress);
+            return Err(classify_consensus_log_prune_sqlite_error(&error));
+        }
     };
-    preempt_consensus_log_prune_if_requested(control.primary_writers)?;
-    let completion = prune_consensus_log_rows_in_tx(&tx, &floor, control.primary_writers)?;
-    verify_proactive_checkpoint_connection(conn, source).map_err(consensus_log_prune_permanent)?;
-    preempt_consensus_log_prune_if_requested(control.primary_writers)?;
-    tx.commit()
-        .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
-    Ok(completion)
+    let result = (|| {
+        #[cfg(all(test, target_os = "linux"))]
+        if control
+            .turn_gate
+            .as_deref()
+            .is_some_and(ConsensusLogPruneTurnGate::wait_after_writer_acquired)
+        {
+            return Err(ConsensusLogPruneTurnError::Interrupted);
+        }
+        preempt_consensus_log_prune_if_requested(control.primary_writers.as_ref())?;
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(gate) = control.turn_gate.as_deref() {
+            gate.wait_at(ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead);
+        }
+        validate_durable_authority_for_raw_access(
+            &tx,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            expected_members,
+            expected_bindings,
+            fixed_placement_policy,
+        )
+        .map_err(consensus_log_prune_permanent)?;
+        preempt_consensus_log_prune_if_requested(control.primary_writers.as_ref())?;
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(gate) = control.turn_gate.as_deref() {
+            gate.wait_at(ConsensusLogPruneTurnGatePoint::BeforeReadPurged);
+        }
+        let Some(floor) = read_purged_for_prune_sync(&tx, identity)? else {
+            preempt_consensus_log_prune_if_requested(control.primary_writers.as_ref())?;
+            return Ok(ConsensusLogPruneTurnCompletion {
+                more: false,
+                rows_deleted: 0,
+                encoded_bytes_deleted: 0,
+            });
+        };
+        preempt_consensus_log_prune_if_requested(control.primary_writers.as_ref())?;
+        let completion = prune_consensus_log_rows_in_tx(
+            &tx,
+            &floor,
+            control.primary_writers.as_ref(),
+            #[cfg(all(test, target_os = "linux"))]
+            control.turn_gate.as_deref(),
+        )?;
+        verify_proactive_checkpoint_connection(conn, source)
+            .map_err(consensus_log_prune_permanent)?;
+        preempt_consensus_log_prune_if_requested(control.primary_writers.as_ref())?;
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(gate) = control.turn_gate.as_deref() {
+            gate.wait_at(ConsensusLogPruneTurnGatePoint::BeforeCommit);
+        }
+        Ok(completion)
+    })();
+    let result = match result {
+        Ok(completion) => {
+            let commit = tx
+                .execute_batch("COMMIT")
+                .map_err(|error| classify_consensus_log_prune_sqlite_error(&error));
+            tx.set_drop_behavior(DropBehavior::Ignore);
+            drop(progress);
+            if commit.is_err() {
+                let rollback = rollback_consensus_log_prune_transaction(conn);
+                drop(tx);
+                rollback.map_err(|_| ConsensusLogPruneTurnError::Permanent)?;
+            } else {
+                drop(tx);
+            }
+            commit.map(|()| completion)
+        }
+        Err(error) => {
+            // A progress callback may have interrupted an SQLite VM. Remove
+            // it before the rollback/transaction drop so cleanup itself is
+            // never interrupted and cannot strand the write lock.
+            tx.set_drop_behavior(DropBehavior::Ignore);
+            drop(progress);
+            let rollback = rollback_consensus_log_prune_transaction(conn);
+            drop(tx);
+            rollback.map_err(|_| ConsensusLogPruneTurnError::Permanent)?;
+            Err(error)
+        }
+    };
+    match result {
+        Err(ConsensusLogPruneTurnError::Interrupted | ConsensusLogPruneTurnError::Permanent)
+            if observed_preemption.load(Ordering::Acquire)
+                && control.primary_writers.load(Ordering::Acquire) != 0 =>
+        {
+            Err(ConsensusLogPruneTurnError::PreemptedByPrimary)
+        }
+        result => result,
+    }
+}
+
+fn rollback_consensus_log_prune_transaction(
+    conn: &Connection,
+) -> Result<(), ConsensusLogPruneTurnError> {
+    if conn.is_autocommit() {
+        return Ok(());
+    }
+    conn.execute_batch("ROLLBACK")
+        .map_err(|rollback_error| classify_consensus_log_prune_sqlite_error(&rollback_error))
 }
 
 fn preempt_consensus_log_prune_if_requested(
@@ -2137,10 +2372,49 @@ fn preempt_consensus_log_prune_if_requested(
     }
 }
 
+/// Read the physical-prune floor without erasing an SQLite interrupt. The
+/// generic durable-read surface intentionally redacts backend failures into
+/// `io::Error`; this dedicated lane path retains only the internal interrupt
+/// classifier so a live primary guard can preempt before a transaction drop.
+fn read_purged_for_prune_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> Result<Option<LogId<SessionConsensusNodeId>>, ConsensusLogPruneTurnError> {
+    let row = conn
+        .query_row(
+            "SELECT configuration_epoch, term, log_index, log_id_json \
+             FROM consensus_purged WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
+    let Some((epoch, term, index, encoded)) = row else {
+        return Ok(None);
+    };
+    validate_epoch(epoch, identity).map_err(consensus_log_prune_permanent)?;
+    let log_id: LogId<SessionConsensusNodeId> =
+        decode_json(&encoded).map_err(consensus_log_prune_permanent)?;
+    if checked_u64(term).map_err(consensus_log_prune_permanent)? != log_id.leader_id.term
+        || checked_u64(index).map_err(consensus_log_prune_permanent)? != log_id.index
+    {
+        return Err(ConsensusLogPruneTurnError::Permanent);
+    }
+    Ok(Some(log_id))
+}
+
 fn prune_consensus_log_rows_in_tx(
     tx: &Transaction<'_>,
     floor: &LogId<SessionConsensusNodeId>,
     primary_writers: &AtomicUsize,
+    #[cfg(all(test, target_os = "linux"))] turn_gate: Option<&ConsensusLogPruneTurnGate>,
 ) -> Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError> {
     let mut statement = tx.prepare("SELECT log_index, length(entry_json) FROM consensus_log WHERE log_index <= ?1 ORDER BY log_index ASC LIMIT ?2").map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
     let mut rows = statement
@@ -2176,6 +2450,10 @@ fn prune_consensus_log_rows_in_tx(
     drop(rows);
     drop(statement);
     preempt_consensus_log_prune_if_requested(primary_writers)?;
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(gate) = turn_gate {
+        gate.wait_at(ConsensusLogPruneTurnGatePoint::BeforeDelete);
+    }
     if let Some(last) = selected.last() {
         tx.execute("DELETE FROM consensus_log WHERE log_index <= ?1", [last])
             .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))?;
@@ -8885,10 +9163,11 @@ impl MembershipLogProjection {
                 "projected fenced transition V2 batch lacks an exact activation certificate",
             ));
         }
-        if history.active_epoch != Some(requests[0].request_id().epoch()) {
-            self.advance_projected_logical_time(command.logical_time);
-            return Ok(());
-        }
+        // Do not reject a whole closed-epoch batch here. Each member must
+        // preserve apply's precedence: retained exact receipts replay before
+        // the active-epoch gate, while an unbound closed identity remains a
+        // deterministic no-effect rejection. The singleton projection below
+        // owns that same per-item order for follower append admission.
         let available = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
             .checked_sub(history.current_bound_count)
             .ok_or_else(|| invalid_data("projected fenced transition V2 count is invalid"))?;
@@ -19780,6 +20059,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn consensus_log_prune_progress_guard_preempts_the_next_sqlite_vm_step() {
+        let conn = Connection::open_in_memory().expect("open prune progress fixture");
+        let primary_writers = Arc::new(AtomicUsize::new(0));
+        let observed_preemption = Arc::new(AtomicBool::new(false));
+        let guard = ConsensusLogPruneProgressGuard::install(
+            &conn,
+            Arc::clone(&primary_writers),
+            Arc::clone(&observed_preemption),
+            None,
+        );
+        primary_writers.store(1, Ordering::Release);
+        let error = conn
+            .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            .expect_err("the production progress predicate interrupts the next VM step");
+        drop(guard);
+        assert_eq!(
+            classify_consensus_log_prune_sqlite_error(&error),
+            ConsensusLogPruneTurnError::Interrupted,
+        );
+        assert!(
+            observed_preemption.load(Ordering::Acquire),
+            "only the installed production progress callback proves this interrupt was primary preemption",
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn consensus_log_prune_connection_returns_competing_writer_busy_without_the_primary_timeout() {
@@ -21064,6 +21369,240 @@ mod tests {
         tx.commit().expect("commit purge-floor fixture");
     }
 
+    #[cfg(target_os = "linux")]
+    async fn assert_consensus_log_prune_primary_preemption_at_production_window(
+        point: ConsensusLogPruneTurnGatePoint,
+    ) {
+        let directory = tempfile::tempdir().expect("prune preemption directory");
+        let source_path = directory.path().join("prune-preemption.sqlite");
+        let backend = SqliteSessionBackend::open(&source_path).expect("open prune backend");
+        let primary = backend.conn.lock().await;
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &primary,
+            identity(),
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed prune authority");
+        let membership = membership_entry_at(0, vec![members.clone()], members.clone());
+        let entries = (1..=2).map(blank_entry).collect::<Vec<_>>();
+        append_logs_with_authority_sync(
+            &primary,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            std::slice::from_ref(&membership),
+        )
+        .expect("append prune membership");
+        apply_entries_with_authority_sync(
+            &primary,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![membership],
+        )
+        .expect("apply prune membership");
+        append_logs_with_authority_sync(
+            &primary,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &entries,
+        )
+        .expect("append prune log");
+        apply_entries_with_authority_sync(
+            &primary,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            entries,
+        )
+        .expect("apply prune log");
+        let tx = Transaction::new_unchecked(&primary, TransactionBehavior::Immediate)
+            .expect("begin logical prune floor");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(2), 2).expect("save logical prune floor");
+        tx.commit().expect("commit logical prune floor");
+        let pinned = Arc::new(
+            crate::consensus::snapshot::PinnedSqliteFile::from_file(
+                opc_sqlite_file_control_sys::main_file_descriptor(&primary)
+                    .expect("duplicate prune primary descriptor"),
+                source_path,
+            )
+            .expect("pin prune primary descriptor"),
+        );
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let gate = match point {
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead => {
+                ConsensusLogPruneTurnGateForTest::install_before_authority_read(directory.path())
+            }
+            ConsensusLogPruneTurnGatePoint::BeforeReadPurged => {
+                ConsensusLogPruneTurnGateForTest::install_before_read_purged(directory.path())
+            }
+            ConsensusLogPruneTurnGatePoint::BeforeDelete => {
+                ConsensusLogPruneTurnGateForTest::install_before_delete(directory.path())
+            }
+            ConsensusLogPruneTurnGatePoint::MidDelete => {
+                ConsensusLogPruneTurnGateForTest::install_mid_delete(directory.path())
+            }
+            ConsensusLogPruneTurnGatePoint::BeforeCommit => {
+                ConsensusLogPruneTurnGateForTest::install_before_commit(directory.path())
+            }
+            _ => panic!("only production SQLite lost-interrupt windows are valid"),
+        };
+        let lane = ConsensusLogPruneLane::start(
+            Arc::clone(&pinned),
+            None,
+            identity(),
+            members.clone(),
+            bindings.clone(),
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(Arc::clone(&diagnostics)),
+        )
+        .expect("start prune lane");
+        lane.signal();
+        let gate_state = Arc::clone(&gate.gate);
+        assert!(
+            tokio::task::spawn_blocking(move || {
+                gate_state.wait_until_entered(Duration::from_secs(1))
+            })
+            .await
+            .expect("join production-window gate observer"),
+            "the real lane is parked after its final explicit check with no VDBE active"
+        );
+
+        let primary_guard = lane.request_primary_preemption();
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if diagnostics.snapshot().consensus_log_prune_busy_retries == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("production progress callback preempts the parked prune turn");
+        assert!(
+            gate.progress_preempted(),
+            "the real interval-one production progress callback observed the retained primary guard"
+        );
+        if point == ConsensusLogPruneTurnGatePoint::MidDelete {
+            assert!(
+                gate.progress_steps_seen() > 1,
+                "the real DELETE ran more than one production VDBE progress step before interruption",
+            );
+        }
+        assert_eq!(
+            primary
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count rolled-back prune rows"),
+            3,
+            "the interrupted prune transaction rolls back every pending physical delete"
+        );
+
+        let primary_writer =
+            Connection::open(pinned.path()).expect("open competing primary writer");
+        apply_pragma_profile(&primary_writer, false, true)
+            .expect("configure competing primary writer");
+        let began = std::time::Instant::now();
+        let primary_write =
+            Transaction::new_unchecked(&primary_writer, TransactionBehavior::Immediate)
+                .expect("primary BEGIN IMMEDIATE after prune preemption");
+        primary_write
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = fixed_placement_policy WHERE singleton = 1",
+                [],
+            )
+            .expect("primary write after prune preemption");
+        primary_write
+            .commit()
+            .expect("commit primary write after prune preemption");
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "the primary BEGIN IMMEDIATE and write retain the production 100ms busy bound"
+        );
+
+        drop(primary_guard);
+        lane.signal();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if diagnostics.snapshot().consensus_log_prune_drained_turns == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prune backlog drains after the retained primary guard releases");
+        assert_eq!(
+            primary
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count drained prune rows"),
+            0,
+            "the retained backlog drains only after the primary guard releases"
+        );
+        lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_preemption_closes_the_window_before_delete() {
+        assert_consensus_log_prune_primary_preemption_at_production_window(
+            ConsensusLogPruneTurnGatePoint::BeforeDelete,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_preemption_rolls_back_a_mid_delete_interrupt() {
+        assert_consensus_log_prune_primary_preemption_at_production_window(
+            ConsensusLogPruneTurnGatePoint::MidDelete,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_preemption_closes_the_window_before_purged_read() {
+        assert_consensus_log_prune_primary_preemption_at_production_window(
+            ConsensusLogPruneTurnGatePoint::BeforeReadPurged,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_preemption_closes_the_window_before_authority_read() {
+        assert_consensus_log_prune_primary_preemption_at_production_window(
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_preemption_closes_the_window_before_commit() {
+        assert_consensus_log_prune_primary_preemption_at_production_window(
+            ConsensusLogPruneTurnGatePoint::BeforeCommit,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn consensus_log_prune_turn_honors_the_fixed_128_row_limit() {
         let backend = backend_with_blank_logs(129).await;
@@ -21071,8 +21610,9 @@ mod tests {
         set_test_purge_floor(&conn, &log_id(129));
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
             .expect("begin row-limit turn");
-        let completion = prune_consensus_log_rows_in_tx(&tx, &log_id(129), &AtomicUsize::new(0))
-            .expect("row-limit turn succeeds");
+        let completion =
+            prune_consensus_log_rows_in_tx(&tx, &log_id(129), &AtomicUsize::new(0), None)
+                .expect("row-limit turn succeeds");
         tx.commit().expect("commit row-limit turn");
         assert_eq!(completion.rows_deleted, 128);
         assert!(completion.more);
@@ -21104,8 +21644,9 @@ mod tests {
         .expect("install crossing byte-boundary row");
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
             .expect("begin byte-boundary turn");
-        let completion = prune_consensus_log_rows_in_tx(&tx, &log_id(2), &AtomicUsize::new(0))
-            .expect("byte-boundary turn succeeds");
+        let completion =
+            prune_consensus_log_rows_in_tx(&tx, &log_id(2), &AtomicUsize::new(0), None)
+                .expect("byte-boundary turn succeeds");
         tx.commit().expect("commit byte-boundary turn");
         assert_eq!(completion.rows_deleted, 1);
         assert_eq!(
@@ -21128,8 +21669,9 @@ mod tests {
             .expect("install exact-max row");
         let tx = Transaction::new_unchecked(&exact_conn, TransactionBehavior::Immediate)
             .expect("begin exact-max turn");
-        let completion = prune_consensus_log_rows_in_tx(&tx, &log_id(1), &AtomicUsize::new(0))
-            .expect("an exact-max row makes progress");
+        let completion =
+            prune_consensus_log_rows_in_tx(&tx, &log_id(1), &AtomicUsize::new(0), None)
+                .expect("an exact-max row makes progress");
         tx.commit().expect("commit exact-max turn");
         assert_eq!(completion.rows_deleted, 1);
         assert!(!completion.more);
@@ -21149,7 +21691,7 @@ mod tests {
         let tx = Transaction::new_unchecked(&oversized_conn, TransactionBehavior::Immediate)
             .expect("begin oversize turn");
         assert_eq!(
-            prune_consensus_log_rows_in_tx(&tx, &log_id(1), &AtomicUsize::new(0)),
+            prune_consensus_log_rows_in_tx(&tx, &log_id(1), &AtomicUsize::new(0), None),
             Err(ConsensusLogPruneTurnError::Permanent),
             "an oversize retained row is a sticky nonspinning corruption"
         );
@@ -26538,6 +27080,173 @@ LIMIT 20000;
     }
 
     #[test]
+    fn fenced_transition_v2_batch_projection_replays_retained_closed_epoch_per_item() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("form membership");
+        let retained = fenced_transition_v2_request(0xE1, 1, "v2-projected-retained-owner");
+        let activation = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![activating_fenced_transition_v2_entry(
+                1,
+                retained.clone(),
+                timestamp(1),
+            )],
+        )
+        .expect("bind retained receipt");
+        let original_outcome = match &activation.responses[0].result {
+            Ok(SessionMutationOutcome::FencedTransition(outcome)) => outcome.clone(),
+            other => panic!("unexpected retained activation outcome: {other:?}"),
+        };
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history \
+             SET active_epoch = 2, generation = 1, current_bound_count = 0 \
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("form a retained closed predecessor epoch");
+
+        let mut projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load activated follower projection");
+        let before_sequence = projection.projected_application_sequence;
+        let absent = fenced_transition_v2_request(0xE2, 1, "v2-projected-absent-owner");
+        let batch = fenced_transition_v2_batch_entry(
+            2,
+            vec![retained.clone(), absent.clone()],
+            timestamp(2),
+        );
+
+        projection
+            .project(&conn, &batch, identity())
+            .expect("follower projection accepts retained replay beside closed unbound request");
+        assert!(
+            !projection
+                .projected_v2_bound_requests
+                .contains(&absent.request_id().to_bytes()),
+            "an unbound closed-epoch member cannot reserve a new follower receipt",
+        );
+        assert!(
+            read_fenced_transition_v2_receipt_sync(&conn, identity(), &retained)
+                .expect("read retained receipt")
+                .is_some(),
+            "the follower consults the durable retained receipt rather than discarding the batch",
+        );
+        assert!(
+            read_fenced_transition_v2_receipt_sync(&conn, identity(), &absent)
+                .expect("read unbound closed-epoch receipt")
+                .is_none(),
+            "the unbound closed-epoch member remains unrecorded",
+        );
+        assert_eq!(
+            projection.projected_application_sequence, before_sequence,
+            "a retained replay beside an unbound closed member cannot re-execute application state",
+        );
+
+        let applied = apply_entries_sync(&conn, identity(), &backend.caps, vec![batch])
+            .expect("apply retained replay beside closed unbound request");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+                ..
+            }] if outcomes == &vec![
+                Ok(original_outcome),
+                Err(StoreError::FencedTransitionHistoryEpochNotActive),
+            ]
+        ));
+        assert!(
+            applied.notifications.is_empty(),
+            "the mixed batch must not repeat the retained effect or apply the unbound member",
+        );
+
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history \
+             SET retired_through_epoch = 1 WHERE singleton = 1",
+            [],
+        )
+        .expect("retire the predecessor epoch");
+        let altered = altered_fenced_transition_v2_request(&retained);
+        assert_eq!(
+            read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &retained),
+            Ok(FencedTransitionV2Status::Retired),
+            "the retired floor closes even an exact retained receipt",
+        );
+        assert_eq!(
+            read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &altered),
+            Ok(FencedTransitionV2Status::RequestConflict),
+            "body conflict still precedes the retired floor in status",
+        );
+        let retired_exact = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_entry(
+                3,
+                retained.clone(),
+                timestamp(3),
+            )],
+        )
+        .expect("apply exact retired request");
+        assert!(matches!(
+            retired_exact.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionHistoryEpochRetired),
+                ..
+            }]
+        ));
+        let retired_conflict = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_entry(4, altered, timestamp(4))],
+        )
+        .expect("apply changed-body retired request");
+        assert!(matches!(
+            retired_conflict.responses.as_slice(),
+            [SessionConsensusResponse {
+                result: Err(StoreError::FencedTransitionRequestConflict),
+                ..
+            }]
+        ));
+
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history SET retired_through_epoch = 0 \
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("restore the closed non-retired projection fixture");
+        let mut corrupted_projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load follower projection before retained receipt corruption");
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_receipts \
+             SET response_digest = ?1 WHERE request_id = ?2",
+            params![
+                [0_u8; 32].as_slice(),
+                retained.request_id().to_bytes().as_slice()
+            ],
+        )
+        .expect("corrupt retained receipt after projection load");
+        assert!(
+            corrupted_projection
+                .project(
+                    &conn,
+                    &fenced_transition_v2_batch_entry(
+                        5,
+                        vec![retained, absent],
+                        timestamp(5),
+                    ),
+                    identity(),
+                )
+                .is_err(),
+            "closed-epoch follower projection must consult and validate the retained receipt before its active-epoch gate",
+        );
+    }
+
+    #[test]
     fn fenced_transition_v2_cap_accepts_last_binding_and_rejects_next_without_effect() {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
@@ -26859,18 +27568,35 @@ LIMIT 20000;
             &backend.caps,
             vec![fenced_transition_v2_batch_entry(
                 4,
-                vec![absent_predecessor],
+                vec![predecessor.clone(), absent_predecessor.clone()],
                 timestamp(2),
             )],
         )
-        .expect("reject an unbound identity in a retained epoch");
+        .expect("resolve retained replay beside an unbound closed-epoch identity");
         assert!(matches!(
             retained_absent.responses.as_slice(),
             [SessionConsensusResponse {
                 result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
                 ..
-            }] if outcomes == &vec![Err(StoreError::FencedTransitionHistoryEpochNotActive)]
+            }] if outcomes == &vec![
+                Ok(original_outcome.clone()),
+                Err(StoreError::FencedTransitionHistoryEpochNotActive),
+            ]
         ));
+        assert!(
+            retained_absent.notifications.is_empty(),
+            "a mixed retained replay and unbound closed-epoch request cannot repeat or partially apply business state",
+        );
+        assert_eq!(
+            read_fenced_transition_v2_status_sync(
+                &conn,
+                identity(),
+                identity(),
+                &absent_predecessor,
+            ),
+            Ok(FencedTransitionV2Status::EpochNotActive),
+            "the unbound closed-epoch member remains unrecorded",
+        );
 
         let successor_request = fenced_transition_v2_request(0xE8, 2, "v2-successor-owner");
         apply_entries_sync(

@@ -3154,6 +3154,7 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "linux")]
     async fn prepare_fixed_prune_backlog(
         log_store: &mut SqliteConsensusLogStore,
         state_machine: &mut SqliteConsensusStateMachine,
@@ -3489,6 +3490,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn blank_entry(index: u64) -> Entry<SessionRaftTypeConfig> {
         Entry {
             log_id: log_id(index),

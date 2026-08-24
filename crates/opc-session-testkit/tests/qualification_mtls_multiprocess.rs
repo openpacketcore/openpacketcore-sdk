@@ -54,6 +54,7 @@ use opc_session_store::{
 use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
     qualification_traffic_value, qualification_value_sha256, read_bounded_json_line,
+    session_mtls_batch_release_gate_achieved_rate_milli,
     session_mtls_batch_release_gate_schedule_sha256, session_mtls_candidate_schedule_sha256,
     write_json_line, QualificationConnectionLifecycleConfig,
     QualificationConnectionLifecycleMetrics, QualificationConsensusRpcAvailability,
@@ -68,7 +69,8 @@ use opc_session_testkit::qualification::{
     QualificationTrafficStatus, QualificationTransportConfig,
     SessionMtlsBatchReleaseGateBindingsV1, SessionMtlsBatchReleaseGateEvidenceV1,
     SessionMtlsBatchReleaseGatePoolEvidenceV1, SessionMtlsBatchReleaseGatePoolRoleV1,
-    SessionMtlsBatchReleaseGateResourceGenerationV1, SessionMtlsCandidateCampaign,
+    SessionMtlsBatchReleaseGateResourceGenerationV1,
+    SessionMtlsBatchReleaseGateServerQueueDepthScopeV1, SessionMtlsCandidateCampaign,
     SessionMtlsCandidateEvidenceV2, SessionMtlsCandidateSourceTreeStatus,
     QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
     QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
@@ -107,6 +109,17 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
     QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
     SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON,
+    SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_MIN_ACHIEVED_RATE_MILLI,
+    SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS,
+    SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS,
     SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -117,7 +130,7 @@ use rustix::fs::{
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use opc_tls::TlsConfigBuilder;
 
@@ -202,6 +215,36 @@ struct ResourceSampler {
     handle: JoinHandle<io::Result<Vec<Vec<ProcessResourceHighWater>>>>,
 }
 
+fn record_resource_generation_sample(
+    high_water: &mut [Vec<ProcessResourceHighWater>],
+    observed_process_ids: &mut [Option<u32>],
+    node_index: usize,
+    process_id: u32,
+    snapshot: ProcessResourceSnapshot,
+) {
+    if observed_process_ids[node_index] != Some(process_id) {
+        if observed_process_ids[node_index].is_some() {
+            high_water[node_index].push(ProcessResourceHighWater {
+                process_id,
+                samples: 0,
+                file_descriptors: 0,
+                threads: 0,
+                vm_rss_kib: 0,
+                vm_hwm_kib: 0,
+            });
+        }
+        observed_process_ids[node_index] = Some(process_id);
+    }
+    let current = high_water[node_index]
+        .last_mut()
+        .expect("logical voter has one resource generation");
+    current.samples = current.samples.saturating_add(1);
+    current.file_descriptors = current.file_descriptors.max(snapshot.file_descriptors);
+    current.threads = current.threads.max(snapshot.threads);
+    current.vm_rss_kib = current.vm_rss_kib.max(snapshot.vm_rss_kib);
+    current.vm_hwm_kib = current.vm_hwm_kib.max(snapshot.vm_hwm_kib);
+}
+
 impl ResourceSampler {
     fn start(process_ids: Vec<u32>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -240,19 +283,6 @@ impl ResourceSampler {
                         let Some(process_id) = process_id else {
                             continue;
                         };
-                        if observed_process_ids[index] != Some(process_id) {
-                            if observed_process_ids[index].is_some() {
-                                high_water[index].push(ProcessResourceHighWater {
-                                    process_id,
-                                    samples: 0,
-                                    file_descriptors: 0,
-                                    threads: 0,
-                                    vm_rss_kib: 0,
-                                    vm_hwm_kib: 0,
-                                });
-                            }
-                            observed_process_ids[index] = Some(process_id);
-                        }
                         let snapshot = match read_process_resources(process_id, false) {
                             Ok(snapshot) => snapshot,
                             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -266,15 +296,13 @@ impl ResourceSampler {
                             }
                             Err(error) => return Err(error),
                         };
-                        let current = high_water[index]
-                            .last_mut()
-                            .expect("logical voter has one resource generation");
-                        current.samples = current.samples.saturating_add(1);
-                        current.file_descriptors =
-                            current.file_descriptors.max(snapshot.file_descriptors);
-                        current.threads = current.threads.max(snapshot.threads);
-                        current.vm_rss_kib = current.vm_rss_kib.max(snapshot.vm_rss_kib);
-                        current.vm_hwm_kib = current.vm_hwm_kib.max(snapshot.vm_hwm_kib);
+                        record_resource_generation_sample(
+                            &mut high_water,
+                            &mut observed_process_ids,
+                            index,
+                            process_id,
+                            snapshot,
+                        );
                     }
                     if stop_for_thread.load(Ordering::Acquire) {
                         break;
@@ -368,6 +396,181 @@ fn cumulative_replaced_v2_diagnostics(
             .pool_wait_max
             .max(restored_current.pool_wait_max),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetupAccounting {
+    attempts: u64,
+    failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MtlsSetupAccounting {
+    original_and_restored: SetupAccounting,
+    supplemental: SetupAccounting,
+}
+
+impl MtlsSetupAccounting {
+    fn total(self) -> SetupAccounting {
+        SetupAccounting {
+            attempts: self
+                .original_and_restored
+                .attempts
+                .saturating_add(self.supplemental.attempts),
+            failures: self
+                .original_and_restored
+                .failures
+                .saturating_add(self.supplemental.failures),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MtlsSetupCeilings {
+    original_and_restored: SetupAccounting,
+    supplemental: SetupAccounting,
+    total: SetupAccounting,
+}
+
+fn v2_batch_release_gate_setup_ceilings() -> MtlsSetupCeilings {
+    let original_and_restored = SetupAccounting {
+        attempts: SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING,
+        failures: SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING,
+    };
+    let supplemental = SetupAccounting {
+        attempts: SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_ATTEMPT_CEILING
+            .saturating_mul(2)
+            .saturating_add(SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_ATTEMPT_CEILING),
+        failures: SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_FAILURE_CEILING
+            .saturating_mul(2)
+            .saturating_add(SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_FAILURE_CEILING),
+    };
+    MtlsSetupCeilings {
+        original_and_restored,
+        supplemental,
+        total: SetupAccounting {
+            attempts: SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING,
+            failures: SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING,
+        },
+    }
+}
+
+fn verify_mtls_setup_accounting(
+    observed: MtlsSetupAccounting,
+    ceilings: MtlsSetupCeilings,
+) -> Result<(), String> {
+    let total = observed.total();
+    for (scope, observed, ceiling) in [
+        (
+            "original_and_restored",
+            observed.original_and_restored,
+            ceilings.original_and_restored,
+        ),
+        ("supplemental", observed.supplemental, ceilings.supplemental),
+        ("total", total, ceilings.total),
+    ] {
+        if observed.attempts > ceiling.attempts {
+            return Err(format!(
+                "mTLS setup attempt ceiling exceeded: scope={scope}, observed_attempts={}, bound_attempts={}, observed_failures={}, bound_failures={}",
+                observed.attempts, ceiling.attempts, observed.failures, ceiling.failures
+            ));
+        }
+        if observed.failures > ceiling.failures {
+            return Err(format!(
+                "mTLS setup failure ceiling exceeded: scope={scope}, observed_attempts={}, bound_attempts={}, observed_failures={}, bound_failures={}",
+                observed.attempts, ceiling.attempts, observed.failures, ceiling.failures
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn assert_no_fault_v2_setup_delta(
+    window: &str,
+    before: &[PersistentSessionConsumerV2Diagnostics],
+    after: &[PersistentSessionConsumerV2Diagnostics],
+) {
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "mTLS {window} diagnostic snapshot cardinality is stable"
+    );
+    for (client_index, (after, before)) in after.iter().zip(before).enumerate() {
+        let attempts = checked_no_fault_setup_delta(
+            window,
+            client_index,
+            "setup_attempts",
+            before.setup_attempts,
+            after.setup_attempts,
+        );
+        let failures = checked_no_fault_setup_delta(
+            window,
+            client_index,
+            "setup_failures",
+            before.setup_failures,
+            after.setup_failures,
+        );
+        assert_eq!(
+            attempts, 0,
+            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0"
+        );
+        assert_eq!(
+            failures, 0,
+            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0"
+        );
+    }
+}
+
+fn checked_no_fault_setup_delta(
+    window: &str,
+    client_index: usize,
+    counter: &str,
+    before: u64,
+    after: u64,
+) -> u64 {
+    after.checked_sub(before).unwrap_or_else(|| {
+        panic!(
+            "mTLS {window} diagnostic counter regressed: client_index={client_index}, counter={counter}, before={before}, after={after}"
+        )
+    })
+}
+
+fn select_v2_batch_scheduler_client(
+    preferred_client_index: usize,
+    in_flight_per_client: &[usize],
+    lanes_per_client: usize,
+) -> Option<usize> {
+    (0..in_flight_per_client.len())
+        .map(|offset| (preferred_client_index + offset) % in_flight_per_client.len())
+        .find(|client_index| in_flight_per_client[*client_index] < lanes_per_client)
+}
+
+#[test]
+fn no_fault_setup_delta_rejects_per_client_counter_regression() {
+    assert_eq!(
+        checked_no_fault_setup_delta("pure-regression", 3, "setup_attempts", 7, 7),
+        0
+    );
+    assert!(std::panic::catch_unwind(|| {
+        checked_no_fault_setup_delta("pure-regression", 3, "setup_attempts", 7, 6)
+    })
+    .is_err());
+}
+
+#[test]
+fn v2_batch_scheduler_no_eligible_boundary_requires_a_completed_admission() {
+    let mut in_flight = vec![V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT; V2_BATCH_RELEASE_GATE_CLIENTS];
+    assert_eq!(
+        select_v2_batch_scheduler_client(0, &in_flight, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,),
+        None,
+        "a full four-lane client set cannot accept another scheduler admission"
+    );
+    in_flight[7] -= 1;
+    assert_eq!(
+        select_v2_batch_scheduler_client(0, &in_flight, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,),
+        Some(7),
+        "draining one completed alternate admission restores a deterministic slot"
+    );
 }
 
 fn read_process_resources(
@@ -1395,6 +1598,74 @@ fn connection_attempt_settlement_ledger(
     }
 }
 
+/// Emits only fixed-dimension lifecycle counters, so expiry/replacement
+/// intervals can be attributed without exposing peer, subscriber, or process
+/// identities in qualification diagnostics.
+fn emit_fixed_lifecycle_connection_snapshot(
+    phase: &str,
+    metrics: &[QualificationConnectionLifecycleMetrics],
+) {
+    let ledger = metrics.iter().fold(
+        ConnectionAttemptSettlementLedger {
+            attempts: 0,
+            successes: 0,
+            transport_failures: 0,
+            authentication_failures: 0,
+            timeout_failures: 0,
+            superseded: 0,
+            abandoned: 0,
+            protocol_failures: 0,
+            backend_failures: 0,
+            reconnect_attempts: 0,
+            reconnect_failures: 0,
+        },
+        |mut aggregate, metric| {
+            let current = connection_attempt_settlement_ledger(metric);
+            aggregate.attempts = aggregate.attempts.saturating_add(current.attempts);
+            aggregate.successes = aggregate.successes.saturating_add(current.successes);
+            aggregate.transport_failures = aggregate
+                .transport_failures
+                .saturating_add(current.transport_failures);
+            aggregate.authentication_failures = aggregate
+                .authentication_failures
+                .saturating_add(current.authentication_failures);
+            aggregate.timeout_failures = aggregate
+                .timeout_failures
+                .saturating_add(current.timeout_failures);
+            aggregate.superseded = aggregate.superseded.saturating_add(current.superseded);
+            aggregate.abandoned = aggregate.abandoned.saturating_add(current.abandoned);
+            aggregate.protocol_failures = aggregate
+                .protocol_failures
+                .saturating_add(current.protocol_failures);
+            aggregate.backend_failures = aggregate
+                .backend_failures
+                .saturating_add(current.backend_failures);
+            aggregate.reconnect_attempts = aggregate
+                .reconnect_attempts
+                .saturating_add(current.reconnect_attempts);
+            aggregate.reconnect_failures = aggregate
+                .reconnect_failures
+                .saturating_add(current.reconnect_failures);
+            aggregate
+        },
+    );
+    println!(
+        "MTLS_FIXED_LIFECYCLE_SNAPSHOT phase={phase} members={} connection_attempts={} connection_successes={} connection_failure_transport={} connection_failure_authentication={} connection_failure_timeout={} connection_superseded={} connection_abandoned={} connection_failure_protocol={} connection_failure_backend={} reconnect_attempts={} reconnect_failures={}",
+        metrics.len(),
+        ledger.attempts,
+        ledger.successes,
+        ledger.transport_failures,
+        ledger.authentication_failures,
+        ledger.timeout_failures,
+        ledger.superseded,
+        ledger.abandoned,
+        ledger.protocol_failures,
+        ledger.backend_failures,
+        ledger.reconnect_attempts,
+        ledger.reconnect_failures,
+    );
+}
+
 fn connection_attempt_settlement_ledgers(
     metrics: &[QualificationConnectionLifecycleMetrics],
 ) -> Vec<ConnectionAttemptSettlementLedger> {
@@ -1517,7 +1788,7 @@ fn assert_recovery_fault_flush_bounds(
         );
         assert!(
             terminal <= terminal_bound,
-            "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, counter=connection_terminal_outcomes, observed={terminal}, bound={terminal_bound}, new_attempt_bound={bound}, baseline_outstanding={baseline_outstanding}"
+            "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, counter=connection_terminal_outcomes, observed={terminal}, bound={terminal_bound}, new_attempt_bound={bound}, baseline_outstanding={baseline_outstanding}, attempts={attempts}, reconnect_attempts={reconnect_attempts}, reconnect_failures={reconnect_failures}, before={before:?}, after={after:?}"
         );
         for (counter, observed) in [
             ("connection_attempts", attempts),
@@ -2842,6 +3113,39 @@ impl Fleet {
             QualificationNodeReply::StatelessConsumerDelayedResponseArmed => {}
             reply => panic!(
                 "stateless consumer delayed-response simulation did not arm: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn arm_stateless_consumer_response_holds(&mut self, node_index: usize) {
+        match self.nodes[node_index].invoke(&QualificationNodeCommand::ArmStatelessConsumerResponseHolds) {
+            QualificationNodeReply::StatelessConsumerResponseHoldsArmed { responses: 4 } => {}
+            reply => panic!(
+                "stateless consumer four-response hold gate did not arm: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn stateless_consumer_response_hold_status(&mut self, node_index: usize) -> (usize, usize) {
+        match self.nodes[node_index].invoke(&QualificationNodeCommand::StatelessConsumerResponseHoldStatus) {
+            QualificationNodeReply::StatelessConsumerResponseHoldStatus {
+                armed_responses,
+                held_responses,
+            } => (armed_responses, held_responses),
+            reply => panic!(
+                "stateless consumer four-response hold status unavailable: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn release_stateless_consumer_response_holds(&mut self, node_index: usize) {
+        match self.nodes[node_index].invoke(&QualificationNodeCommand::ReleaseStatelessConsumerResponseHolds) {
+            QualificationNodeReply::StatelessConsumerResponseHoldsReleased { responses: 4 } => {}
+            reply => panic!(
+                "stateless consumer four-response hold gate did not release: node={node_index}, reply={reply:?}, stderr={}",
                 self.node_stderr(node_index)
             ),
         }
@@ -7232,7 +7536,15 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         stopped_expiring_mutation[0].status.last_generation
     );
     let stopped_expiring_status = stopped_expiring_watch[0].status.clone();
-    fleet.wait_for_expiry_soft_retirement(expiring_node_index, &lifecycle_before_expiry, not_after);
+    let lifecycle_after_soft_retirement = fleet.wait_for_expiry_soft_retirement(
+        expiring_node_index,
+        &lifecycle_before_expiry,
+        not_after,
+    );
+    emit_fixed_lifecycle_connection_snapshot(
+        "soft_authenticated_retirement",
+        &lifecycle_after_soft_retirement,
+    );
     assert!(
         time::OffsetDateTime::now_utc() < not_after,
         "soft retirement was not observed strictly before hard expiry"
@@ -7258,6 +7570,7 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         not_after,
     );
     fleet.wait_for_isolated_member_and_survivors(expiring_node_index);
+    emit_fixed_lifecycle_connection_snapshot("hard_expiry", &fleet.all_lifecycle_metrics());
     let traffic_after_hard_expiry_boundary = fleet.traffic_statuses_on(&expiry_survivor_indices);
     let hard_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     fleet.advance_canary_for_survivors(expiring_node_index, "short-lived-svid-expired");
@@ -7329,6 +7642,10 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         "replacement-publication",
         replacement_recovery_deadline,
     );
+    emit_fixed_lifecycle_connection_snapshot(
+        "replacement_publication",
+        &fleet.all_lifecycle_metrics(),
+    );
     assert_eq!(
         fleet.nodes[expiring_node_index].process_id(),
         expiring_process_id,
@@ -7345,6 +7662,7 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
             recovery_started: replacement_recovery_started,
             recovery_deadline: replacement_recovery_deadline,
         });
+    emit_fixed_lifecycle_connection_snapshot("settled_recovery", &fleet.all_lifecycle_metrics());
     let replacement_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     let replacement_phase = format!(
         "survivor-traffic-through-material-replacement/active-restart-{active_restart_node_index}/expiring-{expiring_node_index}"
@@ -8441,6 +8759,8 @@ async fn qualification_fenced_transition_v2_request(
 const V2_BATCH_RELEASE_GATE_CLIENTS: usize = 12;
 const V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT: usize = 4;
 const V2_BATCH_RELEASE_GATE_PENDING_CALLS: usize = 64;
+const V2_BATCH_RELEASE_GATE_OVER_CAPACITY_CALLS: usize =
+    V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT + V2_BATCH_RELEASE_GATE_PENDING_CALLS + 1;
 const V2_BATCH_RELEASE_GATE_PRELOAD_BATCH_SIZE: usize = 256;
 const V2_BATCH_RELEASE_GATE_PRELOAD_CONCURRENCY: usize = 1;
 const V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE: usize = 12;
@@ -8454,6 +8774,7 @@ const V2_BATCH_RELEASE_GATE_P99: Duration = Duration::from_millis(25);
 const V2_BATCH_RELEASE_GATE_P999: Duration = Duration::from_millis(100);
 const V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT: usize = 16;
+const V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn assert_v2_batch_release_profile() {
     let cargo_profile = env!("OPC_SESSION_TESTKIT_CARGO_PROFILE_FAMILY");
@@ -10329,6 +10650,11 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         Duration::from_secs(5),
     )
     .expect("fixed V2 batch pool and queue configuration");
+    assert_eq!(
+        pool_config.connect_attempts(),
+        2,
+        "mTLS setup accounting is derived from the fixed two-attempt connection policy"
+    );
     let credential_negative_pool_config = PersistentSessionConsumerConfig::try_new(
         1,
         0,
@@ -10386,10 +10712,13 @@ fn run_persistent_consumer_v2_batch_release_gate() {
                 && ready.ready_request_connections == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
         }));
     });
-    let prewarmed = clients
+    // Snapshot immediately after the exact 48-lane initial prewarm. Later
+    // load-window accounting is relative to this stable physical baseline.
+    let initial_prewarm_diagnostics = clients
         .iter()
         .map(PersistentSessionConsumerClient::v2_diagnostics)
         .collect::<Vec<_>>();
+    let prewarmed = initial_prewarm_diagnostics.clone();
     assert!(prewarmed.iter().all(|diagnostics| {
         diagnostics.setup_attempts == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
             && diagnostics.setup_failures == 0
@@ -10446,6 +10775,9 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .iter()
         .map(ChildNode::process_id)
         .collect::<Vec<_>>();
+    // The sampler observes only the three child voters. The harness process
+    // and any server queue high-water are downstream diagnostics, not
+    // acceptance evidence for this client-pool qualification.
     let warmed_resources = process_ids
         .iter()
         .copied()
@@ -10553,10 +10885,18 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         }))
         .await;
     });
-    let measurement_baseline = clients
+    // This is the required post-50k preload/restore snapshot. The preload
+    // window must not have created a per-operation transport setup.
+    let post_preload_restore_diagnostics = clients
         .iter()
         .map(PersistentSessionConsumerClient::v2_diagnostics)
         .collect::<Vec<_>>();
+    assert_no_fault_v2_setup_delta(
+        "50k preload/restore",
+        &initial_prewarm_diagnostics,
+        &post_preload_restore_diagnostics,
+    );
+    let measurement_baseline = post_preload_restore_diagnostics.clone();
     let consensus_diagnostics_before_warm_reads = fleet.all_consensus_diagnostics();
 
     const WARM_STATUS_REQUEST_STRIDE: usize = 53;
@@ -10719,6 +11059,9 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         mutation_typed_read_unavailable_retry_high_water,
         mutation_phase_elapsed,
         mutation_scheduled_batches_per_client,
+        mutation_completed_batches_per_client,
+        mutation_slow_lane_other_completions,
+        mutation_saturated_client_skips,
         mutation_max_in_flight_per_client,
         mutation_max_global_in_flight,
     ) = runtime.block_on(async {
@@ -10740,6 +11083,18 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         let mut not_transmitted_retry_high_water = 0usize;
         let mut typed_read_unavailable_retry_high_water = 0usize;
         let mut scheduled_batches_per_client = vec![0usize; clients.len()];
+        let mut completed_batches_per_client = vec![0usize; clients.len()];
+        let mut saturated_client_skips = 0usize;
+        // The first four paced admissions occupy the complete declared
+        // scheduler width of one client. That client is skipped until another
+        // fixed producer completes, proving that a slow producer cannot
+        // create global HOL or leave a capacity-hole deadlock.
+        let slow_lane_client_index = 0usize;
+        let (mut slow_lane_release_senders, mut slow_lane_release_receivers): (Vec<_>, Vec<_>) =
+            (0..V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT)
+                .map(|_| oneshot::channel::<()>())
+                .unzip();
+        let mut slow_lane_other_completions = 0usize;
         let mut in_flight_per_client = vec![0usize; clients.len()];
         let mut max_in_flight_per_client = vec![0usize; clients.len()];
         let mut max_global_in_flight = 0usize;
@@ -10747,14 +11102,10 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             let scheduled_at = phase_started
                 + Duration::from_nanos(interval_nanos.saturating_mul(batch_index as u64));
             tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled_at)).await;
-            let client_index = batch_index % clients.len();
-            scheduled_batches_per_client[client_index] += 1;
-            // Keep round-robin assignment fixed, but wait for that client's
-            // declared lane width before submitting its next call. Retaining
-            // scheduled_at makes this scheduler wait part of the sample.
-            while in_flight_per_client[client_index] >= V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
-                || pending.len() >= V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY
-            {
+            // Drain global capacity only. A saturated preferred client is
+            // skipped below, so one slow four-lane pool cannot induce global
+            // head-of-line blocking for other ready producers.
+            while pending.len() >= V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY {
                 use futures_util::StreamExt;
                 let (completed_batch_index, completed_client_index, result) = pending
                     .next()
@@ -10773,6 +11124,17 @@ fn run_persistent_consumer_v2_batch_release_gate() {
                     "completed V2 batch has a matching scheduler admission"
                 );
                 in_flight_per_client[completed_client_index] -= 1;
+                completed_batches_per_client[completed_client_index] += 1;
+                if completed_client_index != slow_lane_client_index
+                    && !slow_lane_release_senders.is_empty()
+                {
+                    slow_lane_other_completions += 1;
+                    for sender in slow_lane_release_senders.drain(..) {
+                        sender
+                            .send(())
+                            .expect("the bounded slow lanes remain scheduled");
+                    }
+                }
                 samples.push(sample);
                 recovered_unknown += usize::from(recovered);
                 not_transmitted_retries += retries;
@@ -10781,6 +11143,19 @@ fn run_persistent_consumer_v2_batch_release_gate() {
                 typed_read_unavailable_retry_high_water =
                     typed_read_unavailable_retry_high_water.max(typed_retries);
             }
+            let preferred_client_index = if batch_index < V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+                slow_lane_client_index
+            } else {
+                batch_index % clients.len()
+            };
+            let client_index = select_v2_batch_scheduler_client(
+                preferred_client_index,
+                &in_flight_per_client,
+                V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+            )
+                .expect("global capacity implies one V2 producer has a free lane");
+            saturated_client_skips += usize::from(client_index != preferred_client_index);
+            scheduled_batches_per_client[client_index] += 1;
             assert!(
                 pending.len() < V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
                 "the global V2 scheduler bound leaves capacity for one admitted call"
@@ -10794,7 +11169,19 @@ fn run_persistent_consumer_v2_batch_release_gate() {
                 max_in_flight_per_client[client_index].max(in_flight_per_client[client_index]);
             max_global_in_flight = max_global_in_flight.max(pending.len() + 1);
             let client = clients[client_index].clone();
+            let slow_lane_wait = if batch_index < V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+                Some(
+                    slow_lane_release_receivers.remove(0),
+                )
+            } else {
+                None
+            };
             pending.push(tokio::spawn(async move {
+                if let Some(slow_lane_wait) = slow_lane_wait {
+                    slow_lane_wait
+                        .await
+                        .expect("the bounded slow lane is released after alternate progress");
+                }
                 (
                     batch_index,
                     client_index,
@@ -10819,6 +11206,17 @@ fn run_persistent_consumer_v2_batch_release_gate() {
                 "completed V2 batch has a matching scheduler admission"
             );
             in_flight_per_client[completed_client_index] -= 1;
+            completed_batches_per_client[completed_client_index] += 1;
+            if completed_client_index != slow_lane_client_index
+                && !slow_lane_release_senders.is_empty()
+            {
+                slow_lane_other_completions += 1;
+                for sender in slow_lane_release_senders.drain(..) {
+                    sender
+                        .send(())
+                        .expect("the bounded slow lanes remain scheduled");
+                }
+            }
             samples.push(sample);
             recovered_unknown += usize::from(recovered);
             not_transmitted_retries += retries;
@@ -10840,6 +11238,9 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             typed_read_unavailable_retry_high_water,
             phase_started.elapsed(),
             scheduled_batches_per_client,
+            completed_batches_per_client,
+            slow_lane_other_completions,
+            saturated_client_skips,
             max_in_flight_per_client,
             max_global_in_flight,
         )
@@ -10873,31 +11274,37 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         scope,
         1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
     ));
-    let achieved_rate =
-        V2_BATCH_RELEASE_GATE_PACED_MUTATIONS as f64 / mutation_phase_elapsed.as_secs_f64();
+    let paced_elapsed_nanos = u64::try_from(mutation_phase_elapsed.as_nanos())
+        .expect("paced elapsed time fits evidence nanoseconds");
+    let achieved_logical_operations_per_second_milli =
+        session_mtls_batch_release_gate_achieved_rate_milli(
+            V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+            paced_elapsed_nanos,
+        )
+        .expect("paced elapsed time is nonzero and rate fits evidence");
     assert!(
-        achieved_rate >= V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND as f64 * 0.999,
-        "V2 batch release gate achieved less than 99.9% of its offered operation rate: achieved={achieved_rate:.2}"
+        achieved_logical_operations_per_second_milli
+            >= SESSION_MTLS_BATCH_RELEASE_GATE_MIN_ACHIEVED_RATE_MILLI,
+        "V2 batch release gate achieved less than 99.9% of its offered operation rate: achieved_milli={achieved_logical_operations_per_second_milli}"
     );
     assert!(
         mutation_scheduled_batches_per_client
             .iter()
             .all(|scheduled| *scheduled > 0),
-        "fixed round-robin scheduling assigns paced work to every V2 client: {mutation_scheduled_batches_per_client:?}"
+        "saturated-client skipping retains bounded slow-lane progress for every V2 client: {mutation_scheduled_batches_per_client:?}"
     );
-    let min_scheduled_batches = mutation_scheduled_batches_per_client
+    let min_completed_batches = mutation_completed_batches_per_client
         .iter()
         .copied()
         .min()
         .expect("fixed V2 client set is nonempty");
-    let max_scheduled_batches = mutation_scheduled_batches_per_client
-        .iter()
-        .copied()
-        .max()
-        .expect("fixed V2 client set is nonempty");
     assert!(
-        max_scheduled_batches - min_scheduled_batches <= 1,
-        "fixed round-robin scheduling remains fair per client: {mutation_scheduled_batches_per_client:?}"
+        min_completed_batches > 0,
+        "every fixed V2 producer retains one bounded slow-lane completion: {mutation_completed_batches_per_client:?}"
+    );
+    assert!(
+        mutation_saturated_client_skips > 0 && mutation_slow_lane_other_completions > 0,
+        "one bounded slow client is skipped while another fixed client completes, avoiding global HOL: skips={mutation_saturated_client_skips}, other_completions={mutation_slow_lane_other_completions}"
     );
     assert!(
         mutation_max_in_flight_per_client
@@ -10925,11 +11332,31 @@ fn run_persistent_consumer_v2_batch_release_gate() {
     assert!(warm_p999 <= V2_BATCH_RELEASE_GATE_P999);
     assert!(mutation_p99 <= V2_BATCH_RELEASE_GATE_P99);
     assert!(mutation_p999 <= V2_BATCH_RELEASE_GATE_P999);
+    let warm_read_p99_millis =
+        u64::try_from(warm_p99.as_millis()).expect("warm p99 fits evidence milliseconds");
+    let warm_read_p999_millis =
+        u64::try_from(warm_p999.as_millis()).expect("warm p99.9 fits evidence milliseconds");
+    let mutation_p99_millis =
+        u64::try_from(mutation_p99.as_millis()).expect("mutation p99 fits evidence milliseconds");
+    let mutation_p999_millis = u64::try_from(mutation_p999.as_millis())
+        .expect("mutation p99.9 fits evidence milliseconds");
+    assert!(warm_read_p99_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS);
+    assert!(warm_read_p999_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS);
+    assert!(mutation_p99_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS);
+    assert!(mutation_p999_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS);
 
-    let measured_diagnostics = clients
+    // Snapshot after the exact 60k paced mutations plus 1,008 distributed
+    // warm reads, before any fault or credential seam is introduced.
+    let post_measured_load_diagnostics = clients
         .iter()
         .map(PersistentSessionConsumerClient::v2_diagnostics)
         .collect::<Vec<_>>();
+    assert_no_fault_v2_setup_delta(
+        "60k paced mutations plus 1008 warm reads",
+        &post_preload_restore_diagnostics,
+        &post_measured_load_diagnostics,
+    );
+    let measured_diagnostics = post_measured_load_diagnostics;
     let configured_connections =
         (V2_BATCH_RELEASE_GATE_CLIENTS * V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT) as u64;
     assert_eq!(
@@ -11271,7 +11698,7 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             TrustGeneration::NewOnly,
         ),
         pool_config,
-        Some(DELAYED_CONSUMER_CLIENT_DEADLINE),
+        None,
     );
     runtime
         .block_on(delayed_client.prewarm_v2())
@@ -11283,7 +11710,6 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         16,
         "the replacement listener admits no more than its fixed 16 connections"
     );
-    fleet.arm_stateless_consumer_delayed_response(replacement);
     let ambiguous_requests = runtime.block_on(qualification_build_v2_batches(
         MEMBER_COUNT,
         1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
@@ -11294,22 +11720,158 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .into_iter()
         .next()
         .expect("one bounded ambiguity batch");
-    let ambiguous_response =
-        runtime.block_on(delayed_client.execute_v2(&SessionConsumerV2Request::new(
-            scope,
-            SessionConsumerV2Operation::FencedTransitionV2Batch {
-                requests: ambiguous_requests.clone(),
-            },
-        )));
-    assert_eq!(
-        ambiguous_response.expect_err("post-commit V2 batch response loss is ambiguous"),
-        PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch {
-            request_ids: ambiguous_requests
-                .iter()
-                .map(FencedTransitionV2Request::request_id)
-                .collect(),
+    let pressure_request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Batch {
+            requests: ambiguous_requests.clone(),
         },
-        "ambiguity retains every ordered complete V2 ID and forbids replay"
+    );
+    let ambiguous_request_ids = ambiguous_requests
+        .iter()
+        .map(FencedTransitionV2Request::request_id)
+        .collect::<Vec<_>>();
+    // Four delayed in-flight calls occupy the exact fixed request-lane
+    // width. The next 64 calls then occupy the fixed caller queue, and the
+    // 69th admission must fail immediately with typed backpressure. These
+    // are logical callers only: the prewarmed four-lane pool opens no extra
+    // physical connections and server queue depth remains unmeasured.
+    assert_eq!(
+        V2_BATCH_RELEASE_GATE_OVER_CAPACITY_CALLS,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT + V2_BATCH_RELEASE_GATE_PENDING_CALLS + 1
+    );
+    let delayed_setup_before_pressure = delayed_client.v2_diagnostics();
+    fleet.arm_stateless_consumer_response_holds(replacement);
+    let mut pressure_holders = Vec::with_capacity(V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT);
+    for _ in 0..V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+        let client = delayed_client.clone();
+        let request = pressure_request.clone();
+        pressure_holders.push(runtime.spawn(async move { client.execute_v2(&request).await }));
+    }
+    let hold_ack_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+    loop {
+        let (armed_responses, held_responses) =
+            fleet.stateless_consumer_response_hold_status(replacement);
+        if armed_responses == 0 && held_responses == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+            break;
+        }
+        assert!(
+            Instant::now() < hold_ack_deadline,
+            "cross-process response-hold acknowledgement did not observe all four durable V2 executions: armed={armed_responses}, held={held_responses}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let non_slow_client_index = (seam_client_index + 1) % clients.len();
+    runtime.block_on(qualification_execute_v2_status_sample(
+        clients[non_slow_client_index].clone(),
+        scope,
+        ambiguous_requests[0].clone(),
+        Instant::now(),
+    ));
+    let mut queued_pressure_calls = Vec::with_capacity(V2_BATCH_RELEASE_GATE_PENDING_CALLS);
+    for _ in 0..V2_BATCH_RELEASE_GATE_PENDING_CALLS {
+        let client = delayed_client.clone();
+        let request = pressure_request.clone();
+        queued_pressure_calls.push(runtime.spawn(async move { client.execute_v2(&request).await }));
+    }
+    let queue_pressure_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+    let pressure_queued = loop {
+        let diagnostics = delayed_client.v2_diagnostics();
+        if diagnostics.pool_wait_current == V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64
+            && diagnostics.pool_wait_max == V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64
+        {
+            break diagnostics;
+        }
+        assert!(
+            Instant::now() < queue_pressure_deadline,
+            "bounded four-lane hold did not fill the exact 64-caller queue: diagnostics={diagnostics:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        pressure_queued.pool_wait_current, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the deliberate over-capacity probe fills exactly the fixed per-pool caller queue"
+    );
+    assert_eq!(
+        pressure_queued.pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the deliberate over-capacity probe records the exact fixed queue high-water"
+    );
+    assert_eq!(
+        delayed_client.v2_diagnostics().pool_wait_current,
+        V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "an independent client progresses while the slow pool's four real lanes remain saturated"
+    );
+    let over_capacity_result = runtime.block_on(delayed_client.execute_v2(&pressure_request));
+    assert!(
+        matches!(
+            over_capacity_result,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Overloaded,
+            })
+        ),
+        "the 69th fixed-pool caller is rejected as typed not-transmitted overload"
+    );
+    fleet.release_stateless_consumer_response_holds(replacement);
+    let pressure_results = runtime.block_on(async {
+        let holders = futures_util::future::join_all(pressure_holders).await;
+        let queued = futures_util::future::join_all(queued_pressure_calls).await;
+        holders.into_iter().chain(queued).collect::<Vec<_>>()
+    });
+    for result in pressure_results {
+        let outcome = result.expect("every held or queued V2 caller task joins without panic");
+        match outcome {
+            Ok(response) => qualification_assert_v2_batch_response(&ambiguous_requests, response)
+                .expect("every released V2 response has the exact durable result"),
+            Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch { request_ids }) => {
+                assert_eq!(request_ids, ambiguous_request_ids);
+            }
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }) => {
+                assert!(matches!(cause, SessionConsumerClientError::Overloaded));
+            }
+            Err(error) => panic!("released V2 caller returned a disallowed typed outcome: {error:?}"),
+        }
+    }
+    runtime.block_on(async {
+        for request in &ambiguous_requests {
+            qualification_execute_v2_status_sample(
+                clients[non_slow_client_index].clone(),
+                scope,
+                request.clone(),
+                Instant::now(),
+            )
+            .await;
+        }
+    });
+    let pressure_settled = delayed_client.v2_diagnostics();
+    assert_eq!(pressure_settled.pool_wait_current, 0);
+    assert_eq!(
+        pressure_settled.pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "pressure recovery retains, rather than erases, the exact queue high-water"
+    );
+    assert_eq!(
+        pressure_settled.setup_attempts, delayed_setup_before_pressure.setup_attempts,
+        "typed caller backpressure does not create a resolve, TCP, TLS, or Hello attempt"
+    );
+    runtime
+        .block_on(delayed_client.prewarm_v2())
+        .expect("the fixed delayed pool recovers after typed overload");
+    runtime.block_on(qualification_execute_v2_status_sample(
+        delayed_client.clone(),
+        scope,
+        ambiguous_requests[0].clone(),
+        Instant::now(),
+    ));
+    let pressure_recovered = delayed_client.v2_diagnostics();
+    assert_eq!(
+        pressure_recovered.setup_attempts, delayed_setup_before_pressure.setup_attempts,
+        "the recovered fixed pool retains its four prewarmed physical lanes"
+    );
+    assert_eq!(
+        pressure_recovered.active,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+    );
+    assert_eq!(
+        pressure_recovered.idle,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
     );
     runtime.block_on(delayed_client.shutdown());
     let delayed_after_ambiguity = delayed_client.v2_diagnostics();
@@ -11321,7 +11883,10 @@ fn run_persistent_consumer_v2_batch_release_gate() {
     assert_eq!(delayed_after_ambiguity.active, 0);
     assert_eq!(delayed_after_ambiguity.idle, 0);
     assert_eq!(delayed_after_ambiguity.pool_wait_current, 0);
-    assert!(delayed_after_ambiguity.pool_wait_max <= V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64);
+    assert_eq!(
+        delayed_after_ambiguity.pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the post-shutdown delayed-pool diagnostic serializes the exact fixed overload high-water"
+    );
     let (restored_identity_source, restored_client) = qualification_persistent_v2_client(
         Arc::clone(&endpoints),
         replacement,
@@ -11451,6 +12016,9 @@ fn run_persistent_consumer_v2_batch_release_gate() {
 
     let restored_seam_current = clients[seam_client_index].v2_diagnostics();
     let restored_old_root_current = clients[old_root_seam_client_index].v2_diagnostics();
+    // This post-recovery/seam snapshot folds retired generations into the two
+    // restored original pools, so neither their reconnect/setup counters nor
+    // their queue high-water marks disappear at replacement.
     let mut after_recovery = clients
         .iter()
         .map(PersistentSessionConsumerClient::v2_diagnostics)
@@ -11518,20 +12086,19 @@ fn run_persistent_consumer_v2_batch_release_gate() {
             <= configured_connections,
         "one bounded recovery cannot discard more than the fixed V2 lanes"
     );
-    let original_setup_attempt_delta = after_recovery
+    // Evidence carries cumulative client lifecycle counters, including the
+    // initial 48-lane prewarm; it does not subtract the baseline away.
+    let original_setup_attempts = after_recovery
         .iter()
-        .zip(&prewarmed)
-        .map(|(after, before)| after.setup_attempts - before.setup_attempts)
+        .map(|diagnostics| diagnostics.setup_attempts)
         .sum::<u64>();
-    let original_setup_failure_delta = after_recovery
+    let original_setup_failures = after_recovery
         .iter()
-        .zip(&prewarmed)
-        .map(|(after, before)| after.setup_failures - before.setup_failures)
+        .map(|diagnostics| diagnostics.setup_failures)
         .sum::<u64>();
-    let original_setup_success_delta = after_recovery
+    let original_setup_successes = after_recovery
         .iter()
-        .zip(&prewarmed)
-        .map(|(after, before)| after.setup_successes - before.setup_successes)
+        .map(|diagnostics| diagnostics.setup_successes)
         .sum::<u64>();
     let supplemental_setup_attempt_delta = delayed_after_ambiguity
         .setup_attempts
@@ -11545,15 +12112,41 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .setup_successes
         .saturating_add(old_leaf_diagnostics.setup_successes)
         .saturating_add(new_only_old_root_diagnostics.setup_successes);
-    let setup_attempt_delta =
-        original_setup_attempt_delta.saturating_add(supplemental_setup_attempt_delta);
-    let setup_failure_delta =
-        original_setup_failure_delta.saturating_add(supplemental_setup_failure_delta);
-    let setup_success_delta =
-        original_setup_success_delta.saturating_add(supplemental_setup_success_delta);
+    let setup_attempts = original_setup_attempts.saturating_add(supplemental_setup_attempt_delta);
+    let setup_failures = original_setup_failures.saturating_add(supplemental_setup_failure_delta);
+    let setup_successes = original_setup_successes.saturating_add(supplemental_setup_success_delta);
+    let observed_setup_accounting = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: original_setup_attempts,
+            failures: original_setup_failures,
+        },
+        supplemental: SetupAccounting {
+            attempts: supplemental_setup_attempt_delta,
+            failures: supplemental_setup_failure_delta,
+        },
+    };
+    let setup_ceilings = v2_batch_release_gate_setup_ceilings();
+    let total_setup_accounting = observed_setup_accounting.total();
+    println!(
+        "V2_BATCH_RELEASE_GATE_MTLS_SETUP_ACCOUNTING original_and_restored_attempts={} original_and_restored_attempt_bound={} original_and_restored_failures={} original_and_restored_failure_bound={} supplemental_attempts={} supplemental_attempt_bound={} supplemental_failures={} supplemental_failure_bound={} total_attempts={} total_attempt_bound={} total_failures={} total_failure_bound={}",
+        observed_setup_accounting.original_and_restored.attempts,
+        setup_ceilings.original_and_restored.attempts,
+        observed_setup_accounting.original_and_restored.failures,
+        setup_ceilings.original_and_restored.failures,
+        observed_setup_accounting.supplemental.attempts,
+        setup_ceilings.supplemental.attempts,
+        observed_setup_accounting.supplemental.failures,
+        setup_ceilings.supplemental.failures,
+        total_setup_accounting.attempts,
+        setup_ceilings.total.attempts,
+        total_setup_accounting.failures,
+        setup_ceilings.total.failures,
+    );
+    verify_mtls_setup_accounting(observed_setup_accounting, setup_ceilings)
+        .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(
-        setup_attempt_delta,
-        setup_success_delta + setup_failure_delta,
+        setup_attempts,
+        setup_successes + setup_failures,
         "release-gate setup deltas conserve every physical V2 lane attempt"
     );
     let current_process_ids = fleet
@@ -11588,6 +12181,51 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         &resource_high_water,
         &settled_resources,
     );
+    let resource_observations = warmed_resources
+        .iter()
+        .zip(&resource_high_water)
+        .zip(&settled_resources)
+        .enumerate()
+        .map(|(logical_voter_index, ((warmed, high_water), settled))| {
+            opc_session_testkit::qualification::SessionMtlsBatchReleaseGateResourceObservationV1 {
+                logical_voter_index,
+                warmed_file_descriptors: warmed.file_descriptors,
+                warmed_socket_file_descriptors: warmed.socket_file_descriptors,
+                warmed_nontransport_file_descriptors: warmed.nontransport_file_descriptors,
+                warmed_threads: warmed.threads,
+                warmed_vm_rss_kib: warmed.vm_rss_kib,
+                warmed_vm_hwm_kib: warmed.vm_hwm_kib,
+                high_water_file_descriptors: high_water.file_descriptors,
+                high_water_threads: high_water.threads,
+                high_water_vm_rss_kib: high_water.vm_rss_kib,
+                high_water_vm_hwm_kib: high_water.vm_hwm_kib,
+                settled_file_descriptors: settled.file_descriptors,
+                settled_socket_file_descriptors: settled.socket_file_descriptors,
+                settled_threads: settled.threads,
+                settled_vm_rss_kib: settled.vm_rss_kib,
+                settled_vm_hwm_kib: settled.vm_hwm_kib,
+                high_water_file_descriptor_ceiling: process_file_descriptor_high_water_bound(
+                    MEMBER_COUNT,
+                    warmed.nontransport_file_descriptors,
+                ),
+                settled_file_descriptor_ceiling: warmed
+                    .file_descriptors
+                    .saturating_add(QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE),
+                settled_socket_file_descriptor_ceiling: warmed
+                    .socket_file_descriptors
+                    .saturating_add(QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE),
+                high_water_thread_ceiling: warmed
+                    .threads
+                    .saturating_add(QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE),
+                high_water_vm_hwm_ceiling_kib: warmed
+                    .vm_hwm_kib
+                    .saturating_add(QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB),
+                settled_vm_rss_ceiling_kib: warmed
+                    .vm_rss_kib
+                    .saturating_add(QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB),
+            }
+        })
+        .collect::<Vec<_>>();
     let mut resource_generations = resource_high_water_generations
         .iter()
         .enumerate()
@@ -11612,6 +12250,20 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         resource_generations.len(),
         "each logical-voter generation has a distinct nonzero process ID"
     );
+    let replacement_seam_pool_wait_max = released_original_before_shutdown
+        .pool_wait_max
+        .max(restored_seam_current.pool_wait_max);
+    let old_root_seam_pool_wait_max = released_old_root_before_shutdown
+        .pool_wait_max
+        .max(restored_old_root_current.pool_wait_max);
+    assert_eq!(
+        after_recovery[seam_client_index].pool_wait_max, replacement_seam_pool_wait_max,
+        "replacement seam preserves the retired and restored client-pool wait high-water"
+    );
+    assert_eq!(
+        after_recovery[old_root_seam_client_index].pool_wait_max, old_root_seam_pool_wait_max,
+        "old-root seam preserves the retired and restored client-pool wait high-water"
+    );
     let pool_wait_max = after_recovery
         .iter()
         .map(|diagnostics| diagnostics.pool_wait_max)
@@ -11623,9 +12275,9 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .expect("candidate inputs remain unchanged before release-gate evidence output");
     let original_pool = SessionMtlsBatchReleaseGatePoolEvidenceV1 {
         role: SessionMtlsBatchReleaseGatePoolRoleV1::OriginalFixedPools,
-        setup_attempts: original_setup_attempt_delta,
-        setup_failures: original_setup_failure_delta,
-        setup_successes: original_setup_success_delta,
+        setup_attempts: original_setup_attempts,
+        setup_failures: original_setup_failures,
+        setup_successes: original_setup_successes,
         pool_wait_current: 0,
         pool_wait_max,
         configured_lanes: configured_connections,
@@ -11678,6 +12330,20 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         .map(|pool| pool.pool_wait_max)
         .max()
         .expect("all pools accounted");
+    assert_eq!(
+        aggregate_pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the serialized aggregate wait high-water is the delayed fixed-pool overload evidence"
+    );
+    println!(
+        "V2_BATCH_RELEASE_GATE_POOL_WAIT_SCOPES original_and_restored_max={} replacement_released_and_restored_max={} old_root_released_and_restored_max={} delayed_ambiguity_max={} old_credential_negative_max={} new_credential_old_root_negative_max={} aggregate_max={}",
+        pool_wait_max,
+        replacement_seam_pool_wait_max,
+        old_root_seam_pool_wait_max,
+        delayed_after_ambiguity.pool_wait_max,
+        old_leaf_diagnostics.pool_wait_max,
+        new_only_old_root_diagnostics.pool_wait_max,
+        aggregate_pool_wait_max,
+    );
     let typed_evidence = SessionMtlsBatchReleaseGateEvidenceV1 {
         schema_version: "opc-session-mtls-batch-release-gate-evidence/v1".to_owned(),
         experimental: true,
@@ -11698,6 +12364,8 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         members: MEMBER_COUNT,
         clients: V2_BATCH_RELEASE_GATE_CLIENTS,
         lanes_per_client: V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+        // This is the offered logical mutation rate, not an actor-count or
+        // attach-per-second capacity claim.
         logical_operations_per_second: V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND,
         warm_status_samples: V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES,
         warm_status_request_cardinality: warm_status_request_indices.len(),
@@ -11725,6 +12393,23 @@ fn run_persistent_consumer_v2_batch_release_gate() {
         typed_read_unavailable_retry_high_water: mutation_typed_read_unavailable_retry_high_water,
         aggregate_pool_wait_max,
         resource_generations,
+        resource_observations,
+        paced_operations: V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+        paced_elapsed_nanos,
+        achieved_logical_operations_per_second_milli,
+        mutation_batch_samples: mutation_samples.len(),
+        warm_read_p99_millis,
+        warm_read_p999_millis,
+        mutation_p99_millis,
+        mutation_p999_millis,
+        saturated_client_skips: mutation_saturated_client_skips,
+        slow_lane_completed_batches: min_completed_batches,
+        over_capacity_typed_backpressure_events: 1,
+        not_transmitted_retries: mutation_not_transmitted_retries,
+        recovered_unknown: mutation_recovered_unknown,
+        // No server queue depth is sampled by this client-side harness.
+        server_queue_depth_measured: false,
+        server_queue_depth_scope: SessionMtlsBatchReleaseGateServerQueueDepthScopeV1::Downstream,
         positive_new_credential_new_server_statuses: new_only_client_indices.len(),
         old_credential_new_only_server_tls_peer_credential_rejected,
         new_credential_old_root_server_tls_peer_credential_rejected,
@@ -13268,6 +13953,131 @@ fn replaced_v2_pool_diagnostics_preserve_released_and_restored_counters() {
         restored_current.pool_wait_current
     );
     assert_eq!(combined.pool_wait_max, 2);
+}
+
+#[test]
+fn mtls_setup_accounting_rejects_each_attempt_and_failure_ceiling() {
+    let ceilings = v2_batch_release_gate_setup_ceilings();
+    assert_eq!(ceilings.original_and_restored.attempts, 168);
+    assert_eq!(ceilings.original_and_restored.failures, 120);
+    assert_eq!(ceilings.supplemental.attempts, 10);
+    assert_eq!(ceilings.supplemental.failures, 10);
+    assert_eq!(ceilings.total.attempts, 178);
+    assert_eq!(ceilings.total.failures, 130);
+
+    let mut original_attempts = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: ceilings.original_and_restored.attempts + 1,
+            failures: 0,
+        },
+        supplemental: SetupAccounting {
+            attempts: 0,
+            failures: 0,
+        },
+    };
+    let error = verify_mtls_setup_accounting(original_attempts, ceilings)
+        .expect_err("original attempt ceiling must reject overflow");
+    assert!(error.contains("scope=original_and_restored"));
+    assert!(error.contains("attempt ceiling"));
+
+    original_attempts.original_and_restored = SetupAccounting {
+        attempts: 0,
+        failures: ceilings.original_and_restored.failures + 1,
+    };
+    let error = verify_mtls_setup_accounting(original_attempts, ceilings)
+        .expect_err("original failure ceiling must reject overflow");
+    assert!(error.contains("scope=original_and_restored"));
+    assert!(error.contains("failure ceiling"));
+
+    let mut supplemental_attempts = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: 0,
+            failures: 0,
+        },
+        supplemental: SetupAccounting {
+            attempts: ceilings.supplemental.attempts + 1,
+            failures: 0,
+        },
+    };
+    let error = verify_mtls_setup_accounting(supplemental_attempts, ceilings)
+        .expect_err("supplemental attempt ceiling must reject overflow");
+    assert!(error.contains("scope=supplemental"));
+    assert!(error.contains("attempt ceiling"));
+
+    supplemental_attempts.supplemental = SetupAccounting {
+        attempts: 0,
+        failures: ceilings.supplemental.failures + 1,
+    };
+    let error = verify_mtls_setup_accounting(supplemental_attempts, ceilings)
+        .expect_err("supplemental failure ceiling must reject overflow");
+    assert!(error.contains("scope=supplemental"));
+    assert!(error.contains("failure ceiling"));
+
+    let total_observed = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: 1,
+            failures: 1,
+        },
+        supplemental: SetupAccounting {
+            attempts: 1,
+            failures: 1,
+        },
+    };
+    let total_attempt_ceilings = MtlsSetupCeilings {
+        total: SetupAccounting {
+            attempts: 1,
+            failures: ceilings.total.failures,
+        },
+        ..ceilings
+    };
+    let error = verify_mtls_setup_accounting(total_observed, total_attempt_ceilings)
+        .expect_err("total attempt ceiling must reject overflow");
+    assert!(error.contains("scope=total"));
+    assert!(error.contains("attempt ceiling"));
+
+    let total_failure_ceilings = MtlsSetupCeilings {
+        total: SetupAccounting {
+            attempts: ceilings.total.attempts,
+            failures: 1,
+        },
+        ..ceilings
+    };
+    let error = verify_mtls_setup_accounting(total_observed, total_failure_ceilings)
+        .expect_err("total failure ceiling must reject overflow");
+    assert!(error.contains("scope=total"));
+    assert!(error.contains("failure ceiling"));
+}
+
+#[test]
+fn resource_sampler_generation_ledger_keeps_initial_offline_and_restarted_pid() {
+    let initial = ProcessResourceHighWater {
+        process_id: 41,
+        samples: 0,
+        file_descriptors: 0,
+        threads: 0,
+        vm_rss_kib: 0,
+        vm_hwm_kib: 0,
+    };
+    let snapshot = ProcessResourceSnapshot {
+        file_descriptors: 8,
+        socket_file_descriptors: 2,
+        nontransport_file_descriptors: 6,
+        threads: 3,
+        vm_rss_kib: 100,
+        vm_hwm_kib: 120,
+    };
+    let mut generations = vec![vec![initial]];
+    let mut observed_process_ids = vec![None];
+    record_resource_generation_sample(&mut generations, &mut observed_process_ids, 0, 41, snapshot);
+    // Offline is intentionally not sampled. Retaining the old observed PID
+    // makes the next distinct authoritative PID a new logical generation.
+    record_resource_generation_sample(&mut generations, &mut observed_process_ids, 0, 73, snapshot);
+    assert_eq!(generations[0].len(), 2);
+    assert_eq!(generations[0][0].process_id, 41);
+    assert_eq!(generations[0][1].process_id, 73);
+    assert!(generations[0]
+        .iter()
+        .all(|generation| generation.samples >= 1));
 }
 
 #[test]

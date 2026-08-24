@@ -17,7 +17,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 #[cfg(unix)]
@@ -106,7 +106,7 @@ use rustix::net::sockopt::socket_error;
 #[cfg(unix)]
 use rustix::net::{connect, socket, AddressFamily, SocketAddrUnix, SocketType};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
 const QUALIFICATION_TENANT: &str = "session-ha-qualification";
@@ -337,6 +337,7 @@ struct QualificationNode {
     consumer_server: Option<SessionQuorumConsumerServerHandle>,
     consumer_transport: Option<QualificationConsumerTransport>,
     consumer_delayed_response: Arc<AtomicBool>,
+    consumer_response_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
     transport: QualificationTransportRuntime,
     leases: HashMap<String, QualificationLease>,
     next_lease_retention_sequence: u64,
@@ -369,6 +370,83 @@ struct QualificationTrafficRuntime {
 struct QualificationConsumerDelayedResponseService {
     inner: Arc<dyn SessionQuorumConsumer>,
     armed: Arc<AtomicBool>,
+    response_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
+}
+
+/// Bounded post-execution hold gate for the four-lane persistent-V2 pressure
+/// seam. It is deliberately separate from the legacy one-shot response delay:
+/// the control plane can prove all four durable executions have entered the
+/// hold before it admits pressure, then release exactly those four responses.
+struct QualificationConsumerResponseHoldGate {
+    armed: AtomicUsize,
+    entered: AtomicUsize,
+    releases: AtomicUsize,
+    released: Notify,
+}
+
+impl QualificationConsumerResponseHoldGate {
+    const RESPONSE_COUNT: usize = 4;
+
+    fn new() -> Self {
+        Self {
+            armed: AtomicUsize::new(0),
+            entered: AtomicUsize::new(0),
+            releases: AtomicUsize::new(0),
+            released: Notify::new(),
+        }
+    }
+
+    fn arm_exactly_four(&self) -> bool {
+        self.armed
+            .compare_exchange(0, Self::RESPONSE_COUNT, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            && self.entered.load(Ordering::SeqCst) == 0
+            && self.releases.load(Ordering::SeqCst) == 0
+    }
+
+    fn status(&self) -> (usize, usize) {
+        (
+            self.armed.load(Ordering::SeqCst),
+            self.entered.load(Ordering::SeqCst),
+        )
+    }
+
+    fn release_exactly_four(&self) -> bool {
+        if self.armed.load(Ordering::SeqCst) != 0
+            || self.entered.load(Ordering::SeqCst) != Self::RESPONSE_COUNT
+            || self.releases.load(Ordering::SeqCst) != 0
+        {
+            return false;
+        }
+        self.releases.store(Self::RESPONSE_COUNT, Ordering::SeqCst);
+        self.released.notify_waiters();
+        true
+    }
+
+    fn take_armed_response(&self) -> bool {
+        self.armed
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
+                armed.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    async fn hold_response(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        loop {
+            let notified = self.released.notified();
+            if self
+                .releases
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |releases| {
+                    releases.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -428,6 +506,12 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
             // bounded deadline. The qualification seam never fabricates a
             // server-side ambiguity result or bypasses durable execution.
             tokio::time::sleep(QUALIFICATION_DELAYED_CONSUMER_RESPONSE).await;
+        }
+        if mutation && self.response_hold_gate.take_armed_response() {
+            // The durable operation above has already completed. This hold
+            // only withholds its real response and records entry before the
+            // harness applies client-side queue pressure.
+            self.response_hold_gate.hold_response().await;
         }
         response
     }
@@ -943,6 +1027,7 @@ impl QualificationNode {
             consumer_server: None,
             consumer_transport,
             consumer_delayed_response: Arc::new(AtomicBool::new(false)),
+            consumer_response_hold_gate: Arc::new(QualificationConsumerResponseHoldGate::new()),
             transport,
             leases: HashMap::new(),
             next_lease_retention_sequence: 1,
@@ -1009,6 +1094,33 @@ impl QualificationNode {
                 } else {
                     self.consumer_delayed_response.store(true, Ordering::SeqCst);
                     QualificationNodeReply::StatelessConsumerDelayedResponseArmed
+                }
+            }
+            QualificationNodeCommand::ArmStatelessConsumerResponseHolds => {
+                if self.consumer_server.is_none()
+                    || !self.consumer_response_hold_gate.arm_exactly_four()
+                {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                } else {
+                    QualificationNodeReply::StatelessConsumerResponseHoldsArmed { responses: 4 }
+                }
+            }
+            QualificationNodeCommand::StatelessConsumerResponseHoldStatus => {
+                let (armed_responses, held_responses) = self.consumer_response_hold_gate.status();
+                QualificationNodeReply::StatelessConsumerResponseHoldStatus {
+                    armed_responses,
+                    held_responses,
+                }
+            }
+            QualificationNodeCommand::ReleaseStatelessConsumerResponseHolds => {
+                if self.consumer_response_hold_gate.release_exactly_four() {
+                    QualificationNodeReply::StatelessConsumerResponseHoldsReleased { responses: 4 }
+                } else {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
                 }
             }
             QualificationNodeCommand::SecurityMetrics => QualificationNodeReply::SecurityMetrics {
@@ -1281,6 +1393,7 @@ impl QualificationNode {
             Arc::new(QualificationConsumerDelayedResponseService {
                 inner: Arc::new(self.store.consumer_service()),
                 armed: Arc::clone(&self.consumer_delayed_response),
+                response_hold_gate: Arc::clone(&self.consumer_response_hold_gate),
             }),
             transport.server_config.clone(),
             authorizer,
