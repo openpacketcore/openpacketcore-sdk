@@ -34,6 +34,10 @@
 //! caller-visible sequence. Protocol-profile upgrades remain coordinated
 //! stop/upgrade/start operations; this lifecycle provides seamless credential
 //! rotation only after every participant already runs the same profile.
+//!
+//! ```compile_fail
+//! use opc_session_net::SessionConsumerPreparedCheckpointRouter;
+//! ```
 
 #![forbid(unsafe_code)]
 

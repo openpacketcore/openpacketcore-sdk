@@ -307,9 +307,10 @@ in-flight call: no multiplexing is permitted, because cancellation,
 pre-staged/late-response isolation, and write-position ambiguity are structural.
 The fair request pool defaults to four connections, allows at most
 16 configured connections, and bounds pending calls to 64 by default and 256
-absolutely; queue wait/age is at most 250 ms. Watches have two separate slots
-by default and at most 16 configured slots, so they cannot consume request
-capacity.
+absolutely; queue wait/age is at most 250 ms. The retained Watch transport has
+two reserved slots by default and at most 16 configured slots, but the public
+tenant/NF consumer Watch does not acquire them while its global cursor remains
+unsupported.
 
 `PersistentSessionConsumerClient` keeps an additional, independent fixed V2
 request pool of the same configured width. `prewarm_v2` establishes those
@@ -334,8 +335,8 @@ independently restores the configured physical lane width.
 
 An establishment has a 1,500 ms setup limit and a call makes at most two
 pre-write attempts. Resolution occurs only when establishing or
-re-establishing a connection. Every cold request/watch/prewarm setup for one
-pool enters one physical-setup lane after bounded physical admission. A failed
+re-establishing a connection. Every cold request/prewarm setup for one pool
+enters one physical-setup lane after bounded physical admission. A failed
 setup failure or proven cached-lane loss publishes one shared exponential
 backoff deadline plus bounded jitter;
 waiting callers do not create per-caller resolver/TCP/TLS/Hello storms. With
@@ -382,11 +383,9 @@ must release the isolated lease rather than reconnect behind a slow consumer.
 
 The configured complete operation timeout is validated strictly greater than
 zero and no greater than 10 seconds. The configured idle timeout is at most 5
-seconds and caps every active partial frame on client bootstrap, unary, and
-watch reads; it is not reset by received partial bytes. A healthy watch with no
-bytes in flight may remain quiet. Retirement of a saturated, canceled, or
-rotated watch never waits while holding its watch lease. Every discarded
-checked-out request lane has exactly one reconnect/replacement accounting
+seconds and caps every active partial frame on client bootstrap and unary reads;
+it is not reset by received partial bytes. Every discarded checked-out request
+lane has exactly one reconnect/replacement accounting
 outcome. Shutdown phase is monotonic under concurrent callers: it can move
 from running to draining to forced, never backwards.
 
@@ -405,7 +404,8 @@ fixed and nonidentifying: setup phase, pool wait, active/maximum/idle counts,
 reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They
 never contain endpoints, identities, scopes, credentials, keys, payloads,
 request/correlation IDs, owners, or fences. Readiness deliberately becomes
-false while a request lane is leased; isolated watch slots are non-gating.
+false while a request lane is leased; reserved Watch transport slots are
+non-gating.
 Performance evidence is synthetic only and is not an ePDG production-SLO
 claim. Synthetic warm evidence gates only the structural accept/reuse method;
 its elapsed samples are explicitly non-gating. The exact method and bounded raw

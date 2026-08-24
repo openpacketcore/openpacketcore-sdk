@@ -6,6 +6,31 @@
 //! stale-owner protections are intended for 5G CNF session-state boundaries;
 //! production suitability remains specific to the selected backend profile.
 //!
+//! # Protected checkpoint consumption
+//!
+//! Prepared checkpoint requests are obtained only from an SDK-owned
+//! [`ProtectedSessionBackend`] wrapper. The returned affine request captures
+//! its exact scope, caller request ID, sealed mutation, and deadline budget;
+//! only the net-owned consumer composite can turn it into an execution handle.
+//! Prepared is local type-state, never a wire or server authorization marker.
+//!
+//! ```compile_fail
+//! use opc_session_store::{
+//!     PreparedCheckpointAuthorityContext, PreparedCheckpointCompletion,
+//!     PreparedCheckpointPort, PreparedCompareAndSetToken, PreparedLeaseAcquireToken,
+//! };
+//! ```
+//!
+//! ```compile_fail
+//! use opc_session_store::{EncryptingSessionBackend, PreparedCompareAndSetRequest};
+//!
+//! let _ = PreparedCompareAndSetRequest::from_consumer_port;
+//!
+//! fn removed_attachment<B: ?Sized, P: ?Sized>(wrapper: EncryptingSessionBackend<B, P>) {
+//!     let _ = wrapper.with_prepared_checkpoint_port(());
+//! }
+//! ```
+//!
 //! # Module map
 //!
 //! | Module | Responsibility |
@@ -83,12 +108,17 @@ pub use backend::{
     validate_replication_prefix_owned, validate_session_ops_at, validate_session_ops_profile,
     validate_session_ops_ttls, BackendInstanceIdentity, BackendPeerBinding,
     BackendPeerScopeIdentity, CompareAndSet, CompareAndSetResult, EncryptingSessionBackend,
-    ProtectedSelectorLedgerBase, ProtectedSessionBackend, RecordExpiryPreflight,
-    RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange, ReplicationOp,
-    ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor, SelectorLedgerStorageScope,
-    SessionBackend, SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
-    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
-    MAX_REPLICATION_OPERATION_DEPTH, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
+    PreparedCheckpointBudget, PreparedCheckpointBudgetError, PreparedCompareAndSetExecuteError,
+    PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetRequest,
+    PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError,
+    PreparedLeaseAcquireExecuteError, PreparedLeaseAcquirePrepareError,
+    PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError, ProtectedSelectorLedgerBase,
+    ProtectedSessionBackend, RecordExpiryPreflight, RemoteSealingSessionBackend, ReplicationEntry,
+    ReplicationLogRange, ReplicationOp, ReplicationTxId, ReplicationTxIdError,
+    ReplicationWatchCursor, SelectorLedgerStorageScope, SessionBackend, SessionOp, SessionOpResult,
+    MAX_RECORD_EXPIRY_PREFLIGHTS, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
+    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
     REPLICATION_TX_ID_CANONICAL_BYTES, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 pub use capability::{
@@ -123,7 +153,9 @@ pub use consensus::{
 };
 pub use consumer::{
     derive_consumer_consensus_request_id, session_consumer_batch_result,
-    session_consumer_batch_result_into_store, SessionConsumerAuthorizationManifest,
+    session_consumer_batch_result_into_store, SessionConsumerAuthorization,
+    SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationGrantError,
+    SessionConsumerAuthorizationManifest, SessionConsumerAuthorizationManifestError,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerChangeItem,
     SessionConsumerChangeKind, SessionConsumerFencedTransitionError,
     SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerIdentityError,

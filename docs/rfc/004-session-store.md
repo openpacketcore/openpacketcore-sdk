@@ -1728,8 +1728,9 @@ structural: it isolates cancellation and pre-staged/late responses and removes
 write-position ambiguity. The client uses a
 fixed, fair pool of four request connections by default (at most 16 when
 configured), with 64 pending calls by default and a hard maximum of 256. A
-pending call may wait or age for at most 250 ms. Watches use two separate slots
-by default (at most 16 when configured), never consuming request-pool capacity.
+pending call may wait or age for at most 250 ms. The retained Watch transport
+uses two reserved slots by default (at most 16 when configured), but typed
+tenant/NF consumer Watch does not acquire them while its cursor is global.
 
 `PersistentSessionConsumerClient` has separate fixed V2 lanes of the same
 configured request width. `prewarm_v2` establishes revision-5 lanes without
@@ -1771,11 +1772,9 @@ frame bound.
 
 The complete operation timeout MUST validate strictly greater than zero and no
 greater than 10 seconds. The configured idle timeout is at most 5 seconds and
-caps every active partial frame on all client bootstrap, unary, and watch reads;
-partial bytes do not reset that bound. A healthy watch with no bytes in flight
-may remain quiet. Retirement of a saturated, canceled, or rotated watch MUST
-NOT block while holding its watch lease. Each discarded checked-out request lane
-MUST have exactly one reconnect/replacement accounting outcome. Under concurrent
+caps every active partial frame on all client bootstrap and unary reads; partial
+bytes do not reset that bound. Each discarded checked-out request lane MUST have
+exactly one reconnect/replacement accounting outcome. Under concurrent
 shutdown callers, phase progression is monotonic from running to draining to
 forced and MUST NOT regress.
 
@@ -1785,16 +1784,16 @@ is at most 30 seconds, and material-rotation jitter is at most 30 seconds. A
 consumer shutdown drains for at most 5 seconds. An establishment attempt has a
 1,500 ms setup limit and a call makes at most two pre-write establishment
 attempts. Resolution occurs only for establishment or re-establishment, never
-for a reused connection. Every cold request, watch, and rolling-prewarm setup
-MUST enter one pool-wide recovery lane after bounded physical admission. One
+for a reused connection. Every cold request and rolling-prewarm setup MUST enter
+one pool-wide recovery lane after bounded physical admission. One
 failed setup or proven cached-lane loss publishes the shared exponential
 lifecycle backoff floor (50 ms by default) plus at most 25 ms jitter, clipped to
 each logical deadline;
 concurrent waiters MUST NOT start independent resolver/TCP/TLS/Hello attempts.
 Reauthentication, material
 changes, certificate expiry, idle retirement, cancellation, malformed frames,
-EOF, or an uncertain stream position terminate the connection/watch and release
-its transport task slot; they do not create another request on that connection.
+EOF, or an uncertain stream position terminate the connection and release its
+transport task slot; they do not create another request on that connection.
 "Material changes" here means an accepted material-epoch change. It MUST
 schedule each already-admitted lane at a stable directed authenticated-edge
 deadline no later than the configured rotation-jitter maximum; admitted work
@@ -1806,8 +1805,8 @@ jitter exception. TLS MUST expose only the single fixed-domain, fixed-range
 consumer jitter duration needed by session-net. It MUST NOT expose a comparable
 edge-key object, caller-selected digest range, identity, or digest bytes to
 callers or session-net diagnostics. A rejected publication
-that retains the admitted epoch MUST NOT interrupt an active frame or healthy
-watch. Each logical request pool MUST use exactly one maintenance task to
+that retains the admitted epoch MUST NOT interrupt an active frame. Each
+logical request pool MUST use exactly one maintenance task to
 remove cached lanes autonomously at the earliest idle/lifecycle deadline.
 Maintenance task/table cardinality MUST NOT scale with lanes, subscribers, or
 records.
@@ -1870,7 +1869,8 @@ every configured request lane and preserve refreshed plus unprocessed healthy
 capacity after a partial failure. Prewarm and readiness may prove authenticated
 consumer transport capacity only;
 they never prove quorum or product readiness. Readiness deliberately becomes
-false while a request lane is leased; isolated watch slots are non-gating.
+false while a request lane is leased; reserved Watch transport slots are
+non-gating.
 Diagnostics are fixed and
 nonidentifying: setup phase, pool wait, active/maximum/idle counts,
 reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They

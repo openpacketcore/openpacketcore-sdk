@@ -35,8 +35,7 @@ use crate::{
     model::{OwnerId, SessionKey},
     record::{SessionPayloadEncoding, StoredSessionRecord},
     replication_watch::{
-        prepare_consumer_watch_registration, prepare_watch_registration, watch_backlog_query_limit,
-        ConsumerReplicationWatcher, ReplicationWatcher,
+        prepare_watch_registration, watch_backlog_query_limit, ReplicationWatcher,
     },
     restore::{RestoreScanPage, RestoreScanRequest},
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
@@ -541,7 +540,6 @@ pub struct SqliteSessionBackend {
     #[cfg(test)]
     pub(crate) fixed_quorum_durable_check_count: Arc<AtomicUsize>,
     watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
-    consumer_watchers: Arc<tokio::sync::Mutex<Vec<ConsumerReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) consumer_watch_projection_count: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -1084,7 +1082,6 @@ impl SqliteSessionBackend {
             #[cfg(test)]
             fixed_quorum_durable_check_count: Arc::new(AtomicUsize::new(0)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            consumer_watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             consumer_watch_projection_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -2877,7 +2874,7 @@ impl SessionBackend for SqliteSessionBackend {
         let caps = self.caps;
         self.run_store_sqlite_task(SqliteStoreWorkKind::CompareAndSet, move |conn| {
             let tx = standalone_transaction(conn)?;
-            let result = ops::compare_and_set_sync(&tx, op, &caps, now)?;
+            let result = ops::compare_and_set_sync(&tx, &op, &caps, now)?;
             tx.commit()
                 .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
             Ok(result)
@@ -2952,7 +2949,7 @@ impl SessionBackend for SqliteSessionBackend {
                     SessionOp::CompareAndSet(cas) => {
                         let run_cas = || {
                             let tx = standalone_transaction(conn)?;
-                            let result = ops::compare_and_set_sync(&tx, cas, &caps, now)?;
+                            let result = ops::compare_and_set_sync(&tx, &cas, &caps, now)?;
                             tx.commit()
                                 .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
                             Ok(result)

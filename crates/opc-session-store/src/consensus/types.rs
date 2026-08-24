@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -187,7 +188,11 @@ pub enum SessionMutationIntent {
     /// expired lease or record.
     AdvanceLogicalTime,
     /// Compare and set one record under a fenced lease.
-    CompareAndSet(Box<CompareAndSet>),
+    ///
+    /// The shared ownership is runtime-only: serde still emits exactly the
+    /// wrapped operation.  It lets a forwarding request survive a proven
+    /// before-transmission leader reroute without cloning sealed ciphertext.
+    CompareAndSet(Arc<CompareAndSet>),
     /// Delete one record under a fenced lease.
     DeleteFenced(LeaseGuard),
     /// Refresh a record TTL under a fenced lease.
@@ -1371,7 +1376,7 @@ mod tests {
         );
         assert_postcard_cross_decode(
             "CompareAndSet",
-            SessionMutationIntent::CompareAndSet(Box::new(cas.clone())),
+            SessionMutationIntent::CompareAndSet(Arc::new(cas.clone())),
             LegacySessionMutationIntent684::CompareAndSet(Box::new(cas)),
         );
         assert_postcard_cross_decode(

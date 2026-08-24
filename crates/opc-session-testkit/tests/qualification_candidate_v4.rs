@@ -311,6 +311,17 @@ fn v5_profile_decoder_is_bounded_and_closed() {
         ),
         Err(QualificationCandidateContractError::InvalidDocument)
     );
+
+    let mut retroactive_revision: Value =
+        serde_json::from_str(SESSION_HA_CANDIDATE_PROFILE_V5_JSON).expect("v5 profile value");
+    retroactive_revision["protocol"]["application_revision"] = 2.into();
+    assert_eq!(
+        SessionHaCandidateQualificationProfileV5::from_json(
+            &serde_json::to_vec(&retroactive_revision).expect("encode retroactive revision")
+        ),
+        Err(QualificationCandidateContractError::InvalidDocument),
+        "frozen v5 evidence cannot acquire a later authority-bearing protocol field"
+    );
 }
 
 #[test]

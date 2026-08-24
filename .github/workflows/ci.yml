@@ -509,7 +509,10 @@ jobs:
           shared-key: opc-session-net-i686
 
       - name: Run opc-session-net tests on i686
-        run: cargo test --locked -p opc-session-net --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
+        # The stateless three-voter consumer proofs retain literal 100/250 ms
+        # caller budgets.  Serialize this 32-bit lane so unrelated quorum
+        # fixtures cannot consume those budgets through host contention.
+        run: cargo test --locked -p opc-session-net --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=1
 
       # Widened beyond opc-session-net: opc-protocol is the shared error type
       # whose layout every protocol crate depends on, and opc-proto-gtpv2c

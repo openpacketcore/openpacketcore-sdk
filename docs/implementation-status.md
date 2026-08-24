@@ -119,9 +119,15 @@ the prefixes are provably disjoint. Overlap, exact duplicates, destination or
 firewall-mark siblings, wildcard selectors, foreign collisions, ownership-
 tagged objects that cannot be represented, and ambiguous resident state fail
 closed before destructive cleanup. This preserves the conservative singleton
-contract, where multiple candidates at the broad family/priority collision key
-remain ambiguous, while providing an exact collection-level removal target
-that preserves disjoint siblings.
+contract except for one narrow Linux-only singleton readback/removal exception:
+stock, protocol-`242`-owned, same-table, source-only rules with provably
+disjoint non-`/0` source prefixes may coexist as siblings. Linux then proves
+the exact target absent after deletion while preserving those siblings; it does
+not claim the entire broad family/priority key is absent. Every other sibling,
+including malformed, unknown, unrepresentable, foreign, overlapping,
+wildcard, destination-qualified, or firewall-mark-qualified state remains
+fail-closed rather than being excluded from the broad collision key. Collection
+reconciliation remains the authoritative complete-set path for siblings.
 
 Linux and mock reconciliation perform one authoritative workflow serialized
 among clones of the same backend: validate a complete bounded resident
@@ -162,8 +168,8 @@ before invoking reconciliation; the SDK does not persist intent. Protocol
 `242` is still only a namespace-local reservation, not authentication, so safe
 cleanup depends on one orchestrated exclusive writer for each declared scope
 and external coordination for overlapping scopes or deliberate marker reuse.
-Legacy static routes, untagged rules, singleton convergence, and their existing
-migration requirements remain unchanged. Scripted Linux tests cover
+Legacy static routes, untagged rules, and their existing migration requirements
+remain unchanged. Scripted Linux tests cover
 same-priority sibling install, exact retry, and targeted removal; foreign
 conflict and cross-set prefix-overlap rejection without mutation, including an
 exact retry; marker omission/substitution rollback preserving owned state;

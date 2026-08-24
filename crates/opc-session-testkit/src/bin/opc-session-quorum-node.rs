@@ -110,6 +110,10 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const QUALIFICATION_TENANT: &str = "session-ha-qualification";
+/// The only application namespaces exercised by the qualification-only
+/// stateless-consumer scenario. Runtime configuration deliberately carries no
+/// consumer scope input, so this fixed test contract must remain exact.
+const QUALIFICATION_STATELESS_CONSUMER_TENANT: &str = "qualification-consumer";
 const QUALIFICATION_KEY_ID: &str = "session-ha-qualification-key-v1";
 const QUALIFICATION_STATE_TYPE: &str = "session-ha-qualification-state";
 const QUALIFICATION_TRAFFIC_STATE_TYPE: &str = "session-ha-qualification-traffic-state";
@@ -371,7 +375,7 @@ struct QualificationConsumerDelayedResponseService {
 impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
     async fn execute(
         &self,
-        identity: &SessionConsumerIdentity,
+        authorization: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         let lease_mutation = matches!(
@@ -380,7 +384,7 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
                 | SessionConsumerOperation::RenewLease { .. }
                 | SessionConsumerOperation::ReleaseLease { .. }
         );
-        let response = self.inner.execute(identity, request).await;
+        let response = self.inner.execute(authorization, request).await;
         if lease_mutation
             && matches!(
                 &response,
@@ -430,14 +434,17 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
 
     async fn watch(
         &self,
-        identity: &SessionConsumerIdentity,
-        scope: SessionConsumerScope,
-        start_sequence: u64,
+        _authorization: &SessionConsumerAuthorization,
+        _scope: SessionConsumerScope,
+        _start_sequence: u64,
     ) -> Result<
         BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
         SessionConsumerRejection,
     > {
-        self.inner.watch(identity, scope, start_sequence).await
+        // The qualification stateless-consumer contract exercises request/
+        // response operations only. Do not turn its exact mutation grants
+        // into a subscription grant.
+        Err(SessionConsumerRejection::Unauthorized)
     }
 }
 
@@ -1233,15 +1240,6 @@ impl QualificationNode {
                 code: QualificationNodeErrorCode::InvalidRequest,
             };
         };
-        let manifest = match self.store.consumer_authorization_manifest().await {
-            Ok(manifest) => manifest,
-            Err(_) => {
-                return QualificationNodeReply::Error {
-                    code: QualificationNodeErrorCode::BackendUnavailable,
-                }
-            }
-        };
-        let scope = manifest.scope();
         let identities = match consumer_identities
             .into_iter()
             .map(SpiffeId::new)
@@ -1254,7 +1252,24 @@ impl QualificationNode {
                 }
             }
         };
-        let authorizer = match SessionConsumerAuthorizer::try_new(manifest, identities) {
+        let grants = match qualification_stateless_consumer_grants(identities) {
+            Ok(grants) => grants,
+            Err(()) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::InvalidRequest,
+                }
+            }
+        };
+        let manifest = match self.store.consumer_authorization_manifest(grants).await {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::BackendUnavailable,
+                }
+            }
+        };
+        let scope = manifest.scope();
+        let authorizer = match SessionConsumerAuthorizer::try_new(manifest) {
             Ok(authorizer) => authorizer,
             Err(_) => {
                 return QualificationNodeReply::Error {
@@ -4074,6 +4089,37 @@ where
     for (handle, _) in released.into_iter().take(remove_count) {
         leases.remove(&handle);
     }
+}
+
+/// Build the exact, qualification-only grants for a validated command identity.
+///
+/// This child process is a test fixture and `QualificationNodeConfig` has no
+/// consumer scope field. The scopes are therefore the two fixed namespaces
+/// exercised by the stateless-consumer qualification workload; they are not
+/// derived from the SPIFFE text or from a request. Watches receive no separate
+/// authority from this helper.
+fn qualification_stateless_consumer_grants(
+    identities: Vec<SpiffeId>,
+) -> Result<Vec<SessionConsumerAuthorizationGrant>, ()> {
+    identities
+        .into_iter()
+        .map(|identity| {
+            SessionConsumerAuthorizationGrant::try_new(
+                identity,
+                [
+                    SessionConsumerTenantNfScope::new(
+                        TenantId::new(QUALIFICATION_STATELESS_CONSUMER_TENANT).map_err(|_| ())?,
+                        NetworkFunctionKind::smf(),
+                    ),
+                    SessionConsumerTenantNfScope::new(
+                        TenantId::new(QUALIFICATION_TENANT).map_err(|_| ())?,
+                        NetworkFunctionKind::smf(),
+                    ),
+                ],
+            )
+            .map_err(|_| ())
+        })
+        .collect()
 }
 
 fn qualification_key(stable_id: &str) -> Result<SessionKey, ()> {

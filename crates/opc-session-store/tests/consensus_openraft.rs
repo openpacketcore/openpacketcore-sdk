@@ -39,6 +39,7 @@ use opc_session_store::{
     TopologyAttestationTime, TopologyAttestationVerificationError,
     TopologyAttestationVerificationInput, TopologyCollectorId, ValidatedQuorumTopology,
     VerifiedQuorumTopologyAttestation, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 use rusqlite::OptionalExtension;
@@ -372,6 +373,27 @@ struct FencedTransitionCapabilityProbeV1 {
     schema_version: u16,
 }
 
+/// Wire-identical test shape for the private V1 capability reply. This lets
+/// the handler below distinguish a peer's explicit protocol `Unsupported`
+/// result from a transport/protocol call failure.
+#[derive(Serialize)]
+#[allow(dead_code)]
+enum FencedTransitionCapabilityReplyV1 {
+    V1,
+    Unsupported,
+}
+
+/// The activation certificate was added after the signed 36720e58 baseline.
+/// Its probe has two required postcard fields; that baseline's one-field V1
+/// decoder rejects the trailing field. This local handler emulates exactly
+/// that peer behavior while retaining real authenticated Raft and ordinary
+/// read-barrier traffic for the surrounding three-voter cluster.
+#[derive(Deserialize)]
+struct FencedTransitionActivationCapabilityProbeV2 {
+    activation_probe_schema_version: u16,
+    activation_command_schema_version: u16,
+}
+
 struct RejectFencedTransitionCapabilityProbeHandler {
     inner: Arc<dyn SessionConsensusRpcHandler>,
 }
@@ -437,6 +459,46 @@ impl SessionConsensusRpcHandler for RejectFencedTransitionCapabilityProbeHandler
             )
         {
             return SessionConsensusWireResponse {
+                result: Ok(
+                    encode_bounded(&FencedTransitionCapabilityReplyV1::Unsupported)
+                        .expect("bounded explicit unsupported capability reply"),
+                ),
+            };
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
+
+struct Baseline36720ActivationProbeHandler {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+}
+
+impl fmt::Debug for Baseline36720ActivationProbeHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Baseline36720ActivationProbeHandler(<redacted>)")
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for Baseline36720ActivationProbeHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if request.family == SessionConsensusRpcFamily::ReadBarrier
+            && matches!(
+                decode_bounded::<FencedTransitionActivationCapabilityProbeV2>(&request.payload),
+                Ok(FencedTransitionActivationCapabilityProbeV2 {
+                    activation_probe_schema_version: 2,
+                    activation_command_schema_version: 1,
+                })
+            )
+        {
+            // The signed baseline accepts the established unit barrier and
+            // one-field V1 capability probe, but rejects this new complete
+            // activation probe before it can ever see a new log intent.
+            return SessionConsensusWireResponse {
                 result: Err(SessionConsensusPeerError::Protocol),
             };
         }
@@ -459,6 +521,12 @@ impl SessionConsensusPeer for LoopbackPeer {
         }
         if request.family == SessionConsensusRpcFamily::ForwardMutation {
             self.forward_mutation_calls.fetch_add(1, Ordering::SeqCst);
+            self.forward_mutation_max_payload_bytes
+                .fetch_max(request.payload.len(), Ordering::SeqCst);
+        }
+        if request.family == SessionConsensusRpcFamily::AppendEntries {
+            self.append_entries_max_payload_bytes
+                .fetch_max(request.payload.len(), Ordering::SeqCst);
         }
         if request.family == SessionConsensusRpcFamily::ReadBarrier
             && matches!(
@@ -495,7 +563,7 @@ impl SessionConsensusPeer for LoopbackPeer {
             tokio::time::sleep(delay).await;
         }
 
-        {
+        if self.capture_payloads.load(Ordering::SeqCst) {
             let mut captured = self
                 .captured_payloads
                 .lock()
@@ -1067,6 +1135,41 @@ impl TestCluster {
             .flat_map(|path| path.captured_payloads())
             .collect()
     }
+
+    /// The maximum-CAS evidence deliberately disables optional test capture:
+    /// capturing an RPC by cloning it would manufacture a second full
+    /// ciphertext allocation that production forwarding does not make.
+    fn set_capture_payloads(&self, capture: bool) {
+        for path in self.paths.values() {
+            path.set_capture_payloads(capture);
+        }
+    }
+
+    fn forward_mutation_max_payload_bytes(&self, source: usize) -> usize {
+        (0..MEMBER_COUNT)
+            .filter(|target| *target != source)
+            .map(|target| {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .forward_mutation_max_payload_bytes()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn append_entries_max_payload_bytes(&self, source: usize) -> usize {
+        (0..MEMBER_COUNT)
+            .filter(|target| *target != source)
+            .map(|target| {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .append_entries_max_payload_bytes()
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 struct CountingKeyProvider {
@@ -1469,6 +1572,31 @@ fn consensus_sqlite_progress(database: &Path) -> (Option<u64>, Option<u64>, Opti
     )
 }
 
+/// Count the two durable artifacts whose one-for-one growth proves an applied
+/// CAS produced exactly one receipt and exactly one visible replication effect
+/// on this SQLite voter.  The query intentionally reads scalar counts only:
+/// the maximum-payload evidence must not hydrate or clone a ciphertext row.
+fn durable_cas_artifact_counts(database: &Path) -> (u64, u64) {
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open consensus durable-artifact database");
+    let receipts = connection
+        .query_row(
+            "SELECT COUNT(*) FROM consensus_request_outcomes",
+            [],
+            |row| row.get::<_, u64>(0),
+        )
+        .expect("count durable consensus receipts");
+    let replication = connection
+        .query_row("SELECT COUNT(*) FROM session_replication_log", [], |row| {
+            row.get::<_, u64>(0)
+        })
+        .expect("count durable replication effects");
+    (receipts, replication)
+}
+
 fn sealed_record(
     key: SessionKey,
     generation: u64,
@@ -1512,6 +1640,72 @@ fn sealed_record(
     .expect("test envelope");
     record.payload = EncryptedSessionPayload::try_envelope(envelope).expect("valid envelope");
     record
+}
+
+/// Build a structurally valid synthetic AEAD envelope whose complete retained
+/// ciphertext is exactly `payload_bytes`.  Calculating the per-record envelope
+/// overhead first keeps the boundary test tied to the admitted capability,
+/// rather than assuming that a one-mebibyte opaque plaintext has the same
+/// stored width after key ID, nonce, AAD, and tag framing.
+fn sealed_record_with_exact_payload_len(
+    key: SessionKey,
+    generation: u64,
+    lease: &opc_session_store::LeaseGuard,
+    payload_bytes: usize,
+) -> StoredSessionRecord {
+    let mut record = StoredSessionRecord {
+        key,
+        generation: Generation::new(generation),
+        owner: lease.owner().clone(),
+        fence: lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("consensus-test-session"),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([]),
+    };
+    let key_id = KeyId::new("synthetic-consensus-test-key").expect("key ID");
+    let aad = EnvelopeAad::session(
+        record.key.tenant.clone(),
+        1,
+        SessionAad::new(
+            record.key.nf_kind.as_str(),
+            "synthetic-keyed-session-digest",
+            record.state_type.as_str(),
+            record.generation.get(),
+            record.fence.get(),
+            "synthetic-consensus-test-backend",
+        )
+        .expect("session AAD"),
+    );
+    let encode = |ciphertext_and_tag| {
+        CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![0x42; AES_256_GCM_SIV_NONCE_LEN],
+            aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+            ciphertext_and_tag,
+        }
+        .encode()
+        .expect("test envelope")
+    };
+    let envelope_overhead = encode(vec![0xA5; AEAD_TAG_LEN]).len();
+    let opaque_bytes = payload_bytes
+        .checked_sub(envelope_overhead)
+        .expect("admitted payload exceeds exact envelope framing");
+    let mut ciphertext_and_tag = vec![0xA5; opaque_bytes];
+    ciphertext_and_tag.extend_from_slice(&[0xA5; AEAD_TAG_LEN]);
+    let envelope = encode(ciphertext_and_tag);
+    assert_eq!(
+        envelope.len(),
+        payload_bytes,
+        "synthetic ciphertext includes exactly the same envelope framing as a stored record"
+    );
+    record.payload = EncryptedSessionPayload::try_envelope(envelope).expect("valid envelope");
+    record
+}
+
+fn payload_sha256(record: &StoredSessionRecord) -> [u8; 32] {
+    Sha256::digest(record.payload.as_bytes()).into()
 }
 
 fn sealed_transition_record(
@@ -4292,38 +4486,48 @@ async fn fenced_transition_preproposal_partition_leaves_no_receipt_or_fence() {
 }
 
 #[tokio::test]
-async fn fenced_transition_durable_activation_avoids_reprobe_on_rejecting_peer_path() {
+async fn state_voter_activation_avoids_reprobe_on_rejecting_peer_path() {
     let cluster = TestCluster::start().await;
     let (leader, _, _) = cluster.observed_leader();
     let source = (leader + 1) % MEMBER_COUNT;
     let store = &cluster.stores[source];
-
-    let activation_key = session_key(b"fenced-transition-activation-before-rejected-probe");
-    let activation_observation = store
-        .observe_fenced_transition(&activation_key)
-        .await
-        .expect("observe the activating transition key");
-    let (activation_request, _) = fenced_acquire_create_request(
-        activation_key,
-        owner("fenced-transition-activation-owner"),
-        activation_observation.current_fence(),
-        [0x60; 16],
-        Duration::from_secs(30),
-        b"sealed-fenced-transition-activation-before-rejected-probe",
-    );
+    let before = cluster.stores[leader]
+        .status()
+        .last_log_index
+        .expect("formed cluster log head");
     store
-        .fenced_transition(activation_request)
+        .activate_fenced_transition_capability()
         .await
-        .expect("commit the first transition and durable activation");
+        .expect("commit the state-voter V1 activation before consumer readiness");
+    assert_eq!(
+        store.status().applied_index,
+        Some(before + 1),
+        "a forwarding voter returns from activation only after its local state machine applies the certificate"
+    );
     cluster
         .wait_all_ready(RECOVERY_TIMEOUT)
         .await
         .expect("all live voters apply durable activation");
+    assert_eq!(
+        cluster.stores[leader].status().last_log_index,
+        Some(before + 1),
+        "cold state-voter activation appends exactly one cluster-scope certificate"
+    );
+    store
+        .activate_fenced_transition_capability()
+        .await
+        .expect("repeated startup activation is idempotent");
+    assert_eq!(
+        cluster.stores[leader].status().last_log_index,
+        Some(before + 1),
+        "a durable exact certificate avoids a second activation proposal"
+    );
 
     // This precise shim is not an old binary: it rejects only a new V1 probe,
     // while ordinary barriers, forwarding, and Raft append traffic stay live.
     // A later operation must use the durable activation rather than probing it.
     cluster.reject_fenced_transition_capability_probe(source, leader);
+    cluster.reject_fenced_transition_capability_probe(leader, source);
     assert!(
         matches!(
             store
@@ -4355,7 +4559,7 @@ async fn fenced_transition_durable_activation_avoids_reprobe_on_rejecting_peer_p
         .expect("post-activation transition succeeds through the rejecting probe path");
     assert!(
         matches!(second.mutation(), FencedTransitionMutationResult::Created),
-        "the activated path commits one fresh record"
+        "the activated path commits one fresh record without any capability-probe RPC"
     );
     assert!(
         cluster.forward_mutation_calls(source) > forwards_before,
@@ -4374,6 +4578,72 @@ async fn fenced_transition_durable_activation_avoids_reprobe_on_rejecting_peer_p
         "the post-activation transition retains its exact result"
     );
     cluster.restore_current_rpc_handler(source, leader);
+    cluster.restore_current_rpc_handler(leader, source);
+}
+
+#[tokio::test]
+async fn state_voter_activation_rejects_baseline_36720_peer_before_proposal() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let rejected_peer = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[leader];
+    let before = store
+        .status()
+        .last_log_index
+        .expect("formed cluster has a durable log head");
+
+    // This preserves ordinary authenticated Raft and read-barrier traffic but
+    // emulates a signed 36720e58 peer that can answer the old V1 probe yet
+    // cannot decode the new activation-command probe or its log intent.
+    cluster.emulate_baseline_36720_activation_probe_rejection(leader, rejected_peer);
+    let result = store.activate_fenced_transition_capability().await;
+    assert!(
+        matches!(
+            result,
+            Err(StoreError::BackendUnavailable(_))
+        ),
+        "a baseline peer's activation-probe decode failure is transiently unavailable and fails closed"
+    );
+    assert_eq!(
+        store.status().last_log_index,
+        Some(before),
+        "a failed unanimous V1 proof cannot append a certificate proposal"
+    );
+    cluster.restore_current_rpc_handler(leader, rejected_peer);
+}
+
+#[tokio::test]
+async fn state_voter_activation_treats_an_unavailable_exact_probe_as_transient() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let unavailable_peer = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[leader];
+    let before = store
+        .status()
+        .last_log_index
+        .expect("formed cluster has a durable log head");
+
+    // The leader still has the other voter for its typed B1, but activation
+    // requires every exact voter to answer the new command probe. A missing
+    // peer is a retryable inability to establish unanimity, not an explicit
+    // capability declaration.
+    cluster
+        .paths
+        .get(&(leader, unavailable_peer))
+        .expect("leader outbound peer path")
+        .set_enabled(false);
+    let result = store.activate_fenced_transition_capability().await;
+    assert!(matches!(result, Err(StoreError::BackendUnavailable(_))));
+    assert_eq!(
+        store.status().last_log_index,
+        Some(before),
+        "a transient probe failure cannot append an activation proposal"
+    );
+    cluster
+        .paths
+        .get(&(leader, unavailable_peer))
+        .expect("leader outbound peer path")
+        .set_enabled(true);
 }
 
 #[tokio::test]
@@ -5662,6 +5932,240 @@ async fn repeated_lost_forward_responses_retry_one_request_without_duplicate_eve
     }
 
     panic!("no follower path was exercised while response loss was armed");
+}
+
+#[tokio::test]
+async fn maximum_admitted_cas_from_follower_forwards_applies_and_replicates_once() {
+    // This boundary exercises the complete production 10-second operation
+    // budget (forwarding, quorum commit, and every voter apply). The fixture's
+    // 750ms default is intentional for ordinary negative tests, but is not an
+    // additional compatibility limit on an admitted 1MiB consensus value.
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
+    // The fixture's ordinary captured-payload evidence clones its payloads for
+    // later inspection. Disable only that optional test probe here so this
+    // maximum-CAS qualification observes the production ownership path rather
+    // than introducing a hidden full-ciphertext clone of its own.
+    cluster.set_capture_payloads(false);
+
+    let (leader, leader_id, _) = cluster.observed_leader();
+    let source = (0..MEMBER_COUNT)
+        .find(|index| *index != leader)
+        .expect("three-voter fixture has a nonleader");
+    assert_ne!(
+        cluster.stores[source].status().node_id,
+        leader_id,
+        "the maximum CAS must enter through a current follower"
+    );
+
+    let max_payload_bytes = cluster.stores[source].capabilities().await.max_value_bytes;
+    let key = session_key(b"maximum-follower-forwarded-cas");
+    let lease = cluster.stores[leader]
+        .acquire(
+            &key,
+            owner("maximum-follower-forwarded-owner"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("leader prepares lease for maximum follower CAS");
+    let exact_record =
+        sealed_record_with_exact_payload_len(key.clone(), 1, &lease, max_payload_bytes);
+    assert_eq!(
+        exact_record.payload.len(),
+        max_payload_bytes,
+        "the CAS carries the exact ciphertext capability after envelope framing"
+    );
+    let expected_payload_digest = payload_sha256(&exact_record);
+
+    // Synchronize every durable voter before sampling its scalar receipt and
+    // replication counts. `max_replication_sequence` owns the SDK's required
+    // logical-time barrier, so its log position is the no-race baseline.
+    let before_sequence = cluster.stores[leader]
+        .max_replication_sequence()
+        .await
+        .expect("read pre-CAS replication sequence");
+    let baseline_index = cluster.stores[leader]
+        .status()
+        .last_log_index
+        .expect("logical-time baseline is committed");
+    tokio::time::timeout(RECOVERY_TIMEOUT, async {
+        loop {
+            if cluster.stores.iter().all(|store| {
+                store
+                    .status()
+                    .applied_index
+                    .is_some_and(|index| index >= baseline_index)
+            }) {
+                return;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("all voters apply the pre-CAS baseline");
+    let before_artifacts = (0..MEMBER_COUNT)
+        .map(|index| {
+            durable_cas_artifact_counts(
+                &cluster
+                    ._directory
+                    .path()
+                    .join(format!("node-{index}.sqlite")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let forwards_before = cluster.forward_mutation_calls(source);
+    let forwarded_bytes_before = cluster.forward_mutation_max_payload_bytes(source);
+    let replicated_bytes_before = cluster.append_entries_max_payload_bytes(leader);
+
+    assert_eq!(
+        cluster.stores[source]
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: exact_record,
+            })
+            .await
+            .expect("maximum follower CAS returns the committed leader outcome"),
+        CompareAndSetResult::Success,
+    );
+    let committed_index = cluster.stores[leader]
+        .status()
+        .last_log_index
+        .expect("maximum CAS has a durable leader log index");
+    assert!(
+        committed_index > baseline_index,
+        "the maximum CAS is a new committed application command"
+    );
+    tokio::time::timeout(RECOVERY_TIMEOUT, async {
+        loop {
+            if cluster.stores.iter().all(|store| {
+                store
+                    .status()
+                    .applied_index
+                    .is_some_and(|index| index >= committed_index)
+            }) {
+                return;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("all three voters apply the maximum follower CAS");
+
+    assert_eq!(
+        cluster.forward_mutation_calls(source),
+        forwards_before + 1,
+        "the selected nonleader sends the maximum CAS exactly once to the observed leader"
+    );
+    let forwarded_bytes = cluster.forward_mutation_max_payload_bytes(source);
+    assert!(
+        forwarded_bytes > max_payload_bytes
+            && forwarded_bytes > forwarded_bytes_before
+            && forwarded_bytes <= SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+        "the borrowed ForwardMutation envelope carried the complete maximum ciphertext over RPC"
+    );
+    let replicated_bytes = cluster.append_entries_max_payload_bytes(leader);
+    assert!(
+        replicated_bytes > max_payload_bytes
+            && replicated_bytes > replicated_bytes_before
+            && replicated_bytes <= SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+        "the leader replicated the complete maximum CAS through real AppendEntries RPCs"
+    );
+
+    let after_artifacts = (0..MEMBER_COUNT)
+        .map(|index| {
+            durable_cas_artifact_counts(
+                &cluster
+                    ._directory
+                    .path()
+                    .join(format!("node-{index}.sqlite")),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (before, after) in before_artifacts.iter().zip(&after_artifacts) {
+        assert_eq!(
+            after.0,
+            before.0 + 1,
+            "each applied voter durably retains exactly one CAS outcome receipt"
+        );
+        assert_eq!(
+            after.1,
+            before.1 + 1,
+            "each applied voter durably retains exactly one CAS replication effect"
+        );
+    }
+    assert_eq!(
+        cluster.stores[leader]
+            .max_replication_sequence()
+            .await
+            .expect("read post-CAS replication sequence"),
+        before_sequence + 1,
+        "the maximum CAS has exactly one visible mutation effect"
+    );
+
+    // The one-byte-over case is rejected by follower-side admission before a
+    // ForwardMutation can be transmitted or a durable receipt/effect can be
+    // created.  Build a complete valid envelope first so this tests the actual
+    // capability boundary rather than malformed-ciphertext rejection.
+    let oversized_record =
+        sealed_record_with_exact_payload_len(key.clone(), 2, &lease, max_payload_bytes + 1);
+    let forwards_before_rejection = cluster.forward_mutation_calls(source);
+    let artifacts_before_rejection = (0..MEMBER_COUNT)
+        .map(|index| {
+            durable_cas_artifact_counts(
+                &cluster
+                    ._directory
+                    .path()
+                    .join(format!("node-{index}.sqlite")),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cluster.stores[source]
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: Some(Generation::new(1)),
+                new_record: oversized_record,
+            })
+            .await
+            .expect_err("one byte beyond the ciphertext capability must fail closed"),
+        StoreError::PayloadTooLarge {
+            actual: max_payload_bytes + 1,
+            max: max_payload_bytes,
+        }
+    );
+    assert_eq!(
+        cluster.forward_mutation_calls(source),
+        forwards_before_rejection,
+        "the oversized CAS cannot cross follower-to-leader forwarding"
+    );
+    assert_eq!(
+        (0..MEMBER_COUNT)
+            .map(|index| {
+                durable_cas_artifact_counts(
+                    &cluster
+                        ._directory
+                        .path()
+                        .join(format!("node-{index}.sqlite")),
+                )
+            })
+            .collect::<Vec<_>>(),
+        artifacts_before_rejection,
+        "the oversized CAS creates neither a receipt nor a replication effect"
+    );
+
+    for store in &cluster.stores {
+        let stored = store
+            .get(&key)
+            .await
+            .expect("linearizable read of maximum replicated record")
+            .expect("maximum CAS record is present on every voter");
+        assert_eq!(stored.payload.len(), max_payload_bytes);
+        assert_eq!(payload_sha256(&stored), expected_payload_digest);
+    }
 }
 
 #[tokio::test]
