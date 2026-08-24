@@ -58,7 +58,15 @@ const MEMBERSHIP_SCOPE_MEMBERS_MAX_BYTES: usize = 1_024;
 const MEMBERSHIP_SCOPE_BINDINGS_MAX_BYTES: usize = 32 * 1_024;
 const MEMBERSHIP_HISTORY_MAX_ENTRIES: usize = 4_096;
 const MEMBERSHIP_TRANSITION_ID_BYTES: usize = 16;
-const OUTCOME_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/outcome-payload/v1\0";
+// v2 covers consumer request commitments that include the SDK-minted
+// prepared-checkpoint protection/tenant scope context. Existing v1 outcome
+// IDs therefore fail closed on a binding/digest mismatch; there is no
+// permissive fallback for a protected prepared request.
+const OUTCOME_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-consensus/outcome-payload/v2\0";
+// Fenced-transition requests retain their independently published V1
+// canonical digest; the generic outcome namespace version does not migrate it.
+const FENCED_TRANSITION_PAYLOAD_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/outcome-payload/v1\0";
 const FENCED_TRANSITION_RECEIPT_BINDING_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-receipt-binding/v1\0";
 const FENCED_TRANSITION_RECEIPT_RESPONSE_DIGEST_DOMAIN: &[u8] =
@@ -1297,8 +1305,6 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) snapshot_receive_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
     pub(crate) watchers: Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ReplicationWatcher>>>,
-    pub(crate) consumer_watchers:
-        Arc<tokio::sync::Mutex<Vec<crate::replication_watch::ConsumerReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -1435,7 +1441,6 @@ impl SqliteConsensusCore {
             snapshot_receive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             applied_progress,
             watchers: Arc::clone(&backend.watchers),
-            consumer_watchers: Arc::clone(&backend.consumer_watchers),
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
             #[cfg(test)]
@@ -6018,6 +6023,22 @@ pub(crate) fn validate_command_for_log(
             "session consensus authorized intent nesting is invalid",
         ));
     }
+    match semantic_intent {
+        SessionMutationIntent::PreflightFencedTransitionCapability => {
+            return Err(invalid_data(
+                "session consensus activation preflight reached the log",
+            ));
+        }
+        SessionMutationIntent::ActivateFencedTransitionCapability { schema_version, .. }
+            if *schema_version != FENCED_TRANSITION_SCHEMA_V1
+                || !matches!(command.intent, SessionMutationIntent::Authorized { .. }) =>
+        {
+            return Err(invalid_data(
+                "session consensus activation certificate is invalid",
+            ));
+        }
+        _ => {}
+    }
     if let SessionMutationIntent::CompareAndSet(op) = semantic_intent {
         crate::ttl::validate_stored_record_expiry_at(&op.new_record, command.logical_time)
             .map_err(|_| invalid_data("session consensus record expiry is invalid"))?;
@@ -6227,6 +6248,33 @@ impl MembershipLogProjection {
             EntryPayload::Normal(command) => {
                 let request_id = *command.request_id.as_bytes();
                 let is_fenced_transition = fenced_transition_request(&command.intent).is_some();
+                let is_capability_activation = !is_fenced_transition
+                    && fenced_transition_activation(&command.intent).is_some();
+                if is_capability_activation {
+                    let access_is_authorized = fenced_transition_access_is_authorized_sync(
+                        &self.scope,
+                        storage_identity,
+                        &command.intent,
+                    )?;
+                    if access_is_authorized {
+                        let (scope_identity, voter_set_digest) =
+                            fenced_transition_activation(&command.intent)
+                                .expect("checked capability activation");
+                        if scope_identity != self.scope.current_identity
+                            || voter_set_digest
+                                != fenced_transition_voter_set_digest(
+                                    self.scope.current_identity,
+                                    &self.scope.current_members,
+                                )
+                        {
+                            return Err(invalid_data(
+                                "projected fenced transition activation scope is stale",
+                            ));
+                        }
+                        self.fenced_transition_scope_activated = true;
+                        self.fenced_receipt_ledger_has_commitments = true;
+                    }
+                }
                 if is_fenced_transition {
                     let access_is_authorized = fenced_transition_access_is_authorized_sync(
                         &self.scope,
@@ -6651,6 +6699,8 @@ impl MembershipLogProjection {
             | SessionMutationIntent::ReadConsumerRecord { .. }
             | SessionMutationIntent::FencedTransition(_)
             | SessionMutationIntent::ActivateFencedTransition { .. }
+            | SessionMutationIntent::PreflightFencedTransitionCapability
+            | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
             | SessionMutationIntent::CompareAndSet(_)
             | SessionMutationIntent::DeleteFenced(_)
             | SessionMutationIntent::RefreshTtl { .. }
@@ -6678,10 +6728,13 @@ fn replay_unapplied_log_prefix_sync(
         })
         .transpose()?
         .unwrap_or(0);
-    let target = last_log_sync(conn, storage_identity)?
-        .map(|log_id| {
-            log_id
-                .index
+    // This hot read needs only the target index.  Do not deserialize the
+    // largest persisted command here and then immediately deserialize it
+    // again in the range reader below: the latter remains the authoritative
+    // validation/apply decode.
+    let target = last_log_index_sync(conn, storage_identity)?
+        .map(|index| {
+            index
                 .checked_add(1)
                 .ok_or_else(|| invalid_data("session consensus log index exhausted"))
         })
@@ -6969,6 +7022,32 @@ pub(crate) fn last_log_sync(
         return Err(invalid_data("persisted session consensus log row mismatch"));
     }
     Ok(Some(entry.log_id))
+}
+
+/// Read only the tail index for a bounded range decision.  Unlike
+/// [`last_log_sync`], this deliberately does not hydrate an entry: the range
+/// consumer immediately below decodes and validates every entry it is going
+/// to use, while this probe otherwise makes an avoidable second maximum-size
+/// ciphertext allocation on every apply-log read.
+fn last_log_index_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<Option<u64>> {
+    let row = conn
+        .query_row(
+            "SELECT configuration_epoch, log_index FROM consensus_log ORDER BY log_index DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((epoch, index)) = row else {
+        return Ok(read_purged_sync(conn, identity)?.map(|log_id| log_id.index));
+    };
+    validate_epoch(epoch, identity)?;
+    checked_u64(index)
+        .map(Some)
+        .map_err(|_| invalid_data("persisted session consensus log index is invalid"))
 }
 
 pub(crate) fn read_log_range_sync(
@@ -7734,6 +7813,14 @@ fn authorized_mutation_payload_digest(
     authority_identity: SessionConsensusIdentity,
     mutation: &SessionMutationIntent,
 ) -> io::Result<[u8; 32]> {
+    authorized_payload_digest(storage_identity, authority_identity, mutation)
+}
+
+fn authorized_payload_digest<T: serde::Serialize>(
+    storage_identity: SessionConsensusIdentity,
+    authority_identity: SessionConsensusIdentity,
+    mutation: &T,
+) -> io::Result<[u8; 32]> {
     let encoded = encode_json(&(
         SESSION_CONSENSUS_SCHEMA_VERSION,
         storage_identity,
@@ -7744,6 +7831,95 @@ fn authorized_mutation_payload_digest(
     hasher.update(OUTCOME_DIGEST_DOMAIN);
     hasher.update(encoded);
     Ok(hasher.finalize().into())
+}
+
+/// Fixed, precomputed identifiers and commitments for one read-only prepared
+/// CAS receipt lookup. This crosses the async SQLite boundary without the
+/// sealed request body, so the blocking task never clones or reserializes it.
+#[derive(Clone, Copy)]
+pub(crate) struct ConsumerCompareAndSetReceiptLookup {
+    pub(crate) binding_request_id: SessionConsensusRequestId,
+    pub(crate) operation_request_id: SessionConsensusRequestId,
+    binding_digest: [u8; 32],
+    operation_digest: [u8; 32],
+}
+
+/// Read-only exact binding lookup used by the leader before proposing a
+/// consumer binding marker. It distinguishes an absent ID from a retained
+/// exact binding or a closed body/context conflict without copying an
+/// application payload.
+pub(crate) enum ConsumerRequestBindingLookup {
+    Missing,
+    Matched(Box<SessionConsensusResponse>),
+    Conflict,
+}
+
+pub(crate) fn read_consumer_request_binding_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    authority_identity: SessionConsensusIdentity,
+    binding_request_id: SessionConsensusRequestId,
+    request_commitment: [u8; 32],
+) -> Result<ConsumerRequestBindingLookup, StoreError> {
+    let binding_digest = authorized_mutation_payload_digest(
+        storage_identity,
+        authority_identity,
+        &SessionMutationIntent::BindConsumerRequest { request_commitment },
+    )
+    .map_err(|_| StoreError::BackendUnavailable("consumer binding lookup is unavailable".into()))?;
+    match read_outcome_sync(conn, storage_identity, binding_request_id).map_err(|_| {
+        StoreError::BackendUnavailable("consumer binding lookup is unavailable".into())
+    })? {
+        Some((digest, response))
+            if digest == binding_digest
+                && matches!(&response.result, Ok(SessionMutationOutcome::Unit)) =>
+        {
+            Ok(ConsumerRequestBindingLookup::Matched(Box::new(response)))
+        }
+        Some(_) => Ok(ConsumerRequestBindingLookup::Conflict),
+        None if request_id_has_fenced_transition_receipt_sync(
+            conn,
+            storage_identity,
+            binding_request_id,
+        )? =>
+        {
+            Ok(ConsumerRequestBindingLookup::Conflict)
+        }
+        None => Ok(ConsumerRequestBindingLookup::Missing),
+    }
+}
+
+#[derive(serde::Serialize)]
+enum BorrowedCompareAndSetIntent<'a> {
+    CompareAndSet(&'a crate::backend::CompareAndSet),
+}
+
+/// Compute the exact ledger keys and payload digests once while the
+/// authenticated service still borrows its canonical prepared CAS body.
+pub(crate) fn consumer_compare_and_set_receipt_lookup(
+    storage_identity: SessionConsensusIdentity,
+    authority_identity: SessionConsensusIdentity,
+    binding_request_id: SessionConsensusRequestId,
+    operation_request_id: SessionConsensusRequestId,
+    request_commitment: [u8; 32],
+    operation: &crate::backend::CompareAndSet,
+) -> io::Result<ConsumerCompareAndSetReceiptLookup> {
+    let binding_digest = authorized_mutation_payload_digest(
+        storage_identity,
+        authority_identity,
+        &SessionMutationIntent::BindConsumerRequest { request_commitment },
+    )?;
+    let operation_digest = authorized_payload_digest(
+        storage_identity,
+        authority_identity,
+        &BorrowedCompareAndSetIntent::CompareAndSet(operation),
+    )?;
+    Ok(ConsumerCompareAndSetReceiptLookup {
+        binding_request_id,
+        operation_request_id,
+        binding_digest,
+        operation_digest,
+    })
 }
 
 /// Return the sole fenced-transition request carried by an application
@@ -7771,12 +7947,26 @@ fn fenced_transition_activation(
             voter_set_digest,
             ..
         } => Some((*scope_identity, *voter_set_digest)),
+        SessionMutationIntent::ActivateFencedTransitionCapability {
+            schema_version,
+            scope_identity,
+            voter_set_digest,
+        } if *schema_version == FENCED_TRANSITION_SCHEMA_V1 => {
+            Some((*scope_identity, *voter_set_digest))
+        }
         SessionMutationIntent::Authorized { mutation, .. } => match mutation.as_ref() {
             SessionMutationIntent::ActivateFencedTransition {
                 scope_identity,
                 voter_set_digest,
                 ..
             } => Some((*scope_identity, *voter_set_digest)),
+            SessionMutationIntent::ActivateFencedTransitionCapability {
+                schema_version,
+                scope_identity,
+                voter_set_digest,
+            } if *schema_version == FENCED_TRANSITION_SCHEMA_V1 => {
+                Some((*scope_identity, *voter_set_digest))
+            }
             _ => None,
         },
         _ => None,
@@ -7794,7 +7984,7 @@ fn fenced_transition_payload_digest(
     let intent = SessionMutationIntent::FencedTransition(Box::new(request.clone()));
     let encoded = encode_json(&(FENCED_TRANSITION_SCHEMA_V1, storage_identity, intent))?;
     let mut hasher = Sha256::new();
-    hasher.update(OUTCOME_DIGEST_DOMAIN);
+    hasher.update(FENCED_TRANSITION_PAYLOAD_DIGEST_DOMAIN);
     hasher.update(encoded);
     Ok(hasher.finalize().into())
 }
@@ -8677,6 +8867,92 @@ pub(crate) fn read_consumer_lease_mutation_status_sync(
     )))
 }
 
+/// Read the exact binding and compare-and-set outcomes for one prepared
+/// consumer request without applying a consensus command or reading the
+/// current session row.
+pub(crate) fn read_consumer_compare_and_set_status_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    lookup: ConsumerCompareAndSetReceiptLookup,
+) -> Result<crate::consumer::SessionConsumerCompareAndSetStatus, StoreError> {
+    use crate::consumer::{
+        SessionConsumerCompareAndSetReceiptOutcome, SessionConsumerCompareAndSetStatus,
+        SessionConsumerStoreError,
+    };
+
+    let binding =
+        read_outcome_sync(conn, storage_identity, lookup.binding_request_id).map_err(|_| {
+            StoreError::BackendUnavailable("consumer compare-and-set status is unavailable".into())
+        })?;
+    let binding_matches = match binding {
+        Some((digest, response)) if digest == lookup.binding_digest => {
+            matches!(response.result, Ok(SessionMutationOutcome::Unit))
+        }
+        Some(_) => return Ok(SessionConsumerCompareAndSetStatus::RequestConflict),
+        None => false,
+    };
+    if !binding_matches {
+        if request_id_has_fenced_transition_receipt_sync(
+            conn,
+            storage_identity,
+            lookup.binding_request_id,
+        )? || request_id_is_occupied_sync(conn, storage_identity, lookup.operation_request_id)?
+        {
+            return Ok(SessionConsumerCompareAndSetStatus::RequestConflict);
+        }
+        return Ok(SessionConsumerCompareAndSetStatus::NotFound);
+    }
+
+    let Some((digest, response)) =
+        read_outcome_sync(conn, storage_identity, lookup.operation_request_id).map_err(|_| {
+            StoreError::BackendUnavailable("consumer compare-and-set status is unavailable".into())
+        })?
+    else {
+        if request_id_has_fenced_transition_receipt_sync(
+            conn,
+            storage_identity,
+            lookup.operation_request_id,
+        )? {
+            return Ok(SessionConsumerCompareAndSetStatus::RequestConflict);
+        }
+        return Ok(SessionConsumerCompareAndSetStatus::NotFound);
+    };
+    if digest != lookup.operation_digest {
+        return Ok(SessionConsumerCompareAndSetStatus::RequestConflict);
+    }
+    let recorded = match response.result {
+        Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Success)) => {
+            SessionConsumerCompareAndSetReceiptOutcome::Applied
+        }
+        Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict { .. })) => {
+            SessionConsumerCompareAndSetReceiptOutcome::Conflict
+        }
+        Err(error) => SessionConsumerCompareAndSetReceiptOutcome::Rejected(
+            SessionConsumerStoreError::from(error),
+        ),
+        Ok(_) => {
+            return Err(StoreError::BackendUnavailable(
+                "consumer compare-and-set status is unavailable".into(),
+            ));
+        }
+    };
+    Ok(SessionConsumerCompareAndSetStatus::Recorded(recorded))
+}
+
+fn request_id_has_fenced_transition_receipt_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request_id: SessionConsensusRequestId,
+) -> Result<bool, StoreError> {
+    read_fenced_transition_receipt_sync(conn, identity, request_id)
+        .map(|receipt| receipt.is_some())
+        .map_err(|_| {
+            StoreError::BackendUnavailable(
+                "consumer compare-and-set receipt status is unavailable".into(),
+            )
+        })
+}
+
 fn request_id_is_occupied_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -9487,7 +9763,8 @@ fn execute_application_intent_sync(
 ) -> Result<(SessionMutationOutcome, Option<ReplicationOp>), StoreError> {
     match intent {
         SessionMutationIntent::AdvanceLogicalTime
-        | SessionMutationIntent::BindConsumerRequest { .. } => {
+        | SessionMutationIntent::BindConsumerRequest { .. }
+        | SessionMutationIntent::ActivateFencedTransitionCapability { .. } => {
             Ok((SessionMutationOutcome::Unit, None))
         }
         SessionMutationIntent::ReadConsumerRecord { key } => {
@@ -9512,7 +9789,7 @@ fn execute_application_intent_sync(
                     "session consensus requires a sealed record payload".into(),
                 ));
             }
-            let result = ops::compare_and_set_sync(conn, op.as_ref().clone(), caps, logical_time)?;
+            let result = ops::compare_and_set_sync(conn, op, caps, logical_time)?;
             let replication = matches!(result, CompareAndSetResult::Success).then(|| {
                 ReplicationOp::CompareAndSet {
                     key: op.key.clone(),
@@ -9621,6 +9898,7 @@ fn execute_application_intent_sync(
         | SessionMutationIntent::FenceTopologyAuthority { .. }
         | SessionMutationIntent::AbortTopologyTransition { .. }
         | SessionMutationIntent::FinalizeTopologyTransition { .. }
+        | SessionMutationIntent::PreflightFencedTransitionCapability
         | SessionMutationIntent::Authorized { .. } => Err(StoreError::BackendUnavailable(
             "session consensus internal intent reached application executor".into(),
         )),
@@ -9679,6 +9957,7 @@ fn fenced_transition_access_is_authorized_sync(
             mutation.as_ref(),
             SessionMutationIntent::FencedTransition(_)
                 | SessionMutationIntent::ActivateFencedTransition { .. }
+                | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
         ) =>
         {
             Ok(application_authority_matches(
@@ -9691,6 +9970,9 @@ fn fenced_transition_access_is_authorized_sync(
         | SessionMutationIntent::ActivateFencedTransition { .. } => {
             Ok(untouched_initial_membership_scope(scope, storage_identity))
         }
+        SessionMutationIntent::ActivateFencedTransitionCapability { .. } => Err(invalid_data(
+            "fenced transition activation lacks an authority envelope",
+        )),
         _ => Err(invalid_data(
             "fenced transition authority envelope is invalid",
         )),
@@ -10004,6 +10286,41 @@ pub(crate) fn apply_entries_with_authority_sync(
             EntryPayload::Normal(command) => {
                 let digest = payload_digest(identity, &command)?;
                 let is_fenced_transition = fenced_transition_request(&command.intent).is_some();
+                let is_capability_activation = !is_fenced_transition
+                    && fenced_transition_activation(&command.intent).is_some();
+                if is_capability_activation {
+                    let access_is_authorized = fenced_transition_access_is_authorized_sync(
+                        &scope,
+                        identity,
+                        &command.intent,
+                    )?;
+                    if access_is_authorized {
+                        let (scope_identity, voter_set_digest) =
+                            fenced_transition_activation(&command.intent)
+                                .expect("checked capability activation");
+                        if scope_identity != scope.current_identity
+                            || voter_set_digest
+                                != fenced_transition_voter_set_digest(
+                                    scope.current_identity,
+                                    &scope.current_members,
+                                )
+                        {
+                            return Err(invalid_data(
+                                "fenced transition activation scope is stale",
+                            ));
+                        }
+                        // This is a cluster-scope certificate only. It has no
+                        // tenant/session body and publishes no replication
+                        // effect; the generic authenticated command below
+                        // durably records its idempotent outcome.
+                        activate_fenced_transition_scope_sync(
+                            &tx,
+                            identity,
+                            scope.current_identity,
+                            &scope.current_members,
+                        )?;
+                    }
+                }
                 if is_fenced_transition {
                     let access_is_authorized = fenced_transition_access_is_authorized_sync(
                         &scope,
@@ -19252,7 +19569,7 @@ BEGIN IMMEDIATE;
                 identity: identity(),
                 request_id: SessionConsensusRequestId::from_bytes(request_id),
                 logical_time: timestamp(u8::try_from(index).expect("test index")),
-                intent: SessionMutationIntent::CompareAndSet(Box::new(crate::CompareAndSet {
+                intent: SessionMutationIntent::CompareAndSet(Arc::new(crate::CompareAndSet {
                     key,
                     lease,
                     expected_generation,
@@ -19607,7 +19924,7 @@ BEGIN IMMEDIATE;
             identity: identity(),
             request_id: SessionConsensusRequestId::from_bytes([0x44; 16]),
             logical_time,
-            intent: SessionMutationIntent::CompareAndSet(Box::new(crate::CompareAndSet {
+            intent: SessionMutationIntent::CompareAndSet(Arc::new(crate::CompareAndSet {
                 key: key.clone(),
                 lease,
                 expected_generation: None,

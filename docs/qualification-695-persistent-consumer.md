@@ -13,11 +13,12 @@ source-compatible production/compatibility fresh-authentication typed
 least-authority surface required by #649, #688, and #691; it is neither hidden,
 deprecated, nor test-only.
 
-A stateless clone lineage shares fail-fast physical-admission caps of 16 request
-connections and 16 watch connections. Permits are acquired before resolve/TCP
-and held for the physical connection lifetime, including by persistent clients
-derived from the same lineage. Independent stateless constructors define
-independent logical clients, as independent persistent constructors do.
+A stateless clone lineage shares a fail-fast physical-admission cap of 16
+request connections. The retained 16 Watch transport permits are deliberately
+unavailable to typed tenant/NF consumer calls: `open_watch` rejects locally
+with stable `Unsupported` before resolution, TCP, TLS, or cursor exposure.
+Independent stateless constructors define independent logical clients, as
+independent persistent constructors do.
 
 ## Current-main successor audit (2026-08-22)
 
@@ -54,7 +55,7 @@ while adding five generic guarantees:
 - explicit prewarm rolls every configured lane through a fresh
   resolver/TCP/TLS/Hello exchange and preserves refreshed plus unprocessed
   healthy lanes after a partial failure;
-- all cold request, watch, and prewarm setups in one pool share one serialized
+- all cold request and prewarm setups in one pool share one serialized
   recovery lane and one coalesced exponential backoff deadline for failed setup
   or proven cached-lane loss;
 - a newer credential/material epoch cancels the stale serialized
@@ -70,7 +71,7 @@ while adding five generic guarantees:
   lower write, while adapter-only plaintext buffering over zero lower writes
   remains exactly `NotTransmitted`.
 
-The tracked v8 exact-head evidence schema now binds transport revision 5. It
+The tracked v8 exact-head evidence schema now binds transport revision 6. It
 continues to require `experimental=true` and
 `qualification_complete=false`; it is a structural wire-binding schema, not a
 production qualification certificate. No new latency samples were collected
@@ -97,11 +98,16 @@ cargo test -p opc-session-testkit --all-features --test qualification_profile
 The focused transport fixtures bind one serialized recovery probe across 12
 callers, coalesced bounded backoff, zero-time stale-epoch setup cancellation,
 rolling fresh prewarm, production mTLS/SPIFFE/ALPN/Hello admission, exact
-composite correlation, below-TLS write classification, watch/request
-cancellation, and fixed request/watch/physical-admission bounds. They are
+composite correlation, below-TLS write classification, request cancellation,
+and fixed request/physical-admission bounds. They are
 correctness evidence;
 they do not replace the still-required production three-voter network latency
 qualification.
+
+The historical protocol count above predates the #719 global-cursor
+contraction. It is not current Watch evidence: those wire fixtures are
+quarantined until an identity-and-scope-bound cursor exists, and the exact
+current Watch commands and assertions are listed below.
 
 Paused-clock lifecycle regressions additionally require a cached lane to remain
 reusable before its stable directed authenticated-edge material deadline and to
@@ -119,8 +125,8 @@ The measurement was recorded at `2026-08-17T04:58:12Z` on Fedora Linux 44,
 Linux 7.1.8 x86-64, an AMD EPYC 9335 host with 128 online logical CPUs, Rust
 1.97.1, and Cargo 1.97.1. The shared host was not isolated or CPU-pinned. The
 test used an unoptimized Cargo test build, an in-process loopback TLS server and
-counting TCP proxy, a fixed three-lane request pool, and one isolated watch
-slot. It prewarmed all three authenticated lanes, then timed 16 sequential
+counting TCP proxy and a fixed three-lane request pool. It prewarmed all three
+authenticated lanes, then timed 16 sequential
 typed `capabilities` calls with `Instant` at the caller. Connection setup and
 prewarm time are intentionally excluded from the per-call samples.
 
@@ -182,23 +188,25 @@ Exact correlation matching was restored, after which the command passed and
 the poisoned lane was replaced with correlation 1 on a new authenticated
 connection.
 
-### Persistent-watch continuity fix coverage
+### Persistent-watch transport coverage
 
-The retained `persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoint_loss`
-fixture holds the first watch stream until its resolver has been switched to a
-replacement endpoint, then proves delivery of sequence 1 followed by exactly
-sequence 2 through a fresh resolver/TLS/Hello path. Its companion
-`persistent_watch_reconnects_after_authenticated_rotation` proves the same
-1-to-2 boundary after client reauthentication retires an otherwise healthy
-watch connection. Removing the persistent reader's reconnect path makes either
-fixture terminate after sequence 1; accepting a duplicate, gap, wrong
-correlation, unknown frame, or partial frame is intentionally not a recovery
-path and remains fail-closed. The focused restored command is:
+The old reconnect fixtures are not production consumer-watch qualification and
+must not be invoked as green Watch evidence: the current consumer API rejects
+`open_watch` with typed `Unsupported`, because its only cursor is global and
+filtering it would reveal foreign tenant/NF activity through sequence movement
+and timing. The evidence-producing contract commands are:
 
 ```text
-opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_transport persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoint_loss -- --exact --test-threads=1
-opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_transport persistent_watch_reconnects_after_authenticated_rotation -- --exact --test-threads=1
+cargo test --locked -p opc-session-net --all-features --test persistent_consumer_transport typed_consumer_watch_is_rejected_before_resolution_or_global_cursor_exposure -- --exact
+cargo test --locked -p opc-session-store --all-features --lib consumer::tests::authorization_requires_exact_scope_and_denies_global_watch -- --exact
+cargo test --locked -p opc-session-store --all-features --test fixed_quorum_authority fixed_scoped_consumer_watch_is_rejected_before_stream_admission -- --exact
 ```
+
+The first asserts both typed rejection forms plus zero resolver, TCP, TLS,
+Hello, service, and Watch admission activity. The latter two assert exact grant
+scope and the fail-closed service-side rejection, including cross-tenant and
+cross-scope attempts. A future production Watch requires an
+identity-and-scope-bound cursor protocol and fresh reconnect evidence.
 
 ### Admission, cursor, and idle-replacement regressions
 
@@ -213,14 +221,9 @@ queues one caller, starts repeated late callers, releases the held lane, and
 requires the already queued request to dispatch first.  Replacing the queued
 acquisition with a `try_acquire` path makes that assertion fail.
 
-The public watch cursor is inclusive and 1-based.  The consumer normalizes a
-zero cursor once, before its first wire request, to sequence 1; every reconnect
-then starts at the exact next undelivered sequence.  The test fixture no longer
-rewrites its emitted sequence to a caller-provided zero value, and retained
-`persistent_watch_zero_cursor_normalizes_to_the_first_committed_sequence`
-requires `open_watch(0)` to yield sequence 1.  Removing that boundary
-normalization makes the reader fail closed on a sequence gap rather than
-silently accepting a synthetic sequence zero.
+The retained cursor normalization and reconnect fixtures are protocol harness
+coverage only. No production tenant/NF-scoped consumer may open that global
+cursor until a scope-bound cursor contract exists.
 
 `expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call` uses a
 normal bounded server idle lifetime and waits for the client's own idle reaper

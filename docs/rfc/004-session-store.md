@@ -1612,17 +1612,18 @@ umbrella until that fleet evidence passes.
 `StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
 `SessionQuorumConsumerServer` provide the typed least-authority
 application-consumer boundary. They MUST use mutual TLS and the dedicated
-`opc-session-consumer/1` ALPN with transport revision 5. This is a separate
+`opc-session-consumer/1` ALPN with transport revision 6. This is a separate
 exact protocol from both `opc-session-consensus/2` and the quarantined
 `opc-session-net/5` compatibility protocol. A listener MUST NOT offer a
 fallback, negotiate a common revision, or multiplex either other protocol as
-equivalent consumer authority. Revision 5 does not interoperate with revisions
-1, 2, 3, or 4.
+equivalent consumer authority. Revision 6 does not interoperate with revisions
+1, 2, 3, 4, or 5.
 Because this SDK is unreleased, deployments MUST drain consumer clients and
-listeners, then make one coordinated revision-5 cutover; fallback, dual-mode,
-and mixed-revision consumer operation are unsupported. Revision-5 private JSON
-DTO bytes are canonical; reordered or otherwise noncanonical encodings,
-aliases, omissions, and unknown fields MUST fail closed.
+listeners, then make one coordinated revision-6 cutover; fallback, dual-mode,
+and mixed-revision consumer operation are unsupported. Revision-6 private JSON
+DTO bytes, including the complete sequence-plus-nonce correlation envelope, are
+canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
+and unknown fields MUST fail closed.
 
 `StatelessSessionConsumerClient` remains a public, source-compatible
 production/compatibility fresh-authentication typed least-authority surface
@@ -1704,38 +1705,37 @@ structural: it isolates cancellation and pre-staged/late responses and removes
 write-position ambiguity. The client uses a
 fixed, fair pool of four request connections by default (at most 16 when
 configured), with 64 pending calls by default and a hard maximum of 256. A
-pending call may wait or age for at most 250 ms. Watches use two separate slots
-by default (at most 16 when configured), never consuming request-pool capacity.
+pending call may wait or age for at most 250 ms. The retained Watch transport
+uses two reserved slots by default (at most 16 when configured), but typed
+tenant/NF consumer Watch does not acquire them while its cursor is global.
 
-Stateless-client clones share fail-fast physical-admission caps of 16 request
-connections and 16 watch connections per clone lineage. The respective permit
-MUST be acquired before resolve/TCP and held for the complete physical
-connection lifetime, including by a persistent client derived from that
-stateless lineage. Independently constructed stateless clients define
-independent logical clients, as independently constructed persistent clients do.
-The typed persistent watch surface MUST preserve exhaustion of either bound as
-`Overloaded` and record that bounded outcome; it MUST NOT relabel intentional
-load shedding as endpoint unavailability.
+Stateless-client clones share a fail-fast physical-admission cap of 16 request
+connections per clone lineage. Sixteen reserved Watch transport permits remain
+for a future reviewed protocol, but typed consumer Watch rejects before permit
+acquisition, resolve/TCP, TLS, or a request frame. Independently constructed
+stateless clients define independent logical clients, as independently
+constructed persistent clients do.
+The typed consumer Watch is currently unsupported for production tenant/NF
+grants: its only available cursor is global, and filtering it would leak
+foreign activity through timing and cursor movement. The public Watch methods
+therefore return a stable typed unsupported rejection before a stream is
+admitted. A future Watch MUST define an identity-and-scope-bound cursor before
+it can use the retained watch-slot/reconnect machinery.
 
 The hard listener limit is 256 live connections and its retained
-connection-task set is bounded by that limit; each watch owns one delivery
-task. Consumer frames are at most 16 MiB and a configured listener frame limit
-cannot be lower than the 8 MiB batch-response limit plus 4 KiB framing
-allowance. The bootstrap and active-frame idle bound remains 5 seconds and one
-complete request/response operation remains bounded to 10 seconds. A watch has
-a 64-item, 512 KiB transport queue, rechecks cancellation at least every 50
-ms, and is also bounded by the 256 KiB store-side projection buffer. The fixed
-request identity is 16 bytes; consumer identity input is capped at 253 UTF-8
-bytes; one batch has at most 256 operations and retains at most 8 MiB of
-serialized response data.
+connection-task set is bounded by that limit. Consumer frames are at most 16
+MiB and a configured listener frame limit cannot be lower than the 8 MiB
+batch-response limit plus 4 KiB framing allowance. The bootstrap and
+active-frame idle bound remains 5 seconds and one complete request/response
+operation remains bounded to 10 seconds. The fixed request identity is 16
+bytes; consumer identity input is capped at 253 UTF-8 bytes; one batch has at
+most 256 operations and retains at most 8 MiB of serialized response data.
 
 The complete operation timeout MUST validate strictly greater than zero and no
 greater than 10 seconds. The configured idle timeout is at most 5 seconds and
-caps every active partial frame on all client bootstrap, unary, and watch reads;
-partial bytes do not reset that bound. A healthy watch with no bytes in flight
-may remain quiet. Retirement of a saturated, canceled, or rotated watch MUST
-NOT block while holding its watch lease. Each discarded checked-out request lane
-MUST have exactly one reconnect/replacement accounting outcome. Under concurrent
+caps every active partial frame on all client bootstrap and unary reads; partial
+bytes do not reset that bound. Each discarded checked-out request lane MUST have
+exactly one reconnect/replacement accounting outcome. Under concurrent
 shutdown callers, phase progression is monotonic from running to draining to
 forced and MUST NOT regress.
 
@@ -1745,16 +1745,16 @@ is at most 30 seconds, and material-rotation jitter is at most 30 seconds. A
 consumer shutdown drains for at most 5 seconds. An establishment attempt has a
 1,500 ms setup limit and a call makes at most two pre-write establishment
 attempts. Resolution occurs only for establishment or re-establishment, never
-for a reused connection. Every cold request, watch, and rolling-prewarm setup
-MUST enter one pool-wide recovery lane after bounded physical admission. One
+for a reused connection. Every cold request and rolling-prewarm setup MUST enter
+one pool-wide recovery lane after bounded physical admission. One
 failed setup or proven cached-lane loss publishes the shared exponential
 lifecycle backoff floor (50 ms by default) plus at most 25 ms jitter, clipped to
 each logical deadline;
 concurrent waiters MUST NOT start independent resolver/TCP/TLS/Hello attempts.
 Reauthentication, material
 changes, certificate expiry, idle retirement, cancellation, malformed frames,
-EOF, or an uncertain stream position terminate the connection/watch and release
-its transport task slot; they do not create another request on that connection.
+EOF, or an uncertain stream position terminate the connection and release its
+transport task slot; they do not create another request on that connection.
 "Material changes" here means an accepted material-epoch change. It MUST
 schedule each already-admitted lane at a stable directed authenticated-edge
 deadline no later than the configured rotation-jitter maximum; admitted work
@@ -1766,8 +1766,8 @@ jitter exception. TLS MUST expose only the single fixed-domain, fixed-range
 consumer jitter duration needed by session-net. It MUST NOT expose a comparable
 edge-key object, caller-selected digest range, identity, or digest bytes to
 callers or session-net diagnostics. A rejected publication
-that retains the admitted epoch MUST NOT interrupt an active frame or healthy
-watch. Each logical request pool MUST use exactly one maintenance task to
+that retains the admitted epoch MUST NOT interrupt an active frame. Each
+logical request pool MUST use exactly one maintenance task to
 remove cached lanes autonomously at the earliest idle/lifecycle deadline.
 Maintenance task/table cardinality MUST NOT scale with lanes, subscribers, or
 records.
@@ -1817,7 +1817,8 @@ every configured request lane and preserve refreshed plus unprocessed healthy
 capacity after a partial failure. Prewarm and readiness may prove authenticated
 consumer transport capacity only;
 they never prove quorum or product readiness. Readiness deliberately becomes
-false while a request lane is leased; isolated watch slots are non-gating.
+false while a request lane is leased; reserved Watch transport slots are
+non-gating.
 Diagnostics are fixed and
 nonidentifying: setup phase, pool wait, active/maximum/idle counts,
 reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They

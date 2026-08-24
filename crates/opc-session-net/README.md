@@ -246,10 +246,11 @@ and compatibility fresh-authentication typed least-authority surface required by
 `PersistentSessionConsumerClient` with `SessionQuorumConsumerServer` is the
 required warm fixed-pool primitive for #695/ePDG latency. Production deployments
 that require warm reuse should use it. Both use mutual TLS with the unchanged
-`opc-session-consumer/1` ALPN and exact consumer transport revision 5. Earlier
+`opc-session-consumer/1` ALPN and exact consumer transport revision 6. Earlier
 revisions will not fall back or interoperate. The unreleased SDK requires one
-coordinated, drained client/listener cutover; there is no dual mode. Revision-4
-features remain present, while revision-5 private JSON DTO bytes are canonical;
+coordinated, drained client/listener cutover; there is no dual mode. Revision-5
+features remain present, while revision-6 private JSON DTO bytes, including the
+complete sequence-plus-nonce correlation envelope, are canonical;
 reordered or otherwise noncanonical encodings, aliases, omissions, and unknown
 fields fail closed. This does not add `RemoteSessionBackend` or any
 consensus/replication/snapshot/rebuild/membership/admin authority, and it
@@ -281,14 +282,15 @@ in-flight call: no multiplexing is permitted, because cancellation,
 pre-staged/late-response isolation, and write-position ambiguity are structural.
 The fair request pool defaults to four connections, allows at most
 16 configured connections, and bounds pending calls to 64 by default and 256
-absolutely; queue wait/age is at most 250 ms. Watches have two separate slots
-by default and at most 16 configured slots, so they cannot consume request
-capacity.
+absolutely; queue wait/age is at most 250 ms. The retained Watch transport has
+two reserved slots by default and at most 16 configured slots, but the public
+tenant/NF consumer Watch does not acquire them while its global cursor remains
+unsupported.
 
 An establishment has a 1,500 ms setup limit and a call makes at most two
 pre-write attempts. Resolution occurs only when establishing or
-re-establishing a connection. Every cold request/watch/prewarm setup for one
-pool enters one physical-setup lane after bounded physical admission. A failed
+re-establishing a connection. Every cold request/prewarm setup for one pool
+enters one physical-setup lane after bounded physical admission. A failed
 setup failure or proven cached-lane loss publishes one shared exponential
 backoff deadline plus bounded jitter;
 waiting callers do not create per-caller resolver/TCP/TLS/Hello storms. With
@@ -309,36 +311,21 @@ enter diagnostics. A rejected same-epoch material publication retains the
 authenticated lane.
 
 One stateless client lineage shares fail-fast physical-admission caps of 16
-request connections and 16 watch connections across its clones. The permits are
-acquired before resolve/TCP and remain held for the physical connection
-lifetime, including for persistent clients derived from that lineage.
-Independent stateless constructors create independent logical clients, as
-independent persistent constructors do. The typed persistent watch surface
-preserves physical-cap exhaustion as fail-fast `Overloaded` and records the
-bounded overload outcome; it does not relabel intentional load shedding as
-endpoint unavailability.
-
-A persistent watch keeps one isolated watch lease and one reader task across
-its bounded reconnect sequence. On authenticated retirement or a clean peer
-transport loss it closes the old socket, resolves again, completes a fresh
-mutual-TLS/Hello handshake, and resumes from the successor of the last item
-accepted by its bounded caller-visible queue. A disconnect before that
-boundary reuses the prior cursor. Duplicate, gap, mismatched-correlation,
-unknown-frame, malformed, partial-frame, and permanent store outcomes are
-ambiguous or invalid and therefore terminate fail-closed rather than replaying
-the cursor. Reconnect attempts use the configured finite setup-attempt and
-jitter bounds; shutdown, a closed caller stream, or exhausted recovery returns
-the fixed redaction-safe unavailable outcome. A decoded item blocked on the
-fixed local byte/item queue is also terminal: it has not crossed delivery and
-must release the isolated lease rather than reconnect behind a slow consumer.
+request connections and 16 reserved Watch transport connections across its
+clones. The Watch permits are retained for a future reviewed protocol; typed
+consumer Watch rejects locally before acquiring one, resolving, or connecting.
+The typed persistent Watch is currently unavailable to production tenant/NF-
+scoped consumers: `open_watch` returns the stable typed `Unsupported` rejection
+before it can expose the global replication cursor. Filtering that cursor would
+still disclose foreign-tenant mutation timing and sequence movement. A future
+production Watch requires an identity-and-scope-bound cursor; the retained
+reconnect machinery is not a supported subscription claim.
 
 The configured complete operation timeout is validated strictly greater than
 zero and no greater than 10 seconds. The configured idle timeout is at most 5
-seconds and caps every active partial frame on client bootstrap, unary, and
-watch reads; it is not reset by received partial bytes. A healthy watch with no
-bytes in flight may remain quiet. Retirement of a saturated, canceled, or
-rotated watch never waits while holding its watch lease. Every discarded
-checked-out request lane has exactly one reconnect/replacement accounting
+seconds and caps every active partial frame on client bootstrap and unary reads;
+it is not reset by received partial bytes. Every discarded checked-out request
+lane has exactly one reconnect/replacement accounting
 outcome. Shutdown phase is monotonic under concurrent callers: it can move
 from running to draining to forced, never backwards.
 
@@ -357,7 +344,8 @@ fixed and nonidentifying: setup phase, pool wait, active/maximum/idle counts,
 reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They
 never contain endpoints, identities, scopes, credentials, keys, payloads,
 request/correlation IDs, owners, or fences. Readiness deliberately becomes
-false while a request lane is leased; isolated watch slots are non-gating.
+false while a request lane is leased; reserved Watch transport slots are
+non-gating.
 Performance evidence is synthetic only and is not an ePDG production-SLO
 claim. Synthetic warm evidence gates only the structural accept/reuse method;
 its elapsed samples are explicitly non-gating. The exact method and bounded raw
