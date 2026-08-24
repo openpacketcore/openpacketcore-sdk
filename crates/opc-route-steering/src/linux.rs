@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::net::IpAddr;
 use std::num::NonZeroU16;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,6 +61,7 @@ const MAX_RECEIVE_BUFFER_LEN: usize = 1024 * 1024;
 const MAX_OWNED_COLLECTION_DUMP_DATAGRAMS: u32 = 65_535;
 const MAX_OWNED_COLLECTION_DUMP_MESSAGES: usize = 131_072;
 const MAX_OWNED_COLLECTION_DUMP_BYTES: usize = 64 * 1024 * 1024;
+const MAX_OWNED_RECONCILE_STEP_UNITS: usize = 16;
 const MAX_KERNEL_RELEASE_LEN: usize = 256;
 
 /// Nonzero rtnetlink origin protocol reserved for one OpenPacketCore
@@ -72,6 +73,31 @@ const MAX_KERNEL_RELEASE_LEN: usize = 256;
 /// one coordinated owner of this protocol value; separate backend instances
 /// and external writers require orchestration-level serialization.
 pub const LINUX_ROUTE_STEERING_PROTOCOL: u8 = 242;
+
+/// Opaque, backend-bound state for resumable owned reconciliation.
+pub struct OwnedRouteRuleReconcilePlan {
+    state: Arc<Mutex<OwnedRouteRuleReconcilePlanState>>,
+}
+
+impl fmt::Debug for OwnedRouteRuleReconcilePlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedRouteRuleReconcilePlan")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Verified boundary returned by a bounded reconciliation step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedRouteRuleReconcileStep {
+    /// A single cursor or mutation unit completed and the backend lock was
+    /// released. No mutation is in flight; callers may yield local permits
+    /// before resuming this opaque plan.
+    Yielded,
+    /// A bounded mutation group was read back completely and more work remains.
+    Pending(OwnedRouteRuleReconcilePhase),
+    /// A fresh final exact snapshot matched desired state.
+    Complete(OwnedRouteRuleReconcileOutcome),
+}
 
 const RULE_PROTOCOL_CAPABILITY_UNCONFIRMED: u8 = 0;
 const RULE_PROTOCOL_CAPABILITY_CONFIRMED: u8 = 1;
@@ -242,14 +268,73 @@ pub struct LinuxRouteSteeringBackend {
     inner: Arc<LinuxRouteSteeringBackendInner>,
 }
 
+/// A short-lived signal that an exact route/rule operation is waiting.
+///
+/// Retain this before waiting on an orchestration-local publication gate, then
+/// drop it after the exact operation has completed or been abandoned. While
+/// at least one intent is retained, a stepped owned reconciliation parks at
+/// its next quiescent cursor/mutation boundary instead of beginning another
+/// bounded unit. This is a scheduling signal only: it neither acquires the
+/// backend operation lock nor grants permission to mutate routes or rules.
+#[must_use = "retain the intent while waiting for the exact operation to reach the backend"]
+pub struct LinuxRouteSteeringUrgentIntent(Arc<LinuxRouteSteeringBackendInner>);
+
+impl fmt::Debug for LinuxRouteSteeringUrgentIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinuxRouteSteeringUrgentIntent")
+            .finish_non_exhaustive()
+    }
+}
+
 struct LinuxRouteSteeringBackendInner {
     transport: Arc<dyn LinuxRouteTransport>,
     next_sequence: AtomicU32,
+    owned_generation: AtomicU64,
+    urgent_waiters: AtomicU64,
+    urgent_notify: tokio::sync::Notify,
     operation_lock: Mutex<()>,
     config: LinuxRouteSteeringBackendConfig,
     readback_limits: LinuxRouteReadbackLimits,
     owned_collection_limits: LinuxOwnedRouteRuleCollectionLimits,
     rule_protocol_capability: AtomicU8,
+}
+
+struct OwnedRouteRuleReconcilePlanState {
+    desired: OwnedRouteRuleSet,
+    backend: Arc<LinuxRouteSteeringBackendInner>,
+    generation: u64,
+    snapshot: Option<OwnedCollectionCursor>,
+    ready_snapshot: Option<LinuxOwnedCollectionState>,
+    retained_routes: usize,
+    retained_rules: usize,
+    installed_routes: usize,
+    installed_rules: usize,
+    removed_routes: usize,
+    removed_rules: usize,
+    awaiting_verification: Option<OwnedRouteRuleReconcilePhase>,
+    verification: Option<OwnedStepVerification>,
+}
+
+enum OwnedStepVerification {
+    PresentRoute(RouteRequest),
+    PresentRule(RuleRequest),
+    AbsentRoute(RouteRequest),
+    AbsentRule(RuleRequest),
+}
+
+impl Drop for LinuxRouteSteeringUrgentIntent {
+    fn drop(&mut self) {
+        self.0.urgent_waiters.fetch_sub(1, Ordering::AcqRel);
+        self.0.urgent_notify.notify_waiters();
+    }
+}
+
+struct OwnedCollectionCursor {
+    scope: OwnedRouteRuleScope,
+    route: Option<Box<dyn LinuxOwnedDumpCursor>>,
+    route_bodies: Option<Vec<Vec<u8>>>,
+    rule: Option<Box<dyn LinuxOwnedDumpCursor>>,
+    rule_bodies: Option<Vec<Vec<u8>>>,
 }
 
 impl fmt::Debug for LinuxRouteSteeringBackend {
@@ -308,6 +393,9 @@ impl LinuxRouteSteeringBackend {
             inner: Arc::new(LinuxRouteSteeringBackendInner {
                 transport: Arc::new(NetlinkRouteTransport),
                 next_sequence: AtomicU32::new(1),
+                owned_generation: AtomicU64::new(0),
+                urgent_waiters: AtomicU64::new(0),
+                urgent_notify: tokio::sync::Notify::new(),
                 operation_lock: Mutex::new(()),
                 config,
                 readback_limits,
@@ -340,6 +428,9 @@ impl LinuxRouteSteeringBackend {
             inner: Arc::new(LinuxRouteSteeringBackendInner {
                 transport: Arc::new(transport),
                 next_sequence: AtomicU32::new(1),
+                owned_generation: AtomicU64::new(0),
+                urgent_waiters: AtomicU64::new(0),
+                urgent_notify: tokio::sync::Notify::new(),
                 operation_lock: Mutex::new(()),
                 config: LinuxRouteSteeringBackendConfig {
                     receive_attempts: 1,
@@ -414,6 +505,425 @@ impl LinuxRouteSteeringBackend {
             1
         } else {
             sequence
+        }
+    }
+
+    fn owned_generation(&self) -> u64 {
+        self.inner.owned_generation.load(Ordering::Acquire)
+    }
+    fn advance_owned_generation(&self) -> u64 {
+        self.inner
+            .owned_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    }
+    /// Register exact-operation intent before waiting on caller-local gates.
+    ///
+    /// This makes a background owned reconciliation yield before its next
+    /// bounded unit even when the exact caller cannot yet invoke
+    /// [`RouteSteeringBackend::converge_route_and_rule`].
+    pub fn register_urgent_route_operation(&self) -> LinuxRouteSteeringUrgentIntent {
+        self.inner.urgent_waiters.fetch_add(1, Ordering::AcqRel);
+        LinuxRouteSteeringUrgentIntent(Arc::clone(&self.inner))
+    }
+
+    fn begin_owned_collection_cursor(
+        &self,
+        scope: OwnedRouteRuleScope,
+    ) -> Result<OwnedCollectionCursor, RouteSteeringError> {
+        validate_owned_collection_config(self.inner.config, self.inner.owned_collection_limits)?;
+        let limits = self.inner.owned_collection_limits.into();
+        let sequence = self.next_sequence();
+        let request = encode_netlink_message(
+            RTM_GETROUTE,
+            NLM_F_REQUEST | NLM_F_DUMP,
+            sequence,
+            &encode_collection_dump_request(ROUTE_MESSAGE_LEN),
+        )?;
+        Ok(OwnedCollectionCursor {
+            scope,
+            route: Some(self.inner.transport.begin_owned_dump(
+                "snapshot_owned_routes",
+                &request,
+                sequence,
+                RTM_NEWROUTE,
+                self.inner.config,
+                limits,
+            )?),
+            route_bodies: None,
+            rule: None,
+            rule_bodies: None,
+        })
+    }
+
+    fn poll_owned_collection_cursor(
+        &self,
+        cursor: &mut OwnedCollectionCursor,
+    ) -> Result<Option<LinuxOwnedCollectionState>, RouteSteeringError> {
+        if let Some(route) = cursor.route.as_mut() {
+            if let Some(bodies) = route.poll_one()? {
+                cursor.route_bodies = Some(bodies);
+                cursor.route = None;
+            }
+            return Ok(None);
+        }
+        if cursor.rule.is_none() && cursor.rule_bodies.is_none() {
+            let limits = self.inner.owned_collection_limits.into();
+            let sequence = self.next_sequence();
+            let request = encode_netlink_message(
+                RTM_GETRULE,
+                NLM_F_REQUEST | NLM_F_DUMP,
+                sequence,
+                &encode_collection_dump_request(FIB_RULE_HEADER_LEN),
+            )?;
+            cursor.rule = Some(self.inner.transport.begin_owned_dump(
+                "snapshot_owned_rules",
+                &request,
+                sequence,
+                RTM_NEWRULE,
+                self.inner.config,
+                limits,
+            )?);
+            return Ok(None);
+        }
+        if let Some(rule) = cursor.rule.as_mut() {
+            if let Some(bodies) = rule.poll_one()? {
+                cursor.rule_bodies = Some(bodies);
+                cursor.rule = None;
+            }
+            return Ok(None);
+        }
+        let route_bodies = cursor.route_bodies.take().ok_or_else(malformed_readback)?;
+        let rule_bodies = cursor.rule_bodies.take().ok_or_else(malformed_readback)?;
+        let state = classify_owned_collection(
+            cursor.scope,
+            &route_bodies,
+            &rule_bodies,
+            self.inner
+                .owned_collection_limits
+                .max_transient_owned_routes,
+            self.inner.owned_collection_limits.max_transient_owned_rules,
+        )?;
+        Ok(Some(state))
+    }
+
+    /// Start an opaque cursor plan. It sends only the first route dump request;
+    /// replies are consumed one datagram per lock acquisition by `step`.
+    pub async fn plan_owned_route_rules(
+        &self,
+        desired: OwnedRouteRuleSet,
+    ) -> Result<OwnedRouteRuleReconcilePlan, RouteSteeringError> {
+        let planned_desired = desired.clone();
+        let (generation, snapshot) = self
+            .run_locked("plan_owned_route_rules", move |backend| {
+                if planned_desired.routes().len()
+                    > backend.inner.owned_collection_limits.max_owned_routes
+                    || planned_desired.rules().len()
+                        > backend.inner.owned_collection_limits.max_owned_rules
+                {
+                    return Err(RouteSteeringError::invalid_config(
+                        "linux.owned_collection",
+                        "desired owned collection exceeds configured bounds",
+                    ));
+                }
+                Ok((
+                    backend.owned_generation(),
+                    backend.begin_owned_collection_cursor(planned_desired.scope())?,
+                ))
+            })
+            .await?;
+        Ok(OwnedRouteRuleReconcilePlan {
+            state: Arc::new(Mutex::new(OwnedRouteRuleReconcilePlanState {
+                desired,
+                backend: Arc::clone(&self.inner),
+                generation,
+                snapshot: Some(snapshot),
+                ready_snapshot: None,
+                retained_routes: 0,
+                retained_rules: 0,
+                installed_routes: 0,
+                installed_rules: 0,
+                removed_routes: 0,
+                removed_rules: 0,
+                awaiting_verification: None,
+                verification: None,
+            })),
+        })
+    }
+
+    /// Drive a plan by at most one bounded cursor or mutation unit.
+    ///
+    /// The lock is acquired for one cursor datagram or at most the hard step
+    /// mutation cap, then released before this future returns. `budget`
+    /// controls the maximum number of units, subject to a production hard cap
+    /// of [`MAX_OWNED_RECONCILE_STEP_UNITS`]. A budget of one is the strict
+    /// latency setting. Callers must not hold external publication locks
+    /// across a step; release them whenever [`OwnedRouteRuleReconcileStep::Yielded`]
+    /// is returned. Dropping this future therefore leaves no detached
+    /// collection worker behind.
+    pub async fn reconcile_owned_route_rules_step(
+        &self,
+        plan: &mut OwnedRouteRuleReconcilePlan,
+        budget: NonZeroU16,
+    ) -> Result<OwnedRouteRuleReconcileStep, RouteSteeringError> {
+        let mut remaining_units = usize::from(budget.get()).min(MAX_OWNED_RECONCILE_STEP_UNITS);
+        let state = Arc::clone(&plan.state);
+        loop {
+            if self.inner.urgent_waiters.load(Ordering::Acquire) != 0 {
+                return Ok(OwnedRouteRuleReconcileStep::Yielded);
+            }
+            let result = self
+                .run_locked("reconcile_owned_route_rules_step", {
+                    let state = Arc::clone(&state);
+                    move |backend| {
+                        let mut plan = state.lock().unwrap_or_else(|p| p.into_inner());
+                        if backend.inner.urgent_waiters.load(Ordering::Acquire) != 0 {
+                            return Ok(Some(OwnedRouteRuleReconcileStep::Yielded));
+                        }
+                        if !Arc::ptr_eq(&plan.backend, &backend.inner)
+                            || plan.generation != backend.owned_generation()
+                        {
+                            return Err(RouteSteeringError::indeterminate(
+                                ReadbackIndeterminateReason::ConcurrentModification,
+                            ));
+                        }
+                        let snapshot = if let Some(snapshot) = plan.ready_snapshot.take() {
+                            snapshot
+                        } else {
+                            if plan.snapshot.is_none() {
+                                plan.snapshot = Some(
+                                    backend.begin_owned_collection_cursor(plan.desired.scope())?,
+                                );
+                                return Ok(Some(OwnedRouteRuleReconcileStep::Yielded));
+                            }
+                            let Some(snapshot) = backend.poll_owned_collection_cursor(
+                                plan.snapshot.as_mut().expect("cursor checked above"),
+                            )?
+                            else {
+                                return Ok(Some(OwnedRouteRuleReconcileStep::Yielded));
+                            };
+                            // Classification followed one terminal cursor
+                            // datagram. Retain it privately and make the
+                            // subsequent diff/mutation its own public unit.
+                            plan.snapshot = None;
+                            plan.ready_snapshot = Some(snapshot);
+                            return Ok(Some(OwnedRouteRuleReconcileStep::Yielded));
+                        };
+                        LinuxRouteSteeringBackend::ensure_collection_collision_free(
+                            &snapshot,
+                            &plan.desired,
+                        )?;
+                        if let Some(phase) = plan.awaiting_verification.take() {
+                            // The complete post-mutation readback is authoritative;
+                            // retain it only by restarting the next snapshot after a
+                            // later bounded mutation.
+                            let verification =
+                                plan.verification.take().ok_or_else(malformed_readback)?;
+                            let verified = match verification {
+                                OwnedStepVerification::PresentRoute(route) => {
+                                    snapshot.snapshot.routes().binary_search(&route).is_ok()
+                                }
+                                OwnedStepVerification::PresentRule(rule) => {
+                                    snapshot.snapshot.rules().binary_search(&rule).is_ok()
+                                }
+                                OwnedStepVerification::AbsentRoute(route) => {
+                                    snapshot.snapshot.routes().binary_search(&route).is_err()
+                                }
+                                OwnedStepVerification::AbsentRule(rule) => {
+                                    snapshot.snapshot.rules().binary_search(&rule).is_err()
+                                }
+                            };
+                            if !verified {
+                                return Err(RouteSteeringError::indeterminate(
+                                    ReadbackIndeterminateReason::ConcurrentModification,
+                                ));
+                            }
+                            plan.snapshot = None;
+                            return Ok(Some(OwnedRouteRuleReconcileStep::Pending(phase)));
+                        }
+                        let before_routes = snapshot
+                            .snapshot
+                            .routes()
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>();
+                        let before_rules = snapshot
+                            .snapshot
+                            .rules()
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>();
+                        let desired_routes = plan
+                            .desired
+                            .routes()
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>();
+                        let desired_rules = plan
+                            .desired
+                            .rules()
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>();
+                        if plan.retained_routes == 0
+                            && plan.retained_rules == 0
+                            && plan.installed_routes == 0
+                            && plan.installed_rules == 0
+                            && plan.removed_routes == 0
+                            && plan.removed_rules == 0
+                        {
+                            plan.retained_routes =
+                                before_routes.intersection(&desired_routes).count();
+                            plan.retained_rules = before_rules.intersection(&desired_rules).count();
+                        }
+                        let missing_routes = desired_routes
+                            .difference(&before_routes)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let missing_rules = desired_rules
+                            .difference(&before_rules)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let orphan_rules = before_rules
+                            .difference(&desired_rules)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let orphan_routes = before_routes
+                            .difference(&desired_routes)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if before_routes.len().saturating_add(missing_routes.len())
+                            > backend
+                                .inner
+                                .owned_collection_limits
+                                .max_transient_owned_routes
+                            || before_rules.len().saturating_add(missing_rules.len())
+                                > backend
+                                    .inner
+                                    .owned_collection_limits
+                                    .max_transient_owned_rules
+                        {
+                            return Err(RouteSteeringError::indeterminate(
+                                ReadbackIndeterminateReason::LimitExceeded,
+                            ));
+                        }
+                        // Validate the full old∪new state before the first create;
+                        // independent snapshots can otherwise hide ambiguous
+                        // same-priority rule siblings during a crash recovery.
+                        OwnedRouteRuleSnapshot::new_transient(
+                            plan.desired.scope(),
+                            before_routes
+                                .iter()
+                                .cloned()
+                                .chain(missing_routes.iter().cloned())
+                                .collect(),
+                            before_rules
+                                .iter()
+                                .cloned()
+                                .chain(missing_rules.iter().cloned())
+                                .collect(),
+                        )?;
+                        let (phase, verification) = if let Some(route) = missing_routes.first() {
+                            plan.generation = u64::MAX;
+                            let generation = backend.advance_owned_generation();
+                            backend.install_route_sync(route)?;
+                            plan.installed_routes += 1;
+                            plan.generation = generation;
+                            (
+                                OwnedRouteRuleReconcilePhase::InstallRoutes,
+                                OwnedStepVerification::PresentRoute(route.clone()),
+                            )
+                        } else if let Some(rule) = missing_rules.first() {
+                            backend.require_rule_protocol_capability()?;
+                            plan.generation = u64::MAX;
+                            let generation = backend.advance_owned_generation();
+                            backend.install_rule_sync(rule)?;
+                            plan.installed_rules += 1;
+                            plan.generation = generation;
+                            (
+                                OwnedRouteRuleReconcilePhase::InstallRules,
+                                OwnedStepVerification::PresentRule(rule.clone()),
+                            )
+                        } else if let Some(rule) = orphan_rules.first() {
+                            plan.generation = u64::MAX;
+                            let generation = backend.advance_owned_generation();
+                            backend.remove_owned_rule_exact_sync(
+                                "remove_owned_collection_rule",
+                                rule,
+                                false,
+                            )?;
+                            plan.removed_rules += 1;
+                            plan.generation = generation;
+                            (
+                                OwnedRouteRuleReconcilePhase::RemoveRules,
+                                OwnedStepVerification::AbsentRule(rule.clone()),
+                            )
+                        } else if let Some(route) = orphan_routes.first() {
+                            plan.generation = u64::MAX;
+                            let generation = backend.advance_owned_generation();
+                            backend.remove_owned_route_exact_sync(
+                                "remove_owned_collection_route",
+                                route,
+                            )?;
+                            plan.removed_routes += 1;
+                            plan.generation = generation;
+                            (
+                                OwnedRouteRuleReconcilePhase::RemoveRoutes,
+                                OwnedStepVerification::AbsentRoute(route.clone()),
+                            )
+                        } else {
+                            if !snapshot.snapshot.matches_desired(&plan.desired) {
+                                return Err(RouteSteeringError::indeterminate(
+                                    ReadbackIndeterminateReason::ConcurrentModification,
+                                ));
+                            }
+                            return Ok(Some(OwnedRouteRuleReconcileStep::Complete(
+                                OwnedRouteRuleReconcileOutcome {
+                                    snapshot: snapshot.snapshot,
+                                    retained_routes: plan.retained_routes,
+                                    installed_routes: plan.installed_routes,
+                                    removed_routes: plan.removed_routes,
+                                    retained_rules: plan.retained_rules,
+                                    installed_rules: plan.installed_rules,
+                                    removed_rules: plan.removed_rules,
+                                },
+                            )));
+                        };
+                        plan.snapshot = None;
+                        plan.awaiting_verification = Some(phase);
+                        plan.verification = Some(verification);
+                        Ok(Some(OwnedRouteRuleReconcileStep::Yielded))
+                    }
+                })
+                .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    // A failed bounded unit may have crossed an ACK or
+                    // readback boundary. Its cursor/diff receipt is no
+                    // longer replay-safe, so only a freshly planned,
+                    // authoritative snapshot may continue reconciliation.
+                    let mut plan = state.lock().unwrap_or_else(|p| p.into_inner());
+                    plan.generation = u64::MAX;
+                    plan.awaiting_verification = None;
+                    plan.verification = None;
+                    return Err(error);
+                }
+            };
+            if let Some(step) = result {
+                if matches!(step, OwnedRouteRuleReconcileStep::Yielded) {
+                    if self.inner.urgent_waiters.load(Ordering::Acquire) != 0 {
+                        return Ok(step);
+                    }
+                    remaining_units = remaining_units.saturating_sub(1);
+                    if remaining_units != 0 {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
+                return Ok(step);
+            }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -527,8 +1037,11 @@ impl LinuxRouteSteeringBackend {
         &self,
         request: RouteRequest,
     ) -> Result<(), RouteSteeringError> {
+        let _urgent = self.register_urgent_route_operation();
         self.run_locked("remove_converged_route", move |backend| {
-            backend.remove_converged_route_sync(&request)
+            backend.advance_owned_generation();
+            backend.remove_converged_route_sync(&request)?;
+            Ok(())
         })
         .await
     }
@@ -537,8 +1050,11 @@ impl LinuxRouteSteeringBackend {
         &self,
         request: RuleRequest,
     ) -> Result<(), RouteSteeringError> {
+        let _urgent = self.register_urgent_route_operation();
         self.run_locked("remove_converged_rule", move |backend| {
-            backend.remove_converged_rule_sync(&request)
+            backend.advance_owned_generation();
+            backend.remove_converged_rule_sync(&request)?;
+            Ok(())
         })
         .await
     }
@@ -547,8 +1063,11 @@ impl LinuxRouteSteeringBackend {
         &self,
         request: RouteRequest,
     ) -> Result<RouteConvergenceOutcome, RouteSteeringError> {
+        let _urgent = self.register_urgent_route_operation();
         self.run_locked("converge_route", move |backend| {
-            backend.converge_route_sync(&request)
+            backend.advance_owned_generation();
+            let result = backend.converge_route_sync(&request)?;
+            Ok(result)
         })
         .await
     }
@@ -557,8 +1076,11 @@ impl LinuxRouteSteeringBackend {
         &self,
         request: RuleRequest,
     ) -> Result<RuleConvergenceOutcome, RouteSteeringError> {
+        let _urgent = self.register_urgent_route_operation();
         self.run_locked("converge_rule", move |backend| {
-            backend.converge_rule_sync(&request)
+            backend.advance_owned_generation();
+            let result = backend.converge_rule_sync(&request)?;
+            Ok(result)
         })
         .await
     }
@@ -568,8 +1090,11 @@ impl LinuxRouteSteeringBackend {
         route: RouteRequest,
         rule: RuleRequest,
     ) -> Result<RouteRuleConvergenceOutcome, RouteSteeringError> {
+        let _urgent = self.register_urgent_route_operation();
         self.run_locked("converge_route_and_rule", move |backend| {
-            backend.converge_pair_sync(&route, &rule)
+            backend.advance_owned_generation();
+            let result = backend.converge_pair_sync(&route, &rule)?;
+            Ok(result)
         })
         .await
     }
@@ -590,8 +1115,11 @@ impl LinuxRouteSteeringBackend {
         &self,
         desired: OwnedRouteRuleSet,
     ) -> Result<OwnedRouteRuleReconcileOutcome, RouteSteeringError> {
+        let _urgent = self.register_urgent_route_operation();
         self.run_locked("reconcile_owned_route_rules", move |backend| {
-            backend.reconcile_owned_collection_sync(desired)
+            backend.advance_owned_generation();
+            let result = backend.reconcile_owned_collection_sync(desired)?;
+            Ok(result)
         })
         .await
     }
@@ -1622,11 +2150,32 @@ trait LinuxRouteTransport: Send + Sync + fmt::Debug {
         ))
     }
 
+    fn begin_owned_dump(
+        &self,
+        _operation: &'static str,
+        _request: &[u8],
+        _expected_sequence: u32,
+        _expected_message_type: u16,
+        _config: LinuxRouteSteeringBackendConfig,
+        _limits: LinuxNetlinkDumpLimits,
+    ) -> Result<Box<dyn LinuxOwnedDumpCursor>, RouteSteeringError> {
+        Err(RouteSteeringError::indeterminate(
+            ReadbackIndeterminateReason::Unsupported,
+        ))
+    }
+
     fn probe(&self, config: LinuxRouteSteeringBackendConfig) -> RouteSteeringProbe;
 
     fn rule_protocol_capability(&self) -> LinuxRuleProtocolCapability {
         LinuxRuleProtocolCapability::Unknown
     }
+}
+
+trait LinuxOwnedDumpCursor: Send {
+    /// Returns `Some` only after NLMSG_DONE. One call receives at most one
+    /// datagram, so callers can release the backend operation lock between
+    /// every bounded readback unit.
+    fn poll_one(&mut self) -> Result<Option<Vec<Vec<u8>>>, RouteSteeringError>;
 }
 
 #[derive(Debug)]
@@ -1746,6 +2295,40 @@ impl LinuxRouteTransport for NetlinkRouteTransport {
         ))
     }
 
+    fn begin_owned_dump(
+        &self,
+        operation: &'static str,
+        request: &[u8],
+        expected_sequence: u32,
+        expected_message_type: u16,
+        config: LinuxRouteSteeringBackendConfig,
+        limits: LinuxNetlinkDumpLimits,
+    ) -> Result<Box<dyn LinuxOwnedDumpCursor>, RouteSteeringError> {
+        validate_dump_config(config, limits)?;
+        let socket =
+            open_route_netlink_socket().map_err(|error| map_open_error(operation, error))?;
+        let sent = send_message(&socket, request)
+            .map_err(|error| RouteSteeringError::io("netlink_send", error))?;
+        if sent != request.len() {
+            return Err(RouteSteeringError::io(
+                "netlink_send",
+                io::Error::new(io::ErrorKind::WriteZero, "short netlink send"),
+            ));
+        }
+        Ok(Box::new(NetlinkOwnedDumpCursor {
+            socket,
+            expected_sequence,
+            expected_message_type,
+            config,
+            limits,
+            buffer: vec![0; config.receive_buffer_len],
+            messages: Vec::new(),
+            datagrams: 0,
+            total_bytes: 0,
+            empty_attempts: 0,
+        }))
+    }
+
     fn probe(&self, _config: LinuxRouteSteeringBackendConfig) -> RouteSteeringProbe {
         match open_route_netlink_socket() {
             Ok(_) => {
@@ -1792,6 +2375,65 @@ impl LinuxRouteTransport for NetlinkRouteTransport {
 
     fn rule_protocol_capability(&self) -> LinuxRuleProtocolCapability {
         linux_rule_protocol_capability_from_osrelease()
+    }
+}
+
+struct NetlinkOwnedDumpCursor {
+    socket: opc_linux_route_sys::NetlinkSocket,
+    expected_sequence: u32,
+    expected_message_type: u16,
+    config: LinuxRouteSteeringBackendConfig,
+    limits: LinuxNetlinkDumpLimits,
+    buffer: Vec<u8>,
+    messages: Vec<Vec<u8>>,
+    datagrams: u32,
+    total_bytes: usize,
+    empty_attempts: u16,
+}
+
+impl LinuxOwnedDumpCursor for NetlinkOwnedDumpCursor {
+    fn poll_one(&mut self) -> Result<Option<Vec<Vec<u8>>>, RouteSteeringError> {
+        match receive_message(&self.socket, &mut self.buffer) {
+            Ok(0) => self.empty_attempts = self.empty_attempts.saturating_add(1),
+            Ok(len) => {
+                self.empty_attempts = 0;
+                account_dump_datagram(
+                    &mut self.datagrams,
+                    &mut self.total_bytes,
+                    len,
+                    self.limits,
+                )?;
+                if parse_dump_datagram(
+                    &self.buffer[..len],
+                    self.expected_sequence,
+                    self.expected_message_type,
+                    self.limits.max_messages,
+                    &mut self.messages,
+                )? {
+                    return Ok(Some(std::mem::take(&mut self.messages)));
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                self.empty_attempts = self.empty_attempts.saturating_add(1);
+            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                return Err(RouteSteeringError::indeterminate(
+                    ReadbackIndeterminateReason::MalformedReply,
+                ))
+            }
+            Err(error) => return Err(RouteSteeringError::io("netlink_receive", error)),
+        }
+        if self.empty_attempts >= self.config.receive_attempts {
+            return Err(RouteSteeringError::indeterminate(
+                ReadbackIndeterminateReason::IncompleteReply,
+            ));
+        }
+        Ok(None)
     }
 }
 
@@ -3407,8 +4049,227 @@ mod tests {
             }
         }
 
+        fn begin_owned_dump(
+            &self,
+            _operation: &'static str,
+            request: &[u8],
+            _expected_sequence: u32,
+            _expected_message_type: u16,
+            _config: LinuxRouteSteeringBackendConfig,
+            _limits: LinuxNetlinkDumpLimits,
+        ) -> Result<Box<dyn LinuxOwnedDumpCursor>, RouteSteeringError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(request.to_vec());
+            Ok(Box::new(ScriptedOwnedDumpCursor {
+                transport: self.clone(),
+            }))
+        }
+
         fn probe(&self, _config: LinuxRouteSteeringBackendConfig) -> RouteSteeringProbe {
             RouteSteeringProbe::default()
+        }
+    }
+
+    struct ScriptedOwnedDumpCursor {
+        transport: ScriptedTransport,
+    }
+    impl LinuxOwnedDumpCursor for ScriptedOwnedDumpCursor {
+        fn poll_one(&mut self) -> Result<Option<Vec<Vec<u8>>>, RouteSteeringError> {
+            match self.transport.next()? {
+                ScriptedResponse::Dump(result) => result.map(Some),
+                ScriptedResponse::Transaction(_) => Err(malformed_readback()),
+            }
+        }
+    }
+
+    type DumpPage = Vec<Vec<u8>>;
+    type DumpCursorPages = VecDeque<DumpPage>;
+
+    #[derive(Debug, Clone)]
+    struct PagedOwnedTransport {
+        cursors: Arc<Mutex<VecDeque<DumpCursorPages>>>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PagedOwnedTransport {
+        fn new(cursors: Vec<Vec<DumpPage>>) -> Self {
+            Self {
+                cursors: Arc::new(Mutex::new(
+                    cursors.into_iter().map(VecDeque::from).collect(),
+                )),
+                polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl LinuxRouteTransport for PagedOwnedTransport {
+        fn transact(
+            &self,
+            _operation: &'static str,
+            _request: &[u8],
+            _expected_sequence: u32,
+            _config: LinuxRouteSteeringBackendConfig,
+        ) -> Result<Option<Vec<u8>>, RouteSteeringError> {
+            Ok(None)
+        }
+
+        fn probe(&self, _config: LinuxRouteSteeringBackendConfig) -> RouteSteeringProbe {
+            RouteSteeringProbe::default()
+        }
+
+        fn begin_owned_dump(
+            &self,
+            _operation: &'static str,
+            _request: &[u8],
+            _expected_sequence: u32,
+            _expected_message_type: u16,
+            _config: LinuxRouteSteeringBackendConfig,
+            _limits: LinuxNetlinkDumpLimits,
+        ) -> Result<Box<dyn LinuxOwnedDumpCursor>, RouteSteeringError> {
+            let pages = self
+                .cursors
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop_front()
+                .ok_or_else(malformed_readback)?;
+            Ok(Box::new(PagedOwnedDumpCursor {
+                pages,
+                messages: Vec::new(),
+                polls: Arc::clone(&self.polls),
+            }))
+        }
+    }
+
+    struct PagedOwnedDumpCursor {
+        pages: DumpCursorPages,
+        messages: Vec<Vec<u8>>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LinuxOwnedDumpCursor for PagedOwnedDumpCursor {
+        fn poll_one(&mut self) -> Result<Option<Vec<Vec<u8>>>, RouteSteeringError> {
+            self.polls.fetch_add(1, AtomicOrdering::SeqCst);
+            if let Some(page) = self.pages.pop_front() {
+                self.messages.extend(page);
+                Ok(None)
+            } else {
+                Ok(Some(std::mem::take(&mut self.messages)))
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct BlockingOwnedTransport {
+        started: mpsc::Sender<()>,
+        release: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<Mutex<Vec<Vec<u8>>>>,
+        responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    }
+
+    impl BlockingOwnedTransport {
+        fn next(&self) -> Result<ScriptedResponse, RouteSteeringError> {
+            self.responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .ok_or_else(malformed_readback)
+        }
+
+        fn requests(&self) -> Vec<Vec<u8>> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl LinuxRouteTransport for BlockingOwnedTransport {
+        fn transact(
+            &self,
+            _operation: &'static str,
+            request: &[u8],
+            _expected_sequence: u32,
+            _config: LinuxRouteSteeringBackendConfig,
+        ) -> Result<Option<Vec<u8>>, RouteSteeringError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.to_vec());
+            match self.next()? {
+                ScriptedResponse::Transaction(result) => result,
+                ScriptedResponse::Dump(_) => Err(malformed_readback()),
+            }
+        }
+        fn dump(
+            &self,
+            _operation: &'static str,
+            request: &[u8],
+            _expected_sequence: u32,
+            _expected_message_type: u16,
+            _config: LinuxRouteSteeringBackendConfig,
+            _limits: LinuxNetlinkDumpLimits,
+        ) -> Result<Vec<Vec<u8>>, RouteSteeringError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.to_vec());
+            match self.next()? {
+                ScriptedResponse::Dump(result) => result,
+                ScriptedResponse::Transaction(_) => Err(malformed_readback()),
+            }
+        }
+        fn probe(&self, _config: LinuxRouteSteeringBackendConfig) -> RouteSteeringProbe {
+            RouteSteeringProbe::default()
+        }
+        fn begin_owned_dump(
+            &self,
+            _operation: &'static str,
+            request: &[u8],
+            _expected_sequence: u32,
+            _expected_message_type: u16,
+            _config: LinuxRouteSteeringBackendConfig,
+            _limits: LinuxNetlinkDumpLimits,
+        ) -> Result<Box<dyn LinuxOwnedDumpCursor>, RouteSteeringError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.to_vec());
+            Ok(Box::new(BlockingOwnedDumpCursor {
+                started: self.started.clone(),
+                release: Arc::clone(&self.release),
+                polls: Arc::clone(&self.polls),
+                first: true,
+            }))
+        }
+    }
+
+    struct BlockingOwnedDumpCursor {
+        started: mpsc::Sender<()>,
+        release: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        first: bool,
+    }
+    impl LinuxOwnedDumpCursor for BlockingOwnedDumpCursor {
+        fn poll_one(&mut self) -> Result<Option<Vec<Vec<u8>>>, RouteSteeringError> {
+            self.polls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.first {
+                self.first = false;
+                let _ = self.started.send(());
+                let receiver = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                    .ok_or_else(malformed_readback)?;
+                receiver.recv().map_err(|_| {
+                    RouteSteeringError::indeterminate(ReadbackIndeterminateReason::IncompleteReply)
+                })?;
+                return Ok(None);
+            }
+            Ok(Some(Vec::new()))
         }
     }
 
@@ -3595,6 +4456,47 @@ mod tests {
             table: 1000,
             priority: 900,
         }
+    }
+
+    async fn assert_failed_bounded_step_is_not_replayable(
+        desired: OwnedRouteRuleSet,
+        responses: Vec<ScriptedResponse>,
+    ) -> Vec<Vec<u8>> {
+        let transport = ScriptedTransport::new(responses);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let mut plan = backend.plan_owned_route_rules(desired).await.unwrap();
+        let mut failed = false;
+        for _ in 0..16 {
+            match backend
+                .reconcile_owned_route_rules_step(&mut plan, NonZeroU16::new(1).unwrap())
+                .await
+            {
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+                Ok(
+                    OwnedRouteRuleReconcileStep::Yielded | OwnedRouteRuleReconcileStep::Pending(_),
+                ) => {}
+                Ok(OwnedRouteRuleReconcileStep::Complete(_)) => {
+                    panic!("failure fixture unexpectedly completed")
+                }
+            }
+        }
+        assert!(failed, "failure fixture did not reach its boundary");
+        let requests_after_failure = transport.requests();
+        // A possibly transmitted create/delete is never retried from the
+        // stale cursor. Recovery starts from a new authoritative plan.
+        assert!(matches!(
+            backend
+                .reconcile_owned_route_rules_step(&mut plan, NonZeroU16::new(1).unwrap())
+                .await,
+            Err(RouteSteeringError::ReadbackIndeterminate {
+                reason: ReadbackIndeterminateReason::ConcurrentModification
+            })
+        ));
+        assert_eq!(transport.requests(), requests_after_failure);
+        requests_after_failure
     }
 
     fn ipv6_collection_scope() -> OwnedRouteRuleScope {
@@ -5473,6 +6375,456 @@ mod tests {
                 RTM_GETROUTE,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_owned_plan_yields_between_cursor_reads_and_stales_after_exact_generation() {
+        let desired_route = collection_route(11);
+        let body = encode_route_request(&desired_route).unwrap();
+        let exact_route = collection_route(99);
+        let exact_rule = collection_rule(99);
+        let transport = ScriptedTransport::new(vec![
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(vec![body.clone()])),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            // An exact pair succeeds between yielded cursor boundaries.
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(vec![encode_route_request(&exact_route).unwrap()])),
+            ScriptedResponse::Dump(Ok(Vec::new())),
+            ScriptedResponse::Transaction(Ok(None)),
+            ScriptedResponse::Dump(Ok(vec![encode_rule_request(&exact_rule).unwrap()])),
+        ]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired =
+            OwnedRouteRuleSet::new(collection_scope(), vec![desired_route], Vec::new()).unwrap();
+        let mut plan = backend.plan_owned_route_rules(desired).await.unwrap();
+        for _ in 0..16 {
+            match backend
+                .reconcile_owned_route_rules_step(&mut plan, NonZeroU16::new(1).unwrap())
+                .await
+                .unwrap()
+            {
+                OwnedRouteRuleReconcileStep::Pending(
+                    OwnedRouteRuleReconcilePhase::InstallRoutes,
+                ) => break,
+                OwnedRouteRuleReconcileStep::Yielded => {}
+                unexpected => panic!("unexpected bounded step: {unexpected:?}"),
+            }
+        }
+        // The exact pair advances this fence while serialized on the same
+        // backend; a stale roster may not perform orphan deletion.
+        assert!(matches!(
+            backend
+                .converge_route_and_rule(exact_route, exact_rule)
+                .await,
+            Ok(RouteRuleConvergenceOutcome {
+                route: RouteConvergenceOutcome::Installed,
+                rule: RuleConvergenceOutcome::Installed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            backend
+                .reconcile_owned_route_rules_step(&mut plan, NonZeroU16::new(1).unwrap())
+                .await,
+            Err(RouteSteeringError::ReadbackIndeterminate {
+                reason: ReadbackIndeterminateReason::ConcurrentModification
+            })
+        ));
+        assert!(transport.requests().len() >= 4);
+    }
+
+    #[tokio::test]
+    async fn bounded_owned_plan_consumes_fifty_thousand_entries_in_cursor_chunks() {
+        let routes = (0_u32..50_000)
+            .map(|value| RouteRequest {
+                destination: prefix(
+                    [
+                        10,
+                        ((value >> 16) & 0xff) as u8,
+                        ((value >> 8) & 0xff) as u8,
+                        (value & 0xff) as u8,
+                    ],
+                    32,
+                ),
+                oif_ifindex: 42,
+                table: 1000,
+                priority: Some(10),
+            })
+            .collect::<Vec<_>>();
+        let route_pages = routes
+            .iter()
+            .map(|route| encode_route_request(route).unwrap())
+            .collect::<Vec<_>>()
+            .chunks(100)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let transport = PagedOwnedTransport::new(vec![route_pages, vec![Vec::new()]]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired = OwnedRouteRuleSet::new(collection_scope(), routes, Vec::new()).unwrap();
+        let mut plan = backend.plan_owned_route_rules(desired).await.unwrap();
+        let mut saw_yield = false;
+        let mut complete = false;
+        for _ in 0..2_000 {
+            let before = transport.polls.load(AtomicOrdering::SeqCst);
+            match backend
+                .reconcile_owned_route_rules_step(&mut plan, NonZeroU16::new(1).unwrap())
+                .await
+                .unwrap()
+            {
+                OwnedRouteRuleReconcileStep::Complete(_) => {
+                    complete = true;
+                    break;
+                }
+                OwnedRouteRuleReconcileStep::Yielded => saw_yield = true,
+                unexpected => panic!("unexpected bounded step: {unexpected:?}"),
+            }
+            assert!(
+                transport.polls.load(AtomicOrdering::SeqCst) - before <= 1,
+                "one public step may poll at most one cursor datagram"
+            );
+        }
+        assert!(complete);
+        assert!(saw_yield);
+        // 500 data pages plus terminal polls for route and rule prove the
+        // collection dump is caller-step-bounded, not only lock-bounded.
+        assert!(transport.polls.load(AtomicOrdering::SeqCst) >= 502);
+    }
+
+    #[tokio::test]
+    async fn cancelling_bounded_cursor_step_does_not_detach_follow_on_plan_work() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let transport = BlockingOwnedTransport {
+            started: started_tx,
+            release: Arc::new(Mutex::new(Some(release_rx))),
+            polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let polls = Arc::clone(&transport.polls);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport);
+        let desired = OwnedRouteRuleSet::new(collection_scope(), Vec::new(), Vec::new()).unwrap();
+        let plan = backend.plan_owned_route_rules(desired).await.unwrap();
+        let worker = backend.clone();
+        let task = tokio::spawn(async move {
+            let mut plan = plan;
+            worker
+                .reconcile_owned_route_rules_step(&mut plan, NonZeroU16::new(1).unwrap())
+                .await
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The only detached blocking unit is the already-started single poll;
+        // cancellation cannot advance the plan to a second poll or mutation.
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fifty_thousand_entry_step_yields_to_an_actual_urgent_pair_after_one_poll() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let successor_route = collection_route(99);
+        let successor_rule = collection_rule(99);
+        let transport = BlockingOwnedTransport {
+            started: started_tx,
+            release: Arc::new(Mutex::new(Some(release_rx))),
+            polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            // The blocking cursor owns the background dump. These are the
+            // exact pair's route/rule readback and ACKs once it is allowed
+            // to acquire the same backend operation lock.
+            responses: Arc::new(Mutex::new(
+                vec![
+                    ScriptedResponse::Dump(Ok(Vec::new())),
+                    ScriptedResponse::Transaction(Ok(None)),
+                    ScriptedResponse::Dump(Ok(vec![
+                        encode_route_request(&successor_route).unwrap()
+                    ])),
+                    ScriptedResponse::Dump(Ok(Vec::new())),
+                    ScriptedResponse::Transaction(Ok(None)),
+                    ScriptedResponse::Dump(Ok(vec![encode_rule_request(&successor_rule).unwrap()])),
+                ]
+                .into(),
+            )),
+        };
+        let polls = Arc::clone(&transport.polls);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let desired_routes = (0_u32..50_000)
+            .map(|value| RouteRequest {
+                destination: prefix(
+                    [
+                        10,
+                        ((value >> 16) & 0xff) as u8,
+                        ((value >> 8) & 0xff) as u8,
+                        (value & 0xff) as u8,
+                    ],
+                    32,
+                ),
+                oif_ifindex: 42,
+                table: 1000,
+                priority: Some(10),
+            })
+            .collect::<Vec<_>>();
+        let plan = backend
+            .plan_owned_route_rules(
+                OwnedRouteRuleSet::new(collection_scope(), desired_routes, Vec::new()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let background_backend = backend.clone();
+        let background = tokio::spawn(async move {
+            let mut plan = plan;
+            let result = background_backend
+                .reconcile_owned_route_rules_step(&mut plan, NonZeroU16::new(1).unwrap())
+                .await;
+            (plan, result)
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 1);
+
+        let urgent_backend = backend.clone();
+        let urgent = tokio::spawn(async move {
+            urgent_backend
+                .converge_route_and_rule(successor_route, successor_rule)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.inner.urgent_waiters.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The public stepped call is still in its single bounded cursor unit;
+        // it has not completed the 50k roster while urgent work waits.
+        assert!(!background.is_finished());
+        release_tx.send(()).unwrap();
+
+        let exact = tokio::time::timeout(Duration::from_secs(1), urgent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            exact,
+            RouteRuleConvergenceOutcome {
+                route: RouteConvergenceOutcome::Installed,
+                rule: RuleConvergenceOutcome::Installed,
+                ..
+            }
+        ));
+        // The exact pair completed after the held cursor poll, before the
+        // background call could take any second dump/mutation unit.
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 1);
+        let (mut plan, background_step) = tokio::time::timeout(Duration::from_secs(1), background)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            background_step.unwrap(),
+            OwnedRouteRuleReconcileStep::Yielded
+        );
+        assert!(matches!(
+            backend
+                .reconcile_owned_route_rules_step(&mut plan, NonZeroU16::new(1).unwrap())
+                .await,
+            Err(RouteSteeringError::ReadbackIndeterminate {
+                reason: ReadbackIndeterminateReason::ConcurrentModification
+            })
+        ));
+        // A stale 50k roster cannot issue a destructive successor delete or
+        // rollback after the exact pair has advanced the ownership fence.
+        assert!(!transport.requests().iter().any(|request| {
+            matches!(
+                u16::from_ne_bytes([request[4], request[5]]),
+                RTM_DELROUTE | RTM_DELRULE
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn bounded_step_failure_boundaries_invalidate_the_cursor_and_never_replay() {
+        let desired_route = collection_route(31);
+        let desired_rule = collection_rule(31);
+        let orphan_route = collection_route(32);
+        let orphan_rule = collection_rule(32);
+        let io_failure = || {
+            RouteSteeringError::io(
+                "synthetic_bounded_step",
+                io::Error::new(io::ErrorKind::PermissionDenied, "synthetic failure"),
+            )
+        };
+
+        // Cursor/dump failure before classification is terminal for this
+        // plan, so a later retry cannot use a partial cursor.
+        assert_failed_bounded_step_is_not_replayable(
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), Vec::new()).unwrap(),
+            vec![ScriptedResponse::Dump(Err(io_failure()))],
+        )
+        .await;
+
+        // Route and rule create ACK errors advance the generation before the
+        // attempted mutation; they are never replayed by the same plan.
+        let route_requests = assert_failed_bounded_step_is_not_replayable(
+            OwnedRouteRuleSet::new(collection_scope(), vec![desired_route.clone()], Vec::new())
+                .unwrap(),
+            vec![
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Transaction(Err(io_failure())),
+            ],
+        )
+        .await;
+        assert_eq!(
+            route_requests
+                .iter()
+                .filter(|request| read_u16_ne(request, 4).unwrap() == RTM_NEWROUTE)
+                .count(),
+            1
+        );
+        let rule_requests = assert_failed_bounded_step_is_not_replayable(
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), vec![desired_rule.clone()])
+                .unwrap(),
+            vec![
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Transaction(Err(io_failure())),
+            ],
+        )
+        .await;
+        assert_eq!(
+            rule_requests
+                .iter()
+                .filter(|request| read_u16_ne(request, 4).unwrap() == RTM_NEWRULE)
+                .count(),
+            1
+        );
+
+        // A create ACK can be ambiguous. A complete post-create snapshot
+        // that does not contain the exact receipt is also terminal, rather
+        // than inviting an unsafe retry.
+        assert_failed_bounded_step_is_not_replayable(
+            OwnedRouteRuleSet::new(collection_scope(), vec![desired_route.clone()], Vec::new())
+                .unwrap(),
+            vec![
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Transaction(Ok(None)),
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Dump(Ok(Vec::new())),
+            ],
+        )
+        .await;
+
+        // Destructive orphan phases use the same receipt fence. Errors at
+        // either delete, and an ACK followed by an unexpectedly-present
+        // route, leave only a fresh plan eligible to resume.
+        let orphan_rule_body = encode_rule_request(&orphan_rule).unwrap();
+        assert_failed_bounded_step_is_not_replayable(
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), Vec::new()).unwrap(),
+            vec![
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Dump(Ok(vec![orphan_rule_body])),
+                ScriptedResponse::Transaction(Err(io_failure())),
+            ],
+        )
+        .await;
+        let orphan_route_body = encode_route_request(&orphan_route).unwrap();
+        assert_failed_bounded_step_is_not_replayable(
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), Vec::new()).unwrap(),
+            vec![
+                ScriptedResponse::Dump(Ok(vec![orphan_route_body.clone()])),
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Transaction(Err(io_failure())),
+            ],
+        )
+        .await;
+        let absent_receipt_requests = assert_failed_bounded_step_is_not_replayable(
+            OwnedRouteRuleSet::new(collection_scope(), Vec::new(), Vec::new()).unwrap(),
+            vec![
+                ScriptedResponse::Dump(Ok(vec![orphan_route_body.clone()])),
+                ScriptedResponse::Dump(Ok(Vec::new())),
+                ScriptedResponse::Transaction(Ok(None)),
+                ScriptedResponse::Dump(Ok(vec![orphan_route_body])),
+                ScriptedResponse::Dump(Ok(Vec::new())),
+            ],
+        )
+        .await;
+        assert_eq!(
+            absent_receipt_requests
+                .iter()
+                .filter(|request| read_u16_ne(request, 4).unwrap() == RTM_DELROUTE)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_reconcile_error_invalidates_a_preexisting_bounded_plan() {
+        let desired =
+            OwnedRouteRuleSet::new(collection_scope(), vec![collection_route(41)], Vec::new())
+                .unwrap();
+        let transport =
+            ScriptedTransport::new(vec![ScriptedResponse::Dump(Err(RouteSteeringError::io(
+                "synthetic_legacy_snapshot",
+                io::Error::other("synthetic failure"),
+            )))]);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport);
+        let mut plan = backend
+            .plan_owned_route_rules(desired.clone())
+            .await
+            .unwrap();
+        assert!(backend.reconcile_owned_route_rules(desired).await.is_err());
+        assert!(matches!(
+            backend
+                .reconcile_owned_route_rules_step(&mut plan, NonZeroU16::new(1).unwrap())
+                .await,
+            Err(RouteSteeringError::ReadbackIndeterminate {
+                reason: ReadbackIndeterminateReason::ConcurrentModification
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn urgent_intent_returns_a_quiescent_boundary_without_waiting_or_polling() {
+        let (started_tx, _started_rx) = mpsc::channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        let transport = BlockingOwnedTransport {
+            started: started_tx,
+            release: Arc::new(Mutex::new(Some(release_rx))),
+            polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let polls = Arc::clone(&transport.polls);
+        let backend = LinuxRouteSteeringBackend::with_transport(transport);
+        let desired = OwnedRouteRuleSet::new(collection_scope(), Vec::new(), Vec::new()).unwrap();
+        let mut plan = backend.plan_owned_route_rules(desired).await.unwrap();
+        let urgent = backend.register_urgent_route_operation();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                backend.reconcile_owned_route_rules_step(&mut plan, NonZeroU16::new(1).unwrap())
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            OwnedRouteRuleReconcileStep::Yielded
+        );
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 0);
+        drop(urgent);
     }
 
     #[tokio::test]
