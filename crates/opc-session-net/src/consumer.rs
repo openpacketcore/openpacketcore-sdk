@@ -19014,13 +19014,14 @@ mod tests {
         let full = persistent.pool.test_hooks.warm_full_observed.notified();
         tokio::pin!(full);
         full.as_mut().enable();
+        // This hands the final lane directly to the paused queued semaphore
+        // future.  Do not manufacture a capacity wake: ensure must discover
+        // that reservation itself and arm its wait at full width.
+        drop(holder_lane);
+        drop(holder_pending);
         let ensure_client = persistent.clone();
         let ensure =
             tokio::spawn(async move { ensure_client.ensure_warm_request_capacity().await });
-        tokio::task::yield_now().await;
-        drop(holder_lane);
-        drop(holder_pending);
-        persistent.pool.warm_capacity_changed.notify_waiters();
         full.await;
         queued.abort();
         assert_eq!(ensure.await.expect("ensure"), Ok(()));
