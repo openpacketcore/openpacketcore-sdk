@@ -7103,6 +7103,9 @@ struct PersistentConsumerTestHooks {
     warm_probe_pause_once: AtomicBool,
     warm_probe_entered: Arc<Notify>,
     warm_probe_release: Arc<Notify>,
+    warm_return_pause_once: AtomicBool,
+    warm_return_entered: Arc<Notify>,
+    warm_return_release: Arc<Notify>,
     queued_lane_pause_once: AtomicBool,
     queued_lane_assigned: Arc<Notify>,
     queued_lane_release: Arc<Notify>,
@@ -7121,6 +7124,9 @@ impl PersistentConsumerTestHooks {
             warm_probe_pause_once: AtomicBool::new(false),
             warm_probe_entered: Arc::new(Notify::new()),
             warm_probe_release: Arc::new(Notify::new()),
+            warm_return_pause_once: AtomicBool::new(false),
+            warm_return_entered: Arc::new(Notify::new()),
+            warm_return_release: Arc::new(Notify::new()),
             queued_lane_pause_once: AtomicBool::new(false),
             queued_lane_assigned: Arc::new(Notify::new()),
             queued_lane_release: Arc::new(Notify::new()),
@@ -9669,6 +9675,48 @@ impl PersistentSessionConsumerClient {
         }
     }
 
+    async fn ensure_warm_request_capacity_before(
+        &self,
+        caller_deadline: tokio::time::Instant,
+    ) -> Result<(), SessionConsumerClientError> {
+        if self.pool.phase() != PersistentShutdownPhase::Running {
+            return Err(SessionConsumerClientError::ShuttingDown);
+        }
+        let started = tokio::time::Instant::now();
+        let mut deadline = caller_deadline.min(
+            started
+                .checked_add(self.pool.config.setup_timeout)
+                .ok_or(SessionConsumerClientError::Deadline)?,
+        );
+        if let Some(pre_request_deadline) = self
+            .pool
+            .client
+            .pre_request_connection_timeout
+            .and_then(|timeout| started.checked_add(timeout))
+        {
+            deadline = deadline.min(pre_request_deadline);
+        }
+        if deadline <= started {
+            return Err(SessionConsumerClientError::Deadline);
+        }
+        let result = match self.pool.begin_warm_lane()? {
+            Ok(leader) => leader.complete(self.establish_one_warm_request_lane(deadline).await),
+            Err(flight) => self.join_warm_request_lane(flight, deadline).await,
+        };
+        #[cfg(test)]
+        if result.is_ok()
+            && self
+                .pool
+                .test_hooks
+                .warm_return_pause_once
+                .swap(false, Ordering::SeqCst)
+        {
+            self.pool.test_hooks.warm_return_entered.notify_waiters();
+            self.pool.test_hooks.warm_return_release.notified().await;
+        }
+        result
+    }
+
     /// Ensure the configured request capacity is authenticated for the current
     /// resolver target without dispatching an application operation or frame.
     ///
@@ -9678,25 +9726,10 @@ impl PersistentSessionConsumerClient {
     /// request IDs nor reserves the whole fixed pool. A returned error is
     /// therefore conclusive before an application request is written.
     pub async fn ensure_warm_request_capacity(&self) -> Result<(), SessionConsumerClientError> {
-        if self.pool.phase() != PersistentShutdownPhase::Running {
-            return Err(SessionConsumerClientError::ShuttingDown);
-        }
-        let started = tokio::time::Instant::now();
-        let mut deadline = started
+        let deadline = tokio::time::Instant::now()
             .checked_add(self.pool.config.setup_timeout)
             .ok_or(SessionConsumerClientError::Deadline)?;
-        if let Some(pre_request_deadline) = self
-            .pool
-            .client
-            .pre_request_connection_timeout
-            .and_then(|timeout| started.checked_add(timeout))
-        {
-            deadline = deadline.min(pre_request_deadline);
-        }
-        match self.pool.begin_warm_lane()? {
-            Ok(leader) => leader.complete(self.establish_one_warm_request_lane(deadline).await),
-            Err(flight) => self.join_warm_request_lane(flight, deadline).await,
-        }
+        self.ensure_warm_request_capacity_before(deadline).await
     }
 
     /// Return a conservative local authenticated-idle-capacity snapshot.
@@ -9838,9 +9871,10 @@ fn prepared_voter_index(cursor: usize, voter_count: usize) -> usize {
 }
 
 const PREPARED_READY: u8 = 0;
-const PREPARED_DISPATCHING: u8 = 1;
-const PREPARED_RECEIPT_ONLY: u8 = 2;
-const PREPARED_TERMINAL: u8 = 3;
+const PREPARED_PREPARING: u8 = 1;
+const PREPARED_DISPATCHING: u8 = 2;
+const PREPARED_RECEIPT_ONLY: u8 = 3;
+const PREPARED_TERMINAL: u8 = 4;
 
 struct PreparedRequestState {
     phase: AtomicU8,
@@ -9867,19 +9901,24 @@ impl PreparedRequestState {
         }
     }
 
-    fn begin_dispatch(&self) -> Result<PreparedDispatchGuard<'_>, ()> {
+    fn begin_preparation(&self) -> Result<PreparedPreparationGuard<'_>, ()> {
         self.phase
             .compare_exchange(
                 PREPARED_READY,
-                PREPARED_DISPATCHING,
+                PREPARED_PREPARING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map(|_| PreparedDispatchGuard {
+            .map(|_| PreparedPreparationGuard {
                 state: self,
-                terminal: false,
+                completed: false,
             })
             .map_err(|_| ())
+    }
+
+    #[cfg(test)]
+    fn begin_dispatch(&self) -> Result<PreparedDispatchGuard<'_>, ()> {
+        self.begin_preparation()?.begin_dispatch().map_err(|_| ())
     }
 
     fn not_transmitted(&self) {
@@ -9930,6 +9969,52 @@ impl PreparedRequestState {
     }
 }
 
+/// Owns the pre-dispatch setup phase while the async execute future warms an
+/// authenticated request lane. No application request can be written in this
+/// phase, so cancellation safely returns the exact token to `READY`.
+struct PreparedPreparationGuard<'a> {
+    state: &'a PreparedRequestState,
+    completed: bool,
+}
+
+impl<'a> PreparedPreparationGuard<'a> {
+    fn begin_dispatch(mut self) -> Result<PreparedDispatchGuard<'a>, PreparedPreparationGuard<'a>> {
+        match self.state.phase.compare_exchange(
+            PREPARED_PREPARING,
+            PREPARED_DISPATCHING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.completed = true;
+                Ok(PreparedDispatchGuard {
+                    state: self.state,
+                    terminal: false,
+                })
+            }
+            Err(_) => Err(self),
+        }
+    }
+
+    fn terminal(&mut self) {
+        self.state.terminal();
+        self.completed = true;
+    }
+}
+
+impl Drop for PreparedPreparationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.state.phase.compare_exchange(
+                PREPARED_PREPARING,
+                PREPARED_READY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
 /// Owns a dispatch phase while the async execute future is alive. Dropping it
 /// is conservative: a cancellation can race physical write progress, so the
 /// retained request is permanently receipt-only.
@@ -9955,6 +10040,17 @@ impl Drop for PreparedDispatchGuard<'_> {
         if !self.terminal {
             self.state.receipt_only();
         }
+    }
+}
+
+fn terminal_prepared_execution(
+    preparation: &mut Option<PreparedPreparationGuard<'_>>,
+    dispatch: &mut Option<PreparedDispatchGuard<'_>>,
+) {
+    if let Some(dispatch) = dispatch.as_mut() {
+        dispatch.terminal();
+    } else if let Some(preparation) = preparation.as_mut() {
+        preparation.terminal();
     }
 }
 
@@ -10074,21 +10170,52 @@ impl PersistentPreparedCompareAndSetToken {
     async fn execute_once(
         &self,
     ) -> Result<PreparedCompareAndSetOutcome, PreparedCompareAndSetExecuteError> {
-        let mut dispatch = self
-            .state
-            .begin_dispatch()
-            .map_err(|_| PreparedCompareAndSetExecuteError::AlreadyExecuted)?;
+        let mut preparation = Some(
+            self.state
+                .begin_preparation()
+                .map_err(|_| PreparedCompareAndSetExecuteError::AlreadyExecuted)?,
+        );
+        let mut dispatch: Option<PreparedDispatchGuard<'_>> = None;
         for _ in 0..self.router.clients.len() {
+            let client = self.router.mutation_client(&self.state.mutation_cursor);
+            match client
+                .ensure_warm_request_capacity_before(self.budget.original_deadline())
+                .await
+            {
+                Ok(()) => {}
+                Err(SessionConsumerClientError::Scope) => {
+                    terminal_prepared_execution(&mut preparation, &mut dispatch);
+                    return Err(PreparedCompareAndSetExecuteError::TopologyAuthorityRevoked);
+                }
+                Err(_) => {
+                    self.state.not_transmitted();
+                    continue;
+                }
+            }
             let now = tokio::time::Instant::now();
-            let deadline = self.budget.original_deadline().min(
-                now.checked_add(self.budget.physical_attempt_timeout())
-                    .ok_or(PreparedCompareAndSetExecuteError::NotTransmitted)?,
-            );
+            let Some(physical_deadline) = now.checked_add(self.budget.physical_attempt_timeout())
+            else {
+                terminal_prepared_execution(&mut preparation, &mut dispatch);
+                return Err(PreparedCompareAndSetExecuteError::NotTransmitted);
+            };
+            let deadline = self.budget.original_deadline().min(physical_deadline);
             if deadline <= now {
-                dispatch.terminal();
+                terminal_prepared_execution(&mut preparation, &mut dispatch);
                 return Err(PreparedCompareAndSetExecuteError::NotTransmitted);
             }
-            let client = self.router.mutation_client(&self.state.mutation_cursor);
+            let dispatch = match dispatch.as_mut() {
+                Some(dispatch) => dispatch,
+                None => {
+                    let preparation = preparation
+                        .take()
+                        .ok_or(PreparedCompareAndSetExecuteError::AlreadyExecuted)?;
+                    dispatch.insert(
+                        preparation
+                            .begin_dispatch()
+                            .map_err(|_| PreparedCompareAndSetExecuteError::AlreadyExecuted)?,
+                    )
+                }
+            };
             match client
                 .execute_classified_before(&self.request, deadline, 1)
                 .await
@@ -10141,7 +10268,7 @@ impl PersistentPreparedCompareAndSetToken {
                 }
             }
         }
-        dispatch.terminal();
+        terminal_prepared_execution(&mut preparation, &mut dispatch);
         Err(PreparedCompareAndSetExecuteError::NotTransmitted)
     }
 
@@ -10169,11 +10296,27 @@ impl PersistentPreparedCompareAndSetToken {
         if deadline <= now || deadline > self.budget.original_deadline() {
             return Err(PreparedCompareAndSetStatusError::Deadline);
         }
+        let client = self.router.receipt_client(&self.state.status_cursor);
+        match client.ensure_warm_request_capacity_before(deadline).await {
+            Ok(()) => {}
+            Err(SessionConsumerClientError::Scope) => {
+                return self.terminal_receipt(Err(
+                    PreparedCompareAndSetStatusError::TopologyAuthorityRevoked,
+                ));
+            }
+            Err(SessionConsumerClientError::Deadline) => {
+                return Err(PreparedCompareAndSetStatusError::Deadline);
+            }
+            Err(_) => return Err(PreparedCompareAndSetStatusError::Unavailable),
+        }
+        let now = tokio::time::Instant::now();
+        if deadline <= now {
+            return Err(PreparedCompareAndSetStatusError::Deadline);
+        }
         let attempt_deadline = deadline.min(
             now.checked_add(self.budget.physical_attempt_timeout())
                 .ok_or(PreparedCompareAndSetStatusError::Deadline)?,
         );
-        let client = self.router.receipt_client(&self.state.status_cursor);
         let result = match client
             .execute_classified_before(self.receipt_request(), attempt_deadline, 1)
             .await
@@ -10381,21 +10524,52 @@ fn classify_prepared_lease_acquire_rejection(
 
 impl PersistentPreparedLeaseAcquireToken {
     async fn execute_once(&self) -> Result<LeaseGuard, PreparedLeaseAcquireExecuteError> {
-        let mut dispatch = self
-            .state
-            .begin_dispatch()
-            .map_err(|_| PreparedLeaseAcquireExecuteError::AlreadyExecuted)?;
+        let mut preparation = Some(
+            self.state
+                .begin_preparation()
+                .map_err(|_| PreparedLeaseAcquireExecuteError::AlreadyExecuted)?,
+        );
+        let mut dispatch: Option<PreparedDispatchGuard<'_>> = None;
         for _ in 0..self.router.clients.len() {
+            let client = self.router.mutation_client(&self.state.mutation_cursor);
+            match client
+                .ensure_warm_request_capacity_before(self.budget.original_deadline())
+                .await
+            {
+                Ok(()) => {}
+                Err(SessionConsumerClientError::Scope) => {
+                    terminal_prepared_execution(&mut preparation, &mut dispatch);
+                    return Err(PreparedLeaseAcquireExecuteError::TopologyAuthorityRevoked);
+                }
+                Err(_) => {
+                    self.state.not_transmitted();
+                    continue;
+                }
+            }
             let now = tokio::time::Instant::now();
-            let deadline = self.budget.original_deadline().min(
-                now.checked_add(self.budget.physical_attempt_timeout())
-                    .ok_or(PreparedLeaseAcquireExecuteError::NotTransmitted)?,
-            );
+            let Some(physical_deadline) = now.checked_add(self.budget.physical_attempt_timeout())
+            else {
+                terminal_prepared_execution(&mut preparation, &mut dispatch);
+                return Err(PreparedLeaseAcquireExecuteError::NotTransmitted);
+            };
+            let deadline = self.budget.original_deadline().min(physical_deadline);
             if deadline <= now {
-                dispatch.terminal();
+                terminal_prepared_execution(&mut preparation, &mut dispatch);
                 return Err(PreparedLeaseAcquireExecuteError::NotTransmitted);
             }
-            let client = self.router.mutation_client(&self.state.mutation_cursor);
+            let dispatch = match dispatch.as_mut() {
+                Some(dispatch) => dispatch,
+                None => {
+                    let preparation = preparation
+                        .take()
+                        .ok_or(PreparedLeaseAcquireExecuteError::AlreadyExecuted)?;
+                    dispatch.insert(
+                        preparation
+                            .begin_dispatch()
+                            .map_err(|_| PreparedLeaseAcquireExecuteError::AlreadyExecuted)?,
+                    )
+                }
+            };
             match client
                 .execute_classified_before(&self.request, deadline, 1)
                 .await
@@ -10438,7 +10612,7 @@ impl PersistentPreparedLeaseAcquireToken {
                 }
             }
         }
-        dispatch.terminal();
+        terminal_prepared_execution(&mut preparation, &mut dispatch);
         Err(PreparedLeaseAcquireExecuteError::NotTransmitted)
     }
 
@@ -10465,11 +10639,27 @@ impl PersistentPreparedLeaseAcquireToken {
         if deadline <= now || deadline > self.budget.original_deadline() {
             return Err(PreparedLeaseAcquireStatusError::Deadline);
         }
+        let client = self.router.receipt_client(&self.state.status_cursor);
+        match client.ensure_warm_request_capacity_before(deadline).await {
+            Ok(()) => {}
+            Err(SessionConsumerClientError::Scope) => {
+                return self.terminal_receipt(Err(
+                    PreparedLeaseAcquireStatusError::TopologyAuthorityRevoked,
+                ));
+            }
+            Err(SessionConsumerClientError::Deadline) => {
+                return Err(PreparedLeaseAcquireStatusError::Deadline);
+            }
+            Err(_) => return Err(PreparedLeaseAcquireStatusError::Unavailable),
+        }
+        let now = tokio::time::Instant::now();
+        if deadline <= now {
+            return Err(PreparedLeaseAcquireStatusError::Deadline);
+        }
         let deadline = deadline.min(
             now.checked_add(self.budget.physical_attempt_timeout())
                 .ok_or(PreparedLeaseAcquireStatusError::Deadline)?,
         );
-        let client = self.router.receipt_client(&self.state.status_cursor);
         let result = match client
             .execute_classified_before(self.receipt_request(), deadline, 1)
             .await
@@ -12328,7 +12518,7 @@ mod tests {
         MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
         MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS, PREPARED_DISPATCHING,
-        PREPARED_RECEIPT_ONLY,
+        PREPARED_PREPARING, PREPARED_READY, PREPARED_RECEIPT_ONLY, PREPARED_TERMINAL,
     };
     use bytes::Bytes;
     use futures_util::FutureExt as _;
@@ -12400,6 +12590,26 @@ mod tests {
         assert!(state.begin_status().is_err());
         drop(first);
         assert!(state.begin_status().is_ok());
+    }
+
+    #[test]
+    fn cancelled_preparation_restores_exact_token_without_dispatch_authority() {
+        let state = PreparedRequestState::new(3);
+        let preparation = state.begin_preparation().expect("preparation guard");
+        assert_eq!(state.phase.load(Ordering::Acquire), PREPARED_PREPARING);
+        assert!(state.begin_preparation().is_err());
+        drop(preparation);
+        assert_eq!(state.phase.load(Ordering::Acquire), PREPARED_READY);
+        assert_eq!(state.mutation_cursor.load(Ordering::Acquire), 3);
+        assert_eq!(state.status_cursor.load(Ordering::Acquire), 4);
+
+        let mut dispatch = state
+            .begin_preparation()
+            .expect("replacement preparation guard")
+            .begin_dispatch()
+            .unwrap_or_else(|_| panic!("replacement dispatch guard"));
+        dispatch.terminal();
+        assert_eq!(state.phase.load(Ordering::Acquire), PREPARED_TERMINAL);
     }
 
     // RED: dropping an execute future after dispatch ownership is acquired
@@ -12877,6 +13087,122 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn receipt_only_cas_and_lease_reject_reexecution_before_cold_setup() {
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let resolving = Arc::clone(&resolver_calls);
+        let material = RotatableClientMaterial::new(
+            material_spiffe("receipt-only-reexecution-client").as_str(),
+        );
+        let client = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver_unattested_for_test(
+                Arc::new(move || {
+                    resolving.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok("127.0.0.1:9".parse().expect("test address")) })
+                }),
+                rustls_pki_types::ServerName::try_from("consumer.test").expect("test server name"),
+                material_spiffe("receipt-only-reexecution-voter"),
+                scope(),
+                material.config(),
+            ),
+        )
+        .expect("cold receipt-only client");
+        let router = Arc::new(PreparedConsumerRouter {
+            clients: Arc::from([client]),
+            scope: scope(),
+            origin_cursor: AtomicUsize::new(0),
+        });
+        let cas_request = unprotected_router_state_test_compare_and_set_request(scope()).await;
+        let lease_key = SessionKey {
+            tenant: TenantId::new("receipt-only-reexecution").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"receipt-only-reexecution")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        let cas = PersistentPreparedCompareAndSetToken {
+            router: Arc::clone(&router),
+            request: Arc::new(cas_request),
+            receipt: OnceLock::new(),
+            budget: PreparedCheckpointBudget::new(deadline, Duration::from_millis(10))
+                .expect("expired CAS reexecution budget"),
+            state: PreparedRequestState::new(4),
+            terminal_receipt: StdMutex::new(None),
+        };
+        let lease = PersistentPreparedLeaseAcquireToken {
+            router,
+            request: Arc::new(SessionConsumerRequest::new(
+                scope(),
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::AcquireLease {
+                    key: lease_key,
+                    owner: OwnerId::new("receipt-only-reexecution-owner").expect("test owner"),
+                    ttl: Duration::from_secs(30),
+                },
+            )),
+            receipt: OnceLock::new(),
+            budget: PreparedCheckpointBudget::new(deadline, Duration::from_millis(10))
+                .expect("expired lease reexecution budget"),
+            state: PreparedRequestState::new(9),
+            terminal_receipt: StdMutex::new(None),
+        };
+        let mut cas_dispatch = cas.state.begin_dispatch().expect("CAS dispatch guard");
+        cas_dispatch.receipt_only();
+        drop(cas_dispatch);
+        let mut lease_dispatch = lease.state.begin_dispatch().expect("lease dispatch guard");
+        lease_dispatch.receipt_only();
+        drop(lease_dispatch);
+        let cas_cursors = (
+            cas.state.mutation_cursor.load(Ordering::Acquire),
+            cas.state.status_cursor.load(Ordering::Acquire),
+        );
+        let lease_cursors = (
+            lease.state.mutation_cursor.load(Ordering::Acquire),
+            lease.state.status_cursor.load(Ordering::Acquire),
+        );
+
+        tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
+        assert_eq!(
+            cas.execute_once().await,
+            Err(PreparedCompareAndSetExecuteError::AlreadyExecuted)
+        );
+        assert_eq!(
+            lease.execute_once().await,
+            Err(PreparedLeaseAcquireExecuteError::AlreadyExecuted)
+        );
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            0,
+            "sealed tokens reject before resolver, TLS, Hello, or mutation work"
+        );
+        assert_eq!(
+            cas.state.phase.load(Ordering::Acquire),
+            PREPARED_RECEIPT_ONLY
+        );
+        assert_eq!(
+            lease.state.phase.load(Ordering::Acquire),
+            PREPARED_RECEIPT_ONLY
+        );
+        assert!(cas.state.status_allowed());
+        assert!(lease.state.status_allowed());
+        assert_eq!(
+            cas_cursors,
+            (
+                cas.state.mutation_cursor.load(Ordering::Acquire),
+                cas.state.status_cursor.load(Ordering::Acquire),
+            )
+        );
+        assert_eq!(
+            lease_cursors,
+            (
+                lease.state.mutation_cursor.load(Ordering::Acquire),
+                lease.state.status_cursor.load(Ordering::Acquire),
+            )
+        );
+    }
+
     /// A scripted persistent-consumer convergence exercise for the router's
     /// transport state machine only. It deliberately uses a context-free
     /// request and private token construction, so it makes no protected
@@ -12885,7 +13211,7 @@ mod tests {
     /// the immutable CAS then deliberately withholds its response, and the
     /// first receipt is read from A (the voter immediately after C).
     #[tokio::test]
-    async fn prepared_cas_three_voter_response_loss_converges_via_next_receipt_voter() {
+    async fn prepared_cas_response_loss_warms_the_cold_receipt_voter() {
         let client_identity = material_spiffe("prepared-cas-router-client");
         let voter_a_identity = material_spiffe("prepared-cas-router-a");
         let voter_b_identity = material_spiffe("prepared-cas-router-b");
@@ -12962,6 +13288,7 @@ mod tests {
                             "scripted before-call-write A failure",
                         ))
                     } else {
+                        tokio::time::sleep(Duration::from_millis(75)).await;
                         Ok(a_address)
                     }
                 })
@@ -13016,6 +13343,10 @@ mod tests {
             ),
         )
         .expect("C persistent client");
+        client_c
+            .ensure_warm_request_capacity()
+            .await
+            .expect("the mutation voter starts warm while the receipt successor stays cold");
         let router = Arc::new(
             PreparedConsumerRouter::persistent([client_a, client_b, client_c])
                 .expect("three distinct same-scope voters"),
@@ -13028,9 +13359,9 @@ mod tests {
             receipt: OnceLock::new(),
             budget: PreparedCheckpointBudget::new(
                 tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_millis(250),
+                Duration::from_millis(25),
             )
-            .expect("explicit 250ms physical budget"),
+            .expect("explicit 25ms physical budget"),
             state: PreparedRequestState::new(0),
             terminal_receipt: StdMutex::new(None),
         };
@@ -13042,7 +13373,11 @@ mod tests {
         );
         assert_eq!(a_resolution_calls.load(Ordering::SeqCst), 1);
         assert_eq!(b_resolution_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(c_resolution_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            c_resolution_calls.load(Ordering::SeqCst),
+            2,
+            "the explicit prewarm and exact prepared-capacity proof each resolve once"
+        );
         assert_eq!(c_mutation_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             c_mutations.lock().expect("C mutation log").as_slice(),
@@ -13082,6 +13417,196 @@ mod tests {
 
         a_server.abort_and_wait().await;
         c_server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn later_voter_scope_failure_after_prewrite_dispatch_is_terminal() {
+        let client_identity = material_spiffe("prepared-scope-client");
+        let voter_identities = [
+            material_spiffe("prepared-scope-voter-a"),
+            material_spiffe("prepared-scope-voter-b"),
+            material_spiffe("prepared-scope-voter-c"),
+        ];
+        let client_material = RotatableClientMaterial::new(client_identity.as_str());
+        let roster = test_consumer_roster_for(&voter_identities);
+        let authority_a = voter_authority_for_identity(&roster, &voter_identities[0]);
+        let authority_b = voter_authority_for_identity(&roster, &voter_identities[1]);
+        let authority_c = voter_authority_for_identity(&roster, &voter_identities[2]);
+        let grant = opc_session_store::SessionConsumerAuthorizationGrant::try_new(
+            client_identity.clone(),
+            [SessionConsumerTenantNfScope::new(
+                TenantId::new("prepared-router-cas").expect("test tenant"),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("prepared scope grant");
+        let authorizer_a = SessionConsumerAuthorizer::try_new(
+            roster
+                .clone()
+                .authorization_manifest(authority_a.node_id(), [grant])
+                .expect("A consumer manifest"),
+        )
+        .expect("A prepared scope authorizer");
+
+        let foreign_identities = [
+            material_spiffe("prepared-scope-foreign-a"),
+            material_spiffe("prepared-scope-foreign-b"),
+            material_spiffe("prepared-scope-foreign-c"),
+        ];
+        let foreign_roster = test_consumer_roster_for(&foreign_identities);
+        let foreign_authority =
+            voter_authority_for_identity(&foreign_roster, &foreign_identities[1]);
+        let foreign_grant = opc_session_store::SessionConsumerAuthorizationGrant::try_new(
+            client_identity,
+            [SessionConsumerTenantNfScope::new(
+                TenantId::new("prepared-router-cas").expect("test tenant"),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("foreign prepared scope grant");
+        let authorizer_b = SessionConsumerAuthorizer::try_new(
+            foreign_roster
+                .authorization_manifest(foreign_authority.node_id(), [foreign_grant])
+                .expect("foreign consumer manifest"),
+        )
+        .expect("foreign prepared scope authorizer");
+
+        let a_service_calls = Arc::new(AtomicUsize::new(0));
+        let b_service_calls = Arc::new(AtomicUsize::new(0));
+        let (a_server, a_address) = SessionQuorumConsumerServer::new(
+            Arc::new(AuthorityRejectingTestConsumer {
+                calls: Arc::clone(&a_service_calls),
+            }),
+            client_material.trusted_server_config(voter_identities[0].as_str()),
+            authorizer_a,
+        )
+        .listen("127.0.0.1:0".parse().expect("A listener"))
+        .await
+        .expect("A listener starts");
+        let (b_server, b_address) = SessionQuorumConsumerServer::new(
+            Arc::new(AuthorityRejectingTestConsumer {
+                calls: Arc::clone(&b_service_calls),
+            }),
+            client_material.trusted_server_config(voter_identities[1].as_str()),
+            authorizer_b,
+        )
+        .listen("127.0.0.1:0".parse().expect("B listener"))
+        .await
+        .expect("B listener starts");
+
+        let a_resolution_calls = Arc::new(AtomicUsize::new(0));
+        let a_resolver: RemoteAddrResolver = {
+            let calls = Arc::clone(&a_resolution_calls);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(a_address) })
+            })
+        };
+        let b_resolution_calls = Arc::new(AtomicUsize::new(0));
+        let b_resolver: RemoteAddrResolver = {
+            let calls = Arc::clone(&b_resolution_calls);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(b_address) })
+            })
+        };
+        let c_resolution_calls = Arc::new(AtomicUsize::new(0));
+        let c_resolver: RemoteAddrResolver = {
+            let calls = Arc::clone(&c_resolution_calls);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "C must never be selected after authority revocation",
+                    ))
+                })
+            })
+        };
+        let client_a = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver(
+                a_resolver,
+                rustls_pki_types::ServerName::IpAddress(a_address.ip().into()),
+                authority_a,
+                client_material.config(),
+            ),
+        )
+        .expect("A persistent client");
+        let client_b = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver(
+                b_resolver,
+                rustls_pki_types::ServerName::IpAddress(b_address.ip().into()),
+                authority_b,
+                client_material.config(),
+            ),
+        )
+        .expect("B persistent client");
+        let client_c = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver(
+                c_resolver,
+                rustls_pki_types::ServerName::try_from("consumer.test").expect("C server name"),
+                authority_c,
+                client_material.config(),
+            ),
+        )
+        .expect("C persistent client");
+        client_a
+            .pool
+            .test_hooks
+            .warm_return_pause_once
+            .store(true, Ordering::SeqCst);
+        let warm_return_entered = Arc::clone(&client_a.pool.test_hooks.warm_return_entered);
+        let shutdown_client_a = client_a.clone();
+        let warm_return_release = Arc::clone(&client_a.pool.test_hooks.warm_return_release);
+        let router = Arc::new(
+            PreparedConsumerRouter::persistent([client_a, client_b, client_c])
+                .expect("three exact prepared voters"),
+        );
+        let token = Arc::new(PersistentPreparedCompareAndSetToken {
+            router,
+            request: Arc::new(
+                unprotected_router_state_test_compare_and_set_request(roster.scope()).await,
+            ),
+            receipt: OnceLock::new(),
+            budget: PreparedCheckpointBudget::new(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(250),
+            )
+            .expect("prepared scope budget"),
+            state: PreparedRequestState::new(0),
+            terminal_receipt: StdMutex::new(None),
+        });
+        let warm_return_observed = warm_return_entered.notified();
+        let executing = {
+            let token = Arc::clone(&token);
+            tokio::spawn(async move { token.execute_once().await })
+        };
+        warm_return_observed.await;
+        shutdown_client_a.pool.start_shutdown();
+        warm_return_release.notify_waiters();
+
+        assert_eq!(
+            executing.await.expect("prepared execution joins"),
+            Err(PreparedCompareAndSetExecuteError::TopologyAuthorityRevoked)
+        );
+        assert_eq!(token.state.phase.load(Ordering::Acquire), PREPARED_TERMINAL);
+        assert!(!token.state.status_allowed());
+        assert_eq!(token.state.mutation_cursor.load(Ordering::Acquire), 1);
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(50))
+                .await,
+            Err(PreparedCompareAndSetStatusError::NotExecuted),
+            "authority revocation is terminal and starts no receipt lookup"
+        );
+        assert_eq!(a_resolution_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(b_resolution_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(c_resolution_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(a_service_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(b_service_calls.load(Ordering::SeqCst), 0);
+
+        a_server.abort_and_wait().await;
+        b_server.abort_and_wait().await;
     }
 
     // Reproduces the old race precisely: clone A sampled status state but was
@@ -13360,7 +13885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_cas_healthy_persistent_success_never_reads_a_receipt() {
+    async fn prepared_cas_cold_setup_precedes_the_physical_attempt_budget() {
         let client_identity = material_spiffe("prepared-cas-healthy-client");
         let voter_identity = material_spiffe("prepared-cas-healthy-voter");
         let client_material = RotatableClientMaterial::new(client_identity.as_str());
@@ -13383,16 +13908,32 @@ mod tests {
         .listen("127.0.0.1:0".parse().expect("healthy listener"))
         .await
         .expect("healthy listener starts");
+        let delayed_resolver: RemoteAddrResolver = Arc::new(move || {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                Ok(address)
+            })
+        });
         let client = PersistentSessionConsumerClient::from_stateless(
-            StatelessSessionConsumerClient::new_unattested_for_test(
-                address,
+            StatelessSessionConsumerClient::new_with_resolver_unattested_for_test(
+                delayed_resolver,
                 rustls_pki_types::ServerName::IpAddress(address.ip().into()),
                 voter_identity,
                 scope(),
                 client_material.config(),
-            ),
+            )
+            .with_idle_timeout(Duration::from_millis(250)),
         )
         .expect("healthy persistent client");
+        client
+            .ensure_warm_request_capacity()
+            .await
+            .expect("initial CAS lane warmup");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !client.readiness().await.ready,
+            "the prepared CAS starts only after its authenticated lane was reaped"
+        );
         let router = Arc::new(
             PreparedConsumerRouter::persistent([client]).expect("one healthy same-scope voter"),
         );
@@ -13405,9 +13946,9 @@ mod tests {
             receipt: OnceLock::new(),
             budget: PreparedCheckpointBudget::new(
                 tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_millis(250),
+                Duration::from_millis(25),
             )
-            .expect("explicit healthy attempt budget"),
+            .expect("explicit cold-setup attempt budget"),
             state: PreparedRequestState::new(0),
             terminal_receipt: StdMutex::new(None),
         };
@@ -13438,7 +13979,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_lease_healthy_persistent_success_never_reads_a_receipt() {
+    async fn prepared_lease_cold_setup_precedes_the_physical_attempt_budget() {
         let client_identity = material_spiffe("prepared-lease-healthy-client");
         let voter_identity = material_spiffe("prepared-lease-healthy-voter");
         let client_material = RotatableClientMaterial::new(client_identity.as_str());
@@ -13476,16 +14017,32 @@ mod tests {
         .listen("127.0.0.1:0".parse().expect("healthy lease listener"))
         .await
         .expect("healthy lease listener starts");
+        let delayed_resolver: RemoteAddrResolver = Arc::new(move || {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                Ok(address)
+            })
+        });
         let client = PersistentSessionConsumerClient::from_stateless(
-            StatelessSessionConsumerClient::new_unattested_for_test(
-                address,
+            StatelessSessionConsumerClient::new_with_resolver_unattested_for_test(
+                delayed_resolver,
                 rustls_pki_types::ServerName::IpAddress(address.ip().into()),
                 voter_identity,
                 scope(),
                 client_material.config(),
-            ),
+            )
+            .with_idle_timeout(Duration::from_millis(250)),
         )
         .expect("healthy lease persistent client");
+        client
+            .ensure_warm_request_capacity()
+            .await
+            .expect("initial lease lane warmup");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !client.readiness().await.ready,
+            "the prepared lease starts only after its authenticated lane was reaped"
+        );
         let wrapper = Arc::new(EncryptingSessionBackend::new(
             backend,
             Arc::new(MemoryKeyProvider::new()),
@@ -13501,9 +14058,9 @@ mod tests {
                 Duration::from_secs(30),
                 PreparedCheckpointBudget::new(
                     tokio::time::Instant::now() + Duration::from_secs(1),
-                    Duration::from_millis(250),
+                    Duration::from_millis(25),
                 )
-                .expect("explicit healthy lease attempt budget"),
+                .expect("explicit cold-setup lease attempt budget"),
             )
             .expect("prepare healthy lease");
 
