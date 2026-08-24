@@ -1672,7 +1672,6 @@ async fn pool_admission_consumes_the_original_complete_operation_deadline() {
     let client_spiffe = spiffe("admission-deadline-client");
     let (authorizer, scope, authority) = authorizer_and_scope(&client_spiffe, &server_spiffe).await;
     let service = Arc::new(ControlledConsumer::default());
-    service.arm_blocks(1);
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
         pki.server_config(&server_spiffe),
@@ -1681,7 +1680,25 @@ async fn pool_admission_consumes_the_original_complete_operation_deadline() {
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
     .await
     .expect("start consumer listener");
-    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let resolver_entered = Arc::new(Semaphore::new(0));
+    let resolver_release = Arc::new(Semaphore::new(0));
+    let resolver: RemoteAddrResolver = {
+        let entered = Arc::clone(&resolver_entered);
+        let release = Arc::clone(&resolver_release);
+        Arc::new(move || {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Box::pin(async move {
+                entered.add_permits(1);
+                release
+                    .acquire_owned()
+                    .await
+                    .expect("resolver release semaphore")
+                    .forget();
+                Ok(address)
+            })
+        })
+    };
     let stateless = StatelessSessionConsumerClient::new_with_resolver(
         resolver,
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
@@ -1691,13 +1708,15 @@ async fn pool_admission_consumes_the_original_complete_operation_deadline() {
     .with_operation_timeout(Duration::from_millis(240));
     let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config(1, 1, 1))
         .expect("persistent client");
-    client.prewarm().await.expect("prewarm the sole lane");
-
-    let first = {
+    let holder = {
         let client = client.clone();
-        tokio::spawn(async move { client.capabilities().await })
+        tokio::spawn(async move { client.prewarm().await })
     };
-    service.wait_until_entered(1).await;
+    tokio::time::timeout(Duration::from_secs(1), resolver_entered.acquire())
+        .await
+        .expect("prewarm reaches resolver")
+        .expect("resolver semaphore")
+        .forget();
     let queued = {
         let client = client.clone();
         tokio::spawn(async move {
@@ -1721,12 +1740,15 @@ async fn pool_admission_consumes_the_original_complete_operation_deadline() {
     );
     assert_eq!(
         service.calls.load(Ordering::SeqCst),
-        1,
-        "a lane-admission deadline cannot dispatch a second request"
+        0,
+        "a lane-admission deadline cannot dispatch a request"
     );
 
-    service.release();
-    let _ = first.await.expect("first caller task");
+    resolver_release.add_permits(1);
+    holder
+        .await
+        .expect("prewarm task")
+        .expect("prewarm the sole lane");
     client.shutdown().await;
     handle.abort_and_wait().await;
 }
