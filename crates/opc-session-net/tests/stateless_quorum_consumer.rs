@@ -268,6 +268,8 @@ impl GatedReadBarrierPeer {
     }
 }
 
+static THREE_VOTER_FLEET_TEST_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 struct ThreeVoterConsumerFleet {
     manifest: Arc<SessionReplicationManifest>,
     topologies: Vec<ValidatedQuorumTopology>,
@@ -285,6 +287,7 @@ struct ThreeVoterConsumerFleet {
     stores: Vec<ConsensusSessionStore>,
     _backends: Vec<SqliteSessionBackend>,
     _directory: tempfile::TempDir,
+    _test_gate: tokio::sync::SemaphorePermit<'static>,
 }
 
 impl Drop for ThreeVoterConsumerFleet {
@@ -299,6 +302,10 @@ impl Drop for ThreeVoterConsumerFleet {
 
 impl ThreeVoterConsumerFleet {
     async fn start(pki: Arc<TestPki>, read_barrier_delay: Option<Duration>) -> Self {
+        let test_gate = THREE_VOTER_FLEET_TEST_GATE
+            .acquire()
+            .await
+            .expect("three-voter test gate remains open");
         let members = (0..THREE_VOTER_COUNT)
             .map(three_voter_member)
             .collect::<Vec<_>>();
@@ -459,6 +466,7 @@ impl ThreeVoterConsumerFleet {
             stores,
             _backends: backends,
             _directory: directory,
+            _test_gate: test_gate,
         };
         for result in futures_util::future::join_all(
             fleet
