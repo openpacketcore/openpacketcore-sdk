@@ -7103,6 +7103,9 @@ struct PersistentConsumerTestHooks {
     warm_probe_pause_once: AtomicBool,
     warm_probe_entered: Arc<Notify>,
     warm_probe_release: Arc<Notify>,
+    queued_lane_pause_once: AtomicBool,
+    queued_lane_assigned: Arc<Notify>,
+    queued_lane_release: Arc<Notify>,
 }
 
 #[cfg(test)]
@@ -7114,6 +7117,9 @@ impl PersistentConsumerTestHooks {
             warm_probe_pause_once: AtomicBool::new(false),
             warm_probe_entered: Arc::new(Notify::new()),
             warm_probe_release: Arc::new(Notify::new()),
+            queued_lane_pause_once: AtomicBool::new(false),
+            queued_lane_assigned: Arc::new(Notify::new()),
+            queued_lane_release: Arc::new(Notify::new()),
         }
     }
 }
@@ -7930,6 +7936,15 @@ impl PersistentSessionConsumerPool {
                 complete_before_deadline(lane, wait_deadline, late_error)?
             }
         };
+        #[cfg(test)]
+        if self
+            .test_hooks
+            .queued_lane_pause_once
+            .swap(false, Ordering::SeqCst)
+        {
+            self.test_hooks.queued_lane_assigned.notify_waiters();
+            self.test_hooks.queued_lane_release.notified().await;
+        }
         if self.phase() != PersistentShutdownPhase::Running {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
@@ -18846,6 +18861,67 @@ mod tests {
             ensure.await.expect("warm task"),
             Err(SessionConsumerClientError::Unavailable),
             "the external release wakes one bounded cold setup attempt"
+        );
+        persistent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_admission_releases_assigned_lane_before_warm_wake() {
+        let control = SessionReauthenticationControl::new();
+        let (stateless, _material) = stateless_test_client(control);
+        let config = PersistentSessionConsumerConfig::try_new(
+            1,
+            1,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(600),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("bounded one-lane test configuration");
+        let persistent = PersistentSessionConsumerClient::try_from_stateless(stateless, config)
+            .expect("valid persistent configuration");
+        let holder_pending = Arc::clone(&persistent.pool.pending)
+            .try_acquire_owned()
+            .expect("holder pending");
+        let holder_lane = Arc::clone(&persistent.pool.lanes)
+            .try_acquire_owned()
+            .expect("holder lane");
+        persistent
+            .pool
+            .test_hooks
+            .queued_lane_pause_once
+            .store(true, Ordering::SeqCst);
+        let assigned = persistent.pool.test_hooks.queued_lane_assigned.notified();
+        tokio::pin!(assigned);
+        assigned.as_mut().enable();
+        let pool = Arc::clone(&persistent.pool);
+        let queued = tokio::spawn(async move {
+            pool.admit_call(
+                tokio::time::Instant::now(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        drop(holder_lane);
+        drop(holder_pending);
+        assigned.await;
+        let changed = persistent.pool.warm_capacity_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        queued.abort();
+        changed.await;
+        assert_eq!(
+            persistent.pool.lanes.available_permits(),
+            1,
+            "lane releases before wake"
+        );
+        assert_eq!(
+            persistent.pool.pending.available_permits(),
+            2,
+            "pending releases before wake"
         );
         persistent.shutdown().await;
     }
