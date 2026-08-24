@@ -169,6 +169,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   this crate. Convergence-owned Linux route `rtm_protocol` and rule
   `FRA_PROTOCOL` use `LINUX_ROUTE_STEERING_PROTOCOL` (`242`). Missing, legacy,
   or other protocol values are foreign conflicts, never exact resident state.
+- The Linux singleton rule readback path has one narrow exception to that broad
+  family/priority key: stock, protocol-`242`-owned, same-table, source-only
+  rules with non-`/0` source prefixes that are provably disjoint may coexist as
+  siblings. It excludes only those proven siblings from the target's exact
+  candidate set. This is not a general sibling or priority-sharing rule: a
+  duplicate, overlap, wildcard, destination/firewall-mark selector, marker or
+  fixed-semantics mismatch, malformed reply, unfamiliar attribute, or any
+  unknown case remains a fail-closed conflict or indeterminate result.
 - A rule containing only a firewall mark uses Linux's IPv4 rule family (the
   same default used by `ip rule`). Source- or destination-qualified rules
   derive their family from that prefix. Legacy mutation and readback preserve
@@ -177,30 +185,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   `InvalidConfig`; Linux treats those values as delete wildcards. Mark masks
   remain nonzero for both APIs.
 - Bounded readback returns `ExactPresent` only for one fully representable
-  object. A modeled difference returns `Conflict`; malformed, incomplete,
-  oversized, unsupported, or unmodeled colliding state returns
-  `Indeterminate`. `AlreadyExists` alone is never idempotent success.
+  candidate, after the Linux-only proven-disjoint source-only sibling exception
+  above. A modeled difference returns `Conflict`; malformed, incomplete,
+  oversized, unsupported, unmodeled, or otherwise unknown colliding state
+  returns `Indeterminate`. `AlreadyExists` alone is never idempotent success.
 - Convergence reads before mutation and verifies again after a successful
   exclusive create. A collision introduced across that race is never reported
   as installed; the object owned by the call is removed and the typed outcome
   records conflict/indeterminate-after-rollback.
 - `remove_converged_route`/`remove_converged_rule` require exactly one owned
-  exact candidate immediately before deletion and verify the broad key is
-  absent afterward. Multiplicity, foreign protocol state, semantic route cache
-  expiry/error, or unfamiliar attributes fail closed without issuing a normal
-  delete. The original `remove_route`/`remove_rule` retain their legacy
-  best-effort semantics and are not ownership-safe APIs.
+  exact candidate immediately before deletion. Routes then verify their broad
+  key absent. Linux rule removal verifies that the exact target is absent while
+  preserving any stock, protocol-owned, same-table, source-only sibling with a
+  provably disjoint non-`/0` source prefix; it does not claim the entire broad
+  family/priority key is absent. Multiplicity, foreign protocol state, semantic
+  route cache expiry/error, malformed or unfamiliar attributes, and all other
+  unknown cases fail closed without issuing a normal delete. The original
+  `remove_route`/`remove_rule` retain their legacy best-effort semantics and
+  are not ownership-safe APIs.
 - Paired convergence handles the route first. If the rule cannot converge, it
   removes only objects installed by the same call and only after the exact
   ownership check succeeds. Post-install races can report owned rule, route,
   or combined rollback; ambiguous rollback returns a typed failure.
-- Singleton rule readback deliberately treats multiple candidates at one
-  family/priority collision key as ambiguous. The collection API is the
-  additive path for siblings at that key: construction permits more than one
-  rule only when every sibling is source-only, non-wildcard, and its prefix is
-  provably disjoint from every other sibling. Exact duplicates, overlapping
-  prefixes, destination or firewall-mark siblings, and wildcard selectors are
-  rejected before mutation.
+- Except for the narrow Linux-only proven-disjoint source-only sibling case,
+  singleton rule readback treats multiple candidates at one family/priority
+  collision key as ambiguous. The collection API remains the additive path for
+  siblings at that key: construction permits more than one rule only when every
+  sibling is source-only, non-wildcard, and its prefix is provably disjoint from
+  every other sibling. Exact duplicates, overlapping prefixes, destination or
+  firewall-mark siblings, and wildcard selectors are rejected before mutation.
 - `OwnedRouteRuleScope` makes collection authority explicit: one address
   family, route/rule table, route output interface and canonical metric, and
   rule priority. `OwnedRouteRuleSet` is the complete desired state for that
