@@ -4770,50 +4770,111 @@ mod production_runtime_cut_matrix_tests {
     use opc_types::{NetworkFunctionKind, TenantId};
     use p256::ecdsa::signature::hazmat::PrehashSigner;
     use p256::ecdsa::SigningKey;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Clone, Copy)]
     enum Cut {
+        BeforeAdmission,
+        AfterAdmission,
         PreparePending,
         PreparedBeforeRun,
+        RunOutcomeUnknown,
         AppliedBeforeFinalize,
-        FiveProofsBeforeSixthEffect,
-        AllSixBeforeTerminalRequest,
+        RosterCommittedBeforeSixthEffect,
+        SixthEffectOutcomeUnknown,
+        ConvergenceBeforeTerminalRequest,
+        TerminalCommitOutcomeUnknown,
+        TerminalCommittedBeforePublication,
+        PublicationBeforeAcknowledgement,
+        RestartAdoptionThroughout,
     }
 
     impl Cut {
-        const ALL: [Self; 5] = [
+        const ALL: [Self; 13] = [
+            Self::BeforeAdmission,
+            Self::AfterAdmission,
             Self::PreparePending,
             Self::PreparedBeforeRun,
+            Self::RunOutcomeUnknown,
             Self::AppliedBeforeFinalize,
-            Self::FiveProofsBeforeSixthEffect,
-            Self::AllSixBeforeTerminalRequest,
+            Self::RosterCommittedBeforeSixthEffect,
+            Self::SixthEffectOutcomeUnknown,
+            Self::ConvergenceBeforeTerminalRequest,
+            Self::TerminalCommitOutcomeUnknown,
+            Self::TerminalCommittedBeforePublication,
+            Self::PublicationBeforeAcknowledgement,
+            Self::RestartAdoptionThroughout,
         ];
 
         const fn name(self) -> &'static str {
             match self {
-                Self::PreparePending => "prepare-pending",
-                Self::PreparedBeforeRun => "prepared-before-run",
-                Self::AppliedBeforeFinalize => "applied-before-finalize",
-                Self::FiveProofsBeforeSixthEffect => "five-proofs-before-sixth-effect",
-                Self::AllSixBeforeTerminalRequest => "all-six-before-terminal-request",
+                Self::BeforeAdmission => "BeforeAdmission",
+                Self::AfterAdmission => "AfterAdmission",
+                Self::PreparePending => "PreparePending",
+                Self::PreparedBeforeRun => "PreparedBeforeRun",
+                Self::RunOutcomeUnknown => "RunOutcomeUnknown",
+                Self::AppliedBeforeFinalize => "AppliedBeforeFinalize",
+                Self::RosterCommittedBeforeSixthEffect => "RosterCommittedBeforeSixthEffect",
+                Self::SixthEffectOutcomeUnknown => "SixthEffectOutcomeUnknown",
+                Self::ConvergenceBeforeTerminalRequest => "ConvergenceBeforeTerminalRequest",
+                Self::TerminalCommitOutcomeUnknown => "TerminalCommitOutcomeUnknown",
+                Self::TerminalCommittedBeforePublication => "TerminalCommittedBeforePublication",
+                Self::PublicationBeforeAcknowledgement => "PublicationBeforeAcknowledgement",
+                Self::RestartAdoptionThroughout => "RestartAdoptionThroughout",
             }
         }
     }
 
     struct CutProvider {
         prepare_pending: bool,
+        execute_outcome_unknown: Option<u8>,
+        prepare_not_transmitted_once: AtomicBool,
+        execute_not_transmitted_once: AtomicBool,
         prepare_calls: AtomicUsize,
         execute_calls: AtomicUsize,
         status_calls: AtomicUsize,
         adopt_calls: AtomicUsize,
-        calls: Mutex<Vec<(ProviderOperation, u8, [u8; 16])>>,
+        calls: Mutex<Vec<(ProviderOperation, MemberCallSnapshot)>>,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct MemberCallSnapshot {
+        roster_id: [u8; 16],
+        admission_commitment: [u8; 32],
+        ordinal: u8,
+        operation_id: [u8; 16],
+        descriptor: Vec<u8>,
+        expected_version: u64,
+        fence: FenceToken,
+        lease_acquired_at: Timestamp,
+        lease_expires_at: Timestamp,
     }
 
     impl CutProvider {
         fn for_cut(cut: Cut) -> Self {
             Self {
                 prepare_pending: matches!(cut, Cut::PreparePending),
+                execute_outcome_unknown: match cut {
+                    Cut::RunOutcomeUnknown => Some(0),
+                    Cut::SixthEffectOutcomeUnknown => Some(5),
+                    _ => None,
+                },
+                prepare_not_transmitted_once: AtomicBool::new(false),
+                execute_not_transmitted_once: AtomicBool::new(false),
+                prepare_calls: AtomicUsize::new(0),
+                execute_calls: AtomicUsize::new(0),
+                status_calls: AtomicUsize::new(0),
+                adopt_calls: AtomicUsize::new(0),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_execute_outcome_unknown(ordinal: u8) -> Self {
+            Self {
+                prepare_pending: false,
+                execute_outcome_unknown: Some(ordinal),
+                prepare_not_transmitted_once: AtomicBool::new(false),
+                execute_not_transmitted_once: AtomicBool::new(false),
                 prepare_calls: AtomicUsize::new(0),
                 execute_calls: AtomicUsize::new(0),
                 status_calls: AtomicUsize::new(0),
@@ -4825,9 +4886,25 @@ mod production_runtime_cut_matrix_tests {
         fn record(&self, operation: ProviderOperation, call: &MemberCall<'_>) {
             self.calls.lock().expect("test provider call ledger").push((
                 operation,
-                call.ordinal(),
-                *call.operation_id().as_bytes(),
+                MemberCallSnapshot {
+                    roster_id: *call.roster_id().as_bytes(),
+                    admission_commitment: call.admission_commitment(),
+                    ordinal: call.ordinal(),
+                    operation_id: *call.operation_id().as_bytes(),
+                    descriptor: call.descriptor().to_vec(),
+                    expected_version: call.expected_version(),
+                    fence: call.current_fence(),
+                    lease_acquired_at: call.current_lease_acquired_at(),
+                    lease_expires_at: call.current_lease_expires_at(),
+                },
             ));
+        }
+
+        fn direct_not_transmitted_once(&self) {
+            self.prepare_not_transmitted_once
+                .store(true, Ordering::SeqCst);
+            self.execute_not_transmitted_once
+                .store(true, Ordering::SeqCst);
         }
 
         fn applied(call: &MemberCall<'_>) -> Result<ProviderCallOutcome, ()> {
@@ -4847,6 +4924,12 @@ mod production_runtime_cut_matrix_tests {
         async fn prepare(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
             self.prepare_calls.fetch_add(1, Ordering::SeqCst);
             self.record(ProviderOperation::Prepare, call);
+            if self
+                .prepare_not_transmitted_once
+                .swap(false, Ordering::SeqCst)
+            {
+                return Ok(ProviderCallOutcome::not_transmitted());
+            }
             if self.prepare_pending {
                 ProviderCallOutcome::pending(vec![0xB0, call.ordinal()]).map_err(|_| ())
             } else {
@@ -4857,6 +4940,15 @@ mod production_runtime_cut_matrix_tests {
         async fn execute(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
             self.record(ProviderOperation::Execute, call);
+            if self
+                .execute_not_transmitted_once
+                .swap(false, Ordering::SeqCst)
+            {
+                return Ok(ProviderCallOutcome::not_transmitted());
+            }
+            if self.execute_outcome_unknown == Some(call.ordinal()) {
+                return Ok(ProviderCallOutcome::outcome_unknown());
+            }
             Self::applied(call)
         }
 
@@ -4989,7 +5081,11 @@ mod production_runtime_cut_matrix_tests {
         current_authority: Option<AuthorityBinding>,
         committed: Option<CommittedTerminal>,
         compact_next_terminal: bool,
-        durable_mutations: usize,
+        lose_next_terminal_reply: bool,
+        next_admission_not_transmitted: bool,
+        next_terminal_not_transmitted: bool,
+        admission_mutation_calls: Vec<(Vec<u8>, Vec<u8>)>,
+        terminal_mutation_calls: Vec<(Vec<u8>, Vec<u8>)>,
     }
 
     #[derive(Default)]
@@ -4998,11 +5094,27 @@ mod production_runtime_cut_matrix_tests {
     }
 
     impl CutBackend {
-        fn mutations(&self) -> usize {
+        fn admission_calls(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
             self.state
                 .lock()
                 .expect("test backend state")
-                .durable_mutations
+                .admission_mutation_calls
+                .clone()
+        }
+
+        fn terminal_calls(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+            self.state
+                .lock()
+                .expect("test backend state")
+                .terminal_mutation_calls
+                .clone()
+        }
+
+        fn install_successor_authority(&self, authority: AuthorityBinding) {
+            self.state
+                .lock()
+                .expect("test backend state")
+                .current_authority = Some(authority);
         }
 
         fn compact_next_terminal(&self) {
@@ -5010,6 +5122,27 @@ mod production_runtime_cut_matrix_tests {
                 .lock()
                 .expect("test backend state")
                 .compact_next_terminal = true;
+        }
+
+        fn lose_next_terminal_reply(&self) {
+            self.state
+                .lock()
+                .expect("test backend state")
+                .lose_next_terminal_reply = true;
+        }
+
+        fn admission_not_transmitted_once(&self) {
+            self.state
+                .lock()
+                .expect("test backend state")
+                .next_admission_not_transmitted = true;
+        }
+
+        fn terminal_not_transmitted_once(&self) {
+            self.state
+                .lock()
+                .expect("test backend state")
+                .next_terminal_not_transmitted = true;
         }
 
         fn current(
@@ -5033,6 +5166,17 @@ mod production_runtime_cut_matrix_tests {
             request: &RegistrationRequest,
         ) -> Result<RegistrationDecision, Self::Error> {
             let mut state = self.state.lock().expect("test backend state");
+            state.admission_mutation_calls.push((
+                request.admission().body_commitment().to_vec(),
+                request
+                    .admission()
+                    .to_canonical_bytes()
+                    .expect("canonical test admission request"),
+            ));
+            if state.next_admission_not_transmitted {
+                state.next_admission_not_transmitted = false;
+                return Ok(RegistrationDecision::NotTransmitted);
+            }
             if state.admission.is_some() {
                 return Ok(RegistrationDecision::AdmissionReplayed);
             }
@@ -5045,7 +5189,6 @@ mod production_runtime_cut_matrix_tests {
             state.admission = Some(Arc::clone(&request.admission));
             state.registration = Some(registration);
             state.current_authority = Some(request.authority.clone());
-            state.durable_mutations += 1;
             Ok(RegistrationDecision::FreshlyAdmitted(registration))
         }
 
@@ -5084,7 +5227,7 @@ mod production_runtime_cut_matrix_tests {
             &self,
             request: &RecoveryRequest,
         ) -> Result<RegistrationDecision, Self::Error> {
-            let mut state = self.state.lock().expect("test backend state");
+            let state = self.state.lock().expect("test backend state");
             let Some(admission) = state.admission.as_ref() else {
                 return Ok(RegistrationDecision::Reject(BackendRejection::Authority));
             };
@@ -5098,16 +5241,13 @@ mod production_runtime_cut_matrix_tests {
                 || request.lookup().roster_id() != admission.roster_id()
                 || request.authority().key() != admission.key()
                 || request.authority().fence() <= admission.admission_fence()
-                || request.authority().fence() < current.fence()
+                || request.authority() != current
                 || request.authority().acquired_at() > Timestamp::now_utc()
                 || request.authority().expires_at() <= Timestamp::now_utc()
             {
                 return Ok(RegistrationDecision::Reject(BackendRejection::Authority));
             }
-            if request.authority().fence() > current.fence() {
-                state.current_authority = Some(request.authority().clone());
-            }
-            let admission = Arc::clone(state.admission.as_ref().expect("admission retained"));
+            let admission = Arc::clone(admission);
             if let Some(committed) = state.committed.clone() {
                 Ok(RegistrationDecision::Terminal {
                     registration,
@@ -5146,6 +5286,18 @@ mod production_runtime_cut_matrix_tests {
             request: TerminalizeRequest<'_>,
         ) -> Result<TerminalizeDecision, Self::Error> {
             let mut state = self.state.lock().expect("test backend state");
+            state.terminal_mutation_calls.push((
+                request.body().record().request_id().to_bytes().to_vec(),
+                request
+                    .body()
+                    .record()
+                    .to_canonical_bytes(request.admission())
+                    .expect("canonical test terminal request"),
+            ));
+            if state.next_terminal_not_transmitted {
+                state.next_terminal_not_transmitted = false;
+                return Ok(TerminalizeDecision::NotTransmitted);
+            }
             if !Self::current(
                 &state,
                 request.admission(),
@@ -5177,7 +5329,10 @@ mod production_runtime_cut_matrix_tests {
                 });
             }
             state.committed = Some(committed.clone());
-            state.durable_mutations += 1;
+            if state.lose_next_terminal_reply {
+                state.lose_next_terminal_reply = false;
+                return Err(());
+            }
             Ok(TerminalizeDecision::Terminalized(committed))
         }
     }
@@ -5388,6 +5543,29 @@ mod production_runtime_cut_matrix_tests {
         }
     }
 
+    async fn restarted_executor(
+        provider: Arc<CutProvider>,
+        backend: Arc<CutBackend>,
+        request: &RegistrationRequest,
+    ) -> (RosterExecutor<CutProvider, CutBackend>, Registration) {
+        let recovery = successor(request, 2);
+        // Recovery is a read: consensus's successor authority is deliberately
+        // installed by the test setup, not by the fake recovery method.
+        backend.install_successor_authority(recovery.authority().clone());
+        let second = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let registration = recovered(
+            second
+                .recover(recovery)
+                .await
+                .expect("read-only successor recovery"),
+        );
+        (second, registration)
+    }
+
     #[tokio::test]
     async fn production_runtime_recovery_cut_matrix_preserves_two_mutation_boundary() {
         for cut in Cut::ALL {
@@ -5395,264 +5573,607 @@ mod production_runtime_cut_matrix_tests {
             let request = request();
             let provider = Arc::new(CutProvider::for_cut(cut));
             let backend = Arc::new(CutBackend::default());
-            let first = executor(
+            let mut active = executor(
                 Arc::clone(&provider),
                 Arc::clone(&backend),
                 request.admission().scope(),
             );
-            let registration = first.register(request.clone()).await.expect(cut_name);
-            assert_eq!(
-                backend.mutations(),
-                1,
-                "{}: PollAdmitted is the sole durable mutation",
-                cut.name()
-            );
-            assert_eq!(
-                registration.admission().roster_id(),
-                request.admission().roster_id()
-            );
-            assert_eq!(
-                registration.admission().members(),
-                request.admission().members()
-            );
-            assert_eq!(
-                registration.admission().protected_plan(),
-                request.admission().protected_plan()
-            );
+            if matches!(cut, Cut::BeforeAdmission) {
+                drop(active);
+                active = executor(
+                    Arc::clone(&provider),
+                    Arc::clone(&backend),
+                    request.admission().scope(),
+                );
+            }
+            let mut registration = active.register(request.clone()).await.expect(cut_name);
+            let mut proofs = Vec::with_capacity(6);
+            let mut precrash_terminal_body = None;
 
+            let restart = matches!(
+                cut,
+                Cut::AfterAdmission
+                    | Cut::PreparePending
+                    | Cut::PreparedBeforeRun
+                    | Cut::RunOutcomeUnknown
+                    | Cut::AppliedBeforeFinalize
+                    | Cut::RosterCommittedBeforeSixthEffect
+                    | Cut::SixthEffectOutcomeUnknown
+                    | Cut::RestartAdoptionThroughout
+            );
             match cut {
+                Cut::AfterAdmission => {}
                 Cut::PreparePending => {
-                    // A local pending prepare does not create a second quorum mutation.
                     assert!(matches!(
-                        first.prepare(&registration, 0).await,
+                        active.prepare(&registration, 0).await,
                         Ok(CallResult::Pending)
                     ));
-                    let second = executor(
-                        Arc::clone(&provider),
-                        Arc::clone(&backend),
-                        request.admission().scope(),
-                    );
-                    let recovery = successor(&request, 2);
-                    let recovered = recovered(second.recover(recovery).await.expect(cut_name));
-                    assert!(matches!(
-                        second.execute(&recovered, 0).await,
-                        Err(ExecutorError::RecoveryRequired)
-                    ));
-                    assert!(matches!(
-                        second.status(&recovered, 0).await,
-                        Ok(CallResult::Conclusive(_))
-                    ));
-                    assert_eq!(
-                        provider.execute_calls.load(Ordering::SeqCst),
-                        0,
-                        "{}: recovery cannot replay execute",
-                        cut.name()
-                    );
                 }
                 Cut::PreparedBeforeRun => {
                     assert!(matches!(
-                        first.prepare(&registration, 0).await,
+                        active.prepare(&registration, 0).await,
+                        Ok(CallResult::PreparedNotRun)
+                    ));
+                }
+                Cut::RunOutcomeUnknown => {
+                    assert!(matches!(
+                        active.prepare(&registration, 0).await,
                         Ok(CallResult::PreparedNotRun)
                     ));
                     assert!(matches!(
-                        first.execute(&registration, 0).await,
-                        Ok(CallResult::Conclusive(_))
+                        active.execute(&registration, 0).await,
+                        Err(ExecutorError::OutcomeUnknown)
                     ));
-                    assert_eq!(
-                        backend.mutations(),
-                        1,
-                        "{}: provider work is local",
-                        cut.name()
-                    );
                 }
-                Cut::AppliedBeforeFinalize => {
-                    let mut proofs = Vec::with_capacity(6);
-                    for ordinal in 0_u8..6 {
-                        assert!(matches!(
-                            first.prepare(&registration, ordinal).await,
-                            Ok(CallResult::PreparedNotRun)
-                        ));
-                        proofs.push(conclusive(
-                            first.execute(&registration, ordinal).await.expect(cut_name),
-                        ));
-                    }
-                    let old_prepared = first
-                        .prepare_terminal(&registration, proofs.clone())
-                        .await
-                        .expect("complete old-fence body");
-                    let second = executor(
-                        Arc::clone(&provider),
-                        Arc::clone(&backend),
-                        request.admission().scope(),
-                    );
-                    let recovered = recovered(
-                        second
-                            .recover(successor(&request, 2))
-                            .await
-                            .expect(cut_name),
-                    );
-                    assert_eq!(
-                        recovered.admission().roster_id(),
-                        registration.admission().roster_id(),
-                        "{}: successor recovers the caller-owned stable roster ID",
-                        cut.name()
-                    );
-                    assert_eq!(
-                        recovered.admission().members(),
-                        registration.admission().members(),
-                        "{}: successor recovers the exact immutable member roster",
-                        cut.name()
-                    );
-                    assert!(matches!(
-                        first.terminalize(&registration, &old_prepared).await,
-                        Err(ExecutorError::AuthorityRejected)
-                    ));
-                    assert!(matches!(
-                        second.recover(expired_successor(&request)).await,
-                        Err(ExecutorError::AuthorityRejected)
-                    ));
-                    proofs.clear();
-                    for ordinal in 0_u8..6 {
-                        proofs.push(conclusive(
-                            second.status(&recovered, ordinal).await.expect(cut_name),
-                        ));
-                    }
-                    let prepared = second
-                        .prepare_terminal(&recovered, proofs)
-                        .await
-                        .expect(cut_name);
-                    assert_eq!(
-                        prepared.body.commitment(),
-                        old_prepared.body.commitment(),
-                        "{}: successor proof bindings change but terminal body remains stable",
-                        cut.name()
-                    );
-                    assert_eq!(backend.mutations(), 1, "{}: preparing is local", cut.name());
-                    assert!(
-                        matches!(
-                            first.recover(successor(&request, 1)).await,
-                            Err(ExecutorError::AuthorityRejected)
-                        ),
-                        "{}: stale authority is rejected",
-                        cut.name()
-                    );
-                    assert_eq!(
-                        second
-                            .terminalize(&recovered, &prepared)
-                            .await
-                            .expect(cut_name)
-                            .phase(),
-                        Phase::Established
-                    );
-                }
-                Cut::FiveProofsBeforeSixthEffect => {
+                Cut::RosterCommittedBeforeSixthEffect => {
                     for ordinal in 0_u8..5 {
                         assert!(matches!(
-                            first.prepare(&registration, ordinal).await,
-                            Ok(CallResult::PreparedNotRun)
-                        ));
-                        let _ = conclusive(
-                            first.execute(&registration, ordinal).await.expect(cut_name),
-                        );
-                    }
-                    let second = executor(
-                        Arc::clone(&provider),
-                        Arc::clone(&backend),
-                        request.admission().scope(),
-                    );
-                    let recovered = recovered(
-                        second
-                            .recover(successor(&request, 2))
-                            .await
-                            .expect(cut_name),
-                    );
-                    assert!(matches!(
-                        second.execute(&recovered, 5).await,
-                        Err(ExecutorError::RecoveryRequired)
-                    ));
-                    assert!(matches!(
-                        second.adopt(&recovered, 5).await,
-                        Ok(CallResult::Conclusive(_))
-                    ));
-                    assert_eq!(
-                        provider.execute_calls.load(Ordering::SeqCst),
-                        5,
-                        "{}: sixth effect is never replayed",
-                        cut.name()
-                    );
-                }
-                Cut::AllSixBeforeTerminalRequest => {
-                    let mut proofs = Vec::with_capacity(6);
-                    for ordinal in 0_u8..6 {
-                        assert!(matches!(
-                            first.prepare(&registration, ordinal).await,
+                            active.prepare(&registration, ordinal).await,
                             Ok(CallResult::PreparedNotRun)
                         ));
                         proofs.push(conclusive(
-                            first.execute(&registration, ordinal).await.expect(cut_name),
+                            active
+                                .execute(&registration, ordinal)
+                                .await
+                                .expect(cut_name),
                         ));
                     }
-                    assert!(
-                        matches!(
-                            first
-                                .prepare_terminal(&registration, proofs[..5].to_vec())
-                                .await,
-                            Err(ExecutorError::InvalidTerminal)
-                        ),
-                        "{}: terminalization requires all SDK proofs",
-                        cut.name()
-                    );
-                    let prepared = first
-                        .prepare_terminal(&registration, proofs)
-                        .await
-                        .expect(cut_name);
-                    assert_eq!(
-                        prepared.body.record().request_id(),
-                        registration.backend_registration().request_id()
-                    );
-                    assert_eq!(
-                        prepared.body.protected_checkpoint(),
-                        request.admission().terminal_checkpoint()
-                    );
-                    assert_eq!(
-                        prepared.body.protected_result(),
-                        request.admission().terminal_result()
-                    );
-                    assert_eq!(
-                        backend.mutations(),
-                        1,
-                        "{}: all local proofs converge before terminal request",
-                        cut.name()
-                    );
-                    assert_eq!(
-                        first
-                            .terminalize(&registration, &prepared)
+                }
+                Cut::SixthEffectOutcomeUnknown => {
+                    for ordinal in 0_u8..6 {
+                        assert!(matches!(
+                            active.prepare(&registration, ordinal).await,
+                            Ok(CallResult::PreparedNotRun)
+                        ));
+                        if ordinal == 5 {
+                            assert!(matches!(
+                                active.execute(&registration, ordinal).await,
+                                Err(ExecutorError::OutcomeUnknown)
+                            ));
+                        } else {
+                            proofs.push(conclusive(
+                                active
+                                    .execute(&registration, ordinal)
+                                    .await
+                                    .expect(cut_name),
+                            ));
+                        }
+                    }
+                }
+                Cut::AppliedBeforeFinalize => {
+                    for ordinal in 0_u8..6 {
+                        assert!(matches!(
+                            active.prepare(&registration, ordinal).await,
+                            Ok(CallResult::PreparedNotRun)
+                        ));
+                        proofs.push(conclusive(
+                            active
+                                .execute(&registration, ordinal)
+                                .await
+                                .expect(cut_name),
+                        ));
+                    }
+                    precrash_terminal_body = Some(
+                        active
+                            .prepare_terminal(&registration, proofs.clone())
                             .await
-                            .expect(cut_name)
-                            .phase(),
-                        Phase::Established
+                            .expect("pre-finalize terminal body")
+                            .body
+                            .commitment(),
                     );
                 }
+                _ => {
+                    for ordinal in 0_u8..6 {
+                        assert!(matches!(
+                            active.prepare(&registration, ordinal).await,
+                            Ok(CallResult::PreparedNotRun)
+                        ));
+                        proofs.push(conclusive(
+                            active
+                                .execute(&registration, ordinal)
+                                .await
+                                .expect(cut_name),
+                        ));
+                    }
+                }
             }
+            if restart {
+                drop(registration);
+                drop(active);
+                (active, registration) =
+                    restarted_executor(Arc::clone(&provider), Arc::clone(&backend), &request).await;
+                proofs.clear();
+                for ordinal in 0_u8..6 {
+                    proofs.push(conclusive(
+                        active.status(&registration, ordinal).await.expect(cut_name),
+                    ));
+                }
+            }
+            assert_eq!(
+                proofs.len(),
+                6,
+                "{cut_name}: all six SDK proofs converge before terminalization"
+            );
+            let prepared = active
+                .prepare_terminal(&registration, proofs)
+                .await
+                .expect(cut_name);
+            if let Some(precrash_terminal_body) = precrash_terminal_body {
+                assert_eq!(
+                    prepared.body.commitment(),
+                    precrash_terminal_body,
+                    "{cut_name}: restart reconstructs the exact body prepared before finalization"
+                );
+            }
+            assert_eq!(
+                prepared.body.record().request_id(),
+                registration.backend_registration().request_id()
+            );
+            assert_eq!(
+                prepared.body.protected_checkpoint(),
+                request.admission().terminal_checkpoint()
+            );
+            assert_eq!(
+                prepared.body.protected_result(),
+                request.admission().terminal_result()
+            );
+            let terminal_receipt = if matches!(cut, Cut::TerminalCommitOutcomeUnknown) {
+                backend.lose_next_terminal_reply();
+                assert!(matches!(
+                    active.terminalize(&registration, &prepared).await,
+                    Err(ExecutorError::TerminalizeOutcomeUnknown)
+                ));
+                let recovery = successor(&request, 2);
+                backend.install_successor_authority(recovery.authority().clone());
+                let restarted = executor(
+                    Arc::clone(&provider),
+                    Arc::clone(&backend),
+                    request.admission().scope(),
+                );
+                assert!(matches!(
+                    restarted.recover(recovery).await,
+                    Ok(RecoveryResult::Established(_))
+                ));
+                None
+            } else {
+                let receipt = active
+                    .terminalize(&registration, &prepared)
+                    .await
+                    .expect(cut_name);
+                assert_eq!(receipt.phase(), Phase::Established);
+                Some(receipt)
+            };
+            if matches!(cut, Cut::ConvergenceBeforeTerminalRequest) {
+                assert_eq!(
+                    backend.terminal_calls().len(),
+                    1,
+                    "{cut_name}: all six conclusive proofs precede the sole terminal request"
+                );
+            }
+            assert_eq!(
+                active.diagnostics().snapshot().publication_acknowledged,
+                0,
+                "{cut_name}: no publication precedes exact Established receipt validation"
+            );
             if matches!(
                 cut,
-                Cut::AppliedBeforeFinalize | Cut::AllSixBeforeTerminalRequest
+                Cut::TerminalCommittedBeforePublication | Cut::PublicationBeforeAcknowledgement
             ) {
+                let receipt = terminal_receipt.as_ref().expect("established receipt");
+                let authority = receipt
+                    .publication_authority()
+                    .expect("only an exact Established receipt carries publication authority");
+                authority
+                    .validate_for(
+                        registration.backend_registration(),
+                        registration.admission(),
+                        registration.authority(),
+                        prepared.body.commitment(),
+                        authority.receipt_commitment(),
+                    )
+                    .expect("receipt-bound publication authority");
                 assert_eq!(
-                    backend.mutations(),
-                    2,
-                    "{}: exactly one atomic terminalization follows PollAdmitted",
-                    cut.name()
-                );
-            } else {
-                assert_eq!(
-                    backend.mutations(),
-                    1,
-                    "{}: no terminal request crossed the quorum boundary",
-                    cut.name()
+                    active.diagnostics().snapshot().publication_acknowledged,
+                    0,
+                    "{cut_name}: terminalization never acknowledges publication"
                 );
             }
+            if matches!(cut, Cut::TerminalCommittedBeforePublication) {
+                let receipt = terminal_receipt.expect("established receipt");
+                let checkpoint = receipt.protected_checkpoint().to_vec();
+                let result = receipt.protected_result().to_vec();
+                let expected_body = prepared.body.commitment();
+                drop(registration);
+                drop(active);
+                let recovery = successor(&request, 2);
+                let recovered_authority = recovery.authority().clone();
+                backend.install_successor_authority(recovery.authority().clone());
+                let restarted = executor(
+                    Arc::clone(&provider),
+                    Arc::clone(&backend),
+                    request.admission().scope(),
+                );
+                let recovered_receipt = match restarted.recover(recovery).await.expect(cut_name) {
+                    RecoveryResult::Established(receipt) => receipt,
+                    _ => panic!("expected exact Established recovery"),
+                };
+                assert_eq!(recovered_receipt.protected_checkpoint(), checkpoint);
+                assert_eq!(recovered_receipt.protected_result(), result);
+                let authority = recovered_receipt
+                    .publication_authority()
+                    .expect("recovered Established receipt retains publication authority");
+                assert_eq!(authority.terminal_body_commitment(), expected_body);
+                authority
+                    .validate_for(
+                        authority.current_registration(),
+                        request.admission(),
+                        &recovered_authority,
+                        expected_body,
+                        authority.receipt_commitment(),
+                    )
+                    .expect("only the recovered exact receipt authorizes publication");
+                assert_eq!(
+                    restarted.diagnostics().snapshot().publication_acknowledged,
+                    0,
+                    "recovery alone cannot publish or acknowledge"
+                );
+            }
+            assert_eq!(
+                backend.admission_calls().len(),
+                1,
+                "{cut_name}: exactly one PollAdmit invocation"
+            );
+            assert_eq!(
+                backend.terminal_calls().len(),
+                1,
+                "{cut_name}: at most one transmitted terminal invocation"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn before_admission_is_non_exclusionary_and_after_admission_is_read_only() {
+        let request = request();
+        let provider = Arc::new(CutProvider::for_cut(Cut::PreparedBeforeRun));
+        let backend = Arc::new(CutBackend::default());
+        let executor = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+
+        assert!(matches!(
+            executor.recover(successor(&request, 2)).await,
+            Err(ExecutorError::AuthorityRejected)
+        ));
+        assert_eq!(
+            backend.admission_calls().len(),
+            0,
+            "no admission invokes no mutation method"
+        );
+
+        let registration = executor.register(request.clone()).await.expect("admission");
+        assert_eq!(backend.admission_calls().len(), 1);
+        let readback = executor
+            .admission_status(request.clone())
+            .await
+            .expect("exact post-admission readback");
+        let recovered = recovered(readback);
+        assert_eq!(
+            recovered.admission().members(),
+            registration.admission().members(),
+            "member ordinals and stable IDs survive the read-only status path"
+        );
+        assert_eq!(
+            recovered.admission().protected_plan(),
+            request.admission().protected_plan()
+        );
+        assert_eq!(
+            backend.admission_calls().len(),
+            1,
+            "status cannot invoke admission mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_not_transmitted_retries_preserve_exact_admission_and_terminal_requests() {
+        let request = request_with_members(1);
+        let provider = Arc::new(CutProvider::for_cut(Cut::PreparedBeforeRun));
+        let backend = Arc::new(CutBackend::default());
+        let executor = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+
+        backend.admission_not_transmitted_once();
+        assert!(matches!(
+            executor.register(request.clone()).await,
+            Err(ExecutorError::AdmissionNotTransmitted)
+        ));
+        let registration = executor
+            .register(request.clone())
+            .await
+            .expect("identical admission retry");
+        let admission_calls = backend.admission_calls();
+        assert_eq!(
+            admission_calls.len(),
+            2,
+            "direct admission retry invokes the backend twice"
+        );
+        assert_eq!(
+            admission_calls[0], admission_calls[1],
+            "direct admission retry retains one exact request identity and canonical body"
+        );
+
+        assert!(matches!(
+            executor.prepare(&registration, 0).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        let proof = conclusive(
+            executor
+                .execute(&registration, 0)
+                .await
+                .expect("conclusive proof"),
+        );
+        let prepared = executor
+            .prepare_terminal(&registration, vec![proof])
+            .await
+            .expect("terminal body");
+        backend.terminal_not_transmitted_once();
+        assert!(matches!(
+            executor.terminalize(&registration, &prepared).await,
+            Err(ExecutorError::TerminalizeNotTransmitted)
+        ));
+        assert_eq!(
+            executor
+                .terminalize(&registration, &prepared)
+                .await
+                .expect("identical terminal retry")
+                .phase(),
+            Phase::Established
+        );
+        let terminal_calls = backend.terminal_calls();
+        assert_eq!(
+            terminal_calls.len(),
+            2,
+            "direct terminal retry invokes the backend twice"
+        );
+        assert_eq!(
+            terminal_calls[0], terminal_calls[1],
+            "direct terminal retry retains one exact request ID and canonical terminal body"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_member_not_transmitted_retries_preserve_every_binding_field() {
+        let request = request_with_members(1);
+        let provider = Arc::new(CutProvider::for_cut(Cut::PreparedBeforeRun));
+        let backend = Arc::new(CutBackend::default());
+        let executor = executor(Arc::clone(&provider), backend, request.admission().scope());
+        let registration = executor.register(request).await.expect("registered");
+        provider.direct_not_transmitted_once();
+
+        assert!(matches!(
+            executor.prepare(&registration, 0).await,
+            Ok(CallResult::NotTransmitted)
+        ));
+        assert!(matches!(
+            executor.prepare(&registration, 0).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        assert!(matches!(
+            executor.execute(&registration, 0).await,
+            Ok(CallResult::NotTransmitted)
+        ));
+        assert!(matches!(
+            executor.execute(&registration, 0).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+        let calls = provider
+            .calls
+            .lock()
+            .expect("test provider call ledger")
+            .clone();
+        assert_eq!(
+            calls.len(),
+            4,
+            "each direct retry invokes the provider again"
+        );
+        assert_eq!(
+            calls[0], calls[1],
+            "prepare retry retains its complete MemberCall binding"
+        );
+        assert_eq!(
+            calls[2], calls[3],
+            "execute retry retains its complete MemberCall binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_outcome_unknown_is_status_only_and_never_reexecutes() {
+        let request = request_with_members(1);
+        let provider = Arc::new(CutProvider::with_execute_outcome_unknown(0));
+        let backend = Arc::new(CutBackend::default());
+        let first = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let registration = first.register(request.clone()).await.expect("admission");
+        assert!(matches!(
+            first.prepare(&registration, 0).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        assert!(matches!(
+            first.execute(&registration, 0).await,
+            Err(ExecutorError::OutcomeUnknown)
+        ));
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+
+        let second = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let recovery = successor(&request, 2);
+        backend.install_successor_authority(recovery.authority().clone());
+        let recovered_registration =
+            recovered(second.recover(recovery).await.expect("successor recovery"));
+        assert!(matches!(
+            second.status(&recovered_registration, 0).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+        assert_eq!(
+            provider.execute_calls.load(Ordering::SeqCst),
+            1,
+            "OutcomeUnknown may status/adopt but never re-executes"
+        );
+        assert_eq!(
+            backend.admission_calls().len(),
+            1,
+            "provider ambiguity is local"
+        );
+    }
+
+    #[tokio::test]
+    async fn sixth_effect_outcome_unknown_is_adopted_without_replay() {
+        let request = request();
+        let provider = Arc::new(CutProvider::with_execute_outcome_unknown(5));
+        let backend = Arc::new(CutBackend::default());
+        let first = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let registration = first.register(request.clone()).await.expect("admission");
+        for ordinal in 0_u8..5 {
+            assert!(matches!(
+                first.prepare(&registration, ordinal).await,
+                Ok(CallResult::PreparedNotRun)
+            ));
+            assert!(matches!(
+                first.execute(&registration, ordinal).await,
+                Ok(CallResult::Conclusive(_))
+            ));
+        }
+        assert!(matches!(
+            first.prepare(&registration, 5).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        assert!(matches!(
+            first.execute(&registration, 5).await,
+            Err(ExecutorError::OutcomeUnknown)
+        ));
+
+        let second = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let recovery = successor(&request, 2);
+        backend.install_successor_authority(recovery.authority().clone());
+        let recovered_registration =
+            recovered(second.recover(recovery).await.expect("successor recovery"));
+        assert_eq!(
+            recovered_registration.admission().members(),
+            registration.admission().members()
+        );
+        assert!(matches!(
+            second.adopt(&recovered_registration, 5).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 6);
+        assert_eq!(backend.admission_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_outcome_unknown_recovers_by_status_without_third_mutation() {
+        let request = request();
+        let provider = Arc::new(CutProvider::for_cut(Cut::PreparedBeforeRun));
+        let backend = Arc::new(CutBackend::default());
+        let executor = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let registration = executor.register(request.clone()).await.expect("admission");
+        let mut proofs = Vec::with_capacity(6);
+        for ordinal in 0_u8..6 {
+            assert!(matches!(
+                executor.prepare(&registration, ordinal).await,
+                Ok(CallResult::PreparedNotRun)
+            ));
+            proofs.push(conclusive(
+                executor
+                    .execute(&registration, ordinal)
+                    .await
+                    .expect("proof"),
+            ));
+        }
+        let prepared = executor
+            .prepare_terminal(&registration, proofs)
+            .await
+            .expect("complete SDK proof bundle");
+        let body_commitment = prepared.body.commitment();
+        backend.lose_next_terminal_reply();
+        assert!(matches!(
+            executor.terminalize(&registration, &prepared).await,
+            Err(ExecutorError::TerminalizeOutcomeUnknown)
+        ));
+        assert_eq!(
+            backend.admission_calls().len(),
+            1,
+            "one PollAdmit invocation"
+        );
+        let terminal_calls = backend.terminal_calls();
+        assert_eq!(
+            terminal_calls.len(),
+            1,
+            "one terminal invocation despite lost reply"
+        );
+        assert_eq!(
+            terminal_calls[0].1,
+            prepared
+                .body
+                .record()
+                .to_canonical_bytes(request.admission())
+                .expect("canonical terminal body")
+        );
+        assert_eq!(prepared.body.commitment(), body_commitment);
+        assert!(matches!(
+            executor.terminal_status(&registration, &prepared).await,
+            Ok(TerminalStatusResult::Recorded(_))
+        ));
+        assert!(matches!(
+            executor.terminalize(&registration, &prepared).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert_eq!(
+            backend.terminal_calls().len(),
+            1,
+            "status recovery cannot replay the terminal mutation"
+        );
     }
 
     #[tokio::test]
@@ -5925,11 +6446,16 @@ mod production_runtime_cut_matrix_tests {
         drop(registration);
         drop(first);
 
-        let second =
-            compensation_executor(Arc::clone(&provider), backend, request.admission().scope());
+        let recovery = successor(&request, 2);
+        backend.install_successor_authority(recovery.authority().clone());
+        let second = compensation_executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
         let recovered = recovered(
             second
-                .recover(successor(&request, 2))
+                .recover(recovery)
                 .await
                 .expect("higher-fence recovery"),
         );
@@ -5990,11 +6516,16 @@ mod production_runtime_cut_matrix_tests {
         drop(registration);
         drop(first);
 
-        let second =
-            compensation_executor(Arc::clone(&provider), backend, request.admission().scope());
+        let recovery = successor(&request, 2);
+        backend.install_successor_authority(recovery.authority().clone());
+        let second = compensation_executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
         let recovered = recovered(
             second
-                .recover(successor(&request, 2))
+                .recover(recovery)
                 .await
                 .expect("higher-fence recovery"),
         );
@@ -6092,11 +6623,16 @@ mod production_runtime_cut_matrix_tests {
         drop(registration);
         drop(first);
 
-        let second =
-            compensation_executor(Arc::clone(&provider), backend, request.admission().scope());
+        let recovery = successor(&request, 2);
+        backend.install_successor_authority(recovery.authority().clone());
+        let second = compensation_executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
         let recovered = recovered(
             second
-                .recover(successor(&request, 2))
+                .recover(recovery)
                 .await
                 .expect("higher-fence recovery"),
         );
@@ -6164,11 +6700,16 @@ mod production_runtime_cut_matrix_tests {
         drop(registration);
         drop(first);
 
-        let second =
-            compensation_executor(Arc::clone(&provider), backend, request.admission().scope());
+        let recovery = successor(&request, 2);
+        backend.install_successor_authority(recovery.authority().clone());
+        let second = compensation_executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
         let recovered = recovered(
             second
-                .recover(successor(&request, 2))
+                .recover(recovery)
                 .await
                 .expect("higher-fence recovery"),
         );

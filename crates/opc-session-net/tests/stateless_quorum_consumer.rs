@@ -1039,6 +1039,7 @@ struct CountingConsumer {
 #[derive(Clone)]
 struct TestP256RosterAttestationIssuer {
     root: RosterAttestationTrustRootV1,
+    calls: Arc<AtomicUsize>,
 }
 
 impl TestP256RosterAttestationIssuer {
@@ -1054,7 +1055,12 @@ impl TestP256RosterAttestationIssuer {
         Self {
             root: RosterAttestationTrustRootV1::new([0x51; 32], public_key)
                 .expect("fixed P-256 roster trust root"),
+            calls: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
@@ -1068,19 +1074,26 @@ impl RosterIngressSigner for TestP256RosterAttestationIssuer {
         &self,
         _input: &RosterIngressAttestationSigningInputV1,
     ) -> Result<RosterIngressAttestationV1, RosterIngressSignerError> {
-        panic!("handshake-only protected-roster test must not request an attestation")
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(RosterIngressSignerError)
     }
 }
 
 struct HandshakeOnlySessionQuorumRosterIngress {
     expected_root_identity: RosterAttestationTrustRootIdentityV1,
+    calls: AtomicUsize,
 }
 
 impl HandshakeOnlySessionQuorumRosterIngress {
     fn new(issuer: &TestP256RosterAttestationIssuer) -> Self {
         Self {
             expected_root_identity: issuer.root.identity(),
+            calls: AtomicUsize::new(0),
         }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
@@ -1098,7 +1111,8 @@ impl SessionQuorumRosterIngress for HandshakeOnlySessionQuorumRosterIngress {
         _request: SessionConsumerRequest,
         _attestation: RosterIngressAttestationV1,
     ) -> SessionConsumerResponse {
-        panic!("handshake-only protected-roster test must not dispatch ingress")
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
     }
 }
 
@@ -1324,6 +1338,12 @@ async fn admitted_store_and_authorizer(
 
 fn spiffe(suffix: &str) -> String {
     format!("spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/{suffix}")
+}
+
+fn tenant_spiffe(tenant: &str, suffix: &str) -> String {
+    format!(
+        "spiffe://test.example/tenant/{tenant}/ns/default/sa/session/nf/consumer/instance/{suffix}"
+    )
 }
 
 fn consumer_client(
@@ -3024,6 +3044,53 @@ async fn consumer_mtls_role_identity_and_server_identity_mismatches_fail_closed(
 }
 
 #[tokio::test]
+async fn protected_roster_client_rejects_general_capabilities_before_transport() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("protected-roster-local-gate-server");
+    let client_spiffe = spiffe("protected-roster-local-gate-client");
+    let (_authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other(
+                    "protected-roster Capabilities must never resolve",
+                ))
+            })
+        })
+    };
+    let client = PersistentSessionConsumerClient::try_from_fenced_mutation_roster_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            rustls_pki_types::ServerName::IpAddress(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
+            ),
+            voter_authority,
+            pki.client_config(&client_spiffe),
+        ),
+        PersistentSessionConsumerConfig::default(),
+    )
+    .expect("protected-roster local-gate client");
+
+    assert_eq!(
+        client.capabilities().await,
+        Err(SessionConsumerClientError::Protocol),
+        "the protected lane must reject general Capabilities before transport"
+    );
+    assert_eq!(resolutions.load(Ordering::SeqCst), 0);
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_attempts, 0);
+    assert_eq!(diagnostics.resolve_attempts, 0);
+    assert_eq!(diagnostics.tcp_attempts, 0);
+    assert_eq!(diagnostics.tls_attempts, 0);
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn protected_roster_mtls_identity_and_server_identity_mismatches_fail_closed() {
     let pki = TestPki::new();
     let server_spiffe = spiffe("protected-roster-server");
@@ -3032,21 +3099,27 @@ async fn protected_roster_mtls_identity_and_server_identity_mismatches_fail_clos
     let (authorizer, _scope, voter_authority) =
         authorizer_from_admitted_store(&admitted_spiffe, &server_spiffe).await;
     let service = Arc::new(CountingConsumer::default());
-    let issuer = TestP256RosterAttestationIssuer::new();
+    let issuer = Arc::new(TestP256RosterAttestationIssuer::new());
     let roster_ingress = Arc::new(HandshakeOnlySessionQuorumRosterIngress::new(&issuer));
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
         pki.server_config(&server_spiffe),
         authorizer,
     )
-    .with_roster_ingress(roster_ingress, Arc::new(issuer))
+    .with_roster_ingress(roster_ingress.clone(), issuer.clone())
     .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
     .await
     .expect("start protected-roster consumer listener");
 
     for (label, client_spiffe) in [
-        ("foreign A", spiffe("protected-roster-foreign-a")),
-        ("foreign B", spiffe("protected-roster-foreign-b")),
+        (
+            "foreign tenant A",
+            tenant_spiffe("protected-roster-foreign-a", "consumer"),
+        ),
+        (
+            "foreign tenant B",
+            tenant_spiffe("protected-roster-foreign-b", "consumer"),
+        ),
         ("consensus member", member_spiffe),
     ] {
         let client = protected_roster_persistent_client(
@@ -3088,8 +3161,10 @@ async fn protected_roster_mtls_identity_and_server_identity_mismatches_fail_clos
         "wrong protected-roster expected server identity must attempt mTLS"
     );
     wrong_server_identity.shutdown().await;
-    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
     handle.abort_and_wait().await;
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(issuer.calls(), 0);
+    assert_eq!(roster_ingress.calls(), 0);
 }
 
 #[tokio::test]
