@@ -80,7 +80,9 @@ use crate::{
         cut_durable_object_roster_at_compensating_member as cut_object_roster_at_compensating_member,
         cut_durable_object_roster_at_issuing_member as cut_object_roster_at_issuing_member,
         durable_object_roster_phase, finalize_durable_object_roster as finalize_object_roster,
+        finish_durable_object_roster_effect_quiesced as finish_object_roster_effect_quiesced,
         issue_durable_object_roster as run_object_roster,
+        issue_durable_object_roster_effect_quiesced as run_object_roster_effect_quiesced,
         prepare_object_roster as prepare_object_roster_record,
         recover_durable_object_roster as recover_object_roster, validate_object_roster_admission,
         XfrmObjectRosterDurableOutcome, XfrmObjectRosterIssueError, XfrmObjectRosterRequest,
@@ -797,6 +799,55 @@ impl XfrmObjectRosterAdmissionAuthority {
 impl fmt::Debug for XfrmObjectRosterAdmissionAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("XfrmObjectRosterAdmissionAuthority(<redacted>)")
+    }
+}
+
+/// Affine proof that every roster effect acknowledged success but the final
+/// durable `Applied` publication is intentionally deferred.
+///
+/// This is an opt-in response-activation boundary.  It is produced only after
+/// the actor has durably published the per-member adjacent `Absent` witness
+/// immediately before every effect and every requested effect has completed.
+/// The final member is deliberately retained as `Issuing`/`Pending` until
+/// [`NamespaceBoundLinuxXfrmBackend::finish_durable_object_roster_effect_quiesced`]
+/// consumes this value.  Dropping it does not replay or complete anything:
+/// the durable record remains unresolved and normal recovery reconciles that
+/// final exact proof before any rollback deletion.
+///
+/// The token remains registered with the namespace actor while live, so a
+/// same-process recovery cannot race response activation.  It is move-only;
+/// the following is deliberately rejected by the compiler:
+///
+/// ```compile_fail,E0382
+/// # use opc_ipsec_xfrm::{NamespaceBoundLinuxXfrmBackend, XfrmObjectRosterEffectQuiesced};
+/// # fn effect() -> XfrmObjectRosterEffectQuiesced { unimplemented!() }
+/// # async fn cannot_finish_twice(backend: NamespaceBoundLinuxXfrmBackend) {
+/// let effect = effect();
+/// let first = backend.finish_durable_object_roster_effect_quiesced(effect);
+/// let second = backend.finish_durable_object_roster_effect_quiesced(effect);
+/// # let _ = (first, second);
+/// # }
+/// ```
+#[cfg(unix)]
+#[must_use = "dropping this token leaves an unresolved issuing roster to recover"]
+pub struct XfrmObjectRosterEffectQuiesced {
+    operation: Box<DurableObjectRosterOperation>,
+    issuing: XfrmObjectRosterRecoveryHandle,
+    actor_binding: NamespaceActorBinding,
+    seal: Arc<()>,
+}
+
+#[cfg(unix)]
+impl XfrmObjectRosterEffectQuiesced {
+    fn key(&self) -> (XfrmObjectRosterGroupId, XfrmObjectRosterOperationGeneration) {
+        (self.operation.group_id, self.operation.generation)
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for XfrmObjectRosterEffectQuiesced {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("XfrmObjectRosterEffectQuiesced(<redacted>)")
     }
 }
 
@@ -1763,6 +1814,12 @@ impl NamespaceActorState {
     }
 
     #[cfg(unix)]
+    fn register_object_roster_effect_quiesced(&mut self, effect: &XfrmObjectRosterEffectQuiesced) {
+        self.roster_admissions
+            .insert(effect.key(), Arc::downgrade(&effect.seal));
+    }
+
+    #[cfg(unix)]
     fn require_object_roster_admission(
         &self,
         authority: &XfrmObjectRosterAdmissionAuthority,
@@ -1778,6 +1835,27 @@ impl NamespaceActorState {
             return Err(XfrmObjectRosterDurableError::Stale);
         };
         if !Arc::ptr_eq(&live, &authority.seal) {
+            return Err(XfrmObjectRosterDurableError::Stale);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn require_object_roster_effect_quiesced(
+        &self,
+        effect: &XfrmObjectRosterEffectQuiesced,
+    ) -> Result<(), XfrmObjectRosterDurableError> {
+        if self.actor_binding != effect.actor_binding {
+            return Err(XfrmObjectRosterDurableError::WrongBinding);
+        }
+        self.require_object_roster_store(&effect.operation.store)?;
+        let Some(registered) = self.roster_admissions.get(&effect.key()) else {
+            return Err(XfrmObjectRosterDurableError::Stale);
+        };
+        let Some(live) = registered.upgrade() else {
+            return Err(XfrmObjectRosterDurableError::Stale);
+        };
+        if !Arc::ptr_eq(&live, &effect.seal) {
             return Err(XfrmObjectRosterDurableError::Stale);
         }
         Ok(())
@@ -2620,6 +2698,84 @@ impl NamespaceBoundLinuxXfrmBackend {
             .map_err(|_| XfrmObjectRosterRunError::from(XfrmObjectRosterDurableError::Storage))?
     }
 
+    /// Apply every member effect and return before the final `Applied`
+    /// publication.
+    ///
+    /// This opt-in variant has the same admission, sweep, writer-epoch, and
+    /// per-member adjacent-proof protocol as [`Self::run_durable_object_roster`].
+    /// It stops only after all effects have acknowledged success: for a
+    /// five-member roster, the returned token follows the six durable
+    /// publications `Prepared`, `Issuing/member0`, and the four adjacent
+    /// acquire-plus-next-absent transitions.  The token may be held while the
+    /// product activates its response; only then pass it to
+    /// [`Self::finish_durable_object_roster_effect_quiesced`] to publish
+    /// `Applied`.
+    ///
+    /// A dropped token is intentionally not auto-completed.  Its final member
+    /// remains at the adjacent `Absent` witness, so normal recovery performs
+    /// the exact same reconciliation and rollback it would after a process
+    /// crash at that point.  While the token is live, the actor keeps recovery
+    /// for this group quiesced and the unresolved roster keeps cooperating
+    /// XFRM mutations fenced.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same proved-clean retry errors as
+    /// [`Self::run_durable_object_roster`].  After any durable issuance step,
+    /// the authority is consumed and recovery—not replay—is authoritative.
+    #[cfg(unix)]
+    pub async fn run_durable_object_roster_effect_quiesced(
+        &self,
+        authority: XfrmObjectRosterAdmissionAuthority,
+    ) -> Result<XfrmObjectRosterEffectQuiesced, XfrmObjectRosterRunError> {
+        if authority.actor_binding != self.inner.actor_binding {
+            return Err(XfrmObjectRosterDurableError::WrongBinding.into());
+        }
+        let permit =
+            self.inner.sender.reserve().await.map_err(|_| {
+                XfrmObjectRosterRunError::from(XfrmObjectRosterDurableError::Storage)
+            })?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::RunDurableObjectRosterEffectQuiesced(
+            Box::new(authority),
+            reply_sender,
+        ));
+        reply_receiver
+            .await
+            .map_err(|_| XfrmObjectRosterRunError::from(XfrmObjectRosterDurableError::Storage))?
+    }
+
+    /// Consume one all-effects-quiesced token and durably publish `Applied`.
+    ///
+    /// The operation performs no kernel call and no request replay.  It is the
+    /// post-response bookkeeping step for
+    /// [`Self::run_durable_object_roster_effect_quiesced`]; product code should
+    /// supervise it after response activation, then use the existing finalize
+    /// API after its own ownership/adoption bookkeeping is durable.
+    #[cfg(unix)]
+    pub async fn finish_durable_object_roster_effect_quiesced(
+        &self,
+        effect: XfrmObjectRosterEffectQuiesced,
+    ) -> Result<XfrmObjectRosterDurableOutcome, XfrmObjectRosterDurableError> {
+        if effect.actor_binding != self.inner.actor_binding {
+            return Err(XfrmObjectRosterDurableError::WrongBinding);
+        }
+        let permit = self
+            .inner
+            .sender
+            .reserve()
+            .await
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        permit.send(NamespaceCommand::FinishDurableObjectRosterEffectQuiesced(
+            Box::new(effect),
+            reply_sender,
+        ));
+        reply_receiver
+            .await
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?
+    }
+
     /// Surrender durable cleanup authority for one applied roster after the
     /// product has adopted the whole group, or retire a terminal no-mutation
     /// or rolled-back result.
@@ -3325,6 +3481,16 @@ enum NamespaceCommand {
     RunDurableObjectRoster(
         Box<XfrmObjectRosterAdmissionAuthority>,
         oneshot::Sender<Result<XfrmObjectRosterDurableOutcome, XfrmObjectRosterRunError>>,
+    ),
+    #[cfg(unix)]
+    RunDurableObjectRosterEffectQuiesced(
+        Box<XfrmObjectRosterAdmissionAuthority>,
+        oneshot::Sender<Result<XfrmObjectRosterEffectQuiesced, XfrmObjectRosterRunError>>,
+    ),
+    #[cfg(unix)]
+    FinishDurableObjectRosterEffectQuiesced(
+        Box<XfrmObjectRosterEffectQuiesced>,
+        oneshot::Sender<Result<XfrmObjectRosterDurableOutcome, XfrmObjectRosterDurableError>>,
     ),
     #[cfg(unix)]
     FinalizeDurableObjectRoster(
@@ -4178,6 +4344,69 @@ impl NamespaceCommand {
                 let _ = reply.send(finish_roster_issue(state, authority, result));
             }
             #[cfg(unix)]
+            Self::RunDurableObjectRosterEffectQuiesced(authority, reply) => {
+                if let Err(rejection) = validate_object_roster_run_admission(state, &authority) {
+                    let _ = reply.send(Err(reject_roster_run(authority, rejection)));
+                    return;
+                }
+                if roster_requires_dscp_activation(backend, &authority.operation.roster) {
+                    let _ = reply.send(Err(XfrmObjectRosterRunError::dscp_activation_required(
+                        authority,
+                    )));
+                    return;
+                }
+                let result = match state.admit_durable_object_roster_mutation(&authority) {
+                    Ok(()) => {
+                        run_object_roster_effect_quiesced(
+                            &authority.operation.store,
+                            &authority.prepared,
+                            authority.operation.group_id,
+                            authority.operation.generation,
+                            &authority.operation.roster,
+                            backend,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(XfrmObjectRosterIssueError::Durable(error)),
+                };
+                match result {
+                    Ok(issuing) => {
+                        let effect = XfrmObjectRosterEffectQuiesced {
+                            operation: authority.operation,
+                            issuing,
+                            actor_binding: state.actor_binding.clone(),
+                            seal: Arc::new(()),
+                        };
+                        state.register_object_roster_effect_quiesced(&effect);
+                        let _ = reply.send(Ok(effect));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(finish_roster_issue(state, authority, Err(error)));
+                    }
+                }
+            }
+            #[cfg(unix)]
+            Self::FinishDurableObjectRosterEffectQuiesced(effect, reply) => {
+                let result = state
+                    .require_object_roster_effect_quiesced(&effect)
+                    .and_then(|()| {
+                        finish_object_roster_effect_quiesced(
+                            &effect.operation.store,
+                            &effect.issuing,
+                            effect.operation.group_id,
+                            effect.operation.generation,
+                            &effect.operation.roster,
+                        )
+                    });
+                // The affine value is consumed whether publication succeeds
+                // or fails.  On failure the authenticated `Issuing` record
+                // remains the recovery authority; on success it is now
+                // `Applied`.  Either way a later recover/adopt command sees
+                // the durable state rather than a stale live seal.
+                state.roster_admissions.remove(&effect.key());
+                let _ = reply.send(result);
+            }
+            #[cfg(unix)]
             Self::DetectorCutRosterPrepared(authority, cut, reply) => {
                 // Crash-detector seams share the run path's validation chain,
                 // DSCP preflight, sweep, and admission consumption. They stop
@@ -4529,6 +4758,14 @@ impl NamespaceCommand {
             #[cfg(unix)]
             Self::RunDurableObjectRoster(_, reply) => {
                 let _ = reply.send(Err(XfrmObjectRosterDurableError::WrongBinding.into()));
+            }
+            #[cfg(unix)]
+            Self::RunDurableObjectRosterEffectQuiesced(_, reply) => {
+                let _ = reply.send(Err(XfrmObjectRosterDurableError::WrongBinding.into()));
+            }
+            #[cfg(unix)]
+            Self::FinishDurableObjectRosterEffectQuiesced(_, reply) => {
+                let _ = reply.send(Err(XfrmObjectRosterDurableError::WrongBinding));
             }
             #[cfg(unix)]
             Self::FinalizeDurableObjectRoster(_, reply) => {
@@ -9875,6 +10112,117 @@ mod tests {
                 .await
                 .unwrap(),
             XfrmObjectRosterDurablePhase::Committed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn roster_effect_quiesced_token_defers_applied_until_explicit_finish() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0x7f);
+        let group = roster_group(0x13);
+        let generation = roster_generation(1);
+        let roster = sa_roster(5);
+        store.tests_reset_physical_barriers().unwrap();
+
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        let effect = backend
+            .run_durable_object_roster_effect_quiesced(authority)
+            .await
+            .unwrap();
+        assert_eq!(
+            durable_object_roster_phase(&store, group, generation, &roster),
+            Ok(XfrmObjectRosterDurablePhase::Issuing)
+        );
+        assert_eq!(store.tests_physical_barriers().unwrap(), 6);
+        assert_eq!(
+            transport
+                .operations()
+                .iter()
+                .filter(|operation| **operation == "install_sa")
+                .count(),
+            5
+        );
+        assert_eq!(
+            format!("{effect:?}"),
+            "XfrmObjectRosterEffectQuiesced(<redacted>)"
+        );
+
+        // The live affine token keeps same-process recovery out of the gap
+        // while the product activates its response; the durable Issuing state
+        // separately fences every cooperating XFRM mutation.
+        assert_eq!(
+            backend
+                .recover_durable_object_roster(&store, group, generation, &roster)
+                .await
+                .unwrap_err(),
+            XfrmObjectRosterDurableError::InvalidTransition
+        );
+        assert!(matches!(
+            backend.remove_sa(remove_request()).await,
+            Err(XfrmError::Unavailable)
+        ));
+
+        let outcome = backend
+            .finish_durable_object_roster_effect_quiesced(effect)
+            .await
+            .unwrap();
+        assert_eq!(outcome.as_str(), "applied");
+        assert_eq!(store.tests_physical_barriers().unwrap(), 7);
+        assert_eq!(
+            backend
+                .finalize_durable_object_roster(&store, group, generation, &roster)
+                .await
+                .unwrap(),
+            XfrmObjectRosterDurablePhase::Committed
+        );
+        assert_eq!(store.tests_physical_barriers().unwrap(), 8);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_roster_effect_quiesced_token_reopens_normal_recovery() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = bind_with_roster_recovery(transport.clone(), &root, 0x7e);
+        let group = roster_group(0x14);
+        let generation = roster_generation(1);
+        let roster = sa_roster(1);
+        let authority = backend
+            .prepare_durable_object_roster(&store, group, generation, roster.clone())
+            .await
+            .unwrap();
+        let effect = backend
+            .run_durable_object_roster_effect_quiesced(authority)
+            .await
+            .unwrap();
+        drop(effect);
+
+        // Once the affine token is dropped the actor reconciles the retained
+        // Issuing record instead of attempting to finish or replay it.
+        assert_eq!(
+            backend
+                .recover_durable_object_roster(&store, group, generation, &roster)
+                .await
+                .unwrap()
+                .as_str(),
+            "rolled_back"
+        );
+        assert_eq!(
+            transport
+                .operations()
+                .iter()
+                .filter(|operation| **operation == "install_sa")
+                .count(),
+            1
+        );
+        assert_eq!(
+            durable_object_roster_phase(&store, group, generation, &roster),
+            Ok(XfrmObjectRosterDurablePhase::Retired)
         );
     }
 

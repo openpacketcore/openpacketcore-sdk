@@ -29,7 +29,7 @@ use std::{
     error::Error,
     ffi::OsStr,
     fmt,
-    io::{self, Read},
+    io::{self, Read, Seek, SeekFrom},
     num::NonZeroU64,
     os::{
         fd::{AsFd, OwnedFd},
@@ -91,6 +91,15 @@ const CONTROL_BODY_BYTES: usize = CONTROL_BYTES - AUTH_TAG_BYTES;
 const CONTROL_MAGIC: [u8; 8] = *b"OPCXRSC1";
 const CONTROL_AUTH_DOMAIN: &[u8] = b"opc-xfrm-roster-control-v1\0";
 const CONTROL_NAME: &str = "control";
+// Fresh roster stores retain the logically ordered state-machine records in
+// one descriptor-anchored append journal.  One frame is still authenticated
+// and complete on its own; the journal only removes the directory-sync and
+// predecessor-unlink barriers from every state transition.
+const JOURNAL_NAME: &str = "journal";
+const MAX_JOURNAL_FRAMES: usize = 256;
+const JOURNAL_HEADER_BYTES: usize = EPOCH_BYTES;
+const MAX_JOURNAL_BYTES: usize =
+    JOURNAL_HEADER_BYTES + MAX_JOURNAL_FRAMES * XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES;
 const TEMPORARY_PREFIX: &str = ".opc-xfrm-roster-pending-";
 const EPOCH_BYTES: usize = 80;
 const EPOCH_BODY_BYTES: usize = EPOCH_BYTES - AUTH_TAG_BYTES;
@@ -1438,9 +1447,12 @@ struct StoreInner {
     owner_process_id: u32,
     proof_key: XfrmObjectRosterRecoveryProofKey,
     control: ControlRecord,
+    journal_enabled: bool,
     process_lock: Mutex<()>,
     #[cfg(test)]
     ledger: Mutex<Vec<XfrmObjectRosterPublication>>,
+    #[cfg(test)]
+    physical_barriers: Mutex<usize>,
 }
 
 impl Drop for StoreInner {
@@ -1618,6 +1630,7 @@ struct Inventory {
     records: Vec<NamedRosterRecord>,
     epoch_name: String,
     epoch: NonZeroU64,
+    journal: bool,
 }
 
 type NamedRosterRecord = (String, DurableRosterRecord);
@@ -1715,11 +1728,15 @@ impl XfrmObjectRosterRecoveryStore {
                 root_device,
                 root_inode,
             },
+            journal_enabled: false,
             process_lock: Mutex::new(()),
             #[cfg(test)]
             ledger: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            physical_barriers: Mutex::new(0),
         };
         inner.control = initialize_or_load_control(&inner, namespace_seal)?;
+        inner.journal_enabled = initialize_journal_mode(&inner)?;
         let store = Self {
             inner: Arc::new(inner),
         };
@@ -1906,7 +1923,10 @@ impl XfrmObjectRosterRecoveryStore {
             return Err(XfrmObjectRosterDurableError::InvalidTransition);
         }
         validate_roster_record(&next_record)?;
-        if entering_issuing && lease.advance_epoch(&inventory)? != projected_epoch {
+        if entering_issuing
+            && !inventory.journal
+            && lease.advance_epoch(&inventory)? != projected_epoch
+        {
             return Err(XfrmObjectRosterDurableError::Stale);
         }
         let class = if next.phase == XfrmObjectRosterDurablePhase::Committed {
@@ -1915,7 +1935,9 @@ impl XfrmObjectRosterRecoveryStore {
             PublicationClass::Transition
         };
         lease.publish_record(&next_record, class)?;
-        lease.remove_record(old_name)?;
+        if !inventory.journal {
+            lease.remove_record(old_name)?;
+        }
         Ok(next_record)
     }
 
@@ -2182,6 +2204,33 @@ impl XfrmObjectRosterRecoveryStore {
             .map_err(|_| XfrmObjectRosterDurableError::Storage)
     }
 
+    /// Test-only physical durability counter.
+    ///
+    /// Unlike [`Self::publication_ledger`], this counts successful filesystem
+    /// synchronization barriers on the roster store itself.  The hot-path
+    /// detector deliberately resets it after opening the store, so initial
+    /// control-record construction is not mistaken for an admission barrier.
+    #[cfg(test)]
+    pub(crate) fn tests_reset_physical_barriers(&self) -> Result<(), XfrmObjectRosterDurableError> {
+        let mut barriers = self
+            .inner
+            .physical_barriers
+            .lock()
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+        *barriers = 0;
+        Ok(())
+    }
+
+    /// Return the test-only successful filesystem synchronization count.
+    #[cfg(test)]
+    pub(crate) fn tests_physical_barriers(&self) -> Result<usize, XfrmObjectRosterDurableError> {
+        self.inner
+            .physical_barriers
+            .lock()
+            .map(|barriers| *barriers)
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)
+    }
+
     /// Test-only durable anomaly: burn the writer epoch underneath an
     /// unresolved roster.
     ///
@@ -2238,6 +2287,7 @@ impl StoreLease<'_> {
         let mut control_count = 0_usize;
         let mut epochs = Vec::new();
         let mut records = Vec::new();
+        let mut journal = None;
         let mut seen_names = BTreeMap::<String, ()>::new();
         let directory = Dir::read_from(&self.store.descriptor)
             .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
@@ -2279,6 +2329,17 @@ impl StoreLease<'_> {
                 epochs.push((name, decoded));
                 continue;
             }
+            if name == JOURNAL_NAME {
+                if !self.store.journal_enabled || journal.is_some() {
+                    return Err(XfrmObjectRosterDurableError::Malformed);
+                }
+                let (journal_epoch, decoded) = read_journal_records(self.store)?;
+                for record in &decoded {
+                    self.validate_record_binding(record)?;
+                }
+                journal = Some((journal_epoch, decoded));
+                continue;
+            }
             let parsed = parse_record_name(OsStr::from_bytes(raw_name))
                 .ok_or(XfrmObjectRosterDurableError::Malformed)?;
             let encoded =
@@ -2309,8 +2370,31 @@ impl StoreLease<'_> {
         // duplicates remain fail-closed; only the exact adjacent publications
         // that this module itself can leave between fsync and unlink are
         // completed deterministically.
-        let (epoch_name, epoch, obsolete_epoch) = classify_epoch_records(epochs)?;
-        let (records, obsolete_records) = classify_roster_records(records, epoch)?;
+        let (epoch_name, legacy_epoch, obsolete_epoch) = classify_epoch_records(epochs)?;
+        let journal_enabled = journal.is_some();
+        if journal_enabled != self.store.journal_enabled || (journal_enabled && !records.is_empty())
+        {
+            return Err(XfrmObjectRosterDurableError::Malformed);
+        }
+        let (journal_epoch, records, obsolete_records) = match journal {
+            Some((epoch, records)) => {
+                (epoch, classify_journal_roster_records(records)?, Vec::new())
+            }
+            None => {
+                let (records, obsolete) = classify_roster_records(records, legacy_epoch)?;
+                (legacy_epoch, records, obsolete)
+            }
+        };
+        // Journal frames carry their own writer epoch.  The durable current
+        // epoch is therefore the greater of the legacy bootstrap/explicit
+        // witness and every authenticated current roster record.
+        let epoch = records
+            .iter()
+            .map(|(_, record)| record.writer_epoch)
+            .max()
+            .map_or(journal_epoch.max(legacy_epoch), |record_epoch| {
+                record_epoch.max(journal_epoch).max(legacy_epoch)
+            });
         validate_unique_active_deletion_identities(&records)?;
         validate_single_cleanup_authority(&records)?;
         if let Some(name) = obsolete_epoch {
@@ -2323,6 +2407,7 @@ impl StoreLease<'_> {
             records,
             epoch_name,
             epoch,
+            journal: journal_enabled,
         })
     }
 
@@ -2382,9 +2467,13 @@ impl StoreLease<'_> {
         class: PublicationClass,
     ) -> Result<(), XfrmObjectRosterDurableError> {
         self.validate_record_binding(record)?;
-        let name = record_name(record);
         let bytes = record.encode(&self.store.proof_key)?;
-        publish_new_file(self.store, &name, &bytes)?;
+        if self.store.journal_enabled {
+            append_journal_record(self.store, &bytes, record.writer_epoch)?;
+        } else {
+            let name = record_name(record);
+            publish_new_file(self.store, &name, &bytes)?;
+        }
         #[cfg(test)]
         {
             let mut ledger = self
@@ -2441,8 +2530,23 @@ impl StoreLease<'_> {
             .filter(|(_, record)| record.phase.is_terminal())
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
-        for name in &names {
-            self.remove_record(name)?;
+        if inventory.journal {
+            if !names.is_empty() {
+                compact_journal(
+                    self.store,
+                    &inventory
+                        .records
+                        .iter()
+                        .filter(|(_, record)| !record.phase.is_terminal())
+                        .map(|(_, record)| record.clone())
+                        .collect::<Vec<_>>(),
+                    inventory.epoch,
+                )?;
+            }
+        } else {
+            for name in &names {
+                self.remove_record(name)?;
+            }
         }
         Ok(!names.is_empty())
     }
@@ -2452,6 +2556,8 @@ impl StoreLease<'_> {
         unlinkat(self.store.descriptor.as_fd(), name, AtFlags::empty())
             .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
         fsync(&self.store.descriptor).map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+        #[cfg(test)]
+        record_physical_barrier(self.store)?;
         Ok(())
     }
 
@@ -2460,8 +2566,22 @@ impl StoreLease<'_> {
         unlinkat(self.store.descriptor.as_fd(), name, AtFlags::empty())
             .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
         fsync(&self.store.descriptor).map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+        #[cfg(test)]
+        record_physical_barrier(self.store)?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn record_physical_barrier(store: &StoreInner) -> Result<(), XfrmObjectRosterDurableError> {
+    let mut barriers = store
+        .physical_barriers
+        .lock()
+        .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    *barriers = barriers
+        .checked_add(1)
+        .ok_or(XfrmObjectRosterDurableError::Storage)?;
+    Ok(())
 }
 
 fn members_share_identity(left: &DurableRosterRecord, right: &DurableRosterRecord) -> bool {
@@ -2557,6 +2677,55 @@ fn classify_roster_records(
         }
     }
     Ok((current, obsolete))
+}
+
+/// Collapse append-journal history to one current record per group.
+///
+/// Every retained frame is an independently authenticated durable record.  A
+/// journal may therefore contain more than the two adjacent files accepted by
+/// the legacy publish-then-unlink layout, but it accepts only a complete
+/// sequence beginning at `Prepared` and linked by the existing exact
+/// successor validator.  This makes a crash after any logical transition
+/// recoverable from that transition without ever treating an arbitrary older
+/// record as current cleanup authority.
+fn classify_journal_roster_records(
+    records: Vec<DurableRosterRecord>,
+) -> Result<Vec<NamedRosterRecord>, XfrmObjectRosterDurableError> {
+    let mut groups = BTreeMap::<([u8; 16], u64), Vec<DurableRosterRecord>>::new();
+    for record in records {
+        groups
+            .entry((record.group_id.0, record.group_generation.get()))
+            .or_default()
+            .push(record);
+    }
+    let mut current = Vec::with_capacity(groups.len());
+    for mut history in groups.into_values() {
+        history.sort_by_key(|record| record.publication_sequence);
+        let first = history
+            .first()
+            .ok_or(XfrmObjectRosterDurableError::Malformed)?;
+        if first.publication_sequence != 1
+            || first.phase != XfrmObjectRosterDurablePhase::Prepared
+            || first.cursor != 0
+        {
+            return Err(XfrmObjectRosterDurableError::Duplicate);
+        }
+        validate_roster_record(first)?;
+        for pair in history.windows(2) {
+            let [old, next] = pair else {
+                return Err(XfrmObjectRosterDurableError::Malformed);
+            };
+            if !is_exact_roster_publication_successor(old, next, next.writer_epoch) {
+                return Err(XfrmObjectRosterDurableError::Duplicate);
+            }
+            validate_roster_record(next)?;
+        }
+        let record = history
+            .pop()
+            .ok_or(XfrmObjectRosterDurableError::Malformed)?;
+        current.push((record_name(&record), record));
+    }
+    Ok(current)
 }
 
 fn validate_unique_active_deletion_identities(
@@ -2902,7 +3071,11 @@ fn initialize_or_load_control(
     // residue. No mutation can have been admitted yet, so completing epoch 1
     // is deterministic. Any additional or different entry remains fail-closed
     // in the bounded inventory scan.
-    if names.len() == 1 {
+    if names.len() == 1
+        || (names.len() == 2
+            && names.iter().any(|name| name == JOURNAL_NAME)
+            && names.iter().any(|name| name == CONTROL_NAME))
+    {
         let epoch = EpochRecord {
             store_incarnation: control.store_incarnation,
             epoch: NonZeroU64::new(1).ok_or(XfrmObjectRosterDurableError::Malformed)?,
@@ -2914,6 +3087,31 @@ fn initialize_or_load_control(
         )?;
     }
     Ok(control)
+}
+
+/// Enable the grouped publication path only for a fresh roster root.
+///
+/// Existing roots with named roster records keep their established
+/// publish-successor recovery format.  This avoids a format migration during
+/// recovery: a fresh root gets the journal before its first `Prepared`
+/// publication, while an old root remains wholly on the legacy path.
+fn initialize_journal_mode(store: &StoreInner) -> Result<bool, XfrmObjectRosterDurableError> {
+    let names = scan_raw_names(store)?;
+    if names.iter().any(|name| name == JOURNAL_NAME) {
+        return Ok(true);
+    }
+    if names
+        .iter()
+        .all(|name| name == CONTROL_NAME || name.starts_with("epoch-"))
+    {
+        let header = EpochRecord {
+            store_incarnation: store.control.store_incarnation,
+            epoch: NonZeroU64::new(1).ok_or(XfrmObjectRosterDurableError::Malformed)?,
+        };
+        publish_new_file(store, JOURNAL_NAME, &header.encode(&store.proof_key)?)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn scan_raw_names(store: &StoreInner) -> Result<Vec<String>, XfrmObjectRosterDurableError> {
@@ -2964,7 +3162,7 @@ fn cleanup_interrupted_publications(
             || metadata.st_mode.store_permissions() != FILE_MODE
             || metadata.st_nlink != 1
             || metadata.st_size < 0
-            || metadata.st_size > XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES as i64
+            || metadata.st_size > MAX_JOURNAL_BYTES as i64
         {
             return Err(XfrmObjectRosterDurableError::Malformed);
         }
@@ -3008,6 +3206,205 @@ fn read_fixed_file<const N: usize>(
         return Err(XfrmObjectRosterDurableError::Malformed);
     }
     Ok(bytes)
+}
+
+fn journal_frame_count<F: AsFd>(
+    store: &StoreInner,
+    descriptor: F,
+) -> Result<usize, XfrmObjectRosterDurableError> {
+    let (frames, trailing_bytes) = journal_frame_layout(store, descriptor)?;
+    if trailing_bytes != 0 {
+        return Err(XfrmObjectRosterDurableError::Malformed);
+    }
+    Ok(frames)
+}
+
+/// Return the authenticated-frame prefix and any incomplete trailing bytes.
+///
+/// A process loss during an append may leave a torn final write even though
+/// the preceding frame was already synchronized.  A non-frame tail has never
+/// been an acknowledged logical publication, so recovery may discard exactly
+/// that tail and resume from the preceding complete record.  A full frame
+/// with a bad tag is deliberately *not* treated this way: it could be
+/// corruption of an acknowledged transition and must remain fail-closed.
+fn journal_frame_layout<F: AsFd>(
+    store: &StoreInner,
+    descriptor: F,
+) -> Result<(usize, usize), XfrmObjectRosterDurableError> {
+    let metadata = fstat(descriptor).map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_file()
+        || stat_device(&metadata)? != store.root_device
+        || metadata.st_uid != store.root_owner
+        || metadata.st_mode.store_permissions() != FILE_MODE
+        || metadata.st_nlink != 1
+        || metadata.st_size < 0
+        || metadata.st_size > MAX_JOURNAL_BYTES as i64
+        || metadata.st_size < JOURNAL_HEADER_BYTES as i64
+    {
+        return Err(XfrmObjectRosterDurableError::Malformed);
+    }
+    let payload = usize::try_from(metadata.st_size - JOURNAL_HEADER_BYTES as i64)
+        .map_err(|_| XfrmObjectRosterDurableError::Malformed)?;
+    Ok((
+        payload / XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES,
+        payload % XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES,
+    ))
+}
+
+fn read_journal_records(
+    store: &StoreInner,
+) -> Result<(NonZeroU64, Vec<DurableRosterRecord>), XfrmObjectRosterDurableError> {
+    let descriptor = openat(
+        store.descriptor.as_fd(),
+        JOURNAL_NAME,
+        OFlags::RDWR | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| XfrmObjectRosterDurableError::Malformed)?;
+    let (frames, trailing_bytes) = journal_frame_layout(store, &descriptor)?;
+    let mut file = std::fs::File::from(descriptor);
+    if trailing_bytes != 0 {
+        let length = JOURNAL_HEADER_BYTES
+            .checked_add(
+                frames
+                    .checked_mul(XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES)
+                    .ok_or(XfrmObjectRosterDurableError::Malformed)?,
+            )
+            .ok_or(XfrmObjectRosterDurableError::Malformed)?;
+        file.set_len(u64::try_from(length).map_err(|_| XfrmObjectRosterDurableError::Malformed)?)
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+        file.sync_all()
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+        #[cfg(test)]
+        record_physical_barrier(store)?;
+    }
+    let mut header = [0_u8; JOURNAL_HEADER_BYTES];
+    file.read_exact(&mut header)
+        .map_err(|_| XfrmObjectRosterDurableError::Malformed)?;
+    let header = EpochRecord::decode(&header, &store.proof_key)?;
+    if header.store_incarnation != store.control.store_incarnation {
+        return Err(XfrmObjectRosterDurableError::WrongBinding);
+    }
+    let mut bytes = vec![0_u8; frames * XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES];
+    file.read_exact(&mut bytes)
+        .map_err(|_| XfrmObjectRosterDurableError::Malformed)?;
+    let (encoded_records, remainder) =
+        bytes.as_chunks::<XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES>();
+    if !remainder.is_empty() {
+        return Err(XfrmObjectRosterDurableError::Malformed);
+    }
+    let records = encoded_records
+        .iter()
+        .map(|encoded| DurableRosterRecord::decode(encoded, &store.proof_key))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((header.epoch, records))
+}
+
+/// Append one complete, authenticated logical publication and synchronize the
+/// already-created journal descriptor.  The record itself remains the
+/// recovery handle's exact fixed-size byte format; only its physical container
+/// changes, so every logical transition remains individually crash-visible.
+fn append_journal_record(
+    store: &StoreInner,
+    bytes: &[u8; XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES],
+    writer_epoch: NonZeroU64,
+) -> Result<(), XfrmObjectRosterDurableError> {
+    verify_visible_identity(store)?;
+    let descriptor = openat(
+        store.descriptor.as_fd(),
+        JOURNAL_NAME,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    let frames = journal_frame_count(store, &descriptor)?;
+    if frames >= MAX_JOURNAL_FRAMES {
+        return Err(XfrmObjectRosterDurableError::CapacityExceeded);
+    }
+    let mut file = std::fs::File::from(descriptor);
+    let mut header = [0_u8; JOURNAL_HEADER_BYTES];
+    file.read_exact(&mut header)
+        .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    let header = EpochRecord::decode(&header, &store.proof_key)?;
+    if header.store_incarnation != store.control.store_incarnation || writer_epoch < header.epoch {
+        return Err(XfrmObjectRosterDurableError::Stale);
+    }
+    // The header is a compaction checkpoint, not a second mutable epoch
+    // witness.  Updating it before the frame would let a failed append leave
+    // a newer epoch visible without the exact transition to which that epoch
+    // belongs.  Every live frame already carries and authenticates its writer
+    // epoch, so append only the frame and advance the header when a later
+    // fully-synchronized compaction snapshots the surviving records.
+    file.seek(SeekFrom::End(0))
+        .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    if file.write_all(bytes).is_err() || file.sync_all().is_err() {
+        return Err(XfrmObjectRosterDurableError::Storage);
+    }
+    #[cfg(test)]
+    record_physical_barrier(store)?;
+    let frames = journal_frame_count(store, &file)?;
+    if frames == 0 || frames > MAX_JOURNAL_FRAMES {
+        return Err(XfrmObjectRosterDurableError::Storage);
+    }
+    Ok(())
+}
+
+/// Compact terminal and superseded journal history only at a later
+/// cooperating write.  The new file is fully synchronized before the atomic
+/// replacement, so a crash can expose either the complete old journal or the
+/// complete snapshot; both retain every unresolved cleanup authority.
+fn compact_journal(
+    store: &StoreInner,
+    records: &[DurableRosterRecord],
+    epoch: NonZeroU64,
+) -> Result<(), XfrmObjectRosterDurableError> {
+    if records.len() > MAX_JOURNAL_FRAMES {
+        return Err(XfrmObjectRosterDurableError::CapacityExceeded);
+    }
+    verify_visible_identity(store)?;
+    let temporary = temporary_name()?;
+    let descriptor = openat(
+        store.descriptor.as_fd(),
+        temporary.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(FILE_MODE),
+    )
+    .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    let mut file = std::fs::File::from(descriptor);
+    file.write_all(
+        &EpochRecord {
+            store_incarnation: store.control.store_incarnation,
+            epoch,
+        }
+        .encode(&store.proof_key)?,
+    )
+    .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    for record in records {
+        file.write_all(&record.encode(&store.proof_key)?)
+            .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    }
+    if file.sync_all().is_err() {
+        let _ = unlinkat(
+            store.descriptor.as_fd(),
+            temporary.as_str(),
+            AtFlags::empty(),
+        );
+        return Err(XfrmObjectRosterDurableError::Storage);
+    }
+    #[cfg(test)]
+    record_physical_barrier(store)?;
+    renameat_with(
+        store.descriptor.as_fd(),
+        temporary.as_str(),
+        store.descriptor.as_fd(),
+        JOURNAL_NAME,
+        RenameFlags::empty(),
+    )
+    .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    fsync(&store.descriptor).map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    #[cfg(test)]
+    record_physical_barrier(store)?;
+    Ok(())
 }
 
 fn validate_file_metadata(
@@ -3067,6 +3464,8 @@ fn publish_new_file(
                 );
                 return Err(XfrmObjectRosterDurableError::Storage);
             }
+            #[cfg(test)]
+            record_physical_barrier(store)?;
             let staged_metadata =
                 fstat(&file).map_err(|_| XfrmObjectRosterDurableError::Storage)?;
             if !FileType::from_raw_mode(staged_metadata.st_mode).is_file()
@@ -3092,6 +3491,8 @@ fn publish_new_file(
             ) {
                 Ok(()) => {
                     fsync(&store.descriptor).map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+                    #[cfg(test)]
+                    record_physical_barrier(store)?;
                     let reopened = openat(
                         store.descriptor.as_fd(),
                         target,
@@ -3651,7 +4052,9 @@ mod tests {
         let mut names = fs::read_dir(root.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name != CONTROL_NAME && !name.starts_with("epoch-"))
+            .filter(|name| {
+                name != CONTROL_NAME && name != JOURNAL_NAME && !name.starts_with("epoch-")
+            })
             .collect::<Vec<_>>();
         names.sort();
         names
@@ -4633,7 +5036,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_sequence_overflow_fails_closed() {
+    fn malformed_journal_sequence_overflow_fails_closed() {
         let root = TestRoot::new();
         let store = store(&root);
         let seed = store
@@ -4665,38 +5068,266 @@ mod tests {
                 XfrmObjectRosterDurablePhase::Prepared,
                 enter_issuing(2)
             ),
-            Err(XfrmObjectRosterDurableError::CapacityExceeded)
+            Err(XfrmObjectRosterDurableError::Duplicate)
         );
     }
 
     #[test]
-    fn a_planted_publication_window_keeps_the_successor_on_reopen() {
+    fn journal_retains_the_exact_successor_history_without_a_predecessor_unlink_window() {
         let root = TestRoot::new();
         let store = store(&root);
         let prepared = store
             .prepare(group(0x21), generation(1), &members(2))
             .unwrap();
-        let predecessor = DurableRosterRecord::decode(&prepared.0, &store.inner.proof_key).unwrap();
         let issuing = advance(
             &store,
             &prepared,
             XfrmObjectRosterDurablePhase::Prepared,
             enter_issuing(2),
         );
-        // Recreate the crash window between the successor's fsync and the
-        // predecessor's unlink.
-        let lease = store.lease().unwrap();
-        lease
-            .publish_record(&predecessor, PublicationClass::Transition)
-            .unwrap();
-        drop(lease);
-        assert_eq!(record_file_names(&root).len(), 2);
-
+        // The journal contains both complete logical states in one permanent
+        // file. There is no predecessor unlink barrier to crash between.
+        let (_, history) = read_journal_records(&store.inner).unwrap();
+        assert_eq!(history.len(), 2);
         assert_eq!(
             store.inspect(&issuing),
             Ok(XfrmObjectRosterDurablePhase::Issuing)
         );
-        assert_eq!(record_file_names(&root).len(), 1);
+    }
+
+    #[test]
+    fn journal_reopens_every_happy_path_logical_transition() {
+        let root = TestRoot::new();
+        let mut recovered_store = store(&root);
+        let mut handle = recovered_store
+            .prepare(group(0x43), generation(1), &members(5))
+            .unwrap();
+        let mut expected_sequence = 1_usize;
+
+        // Each point is a process-loss boundary: only the authenticated
+        // journal frame(s) survive the old store instance. Reopening must
+        // recover exactly the current handle rather than a predecessor or an
+        // uncommitted aggregate.
+        for transition in std::iter::once((
+            XfrmObjectRosterDurablePhase::Prepared,
+            enter_issuing(5),
+            XfrmObjectRosterDurablePhase::Issuing,
+        ))
+        .chain((0..5).map(|ordinal| {
+            (
+                XfrmObjectRosterDurablePhase::Issuing,
+                acquire_member(5, ordinal),
+                if ordinal == 4 {
+                    XfrmObjectRosterDurablePhase::Applied
+                } else {
+                    XfrmObjectRosterDurablePhase::Issuing
+                },
+            )
+        })) {
+            handle = advance(&recovered_store, &handle, transition.0, transition.1);
+            expected_sequence += 1;
+            drop(recovered_store);
+            recovered_store = store(&root);
+            assert_eq!(recovered_store.inspect(&handle), Ok(transition.2));
+            let (_, history) = read_journal_records(&recovered_store.inner).unwrap();
+            assert_eq!(history.len(), expected_sequence);
+        }
+
+        handle = advance(
+            &recovered_store,
+            &handle,
+            XfrmObjectRosterDurablePhase::Applied,
+            XfrmObjectRosterTransition::new(XfrmObjectRosterDurablePhase::Committed, 5),
+        );
+        drop(recovered_store);
+        let store = store(&root);
+        assert_eq!(
+            store.inspect(&handle),
+            Ok(XfrmObjectRosterDurablePhase::Committed)
+        );
+    }
+
+    #[test]
+    fn journal_repairs_only_an_incomplete_unacknowledged_tail() {
+        let root = TestRoot::new();
+        let opened = store(&root);
+        let prepared = opened
+            .prepare(group(0x44), generation(1), &members(2))
+            .unwrap();
+        let journal = root.path().join(JOURNAL_NAME);
+        let complete_length = fs::metadata(&journal).unwrap().len();
+        drop(opened);
+
+        // This models a power loss during the append, before `sync_all`
+        // could acknowledge another logical publication.  The previous whole
+        // frame is still the exact pre-effect recovery authority.
+        let mut file = fs::OpenOptions::new().append(true).open(&journal).unwrap();
+        file.write_all(&[0x5a; 17]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let reopened = store(&root);
+        assert_eq!(
+            reopened.inspect(&prepared),
+            Ok(XfrmObjectRosterDurablePhase::Prepared)
+        );
+        assert_eq!(fs::metadata(&journal).unwrap().len(), complete_length);
+    }
+
+    #[test]
+    fn journal_rejects_a_corrupted_complete_tail_frame() {
+        let root = TestRoot::new();
+        let store = store(&root);
+        store
+            .prepare(group(0x45), generation(1), &members(2))
+            .unwrap();
+        let journal = root.path().join(JOURNAL_NAME);
+        drop(store);
+
+        // A whole frame could have been an acknowledged transition.  Its bad
+        // authenticator therefore remains a fail-closed corruption, rather
+        // than being mistaken for a torn, unacknowledged append.
+        let mut file = fs::OpenOptions::new().append(true).open(&journal).unwrap();
+        file.write_all(&[0x5a; XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES])
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert_eq!(
+            XfrmObjectRosterRecoveryStore::open_bound(root.path(), key(9), NAMESPACE_BINDING)
+                .unwrap_err(),
+            XfrmObjectRosterDurableError::Malformed
+        );
+    }
+
+    #[test]
+    fn journal_compacts_terminal_history_only_before_a_later_prepare() {
+        let root = TestRoot::new();
+        let store = store(&root);
+
+        // Repeated completed groups never make the descriptor grow with
+        // process lifetime.  Compaction is intentionally paid by the next
+        // prepare/maintenance operation, never by the current run path.
+        for index in 0..12_u8 {
+            let prepared = store
+                .prepare(group(0x50 + index), generation(1), &members(1))
+                .unwrap();
+            let applied = run_to_applied(&store, &prepared, 1);
+            advance(
+                &store,
+                &applied,
+                XfrmObjectRosterDurablePhase::Applied,
+                XfrmObjectRosterTransition::new(XfrmObjectRosterDurablePhase::Committed, 1),
+            );
+            let (_, history) = read_journal_records(&store.inner).unwrap();
+            assert_eq!(history.len(), 4);
+        }
+
+        store.tests_reset_physical_barriers().unwrap();
+        store
+            .prepare(group(0x61), generation(1), &members(1))
+            .unwrap();
+        let (_, history) = read_journal_records(&store.inner).unwrap();
+        assert_eq!(history.len(), 1);
+        // One fully synchronized compaction replacement plus the newly
+        // prepared frame.  This maintenance cost is outside the five-member
+        // run-path barrier detector above.
+        assert_eq!(store.tests_physical_barriers().unwrap(), 3);
+    }
+
+    #[test]
+    fn journal_reopens_disjoint_concurrent_prepared_group_identities() {
+        let root = TestRoot::new();
+        let opened = store(&root);
+        let first = opened
+            .prepare(group(0x62), generation(1), &members(2))
+            .unwrap();
+        let second_members = vec![material(5)];
+        let second = opened
+            .prepare(group(0x63), generation(1), &second_members)
+            .unwrap();
+        drop(opened);
+
+        let reopened = store(&root);
+        assert_eq!(
+            reopened.inspect(&first),
+            Ok(XfrmObjectRosterDurablePhase::Prepared)
+        );
+        assert_eq!(
+            reopened.inspect(&second),
+            Ok(XfrmObjectRosterDurablePhase::Prepared)
+        );
+    }
+
+    #[test]
+    fn journal_rejects_unsafe_entry_kinds_and_permissions() {
+        let restrictive = TestRoot::new();
+        drop(store(&restrictive));
+        let journal = restrictive.path().join(JOURNAL_NAME);
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            XfrmObjectRosterRecoveryStore::open_bound(
+                restrictive.path(),
+                key(9),
+                NAMESPACE_BINDING
+            )
+            .unwrap_err(),
+            XfrmObjectRosterDurableError::Malformed
+        );
+
+        let symlinked = TestRoot::new();
+        drop(store(&symlinked));
+        let journal = symlinked.path().join(JOURNAL_NAME);
+        fs::remove_file(&journal).unwrap();
+        std::os::unix::fs::symlink("control", &journal).unwrap();
+        assert_eq!(
+            XfrmObjectRosterRecoveryStore::open_bound(symlinked.path(), key(9), NAMESPACE_BINDING)
+                .unwrap_err(),
+            XfrmObjectRosterDurableError::Malformed
+        );
+
+        let non_regular = TestRoot::new();
+        drop(store(&non_regular));
+        let journal = non_regular.path().join(JOURNAL_NAME);
+        fs::remove_file(&journal).unwrap();
+        fs::create_dir(&journal).unwrap();
+        assert_eq!(
+            XfrmObjectRosterRecoveryStore::open_bound(
+                non_regular.path(),
+                key(9),
+                NAMESPACE_BINDING
+            )
+            .unwrap_err(),
+            XfrmObjectRosterDurableError::Malformed
+        );
+    }
+
+    #[test]
+    fn existing_per_file_roster_roots_remain_on_the_legacy_format() {
+        let root = TestRoot::new();
+        let journal_store = store(&root);
+        let prepared = journal_store
+            .prepare(group(0x64), generation(1), &members(2))
+            .unwrap();
+        let record =
+            DurableRosterRecord::decode(&prepared.0, &journal_store.inner.proof_key).unwrap();
+        drop(journal_store);
+
+        // Simulate a root written by the predecessor format: it has the same
+        // authenticated record and epoch/control witnesses, but no journal.
+        let journal = root.path().join(JOURNAL_NAME);
+        fs::remove_file(&journal).unwrap();
+        let legacy = root.path().join(record_name(&record));
+        fs::write(&legacy, record.encode(&key(9)).unwrap()).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+
+        let reopened = store(&root);
+        assert!(!reopened.inner.journal_enabled);
+        assert_eq!(
+            reopened.inspect(&prepared),
+            Ok(XfrmObjectRosterDurablePhase::Prepared)
+        );
+        assert!(!root.path().join(JOURNAL_NAME).exists());
     }
 
     #[test]
@@ -4716,7 +5347,7 @@ mod tests {
                 u8::try_from(2_usize).unwrap(),
             ),
         );
-        assert_eq!(record_file_names(&root).len(), 1);
+        assert!(record_file_names(&root).is_empty());
         store.advance_writer_epoch().unwrap();
         assert!(record_file_names(&root).is_empty());
 
@@ -4729,11 +5360,11 @@ mod tests {
             XfrmObjectRosterDurablePhase::Prepared,
             XfrmObjectRosterTransition::new(XfrmObjectRosterDurablePhase::Retired, 0),
         );
-        assert_eq!(record_file_names(&root).len(), 1);
+        assert!(record_file_names(&root).is_empty());
         store
             .prepare(group(0x41), generation(1), &members(2))
             .unwrap();
-        assert_eq!(record_file_names(&root).len(), 1);
+        assert!(record_file_names(&root).is_empty());
     }
 
     #[test]
@@ -4758,20 +5389,18 @@ mod tests {
                 1
             ))
         );
-        assert_eq!(record_file_names(&root), vec![name.clone()]);
+        assert!(record_file_names(&root).is_empty());
 
-        // A record whose filename disagrees with its body poisons the scan.
-        fs::rename(
-            root.path().join(&name),
-            root.path().join(format!(
-                "prepared-{}-0000000000000007-0002",
-                encode_hex(&[0x21; 16])
-            )),
-        )
-        .unwrap();
+        // The journal removes the record filename from the trusted surface;
+        // a changed logical frame still poisons the authenticated scan.
+        let journal = root.path().join(JOURNAL_NAME);
+        let mut bytes = fs::read(&journal).unwrap();
+        let offset = JOURNAL_HEADER_BYTES + XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES - 1;
+        bytes[offset] ^= 0x01;
+        fs::write(&journal, bytes).unwrap();
         assert_eq!(
             store.advance_writer_epoch(),
-            Err(XfrmObjectRosterDurableError::Malformed)
+            Err(XfrmObjectRosterDurableError::AuthenticationFailed)
         );
     }
 
@@ -5014,11 +5643,7 @@ mod tests {
         let pending = root
             .path()
             .join(".opc-xfrm-roster-pending-fedcba0987654321fedcba0987654321");
-        fs::write(
-            &pending,
-            [0x5a; XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES + 1],
-        )
-        .unwrap();
+        fs::write(&pending, [0x5a; MAX_JOURNAL_BYTES + 1]).unwrap();
         fs::set_permissions(&pending, fs::Permissions::from_mode(FILE_MODE)).unwrap();
         assert_eq!(
             XfrmObjectRosterRecoveryStore::open_bound(root.path(), key(9), NAMESPACE_BINDING)
