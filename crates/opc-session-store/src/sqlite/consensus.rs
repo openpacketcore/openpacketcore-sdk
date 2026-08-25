@@ -20058,6 +20058,7 @@ mod tests {
             &conn,
             Arc::clone(&primary_writers),
             Arc::clone(&observed_preemption),
+            #[cfg(all(test, target_os = "linux"))]
             None,
         );
         primary_writers.store(1, Ordering::Release);
@@ -21600,9 +21601,14 @@ mod tests {
         set_test_purge_floor(&conn, &log_id(129));
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
             .expect("begin row-limit turn");
-        let completion =
-            prune_consensus_log_rows_in_tx(&tx, &log_id(129), &AtomicUsize::new(0), None)
-                .expect("row-limit turn succeeds");
+        let completion = prune_consensus_log_rows_in_tx(
+            &tx,
+            &log_id(129),
+            &AtomicUsize::new(0),
+            #[cfg(all(test, target_os = "linux"))]
+            None,
+        )
+        .expect("row-limit turn succeeds");
         tx.commit().expect("commit row-limit turn");
         assert_eq!(completion.rows_deleted, 128);
         assert!(completion.more);
@@ -21634,9 +21640,14 @@ mod tests {
         .expect("install crossing byte-boundary row");
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
             .expect("begin byte-boundary turn");
-        let completion =
-            prune_consensus_log_rows_in_tx(&tx, &log_id(2), &AtomicUsize::new(0), None)
-                .expect("byte-boundary turn succeeds");
+        let completion = prune_consensus_log_rows_in_tx(
+            &tx,
+            &log_id(2),
+            &AtomicUsize::new(0),
+            #[cfg(all(test, target_os = "linux"))]
+            None,
+        )
+        .expect("byte-boundary turn succeeds");
         tx.commit().expect("commit byte-boundary turn");
         assert_eq!(completion.rows_deleted, 1);
         assert_eq!(
@@ -21659,9 +21670,14 @@ mod tests {
             .expect("install exact-max row");
         let tx = Transaction::new_unchecked(&exact_conn, TransactionBehavior::Immediate)
             .expect("begin exact-max turn");
-        let completion =
-            prune_consensus_log_rows_in_tx(&tx, &log_id(1), &AtomicUsize::new(0), None)
-                .expect("an exact-max row makes progress");
+        let completion = prune_consensus_log_rows_in_tx(
+            &tx,
+            &log_id(1),
+            &AtomicUsize::new(0),
+            #[cfg(all(test, target_os = "linux"))]
+            None,
+        )
+        .expect("an exact-max row makes progress");
         tx.commit().expect("commit exact-max turn");
         assert_eq!(completion.rows_deleted, 1);
         assert!(!completion.more);
@@ -21681,7 +21697,13 @@ mod tests {
         let tx = Transaction::new_unchecked(&oversized_conn, TransactionBehavior::Immediate)
             .expect("begin oversize turn");
         assert_eq!(
-            prune_consensus_log_rows_in_tx(&tx, &log_id(1), &AtomicUsize::new(0), None),
+            prune_consensus_log_rows_in_tx(
+                &tx,
+                &log_id(1),
+                &AtomicUsize::new(0),
+                #[cfg(all(test, target_os = "linux"))]
+                None,
+            ),
             Err(ConsensusLogPruneTurnError::Permanent),
             "an oversize retained row is a sticky nonspinning corruption"
         );
