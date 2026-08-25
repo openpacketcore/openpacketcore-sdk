@@ -1203,6 +1203,18 @@ fn validate_history_epoch(history_epoch: u64) -> Result<(), Error> {
     }
 }
 
+/// Compute the exact domain-separated session-key commitment used by durable
+/// protected-roster bindings and their SQLite business reservation projection.
+///
+/// This is an internal persistence identity. Callers must use this helper
+/// rather than independently recreating its framing or digest domain.
+pub(crate) fn session_key_commitment(key: &SessionKey) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_KEY_BINDING_DOMAIN);
+    update_len_prefixed(&mut hasher, &key.canonical_digest_input());
+    hasher.finalize().into()
+}
+
 fn request_binding_key(
     history_epoch: u64,
     scope: Scope,
@@ -1211,9 +1223,6 @@ fn request_binding_key(
 ) -> Result<RequestBindingKey, Error> {
     validate_history_epoch(history_epoch)?;
     scope.validate()?;
-    let mut hasher = Sha256::new();
-    hasher.update(SESSION_KEY_BINDING_DOMAIN);
-    update_len_prefixed(&mut hasher, &key.canonical_digest_input());
     let mut partition_hasher = Sha256::new();
     partition_hasher.update(TENANT_SCOPE_PARTITION_DOMAIN);
     partition_hasher.update(scope.digest());
@@ -1222,7 +1231,7 @@ fn request_binding_key(
         history_epoch,
         scope,
         tenant_scope_partition: partition_hasher.finalize().into(),
-        session_key_commitment: hasher.finalize().into(),
+        session_key_commitment: session_key_commitment(key),
         roster_id,
     };
     binding.validate()?;
@@ -1393,23 +1402,37 @@ impl TerminalRecord {
             TERMINAL_FRAME_DOMAIN,
             MAX_TERMINAL_CODEC_BYTES,
         )?;
-        Scope::from_digest(value.scope).validate()?;
-        if value.proof_commitments.is_empty()
-            || value.proof_commitments.len() > MAX_MEMBERS
-            || value.proof_commitments.contains(&[0; 32])
-            || value.body_commitment == [0; 32]
-            || value.body_commitment != value.calculate_body_commitment()
-            || Phase::from_tag(value.phase_tag).is_err()
-            || encode_frame(
-                TERMINAL_FRAME_MAGIC,
-                TERMINAL_FRAME_DOMAIN,
-                &value,
-                MAX_TERMINAL_CODEC_BYTES,
-            )? != bytes
+        value.validate_self_contained()?;
+        if encode_frame(
+            TERMINAL_FRAME_MAGIC,
+            TERMINAL_FRAME_DOMAIN,
+            &value,
+            MAX_TERMINAL_CODEC_BYTES,
+        )? != bytes
         {
             return Err(Error::InvalidTerminal);
         }
         Ok(value.body_commitment)
+    }
+
+    /// Validate the commitment-bound fields available without an admission.
+    ///
+    /// This is deliberately not an authorization check. It lets a retained
+    /// committed-terminal capsule prove that its embedded terminal body is
+    /// the exact canonical body named by the originating consensus command;
+    /// full recovery still validates the body against the immutable admission.
+    pub(crate) fn validate_self_contained(&self) -> Result<(), Error> {
+        Scope::from_digest(self.scope).validate()?;
+        if self.proof_commitments.is_empty()
+            || self.proof_commitments.len() > MAX_MEMBERS
+            || self.proof_commitments.contains(&[0; 32])
+            || self.body_commitment == [0; 32]
+            || self.body_commitment != self.calculate_body_commitment()
+            || Phase::from_tag(self.phase_tag).is_err()
+        {
+            return Err(Error::InvalidTerminal);
+        }
+        Ok(())
     }
     fn calculate_body_commitment(&self) -> [u8; 32] {
         let mut h = Sha256::new();
@@ -3481,6 +3504,29 @@ mod tests {
     fn frame_sha256(bytes: &[u8]) -> [u8; 32] {
         Sha256::digest(bytes).into()
     }
+
+    #[test]
+    fn shared_session_key_commitment_preserves_the_frozen_binding_digest() {
+        let key = key();
+        let mut legacy = Sha256::new();
+        legacy.update(SESSION_KEY_BINDING_DOMAIN);
+        update_len_prefixed(&mut legacy, &key.canonical_digest_input());
+        let expected: [u8; 32] = legacy.finalize().into();
+
+        assert_eq!(session_key_commitment(&key), expected);
+        assert_eq!(
+            request_binding_key(
+                1,
+                Scope::from_digest([9; 32]),
+                &key,
+                RosterId::from_bytes([7; ROSTER_ID_BYTES]).expect("roster ID"),
+            )
+            .expect("binding")
+            .session_key_commitment(),
+            expected
+        );
+    }
+
     fn proposal(width: usize) -> Result<AdmissionProposal, Error> {
         AdmissionProposal::new(
             Profile::v1(),
