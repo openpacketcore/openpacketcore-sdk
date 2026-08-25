@@ -16,7 +16,8 @@ use crate::fenced_mutation_roster::{
     Admission, IrreversibleHistoryFloor, RequestBindingKey, TerminalConflictTombstone,
     CHARGE_WITNESS_VERSION, MAX_ADMISSION_CODEC_BYTES, MAX_BUSINESS_SESSION_HEADER_BYTES,
     MAX_CHECKPOINT_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES,
-    MAX_HISTORY_EPOCH, MAX_LIVE_ROSTERS, MAX_RESERVED_AND_RETAINED, MAX_TOMBSTONE_CODEC_BYTES,
+    MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_HISTORY_EPOCH, MAX_LIVE_ROSTERS,
+    MAX_RESERVED_AND_RETAINED, MAX_ROSTER_INGRESS_ATTESTATION_BYTES, MAX_TOMBSTONE_CODEC_BYTES,
     PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES, RECLAIM_BATCH, STORAGE_CHARGE_LIVE_INDEX_BYTES,
     STORAGE_CHARGE_LIVE_ROW_BYTES, STORAGE_CHARGE_PAGE_BYTES, STORAGE_CHARGE_RETAINED_INDEX_BYTES,
     STORAGE_CHARGE_RETAINED_ROW_BYTES, STORAGE_CHARGE_TOMBSTONE_INDEX_BYTES,
@@ -356,14 +357,15 @@ mod production_tests {
                 }
             }
             if let Some(business) = transaction.business.as_ref() {
-                if self.business.as_ref() != business.expected() {
+                let action = business.action();
+                if self.business.as_ref() != Some(action.expected()) {
                     return Err(ReservationError::BusinessCas);
                 }
                 if self
                     .business_reservation
                     .as_ref()
                     .map(ProductionAdmissionBusinessReservation::expected)
-                    != business.expected()
+                    != Some(action.expected())
                 {
                     return Err(ReservationError::BusinessCas);
                 }
@@ -409,7 +411,15 @@ mod production_tests {
                 business_reservation = Some(reservation);
             }
             if let Some(business) = transaction.business {
-                business_row = business.replacement().cloned();
+                match business.action() {
+                    ProductionTerminalBusinessAction::AbortedCompareRelease { .. } => {}
+                    ProductionTerminalBusinessAction::EstablishedPut { successor, .. } => {
+                        business_row = Some(successor.clone());
+                    }
+                    ProductionTerminalBusinessAction::EstablishedDelete { .. } => {
+                        business_row = None;
+                    }
+                }
                 business_reservation = None;
             }
             if let Some(floor) = transaction.floor {
@@ -573,6 +583,96 @@ mod production_tests {
             .unwrap(),
             completed.next_witness().roster
         );
+    }
+
+    #[test]
+    fn aborted_terminal_is_compare_release_without_a_session_replacement() {
+        let profile = profile();
+        let admission = admission(31);
+        let live = live(&admission, 1, profile);
+        let terminal = terminal(&admission);
+        let admitted = prepare_production_admission(
+            None,
+            live,
+            None,
+            None,
+            empty_witness(),
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+        let prepared = prepare_production_terminalization(
+            admitted.replacement().unwrap(),
+            admitted.binding().unwrap(),
+            &terminal,
+            admitted.next_witness(),
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+        let business = prepared.business_cas().unwrap();
+        let replacement_request = match business.action() {
+            ProductionTerminalBusinessAction::AbortedCompareRelease { expected } => {
+                assert_eq!(
+                    expected,
+                    admission_business_reservation(&admission).expected()
+                );
+                None
+            }
+            ProductionTerminalBusinessAction::EstablishedPut { successor, .. } => Some(successor),
+            ProductionTerminalBusinessAction::EstablishedDelete { .. } => None,
+        };
+
+        assert!(replacement_request.is_none());
+        assert!(matches!(
+            business.action(),
+            ProductionTerminalBusinessAction::AbortedCompareRelease { .. }
+        ));
+    }
+
+    #[test]
+    fn terminal_evidence_envelope_is_reserved_at_admission_and_charged_at_terminal() {
+        let profile = profile();
+        let admission = admission(32);
+        let mut live = live(&admission, 1, profile);
+        let without_evidence = ComponentBytes::from_exact(
+            live.admission.len(),
+            MAX_COMMITTED_TERMINAL_CODEC_BYTES,
+            MAX_BUSINESS_SESSION_COPY_BYTES,
+            MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES,
+            0,
+            MAX_TOMBSTONE_CODEC_BYTES,
+        )
+        .unwrap();
+        let reserved = production_components(&live.admission, None, None).unwrap();
+        assert_eq!(
+            reserved.terminal_evidence_envelope_bytes,
+            MAX_EXECUTOR_PROOF_BUNDLE_BYTES + 16 + MAX_ROSTER_INGRESS_ATTESTATION_BYTES
+        );
+        assert!(
+            profile.charge(reserved).unwrap().retained
+                > profile.charge(without_evidence).unwrap().retained
+        );
+        assert!(live.peak_charge_bytes >= profile.charge(reserved).unwrap().retained);
+
+        let terminal = terminal(&admission);
+        let terminal_bytes = terminal.to_canonical_bytes(&admission).unwrap();
+        let retained_without_evidence = ComponentBytes::from_exact(
+            live.admission.len(),
+            terminal_bytes.len(),
+            MAX_BUSINESS_SESSION_COPY_BYTES,
+            MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES,
+            0,
+            MAX_TOMBSTONE_CODEC_BYTES,
+        )
+        .unwrap();
+        live.terminalize(&terminal, profile).unwrap();
+
+        assert!(
+            live.retained_charge_bytes
+                > profile.charge(retained_without_evidence).unwrap().retained
+        );
+        assert!(live.retained_charge_bytes <= live.peak_charge_bytes);
     }
 
     #[test]
@@ -1963,6 +2063,15 @@ impl fmt::Debug for GlobalChargeWitness {
 const MAX_BUSINESS_SESSION_COPY_BYTES: usize =
     MAX_CHECKPOINT_BYTES + MAX_BUSINESS_SESSION_HEADER_BYTES;
 
+/// Bounded future terminal evidence retained alongside the terminal receipt.
+///
+/// This is reserved when a live roster is admitted, even though the evidence
+/// arrives only with its terminal command. The ingress request ID is fixed at
+/// 16 bytes; terminal-row and receipt framing remain in their respective
+/// schema-charge components below.
+const MAX_TERMINAL_EVIDENCE_ENVELOPE_BYTES: usize =
+    MAX_EXECUTOR_PROOF_BUNDLE_BYTES + 16 + MAX_ROSTER_INGRESS_ATTESTATION_BYTES;
+
 /// Fixed, versioned schema charge parameters.
 ///
 /// The values are a logical, page-rounded envelope.  They are intentionally
@@ -2036,10 +2145,11 @@ impl ChargeProfile {
             self.retained_row_bytes,
             self.retained_index_bytes,
             as_u64(components.canonical_admission_bytes)?,
-            add3(
+            add4(
                 as_u64(components.terminal_record_bytes)?,
                 as_u64(components.business_session_copy_bytes)?,
                 as_u64(components.composite_receipt_bytes)?,
+                as_u64(components.terminal_evidence_envelope_bytes)?,
             )?,
         )?)?;
         let tombstone = self.page_round(add3(
@@ -2086,6 +2196,7 @@ pub(crate) struct ComponentBytes {
     terminal_record_bytes: usize,
     business_session_copy_bytes: usize,
     composite_receipt_bytes: usize,
+    terminal_evidence_envelope_bytes: usize,
     tombstone_bytes: usize,
 }
 
@@ -2095,6 +2206,7 @@ impl ComponentBytes {
         terminal_record_bytes: usize,
         business_session_copy_bytes: usize,
         composite_receipt_bytes: usize,
+        terminal_evidence_envelope_bytes: usize,
         tombstone_bytes: usize,
     ) -> Result<Self, ReservationError> {
         let result = Self {
@@ -2102,6 +2214,7 @@ impl ComponentBytes {
             terminal_record_bytes,
             business_session_copy_bytes,
             composite_receipt_bytes,
+            terminal_evidence_envelope_bytes,
             tombstone_bytes,
         };
         result.validate()?;
@@ -2113,6 +2226,7 @@ impl ComponentBytes {
             || self.terminal_record_bytes > MAX_COMMITTED_TERMINAL_CODEC_BYTES
             || self.business_session_copy_bytes > MAX_BUSINESS_SESSION_COPY_BYTES
             || self.composite_receipt_bytes > MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES
+            || self.terminal_evidence_envelope_bytes > MAX_TERMINAL_EVIDENCE_ENVELOPE_BYTES
             || self.tombstone_bytes > MAX_TOMBSTONE_CODEC_BYTES
         {
             return Err(ReservationError::ComponentBounds);
@@ -2684,6 +2798,7 @@ fn production_components(
         terminal.map_or(MAX_COMMITTED_TERMINAL_CODEC_BYTES, <[u8]>::len),
         MAX_BUSINESS_SESSION_COPY_BYTES,
         MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES,
+        MAX_TERMINAL_EVIDENCE_ENVELOPE_BYTES,
         tombstone.map_or(MAX_TOMBSTONE_CODEC_BYTES, <[u8]>::len),
     )
 }
@@ -4193,32 +4308,96 @@ impl fmt::Debug for ProductionAdmissionBusinessReservation {
 /// Exact authoritative business-row CAS coupled only to a terminal mutation.
 #[derive(Clone)]
 pub(crate) enum ProductionTerminalBusinessCas {
-    /// An Aborted terminal revalidates the admission-reserved row and writes it
-    /// back identically, making its no-op explicit in the all-or-none adapter.
-    AbortedNoOp {
+    /// An Aborted terminal compares the admission-reserved authoritative row
+    /// and releases only its reservation. It never requests a session-row
+    /// insert, replacement, or deletion.
+    AbortedCompareRelease { expected: ProductionBusinessState },
+    /// An Established terminal compares and writes one exact successor row.
+    EstablishedPut {
         expected: ProductionBusinessState,
-        replacement: ProductionBusinessState,
+        successor: ProductionBusinessState,
     },
-    /// An Established terminal compares and materializes one exact business row.
-    Established {
-        expected: ProductionBusinessState,
-        replacement: Option<ProductionBusinessState>,
+    /// An Established terminal compares and deletes its exact present row.
+    EstablishedDelete { expected: ProductionBusinessState },
+}
+
+/// The terminal business operation an adapter must apply atomically with its
+/// retained terminal receipt and reservation release.
+///
+/// This deliberately has no `Option<ProductionBusinessState>` successor:
+/// absence must be selected explicitly as `EstablishedDelete`, so an Aborted
+/// compare-and-release can never be mistaken for a session-row deletion.
+pub(crate) enum ProductionTerminalBusinessAction<'a> {
+    /// Compare the exact admitted raw authoritative row and release only its
+    /// key-exclusive reservation.
+    AbortedCompareRelease {
+        expected: &'a ProductionBusinessState,
+    },
+    /// Compare the exact admitted row and insert-or-replace this successor.
+    EstablishedPut {
+        expected: &'a ProductionBusinessState,
+        successor: &'a ProductionBusinessState,
+    },
+    /// Compare the exact admitted row and delete it as an Established action.
+    EstablishedDelete {
+        expected: &'a ProductionBusinessState,
     },
 }
 
-impl ProductionTerminalBusinessCas {
-    pub(crate) fn expected(&self) -> Option<&ProductionBusinessState> {
+impl<'a> ProductionTerminalBusinessAction<'a> {
+    /// Return the exact admitted authoritative pre-state to compare before
+    /// either releasing the reservation or applying the selected action.
+    pub(crate) const fn expected(&self) -> &'a ProductionBusinessState {
         match self {
-            Self::AbortedNoOp { expected, .. } | Self::Established { expected, .. } => {
-                Some(expected)
+            Self::AbortedCompareRelease { expected }
+            | Self::EstablishedPut { expected, .. }
+            | Self::EstablishedDelete { expected } => expected,
+        }
+    }
+}
+
+impl ProductionTerminalBusinessCas {
+    /// Return the exact typed terminal business operation for adapter dispatch.
+    pub(crate) const fn action(&self) -> ProductionTerminalBusinessAction<'_> {
+        match self {
+            Self::AbortedCompareRelease { expected } => {
+                ProductionTerminalBusinessAction::AbortedCompareRelease { expected }
+            }
+            Self::EstablishedPut {
+                expected,
+                successor,
+            } => ProductionTerminalBusinessAction::EstablishedPut {
+                expected,
+                successor,
+            },
+            Self::EstablishedDelete { expected } => {
+                ProductionTerminalBusinessAction::EstablishedDelete { expected }
             }
         }
     }
 
+    /// Return the exact business pre-state for legacy compare validation.
+    ///
+    /// New adapters must dispatch through [`Self::action`] so the aborted
+    /// compare-and-release operation cannot be represented as a replacement.
+    pub(crate) fn expected(&self) -> Option<&ProductionBusinessState> {
+        match self {
+            Self::AbortedCompareRelease { expected }
+            | Self::EstablishedPut { expected, .. }
+            | Self::EstablishedDelete { expected } => Some(expected),
+        }
+    }
+
+    /// Legacy replacement projection for the pre-#707 SQLite adapter.
+    ///
+    /// New adapters must use [`Self::action`]. In particular, this projection
+    /// preserves the previous no-op write for Aborted only while callers are
+    /// migrated; it is not the prepared Aborted business operation.
     pub(crate) fn replacement(&self) -> Option<&ProductionBusinessState> {
         match self {
-            Self::AbortedNoOp { replacement, .. } => Some(replacement),
-            Self::Established { replacement, .. } => replacement.as_ref(),
+            Self::AbortedCompareRelease { expected } => Some(expected),
+            Self::EstablishedPut { successor, .. } => Some(successor),
+            Self::EstablishedDelete { .. } => None,
         }
     }
 
@@ -4230,10 +4409,7 @@ impl ProductionTerminalBusinessCas {
         reservation.validate_for(admission)?;
         let expected = reservation.expected.clone();
         match terminal.materialization() {
-            TerminalMaterialization::Aborted => Ok(Self::AbortedNoOp {
-                expected: expected.clone(),
-                replacement: expected,
-            }),
+            TerminalMaterialization::Aborted => Ok(Self::AbortedCompareRelease { expected }),
             TerminalMaterialization::Established(EstablishedMaterialization::Updated {
                 from,
                 to,
@@ -4242,13 +4418,13 @@ impl ProductionTerminalBusinessCas {
                 if *from != expected.generation {
                     return Err(ReservationError::BusinessCas);
                 }
-                Ok(Self::Established {
+                Ok(Self::EstablishedPut {
                     expected,
-                    replacement: Some(ProductionBusinessState::updated(
+                    successor: ProductionBusinessState::updated(
                         admission,
                         *to,
                         *record_commitment,
-                    )?),
+                    )?,
                 })
             }
             TerminalMaterialization::Established(EstablishedMaterialization::Deleted {
@@ -4257,10 +4433,7 @@ impl ProductionTerminalBusinessCas {
                 if *generation != expected.generation {
                     return Err(ReservationError::BusinessCas);
                 }
-                Ok(Self::Established {
-                    expected,
-                    replacement: None,
-                })
+                Ok(Self::EstablishedDelete { expected })
             }
             TerminalMaterialization::Established(EstablishedMaterialization::NoOp {
                 generation,
@@ -4268,9 +4441,9 @@ impl ProductionTerminalBusinessCas {
                 if *generation != expected.generation {
                     return Err(ReservationError::BusinessCas);
                 }
-                Ok(Self::Established {
+                Ok(Self::EstablishedPut {
                     expected: expected.clone(),
-                    replacement: Some(expected),
+                    successor: expected,
                 })
             }
         }
