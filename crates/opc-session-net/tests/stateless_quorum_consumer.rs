@@ -23,9 +23,9 @@ use opc_key::{
 use opc_session_net::{
     session_consumer_payload_budget, PersistentSessionConsumerClient,
     PersistentSessionConsumerConfig, PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver,
-    RemoteSessionConsensusPeer, SessionClusterId, SessionConfigurationGeneration,
-    SessionConsensusServer, SessionConsensusServerHandle, SessionConsumerAuthorizer,
-    SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+    RemoteSessionConsensusPeer, RosterIngressSigner, RosterIngressSignerError, SessionClusterId,
+    SessionConfigurationGeneration, SessionConsensusServer, SessionConsensusServerHandle,
+    SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
     SessionConsumerLeaseMutationError, SessionConsumerMutationError,
     SessionConsumerPreparedCheckpointBackend, SessionQuorumConsumerServer,
     SessionReauthenticationControl, SessionReplicationManifest, StatelessSessionConsumerClient,
@@ -42,20 +42,23 @@ use opc_session_store::{
     PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
     PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
-    QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, SessionBackend,
-    SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
-    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusResponse,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerAuthorization,
-    SessionConsumerAuthorizationGrant, SessionConsumerChange, SessionConsumerLeaseError,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
+    QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaId,
+    ReplicaTlsIdentity, RestoreScanRequest, RosterAttestationTrustRootIdentityV1,
+    RosterAttestationTrustRootV1, RosterIngressAttestationSigningInputV1,
+    RosterIngressAttestationV1, SessionBackend, SessionConsensusCommand, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusResponse, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionConsumerAuthorization, SessionConsumerAuthorizationGrant, SessionConsumerChange,
+    SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerRosterAuthorization, SessionConsumerScope,
+    SessionConsumerStoreError, SessionConsumerTenantNfScope,
     SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
     SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
     SessionConsumerVoterAuthority, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    SessionPayloadEncoding, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
-    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    SessionPayloadEncoding, SessionQuorumConsumer, SessionQuorumRosterIngress,
+    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
+    ValidatedQuorumTopology,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
@@ -1033,6 +1036,72 @@ struct CountingConsumer {
     v2_calls: AtomicUsize,
 }
 
+#[derive(Clone)]
+struct TestP256RosterAttestationIssuer {
+    root: RosterAttestationTrustRootV1,
+}
+
+impl TestP256RosterAttestationIssuer {
+    fn new() -> Self {
+        let signing_key = p256::ecdsa::SigningKey::from_bytes((&[0x61; 32]).into())
+            .expect("fixed P-256 roster signer");
+        let public_key = signing_key
+            .verifying_key()
+            .to_sec1_point(true)
+            .as_bytes()
+            .try_into()
+            .expect("compressed P-256 roster public key");
+        Self {
+            root: RosterAttestationTrustRootV1::new([0x51; 32], public_key)
+                .expect("fixed P-256 roster trust root"),
+        }
+    }
+}
+
+#[async_trait]
+impl RosterIngressSigner for TestP256RosterAttestationIssuer {
+    fn trust_root(&self) -> RosterAttestationTrustRootV1 {
+        self.root.clone()
+    }
+
+    async fn attest(
+        &self,
+        _input: &RosterIngressAttestationSigningInputV1,
+    ) -> Result<RosterIngressAttestationV1, RosterIngressSignerError> {
+        panic!("handshake-only protected-roster test must not request an attestation")
+    }
+}
+
+struct HandshakeOnlySessionQuorumRosterIngress {
+    expected_root_identity: RosterAttestationTrustRootIdentityV1,
+}
+
+impl HandshakeOnlySessionQuorumRosterIngress {
+    fn new(issuer: &TestP256RosterAttestationIssuer) -> Self {
+        Self {
+            expected_root_identity: issuer.root.identity(),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionQuorumRosterIngress for HandshakeOnlySessionQuorumRosterIngress {
+    fn expected_roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<RosterAttestationTrustRootIdentityV1> {
+        Some(self.expected_root_identity)
+    }
+
+    async fn execute_roster_ingress(
+        &self,
+        _authorization: &SessionConsumerRosterAuthorization,
+        _request: SessionConsumerRequest,
+        _attestation: RosterIngressAttestationV1,
+    ) -> SessionConsumerResponse {
+        panic!("handshake-only protected-roster test must not dispatch ingress")
+    }
+}
+
 #[derive(Default)]
 struct HangingConsumer {
     calls: AtomicUsize,
@@ -1341,6 +1410,20 @@ async fn v2_mutation_request(
         ),
         request_id,
     )
+}
+
+fn protected_roster_persistent_client(
+    pki: &TestPki,
+    address: SocketAddr,
+    server_spiffe: &str,
+    client_spiffe: &str,
+    voter_authority: SessionConsumerVoterAuthority,
+) -> PersistentSessionConsumerClient {
+    PersistentSessionConsumerClient::try_from_fenced_mutation_roster_stateless(
+        consumer_client(pki, address, server_spiffe, client_spiffe, voter_authority),
+        PersistentSessionConsumerConfig::default(),
+    )
+    .expect("protected-roster persistent consumer")
 }
 
 fn test_key() -> SessionKey {
@@ -2936,6 +3019,113 @@ async fn consumer_mtls_role_identity_and_server_identity_mismatches_fail_closed(
         wrong_server_identity.capabilities().await,
         Err(SessionConsumerClientError::Authentication)
     );
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn protected_roster_mtls_identity_and_server_identity_mismatches_fail_closed() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("protected-roster-server");
+    let admitted_spiffe = spiffe("protected-roster-admitted");
+    let member_spiffe = server_spiffe.clone();
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&admitted_spiffe, &server_spiffe).await;
+    let service = Arc::new(CountingConsumer::default());
+    let issuer = TestP256RosterAttestationIssuer::new();
+    let roster_ingress = Arc::new(HandshakeOnlySessionQuorumRosterIngress::new(&issuer));
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_roster_ingress(roster_ingress, Arc::new(issuer))
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start protected-roster consumer listener");
+
+    for (label, client_spiffe) in [
+        ("foreign A", spiffe("protected-roster-foreign-a")),
+        ("foreign B", spiffe("protected-roster-foreign-b")),
+        ("consensus member", member_spiffe),
+    ] {
+        let client = protected_roster_persistent_client(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            voter_authority.clone(),
+        );
+        assert_eq!(
+            client.prewarm().await,
+            Err(SessionConsumerClientError::Unavailable),
+            "{label} must not receive a protected-roster role oracle"
+        );
+        assert!(
+            client.diagnostics().await.tls_attempts > 0,
+            "{label} protected-roster prewarm must attempt mTLS"
+        );
+        client.shutdown().await;
+    }
+
+    let (_wrong_authorizer, _wrong_scope, wrong_voter_authority) =
+        authorizer_from_admitted_store(&admitted_spiffe, &spiffe("different-protected-server"))
+            .await;
+    let wrong_server_identity = protected_roster_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &admitted_spiffe,
+        wrong_voter_authority,
+    );
+    assert_eq!(
+        wrong_server_identity.prewarm().await,
+        Err(SessionConsumerClientError::Authentication),
+        "a wrong protected-roster expected server identity must fail authentication"
+    );
+    assert!(
+        wrong_server_identity.diagnostics().await.tls_attempts > 0,
+        "wrong protected-roster expected server identity must attempt mTLS"
+    );
+    wrong_server_identity.shutdown().await;
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn protected_roster_prewarm_rejects_a_listener_without_roster_ingress() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("protected-roster-missing-ingress-server");
+    let client_spiffe = spiffe("protected-roster-missing-ingress-client");
+    let (authorizer, _scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(CountingConsumer::default());
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start /1-only consumer listener");
+    let client = protected_roster_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
+
+    assert_eq!(
+        client.prewarm().await,
+        Err(SessionConsumerClientError::Protocol),
+        "a protected-roster prewarm must reject a /1-only listener"
+    );
+    assert!(
+        client.diagnostics().await.tls_attempts > 0,
+        "a protected-roster prewarm must attempt mTLS before rejecting /1-only"
+    );
+    client.shutdown().await;
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
     handle.abort_and_wait().await;
 }
