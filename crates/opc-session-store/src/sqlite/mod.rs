@@ -9,7 +9,9 @@
 //! is the only mutation and read-authority path.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(feature = "test-vfs")]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -18,6 +20,7 @@ use rusqlite::{
     params, Connection, InterruptHandle, OptionalExtension, Transaction, TransactionBehavior,
 };
 
+use crate::consensus::store::ConsensusStoreDiagnosticCounters;
 use crate::{
     backend::{
         validate_replication_log_page_owned, validate_replication_prefix_owned,
@@ -53,9 +56,277 @@ pub(crate) const SQLITE_CONSENSUS_MAX_VALUE_BYTES: usize = 1_048_576;
 const CONSENSUS_AUTHORITY_REQUIRED: &str = "consensus_authority_required";
 const RESTORE_SCAN_BLOCKING_WORKERS: usize = 1;
 const SQLITE_OPERATION_BLOCKING_WORKERS: usize = 1;
+// Fixed at the store scope, rather than at a consumer or subscriber scope.
+// Three lanes let two independent exact acceptance snapshots progress while a
+// third has a bounded in-flight SQLite operation.
+const SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS: usize = 3;
 const SQLITE_OPERATION_MAX_WORK: Duration = Duration::from_secs(2);
 const SQLITE_BUSY_TIMEOUT_MILLIS: u64 = 100;
 const SQLITE_OPERATION_PROGRESS_INTERVAL: i32 = 1_000;
+// Keep the file-backed writer's automatic WAL checkpoint threshold explicit.
+// This is SQLite's default, but the writer owns checkpoint policy rather than
+// acceptance readers, whose return path must remain a pure health check.
+const SQLITE_WRITER_WAL_AUTOCHECKPOINT_PAGES: i32 = 1_000;
+
+#[cfg(feature = "test-vfs")]
+#[derive(Default)]
+struct ProactiveCheckpointIdleWaitState {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+
+/// Feature-gated deterministic seam for the checkpoint worker's idle receive.
+///
+/// It is only available to the real-file test VFS qualification. The guard
+/// pauses the worker after its durable-work cancellation check and before it
+/// registers its next receive, which makes retained shutdown state testable.
+#[cfg(feature = "test-vfs")]
+#[doc(hidden)]
+pub struct ProactiveCheckpointIdleWaitForTest {
+    hook: Arc<ProactiveCheckpointIdleWaitHook>,
+}
+
+#[cfg(feature = "test-vfs")]
+struct ProactiveCheckpointIdleWaitHook {
+    state: StdMutex<ProactiveCheckpointIdleWaitState>,
+    entered: Condvar,
+    released: Condvar,
+}
+
+#[cfg(feature = "test-vfs")]
+impl Default for ProactiveCheckpointIdleWaitHook {
+    fn default() -> Self {
+        Self {
+            state: StdMutex::new(ProactiveCheckpointIdleWaitState::default()),
+            entered: Condvar::new(),
+            released: Condvar::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-vfs")]
+impl ProactiveCheckpointIdleWaitHook {
+    fn arm(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.armed = true;
+        state.entered = false;
+        state.released = false;
+    }
+
+    fn wait_before_receive(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.entered = true;
+        self.entered.notify_all();
+        while !state.released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.armed = false;
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.released = true;
+        self.released.notify_all();
+    }
+}
+
+#[cfg(feature = "test-vfs")]
+impl ProactiveCheckpointIdleWaitForTest {
+    /// Wait until the selected lane has reached the exact idle-receive seam.
+    pub fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let state = self
+            .hook
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, _) = self
+            .hook
+            .entered
+            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.entered
+    }
+
+    /// Release the idle-receive seam.
+    pub fn release(&self) {
+        self.hook.release();
+    }
+}
+
+#[cfg(feature = "test-vfs")]
+impl Drop for ProactiveCheckpointIdleWaitForTest {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(feature = "test-vfs")]
+#[derive(Default)]
+struct ProactiveCheckpointShutdownJoinState {
+    armed: bool,
+    entered: bool,
+}
+
+#[cfg(feature = "test-vfs")]
+struct ProactiveCheckpointShutdownJoinHook {
+    state: StdMutex<ProactiveCheckpointShutdownJoinState>,
+    entered: Condvar,
+}
+
+#[cfg(feature = "test-vfs")]
+impl Default for ProactiveCheckpointShutdownJoinHook {
+    fn default() -> Self {
+        Self {
+            state: StdMutex::new(ProactiveCheckpointShutdownJoinState::default()),
+            entered: Condvar::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-vfs")]
+impl ProactiveCheckpointShutdownJoinHook {
+    fn arm(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.armed = true;
+        state.entered = false;
+    }
+
+    fn observe(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.armed {
+            state.entered = true;
+            self.entered.notify_all();
+        }
+    }
+}
+
+/// Feature-gated observation of the checkpoint-worker join boundary.
+///
+/// This test-only seam marks the point after a shutdown owns the shared join
+/// slot and immediately before it awaits the worker. It does not pause or
+/// alter the worker.
+#[cfg(feature = "test-vfs")]
+#[doc(hidden)]
+pub struct ProactiveCheckpointShutdownJoinForTest {
+    hook: Arc<ProactiveCheckpointShutdownJoinHook>,
+}
+
+#[cfg(feature = "test-vfs")]
+impl ProactiveCheckpointShutdownJoinForTest {
+    /// Wait until shutdown begins awaiting the retained worker join handle.
+    pub fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let state = self
+            .hook
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, _) = self
+            .hook
+            .entered
+            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.entered
+    }
+}
+
+#[cfg(feature = "test-vfs")]
+struct ProactiveCheckpointWorkerObservation {
+    active_workers: AtomicUsize,
+    sender: tokio::sync::watch::Sender<usize>,
+}
+
+#[cfg(feature = "test-vfs")]
+impl ProactiveCheckpointWorkerObservation {
+    fn new() -> Self {
+        let (sender, _) = tokio::sync::watch::channel(0);
+        Self {
+            active_workers: AtomicUsize::new(0),
+            sender,
+        }
+    }
+
+    fn begin(self: &Arc<Self>) -> ProactiveCheckpointWorkerObservationGuard {
+        let active = self
+            .active_workers
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        self.sender.send_replace(active);
+        ProactiveCheckpointWorkerObservationGuard {
+            observation: Arc::clone(self),
+        }
+    }
+
+    fn end(&self) {
+        let active = self
+            .active_workers
+            .fetch_sub(1, Ordering::AcqRel)
+            .saturating_sub(1);
+        self.sender.send_replace(active);
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.sender.subscribe()
+    }
+}
+
+#[cfg(feature = "test-vfs")]
+struct ProactiveCheckpointWorkerObservationGuard {
+    observation: Arc<ProactiveCheckpointWorkerObservation>,
+}
+
+#[cfg(feature = "test-vfs")]
+impl Drop for ProactiveCheckpointWorkerObservationGuard {
+    fn drop(&mut self) {
+        self.observation.end();
+    }
+}
+
+/// Feature-gated, redaction-free worker-liveness observation for a test.
+///
+/// A lane has exactly one task, so this only exposes the bounded `0` or `1`
+/// lifecycle count; it carries no database identity, path, or error value.
+#[cfg(feature = "test-vfs")]
+#[doc(hidden)]
+pub struct ProactiveCheckpointWorkerObservationForTest {
+    receiver: tokio::sync::watch::Receiver<usize>,
+}
+
+#[cfg(feature = "test-vfs")]
+impl ProactiveCheckpointWorkerObservationForTest {
+    /// Wait for this store's fixed checkpoint worker count.
+    pub async fn wait_for_worker_count(&mut self, expected: usize) -> bool {
+        loop {
+            if *self.receiver.borrow() == expected {
+                return true;
+            }
+            if self.receiver.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+}
 
 pub(crate) fn validate_consensus_record(record: &StoredSessionRecord) -> Result<(), StoreError> {
     let actual = record.payload.len();
@@ -77,6 +348,86 @@ pub(crate) fn validate_consensus_record(record: &StoredSessionRecord) -> Result<
 pub(crate) enum RestoreScanValidationProfile {
     Standalone,
     Consensus,
+}
+
+/// Result of the fixed-quorum V2 status acceptance read.
+///
+/// `Unactivated` is deliberately distinct from an unavailable authority: the
+/// caller may obtain the one-shot unanimous V2 proof and repeat the same
+/// atomic authority/status read.  A normal status is never returned until the
+/// immutable authority, recovery state, and (when requested) exact activation
+/// certificate have all been observed in one SQLite transaction.
+#[derive(Debug)]
+#[allow(dead_code)] // Retained singleton adapter for internal generic callers.
+pub(crate) enum FixedQuorumFencedTransitionV2StatusRead {
+    Activated(crate::FencedTransitionV2Status),
+    Unactivated,
+}
+
+/// Result of one atomic fixed-quorum V2 status cohort acceptance read.
+///
+/// The vector preserves the caller's admitted order.  It is never retained
+/// after the one SQLite snapshot has been fanned back to that cohort.
+#[derive(Debug)]
+pub(crate) enum FixedQuorumFencedTransitionV2StatusBatchRead {
+    Activated(Vec<crate::FencedTransitionV2Status>),
+    Unactivated,
+}
+
+/// Atomic fixed-quorum admission facts for a raw V2 mutation proposal.
+///
+/// `Activated` carries the durable state machine's currently applied logical
+/// time. The leader must derive its command time from this fresh snapshot; it
+/// must not reuse a logical-time read made before the exact authority and V2
+/// activation checks. `Unactivated` is a normal result that lets the caller
+/// take the existing one-shot unanimous activation path. It never means that
+/// authority, recovery, or a mismatched V2 profile was accepted.
+#[derive(Debug)]
+pub(crate) enum FixedQuorumActivatedV2MutationSnapshot {
+    Activated {
+        /// Last logical time applied by the durable consensus state machine.
+        applied_logical_time: Option<opc_types::Timestamp>,
+    },
+    Unactivated,
+}
+
+/// Immutable inputs revalidated together before a raw V2 mutation proposal.
+///
+/// This is an owned caller snapshot only; the durable authority, recovery
+/// state, V2 activation certificate, and logical time are always read again
+/// in one SQLite transaction.
+pub(crate) struct FixedQuorumActivatedV2MutationSnapshotRequest {
+    pub(crate) storage_identity: crate::consensus::SessionConsensusIdentity,
+    pub(crate) scope_identity: crate::consensus::SessionConsensusIdentity,
+    pub(crate) voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+    pub(crate) expected_members:
+        std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+    pub(crate) expected_bindings: std::collections::BTreeMap<
+        crate::consensus::SessionConsensusNodeId,
+        crate::consensus::SessionTopologyMemberBinding,
+    >,
+    pub(crate) expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
+    pub(crate) profile_digest: [u8; 32],
+}
+
+/// Fixed inputs that must be revalidated with a consumer V2 status result.
+///
+/// This is intentionally an owned snapshot from the caller: every invocation
+/// still re-reads durable authority and recovery state; none of these values
+/// cache that decision across calls.
+pub(crate) struct FixedQuorumFencedTransitionV2StatusReadRequest {
+    pub(crate) storage_identity: crate::consensus::SessionConsensusIdentity,
+    pub(crate) scope_identity: crate::consensus::SessionConsensusIdentity,
+    pub(crate) voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+    pub(crate) expected_members:
+        std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+    pub(crate) expected_bindings: std::collections::BTreeMap<
+        crate::consensus::SessionConsensusNodeId,
+        crate::consensus::SessionTopologyMemberBinding,
+    >,
+    pub(crate) expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
+    pub(crate) profile_digest: [u8; 32],
+    pub(crate) require_activation: bool,
 }
 
 impl RestoreScanValidationProfile {
@@ -154,18 +505,40 @@ fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
 #[allow(clippy::type_complexity)]
 pub struct SqliteSessionBackend {
     conn: Arc<tokio::sync::Mutex<Connection>>,
+    // File-backed consensus acceptance reads use fixed WAL reader lanes instead
+    // of waiting behind Raft log/state-machine writes on `conn`. This is a
+    // store-level resource shared by every clone, never a caller or subscriber
+    // allocation. In-memory stores retain their single-connection behavior.
+    consensus_acceptance_reader_pool: Option<Arc<ConsensusAcceptanceReaderPool>>,
     database_path: Option<Arc<PathBuf>>,
+    // The selected VFS is normally SQLite's default. The feature-gated RED
+    // fixture supplies its explicit test VFS here so the store-scoped
+    // checkpoint lane observes the same real-file durability boundary as the
+    // primary writer. This is not user configuration and is never populated
+    // by production construction.
+    checkpoint_vfs_name: Option<Arc<str>>,
+    #[cfg(feature = "test-vfs")]
+    proactive_checkpoint_idle_wait_hook: Arc<ProactiveCheckpointIdleWaitHook>,
+    #[cfg(feature = "test-vfs")]
+    proactive_checkpoint_worker_observation: Arc<ProactiveCheckpointWorkerObservation>,
+    #[cfg(feature = "test-vfs")]
+    proactive_checkpoint_shutdown_join_hook: Arc<ProactiveCheckpointShutdownJoinHook>,
     consensus_snapshot_observation: Arc<consensus::SnapshotBuildObservation>,
     caps: BackendCapabilities,
     clock: Arc<dyn Clock>,
     restore_scan_workers: Arc<tokio::sync::Semaphore>,
     operation_workers: Arc<tokio::sync::Semaphore>,
+    consensus_diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     consensus_snapshot_capture_gate: Arc<consensus::SnapshotCaptureGate>,
     #[cfg(test)]
     consensus_operator_recovery_failure: Arc<AtomicBool>,
+    #[cfg(test)]
+    fixed_quorum_v2_mutation_snapshot_cut: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) fixed_quorum_durable_check_count: Arc<AtomicUsize>,
     watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
     #[cfg(test)]
     pub(crate) watch_registration_gate: Arc<tokio::sync::Semaphore>,
@@ -237,6 +610,154 @@ impl Drop for SqliteOperationProgressGuard<'_> {
     }
 }
 
+/// Fixed, process-scoped WAL readers for exact consensus acceptance snapshots.
+///
+/// A checked-out connection is owned by exactly one blocking task. Returning
+/// it through the bounded channel makes reuse exclusive without holding a
+/// process-wide execution lock. A failed reset retires the lane; a replacement
+/// is admitted only after its WAL profile has been installed successfully.
+struct ConsensusAcceptanceReaderPool {
+    sender: tokio::sync::mpsc::Sender<Connection>,
+    receiver: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Connection>>,
+    workers: Arc<tokio::sync::Semaphore>,
+    database_path: Arc<PathBuf>,
+    usable_lanes: AtomicUsize,
+    #[cfg(test)]
+    retire_next_reader: AtomicBool,
+    #[cfg(test)]
+    fail_replenishment: AtomicBool,
+}
+
+impl ConsensusAcceptanceReaderPool {
+    fn new(database_path: Arc<PathBuf>) -> Result<Arc<Self>, StoreError> {
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel(SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS);
+        for _ in 0..SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS {
+            let reader = Connection::open(database_path.as_ref())
+                .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+            apply_pragma_profile(&reader, false, false)?;
+            sender.try_send(reader).map_err(|_| {
+                StoreError::BackendUnavailable("session acceptance reader pool unavailable".into())
+            })?;
+        }
+        Ok(Arc::new(Self {
+            sender,
+            receiver: tokio::sync::Mutex::new(receiver),
+            workers: Arc::new(tokio::sync::Semaphore::new(
+                SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS,
+            )),
+            database_path,
+            usable_lanes: AtomicUsize::new(SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS),
+            #[cfg(test)]
+            retire_next_reader: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_replenishment: AtomicBool::new(false),
+        }))
+    }
+
+    async fn checkout(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Connection, SqliteWorkerFailure> {
+        let mut receiver = tokio::time::timeout_at(deadline, self.receiver.lock())
+            .await
+            .map_err(|_| SqliteWorkerFailure::Admission)?;
+        tokio::time::timeout_at(deadline, receiver.recv())
+            .await
+            .map_err(|_| SqliteWorkerFailure::Admission)?
+            .ok_or(SqliteWorkerFailure::Admission)
+    }
+
+    fn connection_is_usable(&self, conn: &Connection) -> bool {
+        #[cfg(test)]
+        if self.retire_next_reader.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        conn.is_autocommit()
+            && conn
+                .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .is_ok()
+    }
+
+    fn replenish(&self) -> Option<Connection> {
+        #[cfg(test)]
+        if self.fail_replenishment.load(Ordering::Acquire) {
+            return None;
+        }
+        let reader = Connection::open(self.database_path.as_ref()).ok()?;
+        apply_pragma_profile(&reader, false, false).ok()?;
+        Some(reader)
+    }
+
+    fn return_or_retire(
+        &self,
+        reader: Connection,
+        worker_permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        if self.connection_is_usable(&reader) && self.sender.try_send(reader).is_ok() {
+            return;
+        }
+        if let Some(replacement) = self.replenish() {
+            if self.sender.try_send(replacement).is_ok() {
+                return;
+            }
+        }
+        self.usable_lanes.fetch_sub(1, Ordering::AcqRel);
+        // A lane that cannot be safely replenished must not leave a phantom
+        // permit that could admit work without a usable reader.
+        worker_permit.forget();
+    }
+
+    #[cfg(test)]
+    fn usable_lanes(&self) -> usize {
+        self.usable_lanes.load(Ordering::Acquire)
+    }
+}
+
+/// Owns one checked-out reader and its matching admission permit. Dropping a
+/// lease is deliberately fail-closed: panics, task cancellation, and join
+/// failure all return a healthy lane or retire the lane and its permit.
+struct ConsensusAcceptanceReaderLease {
+    pool: Arc<ConsensusAcceptanceReaderPool>,
+    reader: Option<Connection>,
+    worker_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl ConsensusAcceptanceReaderLease {
+    fn new(
+        pool: Arc<ConsensusAcceptanceReaderPool>,
+        reader: Connection,
+        worker_permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            pool,
+            reader: Some(reader),
+            worker_permit: Some(worker_permit),
+        }
+    }
+
+    fn connection(&self) -> Option<&Connection> {
+        self.reader.as_ref()
+    }
+
+    fn complete(mut self) {
+        self.return_or_retire();
+    }
+
+    fn return_or_retire(&mut self) {
+        if let (Some(reader), Some(worker_permit)) = (self.reader.take(), self.worker_permit.take())
+        {
+            self.pool.return_or_retire(reader, worker_permit);
+        }
+    }
+}
+
+impl Drop for ConsensusAcceptanceReaderLease {
+    fn drop(&mut self) {
+        self.return_or_retire();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum SqliteStoreWorkKind {
     Read,
@@ -268,6 +789,31 @@ impl SqliteSessionBackend {
         let path = path.as_ref();
         let conn = Connection::open(path)
             .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+        Self::finish_file_open(path, conn)
+    }
+
+    /// Open a test database through an explicitly selected SQLite test VFS.
+    ///
+    /// This exists only for the `test-vfs` feature's real-file durability
+    /// qualification. Apart from selecting the VFS for `Connection::open`, it
+    /// takes the identical file-open path as [`Self::open`], including the
+    /// recovery latch check and the primary writer pragma profile.
+    #[cfg(feature = "test-vfs")]
+    #[doc(hidden)]
+    pub fn open_with_vfs_for_test(
+        path: impl AsRef<Path>,
+        vfs_name: &str,
+    ) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        let conn =
+            Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), vfs_name)
+                .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+        let mut backend = Self::finish_file_open(path, conn)?;
+        backend.checkpoint_vfs_name = Some(Arc::from(vfs_name));
+        Ok(backend)
+    }
+
+    fn finish_file_open(path: &Path, conn: Connection) -> Result<Self, StoreError> {
         let database_path = std::fs::canonicalize(path)
             .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
         if let Some(latch) =
@@ -293,6 +839,63 @@ impl SqliteSessionBackend {
         Self::new_with_conn(conn, false, Some(database_path))
     }
 
+    /// Read the primary writer's fixed automatic-checkpoint fallback in a test.
+    ///
+    /// The proactive lane never changes this value. Keeping the assertion at
+    /// the normal writer profile guards against a test accidentally proving a
+    /// threshold-retuned configuration instead of the production boundary.
+    #[cfg(feature = "test-vfs")]
+    #[doc(hidden)]
+    pub async fn wal_autocheckpoint_for_test(&self) -> Result<i32, StoreError> {
+        if self.database_path.is_none() {
+            return Err(StoreError::BackendUnavailable(
+                "SQLite checkpoint profile is unavailable for an in-memory backend".into(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .map_err(|error| StoreError::BackendUnavailable(error.to_string()))
+    }
+
+    /// Pause the one checkpoint worker before its next idle receive in a test.
+    ///
+    /// The returned guard releases the worker on drop, including a failing
+    /// test. This is only a retained-cancellation regression seam; it cannot
+    /// be enabled by production construction.
+    #[cfg(feature = "test-vfs")]
+    #[doc(hidden)]
+    pub fn hold_proactive_checkpoint_before_idle_receive_for_test(
+        &self,
+    ) -> ProactiveCheckpointIdleWaitForTest {
+        self.proactive_checkpoint_idle_wait_hook.arm();
+        ProactiveCheckpointIdleWaitForTest {
+            hook: Arc::clone(&self.proactive_checkpoint_idle_wait_hook),
+        }
+    }
+
+    /// Observe the one store-scoped checkpoint worker's bounded lifecycle.
+    #[cfg(feature = "test-vfs")]
+    #[doc(hidden)]
+    pub fn proactive_checkpoint_worker_observation_for_test(
+        &self,
+    ) -> ProactiveCheckpointWorkerObservationForTest {
+        ProactiveCheckpointWorkerObservationForTest {
+            receiver: self.proactive_checkpoint_worker_observation.subscribe(),
+        }
+    }
+
+    /// Mark the next checkpoint-worker join boundary for a cancellation test.
+    #[cfg(feature = "test-vfs")]
+    #[doc(hidden)]
+    pub fn observe_proactive_checkpoint_shutdown_join_for_test(
+        &self,
+    ) -> ProactiveCheckpointShutdownJoinForTest {
+        self.proactive_checkpoint_shutdown_join_hook.arm();
+        ProactiveCheckpointShutdownJoinForTest {
+            hook: Arc::clone(&self.proactive_checkpoint_shutdown_join_hook),
+        }
+    }
+
     /// Open an ephemeral in-memory SQLite database.
     pub fn in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()
@@ -305,7 +908,7 @@ impl SqliteSessionBackend {
         in_memory: bool,
         database_path: Option<PathBuf>,
     ) -> Result<Self, StoreError> {
-        apply_pragma_profile(&conn, in_memory)?;
+        apply_pragma_profile(&conn, in_memory, true)?;
 
         // Create table for storing session records
         conn.execute(
@@ -434,9 +1037,28 @@ impl SqliteSessionBackend {
         )
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
+        let consensus_acceptance_reader_pool = database_path
+            .as_ref()
+            .map(|path| ConsensusAcceptanceReaderPool::new(Arc::new(path.clone())))
+            .transpose()?;
+
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            consensus_acceptance_reader_pool,
             database_path: database_path.map(Arc::new),
+            checkpoint_vfs_name: None,
+            #[cfg(feature = "test-vfs")]
+            proactive_checkpoint_idle_wait_hook: Arc::new(
+                ProactiveCheckpointIdleWaitHook::default(),
+            ),
+            #[cfg(feature = "test-vfs")]
+            proactive_checkpoint_worker_observation: Arc::new(
+                ProactiveCheckpointWorkerObservation::new(),
+            ),
+            #[cfg(feature = "test-vfs")]
+            proactive_checkpoint_shutdown_join_hook: Arc::new(
+                ProactiveCheckpointShutdownJoinHook::default(),
+            ),
             consensus_snapshot_observation: Arc::new(consensus::SnapshotBuildObservation::default()),
             caps: sqlite_capabilities(),
             clock: Arc::new(crate::clock::SystemClock),
@@ -446,12 +1068,17 @@ impl SqliteSessionBackend {
             operation_workers: Arc::new(tokio::sync::Semaphore::new(
                 SQLITE_OPERATION_BLOCKING_WORKERS,
             )),
+            consensus_diagnostics: None,
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             consensus_snapshot_capture_gate: Arc::new(consensus::SnapshotCaptureGate::new()),
             #[cfg(test)]
             consensus_operator_recovery_failure: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fixed_quorum_v2_mutation_snapshot_cut: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fixed_quorum_durable_check_count: Arc::new(AtomicUsize::new(0)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             watch_registration_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -476,6 +1103,11 @@ impl SqliteSessionBackend {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn lock_connection_for_test(&self) -> tokio::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().await
+    }
+
     /// Replace the default `SystemClock`.
     ///
     /// The clock drives record TTL expiry and server-side lease expiry
@@ -484,6 +1116,14 @@ impl SqliteSessionBackend {
     /// how their deadlines are evaluated.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    pub(crate) fn with_consensus_diagnostics(
+        mut self,
+        diagnostics: Arc<ConsensusStoreDiagnosticCounters>,
+    ) -> Self {
+        self.consensus_diagnostics = Some(diagnostics);
         self
     }
 
@@ -496,23 +1136,49 @@ impl SqliteSessionBackend {
         E: Send + 'static,
         F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
     {
+        self.run_sqlite_task_on(
+            Arc::clone(&self.conn),
+            Arc::clone(&self.operation_workers),
+            operation,
+        )
+        .await
+    }
+
+    async fn run_sqlite_task_on<T, E, F>(
+        &self,
+        conn: Arc<tokio::sync::Mutex<Connection>>,
+        workers: Arc<tokio::sync::Semaphore>,
+        operation: F,
+    ) -> Result<Result<T, E>, SqliteWorkerFailure>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    {
         let deadline = tokio::time::Instant::now()
             .checked_add(SQLITE_OPERATION_MAX_WORK)
             .ok_or(SqliteWorkerFailure::Admission)?;
-        let worker_permit = tokio::time::timeout_at(
-            deadline,
-            Arc::clone(&self.operation_workers).acquire_owned(),
-        )
-        .await
-        .map_err(|_| SqliteWorkerFailure::Admission)?
-        .map_err(|_| SqliteWorkerFailure::Admission)?;
+        let worker_permit = tokio::time::timeout_at(deadline, workers.acquire_owned())
+            .await
+            .map_err(|_| {
+                if let Some(diagnostics) = &self.consensus_diagnostics {
+                    diagnostics.increment_sqlite_worker_permit_deadline();
+                }
+                SqliteWorkerFailure::Admission
+            })?
+            .map_err(|_| SqliteWorkerFailure::Admission)?;
         // The async connection lock is acquired before `spawn_blocking`, so a
         // blocked database cannot accumulate detached blocking jobs. Once the
         // job starts, both the connection and worker permit stay in its
         // closure even if the caller disconnects or its future is cancelled.
-        let conn = tokio::time::timeout_at(deadline, Arc::clone(&self.conn).lock_owned())
+        let conn = tokio::time::timeout_at(deadline, conn.lock_owned())
             .await
-            .map_err(|_| SqliteWorkerFailure::Admission)?;
+            .map_err(|_| {
+                if let Some(diagnostics) = &self.consensus_diagnostics {
+                    diagnostics.increment_sqlite_connection_lock_deadline();
+                }
+                SqliteWorkerFailure::Admission
+            })?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let interrupt = conn.get_interrupt_handle();
         let operation_deadline = deadline.into_std();
@@ -559,7 +1225,12 @@ impl SqliteSessionBackend {
             armed: true,
         };
         match tokio::time::timeout_at(deadline, task).await {
-            Err(_) => Err(SqliteWorkerFailure::OutcomeUnavailable),
+            Err(_) => {
+                if let Some(diagnostics) = &self.consensus_diagnostics {
+                    diagnostics.increment_sqlite_execution_deadline();
+                }
+                Err(SqliteWorkerFailure::OutcomeUnavailable)
+            }
             Ok(Err(_)) => {
                 cancel_on_drop.disarm();
                 Err(SqliteWorkerFailure::OutcomeUnavailable)
@@ -598,6 +1269,130 @@ impl SqliteSessionBackend {
         }
     }
 
+    async fn run_sqlite_task_on_consensus_acceptance_reader<T, E, F>(
+        &self,
+        pool: Arc<ConsensusAcceptanceReaderPool>,
+        operation: F,
+    ) -> Result<Result<T, E>, SqliteWorkerFailure>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(SQLITE_OPERATION_MAX_WORK)
+            .ok_or(SqliteWorkerFailure::Admission)?;
+        let worker_permit =
+            tokio::time::timeout_at(deadline, Arc::clone(&pool.workers).acquire_owned())
+                .await
+                .map_err(|_| {
+                    if let Some(diagnostics) = &self.consensus_diagnostics {
+                        diagnostics.increment_sqlite_worker_permit_deadline();
+                    }
+                    SqliteWorkerFailure::Admission
+                })?
+                .map_err(|_| SqliteWorkerFailure::Admission)?;
+        let conn = pool.checkout(deadline).await?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let interrupt = conn.get_interrupt_handle();
+        let operation_deadline = deadline.into_std();
+        let task_cancellation = Arc::clone(&cancellation);
+        let queued_job = Arc::new(StdMutex::new(Some((
+            ConsensusAcceptanceReaderLease::new(Arc::clone(&pool), conn, worker_permit),
+            operation,
+        ))));
+        let task_job = Arc::clone(&queued_job);
+        let task = tokio::task::spawn_blocking(move || {
+            let (lease, operation) = task_job
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()?;
+            let result = {
+                if let Some(conn) = lease.connection() {
+                    let _progress = install_sqlite_operation_progress_handler(
+                        conn,
+                        Arc::clone(&task_cancellation),
+                        operation_deadline,
+                    );
+                    if task_cancellation.load(Ordering::Acquire) || !conn.is_autocommit() {
+                        Err(SqliteWorkerFailure::OutcomeUnavailable)
+                    } else {
+                        Ok(operation(conn))
+                    }
+                } else {
+                    Err(SqliteWorkerFailure::OutcomeUnavailable)
+                }
+            };
+            lease.complete();
+            Some(result)
+        });
+        let cancel_job = Arc::clone(&queued_job);
+        let mut cancel_on_drop = SqliteOperationCancellation {
+            cancellation: Arc::clone(&cancellation),
+            interrupt,
+            abort: task.abort_handle(),
+            cancel_queued: Some(Box::new(move || {
+                if let Some((lease, _)) = cancel_job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    drop(lease);
+                }
+            })),
+            armed: true,
+        };
+        match tokio::time::timeout_at(deadline, task).await {
+            Err(_) => {
+                if let Some(diagnostics) = &self.consensus_diagnostics {
+                    diagnostics.increment_sqlite_execution_deadline();
+                }
+                Err(SqliteWorkerFailure::OutcomeUnavailable)
+            }
+            Ok(Err(_)) => {
+                cancel_on_drop.disarm();
+                Err(SqliteWorkerFailure::OutcomeUnavailable)
+            }
+            Ok(Ok(Some(result))) => {
+                cancel_on_drop.disarm();
+                result
+            }
+            Ok(Ok(None)) => {
+                cancel_on_drop.disarm();
+                Err(SqliteWorkerFailure::OutcomeUnavailable)
+            }
+        }
+    }
+
+    /// Run one exact fixed-quorum acceptance snapshot on a fixed file-backed
+    /// WAL reader lane. Every lane is process-scoped and exclusive, so Raft
+    /// log/state-machine writes cannot create head-of-line lock waits. The
+    /// supplied closure must establish its own fresh SQLite transaction as the
+    /// visibility and authority boundary.
+    async fn run_consensus_acceptance_read_task<T, F>(&self, operation: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+    {
+        let result = match &self.consensus_acceptance_reader_pool {
+            Some(pool) => {
+                self.run_sqlite_task_on_consensus_acceptance_reader(Arc::clone(pool), operation)
+                    .await
+            }
+            None => self.run_sqlite_task(operation).await,
+        };
+        match result {
+            Ok(Ok(value)) => Ok(value),
+            Err(SqliteWorkerFailure::OutcomeUnavailable) => {
+                Err(sqlite_store_outcome_unavailable(SqliteStoreWorkKind::Read))
+            }
+            Ok(Err(error)) => Err(error),
+            Err(SqliteWorkerFailure::Admission) => Err(StoreError::BackendUnavailable(
+                "session SQLite worker admission deadline exceeded".into(),
+            )),
+        }
+    }
+
     async fn run_lease_sqlite_task<T, F>(&self, operation: F) -> Result<T, LeaseError>
     where
         T: Send + 'static,
@@ -620,6 +1415,13 @@ impl SqliteSessionBackend {
         let mut capabilities = self.caps;
         capabilities.max_value_bytes = SQLITE_CONSENSUS_MAX_VALUE_BYTES;
         capabilities
+    }
+
+    /// Maximum encoded durable consensus-log entry accepted by this SQLite
+    /// build. V2 capability admission binds this concrete limit into the
+    /// advertised protocol profile before any command is proposed.
+    pub(crate) const fn consensus_log_entry_max_bytes(&self) -> usize {
+        consensus::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES
     }
 
     /// Whether consensus state is backed by a filesystem database.
@@ -681,6 +1483,9 @@ impl SqliteSessionBackend {
         expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
         allow_pristine_membership: bool,
     ) -> bool {
+        #[cfg(test)]
+        self.fixed_quorum_durable_check_count
+            .fetch_add(1, Ordering::SeqCst);
         let conn = self.conn.lock().await;
         consensus::fixed_quorum_authority_is_exact_sync(
             &conn,
@@ -691,6 +1496,398 @@ impl SqliteSessionBackend {
             allow_pristine_membership,
         )
         .unwrap_or(false)
+    }
+
+    /// Atomically revalidate the immutable fixed-quorum authority and operator
+    /// recovery state needed before ordinary application traffic is admitted.
+    ///
+    /// A malformed or unavailable durable record remains distinguishable to
+    /// callers as storage unavailability; callers must fail closed in either
+    /// case. The recovery sidecar is deliberately read for every invocation,
+    /// rather than being cached with the immutable authority record.
+    pub(crate) async fn fixed_quorum_application_traffic_authority_is_exact(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        expected_members: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+        expected_bindings: std::collections::BTreeMap<
+            crate::consensus::SessionConsensusNodeId,
+            crate::consensus::SessionTopologyMemberBinding,
+        >,
+        expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
+    ) -> Result<bool, StoreError> {
+        #[cfg(test)]
+        if self
+            .consensus_operator_recovery_failure
+            .load(Ordering::Acquire)
+        {
+            return Err(StoreError::BackendUnavailable(
+                "injected session operator recovery check failure".into(),
+            ));
+        }
+        let database_path = self.database_path.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let database_latch = database_path
+                .as_deref()
+                .map(|path| consensus::read_operator_recovery_latch_sync(path))
+                .transpose()
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery latch is unavailable".into(),
+                    )
+                })?
+                .flatten();
+            if let Some(latch) = database_latch {
+                if latch.identity != identity {
+                    return Err(StoreError::BackendUnavailable(
+                        "session operator recovery latch identity does not match".into(),
+                    ));
+                }
+                opc_redaction::metrics::METRICS
+                    .session_operator_recovery_required
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
+                opc_redaction::metrics::METRICS
+                    .session_operator_recovery_epoch
+                    .fetch_max(latch.recovery_epoch, std::sync::atomic::Ordering::Relaxed);
+                if latch.audit_pending {
+                    opc_redaction::metrics::METRICS
+                        .session_operator_recovery_audit_pending
+                        .store(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            let fixed_authority_is_exact = consensus::fixed_quorum_authority_is_exact_sync(
+                conn,
+                identity,
+                &expected_members,
+                &expected_bindings,
+                expected_placement_policy,
+                false,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session fixed-quorum authority is unavailable".into(),
+                )
+            })?;
+            let recovery_pending = consensus::read_operator_recovery_sync(conn, identity)
+                .map(|state| state.pending_epoch.is_some())
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery state is unavailable".into(),
+                    )
+                })?;
+            Ok(fixed_authority_is_exact && !recovery_pending && database_latch.is_none())
+        })
+        .await
+    }
+
+    /// Atomically snapshot all durable facts required to propose a raw V2
+    /// mutation through an immutable fixed quorum.
+    ///
+    /// The filesystem recovery latch is re-read on every call in the same
+    /// bounded SQLite worker closure. The database-resident checks -- exact
+    /// fixed authority and scope, pending recovery, exact active V2 profile,
+    /// and the currently applied logical time -- share one read transaction.
+    /// Any malformed, changed, or unavailable durable state is a safe
+    /// pre-proposal failure and no result is cached across invocations.
+    pub(crate) async fn fixed_quorum_activated_v2_mutation_snapshot(
+        &self,
+        acceptance: FixedQuorumActivatedV2MutationSnapshotRequest,
+    ) -> Result<FixedQuorumActivatedV2MutationSnapshot, StoreError> {
+        let FixedQuorumActivatedV2MutationSnapshotRequest {
+            storage_identity,
+            scope_identity,
+            voters,
+            expected_members,
+            expected_bindings,
+            expected_placement_policy,
+            profile_digest,
+        } = acceptance;
+        #[cfg(test)]
+        if self
+            .consensus_operator_recovery_failure
+            .load(Ordering::Acquire)
+        {
+            return Err(StoreError::BackendUnavailable(
+                "injected session operator recovery check failure".into(),
+            ));
+        }
+        let database_path = self.database_path.clone();
+        #[cfg(test)]
+        let snapshot_cut = Arc::clone(&self.fixed_quorum_v2_mutation_snapshot_cut);
+        self.run_consensus_acceptance_read_task(move |conn| {
+            let database_latch = database_path
+                .as_deref()
+                .map(|path| consensus::read_operator_recovery_latch_sync(path))
+                .transpose()
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery latch is unavailable".into(),
+                    )
+                })?
+                .flatten();
+            if let Some(latch) = database_latch {
+                if latch.identity != storage_identity {
+                    return Err(StoreError::BackendUnavailable(
+                        "session operator recovery latch identity does not match".into(),
+                    ));
+                }
+                opc_redaction::metrics::METRICS
+                    .session_operator_recovery_required
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
+                opc_redaction::metrics::METRICS
+                    .session_operator_recovery_epoch
+                    .fetch_max(latch.recovery_epoch, std::sync::atomic::Ordering::Relaxed);
+                if latch.audit_pending {
+                    opc_redaction::metrics::METRICS
+                        .session_operator_recovery_audit_pending
+                        .store(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Err(StoreError::BackendUnavailable(
+                    "session application traffic authority is unavailable".into(),
+                ));
+            }
+
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            if scope_identity != storage_identity || voters != expected_members {
+                return Err(StoreError::BackendUnavailable(
+                    "session fixed-quorum authority is unavailable".into(),
+                ));
+            }
+            let fixed_authority_is_exact = consensus::fixed_quorum_authority_is_exact_sync(
+                &tx,
+                storage_identity,
+                &expected_members,
+                &expected_bindings,
+                expected_placement_policy,
+                false,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session fixed-quorum authority is unavailable".into(),
+                )
+            })?;
+            let recovery_pending = consensus::read_operator_recovery_sync(&tx, storage_identity)
+                .map(|state| state.pending_epoch.is_some())
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery state is unavailable".into(),
+                    )
+                })?;
+            if !fixed_authority_is_exact || recovery_pending {
+                return Err(StoreError::BackendUnavailable(
+                    "session application traffic authority is unavailable".into(),
+                ));
+            }
+            let activated = consensus::fenced_transition_v2_activation_matches_scope_sync(
+                &tx,
+                storage_identity,
+                scope_identity,
+                &voters,
+                profile_digest,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "fenced transition V2 activation is unavailable".into(),
+                )
+            })?;
+            #[cfg(test)]
+            if snapshot_cut.load(Ordering::Acquire) {
+                return Err(StoreError::BackendUnavailable(
+                    "injected fixed-quorum V2 mutation snapshot cut".into(),
+                ));
+            }
+            let result = if activated {
+                FixedQuorumActivatedV2MutationSnapshot::Activated {
+                    applied_logical_time: consensus::logical_time_sync(&tx, storage_identity)
+                        .map_err(|_| {
+                            StoreError::BackendUnavailable(
+                                "session consensus logical time is unavailable".into(),
+                            )
+                        })?,
+                }
+            } else {
+                FixedQuorumActivatedV2MutationSnapshot::Unactivated
+            };
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Atomically accept one fixed-quorum V2 status read at an exact consumer
+    /// scope.
+    ///
+    /// The recovery sidecar is necessarily checked outside SQLite, but is read
+    /// anew for every invocation.  All database-resident acceptance facts --
+    /// fixed authority, recovery state, exact V2 activation, and the receipt
+    /// status itself -- share the one read transaction.  `require_activation`
+    /// is false only after the caller has just obtained a fresh unanimous V2
+    /// capability proof at the preceding committed logical-time fence.
+    #[allow(dead_code)] // Retained singleton adapter for internal generic callers.
+    pub(crate) async fn fixed_quorum_fenced_transition_v2_status_at_scope(
+        &self,
+        acceptance: FixedQuorumFencedTransitionV2StatusReadRequest,
+        request: &crate::FencedTransitionV2Request,
+    ) -> Result<FixedQuorumFencedTransitionV2StatusRead, StoreError> {
+        match self
+            .fixed_quorum_fenced_transition_v2_status_batch_at_scope(
+                acceptance,
+                vec![request.clone()],
+            )
+            .await?
+        {
+            FixedQuorumFencedTransitionV2StatusBatchRead::Activated(mut statuses) => statuses
+                .pop()
+                .map(FixedQuorumFencedTransitionV2StatusRead::Activated)
+                .ok_or_else(|| {
+                    StoreError::BackendUnavailable("session status cohort was empty".into())
+                }),
+            FixedQuorumFencedTransitionV2StatusBatchRead::Unactivated => {
+                Ok(FixedQuorumFencedTransitionV2StatusRead::Unactivated)
+            }
+        }
+    }
+
+    /// Atomically accept an ordered bounded cohort of V2 status reads at one
+    /// exact fixed-quorum consumer scope.
+    ///
+    /// The recovery sidecar and all durable authority facts are evaluated once
+    /// for this one local cohort, then every receipt lookup runs in the same
+    /// SQLite snapshot.  No answer survives the fanout to its original callers.
+    pub(crate) async fn fixed_quorum_fenced_transition_v2_status_batch_at_scope(
+        &self,
+        acceptance: FixedQuorumFencedTransitionV2StatusReadRequest,
+        requests: Vec<crate::FencedTransitionV2Request>,
+    ) -> Result<FixedQuorumFencedTransitionV2StatusBatchRead, StoreError> {
+        if requests.is_empty() {
+            return Err(StoreError::BackendUnavailable(
+                "session status cohort was empty".into(),
+            ));
+        }
+        let FixedQuorumFencedTransitionV2StatusReadRequest {
+            storage_identity,
+            scope_identity,
+            voters,
+            expected_members,
+            expected_bindings,
+            expected_placement_policy,
+            profile_digest,
+            require_activation,
+        } = acceptance;
+        #[cfg(test)]
+        if self
+            .consensus_operator_recovery_failure
+            .load(Ordering::Acquire)
+        {
+            return Err(StoreError::BackendUnavailable(
+                "injected session operator recovery check failure".into(),
+            ));
+        }
+        let database_path = self.database_path.clone();
+        self.run_consensus_acceptance_read_task(move |conn| {
+            let database_latch = database_path
+                .as_deref()
+                .map(|path| consensus::read_operator_recovery_latch_sync(path))
+                .transpose()
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery latch is unavailable".into(),
+                    )
+                })?
+                .flatten();
+            if let Some(latch) = database_latch {
+                if latch.identity != storage_identity {
+                    return Err(StoreError::BackendUnavailable(
+                        "session operator recovery latch identity does not match".into(),
+                    ));
+                }
+                opc_redaction::metrics::METRICS
+                    .session_operator_recovery_required
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
+                opc_redaction::metrics::METRICS
+                    .session_operator_recovery_epoch
+                    .fetch_max(latch.recovery_epoch, std::sync::atomic::Ordering::Relaxed);
+                if latch.audit_pending {
+                    opc_redaction::metrics::METRICS
+                        .session_operator_recovery_audit_pending
+                        .store(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Err(StoreError::BackendUnavailable(
+                    "session application traffic authority is unavailable".into(),
+                ));
+            }
+
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            if scope_identity != storage_identity || voters != expected_members {
+                return Err(StoreError::BackendUnavailable(
+                    "session fixed-quorum authority is unavailable".into(),
+                ));
+            }
+            let fixed_authority_is_exact = consensus::fixed_quorum_authority_is_exact_sync(
+                &tx,
+                storage_identity,
+                &expected_members,
+                &expected_bindings,
+                expected_placement_policy,
+                false,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session fixed-quorum authority is unavailable".into(),
+                )
+            })?;
+            let recovery_pending = consensus::read_operator_recovery_sync(&tx, storage_identity)
+                .map(|state| state.pending_epoch.is_some())
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery state is unavailable".into(),
+                    )
+                })?;
+            if !fixed_authority_is_exact || recovery_pending {
+                return Err(StoreError::BackendUnavailable(
+                    "session application traffic authority is unavailable".into(),
+                ));
+            }
+            let activated = consensus::fenced_transition_v2_activation_matches_scope_sync(
+                &tx,
+                storage_identity,
+                scope_identity,
+                &voters,
+                profile_digest,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "fenced transition V2 activation is unavailable".into(),
+                )
+            })?;
+            if require_activation && !activated {
+                tx.commit().map_err(|_| {
+                    StoreError::BackendUnavailable("session store read failed".into())
+                })?;
+                return Ok(FixedQuorumFencedTransitionV2StatusBatchRead::Unactivated);
+            }
+            let statuses = requests
+                .iter()
+                .map(|request| {
+                    consensus::read_fenced_transition_v2_status_sync(
+                        &tx,
+                        storage_identity,
+                        scope_identity,
+                        request,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(FixedQuorumFencedTransitionV2StatusBatchRead::Activated(
+                statuses,
+            ))
+        })
+        .await
     }
 
     /// Read the last committed state-machine logical time after a caller-owned
@@ -728,6 +1925,33 @@ impl SqliteSessionBackend {
             )
             .map_err(|_| {
                 StoreError::BackendUnavailable("fenced transition activation is unavailable".into())
+            })
+        })
+        .await
+    }
+
+    /// Check the exact V2 profile certificate after a caller-owned consensus
+    /// barrier. A missing or stale certificate is a normal unsupported state;
+    /// storage failure remains unavailable.
+    pub(crate) async fn consensus_fenced_transition_v2_activation_matches_scope(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        scope_identity: crate::consensus::SessionConsensusIdentity,
+        voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+        profile_digest: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::fenced_transition_v2_activation_matches_scope_sync(
+                conn,
+                storage_identity,
+                scope_identity,
+                &voters,
+                profile_digest,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "fenced transition V2 activation is unavailable".into(),
+                )
             })
         })
         .await
@@ -905,6 +2129,78 @@ impl SqliteSessionBackend {
             tx.commit()
                 .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
             Ok(lookup)
+        })
+        .await
+    }
+
+    /// Read one exact V2 receipt after a caller-owned barrier.
+    pub(crate) async fn consensus_fenced_transition_v2_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        authority_identity: crate::consensus::SessionConsensusIdentity,
+        request: &crate::FencedTransitionV2Request,
+    ) -> Result<crate::FencedTransitionV2Status, StoreError> {
+        let request = request.clone();
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let status = consensus::read_fenced_transition_v2_status_sync(
+                &tx,
+                storage_identity,
+                authority_identity,
+                &request,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(status)
+        })
+        .await
+    }
+
+    /// Report whether the durable V2 ledger layout has already been activated.
+    ///
+    /// This survives replication-authority changes even though the exact-scope
+    /// activation certificate is cleared at cutover. Callers use it to keep
+    /// prospective voters fail-closed once V2 history semantics are durable.
+    pub(crate) async fn consensus_fenced_transition_v2_history_is_activated(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let persisted_identity = consensus::read_storage_identity_sync(conn).map_err(|_| {
+                StoreError::BackendUnavailable("fenced transition V2 history is unavailable".into())
+            })?;
+            if persisted_identity != storage_identity {
+                return Err(StoreError::BackendUnavailable(
+                    "fenced transition V2 history is unavailable".into(),
+                ));
+            }
+            consensus::fenced_transition_v2_ledger_layout_sync(conn)
+                .map(|layout| layout == consensus::FencedTransitionV2LedgerLayout::Activated)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "fenced transition V2 history is unavailable".into(),
+                    )
+                })
+        })
+        .await
+    }
+
+    /// Read the durable V2 history lifecycle after a caller-owned barrier.
+    pub(crate) async fn consensus_fenced_transition_v2_history_state(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        _authority_identity: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<crate::FencedTransitionV2HistoryState, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::read_fenced_transition_v2_history_state_sync(conn, storage_identity).map_err(
+                |_| {
+                    StoreError::BackendUnavailable(
+                        "fenced transition V2 history is unavailable".into(),
+                    )
+                },
+            )
         })
         .await
     }
@@ -1111,6 +2407,12 @@ impl SqliteSessionBackend {
     #[cfg(test)]
     pub(crate) fn inject_consensus_operator_recovery_failure(&self, enabled: bool) {
         self.consensus_operator_recovery_failure
+            .store(enabled, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_fixed_quorum_v2_mutation_snapshot_cut(&self, enabled: bool) {
+        self.fixed_quorum_v2_mutation_snapshot_cut
             .store(enabled, Ordering::Release);
     }
 
@@ -1457,7 +2759,11 @@ fn migrate_lease_acquired_at_schema(conn: &Connection) -> Result<(), StoreError>
     }
 }
 
-fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreError> {
+fn apply_pragma_profile(
+    conn: &Connection,
+    in_memory: bool,
+    primary_write_connection: bool,
+) -> Result<(), StoreError> {
     if in_memory {
         conn.execute_batch(
             r#"
@@ -1481,6 +2787,23 @@ fn apply_pragma_profile(conn: &Connection, in_memory: bool) -> Result<(), StoreE
     .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
     conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MILLIS))
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+
+    if !in_memory && primary_write_connection {
+        conn.pragma_update(
+            None,
+            "wal_autocheckpoint",
+            SQLITE_WRITER_WAL_AUTOCHECKPOINT_PAGES,
+        )
+        .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        let wal_autocheckpoint: i32 = conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+        if wal_autocheckpoint != SQLITE_WRITER_WAL_AUTOCHECKPOINT_PAGES {
+            return Err(StoreError::BackendUnavailable(
+                "failed to set SQLite WAL autocheckpoint threshold".into(),
+            ));
+        }
+    }
 
     let foreign_keys: i32 = conn
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
@@ -1955,6 +3278,7 @@ mod operation_lifetime_tests {
     };
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+    use rusqlite::hooks::{AuthAction, Authorization};
 
     fn key(stable_id: &'static [u8]) -> SessionKey {
         SessionKey {
@@ -2058,6 +3382,500 @@ mod operation_lifetime_tests {
 
         blocker.execute_batch("ROLLBACK").expect("release blocker");
         assert_eq!(backend.get(&key).await.expect("read after unblock"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_backed_consensus_acceptance_reader_pool_admits_unrelated_probes_and_uses_fresh_snapshots(
+    ) {
+        let directory = tempfile::tempdir().expect("SQLite acceptance-reader directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let clone = backend.clone();
+        let pool = backend
+            .consensus_acceptance_reader_pool
+            .as_ref()
+            .expect("file-backed stores have acceptance readers");
+        assert!(Arc::ptr_eq(
+            pool,
+            clone
+                .consensus_acceptance_reader_pool
+                .as_ref()
+                .expect("backend clones share the acceptance reader pool"),
+        ));
+        assert!(Arc::ptr_eq(
+            &pool.workers,
+            &clone
+                .consensus_acceptance_reader_pool
+                .as_ref()
+                .expect("backend clones share the acceptance reader pool")
+                .workers,
+        ));
+        assert_eq!(
+            pool.usable_lanes(),
+            SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS,
+            "acceptance reads have a fixed process-local reader width",
+        );
+
+        // Remove one lane and hold the primary writer mutex. The two remaining
+        // lanes must both enter their independent acceptance probes; a single
+        // mutex-protected reader would leave the second probe behind the first.
+        let held_reader = {
+            let mut receiver = pool.receiver.lock().await;
+            receiver.recv().await.expect("reader pool lane")
+        };
+        let held_primary = backend.conn.lock().await;
+        let entered = Arc::new(std::sync::Barrier::new(3));
+        let first_backend = clone.clone();
+        let first_entered = Arc::clone(&entered);
+        let first = tokio::spawn(async move {
+            first_backend
+                .run_consensus_acceptance_read_task(move |conn| {
+                    let tx = conn.unchecked_transaction().map_err(|_| {
+                        StoreError::BackendUnavailable("session store read failed".into())
+                    })?;
+                    let count = tx
+                        .query_row("SELECT COUNT(*) FROM session_records", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .map_err(|_| {
+                            StoreError::BackendUnavailable("session store read failed".into())
+                        })?;
+                    first_entered.wait();
+                    tx.commit().map_err(|_| {
+                        StoreError::BackendUnavailable("session store read failed".into())
+                    })?;
+                    Ok(count)
+                })
+                .await
+        });
+        let second_backend = clone.clone();
+        let second_entered = Arc::clone(&entered);
+        let second = tokio::spawn(async move {
+            second_backend
+                .run_consensus_acceptance_read_task(move |conn| {
+                    let tx = conn.unchecked_transaction().map_err(|_| {
+                        StoreError::BackendUnavailable("session store read failed".into())
+                    })?;
+                    let count = tx
+                        .query_row("SELECT COUNT(*) FROM session_records", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .map_err(|_| {
+                            StoreError::BackendUnavailable("session store read failed".into())
+                        })?;
+                    second_entered.wait();
+                    tx.commit().map_err(|_| {
+                        StoreError::BackendUnavailable("session store read failed".into())
+                    })?;
+                    Ok(count)
+                })
+                .await
+        });
+        let observer = Arc::clone(&entered);
+        tokio::task::spawn_blocking(move || observer.wait())
+            .await
+            .expect("acceptance probes enter distinct reader lanes");
+        assert_eq!(
+            first.await.expect("first probe task").expect("first probe"),
+            0
+        );
+        assert_eq!(
+            second
+                .await
+                .expect("second probe task")
+                .expect("second probe"),
+            0
+        );
+        drop(held_primary);
+        pool.sender
+            .send(held_reader)
+            .await
+            .expect("return held reader lane");
+
+        // Each checkout starts a new transaction rather than reusing a stale
+        // snapshot retained by a previous borrower.
+        backend
+            .conn
+            .lock()
+            .await
+            .execute_batch(
+                "CREATE TABLE acceptance_reader_visibility (value INTEGER NOT NULL);
+                 INSERT INTO acceptance_reader_visibility (value) VALUES (1);",
+            )
+            .expect("writer commits a new row");
+        let visible_rows = clone
+            .run_consensus_acceptance_read_task(|conn| {
+                let tx = conn.unchecked_transaction().map_err(|_| {
+                    StoreError::BackendUnavailable("session store read failed".into())
+                })?;
+                let count = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM acceptance_reader_visibility",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|_| {
+                        StoreError::BackendUnavailable("session store read failed".into())
+                    })?;
+                tx.commit().map_err(|_| {
+                    StoreError::BackendUnavailable("session store read failed".into())
+                })?;
+                Ok(count)
+            })
+            .await
+            .expect("fresh reader transaction sees committed writer state");
+        assert_eq!(visible_rows, 1);
+
+        let callers = (0..32)
+            .map(|_| {
+                let backend = clone.clone();
+                tokio::spawn(async move {
+                    backend
+                        .run_consensus_acceptance_read_task(|conn| {
+                            conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                                .map_err(|_| {
+                                    StoreError::BackendUnavailable(
+                                        "session store read failed".into(),
+                                    )
+                                })
+                        })
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        for caller in callers {
+            assert_eq!(caller.await.expect("caller task").expect("caller probe"), 1);
+        }
+        assert_eq!(
+            pool.usable_lanes(),
+            SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS
+        );
+        assert_eq!(
+            pool.workers.available_permits(),
+            SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS
+        );
+    }
+
+    #[tokio::test]
+    async fn file_backed_writer_sets_exact_wal_autocheckpoint_ceiling() {
+        let directory = tempfile::tempdir().expect("SQLite writer-profile directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let writer = backend.conn.lock().await;
+        let wal_autocheckpoint: i32 = writer
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .expect("writer WAL autocheckpoint threshold");
+
+        assert_eq!(
+            wal_autocheckpoint, SQLITE_WRITER_WAL_AUTOCHECKPOINT_PAGES,
+            "the primary writer owns the fixed WAL autocheckpoint threshold",
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_reader_return_skips_checkpoint_and_next_transaction_sees_fresh_commit() {
+        let directory = tempfile::tempdir().expect("SQLite acceptance-reader directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let pool = backend
+            .consensus_acceptance_reader_pool
+            .as_ref()
+            .expect("file-backed stores have acceptance readers");
+        {
+            let writer = backend.conn.lock().await;
+            writer
+                .execute_batch(
+                    "CREATE TABLE acceptance_reader_return_visibility (value INTEGER NOT NULL);",
+                )
+                .expect("create visibility table");
+        }
+
+        // Empty the channel so the returned reader is the next borrower. The
+        // two unreturned lanes are deliberately held only within this test.
+        let mut readers = {
+            let mut receiver = pool.receiver.lock().await;
+            let mut readers = Vec::with_capacity(SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS);
+            for _ in 0..SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS {
+                readers.push(receiver.recv().await.expect("reader pool lane"));
+            }
+            readers
+        };
+        let reader = readers.pop().expect("reader to return");
+        let checkpoint_attempts = Arc::new(AtomicUsize::new(0));
+        reader.authorizer(Some({
+            let checkpoint_attempts = Arc::clone(&checkpoint_attempts);
+            move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                AuthAction::Pragma { pragma_name, .. }
+                    if pragma_name.eq_ignore_ascii_case("wal_checkpoint") =>
+                {
+                    checkpoint_attempts.fetch_add(1, Ordering::AcqRel);
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            }
+        }));
+
+        let first = reader
+            .unchecked_transaction()
+            .expect("first reader transaction");
+        let first_visible: i64 = first
+            .query_row(
+                "SELECT COUNT(*) FROM acceptance_reader_return_visibility",
+                [],
+                |row| row.get(0),
+            )
+            .expect("first reader snapshot");
+        first.commit().expect("close first reader transaction");
+        assert_eq!(first_visible, 0);
+        {
+            let writer = backend.conn.lock().await;
+            writer
+                .execute(
+                    "INSERT INTO acceptance_reader_return_visibility (value) VALUES (1)",
+                    [],
+                )
+                .expect("writer commits fresh state");
+        }
+
+        let permit = pool
+            .workers
+            .clone()
+            .try_acquire_owned()
+            .expect("reader worker permit");
+        pool.return_or_retire(reader, permit);
+        assert_eq!(
+            checkpoint_attempts.load(Ordering::Acquire),
+            0,
+            "returning a reader never attempts a manual WAL checkpoint",
+        );
+
+        let returned = {
+            let mut receiver = pool.receiver.lock().await;
+            receiver.recv().await.expect("returned reader lane")
+        };
+        let next = returned
+            .unchecked_transaction()
+            .expect("next reader transaction");
+        let next_visible: i64 = next
+            .query_row(
+                "SELECT COUNT(*) FROM acceptance_reader_return_visibility",
+                [],
+                |row| row.get(0),
+            )
+            .expect("next reader snapshot");
+        next.commit().expect("close next reader transaction");
+        assert_eq!(
+            next_visible, 1,
+            "the next transaction sees the fresh commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_acceptance_snapshots_skip_manual_checkpoints_and_observe_commits() {
+        let directory = tempfile::tempdir().expect("SQLite acceptance-reader directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let pool = backend
+            .consensus_acceptance_reader_pool
+            .as_ref()
+            .expect("file-backed stores have acceptance readers");
+        let checkpoint_attempts = Arc::new(AtomicUsize::new(0));
+
+        // Instrument every fixed reader lane before returning it to the pool.
+        // A denied checkpoint makes the historical per-return path observable
+        // without permitting it to alter the connection's state.
+        let readers = {
+            let mut receiver = pool.receiver.lock().await;
+            let mut readers = Vec::with_capacity(SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS);
+            for _ in 0..SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS {
+                readers.push(receiver.recv().await.expect("reader pool lane"));
+            }
+            readers
+        };
+        for reader in readers {
+            reader.authorizer(Some({
+                let checkpoint_attempts = Arc::clone(&checkpoint_attempts);
+                move |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                    AuthAction::Pragma { pragma_name, .. }
+                        if pragma_name.eq_ignore_ascii_case("wal_checkpoint") =>
+                    {
+                        checkpoint_attempts.fetch_add(1, Ordering::AcqRel);
+                        Authorization::Deny
+                    }
+                    _ => Authorization::Allow,
+                }
+            }));
+            pool.sender
+                .try_send(reader)
+                .expect("return instrumented reader lane");
+        }
+        {
+            let writer = backend.conn.lock().await;
+            writer
+                .execute_batch(
+                    "CREATE TABLE repeated_acceptance_reader_visibility (value INTEGER NOT NULL);",
+                )
+                .expect("create visibility table");
+        }
+
+        // Cycle through every fixed lane twice. Each closure establishes and
+        // commits its own transaction, which is the acceptance visibility cut.
+        for expected_rows in 1..=(SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS as i64 * 2) {
+            {
+                let writer = backend.conn.lock().await;
+                writer
+                    .execute(
+                        "INSERT INTO repeated_acceptance_reader_visibility (value) VALUES (1)",
+                        [],
+                    )
+                    .expect("writer commits fresh state");
+            }
+            let visible_rows = backend
+                .run_consensus_acceptance_read_task(|conn| {
+                    let tx = conn.unchecked_transaction().map_err(|_| {
+                        StoreError::BackendUnavailable("session store read failed".into())
+                    })?;
+                    let rows = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM repeated_acceptance_reader_visibility",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(|_| {
+                            StoreError::BackendUnavailable("session store read failed".into())
+                        })?;
+                    tx.commit().map_err(|_| {
+                        StoreError::BackendUnavailable("session store read failed".into())
+                    })?;
+                    Ok(rows)
+                })
+                .await
+                .expect("acceptance snapshot succeeds");
+            assert_eq!(
+                visible_rows, expected_rows,
+                "each fresh acceptance transaction sees the current committed state",
+            );
+        }
+
+        assert_eq!(
+            checkpoint_attempts.load(Ordering::Acquire),
+            0,
+            "no acceptance snapshot return attempts a manual WAL checkpoint",
+        );
+        assert_eq!(
+            pool.usable_lanes(),
+            SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS,
+            "all bounded reader lanes remain usable",
+        );
+        assert_eq!(
+            pool.workers.available_permits(),
+            SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS,
+            "all bounded reader permits are returned",
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_reader_health_requires_autocommit_and_select() {
+        let directory = tempfile::tempdir().expect("SQLite acceptance-reader directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let pool = backend
+            .consensus_acceptance_reader_pool
+            .as_ref()
+            .expect("file-backed stores have acceptance readers");
+        let reader = {
+            let mut receiver = pool.receiver.lock().await;
+            receiver.recv().await.expect("reader pool lane")
+        };
+
+        assert!(pool.connection_is_usable(&reader));
+        reader
+            .execute_batch("BEGIN")
+            .expect("open reader transaction");
+        assert!(
+            !pool.connection_is_usable(&reader),
+            "a reader with an active transaction is not reusable",
+        );
+        reader
+            .execute_batch("ROLLBACK")
+            .expect("close reader transaction");
+        reader.authorizer(Some(
+            |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                AuthAction::Select => Authorization::Deny,
+                _ => Authorization::Allow,
+            },
+        ));
+        assert!(
+            !pool.connection_is_usable(&reader),
+            "a reader that cannot run its SELECT 1 health probe is retired",
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_reader_retirement_never_counts_an_unreplenished_lane_as_ready() {
+        let directory = tempfile::tempdir().expect("SQLite acceptance-reader directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let pool = backend
+            .consensus_acceptance_reader_pool
+            .as_ref()
+            .expect("file-backed stores have acceptance readers");
+        pool.retire_next_reader.store(true, Ordering::Release);
+        pool.fail_replenishment.store(true, Ordering::Release);
+
+        assert_eq!(
+            backend
+                .run_consensus_acceptance_read_task(|conn| {
+                    conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                        .map_err(|_| {
+                            StoreError::BackendUnavailable("session store read failed".into())
+                        })
+                })
+                .await
+                .expect("completed probe remains sound before reader retirement"),
+            1
+        );
+        assert_eq!(
+            pool.usable_lanes(),
+            SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS - 1,
+            "a dead lane is retired from usable reader capacity",
+        );
+        assert_eq!(
+            pool.workers.available_permits(),
+            SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS - 1,
+            "the retired lane leaves no phantom admission permit",
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_reader_task_panic_returns_its_lane_once() {
+        let directory = tempfile::tempdir().expect("SQLite acceptance-reader directory");
+        let path = directory.path().join("store.sqlite");
+        let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
+        let pool = backend
+            .consensus_acceptance_reader_pool
+            .as_ref()
+            .expect("file-backed stores have acceptance readers");
+
+        let outcome = backend
+            .run_consensus_acceptance_read_task(|_| -> Result<(), StoreError> {
+                panic!("injected acceptance reader task panic")
+            })
+            .await;
+        assert_eq!(
+            outcome,
+            Err(sqlite_store_outcome_unavailable(SqliteStoreWorkKind::Read)),
+        );
+        assert_eq!(
+            pool.usable_lanes(),
+            SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS,
+            "the dropped lease returns the reader before join-error handling",
+        );
+        assert_eq!(
+            pool.workers.available_permits(),
+            SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS,
+            "the panic path returns exactly one matching worker permit",
+        );
     }
 
     #[tokio::test]

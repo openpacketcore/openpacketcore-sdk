@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use opc_consensus::engine::error::{InstallSnapshotError, RaftError};
+use opc_consensus::engine::raft::InstallSnapshotResponse;
 use opc_consensus::{
     decode_bounded, derive_configuration_id, encode_bounded, ConsensusClusterId,
     ConsensusConfigurationEpoch, ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE,
-    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
@@ -23,17 +24,19 @@ use opc_session_store::{
     ConsensusSessionStore, DurableReadinessReport, DurableReadinessScope, DurableReadinessState,
     DurableRecoveryState, EncryptedSessionPayload, EncryptingSessionBackend, FenceToken,
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
-    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus, Generation,
-    LeaseError, ObservedPhysicalNodeIdentity, OwnerId, QuorumReplicaDescriptor,
-    QuorumTopologyAttestor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationOp, RestoreScanRequest,
-    SessionBackend, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    SessionPayloadEncoding, SessionStorePlatformProfile, SqliteSessionBackend, StateClass,
-    StateType, StoreError, StoredSessionRecord, SystemClock, TopologyAttestationClaims,
-    TopologyAttestationEvidence, TopologyAttestationPolicy, TopologyAttestationProvenance,
-    TopologyAttestationResult, TopologyAttestationTime, TopologyAttestationVerificationError,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
+    FencedTransitionV2CallerNonce, FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch,
+    FencedTransitionV2Request, FencedTransitionV2Status, Generation, LeaseError,
+    ObservedPhysicalNodeIdentity, OwnerId, QuorumReplicaDescriptor, QuorumTopologyAttestor,
+    QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
+    ReplicaTlsIdentity, ReplicationOp, RestoreScanRequest, SessionBackend, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionPayloadEncoding,
+    SessionStorePlatformProfile, SqliteSessionBackend, StateClass, StateType, StoreError,
+    StoredSessionRecord, SystemClock, TopologyAttestationClaims, TopologyAttestationEvidence,
+    TopologyAttestationPolicy, TopologyAttestationProvenance, TopologyAttestationResult,
+    TopologyAttestationTime, TopologyAttestationVerificationError,
     TopologyAttestationVerificationInput, TopologyCollectorId, ValidatedQuorumTopology,
     VerifiedQuorumTopologyAttestation, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
     SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
@@ -65,6 +68,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 // fault-gap so a delayed peer response can never satisfy this assertion.
 const ATTESTATION_PROBE_TIMER_DISPATCH_TOLERANCE: Duration = Duration::from_millis(250);
 const MAX_CAPTURED_CONSENSUS_PAYLOADS: usize = 4_096;
+const MAX_CAPTURED_INSTALL_SNAPSHOT_OBSERVATIONS: usize = 64;
 // Keep the bounded election qualification from competing with the deliberately
 // expensive snapshot-compaction qualification under the parallel test harness.
 static ELECTION_AND_SNAPSHOT_TEST_PERMIT: tokio::sync::Semaphore =
@@ -87,6 +91,55 @@ struct AppendEntriesRequestDelay {
     delay_millis: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstallSnapshotObservation {
+    snapshot_id: String,
+    offset: u64,
+    len: usize,
+    data_sha256: [u8; 32],
+    done: bool,
+}
+
+// This mirrors only the wire shape needed by the transport qualification. It
+// keeps snapshot bytes transient while the observation retains their digest.
+#[derive(Deserialize)]
+struct InstallSnapshotRequestObservation {
+    _vote: opc_consensus::engine::Vote<SessionConsensusNodeId>,
+    meta: opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    offset: u64,
+    data: Vec<u8>,
+    done: bool,
+}
+
+fn install_snapshot_observation(
+    request: &SessionConsensusWireRequest,
+) -> Option<InstallSnapshotObservation> {
+    let request = decode_bounded::<InstallSnapshotRequestObservation>(&request.payload).ok()?;
+    Some(InstallSnapshotObservation {
+        snapshot_id: request.meta.snapshot_id,
+        offset: request.offset,
+        len: request.data.len(),
+        data_sha256: Sha256::digest(&request.data).into(),
+        done: request.done,
+    })
+}
+
+fn install_snapshot_engine_accepted(response: &SessionConsensusWireResponse) -> bool {
+    let Ok(payload) = &response.result else {
+        return false;
+    };
+    decode_bounded::<
+        Result<
+            InstallSnapshotResponse<SessionConsensusNodeId>,
+            RaftError<SessionConsensusNodeId, InstallSnapshotError>,
+        >,
+    >(payload)
+    .is_ok_and(|result| result.is_ok())
+}
+
 #[derive(Clone)]
 struct LoopbackPeer {
     target: SessionConsensusNodeId,
@@ -101,10 +154,17 @@ struct LoopbackPeer {
     delayed_append_entries: Arc<AtomicUsize>,
     rpc_delay_millis: Arc<AtomicU64>,
     delayed_calls: Arc<AtomicUsize>,
+    fenced_transition_v2_capability_probe_calls: Arc<AtomicUsize>,
     capture_payloads: Arc<AtomicBool>,
     captured_payloads: Arc<StdMutex<Vec<Bytes>>>,
     forward_mutation_max_payload_bytes: Arc<AtomicUsize>,
     append_entries_max_payload_bytes: Arc<AtomicUsize>,
+    install_snapshot_responses_to_drop: Arc<AtomicUsize>,
+    dropped_install_snapshot_responses: Arc<AtomicUsize>,
+    install_snapshot_observations: Arc<StdMutex<Vec<InstallSnapshotObservation>>>,
+    dropped_install_snapshot_observation: Arc<StdMutex<Option<InstallSnapshotObservation>>>,
+    install_snapshot_observation_notify: Arc<tokio::sync::Notify>,
+    install_snapshot_response_drop_notify: Arc<tokio::sync::Notify>,
 }
 
 impl LoopbackPeer {
@@ -122,10 +182,17 @@ impl LoopbackPeer {
             delayed_append_entries: Arc::new(AtomicUsize::new(0)),
             rpc_delay_millis: Arc::new(AtomicU64::new(0)),
             delayed_calls: Arc::new(AtomicUsize::new(0)),
+            fenced_transition_v2_capability_probe_calls: Arc::new(AtomicUsize::new(0)),
             capture_payloads: Arc::new(AtomicBool::new(true)),
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
             forward_mutation_max_payload_bytes: Arc::new(AtomicUsize::new(0)),
             append_entries_max_payload_bytes: Arc::new(AtomicUsize::new(0)),
+            install_snapshot_responses_to_drop: Arc::new(AtomicUsize::new(0)),
+            dropped_install_snapshot_responses: Arc::new(AtomicUsize::new(0)),
+            install_snapshot_observations: Arc::new(StdMutex::new(Vec::new())),
+            dropped_install_snapshot_observation: Arc::new(StdMutex::new(None)),
+            install_snapshot_observation_notify: Arc::new(tokio::sync::Notify::new()),
+            install_snapshot_response_drop_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -213,6 +280,11 @@ impl LoopbackPeer {
         self.delayed_calls.load(Ordering::SeqCst)
     }
 
+    fn fenced_transition_v2_capability_probe_calls(&self) -> usize {
+        self.fenced_transition_v2_capability_probe_calls
+            .load(Ordering::SeqCst)
+    }
+
     fn clear_captured_payloads(&self) {
         self.captured_payloads
             .lock()
@@ -244,6 +316,61 @@ impl LoopbackPeer {
 
     fn append_entries_max_payload_bytes(&self) -> usize {
         self.append_entries_max_payload_bytes.load(Ordering::SeqCst)
+    }
+
+    fn arm_one_install_snapshot_response_loss(&self) {
+        self.install_snapshot_responses_to_drop
+            .store(1, Ordering::SeqCst);
+        self.dropped_install_snapshot_responses
+            .store(0, Ordering::SeqCst);
+        self.install_snapshot_observations
+            .lock()
+            .expect("snapshot observation mutex")
+            .clear();
+        self.dropped_install_snapshot_observation
+            .lock()
+            .expect("dropped snapshot observation mutex")
+            .take();
+    }
+
+    fn dropped_install_snapshot_responses(&self) -> usize {
+        self.dropped_install_snapshot_responses
+            .load(Ordering::SeqCst)
+    }
+
+    fn dropped_install_snapshot_observation(&self) -> Option<InstallSnapshotObservation> {
+        self.dropped_install_snapshot_observation
+            .lock()
+            .expect("dropped snapshot observation mutex")
+            .clone()
+    }
+
+    fn observed_install_snapshot_retry(&self, dropped: &InstallSnapshotObservation) -> bool {
+        let observations = self
+            .install_snapshot_observations
+            .lock()
+            .expect("snapshot observation mutex");
+        assert!(
+            observations.len() < MAX_CAPTURED_INSTALL_SNAPSHOT_OBSERVATIONS,
+            "snapshot response-loss observation capture was saturated"
+        );
+        observations
+            .iter()
+            .position(|observation| observation == dropped)
+            .is_some_and(|position| {
+                observations
+                    .iter()
+                    .skip(position + 1)
+                    .any(|observation| observation == dropped)
+            })
+    }
+
+    fn install_snapshot_observation_notification(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.install_snapshot_observation_notify)
+    }
+
+    fn install_snapshot_response_drop_notification(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.install_snapshot_response_drop_notify)
     }
 }
 
@@ -288,6 +415,47 @@ struct FencedTransitionActivationCapabilityProbeV2 {
 
 struct RejectFencedTransitionCapabilityProbeHandler {
     inner: Arc<dyn SessionConsensusRpcHandler>,
+}
+
+/// Test-only shape of the V2 current-voter capability probe.
+#[derive(Deserialize)]
+struct FencedTransitionV2CapabilityProbe {
+    schema_version: u16,
+    profile_digest: [u8; 32],
+}
+
+struct RejectFencedTransitionV2CapabilityProbeHandler {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+}
+
+impl fmt::Debug for RejectFencedTransitionV2CapabilityProbeHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RejectFencedTransitionV2CapabilityProbeHandler(<redacted>)")
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for RejectFencedTransitionV2CapabilityProbeHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if request.family == SessionConsensusRpcFamily::ReadBarrier
+            && matches!(
+                decode_bounded::<FencedTransitionV2CapabilityProbe>(&request.payload),
+                Ok(FencedTransitionV2CapabilityProbe {
+                    schema_version: 2,
+                    profile_digest: _profile_digest,
+                })
+            )
+        {
+            return SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Protocol),
+            };
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
 }
 
 impl fmt::Debug for RejectFencedTransitionCapabilityProbeHandler {
@@ -379,6 +547,18 @@ impl SessionConsensusPeer for LoopbackPeer {
             self.append_entries_max_payload_bytes
                 .fetch_max(request.payload.len(), Ordering::SeqCst);
         }
+        if request.family == SessionConsensusRpcFamily::ReadBarrier
+            && matches!(
+                decode_bounded::<FencedTransitionV2CapabilityProbe>(&request.payload),
+                Ok(FencedTransitionV2CapabilityProbe {
+                    schema_version: 2,
+                    profile_digest: _profile_digest,
+                })
+            )
+        {
+            self.fenced_transition_v2_capability_probe_calls
+                .fetch_add(1, Ordering::SeqCst);
+        }
         let rpc_delay = self.rpc_delay_millis.load(Ordering::SeqCst);
         if rpc_delay != 0 {
             self.delayed_calls.fetch_add(1, Ordering::SeqCst);
@@ -420,7 +600,43 @@ impl SessionConsensusPeer for LoopbackPeer {
             .ok_or(SessionConsensusPeerError::Unavailable)?;
         let sender = request.sender;
         let family = request.family;
+        let snapshot_observation = (family == SessionConsensusRpcFamily::InstallSnapshot)
+            .then(|| install_snapshot_observation(&request))
+            .flatten();
         let response = handler.handle(sender, request).await;
+
+        if family == SessionConsensusRpcFamily::InstallSnapshot
+            && install_snapshot_engine_accepted(&response)
+        {
+            if let Some(observation) = snapshot_observation {
+                let mut observations = self
+                    .install_snapshot_observations
+                    .lock()
+                    .expect("snapshot observation mutex");
+                if observations.len() < MAX_CAPTURED_INSTALL_SNAPSHOT_OBSERVATIONS {
+                    observations.push(observation.clone());
+                }
+                drop(observations);
+                self.install_snapshot_observation_notify.notify_one();
+
+                if self
+                    .install_snapshot_responses_to_drop
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    *self
+                        .dropped_install_snapshot_observation
+                        .lock()
+                        .expect("dropped snapshot observation mutex") = Some(observation);
+                    self.dropped_install_snapshot_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.install_snapshot_response_drop_notify.notify_one();
+                    return Err(SessionConsensusPeerError::Unavailable);
+                }
+            }
+        }
 
         if family == SessionConsensusRpcFamily::ForwardMutation {
             let delay = self.forward_response_delay_millis.load(Ordering::SeqCst);
@@ -486,19 +702,17 @@ impl Clock for MutableTestClock {
 }
 
 async fn commit_snapshot_triggering_commands(store: &ConsensusSessionStore) {
-    use futures_util::StreamExt;
-
     // Retain the production 4,096-log snapshot threshold and commit every
-    // qualification command. Exercise only the SDK's fixed, bounded proposal
-    // admission capacity so per-call forwarding/readback latency does not turn
-    // this real-profile proof into a serial wall-clock race.
-    futures_util::stream::iter(0..SNAPSHOT_CATCH_UP_COMMANDS)
-        .map(|_| store.max_replication_sequence())
-        .buffer_unordered(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
-        .for_each(|result| async {
-            result.expect("advance committed logical time toward snapshot compaction");
-        })
-        .await;
+    // qualification command. Each request must finish before the next begins:
+    // concurrent logical-time reads intentionally share one bounded consensus
+    // proposal, whereas this helper must commit the full production snapshot
+    // threshold without adding an application-visible effect.
+    for _ in 0..SNAPSHOT_CATCH_UP_COMMANDS {
+        store
+            .max_replication_sequence()
+            .await
+            .expect("advance committed logical time toward snapshot compaction");
+    }
 }
 
 impl TestCluster {
@@ -891,6 +1105,18 @@ impl TestCluster {
             .sum()
     }
 
+    fn fenced_transition_v2_capability_probe_calls(&self, source: usize) -> usize {
+        (0..MEMBER_COUNT)
+            .filter(|target| *target != source)
+            .map(|target| {
+                self.paths
+                    .get(&(source, target))
+                    .expect("outbound path")
+                    .fenced_transition_v2_capability_probe_calls()
+            })
+            .sum()
+    }
+
     fn reject_fenced_transition_capability_probe(&self, source: usize, target: usize) {
         self.paths
             .get(&(source, target))
@@ -905,6 +1131,15 @@ impl TestCluster {
             .get(&(source, target))
             .expect("outbound path")
             .install(Arc::new(Baseline36720ActivationProbeHandler {
+                inner: self.stores[target].rpc_handler(),
+            }));
+    }
+
+    fn reject_fenced_transition_v2_capability_probe(&self, source: usize, target: usize) {
+        self.paths
+            .get(&(source, target))
+            .expect("outbound path")
+            .install(Arc::new(RejectFencedTransitionV2CapabilityProbeHandler {
                 inner: self.stores[target].rpc_handler(),
             }));
     }
@@ -1573,6 +1808,37 @@ fn fenced_acquire_create_request(
     (request, record)
 }
 
+fn fenced_v2_acquire_create_request(
+    key: SessionKey,
+    owner: OwnerId,
+    expected_fence: FenceToken,
+    nonce: [u8; 16],
+    payload: &'static [u8],
+) -> (FencedTransitionV2Request, StoredSessionRecord) {
+    let lease = FencedTransitionLease::acquire(
+        key.clone(),
+        owner.clone(),
+        expected_fence,
+        Duration::from_secs(30),
+    )
+    .expect("build V2 acquire action");
+    let record = sealed_transition_record(
+        key,
+        1,
+        &owner,
+        lease.committed_fence().expect("derive committed V2 fence"),
+        payload,
+    );
+    let request = FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 history epoch"),
+        FencedTransitionV2CallerNonce::from_bytes(nonce),
+        lease,
+        FencedTransitionMutation::create(record.clone()),
+    )
+    .expect("build V2 create transition");
+    (request, record)
+}
+
 async fn assert_fenced_renewal_cas_conflict_has_no_effect(
     store: &ConsensusSessionStore,
     key: &SessionKey,
@@ -1788,20 +2054,24 @@ async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_
     );
 
     let (initial_leader, _, _) = cluster.observed_leader();
-    let initial_delayed_before = cluster.delayed_calls(initial_leader);
+    // Exercise the actual leader so a cached ownership/read lease can never
+    // masquerade as the fresh point-in-time quorum evidence required by
+    // production readiness.
+    let remote_probe_source = initial_leader;
+    let initial_delayed_before = cluster.delayed_calls(remote_probe_source);
     // The injected peer delay is much longer than the attestation deadline.
     // This leaves a 1.75 s gap after the timer-dispatch tolerance, so a
     // completed peer call cannot be mistaken for deadline enforcement.
-    cluster.delay_calls(initial_leader, Duration::from_secs(3));
+    cluster.delay_calls(remote_probe_source, Duration::from_secs(3));
     let initial_attestation_budget = Duration::from_secs(1);
     let initial_probe_started = Instant::now();
-    let initial_crossed_expiry = cluster.stores[initial_leader]
+    let initial_crossed_expiry = cluster.stores[remote_probe_source]
         .probe_production_durable_readiness_at(TopologyAttestationTime::from_unix_seconds(1_009))
         .await;
     let initial_elapsed = initial_probe_started.elapsed();
-    cluster.stop_delaying_calls(initial_leader);
+    cluster.stop_delaying_calls(remote_probe_source);
     assert!(
-        cluster.delayed_calls(initial_leader) > initial_delayed_before,
+        cluster.delayed_calls(remote_probe_source) > initial_delayed_before,
         "the attestation-bound probe must enter the delayed peer path"
     );
     assert_eq!(
@@ -1881,20 +2151,57 @@ async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_
         SessionStorePlatformProfile::Unknown
     );
 
-    cluster.delay_calls(0, Duration::from_millis(750));
-    let older_probe = store.probe_production_durable_readiness_with_attestation_at(
-        &refreshed,
-        TopologyAttestationTime::from_unix_seconds(1_022),
+    let (leader_index, _, _) = cluster.observed_leader();
+    let readiness_time = TopologyAttestationTime::from_unix_seconds(1_022);
+    let primed = cluster.stores[leader_index]
+        .probe_production_durable_readiness_with_attestation_at(&refreshed, readiness_time)
+        .await;
+    assert_eq!(
+        primed.state(),
+        DurableReadinessState::Ready,
+        "the elected leader must first obtain fresh production quorum evidence"
     );
+
+    // Disable the actual leader's inbound and outbound paths immediately
+    // after its proof. The next production readiness probe must obtain a
+    // point-in-time quorum proof; it must not reuse the raw-V2 admission
+    // lease while the leader remains in the same term.
+    cluster.isolate(leader_index);
+    let isolated = tokio::time::timeout(
+        DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT + RECOVERY_TIMEOUT,
+        cluster.stores[leader_index]
+            .probe_production_durable_readiness_with_attestation_at(&refreshed, readiness_time),
+    )
+    .await
+    .expect(
+        "post-isolation production readiness probe remains within its declared operation budget",
+    );
+    assert_eq!(
+        isolated.state(),
+        DurableReadinessState::NoQuorum,
+        "a cached leader lease must not satisfy production readiness after immediate isolation"
+    );
+    cluster.heal(leader_index);
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("cluster recovers after the production-readiness isolation proof");
+
+    cluster.delay_calls(remote_probe_source, Duration::from_millis(750));
+    let older_probe = cluster.stores[remote_probe_source]
+        .probe_production_durable_readiness_with_attestation_at(
+            &refreshed,
+            TopologyAttestationTime::from_unix_seconds(1_022),
+        );
     let newer_evaluation = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        store.production_platform_profile_with_attestation_at(
+        cluster.stores[remote_probe_source].production_platform_profile_with_attestation_at(
             &refreshed,
             TopologyAttestationTime::from_unix_seconds(1_023),
         )
     };
     let (older_report, newer_profile) = tokio::join!(older_probe, newer_evaluation);
-    cluster.stop_delaying_calls(0);
+    cluster.stop_delaying_calls(remote_probe_source);
     assert_eq!(newer_profile, SessionStorePlatformProfile::Quorum);
     assert_eq!(
         older_report.state(),
@@ -1986,18 +2293,18 @@ async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_
         wall_expiry,
         wall_start,
     );
-    let short_lived_delayed_before = cluster.delayed_calls(0);
+    let short_lived_delayed_before = cluster.delayed_calls(remote_probe_source);
     // As above, leave a gap substantially larger than scheduler dispatch so
     // this verifies the attestation deadline rather than a peer response.
-    cluster.delay_calls(0, Duration::from_secs(4));
+    cluster.delay_calls(remote_probe_source, Duration::from_secs(4));
     let probe_started = Instant::now();
-    let crossed_expiry = store
+    let crossed_expiry = cluster.stores[remote_probe_source]
         .probe_production_durable_readiness_with_attestation_at(&short_lived, wall_start)
         .await;
     let elapsed = probe_started.elapsed();
-    cluster.stop_delaying_calls(0);
+    cluster.stop_delaying_calls(remote_probe_source);
     assert!(
-        cluster.delayed_calls(0) > short_lived_delayed_before,
+        cluster.delayed_calls(remote_probe_source) > short_lived_delayed_before,
         "the refreshed-attestation probe must enter the delayed peer path"
     );
     assert_eq!(
@@ -2011,12 +2318,13 @@ async fn production_readiness_requires_fresh_authenticated_topology_and_accepts_
         "attestation deadline must bound the barrier; elapsed {elapsed:?}"
     );
     assert_eq!(
-        store.production_platform_profile_with_attestation_at(&short_lived, wall_start),
+        cluster.stores[remote_probe_source]
+            .production_platform_profile_with_attestation_at(&short_lived, wall_start),
         SessionStorePlatformProfile::Unknown,
         "monotonic expiry must prevent a retry with the old pre-expiry wall time"
     );
     assert_eq!(
-        store
+        cluster.stores[remote_probe_source]
             .probe_production_durable_readiness_with_attestation_at(&short_lived, wall_start)
             .await
             .state(),
@@ -4367,6 +4675,133 @@ async fn state_voter_activation_treats_an_unavailable_exact_probe_as_transient()
 }
 
 #[tokio::test]
+async fn fenced_transition_v2_current_voter_probe_fails_closed_then_activates_on_exact_replies() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let rejecting_voter = (leader + 1) % MEMBER_COUNT;
+    let rejected_key = session_key(b"fenced-transition-v2-current-voter-rejected");
+    let rejected_observation = cluster.stores[leader]
+        .observe_fenced_transition(&rejected_key)
+        .await
+        .expect("observe V2 key before unsupported current-voter probe");
+    let (rejected_request, _) = fenced_v2_acquire_create_request(
+        rejected_key.clone(),
+        owner("fenced-transition-v2-current-voter-owner"),
+        rejected_observation.current_fence(),
+        [0x72; 16],
+        b"sealed-fenced-transition-v2-current-voter-rejected",
+    );
+    let applications_before = replication_logs(&cluster).await;
+    let probes_before = cluster.fenced_transition_v2_capability_probe_calls(leader);
+
+    // This is a live current voter on the real leader's authenticated
+    // loopback path. It rejects only the exact V2 probe, modeling an
+    // unsupported/mismatched V2 profile while every ordinary Raft path stays
+    // healthy. One non-exact voter must block the first V2 activation.
+    cluster.reject_fenced_transition_v2_capability_probe(leader, rejecting_voter);
+    assert!(
+        matches!(
+            cluster.stores[leader]
+                .fenced_transition_v2(rejected_request.clone())
+                .await,
+            Err(StoreError::CapabilityNotSupported(capability))
+                if capability == "atomic_fenced_transition_epoch_history_v2"
+        ),
+        "one unsupported current voter fails V2 admission before any proposal"
+    );
+    assert_eq!(
+        cluster.fenced_transition_v2_capability_probe_calls(leader) - probes_before,
+        MEMBER_COUNT - 1,
+        "the leader requires a real exact-profile reply from every remote current voter"
+    );
+    assert_eq!(
+        replication_logs(&cluster).await,
+        applications_before,
+        "the failed current-voter proof creates neither a V2 receipt nor an activation application"
+    );
+
+    cluster.restore_current_rpc_handler(leader, rejecting_voter);
+    assert!(
+        matches!(
+            cluster.stores[leader]
+                .fenced_transition_v2_status(&rejected_request)
+                .await,
+            Ok(FencedTransitionV2Status::NotFound)
+        ),
+        "a failed proof retains no V2 receipt history"
+    );
+
+    let accepted_key = session_key(b"fenced-transition-v2-current-voter-accepted");
+    let accepted_observation = cluster.stores[leader]
+        .observe_fenced_transition(&accepted_key)
+        .await
+        .expect("observe V2 key before exact current-voter proof");
+    let (accepted_request, expected_record) = fenced_v2_acquire_create_request(
+        accepted_key.clone(),
+        owner("fenced-transition-v2-current-voter-owner"),
+        accepted_observation.current_fence(),
+        [0x73; 16],
+        b"sealed-fenced-transition-v2-current-voter-accepted",
+    );
+    let probes_before = cluster.fenced_transition_v2_capability_probe_calls(leader);
+    let outcome = cluster.stores[leader]
+        .fenced_transition_v2(accepted_request.clone())
+        .await
+        .expect("all three exact V2 voters activate epoch one and apply one transition");
+    assert!(
+        matches!(outcome.mutation(), FencedTransitionMutationResult::Created),
+        "the exact-profile activation applies the requested V2 mutation"
+    );
+    assert_eq!(
+        cluster.fenced_transition_v2_capability_probe_calls(leader) - probes_before,
+        2 * (MEMBER_COUNT - 1),
+        "the first successful V2 activation rechecks both remote voters at each exact admission boundary"
+    );
+
+    for voter in &cluster.stores {
+        assert!(
+            matches!(
+                voter
+                    .fenced_transition_v2_capability()
+                    .await
+                    .expect("activated voter advertises exact V2 capability"),
+                Some(FencedTransitionV2Capability::V2)
+            ),
+            "the activation is durable on every voter"
+        );
+        let history = voter
+            .fenced_transition_v2_history_state()
+            .await
+            .expect("read V2 history from every voter");
+        assert_eq!(
+            history.active_epoch(),
+            Some(FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch")),
+            "each voter applies epoch-one activation"
+        );
+        assert_eq!(
+            history.bound_entries(),
+            1,
+            "each voter retains one V2 receipt"
+        );
+        assert!(
+            matches!(
+                voter
+                    .fenced_transition_v2_status(&accepted_request)
+                    .await
+                    .expect("read exact V2 receipt from every voter"),
+                FencedTransitionV2Status::Recorded(result)
+                    if result.as_ref() == &Ok(outcome.clone())
+            ),
+            "each voter retains the expected exact V2 receipt"
+        );
+        assert!(
+            matches!(voter.get(&accepted_key).await, Ok(Some(record)) if record == expected_record),
+            "each voter applies the V2 record mutation"
+        );
+    }
+}
+
+#[tokio::test]
 async fn fenced_transition_new_follower_rejects_old_leader_before_forwarding() {
     let cluster = TestCluster::start().await;
     let (leader, _, _) = cluster.observed_leader();
@@ -4902,12 +5337,13 @@ async fn restore_pages_use_only_linearizable_applied_state_and_fail_closed_when_
 #[tokio::test]
 async fn isolated_node_fails_closed_and_recovers_after_both_peer_paths_heal() {
     let cluster = TestCluster::start().await;
-    cluster.isolate(0);
+    let (isolated_index, _, _) = cluster.observed_leader();
+    cluster.isolate(isolated_index);
 
     let probe_started = Instant::now();
     let report = tokio::time::timeout(
         Duration::from_secs(2),
-        cluster.stores[0].probe_durable_readiness(),
+        cluster.stores[isolated_index].probe_durable_readiness(),
     )
     .await
     .expect("readiness probe is bounded");
@@ -4927,7 +5363,11 @@ async fn isolated_node_fails_closed_and_recovers_after_both_peer_paths_heal() {
     let mutation_started = Instant::now();
     let mutation = tokio::time::timeout(
         Duration::from_secs(2),
-        cluster.stores[0].acquire(&key, owner("isolated-owner"), Duration::from_secs(30)),
+        cluster.stores[isolated_index].acquire(
+            &key,
+            owner("isolated-owner"),
+            Duration::from_secs(30),
+        ),
     )
     .await
     .expect("partitioned mutation is bounded");
@@ -4937,12 +5377,14 @@ async fn isolated_node_fails_closed_and_recovers_after_both_peer_paths_heal() {
     );
     assert!(mutation_started.elapsed() < Duration::from_secs(2));
 
-    cluster.heal(0);
+    cluster.heal(isolated_index);
     cluster
         .wait_all_ready(RECOVERY_TIMEOUT)
         .await
         .expect("healed node rejoins fresh readiness");
-    let healed_report = cluster.stores[0].probe_durable_readiness().await;
+    let healed_report = cluster.stores[isolated_index]
+        .probe_durable_readiness()
+        .await;
     assert_eq!(healed_report.state(), DurableReadinessState::Ready);
     assert_eq!(
         healed_report.recovery_progress().state(),
@@ -4952,10 +5394,39 @@ async fn isolated_node_fails_closed_and_recovers_after_both_peer_paths_heal() {
         healed_report.recovery_progress().local_applied_index()
             >= healed_report.committed_barrier_index()
     );
-    cluster.stores[0]
+    cluster.stores[isolated_index]
         .acquire(&key, owner("healed-owner"), Duration::from_secs(30))
         .await
         .expect("mutation succeeds after healing");
+}
+
+#[tokio::test]
+async fn isolated_leader_readiness_does_not_reuse_cached_quorum_proof() {
+    let cluster = TestCluster::start().await;
+    let (leader_index, _, _) = cluster.observed_leader();
+
+    let primed = cluster.stores[leader_index].probe_durable_readiness().await;
+    assert_eq!(
+        primed.state(),
+        DurableReadinessState::Ready,
+        "the elected leader must first obtain a quorum proof"
+    );
+
+    // Isolate both inbound and outbound routes immediately after the proof.
+    // The very next readiness probe must obtain fresh quorum evidence rather
+    // than reuse the leader's still-valid raw-V2 admission lease.
+    cluster.isolate(leader_index);
+    let report = tokio::time::timeout(
+        Duration::from_secs(2),
+        cluster.stores[leader_index].probe_durable_readiness(),
+    )
+    .await
+    .expect("post-isolation leader readiness probe remains bounded");
+    assert_eq!(
+        report.state(),
+        DurableReadinessState::NoQuorum,
+        "a cached leader lease must not satisfy readiness after immediate isolation"
+    );
 }
 
 #[tokio::test]
@@ -5139,7 +5610,49 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
     .await
     .expect("majority compacts beyond the isolated follower");
 
+    let snapshot_leader = [1, 2]
+        .into_iter()
+        .find(|index| {
+            let status = cluster.stores[*index].status();
+            status.leader_id == Some(status.node_id)
+        })
+        .expect("surviving majority has a snapshot leader");
+    let lagging_snapshot_path = Arc::clone(
+        cluster
+            .paths
+            .get(&(snapshot_leader, 0))
+            .expect("leader-to-lagging snapshot path"),
+    );
+    lagging_snapshot_path.arm_one_install_snapshot_response_loss();
+    let response_dropped = lagging_snapshot_path.install_snapshot_response_drop_notification();
+    let observation_recorded = lagging_snapshot_path.install_snapshot_observation_notification();
+
     cluster.heal(0);
+    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, response_dropped.notified())
+        .await
+        .expect("lagging follower accepts one snapshot request before its response is lost");
+    assert_eq!(
+        1,
+        lagging_snapshot_path.dropped_install_snapshot_responses(),
+        "exactly one accepted snapshot response is lost"
+    );
+    let dropped_observation = lagging_snapshot_path
+        .dropped_install_snapshot_observation()
+        .expect("dropped snapshot response retains a bounded digest observation");
+    assert!(
+        !dropped_observation.done,
+        "the deliberately lost response belongs to a non-final snapshot chunk"
+    );
+    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
+        loop {
+            if lagging_snapshot_path.observed_install_snapshot_retry(&dropped_observation) {
+                return;
+            }
+            observation_recorded.notified().await;
+        }
+    })
+    .await
+    .expect("leader retries the identical accepted snapshot request after response loss");
     if cluster
         .wait_all_ready(SNAPSHOT_RECOVERY_TIMEOUT)
         .await
@@ -5171,6 +5684,21 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
         recovered_progress.state()
     );
     assert!(recovered_progress.local_applied_index() >= compacted.snapshot_index());
+    let (recovered_leader, _, _) = cluster.observed_leader();
+    let leader_progress = cluster.stores[recovered_leader]
+        .probe_durable_readiness()
+        .await
+        .recovery_progress();
+    assert_eq!(
+        leader_progress.local_applied_index(),
+        recovered_progress.local_applied_index(),
+        "follower applied index converges after the lost snapshot response retry"
+    );
+    assert_eq!(
+        leader_progress.snapshot_index(),
+        recovered_progress.snapshot_index(),
+        "follower snapshot index converges after the lost snapshot response retry"
+    );
 }
 
 #[tokio::test]

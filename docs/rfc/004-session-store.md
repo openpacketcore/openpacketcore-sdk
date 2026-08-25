@@ -1612,18 +1612,29 @@ umbrella until that fleet evidence passes.
 `StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
 `SessionQuorumConsumerServer` provide the typed least-authority
 application-consumer boundary. They MUST use mutual TLS and the dedicated
-`opc-session-consumer/1` ALPN with transport revision 6. This is a separate
-exact protocol from both `opc-session-consensus/2` and the quarantined
-`opc-session-net/5` compatibility protocol. A listener MUST NOT offer a
-fallback, negotiate a common revision, or multiplex either other protocol as
-equivalent consumer authority. Revision 6 does not interoperate with revisions
-1, 2, 3, 4, or 5.
-Because this SDK is unreleased, deployments MUST drain consumer clients and
-listeners, then make one coordinated revision-6 cutover; fallback, dual-mode,
-and mixed-revision consumer operation are unsupported. Revision-6 private JSON
-DTO bytes, including the complete sequence-plus-nonce correlation envelope, are
-canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
-and unknown fields MUST fail closed.
+`opc-session-consumer/1` ALPN with transport revision 5 for the existing V1
+operation family. The additive V2 epoch-fenced-transition family MUST use only
+the distinct `opc-session-consumer/2` ALPN with transport revision 5. These are
+separate exact protocols from both `opc-session-consensus/2` and the
+quarantined `opc-session-net/5` compatibility protocol. A V2 client MUST NOT
+fall back to V1, and a lane authenticated for either ALPN MUST NOT carry or be
+reused for the other's Hello or request envelope. A listener MAY offer both
+exact ALPNs, but only as independently authenticated, independently decoded
+lanes; it MUST NOT negotiate a common revision or treat either as equivalent
+consumer authority. The server MUST reject every V2 revision other than 5
+before dispatch; a V1-only peer therefore also fails before V2 dispatch.
+
+V1 revision 5 does not interoperate with revisions 1, 2, 3, or 4. Because this
+SDK is unreleased, a V1 revision cutover MUST drain consumer clients and
+listeners; fallback, V1 dual-mode, and mixed-revision V1 operation are
+unsupported. Deployment MUST provision revision-5 V2 listener support,
+V2-capable store authority, and the required protected-wrapper V2 journal before
+enabling an explicit V2 client call. V1 traffic may continue on its revision-5
+ALPN while V2 is introduced or drained, but that coexistence is not fallback,
+dual-mode wire negotiation, or mixed-revision operation of one request family.
+Removal of V2 requires draining V2 callers first. Revision-5 V1 and revision-5
+V2 private JSON DTO bytes are canonical; reordered or otherwise noncanonical
+encodings, aliases, omissions, and unknown fields MUST fail closed.
 
 `StatelessSessionConsumerClient` remains a public, source-compatible
 production/compatibility fresh-authentication typed least-authority surface
@@ -1643,11 +1654,19 @@ security-sensitive: diagnostics, profile inventories, and observability MUST
 record only redaction-safe status/count information, never their concrete
 values.
 
-The API exposes typed session reads, bounded mutation/lease operations,
+The V1 API exposes typed session reads, bounded mutation/lease operations,
 bounded restore scans, capability discovery, a coarse committed-change watch,
 and #696's generic one-record atomic fenced transition. The latter includes an
 exact-key observation, one lease-acquire or lease-renew action plus one bounded
-record mutation, and exact retained-status readback. Before V1 activation for
+record mutation, and exact retained-status readback. V2 exposes only typed V2
+capability, V2 history state, one epoch-fenced transition,
+`SessionConsumerV2Operation::FencedTransitionV2Batch`, and exact V2 transition
+status. The batch is an ordered, same-epoch `1..=256` transition batch and is
+not all-or-nothing: each item has its own outcome and earlier items may have
+effects when a later item does not. V2 does not add raw consensus or replication
+operations, membership/voting authority, or product-specific roster/policy
+semantics.
+Before V1 activation for
 the exact current voter scope, capability, observation, status, and first
 transition admission require fresh authenticated replies from every exact
 voter; an unavailable or incompatible voter fails closed. A quorum is not a
@@ -1661,12 +1680,16 @@ port, and all accepted mutations route through the durable quorum leader path.
 
 The raw physical store and authenticated-consumer transport advertise exactly
 `AtomicFencedTransitionCapability::V1`. A protected
-`EncryptingSessionBackend` or `RemoteSealingSessionBackend` advertises V2 only
-when it owns the SDK caller-side durable prepared-transition journal and its
-exact inner physical boundary advertises V1. V2 is a local durable-recovery
-composition, not a consumer-wire or consensus revision. A legacy protection
-wrapper without that journal, an older binary, and raw V1 transport MUST fail
-closed for the journaled protected atomic path.
+`EncryptingSessionBackend` or `RemoteSealingSessionBackend` advertises the
+separate `FencedTransitionV2Capability::V2` only when it owns the separately
+scoped SDK caller-side `FencedTransitionV2PreparedJournal` and its exact inner
+physical boundary supports V2 history. That journal binds the stable backend
+authority, protection mode, and payload namespace; it is distinct from the
+permanent capped V1 prepared-transition journal. The session-store
+documentation defines its provision/open/recovery rules. V2 transport neither
+creates nor substitutes for this durable recovery boundary, and MUST NOT fall
+back to V1. A legacy protection wrapper without that journal, an older binary,
+and raw V1 transport MUST fail closed for the V2 history path.
 
 The first authorized transition after that unanimous proof carries the scope
 identity and canonical voter-set commitment inside its same single user command
@@ -1709,27 +1732,43 @@ pending call may wait or age for at most 250 ms. The retained Watch transport
 uses two reserved slots by default (at most 16 when configured), but typed
 tenant/NF consumer Watch does not acquire them while its cursor is global.
 
-Stateless-client clones share a fail-fast physical-admission cap of 16 request
-connections per clone lineage. Sixteen reserved Watch transport permits remain
-for a future reviewed protocol, but typed consumer Watch rejects before permit
-acquisition, resolve/TCP, TLS, or a request frame. Independently constructed
-stateless clients define independent logical clients, as independently
-constructed persistent clients do.
-The typed consumer Watch is currently unsupported for production tenant/NF
-grants: its only available cursor is global, and filtering it would leak
-foreign activity through timing and cursor movement. The public Watch methods
-therefore return a stable typed unsupported rejection before a stream is
-admitted. A future Watch MUST define an identity-and-scope-bound cursor before
-it can use the retained watch-slot/reconnect machinery.
+`PersistentSessionConsumerClient` has separate fixed V2 lanes of the same
+configured request width. `prewarm_v2` establishes revision-5 lanes without
+dispatching an operation, `execute_v2` dispatches only on a V2 lane, and
+`v2_diagnostics` reports only V2 redaction-safe pool state. V1 and V2 queues,
+sockets, and authenticated Hello exchanges are never cross-reused. Their shared
+physical request admission remains bounded but is sized so the legal fixed
+widths of both revisions coexist; it does not allocate a connection, task,
+channel, or pool per subscriber. DNS resolution, TCP, TLS, and Hello are
+performed only on establishment or re-establishment of the relevant lane, not
+on reuse.
+
+Stateless-client clones share a bounded physical-admission ceiling per clone
+lineage. Request admission is sized for the legal simultaneous fixed V1 and V2
+persistent widths, while watch admission remains capped at 16. The respective
+permit MUST be acquired before resolve/TCP and held for the complete physical
+connection lifetime, including by a persistent client derived from that
+stateless lineage. Independently constructed stateless clients define
+independent logical clients, as independently constructed persistent clients do.
+The typed persistent watch surface MUST preserve exhaustion of either bound as
+`Overloaded` and record that bounded outcome; it MUST NOT relabel intentional
+load shedding as endpoint unavailability.
 
 The hard listener limit is 256 live connections and its retained
-connection-task set is bounded by that limit. Consumer frames are at most 16
-MiB and a configured listener frame limit cannot be lower than the 8 MiB
-batch-response limit plus 4 KiB framing allowance. The bootstrap and
-active-frame idle bound remains 5 seconds and one complete request/response
-operation remains bounded to 10 seconds. The fixed request identity is 16
-bytes; consumer identity input is capped at 253 UTF-8 bytes; one batch has at
-most 256 operations and retains at most 8 MiB of serialized response data.
+connection-task set is bounded by that limit; each watch owns one delivery
+task. Consumer frames are at most 16 MiB and a configured listener frame limit
+cannot be lower than the 8 MiB batch-response limit plus 4 KiB framing
+allowance. The bootstrap and active-frame idle bound remains 5 seconds and one
+complete request/response operation remains bounded to 10 seconds. A watch has
+a 64-item, 512 KiB transport queue, rechecks cancellation at least every 50
+ms, and is also bounded by the 256 KiB store-side projection buffer. The fixed
+V1 request identity is 16 bytes; a V2 singleton or V2 batch item identity is
+56 bytes; consumer identity input is capped at 253 UTF-8 bytes. One V1 generic
+batch has at most 256 operations and retains at most 8 MiB of serialized
+response data. A V2 batch has at most 256 operations and separately limits its
+fully Postcard-encoded request vector and outcome vector to 1 MiB each; the
+outer authenticated-consumer JSON frame remains subject to its negotiated
+frame bound.
 
 The complete operation timeout MUST validate strictly greater than zero and no
 greater than 10 seconds. The configured idle timeout is at most 5 seconds and
@@ -1785,6 +1824,19 @@ of that ID for a different request is a closed conflict. Applications otherwise
 must perform authoritative readback and apply the existing fencing/idempotency
 contract.
 
+For persistent V2 calls, `NotTransmitted` is a pre-write result. A
+`ReadUnavailable` result is a post-write read loss for a non-effectful V2
+capability, history, or status operation and may be retried as that read.
+`OutcomeUnknown { request_id }` is returned when an epoch-fenced V2 transition
+may have been delivered; the exact caller-owned `FencedTransitionV2RequestId`
+and complete body remain the recovery identity. The client MUST discard that
+lane and MUST NOT mint a successor ID or automatically replay the transition;
+recovery uses exact V2 status under the same ID/body and the durable V2 journal
+where protection is present. `OutcomeUnknownBatch { request_ids }` is returned
+when a V2 batch may have been delivered; `request_ids` preserves input order,
+and the client MUST use each matching ID for exact V2 status recovery rather
+than blindly replaying any mutation.
+
 `FencedTransitionStorageExhausted` is a retained, complete-body-bound,
 deterministic no-effect receipt, returned only after ordinary stale-fence,
 CAS, and lease admission for an otherwise successful transition. Its SQLite
@@ -1827,6 +1879,12 @@ payloads, request or correlation IDs, owners, or fences. Any performance
 evidence for this transport is synthetic only and makes no ePDG production-SLO
 claim.
 
+Reauthentication, accepted material rotation, idle/lifecycle retirement, and
+the bounded public shutdown apply to both ALPN-isolated persistent pools.
+Shutdown begins both drain paths together so V2 cannot extend the bounded V1
+shutdown window. Per-pool maintenance remains constant; no lane-, subscriber-,
+or record-scaled maintenance state is introduced.
+
 The v7 qualification profile remains the revision-2 persistent-transport
 inventory and records its connection, frame, request/response, watch, task,
 and lifecycle limits beside the consensus profile. The published v6 profile
@@ -1839,6 +1897,10 @@ experimental and fixes `qualification_complete=false`. No profile or evidence
 records consumer identity or scope material. Synthetic warm accept/reuse checks
 gate only their transport method; elapsed samples are non-gating and are not an
 SLO.
+
+V2 is an additive protocol family; it neither changes the V1 revision-5 wire
+enum nor upgrades a V1 request. Its exact capability, history, execution, and
+status outcomes remain on the separate ALPN and V2 identity described above.
 
 Revision 5 retains revision 4's `StorageExhausted` only inside the closed
 fenced-transition `Recorded` status result. Frozen session-net v5 maps this outcome fail-closed as
@@ -1891,15 +1953,22 @@ unavailability MAY block new protection or plaintext reads, but MUST NOT cause
 provider I/O during deterministic apply or make already sealed Raft replay and
 quorum formation depend on provider availability.
 
-Raw physical stores and authenticated-consumer transport implement only V1.
-For protected transitions, V2 requires the outer
-`EncryptingSessionBackend` or `RemoteSealingSessionBackend` to own an SDK
-caller-side durable `PreparedFencedTransitionJournal` and to compose over an
-exact V1 physical boundary that explicitly witnesses unchanged protected bytes.
-This journal, rather than a legacy prepared token or application-persisted
-request state, is the durable recovery authority. The application retains only
-the caller-stable `FencedTransitionRequestId`, which it MUST reuse for that
-same logical operation after restart.
+The following protected-transition rules apply only to #701's protected V2
+composition. Its raw physical store and authenticated-consumer transport execute
+only the V1 `fenced_transition` protocol. This is distinct from #702's
+epoch-fenced V2 protocol, which has its separate
+`FencedTransitionV2Capability::V2`, `FencedTransitionV2PreparedJournal`,
+56-byte identity, and `/2` consumer lane.
+
+For #701 protected transitions, the outer `EncryptingSessionBackend` or
+`RemoteSealingSessionBackend` advertises
+`AtomicFencedTransitionCapability::V2` only when it owns an SDK caller-side
+durable `PreparedFencedTransitionJournal` and composes over an exact V1 physical
+boundary that explicitly witnesses unchanged protected bytes. This #701
+journal, rather than a legacy prepared token or application-persisted request
+state, is the durable recovery authority. The application retains only the
+caller-stable `FencedTransitionRequestId`, which it MUST reuse for that same
+logical operation after restart.
 
 Protected preparation validates the request, capability-gates the exact inner
 V1 boundary, and checks that the journal has no binding for the ID before
@@ -1947,19 +2016,23 @@ NFS-like mounts are unsupported. Within one process, callers MUST clone the
 admitted SDK journal handle instead of reopening the same inode or opening it
 directly through SQLite. The SDK enforces one live SQLite connection per
 admitted inode so its pre-open header check cannot release another connection's
-process-scoped POSIX locks. Platforms without those checks fail closed for V2.
+process-scoped POSIX locks. Platforms without those checks fail closed for the
+#701 protected V2 composition.
 
-The journal uses zeroize-on-drop HMAC-SHA-256 state, SQLite WAL, a fixed
+The #701 journal uses zeroize-on-drop HMAC-SHA-256 state, SQLite WAL, a fixed
 pre-open page/cache-header profile, `synchronous=EXTRA`, bounded SQLite limits
 and catalog/membership scans, and bounded opaque rows containing no plaintext.
 A full authenticated journal
 rejects a new ID before expiry, provider, or inner-prepare work. Payloads,
 identities, request IDs, paths, keys, provider material, token bytes, and
 journal contents MUST NOT appear in examples, fixtures, logs, diagnostics, or
-evidence. Prepared-token schema, journal schema, and V2 are downgrade fences:
-unknown versions, raw V1, and older binaries MUST NOT operate the protected
-journaled path. The V2 journal layer makes no journal GC, retention,
-ledger-lifetime, or capacity-lifecycle claim.
+evidence. The #701 prepared-token and `PreparedFencedTransitionJournal` schemas
+are downgrade fences: unknown versions, raw V1, and older binaries MUST NOT
+operate this protected journaled path. #702's separate
+`FencedTransitionV2Capability::V2` and `FencedTransitionV2PreparedJournal` do
+not upgrade, replace, or share the #701 protocol or journal. The #701 journal
+layer makes no journal GC, retention, ledger-lifetime, or capacity-lifecycle
+claim.
 
 The schema-3 journal also commits a fresh per-journal incarnation, bounded
 membership count, and root over the exact retained request-ID/tag set with a

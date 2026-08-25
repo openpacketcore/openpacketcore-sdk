@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use futures_util::StreamExt;
 use opc_consensus::engine::raft::AppendEntriesRequest;
 use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
@@ -23,40 +22,44 @@ use opc_key::{
 };
 use opc_session_net::{
     session_consumer_payload_budget, PersistentSessionConsumerClient,
-    PersistentSessionConsumerConfig, RemoteAddrResolver, RemoteSessionConsensusPeer,
-    SessionClusterId, SessionConfigurationGeneration, SessionConsensusServer,
-    SessionConsensusServerHandle, SessionConsumerAuthorizer, SessionConsumerClientError,
-    SessionConsumerFencedTransitionBackend, SessionConsumerLeaseMutationError,
-    SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
-    SessionQuorumConsumerServer, SessionReauthenticationControl, SessionReplicationManifest,
-    StatelessSessionConsumerClient, DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
-    MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
+    PersistentSessionConsumerConfig, PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver,
+    RemoteSessionConsensusPeer, SessionClusterId, SessionConfigurationGeneration,
+    SessionConsensusServer, SessionConsensusServerHandle, SessionConsumerAuthorizer,
+    SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+    SessionConsumerLeaseMutationError, SessionConsumerMutationError,
+    SessionConsumerPreparedCheckpointBackend, SessionQuorumConsumerServer,
+    SessionReauthenticationControl, SessionReplicationManifest, StatelessSessionConsumerClient,
+    DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT, MAX_NEGOTIATED_FRAME_SIZE,
+    SESSION_QUORUM_CONSUMER_ALPN, SESSION_QUORUM_CONSUMER_V2_ALPN,
 };
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, ConsensusSessionStore,
     EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, Generation, OwnerId,
-    PreparedCheckpointBudget, PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
-    PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
+    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
+    FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
+    Generation, LeaseGuard, OwnerId, PreparedCheckpointBudget, PreparedCompareAndSetExecuteError,
+    PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
     PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
-    RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, SessionBackend, SessionConsensusCommand,
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusResponse, SessionConsensusWireRequest,
-    SessionConsensusWireResponse, SessionConsumerAuthorization, SessionConsumerAuthorizationGrant,
-    SessionConsumerChange, SessionConsumerLeaseError, SessionConsumerOperation,
-    SessionConsumerOutcomeUnknown, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionConsumerVoterAuthority,
-    SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, SessionPayloadEncoding,
-    SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType, StoreError,
-    StoredSessionRecord, ValidatedQuorumTopology,
+    QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, SessionBackend,
+    SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusResponse,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerAuthorization,
+    SessionConsumerAuthorizationGrant, SessionConsumerChange, SessionConsumerLeaseError,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
+    SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
+    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+    SessionConsumerVoterAuthority, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionPayloadEncoding, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
+    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
-use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 opc_consensus::engine::declare_raft_types!(
@@ -146,6 +149,7 @@ const THREE_VOTER_READY_TIMEOUT: Duration = Duration::from_secs(20);
 // Retain the durable recovery qualification bound for the one explicitly
 // triggered OpenRaft campaign and its bounded authenticated peer calls without
 // changing any production deadline.
+#[cfg(feature = "test-control")]
 const THREE_VOTER_ELECTION_RECOVERY_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
@@ -268,10 +272,13 @@ impl GatedReadBarrierPeer {
     }
 }
 
+#[allow(dead_code)]
 static THREE_VOTER_FLEET_TEST_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
+#[allow(dead_code)]
 struct ThreeVoterConsumerFleet {
     manifest: Arc<SessionReplicationManifest>,
+    fixed_durable: bool,
     topologies: Vec<ValidatedQuorumTopology>,
     pki: Arc<TestPki>,
     path_enabled: BTreeMap<(usize, usize), Arc<AtomicBool>>,
@@ -300,8 +307,21 @@ impl Drop for ThreeVoterConsumerFleet {
     }
 }
 
+#[allow(dead_code)]
 impl ThreeVoterConsumerFleet {
     async fn start(pki: Arc<TestPki>, read_barrier_delay: Option<Duration>) -> Self {
+        Self::start_with_topology(pki, read_barrier_delay, false).await
+    }
+
+    async fn start_fixed_durable(pki: Arc<TestPki>) -> Self {
+        Self::start_with_topology(pki, None, true).await
+    }
+
+    async fn start_with_topology(
+        pki: Arc<TestPki>,
+        read_barrier_delay: Option<Duration>,
+        fixed_durable: bool,
+    ) -> Self {
         let test_gate = THREE_VOTER_FLEET_TEST_GATE
             .acquire()
             .await
@@ -322,14 +342,31 @@ impl ThreeVoterConsumerFleet {
         );
         let topologies = (0..THREE_VOTER_COUNT)
             .map(|index| {
-                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                let consensus_identity = if fixed_durable {
+                    manifest.fixed_durable_quorum_consensus_identity()
+                } else {
+                    manifest.consensus_identity()
+                };
+                let config = QuorumTopologyConfig::new_consensus(
                     three_voter_replica_id(index),
                     members.clone(),
-                    manifest.consensus_identity(),
-                ))
-                .expect("validate three-voter topology")
+                    consensus_identity,
+                );
+                if fixed_durable {
+                    ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
+                        config,
+                        manifest.placement_policy(),
+                    )
+                    .expect("validate fixed-durable three-voter topology")
+                } else {
+                    ValidatedQuorumTopology::try_from(config)
+                        .expect("validate three-voter topology")
+                }
             })
             .collect::<Vec<_>>();
+        assert!(topologies.iter().all(|topology| {
+            (topology.summary().mode() == QuorumTopologyMode::FixedDurableQuorum) == fixed_durable
+        }));
         let directory = tempfile::tempdir().expect("three-voter fleet directory");
         let backends = (0..THREE_VOTER_COUNT)
             .map(|index| {
@@ -352,9 +389,12 @@ impl ThreeVoterConsumerFleet {
             .collect::<Vec<_>>();
         let mut stores = Vec::with_capacity(THREE_VOTER_COUNT);
         for index in 0..THREE_VOTER_COUNT {
-            let local = manifest
-                .bind_local(three_voter_replica_id(index))
-                .expect("three-voter local consensus binding");
+            let local = if fixed_durable {
+                manifest.bind_fixed_durable_quorum_local(three_voter_replica_id(index))
+            } else {
+                manifest.bind_local(three_voter_replica_id(index))
+            }
+            .expect("three-voter local consensus binding");
             let peers = (0..THREE_VOTER_COUNT)
                 .filter(|target| *target != index)
                 .map(|target| {
@@ -414,7 +454,15 @@ impl ThreeVoterConsumerFleet {
                     (node_id, peer)
                 })
                 .collect::<BTreeMap<_, _>>();
-            stores.push(
+            let store = if fixed_durable {
+                ConsensusSessionStore::open_fixed_durable_quorum(
+                    topologies[index].clone(),
+                    backends[index].clone(),
+                    directory.path().join(format!("snapshots-{index}")),
+                    peers,
+                )
+                .await
+            } else {
                 ConsensusSessionStore::open_with_operation_timeout(
                     topologies[index].clone(),
                     backends[index].clone(),
@@ -423,14 +471,17 @@ impl ThreeVoterConsumerFleet {
                     opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                 )
                 .await
-                .expect("open three-voter consensus store"),
-            );
+            };
+            stores.push(store.expect("open three-voter consensus store"));
         }
         let mut servers = Vec::with_capacity(THREE_VOTER_COUNT);
         for index in 0..THREE_VOTER_COUNT {
-            let binding = manifest
-                .bind_local(three_voter_replica_id(index))
-                .expect("three-voter consensus server binding");
+            let binding = if fixed_durable {
+                manifest.bind_fixed_durable_quorum_local(three_voter_replica_id(index))
+            } else {
+                manifest.bind_local(three_voter_replica_id(index))
+            }
+            .expect("three-voter consensus server binding");
             let (server, address) = SessionConsensusServer::new(
                 stores[index].rpc_handler(),
                 pki.server_config(&three_voter_spiffe(index)),
@@ -451,6 +502,7 @@ impl ThreeVoterConsumerFleet {
         }
         let fleet = Self {
             manifest,
+            fixed_durable,
             topologies,
             pki,
             path_enabled,
@@ -824,6 +876,7 @@ impl SessionQuorumConsumer for CountingPreparedCasStatusConsumer {
 /// A real consumer listener wrapper that commits the inner operation then
 /// withholds exactly one response until the test tears down its connection.
 /// It never manufactures an outcome response or invokes a mutation twice.
+#[allow(dead_code)]
 struct CommitThenLoseConsumerResponse {
     inner: Arc<dyn SessionQuorumConsumer>,
     lose_transition: AtomicBool,
@@ -834,6 +887,7 @@ struct CommitThenLoseConsumerResponse {
     status_calls: AtomicUsize,
 }
 
+#[allow(dead_code)]
 impl CommitThenLoseConsumerResponse {
     fn transition(inner: Arc<dyn SessionQuorumConsumer>) -> Self {
         Self {
@@ -976,6 +1030,7 @@ impl SessionQuorumConsumer for CountingFencedConsumerOperations {
 #[derive(Default)]
 struct CountingConsumer {
     calls: AtomicUsize,
+    v2_calls: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -1011,6 +1066,53 @@ impl SessionQuorumConsumer for HangingConsumer {
     }
 }
 
+struct HangingV2Consumer {
+    v2_calls: AtomicUsize,
+    v2_call_started: tokio::sync::Notify,
+}
+
+impl HangingV2Consumer {
+    fn new() -> Self {
+        Self {
+            v2_calls: AtomicUsize::new(0),
+            v2_call_started: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionQuorumConsumer for HangingV2Consumer {
+    async fn execute(
+        &self,
+        _authorization: &SessionConsumerAuthorization,
+        _request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled())
+    }
+
+    async fn execute_v2(
+        &self,
+        _authorization: &SessionConsumerAuthorization,
+        _request: SessionConsumerV2Request,
+    ) -> SessionConsumerV2Response {
+        self.v2_calls.fetch_add(1, Ordering::SeqCst);
+        self.v2_call_started.notify_waiters();
+        std::future::pending().await
+    }
+
+    async fn watch(
+        &self,
+        _identity: &SessionConsumerAuthorization,
+        _scope: SessionConsumerScope,
+        _start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        Err(SessionConsumerRejection::Unavailable)
+    }
+}
+
 #[async_trait]
 impl SessionQuorumConsumer for CountingConsumer {
     async fn execute(
@@ -1020,6 +1122,22 @@ impl SessionQuorumConsumer for CountingConsumer {
     ) -> SessionConsumerResponse {
         self.calls.fetch_add(1, Ordering::SeqCst);
         SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled())
+    }
+
+    async fn execute_v2(
+        &self,
+        _identity: &SessionConsumerAuthorization,
+        request: SessionConsumerV2Request,
+    ) -> SessionConsumerV2Response {
+        self.v2_calls.fetch_add(1, Ordering::SeqCst);
+        match request.operation() {
+            SessionConsumerV2Operation::FencedTransitionV2Capability => {
+                SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+                    FencedTransitionV2Capability::V2,
+                ))
+            }
+            _ => SessionConsumerV2Response::Rejected(SessionConsumerRejection::MalformedRequest),
+        }
     }
 
     async fn watch(
@@ -1151,6 +1269,77 @@ fn consumer_client(
         rustls_pki_types::ServerName::IpAddress(address.ip().into()),
         voter_authority,
         pki.client_config(client_spiffe),
+    )
+}
+
+async fn read_json_frame<R>(reader: &mut R) -> serde_json::Value
+where
+    R: AsyncRead + Unpin,
+{
+    let mut length = [0_u8; 4];
+    reader
+        .read_exact(&mut length)
+        .await
+        .expect("read JSON frame length");
+    let mut payload = vec![
+        0_u8;
+        usize::try_from(u32::from_be_bytes(length))
+            .expect("JSON frame length fits usize")
+    ];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .expect("read JSON frame payload");
+    serde_json::from_slice(&payload).expect("decode JSON frame")
+}
+
+async fn accept_v2_tls(
+    listener: &TcpListener,
+    authenticated: &AuthenticatedServerConfig,
+) -> tokio_rustls::server::TlsStream<tokio::net::TcpStream> {
+    let (tcp, _) = listener.accept().await.expect("accept V2 TLS socket");
+    let mut config = authenticated.rustls_config().as_ref().clone();
+    config.alpn_protocols = vec![SESSION_QUORUM_CONSUMER_V2_ALPN.to_vec()];
+    tokio_rustls::TlsAcceptor::from(Arc::new(config))
+        .accept(tcp)
+        .await
+        .expect("complete V2 mTLS")
+}
+
+async fn v2_mutation_request(
+    scope: SessionConsumerScope,
+    nonce: u8,
+    owner: &str,
+) -> (
+    SessionConsumerV2Request,
+    opc_session_store::FencedTransitionV2RequestId,
+) {
+    let timestamp = time::OffsetDateTime::now_utc();
+    let lease: LeaseGuard = serde_json::from_value(serde_json::json!({
+        "key": test_key(),
+        "owner": OwnerId::new(owner).expect("owner"),
+        "fence": FenceToken::new(1),
+        "acquired_at": Timestamp::from_offset_datetime(timestamp),
+        "expires_at": Timestamp::from_offset_datetime(timestamp + time::Duration::minutes(1)),
+        "credential_id": 1,
+    }))
+    .expect("public lease wire shape");
+    let transition = FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(1).expect("nonzero history epoch"),
+        FencedTransitionV2CallerNonce::from_bytes([nonce; 16]),
+        FencedTransitionLease::renew(lease, Duration::from_secs(30)).expect("renew request"),
+        FencedTransitionMutation::delete(Generation::new(1)),
+    )
+    .expect("self-authenticating V2 transition");
+    let request_id = transition.request_id();
+    (
+        SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(transition),
+            },
+        ),
+        request_id,
     )
 }
 
@@ -1555,6 +1744,275 @@ async fn one_authenticated_consumer_call_uses_the_dedicated_alpn_without_replay(
 }
 
 #[tokio::test]
+async fn authenticated_v2_consumer_call_reaches_the_listener_on_its_dedicated_alpn() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-server");
+    let client_spiffe = spiffe("v2-client");
+    let service = Arc::new(CountingConsumer::default());
+    let (authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start stateless V2 consumer listener");
+    let client = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
+
+    let request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Capability,
+    );
+    assert_eq!(
+        client.execute_v2(&request).await,
+        Ok(SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+            FencedTransitionV2Capability::V2,
+        ))),
+        "the V2 client Hello and request reach the V2 listener lane"
+    );
+    assert_eq!(
+        service.v2_calls.load(Ordering::SeqCst),
+        1,
+        "the V2 service method receives exactly one listener-dispatched request"
+    );
+    assert_eq!(
+        service.calls.load(Ordering::SeqCst),
+        0,
+        "the V2 request never enters the V1 DTO service method"
+    );
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn revision_five_v2_status_transports_a_retained_stale_fence_receipt() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-status-error-server");
+    let client_spiffe = spiffe("v2-status-error-client");
+    let (_snapshots, store, scope, voter_authority, authorizer) =
+        admitted_store_and_authorizer([client_spiffe.clone()], &server_spiffe).await;
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        Arc::new(store.consumer_service()),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start revision-five consumer listener");
+    let client = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
+    let timestamp = time::OffsetDateTime::now_utc();
+    let absent_lease: LeaseGuard = serde_json::from_value(serde_json::json!({
+        "key": test_key(),
+        "owner": OwnerId::new("v2-status-error-owner").expect("owner"),
+        "fence": FenceToken::new(1),
+        "acquired_at": Timestamp::from_offset_datetime(timestamp),
+        "expires_at": Timestamp::from_offset_datetime(timestamp + time::Duration::minutes(1)),
+        "credential_id": 1,
+    }))
+    .expect("public lease wire shape");
+    let transition = FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(1).expect("nonzero history epoch"),
+        FencedTransitionV2CallerNonce::from_bytes([0x78; 16]),
+        FencedTransitionLease::renew(absent_lease, Duration::from_secs(30)).expect("renew request"),
+        FencedTransitionMutation::delete(Generation::new(1)),
+    )
+    .expect("self-authenticating V2 transition");
+
+    let request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2 {
+            request: Box::new(transition),
+        },
+    );
+    let request_id = request.request_id().expect("V2 mutation has full ID");
+    let execute = client.execute_v2(&request).await;
+    assert_eq!(
+        execute,
+        Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id }),
+        "the unbound execution error is recovered only through exact V2 status"
+    );
+
+    let SessionConsumerV2Operation::FencedTransitionV2 {
+        request: original_transition,
+    } = request.operation()
+    else {
+        panic!("retain the exact V2 mutation request")
+    };
+    let status = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Status {
+            request: Box::new((**original_transition).clone()),
+        },
+    );
+    assert_eq!(
+        client.execute_v2(&status).await,
+        Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Err(
+                SessionConsumerV2FencedTransitionError::Store(
+                    SessionConsumerStoreError::StaleFence,
+                ),
+            ))),
+        )))
+    );
+
+    let mut malformed = serde_json::to_value(status).expect("status request encodes");
+    let serde_json::Value::Object(fields) = &mut malformed else {
+        panic!("V2 status envelope is an object");
+    };
+    fields.insert("request_id".into(), serde_json::Value::Null);
+    let malformed: SessionConsumerV2Request =
+        serde_json::from_value(malformed).expect("outer-ID mismatch decodes");
+    assert_eq!(
+        client.execute_v2(&malformed).await,
+        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Protocol,
+        }),
+        "an outer full-ID mismatch remains rejected before dispatch"
+    );
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn persistent_v2_setup_closes_retry_without_mutation_dispatch() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-setup-close-server");
+    let client_spiffe = spiffe("v2-setup-close-client");
+    let (_authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind V2 setup-close listener");
+    let address = listener.local_addr().expect("V2 setup-close address");
+    let setups = Arc::new(AtomicUsize::new(0));
+    let call_frames = Arc::new(AtomicUsize::new(0));
+    let authenticated = pki.server_config(&server_spiffe);
+    let peer = {
+        let setups = Arc::clone(&setups);
+        let call_frames = Arc::clone(&call_frames);
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut tls = accept_v2_tls(&listener, &authenticated).await;
+                let frame = read_json_frame(&mut tls).await;
+                if frame["kind"] == "call" {
+                    call_frames.fetch_add(1, Ordering::SeqCst);
+                }
+                assert_eq!(frame["kind"], "hello");
+                setups.fetch_add(1, Ordering::SeqCst);
+                // Drop before HelloAck: the client cannot establish a lane
+                // or enqueue a mutation Call on this attempt.
+            }
+        })
+    };
+    let persistent = PersistentSessionConsumerClient::try_from_stateless(
+        consumer_client(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            voter_authority,
+        )
+        .with_operation_timeout(Duration::from_secs(2)),
+        PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(500),
+            2,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("two-attempt V2 config"),
+    )
+    .expect("persistent V2 client");
+    let (request, _) = v2_mutation_request(scope, 0x79, "v2-setup-close-owner").await;
+
+    assert_eq!(
+        persistent.execute_v2(&request).await,
+        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable,
+        }),
+        "TLS and Hello writes are setup only and remain retryable"
+    );
+    peer.await.expect("join setup-close peer");
+    assert_eq!(
+        setups.load(Ordering::SeqCst),
+        2,
+        "only the configured bounded setup retries are attempted"
+    );
+    assert_eq!(
+        call_frames.load(Ordering::SeqCst),
+        0,
+        "no setup attempt dispatches a mutation Call"
+    );
+    persistent.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistent_v2_call_acceptance_then_close_is_exactly_outcome_unknown() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-call-close-server");
+    let client_spiffe = spiffe("v2-call-close-client");
+    let (authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(HangingV2Consumer::new());
+    let call_seen = service.v2_call_started.notified();
+    tokio::pin!(call_seen);
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start V2 close-after-Call listener");
+    let persistent = PersistentSessionConsumerClient::from_stateless(
+        consumer_client(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            voter_authority,
+        )
+        .with_operation_timeout(Duration::from_secs(2)),
+    )
+    .expect("persistent V2 client");
+    let (request, request_id) = v2_mutation_request(scope, 0x7a, "v2-call-close-owner").await;
+    let execute = persistent.execute_v2(&request);
+    tokio::pin!(execute);
+    tokio::select! {
+        result = &mut execute => panic!("Call completed before peer receipt: {result:?}"),
+        _ = &mut call_seen => {},
+    }
+    handle.abort_and_wait().await;
+
+    assert_eq!(
+        execute.await,
+        Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id }),
+        "a lower transport acceptance after Call retains the exact V2 ID"
+    );
+    assert_eq!(
+        service.v2_calls.load(Ordering::SeqCst),
+        1,
+        "the complete mutation Call is dispatched exactly once"
+    );
+    persistent.shutdown().await;
+}
+
+#[tokio::test]
 async fn stateless_serial_calls_authenticate_fresh_and_accumulate_setup_delay() {
     const CALLS: usize = 4;
     const SETUP_DELAY: Duration = Duration::from_millis(40);
@@ -1897,6 +2355,59 @@ async fn pre_request_connection_budget_expires_during_a_stalled_tls_handshake() 
         "the pre-request budget must expire before the complete operation deadline"
     );
     stalled_tls.abort();
+}
+
+#[tokio::test]
+async fn v2_pre_request_connection_budget_expires_after_hello_before_hello_ack() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("v2-pre-request-stalled-server");
+    let client_spiffe = spiffe("v2-pre-request-stalled-client");
+    let (_authorizer, scope, voter_authority) =
+        authorizer_from_admitted_store(&client_spiffe, &server_spiffe).await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled V2 TLS listener");
+    let address = listener.local_addr().expect("stalled V2 listener address");
+    let hello_seen = Arc::new(AtomicUsize::new(0));
+    let authenticated = pki.server_config(&server_spiffe);
+    let stalled_hello_ack = {
+        let hello_seen = Arc::clone(&hello_seen);
+        tokio::spawn(async move {
+            let mut tls = accept_v2_tls(&listener, &authenticated).await;
+            let hello = read_json_frame(&mut tls).await;
+            assert_eq!(hello["kind"], "hello");
+            hello_seen.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        })
+    };
+    let client = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    )
+    .with_pre_request_connection_timeout(Duration::from_millis(100))
+    .with_operation_timeout(Duration::from_secs(1));
+    let request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Capability,
+    );
+
+    let started_at = tokio::time::Instant::now();
+    assert_eq!(
+        client.execute_v2(&request).await,
+        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable,
+        }),
+        "setup expiry through HelloAck remains proven not transmitted"
+    );
+    assert_eq!(hello_seen.load(Ordering::SeqCst), 1);
+    assert!(
+        started_at.elapsed() < Duration::from_millis(500),
+        "the V2 setup deadline does not consume the operation response budget"
+    );
+    stalled_hello_ack.abort();
 }
 
 #[tokio::test]
@@ -4249,16 +4760,26 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         .last_log_index
         .expect("committed transition log index");
     tokio::time::timeout(Duration::from_secs(5 * 60), async {
-        futures_util::stream::iter(0..SNAPSHOT_COMMANDS)
-            .map(|_| fleet.stores[new_leader].max_replication_sequence())
-            .buffer_unordered(16)
-            .for_each(|result| async {
-                result.expect("commit logical-time entry for snapshot qualification");
-            })
-            .await;
+        // Each command must finish before the next begins. Concurrent
+        // logical-time reads intentionally share one bounded consensus
+        // proposal, while this proof must cross the production snapshot-log
+        // threshold with distinct committed entries.
+        for _ in 0..SNAPSHOT_COMMANDS {
+            fleet.stores[new_leader]
+                .max_replication_sequence()
+                .await
+                .expect("commit logical-time entry for snapshot qualification");
+        }
     })
     .await
     .expect("snapshot qualification command batch completes");
+    assert!(
+        fleet.stores[new_leader]
+            .status()
+            .last_log_index
+            .is_some_and(|index| index >= transition_log_index + SNAPSHOT_COMMANDS as u64),
+        "the qualification workload crosses the production snapshot-log threshold"
+    );
     tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
         loop {
             let progress = fleet.stores[new_leader]

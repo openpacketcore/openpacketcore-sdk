@@ -703,6 +703,12 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::FencedTransitionHistoryFull => "fenced_transition_history_full",
         StoreError::FencedTransitionRetentionExhausted => "fenced_transition_retention_exhausted",
         StoreError::FencedTransitionStorageExhausted => "fenced_transition_storage_exhausted",
+        StoreError::FencedTransitionHistoryEpochRetired => {
+            "fenced_transition_history_epoch_retired"
+        }
+        StoreError::FencedTransitionHistoryEpochNotActive => {
+            "fenced_transition_history_epoch_not_active"
+        }
         StoreError::BackendOperationOutcomeUnavailable => "backend_operation_outcome_unavailable",
         StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
@@ -790,6 +796,14 @@ mod tests {
             (
                 StoreError::FencedTransitionStorageExhausted,
                 "fenced_transition_storage_exhausted",
+            ),
+            (
+                StoreError::FencedTransitionHistoryEpochRetired,
+                "fenced_transition_history_epoch_retired",
+            ),
+            (
+                StoreError::FencedTransitionHistoryEpochNotActive,
+                "fenced_transition_history_epoch_not_active",
             ),
         ] {
             assert_eq!(store_error_kind(&error), kind);

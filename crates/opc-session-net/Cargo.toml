@@ -43,6 +43,7 @@ rustls-pki-types = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 opc-identity = { path = "../opc-identity", version = "0.2.0" }

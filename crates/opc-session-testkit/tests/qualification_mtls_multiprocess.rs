@@ -25,6 +25,7 @@ use opc_identity::{
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_session_net::{
     ConnectionLifecyclePolicy, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+    PersistentSessionConsumerV2Diagnostics, PersistentSessionConsumerV2ExecuteError,
     RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId, SessionConfigurationEpoch,
     SessionConfigurationGeneration, SessionConsumerClientError, SessionConsumerLeaseMutationError,
     SessionReplicationManifest, StatelessSessionConsumerClient, DEFAULT_MAX_AUTHENTICATION_AGE,
@@ -34,31 +35,44 @@ use opc_session_net::{
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, EncryptedSessionPayload, FenceToken,
     FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
-    FencedTransitionRequestId, Generation, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
-    QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
-    ReplicaTlsIdentity, SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
-    SessionConsensusWireRequest, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerLeaseMutationOperation,
-    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
-    SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerRequest,
+    FencedTransitionRequestId, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
+    FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, Generation, LeaseGuard, OwnerId,
+    QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusWireRequest,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+    SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationRequest,
+    SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
+    SessionConsumerOperation, SessionConsumerRejection, SessionConsumerRequest,
     SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerVoterAuthority, SessionKey, SessionKeyType, StateClass, StateType, StoreError,
-    StoredSessionRecord, ValidatedQuorumTopology,
+    SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
+    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionConsumerVoterAuthority, SessionKey, SessionKeyType,
+    StateClass, StateType, StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
 };
 use opc_session_testkit::qualification::{
     qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
     qualification_traffic_value, qualification_value_sha256, read_bounded_json_line,
-    session_mtls_candidate_schedule_sha256, write_json_line,
-    QualificationConnectionLifecycleConfig, QualificationConnectionLifecycleMetrics,
-    QualificationConsensusRpcAvailability, QualificationMember, QualificationNodeCommand,
-    QualificationNodeCommandKind, QualificationNodeConfig, QualificationNodeErrorCode,
-    QualificationNodeReply, QualificationPeerRouting, QualificationProjectedMtlsConfig,
+    session_mtls_batch_release_gate_achieved_rate_milli,
+    session_mtls_batch_release_gate_schedule_sha256, session_mtls_candidate_schedule_sha256,
+    write_json_line, QualificationConnectionLifecycleConfig,
+    QualificationConnectionLifecycleMetrics, QualificationConsensusRpcAvailability,
+    QualificationMember, QualificationNodeCommand, QualificationNodeCommandKind,
+    QualificationNodeConfig, QualificationNodeErrorCode, QualificationNodeReply,
+    QualificationPeerRouting, QualificationProjectedMtlsConfig,
     QualificationProjectedSvidAvailability, QualificationProjectedSvidReason,
     QualificationProjectedSvidStatus, QualificationReadinessCode,
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialAvailability,
     QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
     QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
-    QualificationTrafficStatus, QualificationTransportConfig, SessionMtlsCandidateCampaign,
+    QualificationTrafficStatus, QualificationTransportConfig,
+    SessionMtlsBatchReleaseGateBindingsV1, SessionMtlsBatchReleaseGateEvidenceV1,
+    SessionMtlsBatchReleaseGatePoolEvidenceV1, SessionMtlsBatchReleaseGatePoolRoleV1,
+    SessionMtlsBatchReleaseGateResourceGenerationV1,
+    SessionMtlsBatchReleaseGateServerQueueDepthScopeV1, SessionMtlsCandidateCampaign,
     SessionMtlsCandidateEvidenceV2, SessionMtlsCandidateSourceTreeStatus,
     QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
     QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
@@ -97,6 +111,17 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
     QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
     SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V8_SCHEMA_JSON,
+    SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_MIN_ACHIEVED_RATE_MILLI,
+    SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING,
+    SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS,
+    SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS,
     SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
@@ -107,7 +132,7 @@ use rustix::fs::{
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use opc_tls::TlsConfigBuilder;
 
@@ -178,42 +203,108 @@ struct ProcessResourceSnapshot {
 
 #[derive(Debug, Clone, Copy)]
 struct ProcessResourceHighWater {
+    process_id: u32,
     samples: u64,
     file_descriptors: usize,
     threads: usize,
+    vm_rss_kib: u64,
     vm_hwm_kib: u64,
 }
 
 struct ResourceSampler {
     stop: Arc<AtomicBool>,
-    handle: JoinHandle<io::Result<Vec<ProcessResourceHighWater>>>,
+    process_ids: Arc<Mutex<Vec<Option<u32>>>>,
+    handle: JoinHandle<io::Result<Vec<Vec<ProcessResourceHighWater>>>>,
+}
+
+fn record_resource_generation_sample(
+    high_water: &mut [Vec<ProcessResourceHighWater>],
+    observed_process_ids: &mut [Option<u32>],
+    node_index: usize,
+    process_id: u32,
+    snapshot: ProcessResourceSnapshot,
+) {
+    if observed_process_ids[node_index] != Some(process_id) {
+        if observed_process_ids[node_index].is_some() {
+            high_water[node_index].push(ProcessResourceHighWater {
+                process_id,
+                samples: 0,
+                file_descriptors: 0,
+                threads: 0,
+                vm_rss_kib: 0,
+                vm_hwm_kib: 0,
+            });
+        }
+        observed_process_ids[node_index] = Some(process_id);
+    }
+    let current = high_water[node_index]
+        .last_mut()
+        .expect("logical voter has one resource generation");
+    current.samples = current.samples.saturating_add(1);
+    current.file_descriptors = current.file_descriptors.max(snapshot.file_descriptors);
+    current.threads = current.threads.max(snapshot.threads);
+    current.vm_rss_kib = current.vm_rss_kib.max(snapshot.vm_rss_kib);
+    current.vm_hwm_kib = current.vm_hwm_kib.max(snapshot.vm_hwm_kib);
 }
 
 impl ResourceSampler {
     fn start(process_ids: Vec<u32>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
+        let process_ids = Arc::new(Mutex::new(
+            process_ids.into_iter().map(Some).collect::<Vec<_>>(),
+        ));
+        let process_ids_for_thread = Arc::clone(&process_ids);
         let handle = thread::Builder::new()
             .name("qualification-resource-sampler".to_owned())
             .spawn(move || {
-                let mut high_water = vec![
-                    ProcessResourceHighWater {
-                        samples: 0,
-                        file_descriptors: 0,
-                        threads: 0,
-                        vm_hwm_kib: 0,
-                    };
-                    process_ids.len()
-                ];
+                let initial_process_ids = process_ids_for_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let mut high_water = initial_process_ids
+                    .iter()
+                    .map(|process_id| {
+                        vec![ProcessResourceHighWater {
+                            process_id: process_id.expect("initial sampler PID is present"),
+                            samples: 0,
+                            file_descriptors: 0,
+                            threads: 0,
+                            vm_rss_kib: 0,
+                            vm_hwm_kib: 0,
+                        }]
+                    })
+                    .collect::<Vec<_>>();
+                let mut observed_process_ids = vec![None; high_water.len()];
                 loop {
-                    for (index, process_id) in process_ids.iter().copied().enumerate() {
-                        let snapshot = read_process_resources(process_id, false)?;
-                        let current = &mut high_water[index];
-                        current.samples = current.samples.saturating_add(1);
-                        current.file_descriptors =
-                            current.file_descriptors.max(snapshot.file_descriptors);
-                        current.threads = current.threads.max(snapshot.threads);
-                        current.vm_hwm_kib = current.vm_hwm_kib.max(snapshot.vm_hwm_kib);
+                    let current_process_ids = process_ids_for_thread
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    for (index, process_id) in current_process_ids.into_iter().enumerate() {
+                        let Some(process_id) = process_id else {
+                            continue;
+                        };
+                        let snapshot = match read_process_resources(process_id, false) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                let current = process_ids_for_thread
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)[index];
+                                if current != Some(process_id) {
+                                    continue;
+                                }
+                                return Err(error);
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        record_resource_generation_sample(
+                            &mut high_water,
+                            &mut observed_process_ids,
+                            index,
+                            process_id,
+                            snapshot,
+                        );
                     }
                     if stop_for_thread.load(Ordering::Acquire) {
                         break;
@@ -223,16 +314,265 @@ impl ResourceSampler {
                 Ok(high_water)
             })
             .expect("start qualification resource sampler");
-        Self { stop, handle }
+        Self {
+            stop,
+            process_ids,
+            handle,
+        }
     }
 
-    fn finish(self) -> Vec<ProcessResourceHighWater> {
+    fn mark_offline(&self, node_index: usize) {
+        self.process_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index] = None;
+    }
+
+    fn install_restarted_process(&self, node_index: usize, process_id: u32) {
+        self.process_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index] = Some(process_id);
+    }
+
+    fn finish(self) -> Vec<Vec<ProcessResourceHighWater>> {
         self.stop.store(true, Ordering::Release);
         self.handle
             .join()
             .expect("join qualification resource sampler")
             .expect("sample live qualification processes")
     }
+}
+
+fn merge_resource_generation_high_water(
+    generations: &[Vec<ProcessResourceHighWater>],
+) -> Vec<ProcessResourceHighWater> {
+    generations
+        .iter()
+        .map(|voter_generations| {
+            voter_generations.iter().copied().fold(
+                ProcessResourceHighWater {
+                    process_id: 0,
+                    samples: 0,
+                    file_descriptors: 0,
+                    threads: 0,
+                    vm_rss_kib: 0,
+                    vm_hwm_kib: 0,
+                },
+                |mut merged, generation| {
+                    merged.samples = merged.samples.saturating_add(generation.samples);
+                    merged.file_descriptors =
+                        merged.file_descriptors.max(generation.file_descriptors);
+                    merged.threads = merged.threads.max(generation.threads);
+                    merged.vm_rss_kib = merged.vm_rss_kib.max(generation.vm_rss_kib);
+                    merged.vm_hwm_kib = merged.vm_hwm_kib.max(generation.vm_hwm_kib);
+                    merged
+                },
+            )
+        })
+        .collect()
+}
+
+fn cumulative_replaced_v2_diagnostics(
+    released_before_shutdown: PersistentSessionConsumerV2Diagnostics,
+    restored_current: PersistentSessionConsumerV2Diagnostics,
+) -> PersistentSessionConsumerV2Diagnostics {
+    PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: released_before_shutdown
+            .setup_attempts
+            .saturating_add(restored_current.setup_attempts),
+        setup_failures: released_before_shutdown
+            .setup_failures
+            .saturating_add(restored_current.setup_failures),
+        setup_successes: released_before_shutdown
+            .setup_successes
+            .saturating_add(restored_current.setup_successes),
+        reused: released_before_shutdown
+            .reused
+            .saturating_add(restored_current.reused),
+        reconnects: released_before_shutdown
+            .reconnects
+            .saturating_add(restored_current.reconnects),
+        active: restored_current.active,
+        idle: restored_current.idle,
+        pool_wait_current: restored_current.pool_wait_current,
+        pool_wait_max: released_before_shutdown
+            .pool_wait_max
+            .max(restored_current.pool_wait_max),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetupAccounting {
+    attempts: u64,
+    failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MtlsSetupAccounting {
+    original_and_restored: SetupAccounting,
+    supplemental: SetupAccounting,
+}
+
+impl MtlsSetupAccounting {
+    fn total(self) -> SetupAccounting {
+        SetupAccounting {
+            attempts: self
+                .original_and_restored
+                .attempts
+                .saturating_add(self.supplemental.attempts),
+            failures: self
+                .original_and_restored
+                .failures
+                .saturating_add(self.supplemental.failures),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MtlsSetupCeilings {
+    original_and_restored: SetupAccounting,
+    supplemental: SetupAccounting,
+    total: SetupAccounting,
+}
+
+fn v2_batch_release_gate_setup_ceilings() -> MtlsSetupCeilings {
+    let original_and_restored = SetupAccounting {
+        attempts: SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING,
+        failures: SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING,
+    };
+    let supplemental = SetupAccounting {
+        attempts: SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_ATTEMPT_CEILING
+            .saturating_mul(2)
+            .saturating_add(SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_ATTEMPT_CEILING),
+        failures: SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_FAILURE_CEILING
+            .saturating_mul(2)
+            .saturating_add(SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_FAILURE_CEILING),
+    };
+    MtlsSetupCeilings {
+        original_and_restored,
+        supplemental,
+        total: SetupAccounting {
+            attempts: SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING,
+            failures: SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING,
+        },
+    }
+}
+
+fn verify_mtls_setup_accounting(
+    observed: MtlsSetupAccounting,
+    ceilings: MtlsSetupCeilings,
+) -> Result<(), String> {
+    let total = observed.total();
+    for (scope, observed, ceiling) in [
+        (
+            "original_and_restored",
+            observed.original_and_restored,
+            ceilings.original_and_restored,
+        ),
+        ("supplemental", observed.supplemental, ceilings.supplemental),
+        ("total", total, ceilings.total),
+    ] {
+        if observed.attempts > ceiling.attempts {
+            return Err(format!(
+                "mTLS setup attempt ceiling exceeded: scope={scope}, observed_attempts={}, bound_attempts={}, observed_failures={}, bound_failures={}",
+                observed.attempts, ceiling.attempts, observed.failures, ceiling.failures
+            ));
+        }
+        if observed.failures > ceiling.failures {
+            return Err(format!(
+                "mTLS setup failure ceiling exceeded: scope={scope}, observed_attempts={}, bound_attempts={}, observed_failures={}, bound_failures={}",
+                observed.attempts, ceiling.attempts, observed.failures, ceiling.failures
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn assert_no_fault_v2_setup_delta(
+    window: &str,
+    before: &[PersistentSessionConsumerV2Diagnostics],
+    after: &[PersistentSessionConsumerV2Diagnostics],
+) {
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "mTLS {window} diagnostic snapshot cardinality is stable"
+    );
+    for (client_index, (after, before)) in after.iter().zip(before).enumerate() {
+        let attempts = checked_no_fault_setup_delta(
+            window,
+            client_index,
+            "setup_attempts",
+            before.setup_attempts,
+            after.setup_attempts,
+        );
+        let failures = checked_no_fault_setup_delta(
+            window,
+            client_index,
+            "setup_failures",
+            before.setup_failures,
+            after.setup_failures,
+        );
+        assert_eq!(
+            attempts, 0,
+            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0"
+        );
+        assert_eq!(
+            failures, 0,
+            "mTLS {window} must not resolve, connect, negotiate TLS, or send Hello per operation: client_index={client_index}, observed_setup_attempts={attempts}, bound_setup_attempts=0, observed_setup_failures={failures}, bound_setup_failures=0"
+        );
+    }
+}
+
+fn checked_no_fault_setup_delta(
+    window: &str,
+    client_index: usize,
+    counter: &str,
+    before: u64,
+    after: u64,
+) -> u64 {
+    after.checked_sub(before).unwrap_or_else(|| {
+        panic!(
+            "mTLS {window} diagnostic counter regressed: client_index={client_index}, counter={counter}, before={before}, after={after}"
+        )
+    })
+}
+
+fn select_v2_batch_scheduler_client(
+    preferred_client_index: usize,
+    in_flight_per_client: &[usize],
+    lanes_per_client: usize,
+) -> Option<usize> {
+    (0..in_flight_per_client.len())
+        .map(|offset| (preferred_client_index + offset) % in_flight_per_client.len())
+        .find(|client_index| in_flight_per_client[*client_index] < lanes_per_client)
+}
+
+#[test]
+fn no_fault_setup_delta_rejects_per_client_counter_regression() {
+    assert_eq!(
+        checked_no_fault_setup_delta("pure-regression", 3, "setup_attempts", 7, 7),
+        0
+    );
+    assert!(std::panic::catch_unwind(|| {
+        checked_no_fault_setup_delta("pure-regression", 3, "setup_attempts", 7, 6)
+    })
+    .is_err());
+}
+
+#[test]
+fn v2_batch_scheduler_no_eligible_boundary_requires_a_completed_admission() {
+    let mut in_flight = vec![V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT; V2_BATCH_RELEASE_GATE_CLIENTS];
+    assert_eq!(
+        select_v2_batch_scheduler_client(0, &in_flight, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,),
+        None,
+        "a full four-lane client set cannot accept another scheduler admission"
+    );
+    in_flight[7] -= 1;
+    assert_eq!(
+        select_v2_batch_scheduler_client(0, &in_flight, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,),
+        Some(7),
+        "draining one completed alternate admission restores a deterministic slot"
+    );
 }
 
 fn read_process_resources(
@@ -1260,6 +1600,74 @@ fn connection_attempt_settlement_ledger(
     }
 }
 
+/// Emits only fixed-dimension lifecycle counters, so expiry/replacement
+/// intervals can be attributed without exposing peer, subscriber, or process
+/// identities in qualification diagnostics.
+fn emit_fixed_lifecycle_connection_snapshot(
+    phase: &str,
+    metrics: &[QualificationConnectionLifecycleMetrics],
+) {
+    let ledger = metrics.iter().fold(
+        ConnectionAttemptSettlementLedger {
+            attempts: 0,
+            successes: 0,
+            transport_failures: 0,
+            authentication_failures: 0,
+            timeout_failures: 0,
+            superseded: 0,
+            abandoned: 0,
+            protocol_failures: 0,
+            backend_failures: 0,
+            reconnect_attempts: 0,
+            reconnect_failures: 0,
+        },
+        |mut aggregate, metric| {
+            let current = connection_attempt_settlement_ledger(metric);
+            aggregate.attempts = aggregate.attempts.saturating_add(current.attempts);
+            aggregate.successes = aggregate.successes.saturating_add(current.successes);
+            aggregate.transport_failures = aggregate
+                .transport_failures
+                .saturating_add(current.transport_failures);
+            aggregate.authentication_failures = aggregate
+                .authentication_failures
+                .saturating_add(current.authentication_failures);
+            aggregate.timeout_failures = aggregate
+                .timeout_failures
+                .saturating_add(current.timeout_failures);
+            aggregate.superseded = aggregate.superseded.saturating_add(current.superseded);
+            aggregate.abandoned = aggregate.abandoned.saturating_add(current.abandoned);
+            aggregate.protocol_failures = aggregate
+                .protocol_failures
+                .saturating_add(current.protocol_failures);
+            aggregate.backend_failures = aggregate
+                .backend_failures
+                .saturating_add(current.backend_failures);
+            aggregate.reconnect_attempts = aggregate
+                .reconnect_attempts
+                .saturating_add(current.reconnect_attempts);
+            aggregate.reconnect_failures = aggregate
+                .reconnect_failures
+                .saturating_add(current.reconnect_failures);
+            aggregate
+        },
+    );
+    println!(
+        "MTLS_FIXED_LIFECYCLE_SNAPSHOT phase={phase} members={} connection_attempts={} connection_successes={} connection_failure_transport={} connection_failure_authentication={} connection_failure_timeout={} connection_superseded={} connection_abandoned={} connection_failure_protocol={} connection_failure_backend={} reconnect_attempts={} reconnect_failures={}",
+        metrics.len(),
+        ledger.attempts,
+        ledger.successes,
+        ledger.transport_failures,
+        ledger.authentication_failures,
+        ledger.timeout_failures,
+        ledger.superseded,
+        ledger.abandoned,
+        ledger.protocol_failures,
+        ledger.backend_failures,
+        ledger.reconnect_attempts,
+        ledger.reconnect_failures,
+    );
+}
+
 fn connection_attempt_settlement_ledgers(
     metrics: &[QualificationConnectionLifecycleMetrics],
 ) -> Vec<ConnectionAttemptSettlementLedger> {
@@ -1382,7 +1790,7 @@ fn assert_recovery_fault_flush_bounds(
         );
         assert!(
             terminal <= terminal_bound,
-            "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, counter=connection_terminal_outcomes, observed={terminal}, bound={terminal_bound}, new_attempt_bound={bound}, baseline_outstanding={baseline_outstanding}"
+            "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, counter=connection_terminal_outcomes, observed={terminal}, bound={terminal_bound}, new_attempt_bound={bound}, baseline_outstanding={baseline_outstanding}, attempts={attempts}, reconnect_attempts={reconnect_attempts}, reconnect_failures={reconnect_failures}, before={before:?}, after={after:?}"
         );
         for (counter, observed) in [
             ("connection_attempts", attempts),
@@ -1688,6 +2096,12 @@ fn assert_process_resource_bounds(
             warmed.vm_hwm_kib
         );
         assert!(
+            high_water.vm_rss_kib <= high_water.vm_hwm_kib,
+            "VmRSS high-water exceeds VmHWM: node={node_index}, rss_kib={}, hwm_kib={}",
+            high_water.vm_rss_kib,
+            high_water.vm_hwm_kib
+        );
+        assert!(
             settled.vm_rss_kib
                 <= warmed
                     .vm_rss_kib
@@ -1791,11 +2205,17 @@ enum TrustGeneration {
     Overlap,
     NewOnly,
 }
+#[derive(Clone, Copy)]
+enum ConsumerCredentialGeneration {
+    OldRoot,
+    NewRoot,
+}
 
 struct TestPki {
     old_root_pem: String,
     new_root_pem: String,
     old_intermediate: Issuer,
+    new_intermediate: Issuer,
     members: Vec<MemberCredentials>,
 }
 
@@ -1824,6 +2244,7 @@ impl TestPki {
             old_root_pem: old_root.certified.pem(),
             new_root_pem: new_root.certified.pem(),
             old_intermediate,
+            new_intermediate,
             members,
         }
     }
@@ -1896,13 +2317,43 @@ impl TestPki {
     }
 
     fn consumer_identity_state(&self, identity: &str) -> IdentityState {
-        let credential = self.old_intermediate.issue_workload(identity);
+        self.consumer_identity_state_with_trust(identity, TrustGeneration::OldOnly)
+    }
+
+    fn consumer_identity_state_with_trust(
+        &self,
+        identity: &str,
+        trust_generation: TrustGeneration,
+    ) -> IdentityState {
+        let credential_generation = match trust_generation {
+            TrustGeneration::OldOnly | TrustGeneration::Overlap => {
+                ConsumerCredentialGeneration::OldRoot
+            }
+            TrustGeneration::NewOnly => ConsumerCredentialGeneration::NewRoot,
+        };
+        self.consumer_identity_state_with_generations(
+            identity,
+            credential_generation,
+            trust_generation,
+        )
+    }
+
+    fn consumer_identity_state_with_generations(
+        &self,
+        identity: &str,
+        credential_generation: ConsumerCredentialGeneration,
+        trust_generation: TrustGeneration,
+    ) -> IdentityState {
+        let credential = match credential_generation {
+            ConsumerCredentialGeneration::OldRoot => self.old_intermediate.issue_workload(identity),
+            ConsumerCredentialGeneration::NewRoot => self.new_intermediate.issue_workload(identity),
+        };
         let trust_domain =
             TrustDomain::new("qualification.invalid").expect("qualification trust domain is valid");
         let mut trust_bundles = TrustBundleSet::new();
         trust_bundles.insert(TrustBundle {
             trust_domain,
-            certificates: parse_certs_pem(&self.old_root_pem)
+            certificates: parse_certs_pem(&self.trust_bundle(trust_generation))
                 .expect("parse qualification consumer trust bundle"),
         });
         build_identity_state(
@@ -2436,6 +2887,7 @@ struct Fleet {
     canary_values: Vec<String>,
     candidate_evidence_inputs: CandidateEvidenceInputs,
     candidate_public_material_manifest: CandidatePublicMaterialManifest,
+    readiness_probe_commands: usize,
 }
 
 impl Fleet {
@@ -2613,6 +3065,7 @@ impl Fleet {
             canary_values: Vec::new(),
             candidate_evidence_inputs,
             candidate_public_material_manifest,
+            readiness_probe_commands: 0,
         };
         fleet.wait_ready();
         fleet.assert_all_material_ready();
@@ -2735,6 +3188,53 @@ impl Fleet {
             .collect()
     }
 
+    fn arm_stateless_consumer_response_holds(&mut self, node_index: usize) {
+        match self.nodes[node_index].invoke(&QualificationNodeCommand::ArmStatelessConsumerResponseHolds) {
+            QualificationNodeReply::StatelessConsumerResponseHoldsArmed { responses: 4 } => {}
+            reply => panic!(
+                "stateless consumer four-response hold gate did not arm: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn stateless_consumer_response_hold_status(&mut self, node_index: usize) -> (usize, usize) {
+        match self.nodes[node_index].invoke(&QualificationNodeCommand::StatelessConsumerResponseHoldStatus) {
+            QualificationNodeReply::StatelessConsumerResponseHoldStatus {
+                armed_responses,
+                held_responses,
+            } => (armed_responses, held_responses),
+            reply => panic!(
+                "stateless consumer four-response hold status unavailable: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn release_stateless_consumer_response_holds(&mut self, node_index: usize) {
+        match self.nodes[node_index].invoke(&QualificationNodeCommand::ReleaseStatelessConsumerResponseHolds) {
+            QualificationNodeReply::StatelessConsumerResponseHoldsReleased { responses: 4 } => {}
+            reply => panic!(
+                "stateless consumer four-response hold gate did not release: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
+    fn consumer_tls_peer_credential_rejections(&mut self, node_index: usize) -> u64 {
+        match self.nodes[node_index]
+            .invoke(&QualificationNodeCommand::ConsumerTlsPeerCredentialRejections)
+        {
+            QualificationNodeReply::ConsumerTlsPeerCredentialRejections { rejections } => {
+                rejections
+            }
+            reply => panic!(
+                "unexpected consumer TLS peer-credential rejection response: node={node_index}, reply={reply:?}, stderr={}",
+                self.node_stderr(node_index)
+            ),
+        }
+    }
+
     fn readiness_reports(&mut self, node_indices: &[usize]) -> Vec<FleetReadiness> {
         self.readiness_reports_by(node_indices, Instant::now() + CHILD_TIMEOUT)
     }
@@ -2744,6 +3244,10 @@ impl Fleet {
         node_indices: &[usize],
         deadline: Instant,
     ) -> Vec<FleetReadiness> {
+        self.readiness_probe_commands = self
+            .readiness_probe_commands
+            .checked_add(node_indices.len())
+            .expect("readiness probe command count overflow");
         for node_index in node_indices {
             self.nodes[*node_index].send(&QualificationNodeCommand::Probe);
         }
@@ -3583,6 +4087,22 @@ impl Fleet {
         self.all_lifecycle_metrics_by(Instant::now() + CHILD_TIMEOUT)
     }
 
+    fn all_consensus_diagnostics(
+        &mut self,
+    ) -> Vec<opc_session_store::ConsensusStoreDiagnosticSnapshot> {
+        let deadline = Instant::now() + CHILD_TIMEOUT;
+        for node in &mut self.nodes {
+            node.send(&QualificationNodeCommand::ConsensusDiagnostics);
+        }
+        self.nodes
+            .iter_mut()
+            .map(|node| match node.receive_until(deadline) {
+                QualificationNodeReply::ConsensusDiagnostics { metrics } => metrics,
+                reply => panic!("unexpected consensus diagnostics response: {reply:?}"),
+            })
+            .collect()
+    }
+
     fn all_lifecycle_metrics_by(
         &mut self,
         deadline: Instant,
@@ -3647,8 +4167,12 @@ impl Fleet {
         let observed_at = Instant::now();
         let mut stable_since = observed_at;
         let mut server_tail_entered = observed_at >= server_tail_deadline;
-        let node_indices = (0..self.member_count()).collect::<Vec<_>>();
 
+        // The caller has just established all-voter readiness, and the next
+        // recovered-member phase establishes it again after this clean
+        // baseline. Do not issue readiness probes inside this interval: a
+        // probe uses the same authenticated consensus lanes whose terminal
+        // outcomes this loop is required to account for.
         loop {
             let traffic = self.traffic_status_snapshots_on_by(
                 &participants.observers,
@@ -3728,29 +4252,6 @@ impl Fleet {
                 traffic_progress.record_coverage(traffic.clone(), traffic_observed_at);
             }
 
-            let member_count = self.member_count();
-            let required_quorum = self.required_quorum();
-            let readiness_deadline = self.recovery_readiness_probe_deadline(
-                traffic_before,
-                &mut traffic_progress,
-                participants,
-                phase,
-                deadline,
-            );
-            let readiness = self.readiness_reports_by(&node_indices, readiness_deadline);
-            assert!(
-                readiness.iter().all(|report| {
-                    report.ready
-                        && report.reason_code == QualificationReadinessCode::Ready
-                        && report.configured_voters == member_count
-                        && report.fresh_reachable_voters == required_quorum
-                        && report.agreeing_voters == required_quorum
-                        && report.required_quorum == required_quorum
-                }),
-                "fleet readiness regressed while flushing fault-era connection outcomes: phase={phase}, readiness={readiness:?}, stderr={:?}",
-                self.stderr_diagnostics()
-            );
-
             lifecycle = self.all_lifecycle_metrics_by(traffic_progress.next_deadline(deadline));
             for (node_index, (fault_before, current)) in before.iter().zip(&lifecycle).enumerate() {
                 assert!(
@@ -3827,7 +4328,7 @@ impl Fleet {
             }
             assert!(
                 deadline_allows_completion(now, deadline),
-                "fault-era connection outcomes did not settle before the recovery baseline: phase={phase}, server_tail_window={server_tail_window:?}, outbound_quiet_window={outbound_quiet_window:?}, elapsed={:?}, outbound_stable_for={outbound_stable_for:?}, readiness={readiness:?}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                "fault-era connection outcomes did not settle before the recovery baseline: phase={phase}, server_tail_window={server_tail_window:?}, outbound_quiet_window={outbound_quiet_window:?}, elapsed={:?}, outbound_stable_for={outbound_stable_for:?}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
                 now.duration_since(started),
                 self.stderr_diagnostics()
             );
@@ -5354,6 +5855,7 @@ impl Fleet {
             "replacement-canary-verification",
             recovery_deadline,
         );
+        let readiness_probe_commands_before_settlement = self.readiness_probe_commands;
         let (lifecycle_before, clean_traffic_baseline) = self
             .wait_for_recovery_fault_outcomes_to_settle(RecoveryFaultSettlementContext {
                 before: fault_lifecycle_before,
@@ -5364,6 +5866,10 @@ impl Fleet {
                 traffic_before: traffic_availability_baseline,
                 traffic_progress,
             });
+        assert_eq!(
+            self.readiness_probe_commands, readiness_probe_commands_before_settlement,
+            "fault-outcome settlement must not issue readiness commands through the lanes whose outcomes it measures"
+        );
         let started = Instant::now();
         let deadline = started + Duration::from_millis(QUALIFICATION_TRAFFIC_TRANSITION_MILLIS);
         self.reauthenticate_recovered_member_and_prove_paths(member);
@@ -5741,7 +6247,7 @@ impl Fleet {
                     outcome,
                     Err(
                         SessionConsensusPeerError::Authentication
-                            | SessionConsensusPeerError::Timeout
+                            | SessionConsensusPeerError::Unavailable
                     )
                 ),
                 "new-only server trust must reject removed old-root client chain: source={source}, target={target}, outcome={outcome:?}"
@@ -7100,7 +7606,15 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         stopped_expiring_mutation[0].status.last_generation
     );
     let stopped_expiring_status = stopped_expiring_watch[0].status.clone();
-    fleet.wait_for_expiry_soft_retirement(expiring_node_index, &lifecycle_before_expiry, not_after);
+    let lifecycle_after_soft_retirement = fleet.wait_for_expiry_soft_retirement(
+        expiring_node_index,
+        &lifecycle_before_expiry,
+        not_after,
+    );
+    emit_fixed_lifecycle_connection_snapshot(
+        "soft_authenticated_retirement",
+        &lifecycle_after_soft_retirement,
+    );
     assert!(
         time::OffsetDateTime::now_utc() < not_after,
         "soft retirement was not observed strictly before hard expiry"
@@ -7126,6 +7640,7 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         not_after,
     );
     fleet.wait_for_isolated_member_and_survivors(expiring_node_index);
+    emit_fixed_lifecycle_connection_snapshot("hard_expiry", &fleet.all_lifecycle_metrics());
     let traffic_after_hard_expiry_boundary = fleet.traffic_statuses_on(&expiry_survivor_indices);
     let hard_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     fleet.advance_canary_for_survivors(expiring_node_index, "short-lived-svid-expired");
@@ -7197,6 +7712,10 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         "replacement-publication",
         replacement_recovery_deadline,
     );
+    emit_fixed_lifecycle_connection_snapshot(
+        "replacement_publication",
+        &fleet.all_lifecycle_metrics(),
+    );
     assert_eq!(
         fleet.nodes[expiring_node_index].process_id(),
         expiring_process_id,
@@ -7213,6 +7732,7 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
             recovery_started: replacement_recovery_started,
             recovery_deadline: replacement_recovery_deadline,
         });
+    emit_fixed_lifecycle_connection_snapshot("settled_recovery", &fleet.all_lifecycle_metrics());
     let replacement_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     let replacement_phase = format!(
         "survivor-traffic-through-material-replacement/active-restart-{active_restart_node_index}/expiring-{expiring_node_index}"
@@ -7785,7 +8305,8 @@ fn run_projected_mtls_traffic_resources(member_count: usize) {
     let (settled, settled_lifecycle) = fleet.wait_for_resources_to_settle(&process_ids, &warmed);
     assert_lifecycle_delta_bounds(member_count, &lifecycle_checkpoint, &settled_lifecycle, 0);
     lifecycle_checkpoint = settled_lifecycle;
-    let high_water = sampler.finish();
+    let high_water_generations = sampler.finish();
+    let high_water = merge_resource_generation_high_water(&high_water_generations);
     assert_process_resource_bounds(member_count, &warmed, &high_water, &settled);
 
     let final_ledger_deadline =
@@ -8266,6 +8787,434 @@ async fn qualification_fenced_transition_record(
     .await
     .expect("seal opaque qualification fenced-transition payload");
     record
+}
+
+async fn qualification_fenced_transition_v2_request(
+    member_count: usize,
+    index: usize,
+) -> FencedTransitionV2Request {
+    let key = qualification_fenced_transition_key(index);
+    let owner = OwnerId::new(format!("qualification-v2-owner-{index}"))
+        .expect("qualification V2 transition owner");
+    let lease = FencedTransitionLease::acquire(
+        key.clone(),
+        owner.clone(),
+        FenceToken::new(0),
+        Duration::from_secs(30),
+    )
+    .expect("build qualification V2 acquire action");
+    let record = qualification_fenced_transition_record(
+        member_count,
+        key,
+        owner,
+        lease
+            .committed_fence()
+            .expect("derive qualification V2 committed fence"),
+        match index {
+            0 => b"opaque-qualification-v2-transition-one",
+            1 => b"opaque-qualification-v2-transition-two",
+            _ => b"opaque-qualification-v2-transition-three",
+        },
+    )
+    .await;
+    FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(1).expect("initial qualification V2 epoch"),
+        FencedTransitionV2CallerNonce::from_bytes((index as u128).to_be_bytes()),
+        lease,
+        FencedTransitionMutation::create(record),
+    )
+    .expect("build self-authenticating qualification V2 request")
+}
+
+const V2_BATCH_RELEASE_GATE_CLIENTS: usize = 12;
+const V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT: usize = 4;
+const V2_BATCH_RELEASE_GATE_PENDING_CALLS: usize = 64;
+const V2_BATCH_RELEASE_GATE_OVER_CAPACITY_CALLS: usize =
+    V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT + V2_BATCH_RELEASE_GATE_PENDING_CALLS + 1;
+const V2_BATCH_RELEASE_GATE_PRELOAD_BATCH_SIZE: usize = 256;
+const V2_BATCH_RELEASE_GATE_PRELOAD_CONCURRENCY: usize = 1;
+const V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE: usize = 12;
+const V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY: usize =
+    V2_BATCH_RELEASE_GATE_CLIENTS * V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT;
+const V2_BATCH_RELEASE_GATE_PRELOAD_CREATES: usize = 50_000;
+const V2_BATCH_RELEASE_GATE_PACED_MUTATIONS: usize = 60_000;
+const V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND: usize = 1_000;
+const V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES: usize = 1_008;
+const V2_BATCH_RELEASE_GATE_P99: Duration = Duration::from_millis(25);
+const V2_BATCH_RELEASE_GATE_P999: Duration = Duration::from_millis(100);
+const V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT: usize = 16;
+const V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn assert_v2_batch_release_profile() {
+    let cargo_profile = env!("OPC_SESSION_TESTKIT_CARGO_PROFILE_FAMILY");
+    let opt_level = env!("OPC_SESSION_TESTKIT_CARGO_OPT_LEVEL");
+    println!(
+        "V2_BATCH_RELEASE_GATE_PROFILE profile={cargo_profile:?} opt_level={opt_level:?} debug_assertions={}",
+        cfg!(debug_assertions)
+    );
+    assert_eq!(
+        cargo_profile, "release",
+        "the V2 batch release gate requires Cargo's release profile"
+    );
+    assert_eq!(
+        opt_level, "3",
+        "the V2 batch release gate requires Cargo release opt-level 3"
+    );
+    assert!(
+        !std::hint::black_box(cfg!(debug_assertions)),
+        "the V2 batch release gate requires debug assertions disabled"
+    );
+}
+
+fn qualification_v2_batch_percentile(
+    samples: &mut [Duration],
+    numerator: usize,
+    denominator: usize,
+) -> Duration {
+    assert!(!samples.is_empty(), "latency sample set is nonempty");
+    assert!(numerator > 0 && numerator <= denominator);
+    samples.sort_unstable();
+    let rank = samples
+        .len()
+        .saturating_mul(numerator)
+        .div_ceil(denominator)
+        .saturating_sub(1);
+    samples[rank]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QualificationV2BatchSampleFailure {
+    InvalidSuccessResponse,
+    TypedStoreError,
+    TypedOutcomeUnknown,
+    UnexpectedTypedError,
+    MismatchedResponse,
+    NotTransmittedRetryExhausted,
+    UnexpectedTransportError,
+}
+
+fn qualification_assert_v2_batch_response(
+    requests: &[FencedTransitionV2Request],
+    response: SessionConsumerV2Response,
+) -> Result<(), QualificationV2BatchSampleFailure> {
+    match response {
+        SessionConsumerV2Response::FencedTransitionV2Batch(Ok(results)) => {
+            if results.len() != requests.len() {
+                return Err(QualificationV2BatchSampleFailure::InvalidSuccessResponse);
+            }
+            let encoded =
+                opc_consensus::encode_bounded(&results).map_err(|_| QualificationV2BatchSampleFailure::InvalidSuccessResponse)?;
+            if encoded.len() > MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES {
+                return Err(QualificationV2BatchSampleFailure::InvalidSuccessResponse);
+            }
+            for (request, result) in requests.iter().zip(results) {
+                if result.request_id() != request.request_id()
+                    || !result
+                        .result()
+                        .as_ref()
+                        .is_ok_and(|outcome| outcome.matches_v2_request(request))
+                {
+                    return Err(QualificationV2BatchSampleFailure::InvalidSuccessResponse);
+                }
+            }
+            Ok(())
+        }
+        SessionConsumerV2Response::FencedTransitionV2Batch(Err(error)) => match error {
+            opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchError::Store(
+                _,
+            ) => Err(QualificationV2BatchSampleFailure::TypedStoreError),
+            opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchError::OutcomeUnknown {
+                ..
+            } => Err(QualificationV2BatchSampleFailure::TypedOutcomeUnknown),
+            _ => Err(QualificationV2BatchSampleFailure::UnexpectedTypedError),
+        },
+        _ => Err(QualificationV2BatchSampleFailure::MismatchedResponse),
+    }
+}
+
+async fn qualification_execute_v2_batch_sample(
+    client: PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+    requests: Vec<FencedTransitionV2Request>,
+    scheduled_at: Instant,
+) -> Result<(Duration, bool, usize, usize), QualificationV2BatchSampleFailure> {
+    assert!(
+        (1..=MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS).contains(&requests.len()),
+        "release-gate batch remains within the protocol operation bound"
+    );
+    let encoded = opc_consensus::encode_bounded(&requests).expect("bounded V2 batch encodes");
+    assert!(
+        encoded.len() <= MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
+        "V2 batch stays below its fixed consumer/consensus request cap"
+    );
+    let request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Batch {
+            requests: requests.clone(),
+        },
+    );
+    let mut not_transmitted_retries = 0usize;
+    let mut typed_read_unavailable_retries = 0usize;
+    let recovered_unknown = loop {
+        match client.execute_v2(&request).await {
+            Ok(response) => {
+                qualification_assert_v2_batch_response(&requests, response)?;
+                break false;
+            }
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }) => {
+                let _ = cause;
+                if not_transmitted_retries >= V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT {
+                    return Err(QualificationV2BatchSampleFailure::NotTransmittedRetryExhausted);
+                }
+                not_transmitted_retries += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch { request_ids }) => {
+                assert_eq!(
+                    request_ids,
+                    requests
+                        .iter()
+                        .map(FencedTransitionV2Request::request_id)
+                        .collect::<Vec<_>>(),
+                    "ambiguous V2 batch preserves every exact caller-owned ID in order"
+                );
+                typed_read_unavailable_retries +=
+                    qualification_resolve_v2_batch_outcome_unknown(&client, scope, &requests).await;
+                break true;
+            }
+            Err(error) => {
+                let _ = error;
+                return Err(QualificationV2BatchSampleFailure::UnexpectedTransportError);
+            }
+        }
+    };
+    let completed_at = Instant::now();
+    Ok((
+        completed_at.saturating_duration_since(scheduled_at),
+        recovered_unknown,
+        not_transmitted_retries,
+        typed_read_unavailable_retries,
+    ))
+}
+
+/// A confirmed status response can still report a retryable service outage.
+/// It is safe to retry because this operation only reads one caller-retained
+/// V2 receipt; all other status outcomes remain exact terminal evidence.
+fn qualification_v2_batch_status_is_retryable_unavailable(
+    response: &SessionConsumerV2Response,
+) -> bool {
+    matches!(
+        response,
+        SessionConsumerV2Response::FencedTransitionV2Status(Err(
+            SessionConsumerStoreError::Unavailable
+        )) | SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
+    )
+}
+
+#[test]
+fn v2_batch_ambiguity_status_retries_only_confirmed_unavailable() {
+    for transient in [
+        SessionConsumerV2Response::FencedTransitionV2Status(Err(
+            SessionConsumerStoreError::Unavailable,
+        )),
+        SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable),
+    ] {
+        assert!(
+            qualification_v2_batch_status_is_retryable_unavailable(&transient),
+            "a confirmed V2 status outage is safe to retry without replaying the batch"
+        );
+    }
+
+    for terminal in [
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::RequestConflict,
+        )),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Expired,
+        )),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Retired,
+        )),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::HistoryFull,
+        )),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::EpochNotActive,
+        )),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::RetentionExhausted,
+        )),
+        SessionConsumerV2Response::Rejected(SessionConsumerRejection::ScopeMismatch),
+    ] {
+        assert!(
+            !qualification_v2_batch_status_is_retryable_unavailable(&terminal),
+            "only confirmed service unavailability is retryable; exact terminal evidence remains fatal"
+        );
+    }
+}
+
+async fn qualification_resolve_v2_batch_outcome_unknown(
+    client: &PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+    requests: &[FencedTransitionV2Request],
+) -> usize {
+    let deadline = Instant::now() + V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT;
+    let mut typed_read_unavailable_retries = 0usize;
+    for transition in requests {
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "ambiguous V2 batch did not become exactly readable within the bounded recovery window"
+            );
+            match client
+                .execute_v2(&SessionConsumerV2Request::new(
+                    scope,
+                    SessionConsumerV2Operation::FencedTransitionV2Status {
+                        request: Box::new(transition.clone()),
+                    },
+                ))
+                .await
+            {
+                Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                    SessionConsumerV2FencedTransitionStatus::Recorded(result),
+                ))) if result
+                    .as_ref()
+                    .as_ref()
+                    .is_ok_and(|outcome| outcome.matches_v2_request(transition)) =>
+                {
+                    break;
+                }
+                Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                    SessionConsumerV2FencedTransitionStatus::NotFound,
+                )))
+                | Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted { .. })
+                | Err(PersistentSessionConsumerV2ExecuteError::ReadUnavailable { .. }) => {}
+                Ok(response)
+                    if qualification_v2_batch_status_is_retryable_unavailable(&response) =>
+                {
+                    typed_read_unavailable_retries += 1;
+                }
+                Ok(response) => {
+                    panic!(
+                        "ambiguous V2 batch status returned a nonmatching terminal: {response:?}"
+                    )
+                }
+                Err(error) => panic!("V2 status read returned an effectful error: {error:?}"),
+            }
+        }
+    }
+    typed_read_unavailable_retries
+}
+
+async fn qualification_execute_v2_status_sample(
+    client: PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+    transition: FencedTransitionV2Request,
+    scheduled_at: Instant,
+) -> Duration {
+    let response = client
+        .execute_v2(&SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2Status {
+                request: Box::new(transition.clone()),
+            },
+        ))
+        .await
+        .expect("warm V2 status read has a typed response");
+    let completed_at = Instant::now();
+    assert!(matches!(
+        response,
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(result)
+        )) if result.as_ref().as_ref().is_ok_and(|outcome| outcome.matches_v2_request(&transition))
+    ));
+    completed_at.saturating_duration_since(scheduled_at)
+}
+
+fn qualification_persistent_v2_client(
+    endpoints: Arc<Mutex<Vec<SocketAddr>>>,
+    node_index: usize,
+    voter_authority: SessionConsumerVoterAuthority,
+    identity: IdentityState,
+    pool_config: PersistentSessionConsumerConfig,
+    operation_timeout: Option<Duration>,
+) -> (
+    watch::Sender<Option<IdentityState>>,
+    PersistentSessionConsumerClient,
+) {
+    let (identity_sender, identity_receiver) = watch::channel(Some(identity));
+    let tls = TlsConfigBuilder::new(identity_receiver)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("bounded V2 seam client mTLS configuration");
+    let initial_endpoint = endpoints
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+    let resolved_endpoints = Arc::clone(&endpoints);
+    let resolver: RemoteAddrResolver = Arc::new(move || {
+        let endpoint = resolved_endpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+        Box::pin(async move { Ok(endpoint) })
+    });
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(initial_endpoint.ip().into()),
+        voter_authority,
+        tls,
+    );
+    let stateless = match operation_timeout {
+        Some(timeout) => stateless.with_operation_timeout(timeout),
+        None => stateless,
+    };
+    (
+        identity_sender,
+        PersistentSessionConsumerClient::try_from_stateless(stateless, pool_config)
+            .expect("bounded persistent V2 seam client"),
+    )
+}
+
+async fn qualification_assert_v2_active_history(
+    client: PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+    expected_entries: usize,
+) {
+    let response = client
+        .execute_v2(&SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2HistoryState,
+        ))
+        .await
+        .expect("V2 active history response");
+    assert!(matches!(
+        response,
+        SessionConsumerV2Response::FencedTransitionV2HistoryState(Ok(state))
+            if state.active_epoch() == Some(FencedTransitionV2HistoryEpoch::new(1).expect("epoch one"))
+                && state.bound_entries() == expected_entries
+    ));
+}
+
+async fn qualification_build_v2_batches(
+    member_count: usize,
+    first_index: usize,
+    operation_count: usize,
+    batch_size: usize,
+) -> Vec<Vec<FencedTransitionV2Request>> {
+    assert!((1..=MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS).contains(&batch_size));
+    let mut batches = Vec::with_capacity(operation_count.div_ceil(batch_size));
+    let mut batch = Vec::with_capacity(batch_size);
+    for index in first_index..first_index.saturating_add(operation_count) {
+        batch.push(qualification_fenced_transition_v2_request(member_count, index).await);
+        if batch.len() == batch_size {
+            batches.push(std::mem::take(&mut batch));
+            batch = Vec::with_capacity(batch_size);
+        }
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
 }
 
 #[derive(Clone, Copy)]
@@ -9348,6 +10297,2364 @@ fn run_persistent_consumer_multiprocess_qualification(member_count: usize) {
     emit_current_persistent_consumer_head_evidence(member_count, measurements);
 }
 
+// The revision-4 lane deliberately uses its own ALPN and request envelope.
+// This is a compact real-network recovery qualification, not a synthetic
+// backend exercise: every operation crosses projected-SVID mTLS into an
+// independently running OpenRaft/SQLite voter.
+fn run_persistent_consumer_v2_multiprocess_qualification() {
+    const MEMBER_COUNT: usize = 3;
+    let mut fleet = Fleet::start(MEMBER_COUNT);
+    // The server-side authorization manifest deliberately admits the same
+    // fixed pool used by the V1 qualification. Keep this bounded and shared
+    // across voters; the V2 client itself uses only the first identity.
+    let consumer_identities = (0..12).map(stateless_consumer_identity).collect::<Vec<_>>();
+    let consumer_identity = consumer_identities[0].clone();
+    let mut endpoints = Vec::with_capacity(MEMBER_COUNT);
+    let mut scope = None;
+    for node_index in 0..MEMBER_COUNT {
+        let (endpoint, node_scope) =
+            fleet.start_stateless_consumer(node_index, consumer_identities.clone());
+        if let Some(expected) = scope {
+            assert_eq!(
+                node_scope, expected,
+                "V2 consumer scope differs between voters"
+            );
+        } else {
+            scope = Some(node_scope);
+        }
+        endpoints.push(endpoint);
+    }
+    let scope = scope.expect("one V2 consumer scope per qualification fleet");
+    let voter_authorities = fleet.stateless_consumer_voter_authorities();
+    assert!(voter_authorities
+        .iter()
+        .all(|authority| authority.scope() == scope));
+    let endpoints = Arc::new(Mutex::new(endpoints));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("V2 consumer qualification runtime");
+    let consumer_identity_state = fleet.pki.consumer_identity_state(&consumer_identity);
+    let client_for = |node_index: usize, operation_timeout: Option<Duration>| {
+        let (_identity_source, identity_receiver) =
+            watch::channel(Some(consumer_identity_state.clone()));
+        let tls = TlsConfigBuilder::new(identity_receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .expect("V2 consumer client mTLS configuration");
+        let initial_endpoint = endpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+        let resolved_endpoints = Arc::clone(&endpoints);
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            let endpoint = resolved_endpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+            Box::pin(async move { Ok(endpoint) })
+        });
+        let stateless = StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            rustls_pki_types::ServerName::IpAddress(initial_endpoint.ip().into()),
+            voter_authorities[node_index].clone(),
+            tls,
+        );
+        let stateless = match operation_timeout {
+            Some(timeout) => stateless.with_operation_timeout(timeout),
+            None => stateless,
+        };
+        PersistentSessionConsumerClient::try_from_stateless(
+            stateless,
+            PersistentSessionConsumerConfig::default(),
+        )
+        .expect("fixed persistent V2 consumer configuration")
+    };
+    let client = client_for(0, None);
+    runtime
+        .block_on(client.prewarm_v2())
+        .expect("prewarm fixed V2 pool");
+    let v2_before = client.v2_diagnostics();
+    assert_eq!(
+        v2_before.setup_successes, 4,
+        "V2 prewarm opens four fixed lanes"
+    );
+    assert_eq!(
+        v2_before.idle, 4,
+        "V2 prewarm retains four fixed idle lanes"
+    );
+    assert_eq!(
+        runtime
+            .block_on(client.execute_v2(&SessionConsumerV2Request::new(
+                scope,
+                SessionConsumerV2Operation::FencedTransitionV2Capability,
+            )))
+            .expect("V2 capability response"),
+        SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+            FencedTransitionV2Capability::V2
+        )),
+        "the real V2 ALPN lane must admit precisely the generic V2 contract"
+    );
+
+    let first = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 0));
+    let first_request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2 {
+            request: Box::new(first.clone()),
+        },
+    );
+    let first_outcome = match runtime
+        .block_on(client.execute_v2(&first_request))
+        .expect("first V2 transition response")
+    {
+        SessionConsumerV2Response::FencedTransitionV2(Ok(outcome)) => {
+            assert!(outcome.matches_v2_request(&first));
+            outcome
+        }
+        response => panic!("first V2 transition must return its typed outcome: {response:?}"),
+    };
+    assert_eq!(
+        runtime
+            .block_on(client.execute_v2(&first_request))
+            .expect("exact V2 replay response"),
+        SessionConsumerV2Response::FencedTransitionV2(Ok(first_outcome.clone())),
+        "the full self-authenticating V2 ID replays its exact durable outcome"
+    );
+    let first_status = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Status {
+            request: Box::new(first.clone()),
+        },
+    );
+    assert_eq!(
+        runtime
+            .block_on(client.execute_v2(&first_status))
+            .expect("V2 status response"),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Ok(first_outcome.clone())))
+        )),
+        "status returns the same exact V2 receipt"
+    );
+
+    // A structural body substitution retains the original complete ID in
+    // both envelope locations. It must be a typed conflict, not a second
+    // transition or malformed transport frame.
+    let altered = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 1));
+    let altered_request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2 {
+            request: Box::new(altered),
+        },
+    );
+    let original_id = serde_json::to_value(first_request.request_id()).expect("V2 ID encodes");
+    let mut conflicted_value = serde_json::to_value(altered_request).expect("V2 envelope encodes");
+    let serde_json::Value::Object(fields) = &mut conflicted_value else {
+        panic!("V2 envelope is an object");
+    };
+    fields.insert("request_id".to_owned(), original_id.clone());
+    fields
+        .get_mut("operation")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|operation| operation.get_mut("request"))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("V2 request body")
+        .insert("request_id".to_owned(), original_id);
+    let conflicted: SessionConsumerV2Request =
+        serde_json::from_value(conflicted_value).expect("structural V2 conflict decodes");
+    assert_eq!(
+        runtime
+            .block_on(client.execute_v2(&conflicted))
+            .expect("V2 conflict response"),
+        SessionConsumerV2Response::FencedTransitionV2(Err(
+            SessionConsumerV2FencedTransitionError::RequestConflict
+        ))
+    );
+    let v2_pre_fault = client.v2_diagnostics();
+    assert_eq!(
+        v2_pre_fault.reconnects, 0,
+        "the steady pre-fault V2 pool does not discard an authenticated lane: {v2_pre_fault:?}"
+    );
+
+    let all_nodes = (0..MEMBER_COUNT).collect::<Vec<_>>();
+    let before_fault = fleet.readiness_reports(&all_nodes);
+    let old_leader_id = before_fault
+        .iter()
+        .find_map(|report| report.leader_id)
+        .expect("V2 qualification leader");
+    let old_term = before_fault[0].term;
+    let leader_node_index = before_fault
+        .iter()
+        .find_map(|report| (report.node_id == old_leader_id).then_some(report.node_index))
+        .expect("V2 qualification leader node");
+    let (leader_address, leader_process_id) = fleet.kill_node_unclean(leader_node_index);
+    let survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|node_index| *node_index != leader_node_index)
+        .collect::<Vec<_>>();
+    let recovery_deadline = Instant::now() + STATELESS_CONSUMER_LEADER_RECOVERY_TIMEOUT;
+    let replacement = loop {
+        let reports = fleet.readiness_reports(&survivors);
+        if let Some(report) = reports.iter().find(|report| {
+            report.ready
+                && report
+                    .leader_id
+                    .is_some_and(|leader| leader != old_leader_id)
+                && report.term > old_term
+                && report.node_id == report.leader_id.expect("leader is present")
+        }) {
+            break report.node_index;
+        }
+        assert!(
+            Instant::now() < recovery_deadline,
+            "V2 consumer quorum did not elect a replacement leader"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let replacement_client = client_for(replacement, None);
+    assert_eq!(
+        runtime
+            .block_on(replacement_client.execute_v2(&first_status))
+            .expect("V2 status after leader loss"),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Ok(first_outcome.clone())))
+        )),
+        "a re-elected leader returns the original V2 receipt"
+    );
+
+    fleet.spawn_node_at_manifest_address(leader_node_index, leader_address, leader_process_id);
+    let restart_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    while !fleet
+        .readiness_reports(&all_nodes)
+        .iter()
+        .all(|report| report.ready)
+    {
+        assert!(
+            Instant::now() < restart_deadline,
+            "restarted V2 leader did not regain readiness"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (restarted_leader_endpoint, _) =
+        fleet.start_stateless_consumer(leader_node_index, consumer_identities.clone());
+    endpoints
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[leader_node_index] =
+        restarted_leader_endpoint;
+
+    let voter_loss_node = all_nodes
+        .iter()
+        .copied()
+        .find(|node_index| *node_index != replacement)
+        .expect("V2 nonleader voter");
+    let (voter_address, voter_process_id) = fleet.kill_node_unclean(voter_loss_node);
+    let voter_survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|node_index| *node_index != voter_loss_node)
+        .collect::<Vec<_>>();
+    let voter_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    while !fleet
+        .readiness_reports(&voter_survivors)
+        .iter()
+        .all(|report| report.ready && report.required_quorum == fleet.required_quorum())
+    {
+        assert!(
+            Instant::now() < voter_deadline,
+            "V2 quorum did not survive voter loss"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let delayed_client = client_for(replacement, Some(DELAYED_CONSUMER_CLIENT_DEADLINE));
+    runtime
+        .block_on(delayed_client.prewarm_v2())
+        .expect("prewarm the bounded delayed-response V2 client");
+    fleet.arm_stateless_consumer_delayed_response(replacement);
+    let ambiguous = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 2));
+    let ambiguous_execute = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2 {
+            request: Box::new(ambiguous.clone()),
+        },
+    );
+    assert_eq!(
+        runtime
+            .block_on(delayed_client.execute_v2(&ambiguous_execute))
+            .expect_err("post-commit V2 response-loss must be ambiguous"),
+        PersistentSessionConsumerV2ExecuteError::OutcomeUnknown {
+            request_id: ambiguous.request_id(),
+        },
+        "the post-commit response-loss seam returns the exact caller-retained V2 ID"
+    );
+    drop(delayed_client);
+    let ambiguous_status = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Status {
+            request: Box::new(ambiguous.clone()),
+        },
+    );
+    assert!(matches!(
+        runtime
+            .block_on(replacement_client.execute_v2(&ambiguous_status))
+            .expect("ambiguous V2 status readback"),
+        SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(result)
+        )) if result.as_ref().as_ref().is_ok_and(|outcome| outcome.matches_v2_request(&ambiguous))
+    ));
+
+    let successor = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 3));
+    assert!(matches!(
+        runtime
+            .block_on(replacement_client.execute_v2(&SessionConsumerV2Request::new(
+                scope,
+                SessionConsumerV2Operation::FencedTransitionV2 {
+                    request: Box::new(successor.clone()),
+                },
+            )))
+            .expect("fresh V2 successor response"),
+        SessionConsumerV2Response::FencedTransitionV2(Ok(outcome)) if outcome.matches_v2_request(&successor)
+    ));
+
+    fleet.spawn_node_at_manifest_address(voter_loss_node, voter_address, voter_process_id);
+    let voter_restart_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    while !fleet
+        .readiness_reports(&all_nodes)
+        .iter()
+        .all(|report| report.ready)
+    {
+        assert!(
+            Instant::now() < voter_restart_deadline,
+            "restarted V2 voter did not regain readiness"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (restarted_voter_endpoint, _) =
+        fleet.start_stateless_consumer(voter_loss_node, consumer_identities);
+    endpoints
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[voter_loss_node] =
+        restarted_voter_endpoint;
+    let v2_after = client.v2_diagnostics();
+    assert!(
+        v2_after.reused >= 4,
+        "steady V2 calls reuse fixed authenticated lanes without a reconnect storm: {v2_after:?}"
+    );
+    assert!(
+        v2_after.reconnects <= 4,
+        "endpoint loss or bounded lifecycle expiry discards at most the fixed four-lane pool once: {v2_after:?}"
+    );
+    runtime
+        .block_on(client.prewarm_v2())
+        .expect("re-establish the exact fixed V2 width after endpoint recovery");
+    let v2_reestablished = client.v2_diagnostics();
+    let v2_readiness = runtime.block_on(client.v2_readiness());
+    assert!(v2_readiness.ready, "re-established V2 pool is ready");
+    assert_eq!(v2_readiness.configured_request_connections, 4);
+    assert_eq!(v2_readiness.ready_request_connections, 4);
+    assert_eq!(v2_reestablished.active, 4);
+    assert_eq!(v2_reestablished.idle, 4);
+    assert!(
+        v2_reestablished.setup_successes <= 8,
+        "one recovered fixed pool cannot create an unbounded setup storm: {v2_reestablished:?}"
+    );
+    runtime.block_on(async {
+        client.shutdown().await;
+        replacement_client.shutdown().await;
+    });
+    fleet.shutdown();
+}
+
+// This ignored gate is intentionally a same-host, three-child-process
+// qualification. It exercises the production persistent V2 pool over TCP,
+// projected-SVID mTLS, exact SPIFFE peer verification, V2 ALPN, and Hello;
+// it is not a cross-host production-capacity claim.
+fn run_persistent_consumer_v2_batch_release_gate() {
+    const MEMBER_COUNT: usize = 3;
+    assert_v2_batch_release_profile();
+    let observed_profile = env!("OPC_SESSION_TESTKIT_CARGO_PROFILE_FAMILY");
+    let observed_opt_level = env!("OPC_SESSION_TESTKIT_CARGO_OPT_LEVEL");
+    assert_eq!(V2_BATCH_RELEASE_GATE_CLIENTS, 12);
+    assert_eq!(V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT, 4);
+    assert_eq!(V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY, 48);
+    assert_eq!(
+        V2_BATCH_RELEASE_GATE_CLIENTS / MEMBER_COUNT * V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+        16,
+        "each voter receives exactly its listener's fixed 16-connection envelope"
+    );
+    assert_eq!(V2_BATCH_RELEASE_GATE_PRELOAD_CREATES, 50_000);
+    assert_eq!(V2_BATCH_RELEASE_GATE_PACED_MUTATIONS, 60_000);
+    assert_eq!(V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND, 1_000);
+    assert_eq!(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES, 1_008);
+    let mut fleet = Fleet::start_with_schedule(
+        MEMBER_COUNT,
+        session_mtls_batch_release_gate_schedule_sha256(),
+    );
+    let consumer_identities = (0..V2_BATCH_RELEASE_GATE_CLIENTS)
+        .map(stateless_consumer_identity)
+        .collect::<Vec<_>>();
+    let mut endpoints = Vec::with_capacity(MEMBER_COUNT);
+    let mut scope = None;
+    for node_index in 0..MEMBER_COUNT {
+        let (endpoint, node_scope) =
+            fleet.start_stateless_consumer(node_index, consumer_identities.clone());
+        if let Some(expected) = scope {
+            assert_eq!(
+                node_scope, expected,
+                "V2 batch scope differs between voters"
+            );
+        } else {
+            scope = Some(node_scope);
+        }
+        endpoints.push(endpoint);
+    }
+    let scope = scope.expect("three V2 batch consumer scopes");
+    let voter_authorities = fleet.stateless_consumer_voter_authorities();
+    assert!(voter_authorities
+        .iter()
+        .all(|authority| authority.scope() == scope));
+    let endpoints = Arc::new(Mutex::new(endpoints));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("V2 batch release-gate runtime");
+    let pool_config = PersistentSessionConsumerConfig::try_new(
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+        V2_BATCH_RELEASE_GATE_PENDING_CALLS,
+        Duration::from_millis(250),
+        2,
+        Duration::from_millis(1_500),
+        2,
+        Duration::from_millis(25),
+        Duration::from_secs(5),
+    )
+    .expect("fixed V2 batch pool and queue configuration");
+    assert_eq!(
+        pool_config.connect_attempts(),
+        2,
+        "mTLS setup accounting is derived from the fixed two-attempt connection policy"
+    );
+    let credential_negative_pool_config = PersistentSessionConsumerConfig::try_new(
+        1,
+        0,
+        Duration::from_millis(250),
+        1,
+        Duration::from_millis(1_500),
+        1,
+        Duration::ZERO,
+        Duration::from_secs(1),
+    )
+    .expect("single-attempt credential-negative pool configuration");
+    let mut identity_senders = Vec::with_capacity(V2_BATCH_RELEASE_GATE_CLIENTS);
+    let mut clients = Vec::with_capacity(V2_BATCH_RELEASE_GATE_CLIENTS);
+    for (consumer_index, consumer_identity) in consumer_identities.iter().enumerate() {
+        let node_index = consumer_index % MEMBER_COUNT;
+        let (identity_sender, identity_receiver) =
+            watch::channel(Some(fleet.pki.consumer_identity_state(consumer_identity)));
+        let tls = TlsConfigBuilder::new(identity_receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .expect("V2 batch client mTLS configuration");
+        let initial_endpoint = endpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+        let resolved_endpoints = Arc::clone(&endpoints);
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            let endpoint = resolved_endpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[node_index];
+            Box::pin(async move { Ok(endpoint) })
+        });
+        let stateless = StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            rustls_pki_types::ServerName::IpAddress(initial_endpoint.ip().into()),
+            voter_authorities[node_index].clone(),
+            tls,
+        );
+        identity_senders.push(identity_sender);
+        clients.push(
+            PersistentSessionConsumerClient::try_from_stateless(stateless, pool_config)
+                .expect("fixed persistent V2 batch client"),
+        );
+    }
+    assert_eq!(clients.len(), V2_BATCH_RELEASE_GATE_CLIENTS);
+    runtime.block_on(async {
+        let readiness = futures_util::future::join_all(clients.iter().map(|client| async {
+            client.prewarm_v2().await.expect("prewarm fixed V2 lanes");
+            client.v2_readiness().await
+        }))
+        .await;
+        assert!(readiness.iter().all(|ready| {
+            ready.ready
+                && ready.configured_request_connections == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+                && ready.ready_request_connections == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+        }));
+    });
+    // Snapshot immediately after the exact 48-lane initial prewarm. Later
+    // load-window accounting is relative to this stable physical baseline.
+    let initial_prewarm_diagnostics = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    let prewarmed = initial_prewarm_diagnostics.clone();
+    assert!(prewarmed.iter().all(|diagnostics| {
+        diagnostics.setup_attempts == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && diagnostics.setup_failures == 0
+            && diagnostics.setup_successes == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && diagnostics.active == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && diagnostics.idle == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+            && diagnostics.pool_wait_current == 0
+            && diagnostics.pool_wait_max == 0
+            && diagnostics.reconnects == 0
+    }));
+
+    // Establish the overlap generation on every server before the measured
+    // workload. The later replacement is the only member that receives a
+    // new-root leaf, which makes the client trust routing below observable.
+    for node_index in 0..MEMBER_COUNT {
+        fleet.transition_member(
+            node_index,
+            CredentialGeneration::Initial,
+            TrustGeneration::Overlap,
+            &format!("v2-batch-initial-overlap-node-{node_index}"),
+        );
+    }
+
+    assert_eq!(
+        runtime
+            .block_on(clients[0].execute_v2(&SessionConsumerV2Request::new(
+                scope,
+                SessionConsumerV2Operation::FencedTransitionV2Capability,
+            )))
+            .expect("V2 batch capability response"),
+        SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+            FencedTransitionV2Capability::V2
+        )),
+        "the release gate uses the V2 ALPN/Hello contract, not the V1 listener"
+    );
+
+    let first = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 0));
+    let first_response = runtime
+        .block_on(clients[0].execute_v2(&SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(first.clone()),
+            },
+        )))
+        .expect("singleton first V2 activation response");
+    assert!(matches!(
+        first_response,
+        SessionConsumerV2Response::FencedTransitionV2(Ok(outcome))
+            if outcome.matches_v2_request(&first)
+    ));
+
+    let process_ids = fleet
+        .nodes
+        .iter()
+        .map(ChildNode::process_id)
+        .collect::<Vec<_>>();
+    // The sampler observes only the three child voters. The harness process
+    // and any server queue high-water are downstream diagnostics, not
+    // acceptance evidence for this client-pool qualification.
+    let warmed_resources = process_ids
+        .iter()
+        .copied()
+        .map(read_classified_process_resources)
+        .collect::<Vec<_>>();
+    let resource_sampler = ResourceSampler::start(process_ids.clone());
+
+    let preload_batches = runtime.block_on(qualification_build_v2_batches(
+        MEMBER_COUNT,
+        1,
+        V2_BATCH_RELEASE_GATE_PRELOAD_CREATES,
+        V2_BATCH_RELEASE_GATE_PRELOAD_BATCH_SIZE,
+    ));
+    assert_eq!(
+        preload_batches.iter().map(Vec::len).sum::<usize>(),
+        V2_BATCH_RELEASE_GATE_PRELOAD_CREATES
+    );
+    let retained_preload_requests = preload_batches
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retained_preload_requests.len(),
+        V2_BATCH_RELEASE_GATE_PRELOAD_CREATES
+    );
+    let (
+        _preload_recovered_unknown,
+        _preload_not_transmitted_retries,
+        _preload_typed_read_unavailable_retries,
+    ) = runtime.block_on(async {
+        let mut recovered_unknown = 0usize;
+        let mut not_transmitted_retries = 0usize;
+        let mut typed_read_unavailable_retries = 0usize;
+        for batches in preload_batches.chunks(V2_BATCH_RELEASE_GATE_PRELOAD_CONCURRENCY) {
+            let measurements = futures_util::future::join_all(batches.iter().map(|requests| {
+                qualification_execute_v2_batch_sample(
+                    clients[0].clone(),
+                    scope,
+                    requests.clone(),
+                    Instant::now(),
+                )
+            }))
+            .await;
+            let measurements = measurements
+                .into_iter()
+                .map(|measurement| measurement.expect("preload V2 batch sample succeeds"))
+                .collect::<Vec<_>>();
+            assert_eq!(measurements.len(), batches.len());
+            recovered_unknown += measurements
+                .iter()
+                .filter(|(_, recovered, _, _)| *recovered)
+                .count();
+            not_transmitted_retries += measurements
+                .iter()
+                .map(|(_, _, retries, _)| retries)
+                .sum::<usize>();
+            typed_read_unavailable_retries += measurements
+                .iter()
+                .map(|(_, _, _, retries)| retries)
+                .sum::<usize>();
+        }
+        (
+            recovered_unknown,
+            not_transmitted_retries,
+            typed_read_unavailable_retries,
+        )
+    });
+    let mutation_batches = runtime.block_on(qualification_build_v2_batches(
+        MEMBER_COUNT,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES,
+        V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+        V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE,
+    ));
+    let mutation_batch_count = mutation_batches.len();
+    assert_eq!(
+        mutation_batches.iter().map(Vec::len).sum::<usize>(),
+        V2_BATCH_RELEASE_GATE_PACED_MUTATIONS
+    );
+
+    // Long unpaced batches deliberately keep one client hot. Restore and
+    // freeze the complete fixed-width pool immediately before latency
+    // measurement so setup work is excluded and every measured call is warm.
+    runtime.block_on(async {
+        futures_util::future::join_all(clients.iter().map(|client| async {
+            client
+                .prewarm_v2()
+                .await
+                .expect("restore fixed V2 width before measured work");
+            let ready = client.v2_readiness().await;
+            assert!(ready.ready);
+            assert_eq!(
+                ready.ready_request_connections,
+                V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+            );
+            let diagnostics = client.v2_diagnostics();
+            assert_eq!(
+                diagnostics.active, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+                "each measured V2 client retains its declared fixed lane width"
+            );
+            assert_eq!(
+                diagnostics.idle, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+                "each measured V2 client is fully idle immediately before warm work"
+            );
+        }))
+        .await;
+    });
+    // This is the required post-50k preload/restore snapshot. The preload
+    // window must not have created a per-operation transport setup.
+    let post_preload_restore_diagnostics = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    assert_no_fault_v2_setup_delta(
+        "50k preload/restore",
+        &initial_prewarm_diagnostics,
+        &post_preload_restore_diagnostics,
+    );
+    let measurement_baseline = post_preload_restore_diagnostics.clone();
+    let consensus_diagnostics_before_warm_reads = fleet.all_consensus_diagnostics();
+
+    const WARM_STATUS_REQUEST_STRIDE: usize = 53;
+    let (mut warm_read_samples, mut warm_status_request_indices) = runtime.block_on(async {
+        let mut samples = Vec::with_capacity(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES);
+        let mut request_indices = Vec::with_capacity(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES);
+        let retained_request_count = V2_BATCH_RELEASE_GATE_PRELOAD_CREATES;
+        let mut sample_index = 0usize;
+        for _ in
+            0..(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY)
+        {
+            let scheduled_at = Instant::now();
+            let mut reads = Vec::with_capacity(V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY);
+            for client in &clients {
+                for _ in 0..V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+                    let request_index = 1 + sample_index.saturating_mul(WARM_STATUS_REQUEST_STRIDE)
+                        % retained_request_count;
+                    sample_index = sample_index.saturating_add(1);
+                    request_indices.push(request_index);
+                    let retained_request = retained_preload_requests
+                        .get(request_index.saturating_sub(1))
+                        .expect("warm status index selects retained preload request")
+                        .clone();
+                    reads.push(qualification_execute_v2_status_sample(
+                        client.clone(),
+                        scope,
+                        retained_request,
+                        scheduled_at,
+                    ));
+                }
+            }
+            let wave = futures_util::future::join_all(reads).await;
+            samples.extend(wave);
+        }
+        (samples, request_indices)
+    });
+    assert_eq!(
+        warm_read_samples.len(),
+        V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES,
+        "warm-read sample collection is exact and bounded"
+    );
+    warm_status_request_indices.sort_unstable();
+    warm_status_request_indices.dedup();
+    assert_eq!(
+        warm_status_request_indices.len(),
+        V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES,
+        "warm status reads cover an exact deterministic non-hot retained-request spread"
+    );
+    let warm_status_request_min = *warm_status_request_indices
+        .first()
+        .expect("warm status request spread is nonempty");
+    let warm_status_request_max = *warm_status_request_indices
+        .last()
+        .expect("warm status request spread is nonempty");
+    let consensus_diagnostics_after_warm_reads = fleet.all_consensus_diagnostics();
+    let status_local_delta = consensus_diagnostics_after_warm_reads
+        .iter()
+        .zip(&consensus_diagnostics_before_warm_reads)
+        .map(|(after, before)| {
+            after
+                .status_local_requests
+                .saturating_sub(before.status_local_requests)
+        })
+        .sum::<u64>();
+    let status_ingress_delta = consensus_diagnostics_after_warm_reads
+        .iter()
+        .zip(&consensus_diagnostics_before_warm_reads)
+        .map(|(after, before)| {
+            after
+                .status_ingress_requests
+                .saturating_sub(before.status_ingress_requests)
+        })
+        .sum::<u64>();
+    let status_leader_delta = consensus_diagnostics_after_warm_reads
+        .iter()
+        .zip(&consensus_diagnostics_before_warm_reads)
+        .map(|(after, before)| {
+            after
+                .status_leader_cohort_requests
+                .saturating_sub(before.status_leader_cohort_requests)
+        })
+        .sum::<u64>();
+    let status_representative_delta = consensus_diagnostics_after_warm_reads
+        .iter()
+        .zip(&consensus_diagnostics_before_warm_reads)
+        .map(|(after, before)| {
+            after
+                .status_representatives
+                .saturating_sub(before.status_representatives)
+        })
+        .sum::<u64>();
+    let status_proposal_delta = consensus_diagnostics_after_warm_reads
+        .iter()
+        .zip(&consensus_diagnostics_before_warm_reads)
+        .map(|(after, before)| {
+            after
+                .status_proposals
+                .saturating_sub(before.status_proposals)
+        })
+        .sum::<u64>();
+    assert_eq!(
+        status_local_delta, V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES as u64,
+        "every recorded warm read enters exactly one bounded node-local batch",
+    );
+    let expected_voter_representatives = u64::try_from(
+        MEMBER_COUNT
+            * (V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY),
+    )
+    .expect("bounded voter representative count");
+    assert_eq!(status_ingress_delta, expected_voter_representatives);
+    assert_eq!(status_representative_delta, expected_voter_representatives);
+    assert_eq!(status_leader_delta, expected_voter_representatives);
+    assert_eq!(
+        status_proposal_delta,
+        u64::try_from(
+            V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
+        )
+        .expect("bounded status proposal count"),
+        "each 48-reader wave has exactly one consensus linearization point",
+    );
+
+    // Take a public capacity snapshot immediately before the paced phase.
+    // The scheduler below supplies the complementary caller-side bound: no
+    // client can have more than this many submitted V2 calls at once.
+    runtime.block_on(async {
+        let readiness = futures_util::future::join_all(
+            clients
+                .iter()
+                .map(PersistentSessionConsumerClient::v2_readiness),
+        )
+        .await;
+        for (client_index, ready) in readiness.iter().enumerate() {
+            assert!(
+                ready.ready
+                    && ready.configured_request_connections
+                        == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT
+                    && ready.ready_request_connections == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+                "V2 client {client_index} is fully ready immediately before paced work: {ready:?}"
+            );
+            let diagnostics = clients[client_index].v2_diagnostics();
+            assert_eq!(
+                diagnostics.active,
+                V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+                "V2 client {client_index} has its declared active lane width immediately before paced work: {diagnostics:?}"
+            );
+            assert_eq!(
+                diagnostics.idle,
+                V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+                "V2 client {client_index} has no checked-out lanes immediately before paced work: {diagnostics:?}"
+            );
+        }
+    });
+
+    let (
+        mut mutation_samples,
+        mutation_recovered_unknown,
+        mutation_not_transmitted_retries,
+        mutation_typed_read_unavailable_retries,
+        mutation_not_transmitted_retry_high_water,
+        mutation_typed_read_unavailable_retry_high_water,
+        mutation_phase_elapsed,
+        mutation_scheduled_batches_per_client,
+        mutation_completed_batches_per_client,
+        mutation_slow_lane_other_completions,
+        mutation_saturated_client_skips,
+        mutation_max_in_flight_per_client,
+        mutation_max_global_in_flight,
+    ) = runtime.block_on(async {
+        let phase_started = Instant::now();
+        let interval_nanos = 1_000_000_000_u64
+            .saturating_mul(V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE as u64)
+            / V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND as u64;
+        let mut pending = futures_util::stream::FuturesUnordered::<
+            tokio::task::JoinHandle<(
+                usize,
+                usize,
+                Result<(Duration, bool, usize, usize), QualificationV2BatchSampleFailure>,
+            )>,
+        >::new();
+        let mut samples = Vec::with_capacity(mutation_batches.len());
+        let mut recovered_unknown = 0usize;
+        let mut not_transmitted_retries = 0usize;
+        let mut typed_read_unavailable_retries = 0usize;
+        let mut not_transmitted_retry_high_water = 0usize;
+        let mut typed_read_unavailable_retry_high_water = 0usize;
+        let mut scheduled_batches_per_client = vec![0usize; clients.len()];
+        let mut completed_batches_per_client = vec![0usize; clients.len()];
+        let mut saturated_client_skips = 0usize;
+        // The first four paced admissions occupy the complete declared
+        // scheduler width of one client. That client is skipped until another
+        // fixed producer completes, proving that a slow producer cannot
+        // create global HOL or leave a capacity-hole deadlock.
+        let slow_lane_client_index = 0usize;
+        let (mut slow_lane_release_senders, mut slow_lane_release_receivers): (Vec<_>, Vec<_>) =
+            (0..V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT)
+                .map(|_| oneshot::channel::<()>())
+                .unzip();
+        let mut slow_lane_other_completions = 0usize;
+        let mut in_flight_per_client = vec![0usize; clients.len()];
+        let mut max_in_flight_per_client = vec![0usize; clients.len()];
+        let mut max_global_in_flight = 0usize;
+        for (batch_index, requests) in mutation_batches.into_iter().enumerate() {
+            let scheduled_at = phase_started
+                + Duration::from_nanos(interval_nanos.saturating_mul(batch_index as u64));
+            tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled_at)).await;
+            // Drain global capacity only. A saturated preferred client is
+            // skipped below, so one slow four-lane pool cannot induce global
+            // head-of-line blocking for other ready producers.
+            while pending.len() >= V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY {
+                use futures_util::StreamExt;
+                let (completed_batch_index, completed_client_index, result) = pending
+                    .next()
+                    .await
+                    .expect("bounded batch driver has a task")
+                    .expect("bounded batch sample task completes");
+                let (sample, recovered, retries, typed_retries) = result.unwrap_or_else(|failure| {
+                    let node_index = completed_client_index % MEMBER_COUNT;
+                    let diagnostics = fleet.all_consensus_diagnostics();
+                    panic!(
+                        "V2 batch release gate paced failure: batch_index={completed_batch_index}, client_index={completed_client_index}, node_index={node_index}, failure={failure:?}, diagnostics_by_node={diagnostics:?}"
+                    )
+                });
+                assert!(
+                    in_flight_per_client[completed_client_index] > 0,
+                    "completed V2 batch has a matching scheduler admission"
+                );
+                in_flight_per_client[completed_client_index] -= 1;
+                completed_batches_per_client[completed_client_index] += 1;
+                if completed_client_index != slow_lane_client_index
+                    && !slow_lane_release_senders.is_empty()
+                {
+                    slow_lane_other_completions += 1;
+                    for sender in slow_lane_release_senders.drain(..) {
+                        sender
+                            .send(())
+                            .expect("the bounded slow lanes remain scheduled");
+                    }
+                }
+                samples.push(sample);
+                recovered_unknown += usize::from(recovered);
+                not_transmitted_retries += retries;
+                typed_read_unavailable_retries += typed_retries;
+                not_transmitted_retry_high_water = not_transmitted_retry_high_water.max(retries);
+                typed_read_unavailable_retry_high_water =
+                    typed_read_unavailable_retry_high_water.max(typed_retries);
+            }
+            let preferred_client_index = if batch_index < V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+                slow_lane_client_index
+            } else {
+                batch_index % clients.len()
+            };
+            let client_index = select_v2_batch_scheduler_client(
+                preferred_client_index,
+                &in_flight_per_client,
+                V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+            )
+                .expect("global capacity implies one V2 producer has a free lane");
+            saturated_client_skips += usize::from(client_index != preferred_client_index);
+            scheduled_batches_per_client[client_index] += 1;
+            assert!(
+                pending.len() < V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
+                "the global V2 scheduler bound leaves capacity for one admitted call"
+            );
+            assert!(
+                in_flight_per_client[client_index] < V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+                "the per-client V2 scheduler bound leaves capacity for one admitted call"
+            );
+            in_flight_per_client[client_index] += 1;
+            max_in_flight_per_client[client_index] =
+                max_in_flight_per_client[client_index].max(in_flight_per_client[client_index]);
+            max_global_in_flight = max_global_in_flight.max(pending.len() + 1);
+            let client = clients[client_index].clone();
+            let slow_lane_wait = if batch_index < V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+                Some(
+                    slow_lane_release_receivers.remove(0),
+                )
+            } else {
+                None
+            };
+            pending.push(tokio::spawn(async move {
+                if let Some(slow_lane_wait) = slow_lane_wait {
+                    slow_lane_wait
+                        .await
+                        .expect("the bounded slow lane is released after alternate progress");
+                }
+                (
+                    batch_index,
+                    client_index,
+                    qualification_execute_v2_batch_sample(client, scope, requests, scheduled_at)
+                        .await,
+                )
+            }));
+        }
+        use futures_util::StreamExt;
+        while let Some(result) = pending.next().await {
+            let (completed_batch_index, completed_client_index, result) =
+                result.expect("bounded batch sample task completes");
+            let (sample, recovered, retries, typed_retries) = result.unwrap_or_else(|failure| {
+                let node_index = completed_client_index % MEMBER_COUNT;
+                let diagnostics = fleet.all_consensus_diagnostics();
+                panic!(
+                    "V2 batch release gate paced failure: batch_index={completed_batch_index}, client_index={completed_client_index}, node_index={node_index}, failure={failure:?}, diagnostics_by_node={diagnostics:?}"
+                )
+            });
+            assert!(
+                in_flight_per_client[completed_client_index] > 0,
+                "completed V2 batch has a matching scheduler admission"
+            );
+            in_flight_per_client[completed_client_index] -= 1;
+            completed_batches_per_client[completed_client_index] += 1;
+            if completed_client_index != slow_lane_client_index
+                && !slow_lane_release_senders.is_empty()
+            {
+                slow_lane_other_completions += 1;
+                for sender in slow_lane_release_senders.drain(..) {
+                    sender
+                        .send(())
+                        .expect("the bounded slow lanes remain scheduled");
+                }
+            }
+            samples.push(sample);
+            recovered_unknown += usize::from(recovered);
+            not_transmitted_retries += retries;
+            typed_read_unavailable_retries += typed_retries;
+            not_transmitted_retry_high_water = not_transmitted_retry_high_water.max(retries);
+            typed_read_unavailable_retry_high_water =
+                typed_read_unavailable_retry_high_water.max(typed_retries);
+        }
+        assert!(
+            in_flight_per_client.iter().all(|in_flight| *in_flight == 0),
+            "every caller-side V2 scheduler admission completes"
+        );
+        (
+            samples,
+            recovered_unknown,
+            not_transmitted_retries,
+            typed_read_unavailable_retries,
+            not_transmitted_retry_high_water,
+            typed_read_unavailable_retry_high_water,
+            phase_started.elapsed(),
+            scheduled_batches_per_client,
+            completed_batches_per_client,
+            slow_lane_other_completions,
+            saturated_client_skips,
+            max_in_flight_per_client,
+            max_global_in_flight,
+        )
+    });
+    let consensus_diagnostics_after_measured_work = fleet.all_consensus_diagnostics();
+    for (node_index, (after, before)) in consensus_diagnostics_after_measured_work
+        .iter()
+        .zip(&consensus_diagnostics_before_warm_reads)
+        .enumerate()
+    {
+        assert_eq!(
+            after.sqlite_connection_lock_deadline, before.sqlite_connection_lock_deadline,
+            "node {node_index} measured work cannot wait through a SQLite connection-lock deadline",
+        );
+        assert_eq!(
+            after.sqlite_worker_permit_deadline, before.sqlite_worker_permit_deadline,
+            "node {node_index} measured work cannot exhaust a fixed SQLite worker permit",
+        );
+        assert_eq!(
+            after.sqlite_execution_deadline, before.sqlite_execution_deadline,
+            "node {node_index} measured work cannot exceed the bounded SQLite execution deadline",
+        );
+    }
+    assert_eq!(
+        mutation_samples.len(),
+        V2_BATCH_RELEASE_GATE_PACED_MUTATIONS / V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE,
+        "all open-loop mutation batches returned exactly one typed response"
+    );
+    runtime.block_on(qualification_assert_v2_active_history(
+        clients[0].clone(),
+        scope,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+    ));
+    let paced_elapsed_nanos = u64::try_from(mutation_phase_elapsed.as_nanos())
+        .expect("paced elapsed time fits evidence nanoseconds");
+    let achieved_logical_operations_per_second_milli =
+        session_mtls_batch_release_gate_achieved_rate_milli(
+            V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+            paced_elapsed_nanos,
+        )
+        .expect("paced elapsed time is nonzero and rate fits evidence");
+    assert!(
+        achieved_logical_operations_per_second_milli
+            >= SESSION_MTLS_BATCH_RELEASE_GATE_MIN_ACHIEVED_RATE_MILLI,
+        "V2 batch release gate achieved less than 99.9% of its offered operation rate: achieved_milli={achieved_logical_operations_per_second_milli}"
+    );
+    assert!(
+        mutation_scheduled_batches_per_client
+            .iter()
+            .all(|scheduled| *scheduled > 0),
+        "saturated-client skipping retains bounded slow-lane progress for every V2 client: {mutation_scheduled_batches_per_client:?}"
+    );
+    let min_completed_batches = mutation_completed_batches_per_client
+        .iter()
+        .copied()
+        .min()
+        .expect("fixed V2 client set is nonempty");
+    assert!(
+        min_completed_batches > 0,
+        "every fixed V2 producer retains one bounded slow-lane completion: {mutation_completed_batches_per_client:?}"
+    );
+    assert!(
+        mutation_saturated_client_skips > 0 && mutation_slow_lane_other_completions > 0,
+        "one bounded slow client is skipped while another fixed client completes, avoiding global HOL: skips={mutation_saturated_client_skips}, other_completions={mutation_slow_lane_other_completions}"
+    );
+    assert!(
+        mutation_max_in_flight_per_client
+            .iter()
+            .all(|max_in_flight| *max_in_flight <= V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT),
+        "each V2 client remains at or below its four declared active calls: {mutation_max_in_flight_per_client:?}"
+    );
+    assert!(
+        mutation_max_global_in_flight <= V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
+        "the V2 scheduler remains at or below its 48-call global bound: max={mutation_max_global_in_flight}"
+    );
+    assert!(
+        mutation_not_transmitted_retry_high_water
+            <= V2_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_LIMIT,
+        "no V2 call exceeds its fixed not-transmitted retry bound"
+    );
+    // The raw samples include scheduled-submission delay and bounded pool
+    // queue dwell through receipt validation; no percentile histogram drops
+    // or compresses individual observations.
+    let warm_p99 = qualification_v2_batch_percentile(&mut warm_read_samples, 99, 100);
+    let warm_p999 = qualification_v2_batch_percentile(&mut warm_read_samples, 999, 1_000);
+    let mutation_p99 = qualification_v2_batch_percentile(&mut mutation_samples, 99, 100);
+    let mutation_p999 = qualification_v2_batch_percentile(&mut mutation_samples, 999, 1_000);
+    assert!(warm_p99 <= V2_BATCH_RELEASE_GATE_P99);
+    assert!(warm_p999 <= V2_BATCH_RELEASE_GATE_P999);
+    assert!(mutation_p99 <= V2_BATCH_RELEASE_GATE_P99);
+    assert!(mutation_p999 <= V2_BATCH_RELEASE_GATE_P999);
+    let warm_read_p99_millis =
+        u64::try_from(warm_p99.as_millis()).expect("warm p99 fits evidence milliseconds");
+    let warm_read_p999_millis =
+        u64::try_from(warm_p999.as_millis()).expect("warm p99.9 fits evidence milliseconds");
+    let mutation_p99_millis =
+        u64::try_from(mutation_p99.as_millis()).expect("mutation p99 fits evidence milliseconds");
+    let mutation_p999_millis = u64::try_from(mutation_p999.as_millis())
+        .expect("mutation p99.9 fits evidence milliseconds");
+    assert!(warm_read_p99_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS);
+    assert!(warm_read_p999_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS);
+    assert!(mutation_p99_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS);
+    assert!(mutation_p999_millis <= SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS);
+
+    // Snapshot after the exact 60k paced mutations plus 1,008 distributed
+    // warm reads, before any fault or credential seam is introduced.
+    let post_measured_load_diagnostics = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    assert_no_fault_v2_setup_delta(
+        "60k paced mutations plus 1008 warm reads",
+        &post_preload_restore_diagnostics,
+        &post_measured_load_diagnostics,
+    );
+    let measured_diagnostics = post_measured_load_diagnostics;
+    let configured_connections =
+        (V2_BATCH_RELEASE_GATE_CLIENTS * V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT) as u64;
+    assert_eq!(
+        measured_diagnostics.iter().map(|diagnostics| diagnostics.active).sum::<u64>(),
+        configured_connections,
+        "authenticated V2 connection cardinality is fixed independently of operations or subscribers"
+    );
+    assert_eq!(
+        measured_diagnostics
+            .iter()
+            .map(|diagnostics| diagnostics.idle)
+            .sum::<u64>(),
+        configured_connections,
+        "every fixed V2 lane returns idle after measured work"
+    );
+    let recovered_lanes =
+        u64::try_from(mutation_recovered_unknown.saturating_add(mutation_not_transmitted_retries))
+            .expect("bounded measured recovery count fits u64");
+    let setup_delta = measured_diagnostics
+        .iter()
+        .zip(&measurement_baseline)
+        .map(|(after, before)| after.setup_successes.saturating_sub(before.setup_successes))
+        .sum::<u64>();
+    let reconnect_delta = measured_diagnostics
+        .iter()
+        .zip(&measurement_baseline)
+        .map(|(after, before)| after.reconnects.saturating_sub(before.reconnects))
+        .sum::<u64>();
+    let reused_delta = measured_diagnostics
+        .iter()
+        .zip(&measurement_baseline)
+        .map(|(after, before)| after.reused.saturating_sub(before.reused))
+        .sum::<u64>();
+    assert!(
+        setup_delta <= recovered_lanes,
+        "only an exact typed safe/ambiguous boundary may re-establish a lane during measured work"
+    );
+    assert!(
+        reconnect_delta <= recovered_lanes,
+        "typed safe/ambiguous recovery cannot create a reconnect storm"
+    );
+    assert!(
+        reused_delta
+            >= u64::try_from(
+                mutation_batch_count.saturating_add(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES),
+            )
+            .expect("bounded call count fits u64"),
+        "typed measured work reuses the prewarmed V2 pools"
+    );
+    assert!(measured_diagnostics.iter().all(|diagnostics| {
+        diagnostics.setup_attempts == diagnostics.setup_successes + diagnostics.setup_failures
+            && diagnostics.pool_wait_current == 0
+            && diagnostics.pool_wait_max <= V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64
+    }));
+
+    let all_nodes = (0..MEMBER_COUNT).collect::<Vec<_>>();
+    runtime.block_on(qualification_assert_v2_active_history(
+        clients[0].clone(),
+        scope,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+    ));
+    let reports_before_loss = fleet.readiness_reports(&all_nodes);
+    let old_leader_id = reports_before_loss
+        .iter()
+        .find_map(|report| report.leader_id)
+        .expect("release-gate leader");
+    let old_term = reports_before_loss[0].term;
+    let leader_node_index = reports_before_loss
+        .iter()
+        .find_map(|report| (report.node_id == old_leader_id).then_some(report.node_index))
+        .expect("leader endpoint index");
+    let killed_endpoint_client_index = (0..clients.len())
+        .find(|client_index| client_index % MEMBER_COUNT == leader_node_index)
+        .expect("one original client is pinned to the killed endpoint");
+    let killed_endpoint_before = clients[killed_endpoint_client_index].v2_diagnostics();
+    resource_sampler.mark_offline(leader_node_index);
+    let (leader_address, leader_process_id) = fleet.kill_node_unclean(leader_node_index);
+    let survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|node_index| *node_index != leader_node_index)
+        .collect::<Vec<_>>();
+    let recovery_deadline = Instant::now() + STATELESS_CONSUMER_LEADER_RECOVERY_TIMEOUT;
+    let replacement = loop {
+        let reports = fleet.readiness_reports(&survivors);
+        if let Some(report) = reports.iter().find(|report| {
+            report.ready
+                && report
+                    .leader_id
+                    .is_some_and(|leader| leader != old_leader_id)
+                && report.term > old_term
+        }) {
+            break report.node_index;
+        }
+        assert!(
+            Instant::now() < recovery_deadline,
+            "release-gate quorum did not elect a replacement leader"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let status_after_loss = runtime.block_on(qualification_execute_v2_status_sample(
+        clients
+            .iter()
+            .enumerate()
+            .find_map(|(index, client)| (index % MEMBER_COUNT == replacement).then_some(client))
+            .expect("client routed to replacement endpoint")
+            .clone(),
+        scope,
+        first.clone(),
+        Instant::now(),
+    ));
+    assert!(status_after_loss <= V2_BATCH_RELEASE_GATE_P999);
+    fleet.spawn_node_at_manifest_address(leader_node_index, leader_address, leader_process_id);
+    let restarted_process_id = fleet.nodes[leader_node_index].process_id();
+    assert_ne!(
+        restarted_process_id, leader_process_id,
+        "restarted logical voter must install a distinct child PID"
+    );
+    resource_sampler.install_restarted_process(leader_node_index, restarted_process_id);
+    let restart_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+    while !fleet
+        .readiness_reports(&all_nodes)
+        .iter()
+        .all(|report| report.ready)
+    {
+        assert!(
+            Instant::now() < restart_deadline,
+            "restarted release-gate leader did not regain readiness"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (restarted_endpoint, _) =
+        fleet.start_stateless_consumer(leader_node_index, consumer_identities.clone());
+    endpoints
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)[leader_node_index] = restarted_endpoint;
+    runtime.block_on(qualification_execute_v2_status_sample(
+        clients[killed_endpoint_client_index].clone(),
+        scope,
+        first.clone(),
+        Instant::now(),
+    ));
+    let killed_endpoint_after = clients[killed_endpoint_client_index].v2_diagnostics();
+    assert_eq!(
+        killed_endpoint_after.active, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        "the client pinned to the killed endpoint restores all four active lanes"
+    );
+    assert_eq!(
+        killed_endpoint_after.idle, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        "the client pinned to the killed endpoint restores all four idle lanes"
+    );
+    let killed_endpoint_reconnect_delta = killed_endpoint_after
+        .reconnects
+        .saturating_sub(killed_endpoint_before.reconnects);
+    assert!(
+        (1..=V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64)
+            .contains(&killed_endpoint_reconnect_delta),
+        "the client pinned to the killed endpoint reconnects each lost lane at most once"
+    );
+    runtime.block_on(qualification_assert_v2_active_history(
+        clients[0].clone(),
+        scope,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+    ));
+
+    // The replacement alone receives a new-root leaf while every member has
+    // already published old+new trust. Exactly the four clients pinned to
+    // that member move to new-root-only trust; the other eight stay
+    // old-root-only and continue to use their old-root server leaves.
+    fleet.transition_member(
+        replacement,
+        CredentialGeneration::NewRoot,
+        TrustGeneration::Overlap,
+        "v2-batch-replacement-new-root-overlap",
+    );
+    let new_only_client_indices = (0..clients.len())
+        .filter(|client_index| client_index % MEMBER_COUNT == replacement)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        new_only_client_indices.len(),
+        V2_BATCH_RELEASE_GATE_CLIENTS / MEMBER_COUNT,
+        "exactly four fixed V2 clients are routed to the replacement member"
+    );
+    let rotation_before = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    for (client_index, ((sender, identity), client)) in identity_senders
+        .iter()
+        .zip(&consumer_identities)
+        .zip(&clients)
+        .enumerate()
+    {
+        let trust_generation = if client_index % MEMBER_COUNT == replacement {
+            TrustGeneration::NewOnly
+        } else {
+            TrustGeneration::OldOnly
+        };
+        sender
+            .send(Some(fleet.pki.consumer_identity_state_with_trust(
+                identity,
+                trust_generation,
+            )))
+            .expect("live V2 client identity source remains subscribed");
+        client
+            .request_reauthentication()
+            .expect("request fixed V2 pool credential drain");
+    }
+    let refreshed_status_samples = runtime.block_on(async {
+        futures_util::future::join_all(clients.iter().map(|client| async {
+            client
+                .prewarm_v2()
+                .await
+                .expect("re-establish fixed V2 pool after SVID rotation");
+            qualification_execute_v2_status_sample(
+                client.clone(),
+                scope,
+                first.clone(),
+                Instant::now(),
+            )
+            .await
+        }))
+        .await
+    });
+    assert_eq!(
+        refreshed_status_samples.len(),
+        V2_BATCH_RELEASE_GATE_CLIENTS,
+        "every original fixed V2 client completed an exact post-rotation status request"
+    );
+    assert_eq!(
+        new_only_client_indices.len(),
+        V2_BATCH_RELEASE_GATE_CLIENTS / MEMBER_COUNT,
+        "the exact NewOnly status validation is server-observed for each replacement-routed client"
+    );
+    let rotation_refreshed = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    for client_index in &new_only_client_indices {
+        let before = rotation_before[*client_index];
+        let after = rotation_refreshed[*client_index];
+        assert!(
+            after.setup_successes
+                >= before
+                    .setup_successes
+                    .saturating_add(V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64),
+            "each replacement-routed new-only client must authenticate four fresh new-root credential lanes"
+        );
+        assert_eq!(after.active, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64);
+        assert_eq!(after.idle, V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64);
+    }
+
+    // Release exactly one original replacement-routed four-lane pool. The
+    // replacement listener therefore has 12 admitted original lanes and four
+    // explicitly bounded seam slots; neither negative nor delayed work can
+    // be mistaken for a capacity rejection or raise the fleet above 48.
+    let seam_client_index = *new_only_client_indices
+        .first()
+        .expect("one replacement-routed original V2 client");
+    let released_original_before_shutdown = clients[seam_client_index].v2_diagnostics();
+    runtime.block_on(clients[seam_client_index].shutdown());
+    let original_lanes_after_release = clients
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != seam_client_index)
+        .filter(|(index, _)| index % MEMBER_COUNT == replacement)
+        .map(|(_, client)| client.v2_diagnostics().active)
+        .sum::<u64>();
+    assert_eq!(
+        original_lanes_after_release, 12,
+        "releasing one original replacement-routed pool leaves exactly four of 16 listener slots"
+    );
+
+    // All consensus-bearing work is complete.  Make this listener genuinely
+    // new-root-only before exercising the old-credential seam: publishing it
+    // directly preserves the already-established cluster peer channels while
+    // changing the listener's independently selected trust generation.
+    let replacement_source_before = fleet.projected_status(replacement);
+    let replacement_controller_before = fleet.material_status(replacement);
+    fleet.publish_known_projected_generation(
+        replacement,
+        CredentialGeneration::NewRoot,
+        TrustGeneration::NewOnly,
+        "v2-batch-replacement-new-only-credential-negative",
+    );
+    fleet.wait_for_member_publication(
+        replacement,
+        replacement_source_before.generation,
+        replacement_controller_before.epoch,
+    );
+    let old_credential_new_only_server_rejections_before =
+        fleet.consumer_tls_peer_credential_rejections(replacement);
+    let (_old_leaf_identity_source, old_leaf_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        replacement,
+        voter_authorities[replacement].clone(),
+        fleet.pki.consumer_identity_state_with_generations(
+            &consumer_identities[seam_client_index],
+            ConsumerCredentialGeneration::OldRoot,
+            // The client retains overlap trust so it verifies the new server
+            // leaf; only its presented credential is intentionally old.
+            TrustGeneration::Overlap,
+        ),
+        credential_negative_pool_config,
+        None,
+    );
+    let old_credential_new_only_server_result = runtime.block_on(old_leaf_client.prewarm_v2());
+    assert!(
+        matches!(
+            old_credential_new_only_server_result,
+            Err(SessionConsumerClientError::Authentication | SessionConsumerClientError::Unavailable)
+        ),
+        "old credential/new-only server negative must expose only typed authentication or unavailable"
+    );
+    runtime.block_on(old_leaf_client.shutdown());
+    let old_leaf_diagnostics = old_leaf_client.v2_diagnostics();
+    assert_eq!(old_leaf_diagnostics.setup_attempts, 1);
+    assert_eq!(old_leaf_diagnostics.setup_failures, 1);
+    assert_eq!(old_leaf_diagnostics.setup_successes, 0);
+    assert_eq!(old_leaf_diagnostics.active, 0);
+    assert_eq!(old_leaf_diagnostics.idle, 0);
+    assert_eq!(old_leaf_diagnostics.pool_wait_current, 0);
+    let old_credential_new_only_server_tls_peer_credential_rejected = fleet
+        .consumer_tls_peer_credential_rejections(replacement)
+        == old_credential_new_only_server_rejections_before
+            .checked_add(1)
+            .expect("release-gate peer-credential rejection counter remains below u64 maximum");
+    assert!(
+        old_credential_new_only_server_tls_peer_credential_rejected,
+        "old credential/new-only server negative produces exactly one local TLS peer-credential rejection"
+    );
+
+    let (_delayed_identity_source, delayed_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        replacement,
+        voter_authorities[replacement].clone(),
+        fleet.pki.consumer_identity_state_with_trust(
+            &consumer_identities[seam_client_index],
+            TrustGeneration::NewOnly,
+        ),
+        pool_config,
+        None,
+    );
+    runtime
+        .block_on(delayed_client.prewarm_v2())
+        .expect("prewarm the released-slot delayed-response V2 client");
+    let delayed_prewarmed_diagnostics = delayed_client.v2_diagnostics();
+    assert_eq!(delayed_prewarmed_diagnostics.active, 4);
+    assert_eq!(
+        original_lanes_after_release + delayed_prewarmed_diagnostics.active,
+        16,
+        "the replacement listener admits no more than its fixed 16 connections"
+    );
+    let ambiguous_requests = runtime.block_on(qualification_build_v2_batches(
+        MEMBER_COUNT,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+        V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE,
+        V2_BATCH_RELEASE_GATE_MUTATION_BATCH_SIZE,
+    ));
+    let ambiguous_requests = ambiguous_requests
+        .into_iter()
+        .next()
+        .expect("one bounded ambiguity batch");
+    let pressure_request = SessionConsumerV2Request::new(
+        scope,
+        SessionConsumerV2Operation::FencedTransitionV2Batch {
+            requests: ambiguous_requests.clone(),
+        },
+    );
+    let ambiguous_request_ids = ambiguous_requests
+        .iter()
+        .map(FencedTransitionV2Request::request_id)
+        .collect::<Vec<_>>();
+    // Four delayed in-flight calls occupy the exact fixed request-lane
+    // width. The next 64 calls then occupy the fixed caller queue, and the
+    // 69th admission must fail immediately with typed backpressure. These
+    // are logical callers only: the prewarmed four-lane pool opens no extra
+    // physical connections and server queue depth remains unmeasured.
+    assert_eq!(
+        V2_BATCH_RELEASE_GATE_OVER_CAPACITY_CALLS,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT + V2_BATCH_RELEASE_GATE_PENDING_CALLS + 1
+    );
+    let delayed_setup_before_pressure = delayed_client.v2_diagnostics();
+    fleet.arm_stateless_consumer_response_holds(replacement);
+    let mut pressure_holders = Vec::with_capacity(V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT);
+    for _ in 0..V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+        let client = delayed_client.clone();
+        let request = pressure_request.clone();
+        pressure_holders.push(runtime.spawn(async move { client.execute_v2(&request).await }));
+    }
+    let hold_ack_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+    let held_response_count = loop {
+        let (armed_responses, held_responses) =
+            fleet.stateless_consumer_response_hold_status(replacement);
+        if armed_responses == 0 && held_responses == V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT {
+            break held_responses;
+        }
+        assert!(
+            Instant::now() < hold_ack_deadline,
+            "cross-process response-hold acknowledgement did not observe all four durable V2 executions: armed={armed_responses}, held={held_responses}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    let non_slow_client_index = (seam_client_index + 1) % clients.len();
+    runtime.block_on(qualification_execute_v2_status_sample(
+        clients[non_slow_client_index].clone(),
+        scope,
+        ambiguous_requests[0].clone(),
+        Instant::now(),
+    ));
+    let cross_client_fair_progress = 1;
+    let mut queued_pressure_calls = Vec::with_capacity(V2_BATCH_RELEASE_GATE_PENDING_CALLS);
+    for _ in 0..V2_BATCH_RELEASE_GATE_PENDING_CALLS {
+        let client = delayed_client.clone();
+        let request = pressure_request.clone();
+        queued_pressure_calls.push(runtime.spawn(async move { client.execute_v2(&request).await }));
+    }
+    let queued_caller_count = queued_pressure_calls.len();
+    let queue_pressure_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+    let pressure_queued = loop {
+        let diagnostics = delayed_client.v2_diagnostics();
+        if diagnostics.pool_wait_current == V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64
+            && diagnostics.pool_wait_max == V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64
+        {
+            break diagnostics;
+        }
+        assert!(
+            Instant::now() < queue_pressure_deadline,
+            "bounded four-lane hold did not fill the exact 64-caller queue: diagnostics={diagnostics:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        pressure_queued.pool_wait_current, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the deliberate over-capacity probe fills exactly the fixed per-pool caller queue"
+    );
+    assert_eq!(
+        pressure_queued.pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the deliberate over-capacity probe records the exact fixed queue high-water"
+    );
+    assert_eq!(
+        delayed_client.v2_diagnostics().pool_wait_current,
+        V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "an independent client progresses while the slow pool's four real lanes remain saturated"
+    );
+    let over_capacity_result = runtime.block_on(delayed_client.execute_v2(&pressure_request));
+    assert!(
+        matches!(
+            over_capacity_result,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Overloaded,
+            })
+        ),
+        "the 69th fixed-pool caller is rejected as typed not-transmitted overload"
+    );
+    fleet.release_stateless_consumer_response_holds(replacement);
+    let released_response_count = pressure_holders.len();
+    let recovered_queued_caller_count = queued_pressure_calls.len();
+    let pressure_results = runtime.block_on(async {
+        let holders = futures_util::future::join_all(pressure_holders).await;
+        let queued = futures_util::future::join_all(queued_pressure_calls).await;
+        holders.into_iter().chain(queued).collect::<Vec<_>>()
+    });
+    for result in pressure_results {
+        let outcome = result.expect("every held or queued V2 caller task joins without panic");
+        match outcome {
+            Ok(response) => qualification_assert_v2_batch_response(&ambiguous_requests, response)
+                .expect("every released V2 response has the exact durable result"),
+            Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch { request_ids }) => {
+                assert_eq!(request_ids, ambiguous_request_ids);
+            }
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }) => {
+                assert!(matches!(cause, SessionConsumerClientError::Overloaded));
+            }
+            Err(error) => {
+                panic!("released V2 caller returned a disallowed typed outcome: {error:?}")
+            }
+        }
+    }
+    runtime.block_on(async {
+        for request in &ambiguous_requests {
+            qualification_execute_v2_status_sample(
+                clients[non_slow_client_index].clone(),
+                scope,
+                request.clone(),
+                Instant::now(),
+            )
+            .await;
+        }
+    });
+    let durable_status_cardinality = ambiguous_requests.len();
+    let pressure_settled = delayed_client.v2_diagnostics();
+    assert_eq!(pressure_settled.pool_wait_current, 0);
+    assert_eq!(
+        pressure_settled.pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "pressure recovery retains, rather than erases, the exact queue high-water"
+    );
+    assert_eq!(
+        pressure_settled.setup_attempts, delayed_setup_before_pressure.setup_attempts,
+        "typed caller backpressure does not create a resolve, TCP, TLS, or Hello attempt"
+    );
+    runtime
+        .block_on(delayed_client.prewarm_v2())
+        .expect("the fixed delayed pool recovers after typed overload");
+    runtime.block_on(qualification_execute_v2_status_sample(
+        delayed_client.clone(),
+        scope,
+        ambiguous_requests[0].clone(),
+        Instant::now(),
+    ));
+    let pressure_recovered = delayed_client.v2_diagnostics();
+    assert_eq!(
+        pressure_recovered.setup_attempts, delayed_setup_before_pressure.setup_attempts,
+        "the recovered fixed pool retains its four prewarmed physical lanes"
+    );
+    assert_eq!(
+        pressure_recovered.active,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+    );
+    assert_eq!(
+        pressure_recovered.idle,
+        V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64
+    );
+    runtime.block_on(delayed_client.shutdown());
+    let delayed_after_ambiguity = delayed_client.v2_diagnostics();
+    assert_eq!(
+        delayed_after_ambiguity.setup_attempts,
+        delayed_after_ambiguity.setup_successes + delayed_after_ambiguity.setup_failures,
+        "the supplemental delayed probe accounts for every physical lane setup"
+    );
+    assert_eq!(delayed_after_ambiguity.active, 0);
+    assert_eq!(delayed_after_ambiguity.idle, 0);
+    assert_eq!(delayed_after_ambiguity.pool_wait_current, 0);
+    assert_eq!(
+        delayed_after_ambiguity.pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the post-shutdown delayed-pool diagnostic serializes the exact fixed overload high-water"
+    );
+    let (restored_identity_source, restored_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        replacement,
+        voter_authorities[replacement].clone(),
+        fleet.pki.consumer_identity_state_with_trust(
+            &consumer_identities[seam_client_index],
+            TrustGeneration::NewOnly,
+        ),
+        pool_config,
+        None,
+    );
+    runtime
+        .block_on(restored_client.prewarm_v2())
+        .expect("restore the released original four-lane replacement pool");
+    clients[seam_client_index] = restored_client;
+    drop(restored_identity_source);
+    // Resolve the exact retained ambiguity batch while every consensus peer
+    // still has overlap trust. The following listener-only credential probes
+    // deliberately install exclusive roots and do not carry quorum traffic.
+    runtime.block_on(async {
+        for request in ambiguous_requests {
+            qualification_execute_v2_status_sample(
+                clients[replacement].clone(),
+                scope,
+                request,
+                Instant::now(),
+            )
+            .await;
+        }
+    });
+    let old_root_server = (replacement + 1) % MEMBER_COUNT;
+    let old_root_seam_client_index = (0..clients.len())
+        .find(|client_index| client_index % MEMBER_COUNT == old_root_server)
+        .expect("old-root client pool");
+    let released_old_root_before_shutdown = clients[old_root_seam_client_index].v2_diagnostics();
+    runtime.block_on(clients[old_root_seam_client_index].shutdown());
+    let old_root_lanes_after_release = clients
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != old_root_seam_client_index)
+        .filter(|(index, _)| index % MEMBER_COUNT == old_root_server)
+        .map(|(_, client)| client.v2_diagnostics().active)
+        .sum::<u64>();
+    assert_eq!(
+        old_root_lanes_after_release, 12,
+        "releasing one old-root pool leaves exactly four of 16 listener permits for the credential negative"
+    );
+    // Likewise select OldOnly at the second listener only after all quorum
+    // activity has ended.  Its retained old-root clients continue to trust its
+    // old server leaf, while the supplemental client presents only new-root.
+    let old_root_source_before = fleet.projected_status(old_root_server);
+    let old_root_controller_before = fleet.material_status(old_root_server);
+    fleet.publish_known_projected_generation(
+        old_root_server,
+        CredentialGeneration::Initial,
+        TrustGeneration::OldOnly,
+        "v2-batch-old-root-server-credential-negative",
+    );
+    fleet.wait_for_member_publication(
+        old_root_server,
+        old_root_source_before.generation,
+        old_root_controller_before.epoch,
+    );
+    let new_credential_old_root_server_rejections_before =
+        fleet.consumer_tls_peer_credential_rejections(old_root_server);
+    let (_new_only_identity_source, new_only_old_root_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        old_root_server,
+        voter_authorities[old_root_server].clone(),
+        fleet.pki.consumer_identity_state_with_generations(
+            &consumer_identities[old_root_seam_client_index],
+            ConsumerCredentialGeneration::NewRoot,
+            TrustGeneration::Overlap,
+        ),
+        credential_negative_pool_config,
+        None,
+    );
+    let new_credential_old_root_server_result =
+        runtime.block_on(new_only_old_root_client.prewarm_v2());
+    assert!(
+        matches!(
+            new_credential_old_root_server_result,
+            Err(SessionConsumerClientError::Authentication | SessionConsumerClientError::Unavailable)
+        ),
+        "new credential/old-root server negative must expose only typed authentication or unavailable"
+    );
+    runtime.block_on(new_only_old_root_client.shutdown());
+    let new_only_old_root_diagnostics = new_only_old_root_client.v2_diagnostics();
+    assert_eq!(new_only_old_root_diagnostics.setup_attempts, 1);
+    assert_eq!(new_only_old_root_diagnostics.setup_failures, 1);
+    assert_eq!(new_only_old_root_diagnostics.setup_successes, 0);
+    assert_eq!(new_only_old_root_diagnostics.active, 0);
+    assert_eq!(new_only_old_root_diagnostics.idle, 0);
+    assert_eq!(new_only_old_root_diagnostics.pool_wait_current, 0);
+    let new_credential_old_root_server_tls_peer_credential_rejected = fleet
+        .consumer_tls_peer_credential_rejections(old_root_server)
+        == new_credential_old_root_server_rejections_before
+            .checked_add(1)
+            .expect("release-gate peer-credential rejection counter remains below u64 maximum");
+    assert!(
+        new_credential_old_root_server_tls_peer_credential_rejected,
+        "new credential/old-root server negative produces exactly one local TLS peer-credential rejection"
+    );
+    let (restored_old_root_identity_source, restored_old_root_client) =
+        qualification_persistent_v2_client(
+            Arc::clone(&endpoints),
+            old_root_server,
+            voter_authorities[old_root_server].clone(),
+            fleet.pki.consumer_identity_state_with_trust(
+                &consumer_identities[old_root_seam_client_index],
+                TrustGeneration::OldOnly,
+            ),
+            pool_config,
+            None,
+        );
+    runtime
+        .block_on(restored_old_root_client.prewarm_v2())
+        .expect("restore old-root pool");
+    clients[old_root_seam_client_index] = restored_old_root_client;
+    drop(restored_old_root_identity_source);
+
+    runtime.block_on(qualification_assert_v2_active_history(
+        clients[0].clone(),
+        scope,
+        1 + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+    ));
+
+    let restored_seam_current = clients[seam_client_index].v2_diagnostics();
+    let restored_old_root_current = clients[old_root_seam_client_index].v2_diagnostics();
+    // This post-recovery/seam snapshot folds retired generations into the two
+    // restored original pools, so neither their reconnect/setup counters nor
+    // their queue high-water marks disappear at replacement.
+    let mut after_recovery = clients
+        .iter()
+        .map(PersistentSessionConsumerClient::v2_diagnostics)
+        .collect::<Vec<_>>();
+    after_recovery[seam_client_index] = cumulative_replaced_v2_diagnostics(
+        released_original_before_shutdown,
+        restored_seam_current,
+    );
+    after_recovery[old_root_seam_client_index] = cumulative_replaced_v2_diagnostics(
+        released_old_root_before_shutdown,
+        restored_old_root_current,
+    );
+    assert_eq!(
+        after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.active)
+            .sum::<u64>(),
+        configured_connections,
+        "recovery retains the fixed authenticated V2 connection cardinality"
+    );
+    assert_eq!(
+        after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.idle)
+            .sum::<u64>(),
+        configured_connections,
+        "recovery drains back to the fixed idle V2 width"
+    );
+    for (client_index, (before, after)) in prewarmed.iter().zip(&after_recovery).enumerate() {
+        assert!(
+            after.setup_attempts >= before.setup_attempts
+                && after.setup_failures >= before.setup_failures
+                && after.setup_successes >= before.setup_successes
+                && after.reused >= before.reused
+                && after.reconnects >= before.reconnects,
+            "settled V2 counters are monotonic: client_index={client_index}"
+        );
+        assert_eq!(
+            after.setup_attempts,
+            after.setup_successes + after.setup_failures,
+            "settled V2 setup attempts are accounted exactly: client_index={client_index}"
+        );
+        assert_eq!(
+            after.pool_wait_current, 0,
+            "settled V2 pool has no queued callers: client_index={client_index}"
+        );
+        assert!(
+            after.pool_wait_max <= V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+            "V2 pool queue high-water remains within its configured bound: client_index={client_index}"
+        );
+    }
+    assert!(
+        after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.setup_successes)
+            .sum::<u64>()
+            <= configured_connections.saturating_mul(3),
+        "one endpoint loss and one SVID rotation cannot create an unbounded setup storm"
+    );
+    assert!(
+        after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.reconnects)
+            .sum::<u64>()
+            <= configured_connections,
+        "one bounded recovery cannot discard more than the fixed V2 lanes"
+    );
+    // Evidence carries cumulative client lifecycle counters, including the
+    // initial 48-lane prewarm; it does not subtract the baseline away.
+    let original_setup_attempts = after_recovery
+        .iter()
+        .map(|diagnostics| diagnostics.setup_attempts)
+        .sum::<u64>();
+    let original_setup_failures = after_recovery
+        .iter()
+        .map(|diagnostics| diagnostics.setup_failures)
+        .sum::<u64>();
+    let original_setup_successes = after_recovery
+        .iter()
+        .map(|diagnostics| diagnostics.setup_successes)
+        .sum::<u64>();
+    let supplemental_setup_attempt_delta = delayed_after_ambiguity
+        .setup_attempts
+        .saturating_add(old_leaf_diagnostics.setup_attempts)
+        .saturating_add(new_only_old_root_diagnostics.setup_attempts);
+    let supplemental_setup_failure_delta = delayed_after_ambiguity
+        .setup_failures
+        .saturating_add(old_leaf_diagnostics.setup_failures)
+        .saturating_add(new_only_old_root_diagnostics.setup_failures);
+    let supplemental_setup_success_delta = delayed_after_ambiguity
+        .setup_successes
+        .saturating_add(old_leaf_diagnostics.setup_successes)
+        .saturating_add(new_only_old_root_diagnostics.setup_successes);
+    let setup_attempts = original_setup_attempts.saturating_add(supplemental_setup_attempt_delta);
+    let setup_failures = original_setup_failures.saturating_add(supplemental_setup_failure_delta);
+    let setup_successes = original_setup_successes.saturating_add(supplemental_setup_success_delta);
+    let observed_setup_accounting = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: original_setup_attempts,
+            failures: original_setup_failures,
+        },
+        supplemental: SetupAccounting {
+            attempts: supplemental_setup_attempt_delta,
+            failures: supplemental_setup_failure_delta,
+        },
+    };
+    let setup_ceilings = v2_batch_release_gate_setup_ceilings();
+    let total_setup_accounting = observed_setup_accounting.total();
+    println!(
+        "V2_BATCH_RELEASE_GATE_MTLS_SETUP_ACCOUNTING original_and_restored_attempts={} original_and_restored_attempt_bound={} original_and_restored_failures={} original_and_restored_failure_bound={} supplemental_attempts={} supplemental_attempt_bound={} supplemental_failures={} supplemental_failure_bound={} total_attempts={} total_attempt_bound={} total_failures={} total_failure_bound={}",
+        observed_setup_accounting.original_and_restored.attempts,
+        setup_ceilings.original_and_restored.attempts,
+        observed_setup_accounting.original_and_restored.failures,
+        setup_ceilings.original_and_restored.failures,
+        observed_setup_accounting.supplemental.attempts,
+        setup_ceilings.supplemental.attempts,
+        observed_setup_accounting.supplemental.failures,
+        setup_ceilings.supplemental.failures,
+        total_setup_accounting.attempts,
+        setup_ceilings.total.attempts,
+        total_setup_accounting.failures,
+        setup_ceilings.total.failures,
+    );
+    verify_mtls_setup_accounting(observed_setup_accounting, setup_ceilings)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        setup_attempts,
+        setup_successes + setup_failures,
+        "release-gate setup deltas conserve every physical V2 lane attempt"
+    );
+    let current_process_ids = fleet
+        .nodes
+        .iter()
+        .map(ChildNode::process_id)
+        .collect::<Vec<_>>();
+    let (settled_resources, _) =
+        fleet.wait_for_resources_to_settle(&current_process_ids, &warmed_resources);
+    let resource_high_water_generations = resource_sampler.finish();
+    for (node_index, generations) in resource_high_water_generations.iter().enumerate() {
+        let expected_generations = if node_index == leader_node_index {
+            2
+        } else {
+            1
+        };
+        assert_eq!(
+            generations.len(),
+            expected_generations,
+            "resource sampler retains a bounded logical-voter generation ledger"
+        );
+        assert!(
+            generations.iter().all(|generation| generation.samples >= 1),
+            "each sampled logical-voter generation has at least one resource observation"
+        );
+    }
+    let resource_high_water =
+        merge_resource_generation_high_water(&resource_high_water_generations);
+    assert_process_resource_bounds(
+        MEMBER_COUNT,
+        &warmed_resources,
+        &resource_high_water,
+        &settled_resources,
+    );
+    let resource_observations = warmed_resources
+        .iter()
+        .zip(&resource_high_water)
+        .zip(&settled_resources)
+        .enumerate()
+        .map(|(logical_voter_index, ((warmed, high_water), settled))| {
+            opc_session_testkit::qualification::SessionMtlsBatchReleaseGateResourceObservationV1 {
+                logical_voter_index,
+                warmed_file_descriptors: warmed.file_descriptors,
+                warmed_socket_file_descriptors: warmed.socket_file_descriptors,
+                warmed_nontransport_file_descriptors: warmed.nontransport_file_descriptors,
+                warmed_threads: warmed.threads,
+                warmed_vm_rss_kib: warmed.vm_rss_kib,
+                warmed_vm_hwm_kib: warmed.vm_hwm_kib,
+                high_water_file_descriptors: high_water.file_descriptors,
+                high_water_threads: high_water.threads,
+                high_water_vm_rss_kib: high_water.vm_rss_kib,
+                high_water_vm_hwm_kib: high_water.vm_hwm_kib,
+                settled_file_descriptors: settled.file_descriptors,
+                settled_socket_file_descriptors: settled.socket_file_descriptors,
+                settled_threads: settled.threads,
+                settled_vm_rss_kib: settled.vm_rss_kib,
+                settled_vm_hwm_kib: settled.vm_hwm_kib,
+                high_water_file_descriptor_ceiling: process_file_descriptor_high_water_bound(
+                    MEMBER_COUNT,
+                    warmed.nontransport_file_descriptors,
+                ),
+                settled_file_descriptor_ceiling: warmed
+                    .file_descriptors
+                    .saturating_add(QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE),
+                settled_socket_file_descriptor_ceiling: warmed
+                    .socket_file_descriptors
+                    .saturating_add(QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE),
+                high_water_thread_ceiling: warmed
+                    .threads
+                    .saturating_add(QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE),
+                high_water_vm_hwm_ceiling_kib: warmed
+                    .vm_hwm_kib
+                    .saturating_add(QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB),
+                settled_vm_rss_ceiling_kib: warmed
+                    .vm_rss_kib
+                    .saturating_add(QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut resource_generations = resource_high_water_generations
+        .iter()
+        .enumerate()
+        .flat_map(|(logical_voter_index, generations)| {
+            generations.iter().map(move |generation| {
+                SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                    logical_voter_index,
+                    process_id: generation.process_id,
+                    samples: generation.samples,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    resource_generations
+        .sort_by_key(|generation| (generation.logical_voter_index, generation.process_id));
+    let distinct_resource_processes = resource_generations
+        .iter()
+        .map(|generation| generation.process_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        distinct_resource_processes.len(),
+        resource_generations.len(),
+        "each logical-voter generation has a distinct nonzero process ID"
+    );
+    let replacement_seam_pool_wait_max = released_original_before_shutdown
+        .pool_wait_max
+        .max(restored_seam_current.pool_wait_max);
+    let old_root_seam_pool_wait_max = released_old_root_before_shutdown
+        .pool_wait_max
+        .max(restored_old_root_current.pool_wait_max);
+    assert_eq!(
+        after_recovery[seam_client_index].pool_wait_max, replacement_seam_pool_wait_max,
+        "replacement seam preserves the retired and restored client-pool wait high-water"
+    );
+    assert_eq!(
+        after_recovery[old_root_seam_client_index].pool_wait_max, old_root_seam_pool_wait_max,
+        "old-root seam preserves the retired and restored client-pool wait high-water"
+    );
+    let pool_wait_max = after_recovery
+        .iter()
+        .map(|diagnostics| diagnostics.pool_wait_max)
+        .max()
+        .expect("fixed V2 client set is nonempty");
+    fleet
+        .candidate_evidence_inputs
+        .verify_unchanged(&fleet.config_paths)
+        .expect("candidate inputs remain unchanged before release-gate evidence output");
+    let original_pool = SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+        role: SessionMtlsBatchReleaseGatePoolRoleV1::OriginalFixedPools,
+        setup_attempts: original_setup_attempts,
+        setup_failures: original_setup_failures,
+        setup_successes: original_setup_successes,
+        pool_wait_current: 0,
+        pool_wait_max,
+        configured_lanes: configured_connections,
+        active_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.active)
+            .sum(),
+        idle_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.idle)
+            .sum(),
+    };
+    let supplemental_pools = [
+        (
+            SessionMtlsBatchReleaseGatePoolRoleV1::OldCredentialNewOnlyServer,
+            old_leaf_diagnostics,
+            1,
+        ),
+        (
+            SessionMtlsBatchReleaseGatePoolRoleV1::DelayedResponseAmbiguity,
+            delayed_after_ambiguity,
+            V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        ),
+        (
+            SessionMtlsBatchReleaseGatePoolRoleV1::NewCredentialOldRootServer,
+            new_only_old_root_diagnostics,
+            1,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(role, diagnostics, configured_lanes)| SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+            role,
+            setup_attempts: diagnostics.setup_attempts,
+            setup_failures: diagnostics.setup_failures,
+            setup_successes: diagnostics.setup_successes,
+            pool_wait_current: diagnostics.pool_wait_current,
+            pool_wait_max: diagnostics.pool_wait_max,
+            configured_lanes,
+            active_lanes: diagnostics.active,
+            idle_lanes: diagnostics.idle,
+        },
+    )
+    .collect::<Vec<_>>();
+    let all_pools = std::iter::once(&original_pool).chain(supplemental_pools.iter());
+    let aggregate_setup_attempts = all_pools.clone().map(|pool| pool.setup_attempts).sum();
+    let aggregate_setup_failures = all_pools.clone().map(|pool| pool.setup_failures).sum();
+    let aggregate_setup_successes = all_pools.clone().map(|pool| pool.setup_successes).sum();
+    let aggregate_pool_wait_max = all_pools
+        .map(|pool| pool.pool_wait_max)
+        .max()
+        .expect("all pools accounted");
+    assert_eq!(
+        aggregate_pool_wait_max, V2_BATCH_RELEASE_GATE_PENDING_CALLS as u64,
+        "the serialized aggregate wait high-water is the delayed fixed-pool overload evidence"
+    );
+    println!(
+        "V2_BATCH_RELEASE_GATE_POOL_WAIT_SCOPES original_and_restored_max={} replacement_released_and_restored_max={} old_root_released_and_restored_max={} delayed_ambiguity_max={} old_credential_negative_max={} new_credential_old_root_negative_max={} aggregate_max={}",
+        pool_wait_max,
+        replacement_seam_pool_wait_max,
+        old_root_seam_pool_wait_max,
+        delayed_after_ambiguity.pool_wait_max,
+        old_leaf_diagnostics.pool_wait_max,
+        new_only_old_root_diagnostics.pool_wait_max,
+        aggregate_pool_wait_max,
+    );
+    let typed_evidence = SessionMtlsBatchReleaseGateEvidenceV1 {
+        schema_version: "opc-session-mtls-batch-release-gate-evidence/v1".to_owned(),
+        experimental: true,
+        qualification_complete: false,
+        cargo_profile: observed_profile.to_owned(),
+        opt_level: observed_opt_level.to_owned(),
+        debug_assertions: cfg!(debug_assertions),
+        bindings: SessionMtlsBatchReleaseGateBindingsV1 {
+            evidence_schema_sha256: opc_session_testkit::qualification::session_mtls_batch_release_gate_evidence_v1_schema_sha256(),
+            configuration_sha256: fleet.candidate_evidence_inputs.configuration_sha256.clone(),
+            public_material_manifest_sha256: fleet.candidate_public_material_manifest.sha256().expect("public material manifest"),
+            workload_schedule_sha256: session_mtls_batch_release_gate_schedule_sha256(),
+            source_revision: fleet.candidate_evidence_inputs.source_revision.clone(),
+            source_worktree_sha256: fleet.candidate_evidence_inputs.source_worktree_sha256.clone(),
+            child_sha256: fleet.candidate_evidence_inputs.child_sha256.clone(),
+            harness_sha256: fleet.candidate_evidence_inputs.harness_sha256.clone(),
+        },
+        members: MEMBER_COUNT,
+        clients: V2_BATCH_RELEASE_GATE_CLIENTS,
+        lanes_per_client: V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT,
+        // This is the offered logical mutation rate, not an actor-count or
+        // attach-per-second capacity claim.
+        logical_operations_per_second: V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND,
+        warm_status_samples: V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES,
+        warm_status_request_cardinality: warm_status_request_indices.len(),
+        warm_status_request_index_min: warm_status_request_min,
+        warm_status_request_index_max: warm_status_request_max,
+        warm_status_request_stride: WARM_STATUS_REQUEST_STRIDE,
+        active_history_entries: 1
+            + V2_BATCH_RELEASE_GATE_PRELOAD_CREATES
+            + V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+        normal_configured_lanes: configured_connections,
+        normal_active_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.active)
+            .sum(),
+        normal_idle_lanes: after_recovery
+            .iter()
+            .map(|diagnostics| diagnostics.idle)
+            .sum(),
+        original_fixed_pools: original_pool,
+        supplemental_pools,
+        aggregate_setup_attempts,
+        aggregate_setup_failures,
+        aggregate_setup_successes,
+        typed_read_unavailable_retries: mutation_typed_read_unavailable_retries,
+        typed_read_unavailable_retry_high_water: mutation_typed_read_unavailable_retry_high_water,
+        aggregate_pool_wait_max,
+        resource_generations,
+        resource_observations,
+        paced_operations: V2_BATCH_RELEASE_GATE_PACED_MUTATIONS,
+        paced_elapsed_nanos,
+        achieved_logical_operations_per_second_milli,
+        mutation_batch_samples: mutation_samples.len(),
+        warm_read_p99_millis,
+        warm_read_p999_millis,
+        mutation_p99_millis,
+        mutation_p999_millis,
+        saturated_client_skips: mutation_saturated_client_skips,
+        slow_lane_completed_batches: min_completed_batches,
+        over_capacity_typed_backpressure_events: 1,
+        held_response_count,
+        queued_caller_count,
+        cross_client_fair_progress,
+        released_response_count,
+        recovered_queued_caller_count,
+        durable_status_cardinality,
+        not_transmitted_retries: mutation_not_transmitted_retries,
+        recovered_unknown: mutation_recovered_unknown,
+        // No server queue depth is sampled by this client-side harness.
+        server_queue_depth_measured: false,
+        server_queue_depth_scope: SessionMtlsBatchReleaseGateServerQueueDepthScopeV1::Downstream,
+        positive_new_credential_new_server_statuses: new_only_client_indices.len(),
+        old_credential_new_only_server_tls_peer_credential_rejected,
+        new_credential_old_root_server_tls_peer_credential_rejected,
+    };
+    typed_evidence
+        .validate()
+        .expect("typed batch evidence validates");
+    let encoded_typed_evidence =
+        serde_json::to_vec(&typed_evidence).expect("typed batch evidence encodes");
+    assert_eq!(
+        SessionMtlsBatchReleaseGateEvidenceV1::from_json(&encoded_typed_evidence)
+            .expect("typed batch evidence round-trips"),
+        typed_evidence
+    );
+    println!(
+        "V2_BATCH_RELEASE_GATE_EVIDENCE {}",
+        String::from_utf8(encoded_typed_evidence).expect("typed evidence is UTF-8 JSON")
+    );
+    runtime.block_on(async {
+        for client in &clients {
+            client.shutdown().await;
+        }
+    });
+    fleet.shutdown();
+}
+
+fn assert_batch_credential_negative_handshake(
+    server_credential: CredentialGeneration,
+    server_trust: TrustGeneration,
+    client_credential: ConsumerCredentialGeneration,
+    client_trust: TrustGeneration,
+    phase: &str,
+) {
+    const MEMBER_COUNT: usize = 3;
+    const TARGET: usize = 0;
+    let mut fleet = Fleet::start(MEMBER_COUNT);
+    let consumer_identities = (0..V2_BATCH_RELEASE_GATE_CLIENTS)
+        .map(stateless_consumer_identity)
+        .collect::<Vec<_>>();
+    let identity = consumer_identities[TARGET].clone();
+    let (endpoint, _scope) = fleet.start_stateless_consumer(TARGET, consumer_identities);
+    let voter_authority = fleet
+        .stateless_consumer_voter_authorities()
+        .into_iter()
+        .nth(TARGET)
+        .expect("qualification target voter authority");
+    let source_before = fleet.projected_status(TARGET);
+    let controller_before = fleet.material_status(TARGET);
+    fleet.publish_known_projected_generation(TARGET, server_credential, server_trust, phase);
+    fleet.wait_for_member_publication(TARGET, source_before.generation, controller_before.epoch);
+    let endpoints = Arc::new(Mutex::new(vec![endpoint; MEMBER_COUNT]));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bounded credential-negative runtime");
+    let pool_config = PersistentSessionConsumerConfig::try_new(
+        1,
+        0,
+        Duration::from_millis(250),
+        1,
+        Duration::from_millis(1_500),
+        1,
+        Duration::ZERO,
+        Duration::from_secs(1),
+    )
+    .expect("single-lane credential-negative pool");
+
+    let positive_credential = match server_trust {
+        TrustGeneration::OldOnly => ConsumerCredentialGeneration::OldRoot,
+        TrustGeneration::NewOnly => ConsumerCredentialGeneration::NewRoot,
+        TrustGeneration::Overlap => panic!("credential-negative server trust must be exclusive"),
+    };
+    let (_positive_identity_source, positive_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        TARGET,
+        voter_authority.clone(),
+        fleet.pki.consumer_identity_state_with_generations(
+            &identity,
+            positive_credential,
+            server_trust,
+        ),
+        pool_config,
+        None,
+    );
+    runtime
+        .block_on(positive_client.prewarm_v2())
+        .expect("matching credential is a positive mTLS control");
+    let positive_diagnostics = positive_client.v2_diagnostics();
+    assert_eq!(positive_diagnostics.setup_attempts, 1);
+    assert_eq!(positive_diagnostics.setup_successes, 1);
+    runtime.block_on(positive_client.shutdown());
+    assert_eq!(
+        fleet.consumer_tls_peer_credential_rejections(TARGET),
+        0,
+        "matching credential control cannot increment the peer-credential rejection counter: phase={phase}"
+    );
+    let peer_credential_rejections_before = fleet.consumer_tls_peer_credential_rejections(TARGET);
+
+    let (_negative_identity_source, negative_client) = qualification_persistent_v2_client(
+        Arc::clone(&endpoints),
+        TARGET,
+        voter_authority,
+        fleet.pki.consumer_identity_state_with_generations(
+            &identity,
+            client_credential,
+            client_trust,
+        ),
+        pool_config,
+        None,
+    );
+    let negative_result = runtime.block_on(negative_client.prewarm_v2());
+    assert!(
+        matches!(
+            negative_result,
+            Err(SessionConsumerClientError::Authentication | SessionConsumerClientError::Unavailable)
+        ),
+        "actual consumer listener mismatched credential result is typed authentication or unavailable: phase={phase}, result={negative_result:?}"
+    );
+    runtime.block_on(negative_client.shutdown());
+    let negative_diagnostics = negative_client.v2_diagnostics();
+    assert_eq!(negative_diagnostics.setup_attempts, 1);
+    assert_eq!(negative_diagnostics.setup_successes, 0);
+    assert_eq!(negative_diagnostics.setup_failures, 1);
+    assert_eq!(negative_diagnostics.active, 0);
+    assert_eq!(negative_diagnostics.idle, 0);
+    assert_eq!(negative_diagnostics.pool_wait_current, 0);
+    assert_eq!(
+        fleet.consumer_tls_peer_credential_rejections(TARGET),
+        peer_credential_rejections_before
+            .checked_add(1)
+            .expect("bounded peer-credential rejection counter remains below u64 maximum"),
+        "the mismatched credential produces exactly one local TLS peer-credential rejection: phase={phase}"
+    );
+    fleet.shutdown();
+}
+
+#[test]
+fn bounded_batch_credential_negatives_reach_consumer_listener_rejection() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_batch_credential_negative_handshake(
+        CredentialGeneration::NewRoot,
+        TrustGeneration::NewOnly,
+        ConsumerCredentialGeneration::OldRoot,
+        TrustGeneration::Overlap,
+        "batch-negative-new-only-server",
+    );
+    assert_batch_credential_negative_handshake(
+        CredentialGeneration::Initial,
+        TrustGeneration::OldOnly,
+        ConsumerCredentialGeneration::NewRoot,
+        TrustGeneration::Overlap,
+        "batch-negative-old-root-server",
+    );
+}
+
 #[test]
 fn three_process_projected_mtls_stateless_quorum_consumers() {
     let _guard = FLEET_TEST_LOCK
@@ -9370,6 +12677,29 @@ fn three_process_projected_mtls_persistent_quorum_consumers() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     run_persistent_consumer_multiprocess_qualification(3);
+}
+
+#[test]
+fn three_process_projected_mtls_persistent_v2_fenced_transition_consumers() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_persistent_consumer_v2_multiprocess_qualification();
+}
+
+#[test]
+#[ignore = "release-profile attestation sentinel; executes only the profile guard"]
+fn v2_batch_release_gate_profile_attestation_sentinel() {
+    assert_v2_batch_release_profile();
+}
+
+#[test]
+#[ignore = "manual same-host three-process V2 batch release gate (50k preload + 60k paced mutations)"]
+fn three_process_projected_mtls_persistent_v2_batch_release_gate() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_persistent_consumer_v2_batch_release_gate();
 }
 
 #[test]
@@ -10666,6 +13996,181 @@ fn persistent_connection_attempt_accounting_is_non_overlapping() {
 
     metrics.connection_attempts = 4;
     assert_eq!(connection_attempt_accounting(&metrics), None);
+}
+
+#[test]
+fn replaced_v2_pool_diagnostics_preserve_released_and_restored_counters() {
+    let prewarmed = PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: 4,
+        setup_failures: 0,
+        setup_successes: 4,
+        reused: 9,
+        reconnects: 0,
+        active: 4,
+        idle: 4,
+        pool_wait_current: 0,
+        pool_wait_max: 0,
+    };
+    let released_before_shutdown = PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: 8,
+        setup_failures: 1,
+        setup_successes: 7,
+        reused: 15,
+        reconnects: 3,
+        active: 4,
+        idle: 4,
+        pool_wait_current: 0,
+        pool_wait_max: 2,
+    };
+    let restored_current = PersistentSessionConsumerV2Diagnostics {
+        setup_attempts: 4,
+        setup_failures: 0,
+        setup_successes: 4,
+        reused: 2,
+        reconnects: 0,
+        active: 4,
+        idle: 4,
+        pool_wait_current: 0,
+        pool_wait_max: 1,
+    };
+    let combined = cumulative_replaced_v2_diagnostics(released_before_shutdown, restored_current);
+    assert_eq!(combined.setup_attempts - prewarmed.setup_attempts, 8);
+    assert_eq!(combined.setup_failures - prewarmed.setup_failures, 1);
+    assert_eq!(combined.setup_successes - prewarmed.setup_successes, 7);
+    assert_eq!(combined.reused - prewarmed.reused, 8);
+    assert_eq!(combined.reconnects - prewarmed.reconnects, 3);
+    assert_eq!(combined.active, restored_current.active);
+    assert_eq!(combined.idle, restored_current.idle);
+    assert_eq!(
+        combined.pool_wait_current,
+        restored_current.pool_wait_current
+    );
+    assert_eq!(combined.pool_wait_max, 2);
+}
+
+#[test]
+fn mtls_setup_accounting_rejects_each_attempt_and_failure_ceiling() {
+    let ceilings = v2_batch_release_gate_setup_ceilings();
+    assert_eq!(ceilings.original_and_restored.attempts, 168);
+    assert_eq!(ceilings.original_and_restored.failures, 120);
+    assert_eq!(ceilings.supplemental.attempts, 10);
+    assert_eq!(ceilings.supplemental.failures, 10);
+    assert_eq!(ceilings.total.attempts, 178);
+    assert_eq!(ceilings.total.failures, 130);
+
+    let mut original_attempts = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: ceilings.original_and_restored.attempts + 1,
+            failures: 0,
+        },
+        supplemental: SetupAccounting {
+            attempts: 0,
+            failures: 0,
+        },
+    };
+    let error = verify_mtls_setup_accounting(original_attempts, ceilings)
+        .expect_err("original attempt ceiling must reject overflow");
+    assert!(error.contains("scope=original_and_restored"));
+    assert!(error.contains("attempt ceiling"));
+
+    original_attempts.original_and_restored = SetupAccounting {
+        attempts: 0,
+        failures: ceilings.original_and_restored.failures + 1,
+    };
+    let error = verify_mtls_setup_accounting(original_attempts, ceilings)
+        .expect_err("original failure ceiling must reject overflow");
+    assert!(error.contains("scope=original_and_restored"));
+    assert!(error.contains("failure ceiling"));
+
+    let mut supplemental_attempts = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: 0,
+            failures: 0,
+        },
+        supplemental: SetupAccounting {
+            attempts: ceilings.supplemental.attempts + 1,
+            failures: 0,
+        },
+    };
+    let error = verify_mtls_setup_accounting(supplemental_attempts, ceilings)
+        .expect_err("supplemental attempt ceiling must reject overflow");
+    assert!(error.contains("scope=supplemental"));
+    assert!(error.contains("attempt ceiling"));
+
+    supplemental_attempts.supplemental = SetupAccounting {
+        attempts: 0,
+        failures: ceilings.supplemental.failures + 1,
+    };
+    let error = verify_mtls_setup_accounting(supplemental_attempts, ceilings)
+        .expect_err("supplemental failure ceiling must reject overflow");
+    assert!(error.contains("scope=supplemental"));
+    assert!(error.contains("failure ceiling"));
+
+    let total_observed = MtlsSetupAccounting {
+        original_and_restored: SetupAccounting {
+            attempts: 1,
+            failures: 1,
+        },
+        supplemental: SetupAccounting {
+            attempts: 1,
+            failures: 1,
+        },
+    };
+    let total_attempt_ceilings = MtlsSetupCeilings {
+        total: SetupAccounting {
+            attempts: 1,
+            failures: ceilings.total.failures,
+        },
+        ..ceilings
+    };
+    let error = verify_mtls_setup_accounting(total_observed, total_attempt_ceilings)
+        .expect_err("total attempt ceiling must reject overflow");
+    assert!(error.contains("scope=total"));
+    assert!(error.contains("attempt ceiling"));
+
+    let total_failure_ceilings = MtlsSetupCeilings {
+        total: SetupAccounting {
+            attempts: ceilings.total.attempts,
+            failures: 1,
+        },
+        ..ceilings
+    };
+    let error = verify_mtls_setup_accounting(total_observed, total_failure_ceilings)
+        .expect_err("total failure ceiling must reject overflow");
+    assert!(error.contains("scope=total"));
+    assert!(error.contains("failure ceiling"));
+}
+
+#[test]
+fn resource_sampler_generation_ledger_keeps_initial_offline_and_restarted_pid() {
+    let initial = ProcessResourceHighWater {
+        process_id: 41,
+        samples: 0,
+        file_descriptors: 0,
+        threads: 0,
+        vm_rss_kib: 0,
+        vm_hwm_kib: 0,
+    };
+    let snapshot = ProcessResourceSnapshot {
+        file_descriptors: 8,
+        socket_file_descriptors: 2,
+        nontransport_file_descriptors: 6,
+        threads: 3,
+        vm_rss_kib: 100,
+        vm_hwm_kib: 120,
+    };
+    let mut generations = vec![vec![initial]];
+    let mut observed_process_ids = vec![None];
+    record_resource_generation_sample(&mut generations, &mut observed_process_ids, 0, 41, snapshot);
+    // Offline is intentionally not sampled. Retaining the old observed PID
+    // makes the next distinct authoritative PID a new logical generation.
+    record_resource_generation_sample(&mut generations, &mut observed_process_ids, 0, 73, snapshot);
+    assert_eq!(generations[0].len(), 2);
+    assert_eq!(generations[0][0].process_id, 41);
+    assert_eq!(generations[0][1].process_id, 73);
+    assert!(generations[0]
+        .iter()
+        .all(|generation| generation.samples >= 1));
 }
 
 #[test]

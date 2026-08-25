@@ -1091,7 +1091,7 @@ impl RotatingConsensusFleet {
                     outcome,
                     Err(
                         SessionConsensusPeerError::Authentication
-                            | SessionConsensusPeerError::Timeout
+                            | SessionConsensusPeerError::Unavailable
                     )
                 ),
                 "new-only server trust must reject the removed old issuer before application admission: source={source}, target={target}, outcome={outcome:?}"
@@ -2799,7 +2799,7 @@ async fn both_consensus_lanes_rotate_across_real_mtls_trust_cutover() {
     assert!(
         matches!(
             old_client_outcome,
-            Err(SessionConsensusPeerError::Authentication | SessionConsensusPeerError::Timeout)
+            Err(SessionConsensusPeerError::Authentication | SessionConsensusPeerError::Unavailable)
         ),
         "new-only server trust must reject the removed old client chain: {old_client_outcome:?}"
     );

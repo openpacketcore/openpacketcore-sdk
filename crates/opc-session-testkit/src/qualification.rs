@@ -150,11 +150,16 @@ pub const SESSION_MTLS_CANDIDATE_EVIDENCE_SCHEMA_JSON: &str =
 /// completed qualification or seamless-rotation production credit.
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_SCHEMA_JSON: &str =
     include_str!("../qualification/v2/session-mtls-candidate-evidence.schema.json");
+/// Closed schema for mTLS batch release-gate evidence.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON: &str =
+    include_str!("../qualification/v1/session-mtls-batch-release-gate-evidence.schema.json");
 /// Maximum accepted size of one v2 projected-mTLS candidate evidence document.
 ///
 /// [`SessionMtlsCandidateEvidenceV2::from_json`] applies this bound before
 /// deserializing any untrusted JSON.
 pub const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES: usize = 64 * 1024;
+/// Maximum accepted size of one batch release-gate evidence document.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_MAX_BYTES: usize = 64 * 1024;
 
 /// Version of the private node configuration and control protocol.
 pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 4;
@@ -1218,6 +1223,608 @@ pub fn session_mtls_candidate_evidence_v2_schema_sha256() -> String {
         let _ = write!(&mut encoded, "{byte:02x}");
     }
     encoded
+}
+
+/// Closed schema version for the batch release-gate evidence contract.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_VERSION: &str =
+    "opc-session-mtls-batch-release-gate-evidence/v1";
+/// Fixed cumulative client setup ceiling for the 48 normal lanes: initial
+/// prewarm plus the bounded loss, rotation, and two four-lane restorations.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING: u64 = 168;
+/// Initial prewarm is successful, so only post-prewarm event attempts can fail.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING: u64 = 120;
+/// Each one-lane credential-negative probe has one fixed setup attempt.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_ATTEMPT_CEILING: u64 = 1;
+/// Each credential-negative probe must fail its single fixed setup attempt.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_FAILURE_CEILING: u64 = 1;
+/// The delayed ambiguity pool contains four lanes and at most two setup attempts per lane.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_ATTEMPT_CEILING: u64 = 8;
+/// Every delayed-pool setup attempt is independently bounded as a possible failure.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_FAILURE_CEILING: u64 = 8;
+/// Sum of every fixed per-role cumulative setup-attempt ceiling.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING: u64 = 178;
+/// Sum of every fixed per-role setup-failure ceiling.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING: u64 = 130;
+/// The fixed latency ceiling is 25 milliseconds at p99.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS: u64 = 25;
+/// The fixed latency ceiling is 100 milliseconds at p99.9.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS: u64 = 100;
+/// Exact fixed paced operation count: 5,000 twelve-operation batches.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_PACED_OPERATIONS: usize = 60_000;
+/// Exact fixed paced response sample count.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_PACED_BATCH_SAMPLES: usize = 5_000;
+/// Exact operations carried by every paced response sample.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_PACED_BATCH_OPERATIONS: usize = 12;
+/// The achieved-rate floor is at least 99.9% of the offered 1,000 ops/s.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_MIN_ACHIEVED_RATE_MILLI: u64 = 999_000;
+/// Each paced batch has the fixed 16-retry not-transmitted recovery limit.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_CEILING_PER_BATCH: usize = 16;
+
+/// Deterministic, non-truncating paced rate contract.
+///
+/// The result is the floor of `operations * 1e12 / elapsed_nanos`, expressed
+/// in milli-operations per second. Returning `None` rejects a zero elapsed
+/// interval or an unrepresentable result rather than silently rounding it.
+pub fn session_mtls_batch_release_gate_achieved_rate_milli(
+    operations: usize,
+    elapsed_nanos: u64,
+) -> Option<u64> {
+    let numerator = u128::try_from(operations)
+        .ok()?
+        .checked_mul(1_000_000_000_000)?;
+    let rate = numerator.checked_div(u128::from(elapsed_nanos))?;
+    u64::try_from(rate).ok()
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256:");
+    for byte in digest {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+const SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1: &str = concat!(
+    "opc-session-mtls-batch-release-gate/v1\n",
+    "topology=members:3,clients:12,lanes-per-client:4,listener-slots:16,wave:48\n",
+    "phase-01-initial-singleton=request-index:0,operations:1\n",
+    "phase-02-preload=first-request-index:1,operations:50000,batch-size:256,concurrency:1,tail:80\n",
+    "phase-03-warm-status=samples:1008,waves:21,wave-size:48,retained-cardinality:1008,",
+    "one-based-index:1+(sample*53%50000),index-min:1,index-max:49980\n",
+    "phase-04-paced-and-active-history-check=first-request-index:50001,operations:60000,batch-size:12,batches:5000,",
+    "logical-operations-per-second:1000,max-in-flight-per-client:4,max-in-flight-global:48\n",
+    "phase-05-leader-loss-restart-reconnect-and-active-history-check=logical-voter-generations:2/1/1\n",
+    "phase-06-credential-rotation-and-positive-controls=all-members:old-root-overlap,replacement:new-root-overlap,positive-statuses:4\n",
+    "phase-07-release-original-pool=target:replacement,lanes:4,remaining-listener-lanes:12\n",
+    "phase-08-publish-replacement-new-only-and-old-credential-negative=pool-lanes:1,client-trust:overlap\n",
+    "phase-09-four-response-hold-and-client-queue-pressure=first-request-index:110001,holders:4,queued-callers:64,typed-overload:1,cross-client-fair-progress:1\n",
+    "phase-10-release-four-holds-and-recover-exact-statuses=released-holders:4,recovered-queued-callers:64,durable-status-cardinality:12\n",
+    "phase-11-release-old-root-pool=lanes:4,remaining-listener-lanes:12\n",
+    "phase-12-publish-old-only-and-new-credential-negative=pool-lanes:1,client-trust:overlap\n",
+    "phase-13-restore-old-root-settle-and-resource-validation=normal-lanes:48,active-history-entries:110001\n"
+);
+
+/// Literal SHA-256 binding for the complete batch release-gate schedule.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256: &str =
+    "sha256:c57da080669b553520658b731c755fa397da0bd89415ec2443b0492d3edb4e03";
+
+/// Literal SHA-256 binding for the closed batch release-gate schema.
+pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_SHA256: &str =
+    "sha256:48acb2db97408811347024c3c4e6d7119fc45b00a81cf56e1704564eeb3bf527";
+
+/// SHA-256 of the fixed release-gate workload schedule.
+pub fn session_mtls_batch_release_gate_schedule_sha256() -> String {
+    assert_eq!(
+        sha256_prefixed(SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1.as_bytes()),
+        SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256,
+        "batch release-gate schedule digest literal must bind the canonical bytes"
+    );
+    SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256.to_owned()
+}
+
+/// SHA-256 of the immutable batch release-gate evidence schema bytes.
+pub fn session_mtls_batch_release_gate_evidence_v1_schema_sha256() -> String {
+    assert_eq!(
+        sha256_prefixed(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON.as_bytes()),
+        SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_SHA256,
+        "batch release-gate schema digest literal must bind the closed schema bytes"
+    );
+    SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_SHA256.to_owned()
+}
+
+/// Immutable digest bindings for one batch release-gate observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsBatchReleaseGateBindingsV1 {
+    /// Digest of the closed evidence schema.
+    pub evidence_schema_sha256: String,
+    /// Digest of the consumed qualification configuration.
+    pub configuration_sha256: String,
+    /// Digest of the public projected-material manifest.
+    pub public_material_manifest_sha256: String,
+    /// Digest of the exact fixed workload schedule.
+    pub workload_schedule_sha256: String,
+    /// Source revision from which the observation was built.
+    pub source_revision: String,
+    /// Digest of the source worktree snapshot.
+    pub source_worktree_sha256: String,
+    /// Digest of the spawned qualification child.
+    pub child_sha256: String,
+    /// Digest of the qualification harness.
+    pub harness_sha256: String,
+}
+
+/// Settled connection-pool accounting for one declared client pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+    /// Closed nonidentifying role for this capacity-accounting pool.
+    pub role: SessionMtlsBatchReleaseGatePoolRoleV1,
+    /// Every physical connection setup attempt for this pool.
+    pub setup_attempts: u64,
+    /// Failed setup attempts for this pool.
+    pub setup_failures: u64,
+    /// Successful setup attempts for this pool.
+    pub setup_successes: u64,
+    /// Queued callers after the pool has settled.
+    pub pool_wait_current: u64,
+    /// Largest observed queued-caller count for this pool.
+    pub pool_wait_max: u64,
+    /// Declared fixed logical lane count for this pool.
+    pub configured_lanes: u64,
+    /// Open lanes after the pool's evidence settlement point.
+    pub active_lanes: u64,
+    /// Reusable lanes after the pool's evidence settlement point.
+    pub idle_lanes: u64,
+}
+
+/// Closed roles for the normal and sequential supplemental pools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMtlsBatchReleaseGatePoolRoleV1 {
+    OriginalFixedPools,
+    OldCredentialNewOnlyServer,
+    DelayedResponseAmbiguity,
+    NewCredentialOldRootServer,
+}
+
+/// Scope of queue-depth evidence for this client-side qualification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMtlsBatchReleaseGateServerQueueDepthScopeV1 {
+    /// Queue depth belongs to the downstream server and is not sampled here.
+    Downstream,
+}
+
+/// One sampled operating-system process generation for a logical voter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsBatchReleaseGateResourceGenerationV1 {
+    /// Logical voter index, not a subscriber or endpoint identity.
+    pub logical_voter_index: usize,
+    /// Process ID sampled for this generation.
+    pub process_id: u32,
+    /// Number of successful resource samples for this process generation.
+    pub samples: u64,
+}
+
+/// Warmed, high-water, and settled child-voter resource observations with the
+/// fixed-policy ceilings that were applied to that voter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsBatchReleaseGateResourceObservationV1 {
+    pub logical_voter_index: usize,
+    pub warmed_file_descriptors: usize,
+    pub warmed_socket_file_descriptors: usize,
+    pub warmed_nontransport_file_descriptors: usize,
+    pub warmed_threads: usize,
+    pub warmed_vm_rss_kib: u64,
+    pub warmed_vm_hwm_kib: u64,
+    pub high_water_file_descriptors: usize,
+    pub high_water_threads: usize,
+    pub high_water_vm_rss_kib: u64,
+    pub high_water_vm_hwm_kib: u64,
+    pub settled_file_descriptors: usize,
+    pub settled_socket_file_descriptors: usize,
+    pub settled_threads: usize,
+    pub settled_vm_rss_kib: u64,
+    pub settled_vm_hwm_kib: u64,
+    pub high_water_file_descriptor_ceiling: usize,
+    pub settled_file_descriptor_ceiling: usize,
+    pub settled_socket_file_descriptor_ceiling: usize,
+    pub high_water_thread_ceiling: usize,
+    pub high_water_vm_hwm_ceiling_kib: u64,
+    pub settled_vm_rss_ceiling_kib: u64,
+}
+
+/// Closed, non-production evidence emitted by the mTLS batch release gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMtlsBatchReleaseGateEvidenceV1 {
+    /// Closed evidence schema version.
+    pub schema_version: String,
+    /// This record is experimental only.
+    pub experimental: bool,
+    /// This record cannot assert production qualification.
+    pub qualification_complete: bool,
+    /// Cargo profile used for the observation.
+    pub cargo_profile: String,
+    /// Rust optimization level used for the observation.
+    pub opt_level: String,
+    /// Whether debug assertions were enabled.
+    pub debug_assertions: bool,
+    /// Immutable inputs bound to this observation.
+    pub bindings: SessionMtlsBatchReleaseGateBindingsV1,
+    /// Fixed cluster member count.
+    pub members: usize,
+    /// Fixed persistent client count.
+    pub clients: usize,
+    /// Fixed lane count per normal client.
+    pub lanes_per_client: usize,
+    /// Offered logical operations per second, distinct from concurrency.
+    pub logical_operations_per_second: usize,
+    /// Exact retained-request warm status sample count.
+    pub warm_status_samples: usize,
+    /// Exact count of distinct retained requests addressed by warm reads.
+    pub warm_status_request_cardinality: usize,
+    /// Lowest one-based retained preload request index addressed by warm reads.
+    pub warm_status_request_index_min: usize,
+    /// Highest one-based retained preload request index addressed by warm reads.
+    pub warm_status_request_index_max: usize,
+    /// Fixed deterministic retained-request index stride.
+    pub warm_status_request_stride: usize,
+    /// Exact active-history entry count after preload and paced work.
+    pub active_history_entries: usize,
+    /// Declared normal-pool lanes, fixed at 12 clients times four lanes.
+    pub normal_configured_lanes: u64,
+    /// Open normal-pool lanes after recovery settlement.
+    pub normal_active_lanes: u64,
+    /// Idle normal-pool lanes after recovery settlement.
+    pub normal_idle_lanes: u64,
+    /// Accounting for the original fixed normal-client pool set.
+    pub original_fixed_pools: SessionMtlsBatchReleaseGatePoolEvidenceV1,
+    /// Every sequential supplemental pool that reuses released capacity.
+    pub supplemental_pools: Vec<SessionMtlsBatchReleaseGatePoolEvidenceV1>,
+    /// Sum of setup attempts across every declared pool.
+    pub aggregate_setup_attempts: u64,
+    /// Sum of failed setup attempts across every declared pool.
+    pub aggregate_setup_failures: u64,
+    /// Sum of successful setup attempts across every declared pool.
+    pub aggregate_setup_successes: u64,
+    /// Total typed read-unavailable retries during paced batch work.
+    pub typed_read_unavailable_retries: usize,
+    /// Per-call high-water of typed read-unavailable retries.
+    pub typed_read_unavailable_retry_high_water: usize,
+    /// Maximum queued-caller high-water across every declared pool.
+    pub aggregate_pool_wait_max: u64,
+    /// Process-generation observations grouped by logical voter index.
+    pub resource_generations: Vec<SessionMtlsBatchReleaseGateResourceGenerationV1>,
+    /// Child-voter warmed, high-water, and settled resource observations.
+    pub resource_observations: Vec<SessionMtlsBatchReleaseGateResourceObservationV1>,
+    /// Exact fixed paced operation count.
+    pub paced_operations: usize,
+    /// Measured paced-work elapsed duration in nanoseconds.
+    pub paced_elapsed_nanos: u64,
+    /// Exact floor-derived logical operation rate, in milli-ops/s.
+    pub achieved_logical_operations_per_second_milli: u64,
+    /// Exact paced batch-response sample cardinality.
+    pub mutation_batch_samples: usize,
+    /// Warm-read p99 latency in milliseconds.
+    pub warm_read_p99_millis: u64,
+    /// Warm-read p99.9 latency in milliseconds.
+    pub warm_read_p999_millis: u64,
+    /// Paced-mutation p99 latency in milliseconds.
+    pub mutation_p99_millis: u64,
+    /// Paced-mutation p99.9 latency in milliseconds.
+    pub mutation_p999_millis: u64,
+    /// Scheduler skips of a saturated selected client; these avoid global HOL.
+    pub saturated_client_skips: usize,
+    /// Minimum completed paced batches across the fixed clients.
+    pub slow_lane_completed_batches: usize,
+    /// Exact typed overload observed after deliberately filling one fixed pool.
+    pub over_capacity_typed_backpressure_events: usize,
+    /// Exact durable V2 responses withheld by the four-lane hold gate.
+    pub held_response_count: usize,
+    /// Exact callers admitted to the filled fixed-pool queue.
+    pub queued_caller_count: usize,
+    /// Exact other-client status progress while the four holds remain entered.
+    pub cross_client_fair_progress: usize,
+    /// Exact held responses released after the typed overload proof.
+    pub released_response_count: usize,
+    /// Exact queued callers that were allowed to recover after the release.
+    pub recovered_queued_caller_count: usize,
+    /// Exact durable V2 request IDs inspected after release and recovery.
+    pub durable_status_cardinality: usize,
+    /// Typed not-transmitted recovery count under bounded admission pressure.
+    pub not_transmitted_retries: usize,
+    /// Typed outcome-unknown recovery count under bounded admission pressure.
+    pub recovered_unknown: usize,
+    /// Server queue depth is deliberately not measured by this client-side gate.
+    pub server_queue_depth_measured: bool,
+    /// The unsampled server queue-depth surface belongs to the downstream service.
+    pub server_queue_depth_scope: SessionMtlsBatchReleaseGateServerQueueDepthScopeV1,
+    /// Exact successful new-credential/new-server normal-client statuses.
+    pub positive_new_credential_new_server_statuses: usize,
+    /// The old credential was rejected locally by the new-only server TLS boundary.
+    pub old_credential_new_only_server_tls_peer_credential_rejected: bool,
+    /// The new credential was rejected locally by the old-root server TLS boundary.
+    pub new_credential_old_root_server_tls_peer_credential_rejected: bool,
+}
+
+/// Typed rejection reason for batch release-gate evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SessionMtlsBatchReleaseGateEvidenceError {
+    /// Input exceeds the bounded evidence-document size.
+    #[error("mTLS batch evidence document exceeds the supported size")]
+    DocumentTooLarge,
+    #[error("mTLS batch evidence document is invalid")]
+    InvalidDocument,
+    #[error("mTLS batch evidence claim is invalid")]
+    Claim,
+    #[error("mTLS batch evidence binding is invalid")]
+    Binding,
+    #[error("mTLS batch evidence pool accounting is invalid")]
+    PoolAccounting,
+    /// Resource-generation coverage is absent or internally inconsistent.
+    #[error("mTLS batch evidence resource generations are invalid")]
+    ResourceGeneration,
+}
+
+impl SessionMtlsBatchReleaseGateEvidenceV1 {
+    /// Decode, size-bound, and validate one closed evidence document.
+    pub fn from_json(document: &[u8]) -> Result<Self, SessionMtlsBatchReleaseGateEvidenceError> {
+        if document.len() > SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_MAX_BYTES {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::DocumentTooLarge);
+        }
+        let evidence: Self = serde_json::from_slice(document)
+            .map_err(|_| SessionMtlsBatchReleaseGateEvidenceError::InvalidDocument)?;
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    /// Enforce the fixed schedule, bindings, and complete pool accounting.
+    pub fn validate(&self) -> Result<(), SessionMtlsBatchReleaseGateEvidenceError> {
+        if self.schema_version != SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_VERSION
+            || !self.experimental
+            || self.qualification_complete
+            || self.cargo_profile != "release"
+            || self.opt_level != "3"
+            || self.debug_assertions
+            || self.members != 3
+            || self.clients != 12
+            || self.lanes_per_client != 4
+            || self.logical_operations_per_second != 1_000
+            || self.warm_status_samples != 1_008
+            || self.warm_status_request_cardinality != 1_008
+            || self.warm_status_request_index_min != 1
+            || self.warm_status_request_index_max != 49_980
+            || self.warm_status_request_stride != 53
+            || self.active_history_entries != 110_001
+            || self.normal_configured_lanes != 48
+            || self.normal_active_lanes != 48
+            || self.normal_idle_lanes != 48
+            || self.positive_new_credential_new_server_statuses != 4
+            || !self.old_credential_new_only_server_tls_peer_credential_rejected
+            || !self.new_credential_old_root_server_tls_peer_credential_rejected
+            || self.paced_operations != SESSION_MTLS_BATCH_RELEASE_GATE_PACED_OPERATIONS
+            || self.paced_elapsed_nanos == 0
+            || self.mutation_batch_samples != SESSION_MTLS_BATCH_RELEASE_GATE_PACED_BATCH_SAMPLES
+            || self.paced_operations
+                != self
+                    .mutation_batch_samples
+                    .saturating_mul(SESSION_MTLS_BATCH_RELEASE_GATE_PACED_BATCH_OPERATIONS)
+            || session_mtls_batch_release_gate_achieved_rate_milli(
+                self.paced_operations,
+                self.paced_elapsed_nanos,
+            ) != Some(self.achieved_logical_operations_per_second_milli)
+            || self.achieved_logical_operations_per_second_milli
+                < SESSION_MTLS_BATCH_RELEASE_GATE_MIN_ACHIEVED_RATE_MILLI
+            || self.warm_read_p99_millis > SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS
+            || self.warm_read_p999_millis > SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS
+            || self.mutation_p99_millis > SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS
+            || self.mutation_p999_millis > SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS
+            || self.slow_lane_completed_batches == 0
+            || self.slow_lane_completed_batches > self.mutation_batch_samples
+            || self.saturated_client_skips == 0
+            || self.saturated_client_skips > self.mutation_batch_samples
+            || self.over_capacity_typed_backpressure_events != 1
+            || self.held_response_count != 4
+            || self.queued_caller_count != 64
+            || self.cross_client_fair_progress != 1
+            || self.released_response_count != 4
+            || self.recovered_queued_caller_count != 64
+            || self.durable_status_cardinality != 12
+            || self.recovered_unknown > self.mutation_batch_samples
+            || self.not_transmitted_retries
+                > self.mutation_batch_samples.saturating_mul(
+                    SESSION_MTLS_BATCH_RELEASE_GATE_NOT_TRANSMITTED_RETRY_CEILING_PER_BATCH,
+                )
+            || self.server_queue_depth_measured
+            || self.server_queue_depth_scope
+                != SessionMtlsBatchReleaseGateServerQueueDepthScopeV1::Downstream
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::Claim);
+        }
+        if !is_exact_sha256(&self.bindings.evidence_schema_sha256)
+            || !is_exact_sha256(&self.bindings.configuration_sha256)
+            || !is_exact_sha256(&self.bindings.public_material_manifest_sha256)
+            || !is_exact_sha256(&self.bindings.workload_schedule_sha256)
+            || !is_lower_hex_exact(&self.bindings.source_revision, 40)
+            || !is_exact_sha256(&self.bindings.source_worktree_sha256)
+            || !is_exact_sha256(&self.bindings.child_sha256)
+            || !is_exact_sha256(&self.bindings.harness_sha256)
+            || self.bindings.evidence_schema_sha256
+                != session_mtls_batch_release_gate_evidence_v1_schema_sha256()
+            || self.bindings.workload_schedule_sha256
+                != session_mtls_batch_release_gate_schedule_sha256()
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::Binding);
+        }
+        if self.original_fixed_pools.role
+            != SessionMtlsBatchReleaseGatePoolRoleV1::OriginalFixedPools
+            || self.supplemental_pools.len() != 3
+            || self.supplemental_pools[0].role
+                != SessionMtlsBatchReleaseGatePoolRoleV1::OldCredentialNewOnlyServer
+            || self.supplemental_pools[1].role
+                != SessionMtlsBatchReleaseGatePoolRoleV1::DelayedResponseAmbiguity
+            || self.supplemental_pools[2].role
+                != SessionMtlsBatchReleaseGatePoolRoleV1::NewCredentialOldRootServer
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
+        }
+        let mut observed_max = 0;
+        let mut attempts: u64 = 0;
+        let mut failures: u64 = 0;
+        let mut successes: u64 = 0;
+        for pool in
+            std::iter::once(&self.original_fixed_pools).chain(self.supplemental_pools.iter())
+        {
+            let (attempt_ceiling, failure_ceiling, queue_wait_ceiling) = match pool.role {
+                SessionMtlsBatchReleaseGatePoolRoleV1::OriginalFixedPools => (
+                    SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING,
+                    SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING,
+                    64,
+                ),
+                SessionMtlsBatchReleaseGatePoolRoleV1::OldCredentialNewOnlyServer
+                | SessionMtlsBatchReleaseGatePoolRoleV1::NewCredentialOldRootServer => (
+                    SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_ATTEMPT_CEILING,
+                    SESSION_MTLS_BATCH_RELEASE_GATE_NEGATIVE_SETUP_FAILURE_CEILING,
+                    0,
+                ),
+                SessionMtlsBatchReleaseGatePoolRoleV1::DelayedResponseAmbiguity => (
+                    SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_ATTEMPT_CEILING,
+                    SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_FAILURE_CEILING,
+                    64,
+                ),
+            };
+            if pool.setup_attempts == 0
+                || pool.setup_successes.checked_add(pool.setup_failures)
+                    != Some(pool.setup_attempts)
+                || pool.pool_wait_current != 0
+                || pool.pool_wait_max > queue_wait_ceiling
+                || pool.setup_attempts > attempt_ceiling
+                || pool.setup_failures > failure_ceiling
+                || pool.active_lanes > pool.configured_lanes
+                || pool.idle_lanes > pool.active_lanes
+            {
+                return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
+            }
+            attempts = attempts
+                .checked_add(pool.setup_attempts)
+                .ok_or(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)?;
+            failures = failures
+                .checked_add(pool.setup_failures)
+                .ok_or(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)?;
+            successes = successes
+                .checked_add(pool.setup_successes)
+                .ok_or(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)?;
+            observed_max = observed_max.max(pool.pool_wait_max);
+        }
+        if attempts != self.aggregate_setup_attempts
+            || failures != self.aggregate_setup_failures
+            || successes != self.aggregate_setup_successes
+            || successes.checked_add(failures) != Some(attempts)
+            || attempts > SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING
+            || failures > SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING
+            || self.typed_read_unavailable_retry_high_water > self.typed_read_unavailable_retries
+            || observed_max != self.aggregate_pool_wait_max
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
+        }
+        if self.original_fixed_pools.configured_lanes != 48
+            || self.original_fixed_pools.active_lanes != 48
+            || self.original_fixed_pools.idle_lanes != 48
+            || self.supplemental_pools[0].configured_lanes != 1
+            || self.supplemental_pools[1].configured_lanes != 4
+            || self.supplemental_pools[2].configured_lanes != 1
+            || self
+                .supplemental_pools
+                .iter()
+                .any(|pool| pool.active_lanes != 0 || pool.idle_lanes != 0)
+            || self.supplemental_pools[0].setup_successes != 0
+            || self.supplemental_pools[0].setup_failures != 1
+            || self.supplemental_pools[1].setup_successes == 0
+            || self.supplemental_pools[1].pool_wait_max != 64
+            || self.supplemental_pools[2].setup_successes != 0
+            || self.supplemental_pools[2].setup_failures != 1
+            || self.aggregate_pool_wait_max != 64
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting);
+        }
+        let mut generations_by_voter = [0_u8; 3];
+        let mut observed_process_ids = std::collections::BTreeSet::new();
+        for generation in &self.resource_generations {
+            if generation.logical_voter_index >= 3
+                || generation.process_id == 0
+                || generation.samples == 0
+                || !observed_process_ids.insert(generation.process_id)
+            {
+                return Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration);
+            }
+            let count = &mut generations_by_voter[generation.logical_voter_index];
+            *count = count
+                .checked_add(1)
+                .ok_or(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration)?;
+        }
+        if self.resource_generations.len() != 4
+            || !matches!(generations_by_voter, [2, 1, 1] | [1, 2, 1] | [1, 1, 2])
+        {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration);
+        }
+        if self.resource_observations.len() != 3 {
+            return Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration);
+        }
+        for (expected_voter_index, observation) in self.resource_observations.iter().enumerate() {
+            let high_water_file_descriptor_ceiling = observation
+                .warmed_nontransport_file_descriptors
+                .saturating_add(QUALIFICATION_INBOUND_CONNECTION_SLOTS)
+                .saturating_add(QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER.saturating_mul(2))
+                .saturating_add(QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE);
+            if observation.logical_voter_index != expected_voter_index
+                || observation.high_water_file_descriptor_ceiling
+                    != high_water_file_descriptor_ceiling
+                || observation.settled_file_descriptor_ceiling
+                    != observation
+                        .warmed_file_descriptors
+                        .saturating_add(QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE)
+                || observation.settled_socket_file_descriptor_ceiling
+                    != observation
+                        .warmed_socket_file_descriptors
+                        .saturating_add(QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE)
+                || observation.high_water_thread_ceiling
+                    != observation
+                        .warmed_threads
+                        .saturating_add(QUALIFICATION_RESOURCE_THREAD_GROWTH_ALLOWANCE)
+                || observation.high_water_vm_hwm_ceiling_kib
+                    != observation
+                        .warmed_vm_hwm_kib
+                        .saturating_add(QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB)
+                || observation.settled_vm_rss_ceiling_kib
+                    != observation
+                        .warmed_vm_rss_kib
+                        .saturating_add(QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB)
+                || observation.high_water_file_descriptors
+                    > observation.high_water_file_descriptor_ceiling
+                || observation.settled_file_descriptors
+                    > observation.settled_file_descriptor_ceiling
+                || observation.settled_socket_file_descriptors
+                    > observation.settled_socket_file_descriptor_ceiling
+                || observation.high_water_threads > observation.high_water_thread_ceiling
+                || observation.settled_threads > observation.high_water_thread_ceiling
+                || observation.high_water_vm_hwm_kib > observation.high_water_vm_hwm_ceiling_kib
+                || observation.high_water_vm_rss_kib > observation.high_water_vm_hwm_kib
+                || observation.settled_vm_rss_kib > observation.settled_vm_rss_ceiling_kib
+                || observation.settled_vm_hwm_kib > observation.high_water_vm_hwm_ceiling_kib
+            {
+                return Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Domain-separated digest of one exact local mTLS campaign schedule.
@@ -3538,6 +4145,8 @@ pub enum QualificationNodeCommandKind {
     DirectedHandshake,
     /// Read bounded connection-lifecycle metrics.
     LifecycleMetrics,
+    /// Read fixed, redaction-safe consensus-store diagnostic counters.
+    ConsensusDiagnostics,
     /// Change the qualification-only consensus RPC fault gate.
     SetConsensusRpcAvailability,
     /// Start the test-only stateless consumer endpoint.
@@ -3545,6 +4154,13 @@ pub enum QualificationNodeCommandKind {
     /// Delay the next successful stateless-consumer mutation response after
     /// durable dispatch so the caller's own deadline creates ambiguity.
     ArmStatelessConsumerDelayedResponse,
+    /// Arm exactly four real V2 post-execution response holds for the bounded
+    /// persistent-client admission-pressure seam.
+    ArmStatelessConsumerResponseHolds,
+    /// Read the cross-process acknowledgement count for the four-response hold gate.
+    StatelessConsumerResponseHoldStatus,
+    /// Release exactly the four V2 responses held by the pressure seam.
+    ReleaseStatelessConsumerResponseHolds,
     /// Read bounded security metrics.
     SecurityMetrics,
     /// Start the deterministic traffic watch.
@@ -3583,6 +4199,9 @@ pub enum QualificationNodeCommandKind {
     ForgetLease,
     /// Shut down the qualification child.
     Shutdown,
+    /// Read the dedicated consumer listener's locally detected peer-credential
+    /// rejection count.
+    ConsumerTlsPeerCredentialRejections,
 }
 
 impl QualificationNodeCommandKind {
@@ -3598,9 +4217,13 @@ impl QualificationNodeCommandKind {
         Self::RequestReauthentication,
         Self::DirectedHandshake,
         Self::LifecycleMetrics,
+        Self::ConsensusDiagnostics,
         Self::SetConsensusRpcAvailability,
         Self::StartStatelessConsumer,
         Self::ArmStatelessConsumerDelayedResponse,
+        Self::ArmStatelessConsumerResponseHolds,
+        Self::StatelessConsumerResponseHoldStatus,
+        Self::ReleaseStatelessConsumerResponseHolds,
         Self::SecurityMetrics,
         Self::StartTrafficWatch,
         Self::ReconcileTrafficWatch,
@@ -3620,6 +4243,7 @@ impl QualificationNodeCommandKind {
         Self::Release,
         Self::ForgetLease,
         Self::Shutdown,
+        Self::ConsumerTlsPeerCredentialRejections,
     ];
 }
 
@@ -3648,6 +4272,8 @@ pub enum QualificationNodeCommand {
         remote_node_index: usize,
     },
     LifecycleMetrics,
+    /// Return fixed, redaction-safe consensus-store diagnostic counters.
+    ConsensusDiagnostics,
     /// Enable or fail closed every consensus RPC path owned by this child.
     /// The stdin control channel remains available while RPCs are disabled.
     SetConsensusRpcAvailability {
@@ -3662,6 +4288,13 @@ pub enum QualificationNodeCommand {
     /// Arm one one-shot, test-only delayed post-dispatch response for the
     /// dedicated stateless-consumer endpoint.
     ArmStatelessConsumerDelayedResponse,
+    /// Arm exactly four real V2 post-execution response holds. The child only
+    /// acknowledges entry after each durable operation has completed.
+    ArmStatelessConsumerResponseHolds,
+    /// Read the bounded four-response hold-gate state.
+    StatelessConsumerResponseHoldStatus,
+    /// Release exactly the four held responses after queue-pressure proof.
+    ReleaseStatelessConsumerResponseHolds,
     /// Return a redacted fixed-cardinality security telemetry snapshot.
     SecurityMetrics,
     /// Register exactly one protected applied-state watch before any traffic
@@ -3742,6 +4375,9 @@ pub enum QualificationNodeCommand {
         lease_handle: String,
     },
     Shutdown,
+    /// Return the scalar counter for local peer-credential rejections at the
+    /// dedicated consumer listener TLS accept boundary.
+    ConsumerTlsPeerCredentialRejections,
 }
 
 impl fmt::Debug for QualificationNodeCommand {
@@ -3770,6 +4406,9 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::LifecycleMetrics => {
                 formatter.write_str("QualificationNodeCommand::LifecycleMetrics")
             }
+            Self::ConsensusDiagnostics => {
+                formatter.write_str("QualificationNodeCommand::ConsensusDiagnostics")
+            }
             Self::SetConsensusRpcAvailability { availability } => formatter
                 .debug_struct("QualificationNodeCommand::SetConsensusRpcAvailability")
                 .field("availability", availability)
@@ -3784,6 +4423,14 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::ArmStatelessConsumerDelayedResponse => {
                 formatter.write_str("QualificationNodeCommand::ArmStatelessConsumerDelayedResponse")
             }
+            Self::ArmStatelessConsumerResponseHolds => {
+                formatter.write_str("QualificationNodeCommand::ArmStatelessConsumerResponseHolds")
+            }
+            Self::StatelessConsumerResponseHoldStatus => {
+                formatter.write_str("QualificationNodeCommand::StatelessConsumerResponseHoldStatus")
+            }
+            Self::ReleaseStatelessConsumerResponseHolds => formatter
+                .write_str("QualificationNodeCommand::ReleaseStatelessConsumerResponseHolds"),
             Self::SecurityMetrics => {
                 formatter.write_str("QualificationNodeCommand::SecurityMetrics")
             }
@@ -3849,6 +4496,9 @@ impl fmt::Debug for QualificationNodeCommand {
                 formatter.write_str("QualificationNodeCommand::ForgetLease")
             }
             Self::Shutdown => formatter.write_str("QualificationNodeCommand::Shutdown"),
+            Self::ConsumerTlsPeerCredentialRejections => {
+                formatter.write_str("QualificationNodeCommand::ConsumerTlsPeerCredentialRejections")
+            }
         }
     }
 }
@@ -3871,6 +4521,7 @@ impl QualificationNodeCommand {
             Self::RequestReauthentication => QualificationNodeCommandKind::RequestReauthentication,
             Self::DirectedHandshake { .. } => QualificationNodeCommandKind::DirectedHandshake,
             Self::LifecycleMetrics => QualificationNodeCommandKind::LifecycleMetrics,
+            Self::ConsensusDiagnostics => QualificationNodeCommandKind::ConsensusDiagnostics,
             Self::SetConsensusRpcAvailability { .. } => {
                 QualificationNodeCommandKind::SetConsensusRpcAvailability
             }
@@ -3879,6 +4530,15 @@ impl QualificationNodeCommand {
             }
             Self::ArmStatelessConsumerDelayedResponse => {
                 QualificationNodeCommandKind::ArmStatelessConsumerDelayedResponse
+            }
+            Self::ArmStatelessConsumerResponseHolds => {
+                QualificationNodeCommandKind::ArmStatelessConsumerResponseHolds
+            }
+            Self::StatelessConsumerResponseHoldStatus => {
+                QualificationNodeCommandKind::StatelessConsumerResponseHoldStatus
+            }
+            Self::ReleaseStatelessConsumerResponseHolds => {
+                QualificationNodeCommandKind::ReleaseStatelessConsumerResponseHolds
             }
             Self::SecurityMetrics => QualificationNodeCommandKind::SecurityMetrics,
             Self::StartTrafficWatch => QualificationNodeCommandKind::StartTrafficWatch,
@@ -3901,6 +4561,9 @@ impl QualificationNodeCommand {
             Self::Release { .. } => QualificationNodeCommandKind::Release,
             Self::ForgetLease { .. } => QualificationNodeCommandKind::ForgetLease,
             Self::Shutdown => QualificationNodeCommandKind::Shutdown,
+            Self::ConsumerTlsPeerCredentialRejections => {
+                QualificationNodeCommandKind::ConsumerTlsPeerCredentialRejections
+            }
         }
     }
 
@@ -3917,8 +4580,12 @@ impl QualificationNodeCommand {
             | Self::ReauthenticationGeneration
             | Self::RequestReauthentication
             | Self::LifecycleMetrics
+            | Self::ConsensusDiagnostics
             | Self::SetConsensusRpcAvailability { .. }
             | Self::ArmStatelessConsumerDelayedResponse
+            | Self::ArmStatelessConsumerResponseHolds
+            | Self::StatelessConsumerResponseHoldStatus
+            | Self::ReleaseStatelessConsumerResponseHolds
             | Self::SecurityMetrics
             | Self::StartTrafficWatch
             | Self::ReconcileTrafficWatch
@@ -3927,7 +4594,8 @@ impl QualificationNodeCommand {
             | Self::StopTrafficWatch
             | Self::TrafficStatus
             | Self::TrafficStatusSnapshot
-            | Self::Shutdown => Ok(()),
+            | Self::Shutdown
+            | Self::ConsumerTlsPeerCredentialRejections => Ok(()),
             Self::StartStatelessConsumer {
                 consumer_identities,
             } => {
@@ -4304,6 +4972,9 @@ pub enum QualificationNodeReply {
     LifecycleMetrics {
         metrics: QualificationConnectionLifecycleMetrics,
     },
+    ConsensusDiagnostics {
+        metrics: opc_session_store::ConsensusStoreDiagnosticSnapshot,
+    },
     ConsensusRpcAvailability {
         availability: QualificationConsensusRpcAvailability,
     },
@@ -4318,6 +4989,19 @@ pub enum QualificationNodeReply {
     },
     /// A one-shot post-dispatch delayed response was armed.
     StatelessConsumerDelayedResponseArmed,
+    /// The exact four-response post-execution hold gate was armed.
+    StatelessConsumerResponseHoldsArmed {
+        responses: usize,
+    },
+    /// Cross-process acknowledgement of armed and currently held responses.
+    StatelessConsumerResponseHoldStatus {
+        armed_responses: usize,
+        held_responses: usize,
+    },
+    /// The exact four held responses were released.
+    StatelessConsumerResponseHoldsReleased {
+        responses: usize,
+    },
     TrafficStatus {
         status: QualificationTrafficStatus,
     },
@@ -4371,6 +5055,11 @@ pub enum QualificationNodeReply {
     ShuttingDown,
     Error {
         code: QualificationNodeErrorCode,
+    },
+    /// Scalar proof of peer credentials rejected locally by the dedicated
+    /// consumer listener's TLS accept boundary.
+    ConsumerTlsPeerCredentialRejections {
+        rejections: u64,
     },
 }
 
@@ -4936,6 +5625,868 @@ where
 mod tests {
     use super::*;
 
+    fn batch_release_gate_pool(
+        role: SessionMtlsBatchReleaseGatePoolRoleV1,
+        successes: u64,
+        failures: u64,
+        wait_max: u64,
+        configured_lanes: u64,
+        active_lanes: u64,
+        idle_lanes: u64,
+    ) -> SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+        SessionMtlsBatchReleaseGatePoolEvidenceV1 {
+            role,
+            setup_attempts: successes + failures,
+            setup_failures: failures,
+            setup_successes: successes,
+            pool_wait_current: 0,
+            pool_wait_max: wait_max,
+            configured_lanes,
+            active_lanes,
+            idle_lanes,
+        }
+    }
+
+    fn batch_release_gate_evidence_fixture() -> SessionMtlsBatchReleaseGateEvidenceV1 {
+        let original_fixed_pools = batch_release_gate_pool(
+            SessionMtlsBatchReleaseGatePoolRoleV1::OriginalFixedPools,
+            48,
+            0,
+            2,
+            48,
+            48,
+            48,
+        );
+        let supplemental_pools = vec![
+            batch_release_gate_pool(
+                SessionMtlsBatchReleaseGatePoolRoleV1::OldCredentialNewOnlyServer,
+                0,
+                1,
+                0,
+                1,
+                0,
+                0,
+            ),
+            batch_release_gate_pool(
+                SessionMtlsBatchReleaseGatePoolRoleV1::DelayedResponseAmbiguity,
+                4,
+                0,
+                64,
+                4,
+                0,
+                0,
+            ),
+            batch_release_gate_pool(
+                SessionMtlsBatchReleaseGatePoolRoleV1::NewCredentialOldRootServer,
+                0,
+                1,
+                0,
+                1,
+                0,
+                0,
+            ),
+        ];
+        let aggregate_setup_attempts = std::iter::once(&original_fixed_pools)
+            .chain(supplemental_pools.iter())
+            .map(|pool| pool.setup_attempts)
+            .sum();
+        let aggregate_setup_failures = std::iter::once(&original_fixed_pools)
+            .chain(supplemental_pools.iter())
+            .map(|pool| pool.setup_failures)
+            .sum();
+        let aggregate_setup_successes = std::iter::once(&original_fixed_pools)
+            .chain(supplemental_pools.iter())
+            .map(|pool| pool.setup_successes)
+            .sum();
+        SessionMtlsBatchReleaseGateEvidenceV1 {
+            schema_version: SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_VERSION.to_owned(),
+            experimental: true,
+            qualification_complete: false,
+            cargo_profile: "release".to_owned(),
+            opt_level: "3".to_owned(),
+            debug_assertions: false,
+            bindings: SessionMtlsBatchReleaseGateBindingsV1 {
+                evidence_schema_sha256: session_mtls_batch_release_gate_evidence_v1_schema_sha256(),
+                configuration_sha256: format!("sha256:{}", "a".repeat(64)),
+                public_material_manifest_sha256: format!("sha256:{}", "b".repeat(64)),
+                workload_schedule_sha256: session_mtls_batch_release_gate_schedule_sha256(),
+                source_revision: "c".repeat(40),
+                source_worktree_sha256: format!("sha256:{}", "d".repeat(64)),
+                child_sha256: format!("sha256:{}", "e".repeat(64)),
+                harness_sha256: format!("sha256:{}", "f".repeat(64)),
+            },
+            members: 3,
+            clients: 12,
+            lanes_per_client: 4,
+            logical_operations_per_second: 1_000,
+            warm_status_samples: 1_008,
+            warm_status_request_cardinality: 1_008,
+            warm_status_request_index_min: 1,
+            warm_status_request_index_max: 49_980,
+            warm_status_request_stride: 53,
+            active_history_entries: 110_001,
+            normal_configured_lanes: 48,
+            normal_active_lanes: 48,
+            normal_idle_lanes: 48,
+            original_fixed_pools,
+            supplemental_pools,
+            aggregate_setup_attempts,
+            aggregate_setup_failures,
+            aggregate_setup_successes,
+            typed_read_unavailable_retries: 0,
+            typed_read_unavailable_retry_high_water: 0,
+            aggregate_pool_wait_max: 64,
+            resource_generations: vec![
+                SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                    logical_voter_index: 0,
+                    process_id: 11,
+                    samples: 1,
+                },
+                SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                    logical_voter_index: 0,
+                    process_id: 12,
+                    samples: 1,
+                },
+                SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                    logical_voter_index: 1,
+                    process_id: 13,
+                    samples: 1,
+                },
+                SessionMtlsBatchReleaseGateResourceGenerationV1 {
+                    logical_voter_index: 2,
+                    process_id: 14,
+                    samples: 1,
+                },
+            ],
+            resource_observations: (0..3)
+                .map(
+                    |logical_voter_index| SessionMtlsBatchReleaseGateResourceObservationV1 {
+                        logical_voter_index,
+                        warmed_file_descriptors: 20,
+                        warmed_socket_file_descriptors: 8,
+                        warmed_nontransport_file_descriptors: 12,
+                        warmed_threads: 10,
+                        warmed_vm_rss_kib: 1_000,
+                        warmed_vm_hwm_kib: 1_200,
+                        high_water_file_descriptors: 20,
+                        high_water_threads: 10,
+                        high_water_vm_rss_kib: 1_000,
+                        high_water_vm_hwm_kib: 1_200,
+                        settled_file_descriptors: 20,
+                        settled_socket_file_descriptors: 8,
+                        settled_threads: 10,
+                        settled_vm_rss_kib: 1_000,
+                        settled_vm_hwm_kib: 1_200,
+                        high_water_file_descriptor_ceiling: 12
+                            + QUALIFICATION_INBOUND_CONNECTION_SLOTS
+                            + QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER * 2
+                            + QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE,
+                        settled_file_descriptor_ceiling: 24,
+                        settled_socket_file_descriptor_ceiling: 12,
+                        high_water_thread_ceiling: 18,
+                        high_water_vm_hwm_ceiling_kib: 1_200
+                            + QUALIFICATION_RESOURCE_VMHWM_GROWTH_KIB,
+                        settled_vm_rss_ceiling_kib: 1_000
+                            + QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB,
+                    },
+                )
+                .collect(),
+            paced_operations: SESSION_MTLS_BATCH_RELEASE_GATE_PACED_OPERATIONS,
+            paced_elapsed_nanos: 60_000_000_000,
+            achieved_logical_operations_per_second_milli: 1_000_000,
+            mutation_batch_samples: 5_000,
+            warm_read_p99_millis: 25,
+            warm_read_p999_millis: 100,
+            mutation_p99_millis: 25,
+            mutation_p999_millis: 100,
+            saturated_client_skips: 1,
+            slow_lane_completed_batches: 1,
+            over_capacity_typed_backpressure_events: 1,
+            held_response_count: 4,
+            queued_caller_count: 64,
+            cross_client_fair_progress: 1,
+            released_response_count: 4,
+            recovered_queued_caller_count: 64,
+            durable_status_cardinality: 12,
+            not_transmitted_retries: 0,
+            recovered_unknown: 0,
+            server_queue_depth_measured: false,
+            server_queue_depth_scope:
+                SessionMtlsBatchReleaseGateServerQueueDepthScopeV1::Downstream,
+            positive_new_credential_new_server_statuses: 4,
+            old_credential_new_only_server_tls_peer_credential_rejected: true,
+            new_credential_old_root_server_tls_peer_credential_rejected: true,
+        }
+    }
+
+    fn assert_local_schema_refs_resolve(schema: &serde_json::Value) {
+        fn visit(
+            value: &serde_json::Value,
+            definitions: &serde_json::Map<String, serde_json::Value>,
+        ) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if let Some(reference) = object.get("$ref").and_then(serde_json::Value::as_str)
+                    {
+                        let definition = reference
+                            .strip_prefix("#/$defs/")
+                            .expect("closed schema contains only local definition references");
+                        assert!(
+                            definitions.contains_key(definition),
+                            "closed schema reference must resolve: {reference}"
+                        );
+                    }
+                    for nested in object.values() {
+                        visit(nested, definitions);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for nested in values {
+                        visit(nested, definitions);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let definitions = schema["$defs"]
+            .as_object()
+            .expect("closed schema has local definitions");
+        visit(schema, definitions);
+    }
+
+    #[test]
+    fn batch_release_gate_evidence_round_trips_and_rejects_unsettled_pool() {
+        let evidence = batch_release_gate_evidence_fixture();
+        evidence.validate().expect("valid closed evidence");
+        let encoded = serde_json::to_vec(&evidence).expect("encode evidence");
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(&encoded)
+                .expect("round-trip closed evidence"),
+            evidence
+        );
+        let schema: serde_json::Value =
+            serde_json::from_str(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON)
+                .expect("closed batch evidence schema parses");
+        assert_local_schema_refs_resolve(&schema);
+
+        let mut unsettled = batch_release_gate_evidence_fixture();
+        unsettled.supplemental_pools[1].pool_wait_current = 1;
+        assert_eq!(
+            unsettled.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut unaccounted = batch_release_gate_evidence_fixture();
+        unaccounted.aggregate_setup_attempts =
+            unaccounted.aggregate_setup_attempts.saturating_add(1);
+        assert_eq!(
+            unaccounted.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut zero_attempts = batch_release_gate_evidence_fixture();
+        zero_attempts.supplemental_pools[0].setup_attempts = 0;
+        zero_attempts.supplemental_pools[0].setup_failures = 0;
+        assert_eq!(
+            zero_attempts.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut overbound_wait = batch_release_gate_evidence_fixture();
+        overbound_wait.supplemental_pools[1].pool_wait_max = 65;
+        assert_eq!(
+            overbound_wait.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut negative_wait = batch_release_gate_evidence_fixture();
+        negative_wait.supplemental_pools[0].pool_wait_max = 1;
+        assert_eq!(
+            negative_wait.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut original_attempt_max_plus_one = batch_release_gate_evidence_fixture();
+        original_attempt_max_plus_one
+            .original_fixed_pools
+            .setup_attempts = SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING + 1;
+        original_attempt_max_plus_one
+            .original_fixed_pools
+            .setup_successes = SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING + 1;
+        assert_eq!(
+            original_attempt_max_plus_one.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut original_failure_max_plus_one = batch_release_gate_evidence_fixture();
+        original_failure_max_plus_one
+            .original_fixed_pools
+            .setup_attempts = SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING + 1;
+        original_failure_max_plus_one
+            .original_fixed_pools
+            .setup_failures = SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING + 1;
+        assert_eq!(
+            original_failure_max_plus_one.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut aggregate_attempt_max_plus_one = batch_release_gate_evidence_fixture();
+        aggregate_attempt_max_plus_one.aggregate_setup_attempts =
+            SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING + 1;
+        assert_eq!(
+            aggregate_attempt_max_plus_one.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut aggregate_failure_max_plus_one = batch_release_gate_evidence_fixture();
+        aggregate_failure_max_plus_one.aggregate_setup_failures =
+            SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING + 1;
+        assert_eq!(
+            aggregate_failure_max_plus_one.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut resource_threshold_max_plus_one = batch_release_gate_evidence_fixture();
+        resource_threshold_max_plus_one.resource_observations[0].high_water_threads =
+            resource_threshold_max_plus_one.resource_observations[0].high_water_thread_ceiling + 1;
+        assert_eq!(
+            resource_threshold_max_plus_one.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration)
+        );
+
+        let resource_ceiling_mutators: [fn(&mut SessionMtlsBatchReleaseGateResourceObservationV1);
+            7] = [
+            |observation: &mut SessionMtlsBatchReleaseGateResourceObservationV1| {
+                observation.high_water_file_descriptors =
+                    observation.high_water_file_descriptor_ceiling + 1;
+            },
+            |observation: &mut SessionMtlsBatchReleaseGateResourceObservationV1| {
+                observation.settled_file_descriptors =
+                    observation.settled_file_descriptor_ceiling + 1;
+            },
+            |observation: &mut SessionMtlsBatchReleaseGateResourceObservationV1| {
+                observation.settled_socket_file_descriptors =
+                    observation.settled_socket_file_descriptor_ceiling + 1;
+            },
+            |observation: &mut SessionMtlsBatchReleaseGateResourceObservationV1| {
+                observation.settled_threads = observation.high_water_thread_ceiling + 1;
+            },
+            |observation: &mut SessionMtlsBatchReleaseGateResourceObservationV1| {
+                observation.high_water_vm_hwm_kib = observation.high_water_vm_hwm_ceiling_kib + 1;
+            },
+            |observation: &mut SessionMtlsBatchReleaseGateResourceObservationV1| {
+                observation.settled_vm_rss_kib = observation.settled_vm_rss_ceiling_kib + 1;
+            },
+            |observation: &mut SessionMtlsBatchReleaseGateResourceObservationV1| {
+                observation.settled_vm_hwm_kib = observation.high_water_vm_hwm_ceiling_kib + 1;
+            },
+        ];
+        for mutate in resource_ceiling_mutators {
+            let mut evidence = batch_release_gate_evidence_fixture();
+            mutate(&mut evidence.resource_observations[0]);
+            assert_eq!(
+                evidence.validate(),
+                Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration)
+            );
+        }
+
+        let mut latency_threshold_max_plus_one = batch_release_gate_evidence_fixture();
+        latency_threshold_max_plus_one.warm_read_p99_millis =
+            SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS + 1;
+        assert_eq!(
+            latency_threshold_max_plus_one.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+        let latency_ceiling_mutators: [fn(&mut SessionMtlsBatchReleaseGateEvidenceV1); 3] = [
+            |evidence: &mut SessionMtlsBatchReleaseGateEvidenceV1| {
+                evidence.warm_read_p999_millis =
+                    SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS + 1;
+            },
+            |evidence: &mut SessionMtlsBatchReleaseGateEvidenceV1| {
+                evidence.mutation_p99_millis =
+                    SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS + 1;
+            },
+            |evidence: &mut SessionMtlsBatchReleaseGateEvidenceV1| {
+                evidence.mutation_p999_millis =
+                    SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS + 1;
+            },
+        ];
+        for mutate in latency_ceiling_mutators {
+            let mut evidence = batch_release_gate_evidence_fixture();
+            mutate(&mut evidence);
+            assert_eq!(
+                evidence.validate(),
+                Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+            );
+        }
+
+        let mut contradictory_rate = batch_release_gate_evidence_fixture();
+        contradictory_rate.achieved_logical_operations_per_second_milli = 1_000_001;
+        assert_eq!(
+            contradictory_rate.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+
+        let mut zero_saturated_client_skips = batch_release_gate_evidence_fixture();
+        zero_saturated_client_skips.saturated_client_skips = 0;
+        assert_eq!(
+            zero_saturated_client_skips.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+
+        for wait_max in [63, 65] {
+            let mut contradictory_wait_high_water = batch_release_gate_evidence_fixture();
+            contradictory_wait_high_water.supplemental_pools[1].pool_wait_max = wait_max;
+            contradictory_wait_high_water.aggregate_pool_wait_max = wait_max;
+            assert_eq!(
+                contradictory_wait_high_water.validate(),
+                Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting),
+                "the one typed overload event requires the exact fixed queue high-water"
+            );
+        }
+
+        let mut missing_typed_backpressure = batch_release_gate_evidence_fixture();
+        missing_typed_backpressure.over_capacity_typed_backpressure_events = 0;
+        assert_eq!(
+            missing_typed_backpressure.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+
+        let mut server_queue_claim = batch_release_gate_evidence_fixture();
+        server_queue_claim.server_queue_depth_measured = true;
+        assert_eq!(
+            server_queue_claim.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+
+        let mut overflow = batch_release_gate_evidence_fixture();
+        overflow.original_fixed_pools.setup_attempts = u64::MAX;
+        overflow.original_fixed_pools.setup_successes = u64::MAX;
+        assert_eq!(
+            overflow.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut wrong_binding = batch_release_gate_evidence_fixture();
+        wrong_binding.bindings.workload_schedule_sha256 = format!("sha256:{}", "0".repeat(64));
+        assert_eq!(
+            wrong_binding.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Binding)
+        );
+
+        let mut reordered_roles = batch_release_gate_evidence_fixture();
+        reordered_roles.supplemental_pools.swap(0, 1);
+        assert_eq!(
+            reordered_roles.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::PoolAccounting)
+        );
+
+        let mut duplicate_process = batch_release_gate_evidence_fixture();
+        duplicate_process.resource_generations[1].process_id = 11;
+        assert_eq!(
+            duplicate_process.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration)
+        );
+
+        let mut wrong_generation_distribution = batch_release_gate_evidence_fixture();
+        wrong_generation_distribution.resource_generations[3].logical_voter_index = 1;
+        assert_eq!(
+            wrong_generation_distribution.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::ResourceGeneration)
+        );
+
+        let mut wrong_claim = batch_release_gate_evidence_fixture();
+        wrong_claim.normal_idle_lanes = 47;
+        assert_eq!(
+            wrong_claim.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+
+        let mut missing_old_credential_rejection = batch_release_gate_evidence_fixture();
+        missing_old_credential_rejection
+            .old_credential_new_only_server_tls_peer_credential_rejected = false;
+        assert_eq!(
+            missing_old_credential_rejection.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+
+        let mut missing_new_credential_rejection = batch_release_gate_evidence_fixture();
+        missing_new_credential_rejection
+            .new_credential_old_root_server_tls_peer_credential_rejected = false;
+        assert_eq!(
+            missing_new_credential_rejection.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+
+        let mut unknown = serde_json::to_value(batch_release_gate_evidence_fixture())
+            .expect("encode evidence value");
+        unknown["unexpected"] = serde_json::Value::Bool(true);
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(
+                &serde_json::to_vec(&unknown).expect("encode unknown field"),
+            ),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::InvalidDocument)
+        );
+
+        let mut arbitrary_role = serde_json::to_value(batch_release_gate_evidence_fixture())
+            .expect("encode evidence value");
+        arbitrary_role["supplemental_pools"][0]["role"] = serde_json::json!("subscriber-123");
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(
+                &serde_json::to_vec(&arbitrary_role).expect("encode arbitrary role"),
+            ),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::InvalidDocument)
+        );
+
+        let mut nested_unknown = serde_json::to_value(batch_release_gate_evidence_fixture())
+            .expect("encode evidence value");
+        nested_unknown["resource_generations"][0]["unexpected"] = serde_json::json!(true);
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(
+                &serde_json::to_vec(&nested_unknown).expect("encode nested unknown"),
+            ),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::InvalidDocument)
+        );
+
+        let mut missing = serde_json::to_value(batch_release_gate_evidence_fixture())
+            .expect("encode evidence value");
+        missing
+            .as_object_mut()
+            .expect("evidence is an object")
+            .remove("resource_generations");
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(
+                &serde_json::to_vec(&missing).expect("encode missing field"),
+            ),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::InvalidDocument)
+        );
+        assert_eq!(
+            SessionMtlsBatchReleaseGateEvidenceV1::from_json(&vec![
+                b'x';
+                SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_MAX_BYTES
+                    + 1
+            ],),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::DocumentTooLarge)
+        );
+    }
+
+    #[test]
+    fn batch_release_gate_complete_evidence_validates_against_full_closed_schema() {
+        let evidence = batch_release_gate_evidence_fixture();
+        evidence
+            .validate()
+            .expect("representative evidence is valid");
+        let encoded = serde_json::to_vec(&evidence).expect("serialize complete evidence");
+        let instance: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("serialized evidence is JSON");
+        let schema: serde_json::Value =
+            serde_json::from_str(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON)
+                .expect("closed batch evidence schema parses");
+        opc_schema_validate::validate(&schema, &instance)
+            .expect("serialized complete evidence satisfies the full closed schema");
+    }
+
+    #[test]
+    fn batch_release_gate_schema_and_schedule_are_closed() {
+        let schema: serde_json::Value =
+            serde_json::from_str(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON)
+                .expect("batch release-gate schema is JSON");
+        assert_eq!(
+            schema["properties"]["schema_version"]["const"],
+            SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_VERSION
+        );
+        assert_eq!(
+            schema["properties"]["active_history_entries"]["const"],
+            110_001
+        );
+        assert!(schema["required"]
+            .as_array()
+            .expect("closed schema has required fields")
+            .iter()
+            .any(|field| field == "aggregate_setup_attempts"));
+        for field in [
+            "resource_observations",
+            "paced_operations",
+            "paced_elapsed_nanos",
+            "achieved_logical_operations_per_second_milli",
+            "mutation_batch_samples",
+            "warm_read_p99_millis",
+            "warm_read_p999_millis",
+            "mutation_p99_millis",
+            "mutation_p999_millis",
+            "over_capacity_typed_backpressure_events",
+            "server_queue_depth_measured",
+            "server_queue_depth_scope",
+        ] {
+            assert!(schema["required"]
+                .as_array()
+                .expect("closed schema has required fields")
+                .iter()
+                .any(|required| required == field));
+        }
+        for (field, expected) in [
+            ("held_response_count", 4),
+            ("queued_caller_count", 64),
+            ("cross_client_fair_progress", 1),
+            ("released_response_count", 4),
+            ("recovered_queued_caller_count", 64),
+            ("durable_status_cardinality", 12),
+        ] {
+            assert!(schema["required"]
+                .as_array()
+                .expect("closed schema has required fields")
+                .iter()
+                .any(|required| required == field));
+            assert_eq!(schema["properties"][field]["const"], expected);
+        }
+        assert_eq!(
+            schema["properties"]["paced_operations"]["const"],
+            SESSION_MTLS_BATCH_RELEASE_GATE_PACED_OPERATIONS
+        );
+        assert_eq!(
+            schema["$defs"]["resource_observation"]["properties"]["settled_threads"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            schema["properties"]["aggregate_setup_attempts"]["maximum"],
+            SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING
+        );
+        assert_eq!(
+            schema["properties"]["aggregate_setup_failures"]["maximum"],
+            SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING
+        );
+        assert_eq!(
+            schema["$defs"]["original_fixed_pools"]["allOf"][1]["properties"]["setup_attempts"]
+                ["maximum"],
+            SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING
+        );
+        assert_eq!(
+            schema["$defs"]["original_fixed_pools"]["allOf"][1]["properties"]["setup_failures"]
+                ["maximum"],
+            SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING
+        );
+        assert_eq!(
+            schema["$defs"]["old_credential_new_only_server"]["allOf"][1]["properties"]
+                ["pool_wait_max"]["const"],
+            0
+        );
+        assert_eq!(
+            schema["$defs"]["new_credential_old_root_server"]["allOf"][1]["properties"]
+                ["pool_wait_max"]["const"],
+            0
+        );
+        assert_eq!(
+            schema["properties"]["warm_read_p99_millis"]["maximum"],
+            SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS
+        );
+        assert_eq!(
+            schema["properties"]["warm_read_p999_millis"]["maximum"],
+            SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS
+        );
+        assert_eq!(
+            schema["properties"]["server_queue_depth_measured"]["const"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["server_queue_depth_scope"]["const"],
+            "downstream"
+        );
+        assert!(schema["required"]
+            .as_array()
+            .expect("closed schema has required fields")
+            .iter()
+            .any(|field| field == "old_credential_new_only_server_tls_peer_credential_rejected"));
+        assert!(schema["required"]
+            .as_array()
+            .expect("closed schema has required fields")
+            .iter()
+            .any(|field| field == "new_credential_old_root_server_tls_peer_credential_rejected"));
+        assert_eq!(
+            schema["properties"]["old_credential_new_only_server_tls_peer_credential_rejected"]
+                ["const"],
+            true
+        );
+        assert_eq!(
+            schema["properties"]["new_credential_old_root_server_tls_peer_credential_rejected"]
+                ["const"],
+            true
+        );
+        assert_local_schema_refs_resolve(&schema);
+        for phase in [
+            "phase-01-initial-singleton",
+            "phase-02-preload",
+            "phase-03-warm-status",
+            "phase-04-paced-and-active-history-check",
+            "phase-05-leader-loss-restart-reconnect-and-active-history-check",
+            "phase-06-credential-rotation-and-positive-controls",
+            "phase-07-release-original-pool",
+            "phase-08-publish-replacement-new-only-and-old-credential-negative",
+            "phase-09-four-response-hold-and-client-queue-pressure",
+            "phase-10-release-four-holds-and-recover-exact-statuses",
+            "phase-11-release-old-root-pool",
+            "phase-12-publish-old-only-and-new-credential-negative",
+            "phase-13-restore-old-root-settle-and-resource-validation",
+        ] {
+            assert!(
+                SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1.contains(phase),
+                "canonical schedule binds causal phase {phase}"
+            );
+        }
+        let reordered_schedule = SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1.replacen(
+            "phase-07-release-original-pool",
+            "phase-11-release-old-root-pool",
+            1,
+        );
+        let removed_phase_schedule = SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1.replace(
+            "phase-09-four-response-hold-and-client-queue-pressure",
+            "phase-09-removed",
+        );
+        assert_ne!(
+            sha256_prefixed(reordered_schedule.as_bytes()),
+            SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256,
+            "reordering causal phases cannot retain the canonical binding"
+        );
+        assert_ne!(
+            sha256_prefixed(removed_phase_schedule.as_bytes()),
+            SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256,
+            "removing a causal phase cannot retain the canonical binding"
+        );
+        assert_eq!(
+            sha256_prefixed(SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1.as_bytes()),
+            SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256
+        );
+        assert_eq!(
+            sha256_prefixed(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON.as_bytes()),
+            SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_SHA256
+        );
+        assert_eq!(
+            session_mtls_batch_release_gate_schedule_sha256(),
+            SESSION_MTLS_BATCH_RELEASE_GATE_SCHEDULE_V1_SHA256
+        );
+    }
+
+    #[test]
+    fn batch_release_gate_paced_rate_is_exactly_cross_validated() {
+        assert_eq!(
+            session_mtls_batch_release_gate_achieved_rate_milli(
+                SESSION_MTLS_BATCH_RELEASE_GATE_PACED_OPERATIONS,
+                60_000_000_000,
+            ),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            session_mtls_batch_release_gate_achieved_rate_milli(
+                SESSION_MTLS_BATCH_RELEASE_GATE_PACED_OPERATIONS,
+                0,
+            ),
+            None
+        );
+        let mut evidence = batch_release_gate_evidence_fixture();
+        evidence.paced_operations = SESSION_MTLS_BATCH_RELEASE_GATE_PACED_OPERATIONS - 1;
+        assert_eq!(
+            evidence.validate(),
+            Err(SessionMtlsBatchReleaseGateEvidenceError::Claim)
+        );
+    }
+
+    #[test]
+    fn batch_release_gate_schema_rejects_every_fixed_numeric_ceiling_plus_one() {
+        let schema: serde_json::Value =
+            serde_json::from_str(SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_SCHEMA_JSON)
+                .expect("batch release-gate schema is JSON");
+        let maximum_schemas = [
+            (
+                &schema["properties"]["aggregate_setup_attempts"],
+                SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING,
+            ),
+            (
+                &schema["properties"]["aggregate_setup_failures"],
+                SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING,
+            ),
+            (
+                &schema["$defs"]["original_fixed_pools"]["allOf"][1]["properties"]
+                    ["setup_attempts"],
+                SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_ATTEMPT_CEILING,
+            ),
+            (
+                &schema["$defs"]["original_fixed_pools"]["allOf"][1]["properties"]
+                    ["setup_failures"],
+                SESSION_MTLS_BATCH_RELEASE_GATE_ORIGINAL_SETUP_FAILURE_CEILING,
+            ),
+            (
+                &schema["$defs"]["delayed_response_ambiguity"]["allOf"][1]["properties"]
+                    ["setup_attempts"],
+                SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_ATTEMPT_CEILING,
+            ),
+            (
+                &schema["$defs"]["delayed_response_ambiguity"]["allOf"][1]["properties"]
+                    ["setup_failures"],
+                SESSION_MTLS_BATCH_RELEASE_GATE_DELAYED_SETUP_FAILURE_CEILING,
+            ),
+            (
+                &schema["properties"]["warm_read_p99_millis"],
+                SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS,
+            ),
+            (
+                &schema["properties"]["warm_read_p999_millis"],
+                SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS,
+            ),
+            (
+                &schema["properties"]["mutation_p99_millis"],
+                SESSION_MTLS_BATCH_RELEASE_GATE_P99_CEILING_MILLIS,
+            ),
+            (
+                &schema["properties"]["mutation_p999_millis"],
+                SESSION_MTLS_BATCH_RELEASE_GATE_P999_CEILING_MILLIS,
+            ),
+        ];
+        for (field_schema, ceiling) in maximum_schemas {
+            opc_schema_validate::validate(field_schema, &serde_json::json!(ceiling))
+                .expect("fixed schema ceiling is inclusive");
+            assert!(
+                opc_schema_validate::validate(field_schema, &serde_json::json!(ceiling + 1))
+                    .is_err(),
+                "schema rejects exact maximum plus one: ceiling={ceiling}"
+            );
+        }
+        for role in [
+            "old_credential_new_only_server",
+            "new_credential_old_root_server",
+        ] {
+            let wait_schema = &schema["$defs"][role]["allOf"][1]["properties"]["pool_wait_max"];
+            opc_schema_validate::validate(wait_schema, &serde_json::json!(0))
+                .expect("credential-negative wait high-water is fixed at zero");
+            assert!(
+                opc_schema_validate::validate(wait_schema, &serde_json::json!(1)).is_err(),
+                "credential-negative pool rejects pending queue high-water"
+            );
+        }
+        let saturated_client_skips_schema = &schema["properties"]["saturated_client_skips"];
+        opc_schema_validate::validate(saturated_client_skips_schema, &serde_json::json!(1))
+            .expect("one saturated-client skip is the fixed minimum evidence");
+        assert!(
+            opc_schema_validate::validate(saturated_client_skips_schema, &serde_json::json!(0))
+                .is_err(),
+            "schema rejects missing saturated-client skip evidence"
+        );
+        for field_schema in [
+            &schema["properties"]["aggregate_pool_wait_max"],
+            &schema["$defs"]["delayed_response_ambiguity"]["allOf"][1]["properties"]
+                ["pool_wait_max"],
+        ] {
+            opc_schema_validate::validate(field_schema, &serde_json::json!(64))
+                .expect("typed overload evidence requires the exact fixed queue high-water");
+            for contradictory in [63, 65] {
+                assert!(
+                    opc_schema_validate::validate(field_schema, &serde_json::json!(contradictory))
+                        .is_err(),
+                    "schema rejects contradictory overload queue high-water={contradictory}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn bounded_line_reader_rejects_oversize_before_next_frame() {
         let input = format!(
@@ -5096,6 +6647,7 @@ mod tests {
                 remote_node_index: 1,
             },
             QualificationNodeCommand::LifecycleMetrics,
+            QualificationNodeCommand::ConsensusDiagnostics,
             QualificationNodeCommand::SetConsensusRpcAvailability {
                 availability: QualificationConsensusRpcAvailability::Available,
             },
@@ -5109,6 +6661,9 @@ mod tests {
                     .collect(),
             },
             QualificationNodeCommand::ArmStatelessConsumerDelayedResponse,
+            QualificationNodeCommand::ArmStatelessConsumerResponseHolds,
+            QualificationNodeCommand::StatelessConsumerResponseHoldStatus,
+            QualificationNodeCommand::ReleaseStatelessConsumerResponseHolds,
             QualificationNodeCommand::SecurityMetrics,
             QualificationNodeCommand::StartTrafficWatch,
             QualificationNodeCommand::ReconcileTrafficWatch,
@@ -5167,6 +6722,7 @@ mod tests {
                 lease_handle: "lease".to_owned(),
             },
             QualificationNodeCommand::Shutdown,
+            QualificationNodeCommand::ConsumerTlsPeerCredentialRejections,
         ];
         let kinds = commands
             .iter()
@@ -5964,6 +7520,25 @@ mod tests {
         assert!(!rendered.contains("node.sqlite"));
         assert!(!rendered.contains("127.0.0.1"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn consumer_tls_peer_credential_rejection_control_frames_are_closed() {
+        let command = QualificationNodeCommand::ConsumerTlsPeerCredentialRejections;
+        assert_eq!(
+            serde_json::to_string(&command).expect("encode rejection command"),
+            r#"{"command":"consumer_tls_peer_credential_rejections"}"#
+        );
+        assert!(command.validate().is_ok());
+
+        let reply = QualificationNodeReply::ConsumerTlsPeerCredentialRejections { rejections: 7 };
+        let encoded = serde_json::to_vec(&reply).expect("encode rejection reply");
+        let decoded = serde_json::from_slice::<QualificationNodeReply>(&encoded)
+            .expect("round-trip rejection reply");
+        assert!(matches!(
+            decoded,
+            QualificationNodeReply::ConsumerTlsPeerCredentialRejections { rejections: 7 }
+        ));
     }
 
     #[test]

@@ -52,12 +52,16 @@ struct TestPki {
 
 impl TestPki {
     fn new() -> Self {
+        Self::new_named("persistent consumer test CA")
+    }
+
+    fn new_named(common_name: &str) -> Self {
         let key = rcgen::KeyPair::generate().expect("test CA key");
         let mut parameters = rcgen::CertificateParams::default();
         parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         parameters
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "persistent consumer test CA");
+            .push(rcgen::DnType::CommonName, common_name);
         Self {
             ca: rcgen::CertifiedIssuer::self_signed(parameters, key).expect("test CA certificate"),
         }
@@ -66,6 +70,19 @@ impl TestPki {
     fn client_config(&self, spiffe_id: &str) -> AuthenticatedClientConfig {
         let (_source, config) = self.rotating_client_config(spiffe_id);
         config
+    }
+
+    fn client_config_trusting(
+        &self,
+        spiffe_id: &str,
+        trusted: &TestPki,
+    ) -> AuthenticatedClientConfig {
+        let (_source, receiver) =
+            tokio::sync::watch::channel(Some(self.identity_state_with_trust(spiffe_id, trusted)));
+        TlsConfigBuilder::new(receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .expect("test client TLS config")
     }
 
     fn rotating_client_config(
@@ -92,6 +109,14 @@ impl TestPki {
     }
 
     fn identity_state(&self, spiffe_id: &str) -> opc_identity::IdentityState {
+        self.identity_state_with_trust(spiffe_id, self)
+    }
+
+    fn identity_state_with_trust(
+        &self,
+        spiffe_id: &str,
+        trusted: &TestPki,
+    ) -> opc_identity::IdentityState {
         let mut parameters = rcgen::CertificateParams::default();
         parameters.subject_alt_names.push(rcgen::SanType::URI(
             rcgen::string::Ia5String::try_from(spiffe_id).expect("test SPIFFE URI"),
@@ -106,10 +131,15 @@ impl TestPki {
         let certificates =
             parse_certs_pem(&(certificate.pem() + &self.ca.pem())).expect("test certificate chain");
         let private_key = parse_key_pem(&key.serialize_pem()).expect("test private key");
+        let trust_certificates = if std::ptr::eq(self, trusted) {
+            self.ca.pem()
+        } else {
+            self.ca.pem() + &trusted.ca.pem()
+        };
         let mut bundles = opc_identity::TrustBundleSet::new();
         bundles.insert(TrustBundle {
             trust_domain: opc_identity::TrustDomain::new("test.example").expect("trust domain"),
-            certificates: parse_certs_pem(&self.ca.pem()).expect("test trust bundle"),
+            certificates: parse_certs_pem(&trust_certificates).expect("test trust bundle"),
         });
         build_identity_state(certificates, private_key, bundles).expect("test identity state")
     }
@@ -765,6 +795,106 @@ async fn assert_single_caller_setup_epoch_supersession(publication: SetupEpochPu
 async fn credential_and_material_epochs_supersede_single_blocked_pool_recovery() {
     assert_single_caller_setup_epoch_supersession(SetupEpochPublication::Reauthentication).await;
     assert_single_caller_setup_epoch_supersession(SetupEpochPublication::Material).await;
+}
+
+#[tokio::test]
+async fn persistent_v2_prewarm_proves_server_peer_credential_rejection() {
+    let server_pki = TestPki::new_named("persistent consumer unknown-CA server root");
+    let client_pki = TestPki::new_named("persistent consumer unknown-CA client root");
+    let server_spiffe = spiffe("v2-unknown-ca-server");
+    let client_spiffe = spiffe("v2-unknown-ca-client");
+    let (authorizer, _scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(ControlledConsumer::default());
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        server_pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let matching = PersistentSessionConsumerClient::try_from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            Arc::clone(&resolver),
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            voter_authority.clone(),
+            server_pki.client_config(&client_spiffe),
+        )
+        .with_operation_timeout(Duration::from_secs(2)),
+        PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(1_500),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("one-attempt persistent config"),
+    )
+    .expect("matching persistent client");
+    assert_eq!(matching.prewarm_v2().await, Ok(()));
+    let matching_diagnostics = matching.v2_diagnostics();
+    assert_eq!(matching_diagnostics.setup_attempts, 1);
+    assert_eq!(matching_diagnostics.setup_successes, 1);
+    assert_eq!(
+        handle.tls_peer_credential_rejections(),
+        0,
+        "matching mTLS prewarm never increments the server rejection proof"
+    );
+    matching.shutdown().await;
+
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        voter_authority,
+        client_pki.client_config_trusting(&client_spiffe, &server_pki),
+    )
+    .with_operation_timeout(Duration::from_secs(2));
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        stateless,
+        PersistentSessionConsumerConfig::try_new(
+            1,
+            0,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(1_500),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("one-attempt persistent config"),
+    )
+    .expect("persistent client");
+
+    let rejections_before = handle.tls_peer_credential_rejections();
+    let result = client.prewarm_v2().await;
+    assert!(
+        matches!(
+            result,
+            Err(SessionConsumerClientError::Authentication
+                | SessionConsumerClientError::Unavailable)
+        ),
+        "a client may observe the local server rejection as an alert or a closed transport"
+    );
+    let diagnostics = client.v2_diagnostics();
+    assert_eq!(diagnostics.setup_attempts, 1);
+    assert_eq!(diagnostics.setup_failures, 1);
+    assert_eq!(diagnostics.setup_successes, 0);
+    assert_eq!(diagnostics.active, 0);
+    assert_eq!(diagnostics.idle, 0);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        handle.tls_peer_credential_rejections(),
+        rejections_before + 1,
+        "exactly one locally detected server peer-credential rejection is recorded"
+    );
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
 }
 
 #[tokio::test]

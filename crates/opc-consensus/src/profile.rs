@@ -158,6 +158,14 @@ pub const DURABLE_CONSENSUS_TIMING_PROFILE: DurableConsensusTimingProfile =
 pub const DURABLE_CONSENSUS_OPERATION_TIMEOUT: Duration =
     DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout();
 
+/// Fixed interval between authenticated remote-retirement setup probes for one
+/// exact durable-consensus peer and local authentication epoch.
+///
+/// This is deliberately independent from Openraft election/vote timing and
+/// from generic transport reconnect backoff: it bounds negative admission
+/// probes after a remote peer has authenticated and declined bootstrap.
+pub const DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Maximum number of log entries admitted to one durable AppendEntries batch.
 pub const DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES: usize = 64;
 
@@ -339,6 +347,10 @@ mod tests {
         assert_eq!(profile.election_timeout_min_millis, 5_000);
         assert_eq!(profile.election_timeout_max_millis, 8_000);
         assert_eq!(profile.operation_timeout(), Duration::from_millis(10_000));
+        assert_eq!(
+            DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
+            Duration::from_secs(5)
+        );
         assert_eq!(profile.server_idle_timeout(), Duration::from_millis(30_000));
         assert_eq!(
             profile.client_connection_reuse_limit(),

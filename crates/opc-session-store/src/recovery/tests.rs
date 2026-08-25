@@ -45,7 +45,8 @@ use crate::{
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
     SessionLeaseManager, SqliteSessionBackend, StateClass, StateType, StoredSessionRecord,
     SystemClock, FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_SCHEMA_V1,
-    REPLICATION_TX_ID_MAX_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, REPLICATION_TX_ID_MAX_BYTES,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 
 const RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
@@ -53,6 +54,18 @@ const RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
         .election_timeout_max_millis
         .saturating_mul(2)
         .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis),
+);
+
+type V3ReceiptFixture = ([u8; 56], [u8; 32], [u8; 32], Vec<u8>, [u8; 32]);
+
+type V3HistoryLifecycle = (
+    Option<i64>,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
 );
 
 #[derive(Default)]
@@ -1349,6 +1362,13 @@ fn current_recovery_inspection_enforces_the_consensus_payload_cap() {
             0,
         ),
     );
+    append_current_blank_checkpoint(
+        &replica,
+        LogId::new(
+            CommittedLeaderId::new(1, *members.iter().next().expect("member")),
+            1,
+        ),
+    );
     let conn = Connection::open(&replica.database_path).expect("open current replica");
     let oversized = sealed_recovery_record(1_048_577);
     crate::sqlite::ops::insert_or_replace_record_sync(&conn, &oversized)
@@ -1559,9 +1579,132 @@ fn append_current_blank_checkpoint(
         .expect("checkpoint current blank checkpoint");
 }
 
+fn install_current_purge_floor(conn: &Connection, floor: &LogId<SessionConsensusNodeId>) {
+    conn.execute(
+        "INSERT OR REPLACE INTO consensus_purged (singleton, configuration_epoch, term, log_index, log_id_json) VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            i64::try_from(identity().configuration_epoch().get()).expect("configuration epoch"),
+            i64::try_from(floor.leader_id.term).expect("floor term"),
+            i64::try_from(floor.index).expect("floor index"),
+            serde_json::to_vec(floor).expect("encode purge floor"),
+        ],
+    )
+    .expect("persist exact purge floor");
+}
+
+fn pad_current_log_entry(conn: &Connection, index: u64, minimum_bytes: usize) {
+    let mut entry: Vec<u8> = conn
+        .query_row(
+            "SELECT entry_json FROM consensus_log WHERE log_index = ?1",
+            [i64::try_from(index).expect("log index")],
+            |row| row.get(0),
+        )
+        .expect("read valid log entry");
+    entry.resize(minimum_bytes, b' ');
+    conn.execute(
+        "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+        params![entry, i64::try_from(index).expect("log index")],
+    )
+    .expect("pad valid log entry");
+}
+
+fn bounded_current_recovery_limits(replica: &RecoveryReplica) -> RecoveryLimits {
+    let database_bytes = std::fs::metadata(&replica.database_path)
+        .expect("database metadata")
+        .len();
+    RecoveryLimits::try_new(
+        database_bytes.checked_mul(2).expect("database bound"),
+        database_bytes.checked_mul(2).expect("snapshot bound"),
+        1_000,
+        64 * 1024,
+    )
+    .expect("bounded recovery limits")
+}
+
+#[test]
+fn current_recovery_capacity_masks_retained_purged_prefix() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let id = replica_id("retained-purged-prefix");
+    let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+    let members = node_set(&[id]);
+    let leader = *members.iter().next().expect("member");
+    let floor = LogId::new(CommittedLeaderId::new(1, leader), 0);
+    claim_current_replica(&replica, &members, floor);
+    append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(1, leader), 1));
+
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    install_current_purge_floor(&conn, &floor);
+    pad_current_log_entry(&conn, floor.index, 128 * 1024);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint retained prefix");
+    drop(conn);
+
+    let limits = bounded_current_recovery_limits(&replica);
+    let before = inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica: &replica,
+        identity: identity(),
+        expected_members: &members,
+        limits,
+    })
+    .expect("retained purged prefix does not consume logical recovery capacity");
+
+    let conn = Connection::open(&replica.database_path).expect("open retained prefix");
+    conn.execute("DELETE FROM consensus_log WHERE log_index <= ?1", [0])
+        .expect("physically prune stale prefix");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint physical prune");
+    drop(conn);
+
+    let after = inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica: &replica,
+        identity: identity(),
+        expected_members: &members,
+        limits,
+    })
+    .expect("physically pruned replica remains recoverable");
+    assert_eq!(before.branch_digest(), after.branch_digest());
+    assert_eq!(before.logical_state_digest(), after.logical_state_digest());
+    assert_eq!(before.committed_index(), after.committed_index());
+    assert_eq!(before.applied_index(), after.applied_index());
+    assert_eq!(before.local_head_index(), after.local_head_index());
+}
+
+#[test]
+fn current_recovery_capacity_rejects_an_oversized_authoritative_suffix() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let id = replica_id("oversized-authoritative-suffix");
+    let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+    let members = node_set(&[id]);
+    let leader = *members.iter().next().expect("member");
+    let floor = LogId::new(CommittedLeaderId::new(1, leader), 0);
+    claim_current_replica(&replica, &members, floor);
+    append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(1, leader), 1));
+
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    install_current_purge_floor(&conn, &floor);
+    pad_current_log_entry(&conn, 1, 128 * 1024);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint oversized suffix");
+    drop(conn);
+
+    assert_eq!(
+        inspect_replica(InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: bounded_current_recovery_limits(&replica),
+        }),
+        Err(RecoveryError::WorkLimitExceeded),
+    );
+}
+
 fn current_receipt_inspection_fixture(
     root: &Path,
 ) -> (RecoveryReplica, BTreeSet<SessionConsensusNodeId>) {
+    std::fs::create_dir_all(root).expect("current recovery fixture root");
     let id = replica_id("receipt-inspection-replica");
     let replica = create_legacy_replica(root, id.clone(), 3);
     let members = node_set(&[id]);
@@ -1573,7 +1716,421 @@ fn current_receipt_inspection_fixture(
             0,
         ),
     );
+    append_current_blank_checkpoint(
+        &replica,
+        LogId::new(
+            CommittedLeaderId::new(1, *members.iter().next().expect("member")),
+            1,
+        ),
+    );
     (replica, members)
+}
+
+fn activate_v3_history_fixture(
+    replica: &RecoveryReplica,
+    active_epoch: u64,
+    retired_through_epoch: u64,
+    current_bound_count: u64,
+) {
+    let conn = Connection::open(&replica.database_path).expect("open V3 fixture");
+    conn.execute_batch(
+        r#"
+CREATE TABLE consensus_fenced_transition_v2_receipts (
+    request_id BLOB NOT NULL PRIMARY KEY CHECK (length(request_id) = 56),
+    history_epoch INTEGER NOT NULL CHECK (history_epoch > 0),
+    ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+    configuration_epoch INTEGER NOT NULL CHECK (configuration_epoch > 0),
+    payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    retained_until TEXT NOT NULL CHECK (octet_length(retained_until) = 30),
+    binding_digest BLOB NOT NULL CHECK (length(binding_digest) = 32),
+    response_json BLOB CHECK (response_json IS NULL OR length(response_json) BETWEEN 1 AND 17408),
+    response_digest BLOB CHECK (response_digest IS NULL OR length(response_digest) = 32),
+    CHECK ((response_json IS NULL AND response_digest IS NULL) OR (response_json IS NOT NULL AND response_digest IS NOT NULL)),
+    UNIQUE (history_epoch, ordinal),
+    FOREIGN KEY(configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+CREATE INDEX consensus_fenced_transition_v2_receipts_reclaim ON consensus_fenced_transition_v2_receipts (history_epoch, ordinal);
+CREATE INDEX consensus_fenced_transition_v2_receipts_due ON consensus_fenced_transition_v2_receipts (retained_until, request_id) WHERE response_json IS NOT NULL;
+CREATE TABLE consensus_fenced_transition_v2_activation (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
+    scope_configuration_id BLOB NOT NULL CHECK (length(scope_configuration_id) = 32),
+    scope_configuration_epoch INTEGER NOT NULL CHECK (scope_configuration_epoch > 0),
+    voter_set_digest BLOB NOT NULL CHECK (length(voter_set_digest) = 32),
+    profile_digest BLOB NOT NULL CHECK (length(profile_digest) = 32),
+    FOREIGN KEY(storage_configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+CREATE TABLE consensus_fenced_transition_v2_history (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    storage_configuration_epoch INTEGER NOT NULL CHECK (storage_configuration_epoch > 0),
+    profile_digest BLOB NOT NULL CHECK (length(profile_digest) = 32),
+    active_epoch INTEGER NOT NULL CHECK (active_epoch > 0),
+    retired_through_epoch INTEGER NOT NULL CHECK (retired_through_epoch >= 0),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    current_bound_count INTEGER NOT NULL CHECK (current_bound_count BETWEEN 0 AND 131072),
+    reclaim_epoch INTEGER CHECK (reclaim_epoch IS NULL OR reclaim_epoch > 0),
+    reclaim_cursor_ordinal INTEGER CHECK (reclaim_cursor_ordinal IS NULL OR reclaim_cursor_ordinal >= 0),
+    reclaim_remaining INTEGER CHECK (reclaim_remaining IS NULL OR reclaim_remaining >= 0),
+    reclaimed_entries INTEGER NOT NULL DEFAULT 0 CHECK (reclaimed_entries >= 0),
+    CHECK ((reclaim_epoch IS NULL AND reclaim_cursor_ordinal IS NULL AND reclaim_remaining IS NULL AND active_epoch - retired_through_epoch BETWEEN 1 AND 8) OR (reclaim_epoch IS NOT NULL AND reclaim_epoch = retired_through_epoch AND reclaim_cursor_ordinal IS NOT NULL AND reclaim_remaining IS NOT NULL AND active_epoch - retired_through_epoch BETWEEN 1 AND 7)),
+    FOREIGN KEY(storage_configuration_epoch) REFERENCES consensus_identity(configuration_epoch)
+);
+"#,
+    )
+    .expect("install exact V3 schema");
+    conn.execute(
+        "UPDATE consensus_identity SET schema_version = ?1, fenced_transition_receipt_ledger_activated = 1 WHERE singleton = 1",
+        [i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 2],
+    )
+    .expect("raise V3 fence");
+    conn.execute(
+        "INSERT INTO consensus_fenced_transition_v2_history (singleton, storage_configuration_epoch, profile_digest, active_epoch, retired_through_epoch, generation, current_bound_count, reclaim_epoch, reclaim_cursor_ordinal, reclaim_remaining, reclaimed_entries) VALUES (1, ?1, ?2, ?3, ?4, 0, ?5, NULL, NULL, NULL, 0)",
+        params![
+            i64::try_from(identity().configuration_epoch().get()).expect("epoch"),
+            crate::fenced_transition::fenced_transition_v2_profile_digest().as_slice(),
+            i64::try_from(active_epoch).expect("active epoch"),
+            i64::try_from(retired_through_epoch).expect("retired epoch"),
+            i64::try_from(current_bound_count).expect("count"),
+        ],
+    )
+    .expect("insert V3 lifecycle singleton");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint V3 fixture");
+}
+
+fn insert_valid_v3_receipt_fixture(
+    replica: &RecoveryReplica,
+    history_epoch: u64,
+    ordinal: u64,
+) -> V3ReceiptFixture {
+    insert_valid_v3_receipt_fixture_with_marker(replica, history_epoch, ordinal, 0xA1)
+}
+
+fn insert_valid_v3_receipt_fixture_with_marker(
+    replica: &RecoveryReplica,
+    history_epoch: u64,
+    ordinal: u64,
+    marker: u8,
+) -> V3ReceiptFixture {
+    let logical_time = receipt_inspection_timestamp();
+    let retained_until =
+        crate::checked_session_deadline(logical_time, FENCED_TRANSITION_OUTCOME_RETENTION)
+            .expect("V3 receipt deadline");
+    let retained_until = crate::sqlite::ops::format_rfc3339_normalized(retained_until);
+    let mut request_id = [marker; 56];
+    request_id[..8].copy_from_slice(&history_epoch.to_be_bytes());
+    let payload_digest =
+        consensus::fenced_transition_v2_payload_digest_for_request_id(identity(), request_id)
+            .expect("V3 payload digest");
+    let binding_digest = consensus::fenced_transition_v2_receipt_binding_digest(
+        identity(),
+        request_id,
+        history_epoch,
+        ordinal,
+        payload_digest,
+        &retained_until,
+    )
+    .expect("V3 receipt binding");
+    let response = SessionConsensusResponse {
+        result: Err(crate::StoreError::NotFound),
+        sequence: 1,
+        digest: Some(SessionConsensusEntryDigest::from_bytes([0xA3; 32])),
+        logical_time: Some(logical_time),
+        raft_log_index: 1,
+    };
+    let response_json =
+        consensus::encode_fenced_transition_v2_response(&response).expect("encode V3 response");
+    let response_digest =
+        consensus::fenced_transition_v2_receipt_response_digest(binding_digest, &response_json)
+            .expect("V3 response digest");
+    let conn = Connection::open(&replica.database_path).expect("open V3 receipt fixture");
+    conn.execute(
+        "UPDATE consensus_machine SET application_sequence = 1, logical_time = ?1 WHERE singleton = 1",
+        [crate::sqlite::ops::format_rfc3339_normalized(logical_time)],
+    )
+    .expect("advance V3 fixture machine");
+    conn.execute(
+        "INSERT INTO consensus_fenced_transition_v2_receipts (request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            request_id.as_slice(),
+            i64::try_from(history_epoch).expect("history epoch"),
+            i64::try_from(ordinal).expect("ordinal"),
+            i64::try_from(identity().configuration_epoch().get()).expect("configuration epoch"),
+            payload_digest.as_slice(),
+            retained_until,
+            binding_digest.as_slice(),
+            response_json.as_slice(),
+            response_digest.as_slice(),
+        ],
+    )
+    .expect("insert valid V3 receipt");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint V3 receipt fixture");
+    (
+        request_id,
+        payload_digest,
+        binding_digest,
+        response_json,
+        response_digest,
+    )
+}
+
+fn insert_v3_tombstone_rows_in_epoch(
+    replica: &RecoveryReplica,
+    history_epoch: u64,
+    first_ordinal: u64,
+    count: usize,
+) {
+    let logical_time = receipt_inspection_timestamp();
+    let retained_until =
+        crate::checked_session_deadline(logical_time, FENCED_TRANSITION_OUTCOME_RETENTION)
+            .expect("V3 tombstone deadline");
+    let retained_until = crate::sqlite::ops::format_rfc3339_normalized(retained_until);
+    let mut conn = Connection::open(&replica.database_path).expect("open V3 tombstone fixture");
+    let transaction = conn.transaction().expect("begin V3 tombstone fixture");
+    let mut insert = transaction
+        .prepare(
+            "INSERT INTO consensus_fenced_transition_v2_receipts (request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+        )
+        .expect("prepare V3 tombstone insert");
+    for offset in 0..count {
+        let ordinal = first_ordinal
+            .checked_add(u64::try_from(offset).expect("V3 tombstone offset"))
+            .expect("V3 tombstone ordinal");
+        let mut request_id = [0x54_u8; 56];
+        request_id[..8].copy_from_slice(&history_epoch.to_be_bytes());
+        request_id[48..].copy_from_slice(&ordinal.to_be_bytes());
+        let payload_digest =
+            consensus::fenced_transition_v2_payload_digest_for_request_id(identity(), request_id)
+                .expect("V3 tombstone payload");
+        let binding_digest = consensus::fenced_transition_v2_receipt_binding_digest(
+            identity(),
+            request_id,
+            history_epoch,
+            ordinal,
+            payload_digest,
+            &retained_until,
+        )
+        .expect("V3 tombstone binding");
+        insert
+            .execute(params![
+                request_id.as_slice(),
+                i64::try_from(history_epoch).expect("V3 tombstone history epoch"),
+                i64::try_from(ordinal).expect("V3 tombstone ordinal"),
+                i64::try_from(identity().configuration_epoch().get())
+                    .expect("V3 tombstone configuration epoch"),
+                payload_digest.as_slice(),
+                retained_until.as_str(),
+                binding_digest.as_slice(),
+            ])
+            .expect("insert V3 tombstone");
+    }
+    drop(insert);
+    transaction.commit().expect("commit V3 tombstone fixture");
+    conn.execute(
+        "UPDATE consensus_machine SET logical_time = ?1 WHERE singleton = 1",
+        [retained_until.as_str()],
+    )
+    .expect("advance V3 tombstone fixture clock");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint V3 tombstones");
+}
+
+fn begin_v3_reclaim_fixture(
+    replica: &RecoveryReplica,
+    reclaim_epoch: u64,
+    cursor: u64,
+    remaining: u64,
+) {
+    let conn = Connection::open(&replica.database_path).expect("open V3 reclaim fixture");
+    conn.execute(
+        "UPDATE consensus_fenced_transition_v2_history SET reclaim_epoch = ?1, reclaim_cursor_ordinal = ?2, reclaim_remaining = ?3 WHERE singleton = 1",
+        params![
+            i64::try_from(reclaim_epoch).expect("reclaim epoch"),
+            i64::try_from(cursor).expect("reclaim cursor"),
+            i64::try_from(remaining).expect("reclaim remaining"),
+        ],
+    )
+    .expect("begin V3 reclaim");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint V3 reclaim");
+}
+
+fn inspect_current_fixture(
+    replica: &RecoveryReplica,
+    members: &BTreeSet<SessionConsensusNodeId>,
+) -> Result<RecoveryReplicaEvidence, RecoveryError> {
+    inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica,
+        identity: identity(),
+        expected_members: members,
+        limits: RecoveryLimits::default(),
+    })
+}
+
+fn v3_history_lifecycle(replica: &RecoveryReplica) -> V3HistoryLifecycle {
+    let conn = Connection::open(&replica.database_path).expect("open V3 lifecycle fixture");
+    conn.query_row(
+        "SELECT active_epoch, retired_through_epoch, current_bound_count, reclaim_epoch, reclaim_cursor_ordinal, reclaim_remaining, reclaimed_entries FROM consensus_fenced_transition_v2_history WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+    )
+    .expect("read V3 lifecycle")
+}
+
+#[test]
+fn current_recovery_inspection_accepts_populated_v3_history_and_reopen_preserves_branch() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(temp.path());
+    activate_v3_history_fixture(&replica, 3, 2, 1);
+    let final_ordinal =
+        u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES).expect("V3 maximum ordinal");
+    let reclaim_remaining = 1_024_u64;
+    let reclaim_cursor = final_ordinal
+        .checked_sub(reclaim_remaining)
+        .expect("V3 reclaim cursor");
+    insert_valid_v3_receipt_fixture_with_marker(&replica, 2, final_ordinal, 0xA2);
+    insert_valid_v3_receipt_fixture_with_marker(&replica, 3, 1, 0xA3);
+    insert_v3_tombstone_rows_in_epoch(
+        &replica,
+        2,
+        reclaim_cursor
+            .checked_add(1)
+            .expect("V3 first retained ordinal"),
+        usize::try_from(reclaim_remaining - 1).expect("V3 retained tombstone count"),
+    );
+    begin_v3_reclaim_fixture(&replica, 2, reclaim_cursor, reclaim_remaining);
+
+    let conn = Connection::open(&replica.database_path).expect("open V3 validation fixture");
+    consensus::validate_fenced_transition_v2_receipts_sync(&conn, identity())
+        .expect("validate populated V3 ledger");
+    drop(conn);
+
+    let lifecycle_before = v3_history_lifecycle(&replica);
+    let before = inspect_current_fixture(&replica, &members).expect("inspect V3 replica");
+    drop(SqliteSessionBackend::open(&replica.database_path).expect("reopen V3 replica"));
+    let after = inspect_current_fixture(&replica, &members).expect("reinspect V3 replica");
+    assert_eq!(before.branch_digest(), after.branch_digest());
+    assert_eq!(
+        lifecycle_before,
+        v3_history_lifecycle(&replica),
+        "inspection/reopen must neither synthesize nor advance V3 retirement",
+    );
+}
+
+#[test]
+fn current_recovery_v3_rejects_lifecycle_corruption_and_distinguishes_floor() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (valid, members) = current_receipt_inspection_fixture(&temp.path().join("valid"));
+    activate_v3_history_fixture(&valid, 5, 4, 0);
+    let valid_evidence = inspect_current_fixture(&valid, &members).expect("valid V3 inspection");
+
+    let (higher_floor, higher_members) =
+        current_receipt_inspection_fixture(&temp.path().join("higher-floor"));
+    activate_v3_history_fixture(&higher_floor, 6, 5, 0);
+    let higher_evidence =
+        inspect_current_fixture(&higher_floor, &higher_members).expect("higher floor inspection");
+    assert_ne!(
+        valid_evidence.branch_digest(),
+        higher_evidence.branch_digest()
+    );
+
+    for (label, sql) in [
+        (
+            "retired floor",
+            "UPDATE consensus_fenced_transition_v2_history SET retired_through_epoch = 5",
+        ),
+        (
+            "count mismatch",
+            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = 1",
+        ),
+        (
+            "reclaim cursor shape",
+            "UPDATE consensus_fenced_transition_v2_history SET reclaim_epoch = 4, reclaim_cursor_ordinal = 2, reclaim_remaining = 1, current_bound_count = 0",
+        ),
+    ] {
+        let (replica, case_members) = current_receipt_inspection_fixture(&temp.path().join(label));
+        activate_v3_history_fixture(&replica, 5, 4, 0);
+        let conn = Connection::open(&replica.database_path).expect("open corrupt V3 fixture");
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("allow lifecycle corruption");
+        conn.execute_batch(sql)
+            .expect("inject lifecycle corruption");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint lifecycle corruption");
+        drop(conn);
+        assert_eq!(
+            inspect_current_fixture(&replica, &case_members),
+            Err(RecoveryError::CorruptReplica),
+            "{label}",
+        );
+    }
+}
+
+#[test]
+fn current_recovery_v3_rejects_profile_and_receipt_commitment_corruption() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(&temp.path().join("profile"));
+    activate_v3_history_fixture(&replica, 5, 4, 0);
+    let conn = Connection::open(&replica.database_path).expect("open V3 fixture");
+    conn.execute(
+        "UPDATE consensus_fenced_transition_v2_history SET profile_digest = ?1 WHERE singleton = 1",
+        [[0xE1_u8; 32].as_slice()],
+    )
+    .expect("corrupt immutable V3 profile");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint corrupt profile");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&replica, &members),
+        Err(RecoveryError::CorruptReplica)
+    );
+
+    for (label, column, value) in [
+        ("payload", "payload_digest", vec![0xA2; 32]),
+        ("binding", "binding_digest", vec![0xA4; 32]),
+        ("response", "response_digest", vec![0xA5; 32]),
+    ] {
+        let (replica, members) = current_receipt_inspection_fixture(&temp.path().join(label));
+        activate_v3_history_fixture(&replica, 5, 4, 1);
+        insert_valid_v3_receipt_fixture(&replica, 5, 1);
+        let conn = Connection::open(&replica.database_path).expect("open V3 receipt corruption");
+        conn.execute(
+            &format!("UPDATE consensus_fenced_transition_v2_receipts SET {column} = ?1"),
+            [value],
+        )
+        .expect("corrupt V3 receipt commitment");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint V3 receipt corruption");
+        drop(conn);
+        assert_eq!(
+            inspect_current_fixture(&replica, &members),
+            Err(RecoveryError::CorruptReplica),
+            "{label}",
+        );
+    }
+
+    let (replica, members) = current_receipt_inspection_fixture(&temp.path().join("codec"));
+    activate_v3_history_fixture(&replica, 5, 4, 1);
+    let (_, _, binding_digest, _, _) = insert_valid_v3_receipt_fixture(&replica, 5, 1);
+    let malformed_codec = b"not-a-v2-codec";
+    let matching_digest =
+        consensus::fenced_transition_v2_receipt_response_digest(binding_digest, malformed_codec)
+            .expect("malformed codec digest");
+    let conn = Connection::open(&replica.database_path).expect("open V3 codec corruption");
+    conn.execute(
+        "UPDATE consensus_fenced_transition_v2_receipts SET response_json = ?1, response_digest = ?2",
+        params![malformed_codec.as_slice(), matching_digest.as_slice()],
+    )
+    .expect("inject self-consistent malformed V3 codec");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint V3 codec corruption");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&replica, &members),
+        Err(RecoveryError::CorruptReplica)
+    );
 }
 
 fn receipt_inspection_timestamp() -> Timestamp {
@@ -2127,7 +2684,10 @@ fn planning_rejects_untrusted_legacy_schema_objects() {
             "trigger",
             "CREATE TRIGGER hostile_trigger AFTER UPDATE ON key_fences BEGIN DELETE FROM leases; END;",
         ),
-        ("view", "CREATE VIEW hostile_view AS SELECT * FROM session_records;"),
+        (
+            "view",
+            "CREATE VIEW hostile_view AS SELECT * FROM session_records;",
+        ),
         ("table", "CREATE TABLE hostile_table (secret BLOB);"),
     ] {
         let temp = tempfile::tempdir().expect("schema test root");

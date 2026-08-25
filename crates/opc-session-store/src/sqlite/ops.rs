@@ -519,7 +519,7 @@ pub(crate) fn get_sync(
         _ => {
             return Err(StoreError::Serialization(format!(
                 "unknown state class: {state_class_str}"
-            )))
+            )));
         }
     };
     let state_type = StateType::new(state_type_str).map_err(StoreError::Serialization)?;
@@ -550,7 +550,7 @@ pub(crate) fn get_sync(
         _ => {
             return Err(StoreError::Serialization(format!(
                 "unknown payload encoding: {encoding}"
-            )))
+            )));
         }
     };
 
@@ -614,7 +614,7 @@ impl RestoreScanCandidate {
             _ => {
                 return Err(StoreError::Serialization(
                     "persisted session timestamp is invalid".into(),
-                ))
+                ));
             }
         };
         Ok(Self {
@@ -746,7 +746,7 @@ fn restore_scan_row_budget(row: &Row<'_>) -> Result<RestoreScanRowBudget, StoreE
         _ => {
             return Err(StoreError::Serialization(
                 "persisted session timestamp is invalid".into(),
-            ))
+            ));
         }
     };
     let payload_bytes = usize::try_from(restore_scan_integer(row, 10)?).map_err(|_| {

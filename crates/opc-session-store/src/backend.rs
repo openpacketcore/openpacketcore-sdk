@@ -17,14 +17,20 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     capability::BackendCapabilities,
+    consensus::types::validate_fenced_transition_v2_batch,
     error::{LeaseError, StoreError},
     fenced_transition::{
         AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionMutation,
         FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
-        FencedTransitionRequestId, FencedTransitionStatus, PreparedFencedTransition,
-        PreparedFencedTransitionLookup, PreparedFencedTransitionProtection,
+        FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2Capability,
+        FencedTransitionV2Effect, FencedTransitionV2HistoryState, FencedTransitionV2Request,
+        FencedTransitionV2Status, PreparedFencedTransition, PreparedFencedTransitionLookup,
+        PreparedFencedTransitionProtection,
     },
-    fenced_transition_journal::PreparedFencedTransitionJournal,
+    fenced_transition_journal::{
+        FencedTransitionV2JournalScope, FencedTransitionV2PreparedJournal,
+        PreparedFencedTransitionJournal,
+    },
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, Generation, OwnerId, SessionKey},
     record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord},
@@ -1428,6 +1434,119 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
+    /// Advertise the explicit epoch-fenced V2 receipt-history contract.
+    ///
+    /// This is intentionally separate from [`Self::fenced_transition_capability`].
+    /// A caller using the original V1 API must never be upgraded to V2 merely
+    /// because a backend also implements it.
+    async fn fenced_transition_v2_capability(
+        &self,
+    ) -> Result<Option<crate::fenced_transition::FencedTransitionV2Capability>, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_epoch_history_v2".into(),
+        ))
+    }
+
+    /// Read the active V2 receipt-history state.
+    ///
+    /// This exposes only the bounded public state needed to select a V2
+    /// request epoch; retirement and reclaim authority remain internal to the
+    /// consensus implementation.
+    async fn fenced_transition_v2_history_state(
+        &self,
+    ) -> Result<crate::fenced_transition::FencedTransitionV2HistoryState, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_epoch_history_v2".into(),
+        ))
+    }
+
+    /// Commit one explicit V2 atomic transition.
+    ///
+    /// V2 has its own full request-ID commitment and bounded, non-absorbing
+    /// history contract. It is never selected by the V1 method above.
+    async fn fenced_transition_v2(
+        &self,
+        _request: crate::fenced_transition::FencedTransitionV2Request,
+    ) -> Result<crate::fenced_transition::FencedTransitionOutcome, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_epoch_history_v2".into(),
+        ))
+    }
+
+    /// Execute one V2 transition while preserving whether it crossed the
+    /// backend effect boundary.
+    ///
+    /// The conservative default preserves the legacy V2 result but never
+    /// reports `NotTransmitted`, because the older `Result` API did not carry
+    /// enough evidence to prove that distinction. V1 is intentionally not
+    /// adapted through this V2-only boundary.
+    async fn fenced_transition_v2_effect(
+        &self,
+        request: FencedTransitionV2Request,
+    ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
+        let request_id = request.request_id();
+        match self.fenced_transition_v2(request).await {
+            Ok(outcome) => FencedTransitionV2Effect::Resolved(Ok(outcome)),
+            Err(StoreError::FencedTransitionOutcomeUnknown) => {
+                FencedTransitionV2Effect::OutcomeUnknown {
+                    request_ids: vec![request_id],
+                }
+            }
+            Err(error) => FencedTransitionV2Effect::Resolved(Err(error)),
+        }
+    }
+
+    /// Coalesce ordered, independent V2 transitions into one physical backend
+    /// operation. Each item retains its own conditional result; this is not a
+    /// caller-visible all-or-nothing transaction.
+    async fn fenced_transition_v2_batch(
+        &self,
+        requests: Vec<FencedTransitionV2Request>,
+    ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
+        validate_fenced_transition_v2_batch(&requests)?;
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_epoch_history_v2_batch".into(),
+        ))
+    }
+
+    /// Execute a V2 batch while preserving its effect-boundary result.
+    ///
+    /// Legacy V2 implementations retain their existing batch result inside
+    /// `Resolved`; they never receive a synthetic `NotTransmitted` proof.
+    /// `OutcomeUnknown` names every exact V2 identity that must remain
+    /// recoverable after an ambiguous legacy batch failure.
+    async fn fenced_transition_v2_batch_effect(
+        &self,
+        requests: Vec<FencedTransitionV2Request>,
+    ) -> FencedTransitionV2Effect<
+        Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError>,
+    > {
+        if let Err(error) = validate_fenced_transition_v2_batch(&requests) {
+            return FencedTransitionV2Effect::Resolved(Err(error));
+        }
+        let request_ids = requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect();
+        match self.fenced_transition_v2_batch(requests).await {
+            Ok(outcomes) => FencedTransitionV2Effect::Resolved(Ok(outcomes)),
+            Err(StoreError::FencedTransitionOutcomeUnknown) => {
+                FencedTransitionV2Effect::OutcomeUnknown { request_ids }
+            }
+            Err(error) => FencedTransitionV2Effect::Resolved(Err(error)),
+        }
+    }
+
+    /// Recover the exact status of one complete V2 transition body.
+    async fn fenced_transition_v2_status(
+        &self,
+        _request: &crate::fenced_transition::FencedTransitionV2Request,
+    ) -> Result<crate::fenced_transition::FencedTransitionV2Status, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "atomic_fenced_transition_epoch_history_v2".into(),
+        ))
+    }
+
     /// Atomically compare the current generation and write the new record if it
     /// matches. Implementations MUST require a current [`LeaseGuard`] and MUST
     /// reject writes whose record owner/fence do not match that lease.
@@ -2199,6 +2318,8 @@ pub struct EncryptingSessionBackend<B: ?Sized, P: ?Sized> {
     provider: Arc<P>,
     backend_namespace: Arc<str>,
     fenced_transition_journal: Option<Arc<PreparedFencedTransitionJournal>>,
+    fenced_transition_v2_journal: Option<Arc<FencedTransitionV2PreparedJournal>>,
+    fenced_transition_v2_journal_scope: Option<FencedTransitionV2JournalScope>,
 }
 
 impl<B: ?Sized, P: ?Sized> Clone for EncryptingSessionBackend<B, P> {
@@ -2208,6 +2329,8 @@ impl<B: ?Sized, P: ?Sized> Clone for EncryptingSessionBackend<B, P> {
             provider: Arc::clone(&self.provider),
             backend_namespace: Arc::clone(&self.backend_namespace),
             fenced_transition_journal: self.fenced_transition_journal.clone(),
+            fenced_transition_v2_journal: self.fenced_transition_v2_journal.clone(),
+            fenced_transition_v2_journal_scope: self.fenced_transition_v2_journal_scope,
         }
     }
 }
@@ -2226,6 +2349,8 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
             provider,
             backend_namespace: Arc::<str>::from(backend_namespace.into()),
             fenced_transition_journal: None,
+            fenced_transition_v2_journal: None,
+            fenced_transition_v2_journal_scope: None,
         }
     }
 
@@ -2238,6 +2363,33 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
         journal: Arc<PreparedFencedTransitionJournal>,
     ) -> Self {
         self.fenced_transition_journal = Some(journal);
+        self
+    }
+
+    /// Enable epoch-fenced V2 transitions with their separate durable
+    /// plaintext-ID-to-sealed-body journal. This path is deliberately
+    /// independent of the permanent capped V1 prepared-request journal.
+    #[must_use]
+    pub fn with_fenced_transition_v2_journal(
+        mut self,
+        journal: Arc<FencedTransitionV2PreparedJournal>,
+    ) -> Self {
+        self.fenced_transition_v2_journal = Some(journal);
+        self
+    }
+
+    /// Bind the V2 prepared journal to one stable backend authority.
+    ///
+    /// Provision the same scope after restart. Prefer
+    /// [`FencedTransitionV2JournalScope::for_consensus_cluster`] for a
+    /// consensus-backed inner store; do not use a rotatable sealing-key or
+    /// provider endpoint as this value.
+    #[must_use]
+    pub fn with_fenced_transition_v2_journal_scope(
+        mut self,
+        scope: FencedTransitionV2JournalScope,
+    ) -> Self {
+        self.fenced_transition_v2_journal_scope = Some(scope);
         self
     }
 
@@ -2443,6 +2595,186 @@ fn require_fenced_transition_journal(
     journal: Option<&Arc<PreparedFencedTransitionJournal>>,
 ) -> Result<&Arc<PreparedFencedTransitionJournal>, StoreError> {
     journal.ok_or_else(unsupported_protected_fenced_transition)
+}
+
+fn unsupported_protected_fenced_transition_v2_history() -> StoreError {
+    StoreError::CapabilityNotSupported("atomic_fenced_transition_epoch_history_v2".into())
+}
+
+fn require_fenced_transition_v2_journal(
+    journal: Option<&Arc<FencedTransitionV2PreparedJournal>>,
+) -> Result<&Arc<FencedTransitionV2PreparedJournal>, StoreError> {
+    journal.ok_or_else(unsupported_protected_fenced_transition_v2_history)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ProtectedFencedTransitionV2JournalMode {
+    LocalAead,
+    RemoteSeal,
+}
+
+impl ProtectedFencedTransitionV2JournalMode {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::LocalAead => 1,
+            Self::RemoteSeal => 2,
+        }
+    }
+}
+
+pub(crate) fn protected_fenced_transition_v2_journal_scope<B>(
+    backend: &B,
+    configured_scope: Option<FencedTransitionV2JournalScope>,
+    backend_namespace: &str,
+    mode: ProtectedFencedTransitionV2JournalMode,
+) -> Result<[u8; 32], StoreError>
+where
+    B: SessionBackend + ?Sized,
+{
+    let payload_scope = protected_payload_scope_commitment(backend_namespace)
+        .ok_or_else(unsupported_protected_fenced_transition_v2_history)?;
+    // A caller can make a cluster scope explicit.  Authenticated peer
+    // adapters also expose a fixed backend scope, which preserves existing
+    // source callers while still failing closed for standalone backends that
+    // provide neither authority.
+    let backend_scope = configured_scope
+        .map(|scope| *scope.as_bytes())
+        .or_else(|| {
+            backend
+                .peer_binding()
+                .map(|binding| *binding.scope().as_bytes())
+        })
+        .ok_or_else(unsupported_protected_fenced_transition_v2_history)?;
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-store/protected-v2-journal/wrapper-scope/v1\0");
+    digest.update([mode.tag()]);
+    digest.update(backend_scope);
+    digest.update(payload_scope);
+    Ok(digest.finalize().into())
+}
+
+fn require_fenced_transition_v2_caller_plaintext(
+    request: &FencedTransitionV2Request,
+) -> Result<(), StoreError> {
+    if request
+        .mutation()
+        .record()
+        .is_none_or(|record| record.payload.encoding() == SessionPayloadEncoding::Plaintext)
+    {
+        Ok(())
+    } else {
+        Err(unsupported_protected_fenced_transition_v2_history())
+    }
+}
+
+struct ProtectedFencedTransitionV2Batch {
+    requests: Vec<FencedTransitionV2Request>,
+    request_slots: Vec<usize>,
+    outcomes: Vec<Option<Result<FencedTransitionOutcome, StoreError>>>,
+}
+
+impl ProtectedFencedTransitionV2Batch {
+    fn prepare(requests: Vec<FencedTransitionV2Request>) -> Result<Self, StoreError> {
+        validate_fenced_transition_v2_batch(&requests)?;
+        let mut valid_requests = Vec::with_capacity(requests.len());
+        let mut request_slots = Vec::with_capacity(requests.len());
+        let mut outcomes = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+        for (slot, request) in requests.into_iter().enumerate() {
+            match request.validate() {
+                Ok(()) => {
+                    require_fenced_transition_v2_caller_plaintext(&request)?;
+                    request_slots.push(slot);
+                    valid_requests.push(request);
+                }
+                Err(StoreError::FencedTransitionRequestConflict) => {
+                    outcomes[slot] = Some(Err(StoreError::FencedTransitionRequestConflict));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Self {
+            requests: valid_requests,
+            request_slots,
+            outcomes,
+        })
+    }
+
+    fn merge(
+        mut self,
+        dispatched: Vec<Result<FencedTransitionOutcome, StoreError>>,
+    ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
+        if dispatched.len() != self.request_slots.len() {
+            return Err(StoreError::BackendUnavailable(
+                "protected fenced-transition V2 batch result unavailable".into(),
+            ));
+        }
+        for (slot, outcome) in self.request_slots.into_iter().zip(dispatched) {
+            self.outcomes[slot] = Some(outcome);
+        }
+        self.outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.ok_or_else(|| {
+                    StoreError::BackendUnavailable(
+                        "protected fenced-transition V2 batch result unavailable".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
+fn require_fenced_transition_v2_physical_envelope(
+    request: &FencedTransitionV2Request,
+) -> Result<(), StoreError> {
+    if request
+        .mutation()
+        .record()
+        .is_none_or(|record| record.payload.encoding() == SessionPayloadEncoding::EnvelopeV1)
+    {
+        Ok(())
+    } else {
+        Err(unsupported_protected_fenced_transition_v2_history())
+    }
+}
+
+async fn require_fenced_transition_v2_capability<B>(backend: &B) -> Result<(), StoreError>
+where
+    B: SessionBackend + ?Sized,
+{
+    require_fenced_transition_physical_boundary(backend)?;
+    match backend.fenced_transition_v2_capability().await? {
+        Some(FencedTransitionV2Capability::V2) => Ok(()),
+        _ => Err(unsupported_protected_fenced_transition_v2_history()),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProtectedFencedTransitionV2Epoch {
+    Active,
+    Replay,
+}
+
+fn classify_protected_fenced_transition_v2_epoch(
+    request: &FencedTransitionV2Request,
+    history: &FencedTransitionV2HistoryState,
+) -> Result<ProtectedFencedTransitionV2Epoch, StoreError> {
+    let epoch = request.request_id().epoch();
+    if history
+        .retired_through()
+        .is_some_and(|floor| epoch <= floor)
+    {
+        return Err(StoreError::FencedTransitionHistoryEpochRetired);
+    }
+    if history.active_epoch() == Some(epoch) {
+        return Ok(ProtectedFencedTransitionV2Epoch::Active);
+    }
+    if history.retired_through().is_none_or(|floor| epoch > floor)
+        && history.active_epoch().is_some_and(|active| epoch < active)
+    {
+        return Ok(ProtectedFencedTransitionV2Epoch::Replay);
+    }
+    Err(StoreError::FencedTransitionHistoryEpochNotActive)
 }
 
 /// A protected V2 wrapper is the sole caller-to-physical payload boundary.
@@ -2718,6 +3050,317 @@ where
         require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
         require_fenced_transition_capability(self.inner.as_ref()).await?;
         self.inner.fenced_transition_status(&inner).await
+    }
+
+    async fn fenced_transition_v2_capability(
+        &self,
+    ) -> Result<Option<FencedTransitionV2Capability>, StoreError> {
+        let Ok(journal_scope) = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::LocalAead,
+        ) else {
+            return Ok(None);
+        };
+        let Some(journal) = self.fenced_transition_v2_journal.as_ref() else {
+            return Ok(None);
+        };
+        journal.ensure_scope(journal_scope).await?;
+        // This explicit capability probe is the deliberate full journal
+        // integrity boundary. Per-operation lookup/bind paths use their
+        // bounded authenticated point checks instead of rescanning the whole
+        // bounded retained-epoch journal.
+        journal.health_check(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        Ok(Some(FencedTransitionV2Capability::V2))
+    }
+
+    async fn fenced_transition_v2_history_state(
+        &self,
+    ) -> Result<FencedTransitionV2HistoryState, StoreError> {
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::LocalAead,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        Ok(history)
+    }
+
+    async fn fenced_transition_v2(
+        &self,
+        request: FencedTransitionV2Request,
+    ) -> Result<FencedTransitionOutcome, StoreError> {
+        request.validate()?;
+        require_fenced_transition_v2_caller_plaintext(&request)?;
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::LocalAead,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let outer_id = request.request_id();
+        let effect_guard = journal.lock_effect_boundary(&[outer_id]).await?;
+        let physical = match journal.lookup(journal_scope, outer_id).await? {
+            Some(stored) => {
+                classify_protected_fenced_transition_v2_epoch(&request, &history)?;
+                (stored, false)
+            }
+            None => {
+                if classify_protected_fenced_transition_v2_epoch(&request, &history)?
+                    != ProtectedFencedTransitionV2Epoch::Active
+                {
+                    return Err(StoreError::FencedTransitionHistoryEpochNotActive);
+                }
+                let mutation = match request.mutation().clone() {
+                    FencedTransitionMutation::Create { record } => {
+                        FencedTransitionMutation::create(self.encrypt_record(*record).await?)
+                    }
+                    FencedTransitionMutation::Update {
+                        expected_generation,
+                        record,
+                    } => FencedTransitionMutation::update(
+                        expected_generation,
+                        self.encrypt_record(*record).await?,
+                    ),
+                    FencedTransitionMutation::Delete {
+                        expected_generation,
+                    } => FencedTransitionMutation::delete(expected_generation),
+                    FencedTransitionMutation::RefreshTtl {
+                        expected_generation,
+                        ttl,
+                    } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
+                };
+                let sealed = FencedTransitionV2Request::new(
+                    outer_id.epoch(),
+                    outer_id.nonce(),
+                    request.lease().clone(),
+                    mutation,
+                )?;
+                require_fenced_transition_v2_physical_envelope(&sealed)?;
+                let binding = journal
+                    .bind_or_lookup_with_created(journal_scope, outer_id, &sealed)
+                    .await?;
+                (binding.request().clone(), binding.was_created())
+            }
+        };
+        require_fenced_transition_v2_physical_envelope(&physical.0)?;
+        let _effect_guard = effect_guard;
+        match self
+            .inner
+            .fenced_transition_v2_effect(physical.0.clone())
+            .await
+        {
+            FencedTransitionV2Effect::NotTransmitted(error) => {
+                if physical.1 {
+                    journal
+                        .remove_if_exact(journal_scope, outer_id, &physical.0)
+                        .await?;
+                }
+                Err(error)
+            }
+            FencedTransitionV2Effect::OutcomeUnknown { .. } => {
+                Err(StoreError::FencedTransitionOutcomeUnknown)
+            }
+            FencedTransitionV2Effect::Resolved(result) => result,
+        }
+    }
+
+    async fn fenced_transition_v2_batch(
+        &self,
+        requests: Vec<FencedTransitionV2Request>,
+    ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
+        let mut batch = ProtectedFencedTransitionV2Batch::prepare(requests)?;
+        if batch.requests.is_empty() {
+            return batch.merge(Vec::new());
+        }
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::LocalAead,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let outer_ids = batch
+            .requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect::<Vec<_>>();
+        let effect_guard = journal.lock_effect_boundary(&outer_ids).await?;
+        let mut physical = journal
+            .lookup_batch(journal_scope, outer_ids.clone())
+            .await?;
+        let mut missing_indices = Vec::new();
+        let mut missing = Vec::new();
+        for (index, request) in batch.requests.drain(..).enumerate() {
+            let outer_id = request.request_id();
+            match &physical[index] {
+                Some(_) => {
+                    classify_protected_fenced_transition_v2_epoch(&request, &history)?;
+                }
+                None => {
+                    if classify_protected_fenced_transition_v2_epoch(&request, &history)?
+                        != ProtectedFencedTransitionV2Epoch::Active
+                    {
+                        return Err(StoreError::FencedTransitionHistoryEpochNotActive);
+                    }
+                    let mutation = match request.mutation().clone() {
+                        FencedTransitionMutation::Create { record } => {
+                            FencedTransitionMutation::create(self.encrypt_record(*record).await?)
+                        }
+                        FencedTransitionMutation::Update {
+                            expected_generation,
+                            record,
+                        } => FencedTransitionMutation::update(
+                            expected_generation,
+                            self.encrypt_record(*record).await?,
+                        ),
+                        FencedTransitionMutation::Delete {
+                            expected_generation,
+                        } => FencedTransitionMutation::delete(expected_generation),
+                        FencedTransitionMutation::RefreshTtl {
+                            expected_generation,
+                            ttl,
+                        } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
+                    };
+                    let sealed = FencedTransitionV2Request::new(
+                        outer_id.epoch(),
+                        outer_id.nonce(),
+                        request.lease().clone(),
+                        mutation,
+                    )?;
+                    require_fenced_transition_v2_physical_envelope(&sealed)?;
+                    missing_indices.push(index);
+                    missing.push((outer_id, sealed));
+                }
+            }
+        }
+        let bound = if missing.is_empty() {
+            Vec::new()
+        } else {
+            journal
+                .bind_or_lookup_batch_with_created(journal_scope, missing)
+                .await?
+        };
+        if bound.len() != missing_indices.len() {
+            return Err(StoreError::BackendUnavailable(
+                "protected fenced-transition V2 journal unavailable".into(),
+            ));
+        }
+        let mut created = vec![false; physical.len()];
+        for (index, binding) in missing_indices.into_iter().zip(bound) {
+            created[index] = binding.was_created();
+            physical[index] = Some(binding.request().clone());
+        }
+        let mut prepared = Vec::with_capacity(physical.len());
+        for physical in physical {
+            let physical = physical.ok_or_else(|| {
+                StoreError::BackendUnavailable(
+                    "protected fenced-transition V2 journal unavailable".into(),
+                )
+            })?;
+            require_fenced_transition_v2_physical_envelope(&physical)?;
+            prepared.push(physical);
+        }
+        let _effect_guard = effect_guard;
+        match self
+            .inner
+            .fenced_transition_v2_batch_effect(prepared.clone())
+            .await
+        {
+            FencedTransitionV2Effect::NotTransmitted(error) => {
+                let cleanup = created
+                    .into_iter()
+                    .zip(outer_ids)
+                    .zip(&prepared)
+                    .filter(|((created, _), _)| *created)
+                    .map(|((_, outer_id), physical)| (outer_id, physical.clone()))
+                    .collect();
+                journal
+                    .remove_batch_if_exact(journal_scope, cleanup)
+                    .await?;
+                Err(error)
+            }
+            // The effect API may name a subset only when it can prove all
+            // other items were not transmitted. Until that stronger contract
+            // exists, retain every batch mapping conservatively.
+            FencedTransitionV2Effect::OutcomeUnknown { .. } => {
+                Err(StoreError::FencedTransitionOutcomeUnknown)
+            }
+            FencedTransitionV2Effect::Resolved(result) => batch.merge(result?),
+        }
+    }
+
+    async fn fenced_transition_v2_status(
+        &self,
+        request: &FencedTransitionV2Request,
+    ) -> Result<FencedTransitionV2Status, StoreError> {
+        if let Err(error) = request.validate() {
+            return if matches!(error, StoreError::FencedTransitionRequestConflict) {
+                Ok(FencedTransitionV2Status::RequestConflict)
+            } else {
+                Err(error)
+            };
+        }
+        require_fenced_transition_v2_caller_plaintext(request)?;
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::LocalAead,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let epoch = match classify_protected_fenced_transition_v2_epoch(request, &history) {
+            Ok(epoch) => epoch,
+            Err(StoreError::FencedTransitionHistoryEpochRetired) => {
+                return Ok(FencedTransitionV2Status::Retired);
+            }
+            Err(StoreError::FencedTransitionHistoryEpochNotActive) => {
+                return Ok(FencedTransitionV2Status::EpochNotActive);
+            }
+            Err(error) => return Err(error),
+        };
+        match journal.lookup(journal_scope, request.request_id()).await? {
+            Some(physical) => {
+                require_fenced_transition_v2_physical_envelope(&physical)?;
+                self.inner.fenced_transition_v2_status(&physical).await
+            }
+            None if epoch == ProtectedFencedTransitionV2Epoch::Active => {
+                Ok(FencedTransitionV2Status::NotFound)
+            }
+            None => Ok(FencedTransitionV2Status::EpochNotActive),
+        }
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
@@ -3039,6 +3682,8 @@ pub struct RemoteSealingSessionBackend<B: ?Sized, S: ?Sized> {
     provider: Arc<S>,
     backend_namespace: Arc<str>,
     fenced_transition_journal: Option<Arc<PreparedFencedTransitionJournal>>,
+    fenced_transition_v2_journal: Option<Arc<FencedTransitionV2PreparedJournal>>,
+    fenced_transition_v2_journal_scope: Option<FencedTransitionV2JournalScope>,
 }
 
 impl<B: ?Sized, S: ?Sized> Clone for RemoteSealingSessionBackend<B, S> {
@@ -3048,6 +3693,8 @@ impl<B: ?Sized, S: ?Sized> Clone for RemoteSealingSessionBackend<B, S> {
             provider: Arc::clone(&self.provider),
             backend_namespace: Arc::clone(&self.backend_namespace),
             fenced_transition_journal: self.fenced_transition_journal.clone(),
+            fenced_transition_v2_journal: self.fenced_transition_v2_journal.clone(),
+            fenced_transition_v2_journal_scope: self.fenced_transition_v2_journal_scope,
         }
     }
 }
@@ -3061,6 +3708,8 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
             provider,
             backend_namespace: Arc::<str>::from(backend_namespace.into()),
             fenced_transition_journal: None,
+            fenced_transition_v2_journal: None,
+            fenced_transition_v2_journal_scope: None,
         }
     }
 
@@ -3073,6 +3722,33 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
         journal: Arc<PreparedFencedTransitionJournal>,
     ) -> Self {
         self.fenced_transition_journal = Some(journal);
+        self
+    }
+
+    /// Enable epoch-fenced V2 transitions with their separate durable
+    /// plaintext-ID-to-sealed-body journal. This path is deliberately
+    /// independent of the permanent capped V1 prepared-request journal.
+    #[must_use]
+    pub fn with_fenced_transition_v2_journal(
+        mut self,
+        journal: Arc<FencedTransitionV2PreparedJournal>,
+    ) -> Self {
+        self.fenced_transition_v2_journal = Some(journal);
+        self
+    }
+
+    /// Bind the V2 prepared journal to one stable backend authority.
+    ///
+    /// Provision the same scope after restart. Prefer
+    /// [`FencedTransitionV2JournalScope::for_consensus_cluster`] for a
+    /// consensus-backed inner store; do not use a rotatable sealing-key or
+    /// provider endpoint as this value.
+    #[must_use]
+    pub fn with_fenced_transition_v2_journal_scope(
+        mut self,
+        scope: FencedTransitionV2JournalScope,
+    ) -> Self {
+        self.fenced_transition_v2_journal_scope = Some(scope);
         self
     }
 
@@ -3453,6 +4129,313 @@ where
         require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
         require_fenced_transition_capability(self.inner.as_ref()).await?;
         self.inner.fenced_transition_status(&inner).await
+    }
+
+    async fn fenced_transition_v2_capability(
+        &self,
+    ) -> Result<Option<FencedTransitionV2Capability>, StoreError> {
+        let Ok(journal_scope) = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+        ) else {
+            return Ok(None);
+        };
+        let Some(journal) = self.fenced_transition_v2_journal.as_ref() else {
+            return Ok(None);
+        };
+        journal.ensure_scope(journal_scope).await?;
+        journal.health_check(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        Ok(Some(FencedTransitionV2Capability::V2))
+    }
+
+    async fn fenced_transition_v2_history_state(
+        &self,
+    ) -> Result<FencedTransitionV2HistoryState, StoreError> {
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        Ok(history)
+    }
+
+    async fn fenced_transition_v2(
+        &self,
+        request: FencedTransitionV2Request,
+    ) -> Result<FencedTransitionOutcome, StoreError> {
+        request.validate()?;
+        require_fenced_transition_v2_caller_plaintext(&request)?;
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let outer_id = request.request_id();
+        let effect_guard = journal.lock_effect_boundary(&[outer_id]).await?;
+        let physical = match journal.lookup(journal_scope, outer_id).await? {
+            Some(stored) => {
+                classify_protected_fenced_transition_v2_epoch(&request, &history)?;
+                (stored, false)
+            }
+            None => {
+                if classify_protected_fenced_transition_v2_epoch(&request, &history)?
+                    != ProtectedFencedTransitionV2Epoch::Active
+                {
+                    return Err(StoreError::FencedTransitionHistoryEpochNotActive);
+                }
+                let mutation = match request.mutation().clone() {
+                    FencedTransitionMutation::Create { record } => {
+                        FencedTransitionMutation::create(self.seal_record(*record).await?)
+                    }
+                    FencedTransitionMutation::Update {
+                        expected_generation,
+                        record,
+                    } => FencedTransitionMutation::update(
+                        expected_generation,
+                        self.seal_record(*record).await?,
+                    ),
+                    FencedTransitionMutation::Delete {
+                        expected_generation,
+                    } => FencedTransitionMutation::delete(expected_generation),
+                    FencedTransitionMutation::RefreshTtl {
+                        expected_generation,
+                        ttl,
+                    } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
+                };
+                let sealed = FencedTransitionV2Request::new(
+                    outer_id.epoch(),
+                    outer_id.nonce(),
+                    request.lease().clone(),
+                    mutation,
+                )?;
+                require_fenced_transition_v2_physical_envelope(&sealed)?;
+                let binding = journal
+                    .bind_or_lookup_with_created(journal_scope, outer_id, &sealed)
+                    .await?;
+                (binding.request().clone(), binding.was_created())
+            }
+        };
+        require_fenced_transition_v2_physical_envelope(&physical.0)?;
+        let _effect_guard = effect_guard;
+        match self
+            .inner
+            .fenced_transition_v2_effect(physical.0.clone())
+            .await
+        {
+            FencedTransitionV2Effect::NotTransmitted(error) => {
+                if physical.1 {
+                    journal
+                        .remove_if_exact(journal_scope, outer_id, &physical.0)
+                        .await?;
+                }
+                Err(error)
+            }
+            FencedTransitionV2Effect::OutcomeUnknown { .. } => {
+                Err(StoreError::FencedTransitionOutcomeUnknown)
+            }
+            FencedTransitionV2Effect::Resolved(result) => result,
+        }
+    }
+
+    async fn fenced_transition_v2_batch(
+        &self,
+        requests: Vec<FencedTransitionV2Request>,
+    ) -> Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError> {
+        let mut batch = ProtectedFencedTransitionV2Batch::prepare(requests)?;
+        if batch.requests.is_empty() {
+            return batch.merge(Vec::new());
+        }
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let outer_ids = batch
+            .requests
+            .iter()
+            .map(FencedTransitionV2Request::request_id)
+            .collect::<Vec<_>>();
+        let effect_guard = journal.lock_effect_boundary(&outer_ids).await?;
+        let mut physical = journal
+            .lookup_batch(journal_scope, outer_ids.clone())
+            .await?;
+        let mut missing_indices = Vec::new();
+        let mut missing = Vec::new();
+        for (index, request) in batch.requests.drain(..).enumerate() {
+            let outer_id = request.request_id();
+            match &physical[index] {
+                Some(_) => {
+                    classify_protected_fenced_transition_v2_epoch(&request, &history)?;
+                }
+                None => {
+                    if classify_protected_fenced_transition_v2_epoch(&request, &history)?
+                        != ProtectedFencedTransitionV2Epoch::Active
+                    {
+                        return Err(StoreError::FencedTransitionHistoryEpochNotActive);
+                    }
+                    let mutation = match request.mutation().clone() {
+                        FencedTransitionMutation::Create { record } => {
+                            FencedTransitionMutation::create(self.seal_record(*record).await?)
+                        }
+                        FencedTransitionMutation::Update {
+                            expected_generation,
+                            record,
+                        } => FencedTransitionMutation::update(
+                            expected_generation,
+                            self.seal_record(*record).await?,
+                        ),
+                        FencedTransitionMutation::Delete {
+                            expected_generation,
+                        } => FencedTransitionMutation::delete(expected_generation),
+                        FencedTransitionMutation::RefreshTtl {
+                            expected_generation,
+                            ttl,
+                        } => FencedTransitionMutation::refresh_ttl(expected_generation, ttl)?,
+                    };
+                    let sealed = FencedTransitionV2Request::new(
+                        outer_id.epoch(),
+                        outer_id.nonce(),
+                        request.lease().clone(),
+                        mutation,
+                    )?;
+                    require_fenced_transition_v2_physical_envelope(&sealed)?;
+                    missing_indices.push(index);
+                    missing.push((outer_id, sealed));
+                }
+            }
+        }
+        let bound = if missing.is_empty() {
+            Vec::new()
+        } else {
+            journal
+                .bind_or_lookup_batch_with_created(journal_scope, missing)
+                .await?
+        };
+        if bound.len() != missing_indices.len() {
+            return Err(StoreError::BackendUnavailable(
+                "protected fenced-transition V2 journal unavailable".into(),
+            ));
+        }
+        let mut created = vec![false; physical.len()];
+        for (index, binding) in missing_indices.into_iter().zip(bound) {
+            created[index] = binding.was_created();
+            physical[index] = Some(binding.request().clone());
+        }
+        let mut prepared = Vec::with_capacity(physical.len());
+        for physical in physical {
+            let physical = physical.ok_or_else(|| {
+                StoreError::BackendUnavailable(
+                    "protected fenced-transition V2 journal unavailable".into(),
+                )
+            })?;
+            require_fenced_transition_v2_physical_envelope(&physical)?;
+            prepared.push(physical);
+        }
+        let _effect_guard = effect_guard;
+        match self
+            .inner
+            .fenced_transition_v2_batch_effect(prepared.clone())
+            .await
+        {
+            FencedTransitionV2Effect::NotTransmitted(error) => {
+                let cleanup = created
+                    .into_iter()
+                    .zip(outer_ids)
+                    .zip(&prepared)
+                    .filter(|((created, _), _)| *created)
+                    .map(|((_, outer_id), physical)| (outer_id, physical.clone()))
+                    .collect();
+                journal
+                    .remove_batch_if_exact(journal_scope, cleanup)
+                    .await?;
+                Err(error)
+            }
+            // The effect API may name a subset only when it can prove all
+            // other items were not transmitted. Until that stronger contract
+            // exists, retain every batch mapping conservatively.
+            FencedTransitionV2Effect::OutcomeUnknown { .. } => {
+                Err(StoreError::FencedTransitionOutcomeUnknown)
+            }
+            FencedTransitionV2Effect::Resolved(result) => batch.merge(result?),
+        }
+    }
+
+    async fn fenced_transition_v2_status(
+        &self,
+        request: &FencedTransitionV2Request,
+    ) -> Result<FencedTransitionV2Status, StoreError> {
+        if let Err(error) = request.validate() {
+            return if matches!(error, StoreError::FencedTransitionRequestConflict) {
+                Ok(FencedTransitionV2Status::RequestConflict)
+            } else {
+                Err(error)
+            };
+        }
+        require_fenced_transition_v2_caller_plaintext(request)?;
+        let journal_scope = protected_fenced_transition_v2_journal_scope(
+            self.inner.as_ref(),
+            self.fenced_transition_v2_journal_scope,
+            self.backend_namespace(),
+            ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+        )?;
+        let journal =
+            require_fenced_transition_v2_journal(self.fenced_transition_v2_journal.as_ref())?;
+        journal.ensure_scope(journal_scope).await?;
+        require_fenced_transition_v2_capability(self.inner.as_ref()).await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        journal
+            .reclaim_retired_through(journal_scope, history.retired_through())
+            .await?;
+        let epoch = match classify_protected_fenced_transition_v2_epoch(request, &history) {
+            Ok(epoch) => epoch,
+            Err(StoreError::FencedTransitionHistoryEpochRetired) => {
+                return Ok(FencedTransitionV2Status::Retired);
+            }
+            Err(StoreError::FencedTransitionHistoryEpochNotActive) => {
+                return Ok(FencedTransitionV2Status::EpochNotActive);
+            }
+            Err(error) => return Err(error),
+        };
+        match journal.lookup(journal_scope, request.request_id()).await? {
+            Some(physical) => {
+                require_fenced_transition_v2_physical_envelope(&physical)?;
+                self.inner.fenced_transition_v2_status(&physical).await
+            }
+            None if epoch == ProtectedFencedTransitionV2Epoch::Active => {
+                Ok(FencedTransitionV2Status::NotFound)
+            }
+            None => Ok(FencedTransitionV2Status::EpochNotActive),
+        }
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
