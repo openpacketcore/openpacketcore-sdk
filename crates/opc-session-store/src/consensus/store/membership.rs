@@ -1222,12 +1222,17 @@ impl ConsensusSessionStore {
         if desired_descriptor != &local_candidate {
             return Err(ConsensusSessionStoreOpenError::InvalidTopology);
         }
-        let desired_topology =
-            ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
-                local_candidate.replica_id().clone(),
-                request.desired_members().to_vec(),
-                request.desired_identity(),
-            ))
+        let roster_attestation_trust_root =
+            current_topology.roster_attestation_trust_root().cloned();
+        let mut desired_config = QuorumTopologyConfig::new_consensus(
+            local_candidate.replica_id().clone(),
+            request.desired_members().to_vec(),
+            request.desired_identity(),
+        );
+        if let Some(root) = roster_attestation_trust_root.clone() {
+            desired_config = desired_config.with_roster_attestation_trust_root(root);
+        }
+        let desired_topology = ValidatedQuorumTopology::try_from(desired_config)
             .map_err(|_| ConsensusSessionStoreOpenError::InvalidTopology)?;
         let local_node_id = desired_topology
             .local_consensus_node_id()
@@ -1277,22 +1282,24 @@ impl ConsensusSessionStore {
         let desired_bindings = request.desired_node_bindings();
         let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
         let backend = backend.with_consensus_diagnostics(Arc::clone(&diagnostics));
-        let (log_store, state_machine, storage_identity) = storage::open_with_pending_membership(
-            &backend,
-            snapshot_dir,
-            storage_anchor.0,
-            current_identity,
-            current_members.clone(),
-            current_bindings.clone(),
-            local_node_id,
-            request.transition_id().as_bytes(),
-            request.request_digest().as_bytes(),
-            request.desired_identity(),
-            &desired_members,
-            &desired_bindings,
-            peer_directory.clone(),
-        )
-        .await?;
+        let (log_store, state_machine, storage_identity) =
+            storage::open_with_pending_membership_and_roster_attestation_root(
+                &backend,
+                snapshot_dir,
+                storage_anchor.0,
+                current_identity,
+                current_members.clone(),
+                current_bindings.clone(),
+                local_node_id,
+                request.transition_id().as_bytes(),
+                request.request_digest().as_bytes(),
+                request.desired_identity(),
+                &desired_members,
+                &desired_bindings,
+                peer_directory.clone(),
+                roster_attestation_trust_root.clone(),
+            )
+            .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
         let storage_shutdown = state_machine
@@ -1359,6 +1366,7 @@ impl ConsensusSessionStore {
             bootstrap_members: current_members,
             bootstrap_bindings: current_bindings,
             topology: topology_summary,
+            roster_attestation_trust_root,
             clock: Arc::new(SystemClock),
             operation_timeout: DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
             admitted: Arc::new(AtomicBool::new(false)),

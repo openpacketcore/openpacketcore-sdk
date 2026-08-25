@@ -1907,6 +1907,101 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read one exact original protected-roster admission and the effective
+    /// authority time under one backend lock after a caller-owned linearizable
+    /// barrier. This path never allocates a consensus request or advances
+    /// logical time.
+    pub(crate) async fn consensus_protected_roster_admission_status(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        admission: crate::fenced_mutation_roster::Admission,
+        original_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_admission_status_sync(
+                conn,
+                identity,
+                &admission,
+                &original_authority,
+                logical_time,
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Recover one exact protected roster under a valid strictly newer fence,
+    /// with effective authority time and state selected under one backend
+    /// lock after a caller-owned linearizable barrier. Missing remains
+    /// ambiguous.
+    pub(crate) async fn consensus_protected_roster_recovery(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        recovery: crate::fenced_mutation_roster_executor::RecoveryRequest,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_recovery_sync(
+                conn,
+                identity,
+                &recovery,
+                logical_time,
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Read one exact terminal body and effective authority time under one
+    /// backend lock after a caller-owned linearizable barrier. No status read
+    /// can select a new terminal phase or body.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn consensus_protected_roster_terminal_status(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        binding: crate::fenced_mutation_roster::RequestBindingKey,
+        registration_parts: ([u8; 32], crate::fenced_mutation_roster::RequestId, [u8; 32]),
+        current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
+        terminal_body_commitment: [u8; 32],
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_terminal_status_sync(
+                conn,
+                identity,
+                binding,
+                registration_parts,
+                &current_authority,
+                terminal_body_commitment,
+                logical_time,
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
     /// Check the bounded V1 activation certificate after a caller-owned
     /// consensus barrier.  A missing or stale certificate is a normal
     /// unsupported state; storage failure remains unavailable.

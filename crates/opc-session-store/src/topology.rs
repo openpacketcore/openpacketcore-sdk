@@ -1330,11 +1330,9 @@ mod tests {
             ),
         )
         .expect("root-bound topology");
-        assert!(
-            topology
-                .roster_attestation_trust_root()
-                .is_some_and(|root| root.identity() == first_root.identity())
-        );
+        assert!(topology
+            .roster_attestation_trust_root()
+            .is_some_and(|root| root.identity() == first_root.identity()));
 
         assert!(matches!(
             ValidatedQuorumTopology::try_from(

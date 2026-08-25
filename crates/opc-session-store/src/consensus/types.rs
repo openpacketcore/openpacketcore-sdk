@@ -12,12 +12,12 @@ use crate::backend::{CompareAndSet, CompareAndSetResult};
 use crate::error::StoreError;
 use crate::fenced_mutation_roster::{
     Admission, RequestBindingKey, RequestId as RosterRequestId, RosterExecutorProofBundleV1,
-    RosterIngressAttestationV1, MAX_ADMISSION_CODEC_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES,
-    MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_ROSTER_INGRESS_ATTESTATION_BYTES,
-    MAX_TERMINAL_CODEC_BYTES,
+    RosterIngressAttestationV1, TerminalConflictTombstone, TerminalRecord,
+    MAX_ADMISSION_CODEC_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES,
+    MAX_ROSTER_INGRESS_ATTESTATION_BYTES, MAX_TERMINAL_CODEC_BYTES, MAX_TOMBSTONE_CODEC_BYTES,
 };
 use crate::fenced_mutation_roster_executor::{
-    AuthorityBinding, AuthorityLeaseMetadata, CommittedTerminal,
+    AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration, CommittedTerminal,
 };
 use crate::fenced_transition::{
     FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionV2HistoryEpoch,
@@ -121,6 +121,8 @@ const ROSTER_ADMISSION_PAYLOAD_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/roster-admission-payload/v1\0";
 const ROSTER_TERMINAL_PAYLOAD_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/roster-terminal-payload/v1\0";
+const ROSTER_COMMAND_ATTEMPT_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/roster-command-attempt/v1\0";
 const ROSTER_COMMAND_REJECTED: &str = "roster consensus command rejected";
 
 /// Produce the canonical, non-describing binding of one exact voter scope.
@@ -409,6 +411,7 @@ impl ConsensusRosterAdmissionCommand {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_ingress(
         admission: Admission,
         authority: AuthorityBinding,
@@ -481,6 +484,17 @@ impl ConsensusRosterAdmissionCommand {
         hasher.update((authority.len() as u64).to_be_bytes());
         hasher.update(authority);
         Ok(hasher.finalize().into())
+    }
+
+    /// Bind the exact replicated attempt, including its connection-issued
+    /// ingress statement. This is response correlation only: the stable
+    /// request ID and immutable body digest remain unchanged.
+    pub(crate) fn exact_attempt_digest(&self) -> Result<[u8; 32], StoreError> {
+        roster_command_attempt_digest(1, self)
+    }
+
+    pub(crate) fn outcome_binding(&self) -> Result<ConsensusRosterOutcomeBinding, StoreError> {
+        ConsensusRosterOutcomeBinding::for_admission(self)
     }
 }
 
@@ -624,6 +638,7 @@ impl ConsensusRosterTerminalCommand {
         Self::new_with_encoded_proof_bundle(input, proof_bundle)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_proof_bundle_and_ingress(
         input: ConsensusRosterTerminalCommandInput,
         proof_bundle: RosterExecutorProofBundleV1,
@@ -709,6 +724,17 @@ impl ConsensusRosterTerminalCommand {
         hasher.update((self.record.0.len() as u64).to_be_bytes());
         hasher.update(&self.record.0);
         hasher.finalize().into()
+    }
+
+    /// Bind the exact replaceable current authority, SDK proof bundle, and
+    /// ingress statement used by this terminal attempt without changing its
+    /// stable idempotency identity.
+    pub(crate) fn exact_attempt_digest(&self) -> Result<[u8; 32], StoreError> {
+        roster_command_attempt_digest(2, self)
+    }
+
+    pub(crate) fn outcome_binding(&self) -> Result<ConsensusRosterOutcomeBinding, StoreError> {
+        ConsensusRosterOutcomeBinding::for_terminal(self)
     }
 }
 
@@ -798,36 +824,150 @@ impl<'de> Deserialize<'de> for ConsensusRosterTerminalCommand {
     }
 }
 
+/// State-machine-issued correlation for one exact roster command outcome.
+///
+/// A forwarding response does not otherwise echo its request identity. Every
+/// roster outcome therefore carries the derived consensus request ID, the
+/// takeover-stable immutable payload digest, and an exact-attempt digest. A
+/// lost or misrouted response cannot become a definitive result for another
+/// body, guard, proof bundle, or ingress statement.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsensusRosterOutcomeBinding {
+    request_id: SessionConsensusRequestId,
+    immutable_payload_digest: [u8; 32],
+    exact_attempt_digest: [u8; 32],
+}
+
+impl ConsensusRosterOutcomeBinding {
+    pub(crate) fn for_admission(
+        command: &ConsensusRosterAdmissionCommand,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            request_id: command.request_id()?,
+            immutable_payload_digest: command.immutable_payload_digest()?,
+            exact_attempt_digest: command.exact_attempt_digest()?,
+        })
+    }
+
+    pub(crate) fn for_terminal(
+        command: &ConsensusRosterTerminalCommand,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            request_id: command.request_id()?,
+            immutable_payload_digest: command.immutable_payload_digest(),
+            exact_attempt_digest: command.exact_attempt_digest()?,
+        })
+    }
+
+    pub(crate) fn matches_admission(
+        self,
+        command: &ConsensusRosterAdmissionCommand,
+    ) -> Result<bool, StoreError> {
+        Ok(self == Self::for_admission(command)?)
+    }
+
+    pub(crate) fn matches_terminal(
+        self,
+        command: &ConsensusRosterTerminalCommand,
+    ) -> Result<bool, StoreError> {
+        Ok(self == Self::for_terminal(command)?)
+    }
+}
+
+fn roster_command_attempt_digest(
+    operation_tag: u8,
+    command: &impl Serialize,
+) -> Result<[u8; 32], StoreError> {
+    let canonical = postcard::to_allocvec(command).map_err(|_| roster_command_rejected())?;
+    let mut hasher = Sha256::new();
+    hasher.update(ROSTER_COMMAND_ATTEMPT_DIGEST_DOMAIN);
+    hasher.update([operation_tag]);
+    hasher.update((canonical.len() as u64).to_be_bytes());
+    hasher.update(canonical);
+    Ok(hasher.finalize().into())
+}
+
+impl fmt::Debug for ConsensusRosterOutcomeBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsensusRosterOutcomeBinding(<redacted>)")
+    }
+}
+
 #[doc(hidden)]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusRosterAdmissionOutcome {
     Admitted {
+        outcome_binding: ConsensusRosterOutcomeBinding,
         slot: [u8; 32],
         binding: Box<RequestBindingKey>,
         registration_handle: [u8; 32],
         registration_request_id: RosterRequestId,
         registration_terminal_slot: [u8; 32],
     },
-    Rejected(ConsensusRosterRejection),
+    Rejected {
+        outcome_binding: ConsensusRosterOutcomeBinding,
+        rejection: ConsensusRosterRejection,
+    },
+}
+
+impl ConsensusRosterAdmissionOutcome {
+    pub(crate) fn admitted(
+        command: &ConsensusRosterAdmissionCommand,
+        registration: BackendRegistration,
+    ) -> Result<Self, StoreError> {
+        let (registration_handle, registration_request_id, registration_terminal_slot) =
+            registration.consensus_parts();
+        Ok(Self::Admitted {
+            outcome_binding: command.outcome_binding()?,
+            slot: command.admission_slot()?,
+            binding: Box::new(
+                command
+                    .admission()
+                    .binding_key(registration_request_id.history_epoch())
+                    .map_err(|_| roster_command_rejected())?,
+            ),
+            registration_handle,
+            registration_request_id,
+            registration_terminal_slot: *registration_terminal_slot.as_bytes(),
+        })
+    }
+
+    pub(crate) fn rejected(
+        command: &ConsensusRosterAdmissionCommand,
+        rejection: ConsensusRosterRejection,
+    ) -> Result<Self, StoreError> {
+        Ok(Self::Rejected {
+            outcome_binding: command.outcome_binding()?,
+            rejection,
+        })
+    }
 }
 
 #[doc(hidden)]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusRosterTerminalOutcome {
     Committed {
+        outcome_binding: ConsensusRosterOutcomeBinding,
         slot: [u8; 32],
         replayed: bool,
         committed: BoundedRosterCapsule<MAX_COMMITTED_TERMINAL_CODEC_BYTES>,
     },
     Compacted {
+        outcome_binding: ConsensusRosterOutcomeBinding,
         slot: [u8; 32],
+        history_epoch: u64,
+        tombstone: BoundedRosterCapsule<MAX_TOMBSTONE_CODEC_BYTES>,
     },
-    Rejected(ConsensusRosterRejection),
+    Rejected {
+        outcome_binding: ConsensusRosterOutcomeBinding,
+        rejection: ConsensusRosterRejection,
+    },
 }
 
 impl ConsensusRosterTerminalOutcome {
     pub(crate) fn committed(
-        slot: [u8; 32],
+        command: &ConsensusRosterTerminalCommand,
         replayed: bool,
         committed: &CommittedTerminal,
         admission: &Admission,
@@ -836,16 +976,83 @@ impl ConsensusRosterTerminalOutcome {
             .to_canonical_bytes(admission)
             .map_err(|_| roster_command_rejected())?;
         Ok(Self::Committed {
-            slot,
+            outcome_binding: command.outcome_binding()?,
+            slot: command.terminal_slot()?,
             replayed,
             committed: BoundedRosterCapsule::new(committed)?,
+        })
+    }
+
+    pub(crate) fn compacted(
+        command: &ConsensusRosterTerminalCommand,
+        history_epoch: u64,
+        tombstone: TerminalConflictTombstone,
+    ) -> Result<Self, StoreError> {
+        let (registration_handle, registration_request_id, registration_terminal_slot) =
+            command.registration_parts();
+        if registration_handle != roster_registration_handle(command.binding())
+            || history_epoch != command.binding().history_epoch()
+            || history_epoch != registration_request_id.history_epoch()
+        {
+            return Err(roster_command_rejected());
+        }
+        let terminal_body_commitment =
+            TerminalRecord::canonical_body_commitment(command.record_bytes())
+                .map_err(|_| roster_command_rejected())?;
+        tombstone
+            .validate_compacted_terminal(
+                command.binding(),
+                registration_request_id,
+                registration_terminal_slot,
+                command.authority().fence(),
+                command.authority().generation(),
+                terminal_body_commitment,
+            )
+            .map_err(|_| roster_command_rejected())?;
+        let tombstone = BoundedRosterCapsule::new(
+            tombstone
+                .to_canonical_bytes()
+                .map_err(|_| roster_command_rejected())?,
+        )?;
+        Ok(Self::Compacted {
+            outcome_binding: command.outcome_binding()?,
+            slot: command.terminal_slot()?,
+            history_epoch,
+            tombstone,
+        })
+    }
+
+    pub(crate) fn rejected(
+        command: &ConsensusRosterTerminalCommand,
+        rejection: ConsensusRosterRejection,
+    ) -> Result<Self, StoreError> {
+        Ok(Self::Rejected {
+            outcome_binding: command.outcome_binding()?,
+            rejection,
         })
     }
 
     pub(crate) fn committed_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Committed { committed, .. } => Some(&committed.0),
-            Self::Compacted { .. } | Self::Rejected(_) => None,
+            Self::Compacted { .. } | Self::Rejected { .. } => None,
+        }
+    }
+
+    pub(crate) fn compacted_parts(
+        &self,
+    ) -> Result<Option<(u64, TerminalConflictTombstone)>, StoreError> {
+        match self {
+            Self::Compacted {
+                history_epoch,
+                tombstone,
+                ..
+            } => Ok(Some((
+                *history_epoch,
+                TerminalConflictTombstone::from_canonical_bytes(&tombstone.0)
+                    .map_err(|_| roster_command_rejected())?,
+            ))),
+            Self::Committed { .. } | Self::Rejected { .. } => Ok(None),
         }
     }
 
@@ -2692,9 +2899,81 @@ mod tests {
             takeover.immutable_payload_digest()
         );
         assert_ne!(
+            original.exact_attempt_digest().expect("original attempt"),
+            takeover.exact_attempt_digest().expect("takeover attempt")
+        );
+        assert!(!original
+            .outcome_binding()
+            .expect("old-guard response binding")
+            .matches_terminal(&takeover)
+            .expect("compare exact attempts"));
+        assert_ne!(
             original.immutable_payload_digest(),
             conflicting.immutable_payload_digest()
         );
+    }
+
+    #[test]
+    fn compacted_terminal_outcome_requires_the_derived_registration_handle() {
+        let admission = roster_digest_admission(0x76);
+        let request_id = RequestId::bind(9, &admission).expect("request ID");
+        let binding = admission.binding_key(9).expect("binding");
+        let derived_handle = roster_registration_handle(binding);
+        let registration =
+            BackendRegistration::from_consensus_parts(derived_handle, request_id, &admission)
+                .expect("registration");
+        let (_, request_id, terminal_slot) = registration.consensus_parts();
+        let terminal = TerminalRecord::new(
+            &admission,
+            request_id,
+            Phase::Established,
+            vec![[0x79; 32]; FRESH_ROSTER_MEMBERS],
+        )
+        .expect("terminal record");
+        let tombstone =
+            TerminalConflictTombstone::new(&admission, &terminal).expect("terminal tombstone");
+        let successor = AuthorityBinding::from_consensus_parts(
+            admission.scope().digest(),
+            admission.key().clone(),
+            OwnerId::new("roster-successor-owner").expect("successor owner"),
+            FenceToken::new(8),
+            AuthorityLeaseMetadata::new(
+                12,
+                admission.expected_generation(),
+                legacy_time(2),
+                legacy_time(62),
+            ),
+        )
+        .expect("successor authority");
+        let terminal_bytes = terminal
+            .to_canonical_bytes(&admission)
+            .expect("terminal bytes");
+        let exact = roster_terminal_command(
+            &admission,
+            ConsensusRosterTerminalCommandInput {
+                binding,
+                registration_handle: derived_handle,
+                registration_request_id: request_id,
+                registration_terminal_slot: *terminal_slot.as_bytes(),
+                authority: successor.clone(),
+                record: terminal_bytes.clone(),
+            },
+        );
+        ConsensusRosterTerminalOutcome::compacted(&exact, 9, tombstone)
+            .expect("exact compacted outcome");
+
+        let forged = roster_terminal_command(
+            &admission,
+            ConsensusRosterTerminalCommandInput {
+                binding,
+                registration_handle: [0x78; 32],
+                registration_request_id: request_id,
+                registration_terminal_slot: *terminal_slot.as_bytes(),
+                authority: successor,
+                record: terminal_bytes,
+            },
+        );
+        assert!(ConsensusRosterTerminalOutcome::compacted(&forged, 9, tombstone).is_err());
     }
 
     #[test]
@@ -2731,6 +3010,12 @@ mod tests {
                 record,
             },
         );
+        let admission_outcome_binding = admission_command
+            .outcome_binding()
+            .expect("admission outcome binding");
+        let terminal_outcome_binding = terminal_command
+            .outcome_binding()
+            .expect("terminal outcome binding");
 
         assert_eq!(
             postcard::to_allocvec(&SessionMutationIntent::PreflightFencedTransitionCapability)
@@ -2775,14 +3060,20 @@ mod tests {
         );
         assert_eq!(
             postcard::to_allocvec(&SessionMutationOutcome::RosterAdmission(
-                ConsensusRosterAdmissionOutcome::Rejected(ConsensusRosterRejection::Authority)
+                ConsensusRosterAdmissionOutcome::Rejected {
+                    outcome_binding: admission_outcome_binding,
+                    rejection: ConsensusRosterRejection::Authority,
+                }
             ))
             .expect("admission outcome")[0],
             5
         );
         assert_eq!(
             postcard::to_allocvec(&SessionMutationOutcome::RosterTerminal(
-                ConsensusRosterTerminalOutcome::Rejected(ConsensusRosterRejection::Authority)
+                ConsensusRosterTerminalOutcome::Rejected {
+                    outcome_binding: terminal_outcome_binding,
+                    rejection: ConsensusRosterRejection::Authority,
+                }
             ))
             .expect("terminal outcome")[0],
             6

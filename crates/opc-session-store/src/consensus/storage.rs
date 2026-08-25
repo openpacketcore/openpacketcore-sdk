@@ -34,6 +34,7 @@ use super::{
     SessionTopologyMemberBinding,
 };
 use crate::backend::ReplicationEntry;
+use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
 use crate::readiness::PlacementResiliencePolicy;
 use crate::sqlite::consensus::{self, SqliteConsensusCore};
 use crate::sqlite::SqliteSessionBackend;
@@ -478,6 +479,7 @@ struct SnapshotCaptureWorker {
     _shutdown_guard: ConsensusStorageShutdownGuard,
 }
 
+#[cfg(test)]
 pub(crate) async fn open_with_member_bindings(
     backend: &SqliteSessionBackend,
     snapshot_dir: impl Into<PathBuf>,
@@ -502,6 +504,41 @@ pub(crate) async fn open_with_member_bindings(
         membership_admission,
         ConsensusAuthorityProfile::Dynamic,
         None,
+        None,
+    )
+    .await
+}
+
+/// Open dynamic consensus with the immutable topology-provisioned roster
+/// attestation root. Passing `None` preserves ordinary non-roster operation;
+/// roster mutations then fail closed in deterministic apply.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_with_member_bindings_and_roster_attestation_root(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
+    open_with_member_bindings_for_profile(
+        backend,
+        snapshot_dir,
+        identity,
+        expected_members,
+        expected_bindings,
+        membership_admission,
+        ConsensusAuthorityProfile::Dynamic,
+        None,
+        roster_attestation_trust_root,
     )
     .await
 }
@@ -510,6 +547,7 @@ pub(crate) async fn open_with_member_bindings(
 ///
 /// Unlike the dynamic entry point, this binds the original durable storage
 /// identity to `identity` permanently and rejects membership transitions.
+#[cfg(test)]
 pub(crate) async fn open_fixed_with_member_bindings(
     backend: &SqliteSessionBackend,
     snapshot_dir: impl Into<PathBuf>,
@@ -535,6 +573,40 @@ pub(crate) async fn open_fixed_with_member_bindings(
         membership_admission,
         ConsensusAuthorityProfile::FixedImmutable,
         Some(placement_policy),
+        None,
+    )
+    .await
+}
+
+/// Fixed-quorum counterpart that persists the immutable roster root.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+    placement_policy: PlacementResiliencePolicy,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
+    open_with_member_bindings_for_profile(
+        backend,
+        snapshot_dir,
+        identity,
+        expected_members,
+        expected_bindings,
+        membership_admission,
+        ConsensusAuthorityProfile::FixedImmutable,
+        Some(placement_policy),
+        roster_attestation_trust_root,
     )
     .await
 }
@@ -549,6 +621,7 @@ async fn open_with_member_bindings_for_profile(
     membership_admission: SessionRaftPeerDirectory,
     authority_profile: ConsensusAuthorityProfile,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -557,7 +630,7 @@ async fn open_with_member_bindings_for_profile(
     ),
     SessionConsensusStorageError,
 > {
-    let core = SqliteConsensusCore::initialize(
+    let core = SqliteConsensusCore::initialize_with_roster_attestation_root(
         backend,
         snapshot_dir.into(),
         identity,
@@ -565,6 +638,7 @@ async fn open_with_member_bindings_for_profile(
         expected_bindings,
         authority_profile,
         fixed_placement_policy,
+        roster_attestation_trust_root,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
@@ -643,6 +717,7 @@ async fn open(
 /// transport admission remain driver responsibilities. Snapshot installation
 /// subsequently requires the source to carry this exact pending scope.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn open_with_pending_membership(
     backend: &SqliteSessionBackend,
     snapshot_dir: impl Into<PathBuf>,
@@ -665,7 +740,52 @@ pub(crate) async fn open_with_pending_membership(
     ),
     SessionConsensusStorageError,
 > {
-    let core = SqliteConsensusCore::initialize_with_pending(
+    open_with_pending_membership_and_roster_attestation_root(
+        backend,
+        snapshot_dir,
+        storage_identity,
+        current_identity,
+        current_members,
+        current_bindings,
+        local_candidate_node_id,
+        transition_id,
+        transition_digest,
+        desired_identity,
+        desired_members,
+        desired_bindings,
+        membership_admission,
+        None,
+    )
+    .await
+}
+
+/// Root-aware pending-membership open that preserves the current immutable
+/// roster root while durably staging one successor scope.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_with_pending_membership_and_roster_attestation_root(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    storage_identity: SessionConsensusIdentity,
+    current_identity: SessionConsensusIdentity,
+    current_members: BTreeSet<SessionConsensusNodeId>,
+    current_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    local_candidate_node_id: SessionConsensusNodeId,
+    transition_id: [u8; 16],
+    transition_digest: [u8; 32],
+    desired_identity: SessionConsensusIdentity,
+    desired_members: &BTreeSet<SessionConsensusNodeId>,
+    desired_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
+    let core = SqliteConsensusCore::initialize_with_pending_and_roster_attestation_root(
         backend,
         snapshot_dir.into(),
         storage_identity,
@@ -682,6 +802,7 @@ pub(crate) async fn open_with_pending_membership(
         },
         ConsensusAuthorityProfile::Dynamic,
         None,
+        roster_attestation_trust_root,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
