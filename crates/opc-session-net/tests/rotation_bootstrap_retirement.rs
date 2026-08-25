@@ -555,12 +555,12 @@ async fn consensus_client_defers_authenticated_bootstrap_retirement_to_later_cal
 
     assert_eq!(
         peer.call(request.clone()).await,
-        Err(SessionConsensusPeerError::Timeout),
-        "the authenticated no-Call receipt ends this logical call"
+        Err(SessionConsensusPeerError::Unavailable),
+        "the authenticated no-Call receipt reports pre-Call unavailability"
     );
     assert_eq!(
         peer.call(request.clone()).await,
-        Err(SessionConsensusPeerError::Timeout),
+        Err(SessionConsensusPeerError::Unavailable),
         "the immediate same-epoch call is negative-admission only"
     );
     assert_eq!(
@@ -674,8 +674,8 @@ async fn consensus_client_material_epoch_successor_bypasses_authenticated_retire
 
     assert_eq!(
         peer.call(request.clone()).await,
-        Err(SessionConsensusPeerError::Timeout),
-        "the old authenticated material epoch is blocked after retirement"
+        Err(SessionConsensusPeerError::Unavailable),
+        "the old authenticated material epoch reports pre-Call unavailability after retirement"
     );
     assert_eq!(MetricSnapshot::capture().since(before).attempts, 1);
     let old_epoch = client_config.material_status().epoch();

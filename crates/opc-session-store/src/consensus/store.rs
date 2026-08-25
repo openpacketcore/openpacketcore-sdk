@@ -8606,6 +8606,12 @@ fn validate_consensus_command_preproposal(
             }
         }
     }
+    if let SessionMutationIntent::ActivateFencedTransitionCapability { schema_version, .. } = intent
+    {
+        if *schema_version != FENCED_TRANSITION_SCHEMA_V1 {
+            return Err(unsupported_fenced_transition());
+        }
+    }
     Ok(())
 }
 
@@ -8631,6 +8637,7 @@ fn validate_consensus_intent_with_recovery(
             | SessionMutationIntent::AbortTopologyTransition { .. }
             | SessionMutationIntent::FinalizeTopologyTransition { .. }
             | SessionMutationIntent::ActivateFencedTransition { .. }
+            | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
             | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
             | SessionMutationIntent::Authorized { .. }
     ) {
@@ -8833,6 +8840,25 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                         FencedTransitionCapabilityReply::V1
                     } else {
                         FencedTransitionCapabilityReply::Unsupported
+                    };
+                    return encode_service_reply(&reply);
+                }
+                if let Ok(probe) =
+                    decode_bounded::<FencedTransitionActivationCapabilityProbe>(&request.payload)
+                {
+                    // Activation establishes a distinct replicated command
+                    // shape.  A voter that can execute ordinary V1 fenced
+                    // transitions but does not recognize that shape is not
+                    // sufficient for an exact-scope activation certificate.
+                    let reply = if probe.activation_probe_schema_version
+                        == FENCED_TRANSITION_ACTIVATION_PROBE_SCHEMA_V1
+                        && probe.activation_command_schema_version == FENCED_TRANSITION_SCHEMA_V1
+                        && self.store.local_fenced_transition_capability()
+                            == AtomicFencedTransitionCapability::V1
+                    {
+                        FencedTransitionActivationCapabilityReply::V1
+                    } else {
+                        FencedTransitionActivationCapabilityReply::Unsupported
                     };
                     return encode_service_reply(&reply);
                 }
@@ -14030,12 +14056,17 @@ mod membership_tests {
             "spiffe://test.example/tenant/consumer-boundary/ns/default/sa/store/nf/smf/instance/one",
         )
             .expect("consumer boundary identity");
+        // The V2 consumer cases intentionally exercise a request whose
+        // retained ID/body fixture is in a second tenant. Grant that exact
+        // tenant/NF pair so those cases reach the conflict and history
+        // semantics; production authorization remains tenant/NF scoped.
+        let v2_fixture_key = v2_test_request(1).lease().key().clone();
         let grant = SessionConsumerAuthorizationGrant::try_new(
             SpiffeId::new(identity.as_str()).expect("canonical consumer SPIFFE ID"),
-            [SessionConsumerTenantNfScope::new(
-                key.tenant.clone(),
-                key.nf_kind.clone(),
-            )],
+            [
+                SessionConsumerTenantNfScope::new(key.tenant.clone(), key.nf_kind.clone()),
+                SessionConsumerTenantNfScope::new(v2_fixture_key.tenant, v2_fixture_key.nf_kind),
+            ],
         )
         .expect("consumer grant");
         let manifest = store

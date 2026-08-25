@@ -6247,7 +6247,7 @@ impl Fleet {
                     outcome,
                     Err(
                         SessionConsensusPeerError::Authentication
-                            | SessionConsensusPeerError::Timeout
+                            | SessionConsensusPeerError::Unavailable
                     )
                 ),
                 "new-only server trust must reject removed old-root client chain: source={source}, target={target}, outcome={outcome:?}"

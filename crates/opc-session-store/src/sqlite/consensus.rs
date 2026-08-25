@@ -2092,7 +2092,7 @@ async fn run_consensus_log_prune_lane(
                 lane.signal();
             }
             Ok((returned, Err(ConsensusLogPruneTurnError::Interrupted))) => {
-                let _ = returned;
+                connection = returned;
                 if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
                     if let Some(diagnostics) = &lane.diagnostics {
                         diagnostics.cancel_consensus_log_prune_turn();
@@ -2100,9 +2100,22 @@ async fn run_consensus_log_prune_lane(
                     return;
                 }
                 if let Some(diagnostics) = &lane.diagnostics {
-                    diagnostics.fail_consensus_log_prune_turn();
+                    diagnostics.retry_consensus_log_prune_turn();
                 }
-                return;
+                // sqlite3_interrupt() may land after a primary writer has
+                // announced itself but before the prune connection enters a
+                // VDBE. SQLite then reports SQLITE_INTERRUPT to the first
+                // operation of this next turn, after the primary guard has
+                // already been released. The logical floor is durable and
+                // this turn has rolled back, so retry the low-priority lane
+                // rather than stranding its physical backlog.
+                if !wait_consensus_log_prune_pacing(&mut stop, &lane).await {
+                    return;
+                }
+                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                    return;
+                }
+                lane.signal();
             }
             Ok((returned, Err(ConsensusLogPruneTurnError::Permanent))) => {
                 let _ = returned;
@@ -16038,6 +16051,40 @@ pub(crate) fn apply_entries_with_authority_sync(
                     )?
                 } else {
                     let is_fenced_transition = fenced_transition_request(&command.intent).is_some();
+                    let is_capability_activation = !is_fenced_transition
+                        && fenced_transition_activation(&command.intent).is_some();
+                    if is_capability_activation {
+                        let access_is_authorized = fenced_transition_access_is_authorized_sync(
+                            &scope,
+                            identity,
+                            &command.intent,
+                        )?;
+                        if access_is_authorized {
+                            let (scope_identity, voter_set_digest) =
+                                fenced_transition_activation(&command.intent)
+                                    .expect("checked capability activation");
+                            if scope_identity != scope.current_identity
+                                || voter_set_digest
+                                    != fenced_transition_voter_set_digest(
+                                        scope.current_identity,
+                                        &scope.current_members,
+                                    )
+                            {
+                                return Err(invalid_data(
+                                    "fenced transition activation scope is stale",
+                                ));
+                            }
+                            // This cluster-scope command has no tenant/session
+                            // body. Its generic authenticated outcome and this
+                            // certificate must commit in the same transaction.
+                            activate_fenced_transition_scope_sync(
+                                &tx,
+                                identity,
+                                scope.current_identity,
+                                &scope.current_members,
+                            )?;
+                        }
+                    }
                     if is_fenced_transition {
                         let access_is_authorized = fenced_transition_access_is_authorized_sync(
                             &scope,
