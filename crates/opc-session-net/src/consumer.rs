@@ -22958,6 +22958,10 @@ mod tests {
             .with_operation_timeout(Duration::from_millis(25)),
         )
         .expect("valid persistent stalled-status client");
+        persistent
+            .prewarm_v2()
+            .await
+            .expect("prewarm the persistent V2 connection before the 25 ms status operation");
         let mutation = persistent_v2_effectful_test_request(0xb3).await;
         let status = match mutation.operation() {
             SessionConsumerV2Operation::FencedTransitionV2 { request } => {

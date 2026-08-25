@@ -2357,7 +2357,9 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use opc_consensus::engine::storage::{RaftLogStorage, RaftLogStorageExt, RaftStateMachine};
+    #[cfg(target_os = "linux")]
+    use opc_consensus::engine::storage::RaftLogStorageExt;
+    use opc_consensus::engine::storage::{RaftLogStorage, RaftStateMachine};
     use opc_consensus::engine::{CommittedLeaderId, EntryPayload, RaftSnapshotBuilder};
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{

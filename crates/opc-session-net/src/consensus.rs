@@ -252,6 +252,20 @@ fn map_protocol_error(error: &ProtocolError) -> SessionConsensusPeerError {
     }
 }
 
+/// Classify TLS alerts that surface only while the peer consumes the
+/// consensus bootstrap frames.
+///
+/// Rustls may defer a remote credential rejection until the Hello write or
+/// HelloAck read. Keep that interpretation at this bootstrap boundary: an
+/// ordinary EOF/reset remains unavailable, while a credential alert is an
+/// authentication failure rather than a generic transport failure.
+fn bootstrap_protocol_error_to_peer_error(error: ProtocolError) -> SessionConsensusPeerError {
+    match error {
+        ProtocolError::Io(error) => map_protocol_error(&classify_tls_io_error(error)),
+        error => map_protocol_error(&error),
+    }
+}
+
 fn record_consensus_server_connection_failure(error: &ProtocolError) {
     match error {
         ProtocolError::Io(error) if error.kind() == io::ErrorKind::TimedOut => {
@@ -540,9 +554,9 @@ impl ConsensusColdConnectionCoordinator {
             state.phase = ConsensusColdConnectionPhase::Failed {
                 attempt_id,
                 epoch,
-                error: SessionConsensusPeerError::Timeout,
+                error: SessionConsensusPeerError::Unavailable,
             };
-            receipt.publish(SessionConsensusPeerError::Timeout);
+            receipt.publish(SessionConsensusPeerError::Unavailable);
             state.no_admission_marker = attempt_id;
             Self::arm_remote_retirement_probe_gate(&mut state, epoch);
             drop(state);
@@ -588,7 +602,7 @@ impl ConsensusColdConnectionCoordinator {
             // replacement attempt; only a later logical call may replace it.
             let remote_retirement = error == SessionConsensusPeerError::Rejected;
             let error = if remote_retirement {
-                SessionConsensusPeerError::Timeout
+                SessionConsensusPeerError::Unavailable
             } else {
                 error
             };
@@ -613,6 +627,7 @@ impl ConsensusColdConnectionCoordinator {
         &self,
         attempt_id: uuid::Uuid,
         epoch: ConsensusColdConnectionEpoch,
+        error: SessionConsensusPeerError,
     ) {
         let mut state = self.state.lock().await;
         let receipt = match &state.phase {
@@ -628,11 +643,11 @@ impl ConsensusColdConnectionCoordinator {
             _ => None,
         };
         if let Some((receipt, remote_retirement_probe)) = receipt {
-            receipt.publish(SessionConsensusPeerError::Timeout);
+            receipt.publish(error);
             state.phase = ConsensusColdConnectionPhase::Failed {
                 attempt_id,
                 epoch,
-                error: SessionConsensusPeerError::Timeout,
+                error,
             };
             state.no_admission_marker = attempt_id;
             if remote_retirement_probe {
@@ -1109,7 +1124,7 @@ impl ConsensusColdConnector {
                 })?;
             let admission = outcome.admission();
             if Some(admission.epoch()) != epoch.material_epoch {
-                return Err(SessionConsensusPeerError::Timeout);
+                return Err(SessionConsensusPeerError::Unavailable);
             }
             let (parts, _) = outcome.into_parts();
             let (
@@ -1189,10 +1204,10 @@ impl ConsensusColdConnector {
         });
         write_frame_bounded_until(writer, &hello, MAX_HANDSHAKE_FRAME_SIZE, deadline)
             .await
-            .map_err(|error| map_protocol_error(&error))?;
+            .map_err(bootstrap_protocol_error_to_peer_error)?;
         let ack: SessionConsensusBootstrapResponse = read_frame(reader, MAX_HANDSHAKE_FRAME_SIZE)
             .await
-            .map_err(|error| map_protocol_error(&error))?;
+            .map_err(bootstrap_protocol_error_to_peer_error)?;
         let ack = match ack {
             SessionConsensusBootstrapResponse::Accepted(ack) => ack,
             SessionConsensusBootstrapResponse::Rejected(error) => return Err(error),
@@ -1230,7 +1245,7 @@ enum DetachedConsensusConnectionOutcome {
 enum ConsensusColdConnectionAction {
     Ready(Box<ConsensusConnection>),
     Failed(SessionConsensusPeerError),
-    NoAdmission,
+    NoAdmission(SessionConsensusPeerError),
     Retry,
     Wait {
         attempt_id: uuid::Uuid,
@@ -1258,7 +1273,9 @@ async fn run_detached_consensus_connection_attempt(
     attempt_deadline: tokio::time::Instant,
 ) {
     if tokio::time::Instant::now() >= attempt_deadline {
-        coordinator.publish_no_admission(attempt_id, epoch).await;
+        coordinator
+            .publish_no_admission(attempt_id, epoch, SessionConsensusPeerError::Timeout)
+            .await;
         return;
     }
     let mut reauthentication_rx = connector.reauthentication.subscribe();
@@ -1273,7 +1290,7 @@ async fn run_detached_consensus_connection_attempt(
             current_epoch.material_epoch,
         );
         coordinator
-            .publish_failure(attempt_id, epoch, SessionConsensusPeerError::Timeout)
+            .publish_failure(attempt_id, epoch, SessionConsensusPeerError::Unavailable)
             .await;
         return;
     }
@@ -1315,13 +1332,21 @@ async fn run_detached_consensus_connection_attempt(
     };
     let reconnect_attempt = match reconnect_admission {
         Some(ReconnectAdmission::Admitted(attempt)) => attempt,
-        Some(ReconnectAdmission::Cooldown | ReconnectAdmission::Deadline) => {
-            coordinator.publish_no_admission(attempt_id, epoch).await;
+        Some(ReconnectAdmission::Cooldown) => {
+            coordinator
+                .publish_no_admission(attempt_id, epoch, SessionConsensusPeerError::Unavailable)
+                .await;
+            return;
+        }
+        Some(ReconnectAdmission::Deadline) => {
+            coordinator
+                .publish_no_admission(attempt_id, epoch, SessionConsensusPeerError::Timeout)
+                .await;
             return;
         }
         Some(ReconnectAdmission::Superseded) | None => {
             coordinator
-                .publish_failure(attempt_id, epoch, SessionConsensusPeerError::Timeout)
+                .publish_failure(attempt_id, epoch, SessionConsensusPeerError::Unavailable)
                 .await;
             return;
         }
@@ -1387,14 +1412,14 @@ async fn run_detached_consensus_connection_attempt(
             attempt_metrics.finish_superseded();
             reconnect_attempt.failed();
             coordinator
-                .publish_failure(attempt_id, epoch, SessionConsensusPeerError::Timeout)
+                .publish_failure(attempt_id, epoch, SessionConsensusPeerError::Unavailable)
                 .await;
             return;
         }
         DetachedConsensusConnectionOutcome::Shutdown => {
             reconnect_attempt.failed();
             coordinator
-                .publish_failure(attempt_id, epoch, SessionConsensusPeerError::Timeout)
+                .publish_failure(attempt_id, epoch, SessionConsensusPeerError::Unavailable)
                 .await;
             // Pool teardown has no wire/deadline outcome. Let the metric
             // guard classify this bounded task cancellation as abandoned.
@@ -1854,7 +1879,9 @@ impl RemoteSessionConsensusPeer {
                     // declined bootstrap. This is a shared negative
                     // admission result, so no blocked caller can reach an
                     // Openraft Call or begin another physical setup.
-                    ConsensusColdConnectionAction::NoAdmission
+                    ConsensusColdConnectionAction::NoAdmission(
+                        SessionConsensusPeerError::Unavailable,
+                    )
                 } else if joined_no_admission_marker
                     .is_some_and(|marker| marker != state.no_admission_marker)
                     && !terminal_receipt_is_superseded
@@ -1870,7 +1897,9 @@ impl RemoteSessionConsensusPeer {
                         {
                             ConsensusColdConnectionAction::Failed(*error)
                         }
-                        _ => ConsensusColdConnectionAction::NoAdmission,
+                        _ => ConsensusColdConnectionAction::NoAdmission(
+                            SessionConsensusPeerError::Unavailable,
+                        ),
                     }
                 } else {
                     let remote_retirement_probe = state
@@ -1946,7 +1975,9 @@ impl RemoteSessionConsensusPeer {
                                         );
                                 }
                                 state.no_admission_marker = attempt_id;
-                                ConsensusColdConnectionAction::NoAdmission
+                                ConsensusColdConnectionAction::NoAdmission(
+                                    SessionConsensusPeerError::Unavailable,
+                                )
                             } else if consensus_connection_idle_expired(&connection, now) {
                                 connection
                                     .lifecycle
@@ -1960,7 +1991,9 @@ impl RemoteSessionConsensusPeer {
                                         Duration::ZERO,
                                     );
                                 state.no_admission_marker = attempt_id;
-                                ConsensusColdConnectionAction::NoAdmission
+                                ConsensusColdConnectionAction::NoAdmission(
+                                    SessionConsensusPeerError::Unavailable,
+                                )
                             } else {
                                 ConsensusColdConnectionAction::Ready(connection)
                             }
@@ -2041,8 +2074,8 @@ impl RemoteSessionConsensusPeer {
                     // the receipt and spawn a second physical setup.
                     return Err(error);
                 }
-                ConsensusColdConnectionAction::NoAdmission => {
-                    return Err(SessionConsensusPeerError::Timeout);
+                ConsensusColdConnectionAction::NoAdmission(error) => {
+                    return Err(error);
                 }
                 ConsensusColdConnectionAction::Retry => continue,
                 ConsensusColdConnectionAction::Spawn {
@@ -2101,7 +2134,7 @@ impl RemoteSessionConsensusPeer {
                 _ = &mut changed => {}
                 changed = reauthentication_rx.changed() => {
                     if changed.is_err() {
-                        return Err(SessionConsensusPeerError::Timeout);
+                        return Err(SessionConsensusPeerError::Unavailable);
                     }
                 }
                 material_epoch = wait_consensus_material_epoch_change(
@@ -2238,7 +2271,7 @@ impl RemoteSessionConsensusPeer {
             METRICS
                 .session_net_reconnect_attempts
                 .fetch_add(1, Ordering::Relaxed);
-            return Err(SessionConsensusPeerError::Timeout);
+            return Err(SessionConsensusPeerError::Unavailable);
         }
         let dispatched_at = tokio::time::Instant::now();
         let result = self
@@ -3739,6 +3772,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn consensus_bootstrap_protocol_error_mapper_preserves_tls_alert_categories() {
+        use tokio_rustls::rustls::{AlertDescription, Error};
+
+        let credential_alert = ProtocolError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            Error::AlertReceived(AlertDescription::CertificateRequired),
+        ));
+        assert_eq!(
+            bootstrap_protocol_error_to_peer_error(credential_alert),
+            SessionConsensusPeerError::Authentication,
+            "a rustls credential alert read during Hello/HelloAck is authentication"
+        );
+
+        let transport_reset = ProtocolError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "test reset",
+        ));
+        assert_eq!(
+            bootstrap_protocol_error_to_peer_error(transport_reset),
+            SessionConsensusPeerError::Unavailable,
+            "ordinary bootstrap transport closure remains unavailable"
+        );
+
+        let deadline = ProtocolError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "test deadline",
+        ));
+        assert_eq!(
+            bootstrap_protocol_error_to_peer_error(deadline),
+            SessionConsensusPeerError::Timeout,
+            "a real bootstrap deadline remains timeout"
+        );
+
+        let tls_protocol = ProtocolError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            Error::AlertReceived(AlertDescription::NoApplicationProtocol),
+        ));
+        assert_eq!(
+            bootstrap_protocol_error_to_peer_error(tls_protocol),
+            SessionConsensusPeerError::Protocol,
+            "non-credential rustls alerts remain protocol failures"
+        );
+    }
+
     #[derive(Debug)]
     struct CountingHandler(AtomicUsize);
 
@@ -4108,7 +4186,7 @@ mod tests {
             ConsensusColdConnectionPhase::Failed {
                 attempt_id: current_attempt_id,
                 epoch: current_epoch,
-                error: SessionConsensusPeerError::Timeout,
+                error: SessionConsensusPeerError::Unavailable,
             } if current_attempt_id == attempt_id && current_epoch == epoch
         ));
         assert_eq!(state.no_admission_marker, attempt_id);
@@ -4195,16 +4273,31 @@ mod tests {
             material_epoch: None,
         };
         let rejected_attempt = uuid::Uuid::new_v4();
+        let rejected_receipt = Arc::new(ConsensusColdAttemptReceipt::default());
         coordinator.state.lock().await.phase = ConsensusColdConnectionPhase::Connecting {
             attempt_id: rejected_attempt,
             epoch,
             attempt_deadline: tokio::time::Instant::now() + Duration::from_secs(1),
-            receipt: Arc::new(ConsensusColdAttemptReceipt::default()),
+            receipt: Arc::clone(&rejected_receipt),
             remote_retirement_probe: false,
         };
         coordinator
             .publish_failure(rejected_attempt, epoch, SessionConsensusPeerError::Rejected)
             .await;
+
+        assert_eq!(
+            rejected_receipt.terminal(),
+            Some(SessionConsensusPeerError::Unavailable),
+            "remote bootstrap retirement is an exact pre-Call unavailable receipt"
+        );
+        assert!(matches!(
+            coordinator.state.lock().await.phase,
+            ConsensusColdConnectionPhase::Failed {
+                attempt_id,
+                error: SessionConsensusPeerError::Unavailable,
+                ..
+            } if attempt_id == rejected_attempt
+        ));
 
         let now = tokio::time::Instant::now();
         assert!(
@@ -4646,7 +4739,7 @@ mod tests {
 
         assert_eq!(
             peer.call(request()).await,
-            Err(SessionConsensusPeerError::Timeout)
+            Err(SessionConsensusPeerError::Unavailable)
         );
         assert_eq!(tokio::time::Instant::now(), started_at);
         assert_eq!(resolutions.load(Ordering::SeqCst), 0);
@@ -4655,7 +4748,7 @@ mod tests {
             assert!(matches!(
                 state.phase,
                 ConsensusColdConnectionPhase::Failed {
-                    error: SessionConsensusPeerError::Timeout,
+                    error: SessionConsensusPeerError::Unavailable,
                     ..
                 }
             ));
@@ -5851,8 +5944,8 @@ mod tests {
 
         assert_eq!(
             peer.call(request()).await,
-            Err(SessionConsensusPeerError::Timeout),
-            "an authenticated no-Call receipt must stop this logical call"
+            Err(SessionConsensusPeerError::Unavailable),
+            "an authenticated no-Call receipt must report pre-Call unavailability"
         );
         make_remote_retirement_probe_due(&peer).await;
         assert_eq!(
@@ -5911,7 +6004,7 @@ mod tests {
 
         assert_eq!(
             peer.call(request()).await,
-            Err(SessionConsensusPeerError::Timeout)
+            Err(SessionConsensusPeerError::Unavailable)
         );
         assert_eq!(
             resolutions.load(Ordering::SeqCst),
@@ -5928,7 +6021,7 @@ mod tests {
         for outcome in [first_blocked, second_blocked, third_blocked, fourth_blocked] {
             assert_eq!(
                 outcome,
-                Err(SessionConsensusPeerError::Timeout),
+                Err(SessionConsensusPeerError::Unavailable),
                 "every later call inside one retirement-probe window has the same fixed no-admission outcome"
             );
         }
@@ -5939,20 +6032,26 @@ mod tests {
         );
 
         make_remote_retirement_probe_due(&peer).await;
+        let (first_due, second_due) = tokio::join!(peer.call(request()), peer.call(request()));
         assert_eq!(
-            peer.call(request()).await,
-            Err(SessionConsensusPeerError::Timeout),
-            "at the fixed boundary exactly one later same-epoch caller owns the next probe"
+            first_due,
+            Err(SessionConsensusPeerError::Unavailable),
+            "the due probe retains its pre-Call unavailable result"
+        );
+        assert_eq!(
+            second_due,
+            Err(SessionConsensusPeerError::Unavailable),
+            "a concurrent due caller joins the one probe and remains pre-Call unavailable"
         );
         assert_eq!(
             resolutions.load(Ordering::SeqCst),
             2,
-            "the boundary probe performs exactly one setup"
+            "at the fixed boundary exactly one same-epoch caller owns the physical probe"
         );
 
         assert_eq!(
             peer.call(request()).await,
-            Err(SessionConsensusPeerError::Timeout),
+            Err(SessionConsensusPeerError::Unavailable),
             "a failed same-epoch probe re-arms the fixed window"
         );
         assert_eq!(resolutions.load(Ordering::SeqCst), 2);
@@ -5960,7 +6059,7 @@ mod tests {
         make_remote_retirement_probe_due(&peer).await;
         assert_eq!(
             peer.call(request()).await,
-            Err(SessionConsensusPeerError::Timeout),
+            Err(SessionConsensusPeerError::Unavailable),
             "the re-armed window permits one later probe"
         );
         assert_eq!(
@@ -6029,7 +6128,7 @@ mod tests {
 
         assert_eq!(
             peer.call(request()).await,
-            Err(SessionConsensusPeerError::Timeout)
+            Err(SessionConsensusPeerError::Unavailable)
         );
         assert_eq!(resolutions.load(Ordering::SeqCst), 1);
         reauthentication
@@ -7095,7 +7194,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(matches!(
             claimant.await.expect("idle staged claimant join"),
-            Err(SessionConsensusPeerError::Timeout)
+            Err(SessionConsensusPeerError::Unavailable)
         ));
         assert_eq!(retirement_probe.recorded_retirement_count(), 1);
         assert_eq!(
