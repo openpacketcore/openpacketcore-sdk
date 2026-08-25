@@ -2697,7 +2697,7 @@ impl NamespaceBoundLinuxXfrmBackend {
     ///
     /// Returns [`XfrmObjectRosterRunError`]; use
     /// [`XfrmObjectRosterRunError::into_retry_authority`] to distinguish the
-    /// two proved-clean rejections from the durable-protocol failures.
+    /// three proved-clean rejections from the durable-protocol failures.
     #[cfg(unix)]
     pub async fn run_durable_object_roster(
         &self,
