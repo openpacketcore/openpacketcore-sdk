@@ -8,6 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{fmt, marker::PhantomData, time::Duration};
 
+use base64::Engine as _;
+use opc_consensus::{
+    ConsensusRpcFamily, CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES, CONSENSUS_SCHEMA_VERSION,
+};
 use opc_session_store::backend::{
     CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationLogRange, ReplicationOp,
     ReplicationTxId, SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
@@ -30,7 +34,7 @@ use opc_session_store::{
 };
 use opc_types::Timestamp;
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -48,9 +52,9 @@ pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 8 * 1024;
 pub const MIN_NEGOTIATED_FRAME_SIZE: usize = 8 * 1024;
 /// Smallest encoded frame budget accepted by the consensus-only profile.
 ///
-/// A worst-case JSON byte-array representation of the shared 2 MiB opaque RPC
-/// ceiling consumes about 8 MiB. This bound leaves deterministic envelope
-/// headroom while remaining below the global per-frame ceiling.
+/// The ordinary private RPC and response retain the historical JSON byte-array
+/// representation. The roster-only request payload uses a compact canonical
+/// padded-base64 outer envelope under its separate revision-five profile.
 pub const MIN_SESSION_CONSENSUS_FRAME_SIZE: usize = 9 * 1024 * 1024;
 /// Largest post-bootstrap frame budget accepted by protocol v5.
 ///
@@ -120,8 +124,15 @@ pub struct SessionConsensusContractProfile {
     pub application_revision: u16,
     /// Revision of the fixed transport and nested forwarded-operation errors.
     pub error_set_revision: u16,
-    /// Largest decoded private consensus payload accepted in either direction.
+    /// Largest decoded ordinary private consensus payload accepted in either
+    /// direction.
     pub max_rpc_payload_bytes: u32,
+    /// Largest decoded protected-roster request payload.
+    ///
+    /// Only the roster-forwarding family and a structurally singleton roster
+    /// AppendEntries request may use this ceiling. Responses and every other
+    /// RPC retain [`Self::max_rpc_payload_bytes`].
+    pub max_roster_rpc_payload_bytes: u32,
     /// Smallest negotiated encoded frame budget.
     pub min_frame_size: u32,
     /// Largest negotiated encoded frame budget.
@@ -138,6 +149,8 @@ impl SessionConsensusContractProfile {
                 == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision
             && self.max_rpc_payload_bytes
                 == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.max_rpc_payload_bytes
+            && self.max_roster_rpc_payload_bytes
+                == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.max_roster_rpc_payload_bytes
             && self.min_frame_size == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.min_frame_size
             && self.max_frame_size == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.max_frame_size
     }
@@ -150,6 +163,7 @@ pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractPr
         application_revision: SESSION_CONSENSUS_APPLICATION_REVISION,
         error_set_revision: 6,
         max_rpc_payload_bytes: SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES as u32,
+        max_roster_rpc_payload_bytes: CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES as u32,
         min_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE as u32,
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     };
@@ -259,6 +273,7 @@ pub const CURRENT_CONTRACT_PROFILE: ContractProfile = ContractProfile {
 
 const _: () = {
     assert!(SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES <= u32::MAX as usize);
+    assert!(CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES <= u32::MAX as usize);
     assert!(RESTORE_SCAN_MAX_PAGE_SIZE <= u32::MAX as usize);
     assert!(RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES <= u32::MAX as usize);
     assert!(opc_session_store::RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES <= u32::MAX as usize);
@@ -480,7 +495,191 @@ pub(crate) enum SessionConsensusBootstrapResponse {
     Rejected(SessionConsensusPeerError),
 }
 
-/// The only post-bootstrap request shape admitted on the consensus ALPN.
+const MAX_COMPACT_ROSTER_PAYLOAD_ENCODED_BYTES: usize =
+    CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES.div_ceil(3) * 4;
+
+const fn compact_roster_family(family: ConsensusRpcFamily) -> bool {
+    matches!(
+        family,
+        ConsensusRpcFamily::ForwardRosterMutation | ConsensusRpcFamily::AppendEntriesRoster
+    )
+}
+
+/// A protected-roster payload encoded with the canonical padded standard
+/// base64 alphabet. This revision-five-only representation avoids expanding
+/// each opaque byte into a JSON number and is bounded before decoded
+/// allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactRosterPayload(Vec<u8>);
+
+impl Serialize for CompactRosterPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+    }
+}
+
+fn decode_compact_roster_payload(encoded: &str) -> Result<Vec<u8>, &'static str> {
+    // Check encoded input before any decoded allocation. STANDARD requires
+    // canonical padding and rejects invalid trailing bits.
+    if encoded.len() > MAX_COMPACT_ROSTER_PAYLOAD_ENCODED_BYTES || !encoded.len().is_multiple_of(4)
+    {
+        return Err("invalid compact roster payload");
+    }
+    let padding = match encoded.as_bytes() {
+        [] => 0,
+        bytes if bytes.ends_with(b"==") => 2,
+        bytes if bytes.ends_with(b"=") => 1,
+        _ => 0,
+    };
+    let decoded_len = encoded
+        .len()
+        .checked_div(4)
+        .and_then(|groups| groups.checked_mul(3))
+        .and_then(|len| len.checked_sub(padding))
+        .filter(|len| *len <= CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES)
+        .ok_or("invalid compact roster payload")?;
+    let expected_encoded_len = decoded_len
+        .checked_add(2)
+        .and_then(|len| len.checked_div(3))
+        .and_then(|groups| groups.checked_mul(4))
+        .ok_or("invalid compact roster payload")?;
+    if encoded.len() != expected_encoded_len {
+        return Err("invalid compact roster payload");
+    }
+    let mut payload = vec![0_u8; decoded_len];
+    let actual_len = base64::engine::general_purpose::STANDARD
+        .decode_slice(encoded.as_bytes(), payload.as_mut_slice())
+        .map_err(|_| "invalid compact roster payload")?;
+    if actual_len != decoded_len {
+        return Err("invalid compact roster payload");
+    }
+    Ok(payload)
+}
+
+impl<'de> Deserialize<'de> for CompactRosterPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CompactRosterPayloadVisitor;
+
+        impl Visitor<'_> for CompactRosterPayloadVisitor {
+            type Value = CompactRosterPayload;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded canonical padded base64 roster payload")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                decode_compact_roster_payload(value)
+                    .map(CompactRosterPayload)
+                    .map_err(E::custom)
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'_ str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(value)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+        }
+
+        deserializer.deserialize_str(CompactRosterPayloadVisitor)
+    }
+}
+
+/// The compact protected-roster portion of the revision-five outer request.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompactRosterWireRequest {
+    schema_version: u16,
+    identity: SessionConsensusIdentity,
+    sender: SessionConsensusNodeId,
+    family: ConsensusRpcFamily,
+    payload: CompactRosterPayload,
+}
+
+impl CompactRosterWireRequest {
+    fn from_wire_request(
+        request: SessionConsensusWireRequest,
+    ) -> Result<Self, SessionConsensusPeerError> {
+        request.validate()?;
+        if !compact_roster_family(request.family) {
+            return Err(SessionConsensusPeerError::Protocol);
+        }
+        Ok(Self {
+            schema_version: request.schema_version,
+            identity: request.identity,
+            sender: request.sender,
+            family: request.family,
+            payload: CompactRosterPayload(request.payload),
+        })
+    }
+
+    fn into_wire_request(self) -> Result<SessionConsensusWireRequest, SessionConsensusPeerError> {
+        if self.schema_version != CONSENSUS_SCHEMA_VERSION || !compact_roster_family(self.family) {
+            return Err(SessionConsensusPeerError::Protocol);
+        }
+        let request = SessionConsensusWireRequest {
+            schema_version: self.schema_version,
+            identity: self.identity,
+            sender: self.sender,
+            family: self.family,
+            payload: self.payload.0,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactRosterWireRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            schema_version: u16,
+            identity: SessionConsensusIdentity,
+            sender: SessionConsensusNodeId,
+            family: ConsensusRpcFamily,
+            payload: CompactRosterPayload,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        if fields.schema_version != CONSENSUS_SCHEMA_VERSION
+            || !compact_roster_family(fields.family)
+        {
+            return Err(serde::de::Error::custom("invalid compact roster request"));
+        }
+        Ok(Self {
+            schema_version: fields.schema_version,
+            identity: fields.identity,
+            sender: fields.sender,
+            family: fields.family,
+            payload: fields.payload,
+        })
+    }
+}
+
+/// The only post-bootstrap request shapes admitted on the consensus ALPN.
+///
+/// `Call` is byte-compatible with ordinary traffic. `RosterCall` is accepted
+/// only for the two protected-roster families.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum SessionConsensusTransportRequest {
@@ -488,6 +687,50 @@ pub(crate) enum SessionConsensusTransportRequest {
         call_id: uuid::Uuid,
         request: SessionConsensusWireRequest,
     },
+    RosterCall {
+        call_id: uuid::Uuid,
+        request: CompactRosterWireRequest,
+    },
+}
+
+impl SessionConsensusTransportRequest {
+    /// Select the compact revision-five representation only for roster-only
+    /// families. Invalid outbound envelopes are rejected rather than panicking.
+    pub(crate) fn from_wire_call(
+        call_id: uuid::Uuid,
+        request: SessionConsensusWireRequest,
+    ) -> Result<Self, SessionConsensusPeerError> {
+        if compact_roster_family(request.family) {
+            return CompactRosterWireRequest::from_wire_request(request)
+                .map(|request| Self::RosterCall { call_id, request });
+        }
+        request.validate()?;
+        Ok(Self::Call { call_id, request })
+    }
+
+    pub(crate) const fn call_id(&self) -> uuid::Uuid {
+        match self {
+            Self::Call { call_id, .. } | Self::RosterCall { call_id, .. } => *call_id,
+        }
+    }
+
+    /// Recover the validated consensus request after outer-envelope decoding.
+    pub(crate) fn into_wire_call(
+        self,
+    ) -> Result<(uuid::Uuid, SessionConsensusWireRequest), SessionConsensusPeerError> {
+        match self {
+            Self::Call { call_id, request } => {
+                if compact_roster_family(request.family) {
+                    return Err(SessionConsensusPeerError::Protocol);
+                }
+                request.validate()?;
+                Ok((call_id, request))
+            }
+            Self::RosterCall { call_id, request } => request
+                .into_wire_request()
+                .map(|request| (call_id, request)),
+        }
+    }
 }
 
 /// The only post-bootstrap response shape emitted on the consensus ALPN.

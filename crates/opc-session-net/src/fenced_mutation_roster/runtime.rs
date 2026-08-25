@@ -13,13 +13,12 @@ use super::{
         decode_frame, encode_frame, session_key_canonical_digest_input, Admission,
         EstablishedPublicationCall, Member, MemberCall, MemberProvider, Phase, ProviderCallOutcome,
         ProviderCallOutcomeParts, ProviderOutcome, RequestId, RosterId, Scope,
-        TerminalConflictTombstone, TerminalRecord, TerminalSlotId,
-        COMMITTED_TERMINAL_FRAME_DOMAIN, COMMITTED_TERMINAL_FRAME_MAGIC,
-        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_PLAN_BYTES, MAX_STATUS_BYTES, PROOF_BINDING_DOMAIN,
-        PROOF_CREDENTIAL_DOMAIN, PROOF_DESCRIPTOR_DOMAIN, PROOF_DOMAIN, PROOF_OWNER_DOMAIN,
-        PROVIDER_OPERATION_ADOPT_TAG, PROVIDER_OPERATION_COMPENSATE_TAG,
-        PROVIDER_OPERATION_EXECUTE_TAG, PROVIDER_OPERATION_PREPARE_TAG,
-        PROVIDER_OPERATION_STATUS_TAG, PROVIDER_SCHEDULING_DOMAIN,
+        TerminalConflictTombstone, TerminalRecord, TerminalSlotId, COMMITTED_TERMINAL_FRAME_DOMAIN,
+        COMMITTED_TERMINAL_FRAME_MAGIC, MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_PLAN_BYTES,
+        MAX_STATUS_BYTES, PROOF_BINDING_DOMAIN, PROOF_CREDENTIAL_DOMAIN, PROOF_DESCRIPTOR_DOMAIN,
+        PROOF_DOMAIN, PROOF_OWNER_DOMAIN, PROVIDER_OPERATION_ADOPT_TAG,
+        PROVIDER_OPERATION_COMPENSATE_TAG, PROVIDER_OPERATION_EXECUTE_TAG,
+        PROVIDER_OPERATION_PREPARE_TAG, PROVIDER_OPERATION_STATUS_TAG, PROVIDER_SCHEDULING_DOMAIN,
         TERMINAL_COMMITTING_GUARD_DOMAIN, TERMINAL_RECEIPT_COMMITMENT_DOMAIN,
         TERMINAL_RECORD_COMMITMENT_DOMAIN,
     },
@@ -5474,10 +5473,7 @@ mod production_runtime_cut_matrix_tests {
                             Ok(CallResult::PreparedNotRun)
                         ));
                         proofs.push(conclusive(
-                            first
-                                .execute(&registration, ordinal)
-                                .await
-                                .expect(cut_name),
+                            first.execute(&registration, ordinal).await.expect(cut_name),
                         ));
                     }
                     let old_prepared = first
@@ -5544,7 +5540,7 @@ mod production_runtime_cut_matrix_tests {
                         second
                             .terminalize(&recovered, &prepared)
                             .await
-                                .expect(cut_name)
+                            .expect(cut_name)
                             .phase(),
                         Phase::Established
                     );
@@ -5556,10 +5552,7 @@ mod production_runtime_cut_matrix_tests {
                             Ok(CallResult::PreparedNotRun)
                         ));
                         let _ = conclusive(
-                            first
-                                .execute(&registration, ordinal)
-                                .await
-                                .expect(cut_name),
+                            first.execute(&registration, ordinal).await.expect(cut_name),
                         );
                     }
                     let second = executor(
@@ -5596,10 +5589,7 @@ mod production_runtime_cut_matrix_tests {
                             Ok(CallResult::PreparedNotRun)
                         ));
                         proofs.push(conclusive(
-                            first
-                                .execute(&registration, ordinal)
-                                .await
-                                .expect(cut_name),
+                            first.execute(&registration, ordinal).await.expect(cut_name),
                         ));
                     }
                     assert!(
@@ -5638,7 +5628,7 @@ mod production_runtime_cut_matrix_tests {
                         first
                             .terminalize(&registration, &prepared)
                             .await
-                                .expect(cut_name)
+                            .expect(cut_name)
                             .phase(),
                         Phase::Established
                     );
