@@ -75,6 +75,10 @@ pub mod consensus;
 pub mod consumer;
 pub mod error;
 pub mod fake;
+pub mod fenced_mutation_roster;
+mod fenced_mutation_roster_executor;
+mod fenced_mutation_roster_storage;
+pub(crate) mod fenced_mutation_roster_transport;
 pub mod fenced_transition;
 pub mod fenced_transition_journal;
 pub mod handover;
@@ -178,6 +182,35 @@ pub use consumer::{
 };
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
+pub use fenced_mutation_roster::{
+    profile_digest as fenced_mutation_roster_profile_digest, roster_executor_evidence_commitment,
+    roster_ingress_capsule_commitment, AdmissionProposal as FencedMutationRosterAdmissionProposal,
+    Error as FencedMutationRosterError,
+    EstablishedMutation as FencedMutationRosterEstablishedMutation,
+    Member as FencedMutationRosterMember,
+    MemberOperationId as FencedMutationRosterMemberOperationId, Phase as FencedMutationRosterPhase,
+    Profile as FencedMutationRosterProfile, RosterAttestationCertificateRoleV1,
+    RosterAttestationLeafCertificatePartsV1, RosterAttestationTrustRootIdentityV1,
+    RosterAttestationTrustRootV1, RosterId as FencedMutationRosterId,
+    RosterIngressAttestationSigningInputV1, RosterIngressAttestationV1,
+    CONSUMER_ALPN as FENCED_MUTATION_ROSTER_CONSUMER_ALPN,
+    CONSUMER_REVISION as FENCED_MUTATION_ROSTER_CONSUMER_REVISION,
+    FRESH_ROSTER_MEMBERS as FENCED_MUTATION_ROSTER_FRESH_MEMBERS,
+    MAX_CHECKPOINT_BYTES as FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES,
+    MAX_DESCRIPTOR_BYTES as FENCED_MUTATION_ROSTER_MAX_DESCRIPTOR_BYTES,
+    MAX_HISTORY_EPOCH as FENCED_MUTATION_ROSTER_MAX_HISTORY_EPOCH,
+    MAX_LIVE_ROSTERS as FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS,
+    MAX_MEMBERS as FENCED_MUTATION_ROSTER_MAX_MEMBERS,
+    MAX_PLAN_BYTES as FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES,
+    MAX_RESERVED_AND_RETAINED as FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+    MAX_RESULT_BYTES as FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES,
+    MAX_STATUS_BYTES as FENCED_MUTATION_ROSTER_MAX_STATUS_BYTES,
+    MEMBER_OPERATION_ID_BYTES as FENCED_MUTATION_ROSTER_MEMBER_OPERATION_ID_BYTES,
+    RECLAIM_BATCH as FENCED_MUTATION_ROSTER_RECLAIM_BATCH,
+    ROSTER_ID_BYTES as FENCED_MUTATION_ROSTER_ID_BYTES,
+    SCHEMA_V1 as FENCED_MUTATION_ROSTER_SCHEMA_V1,
+    TERMINAL_RETENTION as FENCED_MUTATION_ROSTER_TERMINAL_RETENTION,
+};
 pub use fenced_transition::{
     fenced_transition_v2_profile_digest, AtomicFencedTransitionCapability,
     FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
