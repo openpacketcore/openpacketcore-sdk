@@ -1295,6 +1295,9 @@ impl ConsensusSessionStore {
         .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
+        let storage_shutdown = state_machine
+            .shutdown_observer()
+            .ok_or(ConsensusSessionStoreOpenError::StorageUnavailable)?;
         let (membership_scope, _) = backend
             .consensus_membership_scope_snapshot(storage_identity)
             .await
@@ -1344,6 +1347,7 @@ impl ConsensusSessionStore {
             FencedTransitionV2StatusBatchSupervisor::new();
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            storage_shutdown,
             raft_handler,
             backend,
             proactive_checkpoint_lane,

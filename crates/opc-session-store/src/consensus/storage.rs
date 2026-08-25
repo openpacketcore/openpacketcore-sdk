@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use opc_consensus::engine::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
@@ -295,9 +295,94 @@ pub(crate) enum ConsensusAuthorityProfile {
 }
 
 /// Serialized Openraft vote/log persistence.
-#[derive(Clone)]
 pub(crate) struct SqliteConsensusLogStore {
     core: SqliteConsensusCore,
+    // Last-drop notification follows release of the log reader's SQLite core.
+    shutdown_guard: ConsensusStorageShutdownGuard,
+}
+
+impl SqliteConsensusLogStore {
+    fn tracked_reader(&self) -> Self {
+        Self {
+            core: self.core.clone(),
+            shutdown_guard: self.shutdown_guard.child(),
+        }
+    }
+}
+
+struct ConsensusStorageShutdownCompletion {
+    active_owners: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+/// Observation that every Openraft-owned SQLite storage handle has exited.
+#[derive(Clone)]
+pub(crate) struct ConsensusStorageShutdownObserver(Arc<ConsensusStorageShutdownCompletion>);
+
+impl ConsensusStorageShutdownObserver {
+    pub(crate) async fn wait(&self) {
+        loop {
+            if self.0.active_owners.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.0.active_owners.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct ConsensusStorageShutdownGuard(Option<Arc<ConsensusStorageShutdownCompletion>>);
+
+impl ConsensusStorageShutdownGuard {
+    fn tracked() -> Self {
+        Self(Some(Arc::new(ConsensusStorageShutdownCompletion {
+            active_owners: AtomicUsize::new(1),
+            notify: tokio::sync::Notify::new(),
+        })))
+    }
+
+    const fn detached() -> Self {
+        Self(None)
+    }
+
+    fn observer(&self) -> Option<ConsensusStorageShutdownObserver> {
+        self.0
+            .as_ref()
+            .map(|completion| ConsensusStorageShutdownObserver(Arc::clone(completion)))
+    }
+
+    fn child(&self) -> Self {
+        let Some(completion) = self.0.as_ref() else {
+            return Self::detached();
+        };
+        let incremented =
+            completion
+                .active_owners
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                });
+        assert!(
+            incremented.is_ok(),
+            "bounded consensus storage ownership cannot overflow"
+        );
+        Self(Some(Arc::clone(completion)))
+    }
+}
+
+impl Drop for ConsensusStorageShutdownGuard {
+    fn drop(&mut self) {
+        let Some(completion) = self.0.take() else {
+            return;
+        };
+        if completion.active_owners.fetch_sub(1, Ordering::AcqRel) == 1 {
+            completion.notify.notify_waiters();
+        }
+    }
 }
 
 impl SqliteConsensusLogStore {
@@ -314,13 +399,32 @@ impl SqliteConsensusLogStore {
 }
 
 /// Persistent session state machine and snapshot owner.
-#[derive(Clone)]
 pub(crate) struct SqliteConsensusStateMachine {
     core: SqliteConsensusCore,
     membership_admission: Option<SessionRaftPeerDirectory>,
+    // This field must remain last: its Drop is the completion edge after the
+    // worker has released the SQLite core and membership admission fields.
+    shutdown_guard: ConsensusStorageShutdownGuard,
+}
+
+#[cfg(test)]
+impl Clone for SqliteConsensusStateMachine {
+    fn clone(&self) -> Self {
+        Self {
+            core: self.core.clone(),
+            membership_admission: self.membership_admission.clone(),
+            // Test-only direct state-machine clones are not worker owners and
+            // must never satisfy the store's shutdown barrier.
+            shutdown_guard: ConsensusStorageShutdownGuard::detached(),
+        }
+    }
 }
 
 impl SqliteConsensusStateMachine {
+    pub(crate) fn shutdown_observer(&self) -> Option<ConsensusStorageShutdownObserver> {
+        self.shutdown_guard.observer()
+    }
+
     async fn begin_membership_apply(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
         match self.membership_admission.as_ref() {
             Some(admission) => Some(admission.begin_membership_apply().await),
@@ -360,6 +464,18 @@ impl SqliteConsensusStateMachine {
 /// serialization of the session database.
 pub(crate) struct SqliteConsensusSnapshotBuilder {
     core: SqliteConsensusCore,
+    // Last-drop notification follows release of the builder's SQLite core.
+    _shutdown_guard: ConsensusStorageShutdownGuard,
+}
+
+/// Detached blocking snapshot capture and its exact SQLite-owner lifetime.
+///
+/// Field order is intentional: Rust drops `reader` before `_shutdown_guard`,
+/// so the shutdown observer cannot complete while the WAL-pinning connection
+/// remains live after cancellation of the async snapshot caller.
+struct SnapshotCaptureWorker {
+    reader: consensus::SnapshotReadConnection,
+    _shutdown_guard: ConsensusStorageShutdownGuard,
 }
 
 pub(crate) async fn open_with_member_bindings(
@@ -453,11 +569,17 @@ async fn open_with_member_bindings_for_profile(
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
     let storage_identity = core.storage_identity;
+    let shutdown_guard = ConsensusStorageShutdownGuard::tracked();
+    let state_machine_shutdown_guard = shutdown_guard.child();
     Ok((
-        SqliteConsensusLogStore { core: core.clone() },
+        SqliteConsensusLogStore {
+            core: core.clone(),
+            shutdown_guard,
+        },
         SqliteConsensusStateMachine {
             core,
             membership_admission: Some(membership_admission),
+            shutdown_guard: state_machine_shutdown_guard,
         },
         storage_identity,
     ))
@@ -499,11 +621,17 @@ async fn open(
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
+    let shutdown_guard = ConsensusStorageShutdownGuard::tracked();
+    let state_machine_shutdown_guard = shutdown_guard.child();
     Ok((
-        SqliteConsensusLogStore { core: core.clone() },
+        SqliteConsensusLogStore {
+            core: core.clone(),
+            shutdown_guard,
+        },
         SqliteConsensusStateMachine {
             core,
             membership_admission: None,
+            shutdown_guard: state_machine_shutdown_guard,
         },
     ))
 }
@@ -558,11 +686,17 @@ pub(crate) async fn open_with_pending_membership(
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
     let storage_identity = core.storage_identity;
+    let shutdown_guard = ConsensusStorageShutdownGuard::tracked();
+    let state_machine_shutdown_guard = shutdown_guard.child();
     Ok((
-        SqliteConsensusLogStore { core: core.clone() },
+        SqliteConsensusLogStore {
+            core: core.clone(),
+            shutdown_guard,
+        },
         SqliteConsensusStateMachine {
             core,
             membership_admission: Some(membership_admission),
+            shutdown_guard: state_machine_shutdown_guard,
         },
         storage_identity,
     ))
@@ -792,7 +926,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
-        self.clone()
+        self.tracked_reader()
     }
 
     async fn save_vote(
@@ -1096,6 +1230,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         SqliteConsensusSnapshotBuilder {
             core: self.core.clone(),
+            _shutdown_guard: self.shutdown_guard.child(),
         }
     }
 
@@ -1495,6 +1630,7 @@ async fn build_file_backed_snapshot_database(
     raw_artifact: SnapshotArtifact,
     vacuum_artifact: SnapshotArtifact,
     snapshot_guard: tokio::sync::OwnedMutexGuard<()>,
+    worker_shutdown_guard: ConsensusStorageShutdownGuard,
 ) -> Result<
     (
         tokio::sync::OwnedMutexGuard<()>,
@@ -1514,11 +1650,14 @@ async fn build_file_backed_snapshot_database(
     let Some(database_file) = &core.database_file else {
         return Ok((snapshot_guard, None, raw_artifact, None));
     };
-    let reader = consensus::open_snapshot_read_connection(database_file)
-        .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
+    let worker = SnapshotCaptureWorker {
+        reader: consensus::open_snapshot_read_connection(database_file)
+            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?,
+        _shutdown_guard: worker_shutdown_guard,
+    };
     let source_cut = {
         let conn = core.conn.lock().await;
-        match consensus::begin_snapshot_read_sync(&reader, core.storage_identity) {
+        match consensus::begin_snapshot_read_sync(&worker.reader, core.storage_identity) {
             Ok(source_cut) => {
                 let live_file = opc_sqlite_file_control_sys::main_file_descriptor(&conn)
                     .map_err(|_| {
@@ -1562,7 +1701,7 @@ async fn build_file_backed_snapshot_database(
     let source_cut = match source_cut {
         Ok(source_cut) => source_cut,
         Err(error) => {
-            let error = match consensus::release_snapshot_read_sync(&reader) {
+            let error = match consensus::release_snapshot_read_sync(&worker.reader) {
                 Ok(()) => error,
                 Err(release_error) => release_error,
             };
@@ -1583,16 +1722,16 @@ async fn build_file_backed_snapshot_database(
     let vacuum_path = vacuum_artifact.path().to_path_buf();
     #[cfg(test)]
     let snapshot_capture_gate = Arc::clone(&core.snapshot_capture_gate);
-    // The owned guard moves into the worker and comes back with its result.
-    // Cancellation of the async caller therefore cannot detach a second
-    // snapshot worker or a second WAL-pinning reader for this consensus core.
+    // The owned gate guard moves into the worker and comes back with its
+    // result. Cancellation of the async caller therefore cannot detach a
+    // second snapshot worker or a second WAL-pinning reader for this core.
     let (captured, snapshot_guard) = tokio::task::spawn_blocking(move || {
         let raw_artifact = raw_artifact;
         let vacuum_artifact = vacuum_artifact;
         #[cfg(test)]
         snapshot_capture_gate.block_after_capture();
         let captured = consensus::capture_snapshot_database_from_reader_sync(
-            &reader,
+            &worker.reader,
             storage_identity,
             authority_profile,
             &expected_members,
@@ -1603,7 +1742,7 @@ async fn build_file_backed_snapshot_database(
         );
         // The source transaction is retained only through `Backup`; all
         // cleanup, VACUUM, validation, hashing, and sealing follow release.
-        let released = consensus::release_snapshot_read_sync(&reader);
+        let released = consensus::release_snapshot_read_sync(&worker.reader);
         let captured = match (captured, released) {
             (Ok(captured), Ok(())) => {
                 let (captured_cut, raw_snapshot, wal_bytes) = captured;
@@ -1638,6 +1777,10 @@ async fn build_file_backed_snapshot_database(
         // If the async caller is cancelled, Tokio drops this detached worker
         // output in field order, so every unpublished artifact is removed
         // before another snapshot builder can acquire sole-worker ownership.
+        // Force Rust 2021 to retain the complete wrapper: field-disjoint
+        // closure capture must not detach its reader from the shutdown guard
+        // that bounds the WAL-pinning SQLite owner's lifetime.
+        drop(worker);
         (captured, snapshot_guard)
     })
     .await
@@ -1703,6 +1846,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 raw_artifact,
                 vacuum_artifact,
                 snapshot_guard,
+                self._shutdown_guard.child(),
             )
             .await?;
         let (
@@ -2383,6 +2527,81 @@ mod tests {
     use crate::record::{EncryptedSessionPayload, StoredSessionRecord};
 
     const PLAINTEXT_CANARY: &[u8] = b"never-persist-this-plaintext-canary";
+
+    #[tokio::test]
+    async fn shutdown_observer_waits_for_all_tracked_sqlite_owners() {
+        let root = ConsensusStorageShutdownGuard::tracked();
+        let observer = root.observer().expect("tracked root has an observer");
+        let state_machine = root.child();
+        let replication_reader = root.child();
+        let snapshot_builder = state_machine.child();
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 4);
+
+        drop(root);
+        assert_eq!(
+            observer.0.active_owners.load(Ordering::Acquire),
+            3,
+            "the log root cannot complete while other engine tasks own SQLite"
+        );
+        drop(state_machine);
+        drop(replication_reader);
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 1);
+        drop(snapshot_builder);
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 0);
+        tokio::time::timeout(Duration::from_secs(1), observer.wait())
+            .await
+            .expect("the final tracked SQLite owner releases the shutdown barrier");
+    }
+
+    #[tokio::test]
+    async fn shutdown_observer_tracks_real_openraft_storage_wrappers() {
+        let directory = tempfile::tempdir().expect("storage ownership directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
+            .expect("storage ownership backend");
+        let (mut log_store, mut state_machine) = open(
+            &backend,
+            directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("storage ownership wrappers");
+        let observer = state_machine
+            .shutdown_observer()
+            .expect("production wrappers share a shutdown observer");
+        let replication_reader = log_store.get_log_reader().await;
+        let snapshot_builder = state_machine.get_snapshot_builder().await;
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 4);
+
+        let first_waiter = tokio::spawn({
+            let observer = observer.clone();
+            async move { observer.wait().await }
+        });
+        let second_waiter = tokio::spawn({
+            let observer = observer.clone();
+            async move { observer.wait().await }
+        });
+        tokio::task::yield_now().await;
+
+        drop(log_store);
+        drop(state_machine);
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 2);
+        assert!(!first_waiter.is_finished());
+        assert!(!second_waiter.is_finished());
+
+        drop(replication_reader);
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 1);
+        assert!(!first_waiter.is_finished());
+        assert!(!second_waiter.is_finished());
+
+        drop(snapshot_builder);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first_waiter.await.expect("first shutdown observer");
+            second_waiter.await.expect("second shutdown observer");
+        })
+        .await
+        .expect("all waiters observe final wrapper release");
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -3120,10 +3339,14 @@ mod tests {
         .await
         .expect("open exact fixed raw-read store");
         (
-            SqliteConsensusLogStore { core: core.clone() },
+            SqliteConsensusLogStore {
+                core: core.clone(),
+                shutdown_guard: ConsensusStorageShutdownGuard::detached(),
+            },
             SqliteConsensusStateMachine {
                 core,
                 membership_admission: None,
+                shutdown_guard: ConsensusStorageShutdownGuard::detached(),
             },
             database,
         )
@@ -4789,7 +5012,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("snapshot cancellation directory");
         let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
             .expect("snapshot cancellation backend");
-        let (_, mut state_machine) = open(
+        let (log_store, mut state_machine) = open(
             &backend,
             directory.path().join("snapshots"),
             identity(1),
@@ -4797,6 +5020,9 @@ mod tests {
         )
         .await
         .expect("snapshot cancellation storage");
+        let shutdown_observer = state_machine
+            .shutdown_observer()
+            .expect("snapshot wrappers share a shutdown observer");
         state_machine
             .apply([initial_membership_entry()])
             .await
@@ -4857,10 +5083,57 @@ mod tests {
             .await
             .expect("subsequent snapshot succeeds after cancellation");
         drop(successful);
+        drop(successful_builder);
         assert_eq!(
             1,
             core.snapshot_observation.snapshot().3,
             "only the returned, durable snapshot advances completion status"
         );
+
+        capture_gate.arm();
+        let mut cancelled_builder = state_machine.get_snapshot_builder().await;
+        let cancelled = tokio::spawn(async move { cancelled_builder.build_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !capture_gate.started() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("final snapshot worker reaches its fixed source cut");
+        cancelled.abort();
+        assert!(cancelled
+            .await
+            .expect_err("final snapshot future is cancelled")
+            .is_cancelled());
+
+        let shutdown_waiter = tokio::spawn({
+            let observer = shutdown_observer.clone();
+            async move { observer.wait().await }
+        });
+        tokio::task::yield_now().await;
+        drop(log_store);
+        drop(state_machine);
+        assert_eq!(
+            shutdown_observer.0.active_owners.load(Ordering::Acquire),
+            1,
+            "the detached WAL reader remains the final SQLite owner"
+        );
+        assert!(
+            !shutdown_waiter.is_finished(),
+            "shutdown must remain pending while detached capture owns SQLite"
+        );
+
+        capture_gate.release();
+        let worker_released = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&core.snapshot_gate).lock_owned(),
+        )
+        .await
+        .expect("final cancelled snapshot worker exits within the bounded window");
+        drop(worker_released);
+        tokio::time::timeout(Duration::from_secs(1), shutdown_waiter)
+            .await
+            .expect("shutdown observes detached snapshot worker exit")
+            .expect("shutdown observer task remains available");
     }
 }
