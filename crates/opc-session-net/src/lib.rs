@@ -46,6 +46,7 @@ pub mod client;
 pub mod consensus;
 pub mod consumer;
 pub mod error;
+mod fenced_mutation_roster;
 pub mod identity;
 mod lifecycle;
 pub mod membership;
@@ -97,6 +98,42 @@ pub use consumer::{
     SESSION_QUORUM_CONSUMER_V2_ALPN, SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
 };
 pub use error::ProtocolError;
+pub use fenced_mutation_roster::{
+    FencedMutationRosterAbortedTerminal, FencedMutationRosterActive,
+    FencedMutationRosterAdmissionInput, FencedMutationRosterAdmissionOutcome,
+    FencedMutationRosterAdmissionProposal, FencedMutationRosterAdmissionUnknown,
+    FencedMutationRosterClient, FencedMutationRosterClientError,
+    FencedMutationRosterCompleteProofSet, FencedMutationRosterDiagnostics,
+    FencedMutationRosterEstablishedMutation, FencedMutationRosterEstablishedPublication,
+    FencedMutationRosterEstablishedPublicationCall,
+    FencedMutationRosterEstablishedPublicationProvider, FencedMutationRosterEstablishedTerminal,
+    FencedMutationRosterExecuteOutcome, FencedMutationRosterExecutorAttestor,
+    FencedMutationRosterExecutorError, FencedMutationRosterId, FencedMutationRosterMember,
+    FencedMutationRosterMemberAdoption, FencedMutationRosterMemberCall,
+    FencedMutationRosterMemberDisposition, FencedMutationRosterMemberOperationId,
+    FencedMutationRosterMemberOrdinal, FencedMutationRosterMemberPrepareOutcome,
+    FencedMutationRosterMemberProof, FencedMutationRosterMemberProvider,
+    FencedMutationRosterMemberRecoveryOutcome, FencedMutationRosterMemberRecoveryStatus,
+    FencedMutationRosterPhase, FencedMutationRosterPreparedTerminal, FencedMutationRosterProfile,
+    FencedMutationRosterProviderAdapter, FencedMutationRosterProviderAdapterDiagnostics,
+    FencedMutationRosterProviderCallOutcome, FencedMutationRosterPublicationError,
+    FencedMutationRosterPublicationEvidence, FencedMutationRosterPublicationId,
+    FencedMutationRosterPublicationProviderOutcome, FencedMutationRosterReadyMember,
+    FencedMutationRosterRecoverableMember, FencedMutationRosterRecovered,
+    FencedMutationRosterRecoveryInput, FencedMutationRosterRecoveryOutcome,
+    FencedMutationRosterTerminal, FencedMutationRosterTerminalReceipt,
+    FencedMutationRosterTerminalStatus, FencedMutationRosterTerminalizationOutcome,
+    ProtectedRosterTransportError, FENCED_MUTATION_ROSTER_CONSUMER_ALPN,
+    FENCED_MUTATION_ROSTER_CONSUMER_REVISION, FENCED_MUTATION_ROSTER_FRESH_MEMBERS,
+    FENCED_MUTATION_ROSTER_ID_BYTES, FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES,
+    FENCED_MUTATION_ROSTER_MAX_DESCRIPTOR_BYTES, FENCED_MUTATION_ROSTER_MAX_HISTORY_EPOCH,
+    FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS, FENCED_MUTATION_ROSTER_MAX_MEMBERS,
+    FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES, FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+    FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES, FENCED_MUTATION_ROSTER_MAX_STATUS_BYTES,
+    FENCED_MUTATION_ROSTER_MEMBER_OPERATION_ID_BYTES, FENCED_MUTATION_ROSTER_SCHEMA_V1,
+    MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+    MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES, MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES,
+};
 pub use identity::{
     LocalReplicaBinding, RemoteReplicaBinding, SessionClusterId, SessionConfigurationEpoch,
     SessionConfigurationGeneration, SessionConfigurationId, SessionManifestError,
