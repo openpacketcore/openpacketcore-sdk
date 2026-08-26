@@ -795,7 +795,7 @@ impl ThreeVoterConsumerFleet {
     }
 
     async fn wait_for_observed_leader(&self) -> (usize, SessionConsensusNodeId, u64) {
-        tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
+        let observed = tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
             loop {
                 let statuses = self
                     .stores
@@ -821,8 +821,36 @@ impl ThreeVoterConsumerFleet {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
-        .await
-        .expect("three-voter leader converges")
+        .await;
+        if let Ok(observed) = observed {
+            return observed;
+        }
+        let statuses = self
+            .stores
+            .iter()
+            .map(ConsensusSessionStore::status)
+            .collect::<Vec<_>>();
+        let leaders_agree = statuses
+            .first()
+            .and_then(|status| status.leader_id)
+            .is_some_and(|leader| {
+                statuses
+                    .iter()
+                    .all(|status| status.leader_id == Some(leader))
+            });
+        let redacted = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+            let status = &statuses[index];
+            (
+                status.term,
+                status.leader_id.is_some(),
+                status.admitted,
+                status.applied_index,
+                status.last_log_index,
+            )
+        });
+        panic!(
+            "three-voter leader converges; leaders_agree={leaders_agree}; redacted_status={redacted:?}"
+        )
     }
 
     async fn application_sequences(&self) -> [u64; THREE_VOTER_COUNT] {
@@ -854,15 +882,20 @@ impl ThreeVoterConsumerFleet {
         })
         .await;
         if converged.is_err() {
-            let statuses = self
-                .stores
-                .iter()
-                .map(ConsensusSessionStore::status)
-                .collect::<Vec<_>>();
             let sequences = self.application_sequence_observation().await;
+            let redacted_status = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                let status = self.stores[index].status();
+                (
+                    status.term,
+                    status.leader_id.is_some(),
+                    status.admitted,
+                    status.applied_index,
+                    status.last_log_index,
+                )
+            });
             let (decoded, decode_failures, nonempty) = self.append_entries_observation();
             panic!(
-                "three-voter application sequences converge: expected={expected}; sequences={sequences:?}; statuses={statuses:?}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}"
+                "three-voter application sequences converge: expected={expected}; sequences={sequences:?}; redacted_status={redacted_status:?}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}"
             );
         }
     }
@@ -7365,6 +7398,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
         })
         .await
         .expect("retained PollAdmitted body is compacted into a snapshot before restart");
+        fleet.wait_all_application_sequences(target_log_index).await;
     }
     #[cfg(not(feature = "test-control"))]
     assert!(

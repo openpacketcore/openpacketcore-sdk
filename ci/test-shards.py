@@ -16,7 +16,9 @@ selection builds it with ``all-apps``.
 
 Cargo launches the test binaries itself, so the harness argv, working
 directory and every ``CARGO_*`` variable a test may read stay exactly what the
-single-job run provided.
+single-job run provided, except for the two explicitly enumerated protected
+roster proofs that compile at test profile O1 without changing their literal
+authority bounds.
 
 Usage:
     test-shards.py ids                 # shard ids, one per line (CI matrix)
@@ -62,7 +64,17 @@ QUIESCENT_INTEGRATION_TARGET = "stateless_quorum_consumer"
 QUIESCENT_INTEGRATION_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
+    "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
 )
+OPTIMIZED_QUIESCENT_INTEGRATION_TESTS = frozenset(
+    {
+        "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
+        "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
+    }
+)
+# Keep O1 confined to the maximum-envelope and snapshot/restart roster proofs.
+# Applying it to unrelated expiry/fault tests changes their lifecycle timing
+# and would no longer qualify the repository's ordinary test profile.
 
 # A partition that collapses to a handful of targets would still be "total and
 # disjoint" if metadata were misread, so hold a floor on the real inventory
@@ -140,6 +152,23 @@ def shard_ids(plan: dict) -> list[str]:
     return ids
 
 
+def quiescent_integration_command(name: str) -> list[str]:
+    """Run one wall-time-sensitive contract in its exact isolated profile."""
+    profile = (
+        ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"]
+        if name in OPTIMIZED_QUIESCENT_INTEGRATION_TESTS
+        else []
+    )
+    return profile + SELECTION + [
+        "--test",
+        QUIESCENT_INTEGRATION_TARGET,
+        "--",
+        "--test-threads=1",
+        "--exact",
+        name,
+    ]
+
+
 def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
     """The cargo invocations for one shard."""
     heavy = plan["heavy"]
@@ -192,18 +221,7 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         + selected
         + ["--", *HARNESS, "--exact", *skips]
     )
-    isolated = [
-        SELECTION
-        + [
-            "--test",
-            QUIESCENT_INTEGRATION_TARGET,
-            "--",
-            "--test-threads=1",
-            "--exact",
-            name,
-        ]
-        for name in QUIESCENT_INTEGRATION_TESTS
-    ]
+    isolated = [quiescent_integration_command(name) for name in QUIESCENT_INTEGRATION_TESTS]
     return [ordinary, *isolated]
 
 
@@ -288,14 +306,7 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
         )
     owner_commands = commands(plan, owners[0], targets)
     for name in QUIESCENT_INTEGRATION_TESTS:
-        isolated = SELECTION + [
-            "--test",
-            QUIESCENT_INTEGRATION_TARGET,
-            "--",
-            "--test-threads=1",
-            "--exact",
-            name,
-        ]
+        isolated = quiescent_integration_command(name)
         if owner_commands.count(isolated) != 1:
             sys.exit(
                 f"{owners[0]} no longer runs {name!r} exactly once in its "
