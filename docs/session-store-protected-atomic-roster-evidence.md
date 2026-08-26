@@ -4,11 +4,31 @@ This document records reproducible evidence for SDK issue #707. It covers the
 generic SDK boundary only; it does not claim downstream product integration or
 end-to-end application latency.
 
+## Deployment activation
+
+Before advertising the revision-five `opc-session-consumer/3` listener as
+ready, a fixed-durable deployment calls
+`ConsensusSessionStore::activate_protected_roster_profile()` once against the
+current exact voter set. The operation obtains unanimous exact-profile proof
+and durably installs a voter-set-bound certificate. It is a deployment/startup
+transaction, never a per-roster member transaction. Protected admission fails
+closed while the certificate is absent, stale, mixed-capability, or bound to a
+different voter set. Restart and snapshot promotion reuse the persisted exact
+certificate; they do not infer support from the listener or from a generic
+capability marker.
+
+The real three-voter fixtures perform this activation before exposing protected
+traffic. Their full-process restart path deliberately does not reactivate it,
+so every restart/crash test proves that the original certificate survived and
+still matches the current exact voter scope. The fresh roster itself therefore
+retains exactly two state-changing quorum transactions: PollAdmitted before any
+provider effect and one all-or-none Established or Aborted terminal mutation.
+
 ## Candidate lineage
 
 The signed semantic candidate immediately before this evidence-only refresh is
-`6b730906269e8d91ae1b76144558268916c66e8e`, tree
-`37c57e155604e45e1c21a1b521013a50ed031054`. It is based directly on the
+`6086d735f55e9f35f8b23cc3b05e1d6dd3716fd6`, tree
+`903ba32cd566c1efd385ce1a029b837f2e189b41`. It is based directly on the
 normal PR #717 merge at `ff3d41b08b73d987e52c9a87481f3ef7266f760c` and is
 published as [draft PR #729](https://github.com/openpacketcore/openpacketcore-sdk/pull/729).
 The PR remains a candidate, not a consumable pin: hosted checks and the final
@@ -51,14 +71,15 @@ The 13 frozen cuts are:
 3. prepare pending;
 4. prepared before run;
 5. run OutcomeUnknown;
-6. effect applied before provider return;
-7. applied before finalize;
-8. roster admitted before the sixth effect;
-9. sixth durable apply with its reply lost;
-10. all six converged before the terminal request;
-11. terminal committed with its reply OutcomeUnknown;
-12. Established before publication; and
-13. publication durable before acknowledgement.
+6. applied before finalize;
+7. roster admitted before the sixth effect;
+8. sixth durable apply with its reply lost;
+9. all six converged before the terminal request;
+10. terminal committed with its reply OutcomeUnknown;
+11. Established before publication;
+12. publication durable before acknowledgement; and
+13. exact response bytes retained before a transport-conclusively
+    non-transmitted first send, then resent byte-identically after restart.
 
 ```text
 cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
@@ -161,14 +182,14 @@ result: PASS; 44 passed, 0 failed
 
 cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
   -- --nocapture
-result: PASS; 37 passed, 0 failed, 2 release-only latency tests ignored
+result: PASS; 40 passed, 0 failed, 2 release-only latency tests ignored
 ```
 
-For the same candidate, hosted CI has passed strict Clippy, Rust gates, MSRV,
-generated-code drift, the persistence contract, security/advisory/license
-scans, and the completed privileged Linux datapath jobs. Remaining hosted test,
-documentation, feature, and platform lanes and the independent exact-head
-review are still pending; this document does not claim merge readiness.
+The predecessor published checkpoint passed hosted strict Clippy, Rust gates,
+MSRV, generated-code drift, the persistence contract,
+security/advisory/license scans, and the privileged Linux datapath jobs. The
+exact candidate above must rerun every hosted lane and obtain an independent
+exact-head review; this document does not claim merge readiness.
 
 ## Required final gates
 

@@ -486,6 +486,10 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER: gcc
+      # The lane includes literal 100/250 ms production-path contracts. Keep
+      # their deadlines unchanged while avoiding unoptimized 32-bit test code
+      # as a source of hosted-runner timing failures.
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
       RUSTFLAGS: "-C link-arg=-m32"
       TARGET_CC: gcc
       TARGET_CFLAGS: "-m32"

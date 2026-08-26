@@ -37,6 +37,11 @@ jobs:
   conformance:
     name: Kernel-independent conformance
     runs-on: ubuntu-latest
+    env:
+      # The protected-roster lane drives a real three-voter snapshot past the
+      # production compaction threshold. Preserve that threshold and every
+      # caller deadline while avoiding unoptimized test code as runner noise.
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -64,6 +69,7 @@ jobs:
           timing_contracts=(
             persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
             persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal
+            persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart
           )
           skips=()
           for timing_contract in "${timing_contracts[@]}"; do
