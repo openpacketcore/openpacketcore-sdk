@@ -420,7 +420,7 @@ struct ThreeVoterConsumerFleet {
     directory: Option<tempfile::TempDir>,
     read_barrier_delay: Option<Duration>,
     roster_attestation_root: Option<RosterAttestationTrustRootV1>,
-    _test_gate: tokio::sync::SemaphorePermit<'static>,
+    test_gate: Option<tokio::sync::SemaphorePermit<'static>>,
 }
 
 impl Drop for ThreeVoterConsumerFleet {
@@ -462,6 +462,7 @@ impl ThreeVoterConsumerFleet {
             fixed_durable,
             roster_attestation_root,
             tempfile::tempdir().expect("three-voter fleet directory"),
+            None,
         )
         .await
     }
@@ -472,11 +473,15 @@ impl ThreeVoterConsumerFleet {
         fixed_durable: bool,
         roster_attestation_root: Option<RosterAttestationTrustRootV1>,
         directory: tempfile::TempDir,
+        inherited_test_gate: Option<tokio::sync::SemaphorePermit<'static>>,
     ) -> Self {
-        let test_gate = THREE_VOTER_FLEET_TEST_GATE
-            .acquire()
-            .await
-            .expect("three-voter test gate remains open");
+        let test_gate = match inherited_test_gate {
+            Some(test_gate) => test_gate,
+            None => THREE_VOTER_FLEET_TEST_GATE
+                .acquire()
+                .await
+                .expect("three-voter test gate remains open"),
+        };
         let members = (0..THREE_VOTER_COUNT)
             .map(three_voter_member)
             .collect::<Vec<_>>();
@@ -675,7 +680,7 @@ impl ThreeVoterConsumerFleet {
             directory: Some(directory),
             read_barrier_delay,
             roster_attestation_root,
-            _test_gate: test_gate,
+            test_gate: Some(test_gate),
         };
         for result in futures_util::future::join_all(
             fleet
@@ -978,6 +983,10 @@ impl ThreeVoterConsumerFleet {
             .directory
             .take()
             .expect("full restart retains durable test directory");
+        let test_gate = self
+            .test_gate
+            .take()
+            .expect("full restart retains three-voter test gate");
         drop(self);
         Self::start_with_topology_in_directory(
             pki,
@@ -985,6 +994,7 @@ impl ThreeVoterConsumerFleet {
             fixed_durable,
             roster_attestation_root,
             directory,
+            Some(test_gate),
         )
         .await
     }
@@ -1674,71 +1684,15 @@ struct CountingConsumer {
     v2_calls: AtomicUsize,
 }
 
-#[derive(Clone)]
-struct TestP256RosterAttestationIssuer {
-    root: RosterAttestationTrustRootV1,
-    calls: Arc<AtomicUsize>,
-}
-
-impl TestP256RosterAttestationIssuer {
-    fn new() -> Self {
-        let signing_key = p256::ecdsa::SigningKey::from_bytes((&[0x61; 32]).into())
-            .expect("fixed P-256 roster signer");
-        let public_key = signing_key
-            .verifying_key()
-            .to_sec1_point(true)
-            .as_bytes()
-            .try_into()
-            .expect("compressed P-256 roster public key");
-        Self {
-            root: RosterAttestationTrustRootV1::new([0x51; 32], public_key)
-                .expect("fixed P-256 roster trust root"),
-            calls: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl RosterIngressSigner for TestP256RosterAttestationIssuer {
-    fn trust_root(&self) -> RosterAttestationTrustRootV1 {
-        self.root.clone()
-    }
-
-    async fn attest(
-        &self,
-        _input: &RosterIngressAttestationSigningInputV1,
-    ) -> Result<RosterIngressAttestationV1, RosterIngressSignerError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(RosterIngressSignerError)
-    }
-
-    fn compact_admission_certificate(
-        &self,
-    ) -> Result<RosterAttestationLeafCertificatePartsV1, RosterIngressSignerError> {
-        Err(RosterIngressSignerError)
-    }
-
-    async fn sign_compact_admission(
-        &self,
-        _input: &RosterCompactAdmissionProvenanceSigningInputV2,
-    ) -> Result<[u8; 64], RosterIngressSignerError> {
-        Err(RosterIngressSignerError)
-    }
-}
-
 struct HandshakeOnlySessionQuorumRosterIngress {
     expected_root_identity: RosterAttestationTrustRootIdentityV1,
     calls: AtomicUsize,
 }
 
 impl HandshakeOnlySessionQuorumRosterIngress {
-    fn new(issuer: &TestP256RosterAttestationIssuer) -> Self {
+    fn new(expected_root_identity: RosterAttestationTrustRootIdentityV1) -> Self {
         Self {
-            expected_root_identity: issuer.root.identity(),
+            expected_root_identity,
             calls: AtomicUsize::new(0),
         }
     }
@@ -3750,11 +3704,19 @@ async fn protected_roster_mtls_identity_and_server_identity_mismatches_fail_clos
     let server_spiffe = spiffe("protected-roster-server");
     let admitted_spiffe = spiffe("protected-roster-admitted");
     let member_spiffe = server_spiffe.clone();
-    let (authorizer, _scope, voter_authority) =
+    let (authorizer, scope, voter_authority) =
         authorizer_from_admitted_store(&admitted_spiffe, &server_spiffe).await;
     let service = Arc::new(CountingConsumer::default());
-    let issuer = Arc::new(TestP256RosterAttestationIssuer::new());
-    let roster_ingress = Arc::new(HandshakeOnlySessionQuorumRosterIngress::new(&issuer));
+    let cluster = ConsensusClusterId::new("protected-roster-handshake-only")
+        .expect("protected-roster handshake cluster");
+    let epoch = ConsensusConfigurationEpoch::new(1).expect("protected-roster handshake epoch");
+    let issuer = ProductionRosterAttestationIssuer::new(
+        SessionConsensusIdentity::new(cluster, derive_configuration_id(cluster, epoch, &[]), epoch),
+        scope,
+    );
+    let roster_ingress = Arc::new(HandshakeOnlySessionQuorumRosterIngress::new(
+        RosterIngressSigner::trust_root(issuer.as_ref()).identity(),
+    ));
     let (handle, address) = SessionQuorumConsumerServer::new(
         service.clone(),
         pki.server_config(&server_spiffe),
@@ -3817,7 +3779,6 @@ async fn protected_roster_mtls_identity_and_server_identity_mismatches_fail_clos
     wrong_server_identity.shutdown().await;
     handle.abort_and_wait().await;
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(issuer.calls(), 0);
     assert_eq!(roster_ingress.calls(), 0);
 }
 

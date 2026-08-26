@@ -4475,6 +4475,24 @@ where
                 && (prior_attempt == LocalAttempt::OutcomeUnknown
                     || task.operation == ProviderOperation::Compensate);
             let has_conclusive = first_conclusive.is_some();
+            if matches!(observation, Observation::NotTransmitted)
+                && matches!(
+                    task.operation,
+                    ProviderOperation::Prepare | ProviderOperation::Execute
+                )
+            {
+                // A transport-proven non-transmission is the only direct
+                // prepare/execute result that restores a same-ID, same-body
+                // retry. Restore the epoch before returning this ordinal to
+                // its effect-capable lane so its receipt challenge is exact.
+                *local
+                    .proof_epochs
+                    .get_mut(index)
+                    .ok_or(ExecutorError::InvalidMember)? = task
+                    .proof_epoch
+                    .checked_sub(1)
+                    .ok_or(ExecutorError::OutcomeUnknown)?;
+            }
             let attempt = local
                 .attempts
                 .get_mut(index)
@@ -5456,6 +5474,8 @@ mod production_runtime_cut_matrix_tests {
         fence: FenceToken,
         lease_acquired_at: Timestamp,
         lease_expires_at: Timestamp,
+        provider_proof_epoch: u64,
+        provider_receipt_challenge: [u8; 32],
     }
 
     impl CutProvider {
@@ -5504,6 +5524,8 @@ mod production_runtime_cut_matrix_tests {
                     fence: call.current_fence(),
                     lease_acquired_at: call.current_lease_acquired_at(),
                     lease_expires_at: call.current_lease_expires_at(),
+                    provider_proof_epoch: call.provider_proof_epoch(),
+                    provider_receipt_challenge: *call.provider_receipt_challenge().as_bytes(),
                 },
             ));
         }
