@@ -11534,6 +11534,14 @@ async fn persistent_three_voter_protected_roster_survives_real_os_process_loss()
         }
         Some(_) => panic!("invalid protected-roster process-loss phase"),
         None => {
+            // Child processes have their own process-local gate. Hold this
+            // process's permit while orchestrating them so their real
+            // three-voter snapshot workload cannot overlap another heavy
+            // fleet in the parent test binary.
+            let _test_gate = THREE_VOTER_FLEET_TEST_GATE
+                .acquire()
+                .await
+                .expect("three-voter process-loss parent gate remains open");
             let state = tempfile::tempdir().expect("parent process-loss state directory");
             #[cfg(unix)]
             {
