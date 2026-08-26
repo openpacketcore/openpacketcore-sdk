@@ -6130,7 +6130,7 @@ mod tests {
             else {
                 unreachable!()
             };
-            *operation_successor = Box::new(successor);
+            **operation_successor = successor;
             assert_eq!(observe_applied_records(&non_write, &keys, &watched), Ok(0));
         }
     }
