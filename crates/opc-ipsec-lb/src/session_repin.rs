@@ -3976,7 +3976,8 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         StoreError::StaleFence
         | StoreError::LeaseHeld
         | StoreError::LeaseExpired
-        | StoreError::CasConflict => {
+        | StoreError::CasConflict
+        | StoreError::SessionRecordReserved => {
             IpsecLbError::ownership_conflict("session re-pin journal write is contended")
         }
         StoreError::TopologyAuthorityRevoked => IpsecLbError::ownership_conflict(
@@ -4097,11 +4098,16 @@ mod tests {
     }
 
     #[test]
-    fn topology_authority_revocation_maps_to_ownership_conflict() {
-        assert!(matches!(
-            map_store_error(StoreError::TopologyAuthorityRevoked),
-            IpsecLbError::OwnershipConflict { .. }
-        ));
+    fn topology_authority_and_roster_reservation_map_to_ownership_conflict() {
+        for error in [
+            StoreError::TopologyAuthorityRevoked,
+            StoreError::SessionRecordReserved,
+        ] {
+            assert!(matches!(
+                map_store_error(error),
+                IpsecLbError::OwnershipConflict { .. }
+            ));
+        }
     }
 
     #[test]
