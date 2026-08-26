@@ -53,21 +53,21 @@ use crate::consensus::types::{
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_mutation_roster::{
     Admission, CompactAdmissionProvenanceVerificationV2, CompactTerminalEvidenceVerificationV2,
-    CompactedTombstoneHistoryVerificationV2,
-    ExecutorTerminalProofVerification, HistoricalCompactAdmissionProvenanceVerificationV2,
-    IrreversibleHistoryFloor, RequestBindingKey,
-    RequestId as RosterRequestId, RosterAttestationTrustRootV1, RosterCompactAdmissionProvenanceV2,
-    RosterCompactTerminalEvidenceV2, RosterId, RosterIngressAttestationRosterCommandInputV1, Scope,
-    TerminalConflictTombstone, TerminalRecord, RECLAIM_BATCH, session_key_commitment,
-    verify_compact_admission_provenance_v2, verify_compact_terminal_evidence_v2,
-    verify_compacted_tombstone_history_v2,
-    verify_executor_terminal_proof_bundle,
-    verify_historical_compact_admission_provenance_v2,
+    CompactedTombstoneHistoryVerificationV2, ExecutorTerminalProofVerification,
+    HistoricalCompactAdmissionProvenanceVerificationV2, IrreversibleHistoryFloor, RECLAIM_BATCH,
+    RequestBindingKey, RequestId as RosterRequestId, RosterAttestationTrustRootV1,
+    RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceV2, RosterId,
+    RosterIngressAttestationRosterCommandInputV1, Scope, TerminalConflictTombstone, TerminalRecord,
+    session_key_commitment, verify_compact_admission_provenance_v2,
+    verify_compact_terminal_evidence_v2, verify_compacted_tombstone_history_v2,
+    verify_executor_terminal_proof_bundle, verify_historical_compact_admission_provenance_v2,
 };
 use crate::fenced_mutation_roster_executor::{
     AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration, CommittedTerminal,
     ConsensusCommitMetadata, RecoveryRequest,
 };
+#[cfg(test)]
+use crate::fenced_mutation_roster_storage::prepare_production_terminalization;
 use crate::fenced_mutation_roster_storage::{
     ChargeProfile, ConsensusMaintenanceTimestamp, GlobalChargeBudget, GlobalChargeWitness,
     HydratedProductionReservationPayload, HydratedProductionReservationRecord,
@@ -79,8 +79,6 @@ use crate::fenced_mutation_roster_storage::{
     prepare_production_terminalization_hydrated_with_evidence_and_ingress,
     validate_production_snapshot_with_floors,
 };
-#[cfg(test)]
-use crate::fenced_mutation_roster_storage::prepare_production_terminalization;
 use crate::fenced_mutation_roster_transport::{
     roster_poll_admit_ingress_capsule_commitment, roster_terminal_ingress_capsule_commitment,
 };
@@ -7011,12 +7009,25 @@ fn protected_roster_reservation_error(error: ReservationError) -> ProtectedRoste
     }
 }
 
+type ProtectedRosterRecordSqlRow = (
+    i64,
+    Vec<u8>,
+    i64,
+    i64,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Vec<u8>,
+);
+type ProtectedRosterCanonicalRecordSqlRow =
+    (Vec<u8>, i64, i64, Option<Vec<u8>>, Option<i64>, Vec<u8>);
+type ProtectedRosterAdmissionSqlRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64);
+
 fn protected_roster_read_record_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     binding: RequestBindingKey,
 ) -> Result<Option<HydratedProductionReservationRecord>, ProtectedRosterApplyError> {
-    let row: Option<(i64, Vec<u8>, i64, i64, Option<Vec<u8>>, Option<i64>, Vec<u8>)> = conn
+    let row: Option<ProtectedRosterRecordSqlRow> = conn
         .query_row(
             "SELECT configuration_epoch, partition, history_epoch, state, terminalized_at, terminal_sequence, canonical_record \
              FROM consensus_protected_roster_rows WHERE binding = ?1",
@@ -7035,7 +7046,16 @@ fn protected_roster_read_record_sync(
         )
         .optional()
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
-    let Some((epoch, partition, history_epoch, state, terminalized_at, terminal_sequence, canonical)) = row else {
+    let Some((
+        epoch,
+        partition,
+        history_epoch,
+        state,
+        terminalized_at,
+        terminal_sequence,
+        canonical,
+    )) = row
+    else {
         return Ok(None);
     };
     validate_epoch(epoch, identity).map_err(|_| ProtectedRosterApplyError::Corrupt)?;
@@ -7114,8 +7134,7 @@ fn protected_roster_due_reclaim_records_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     maintenance: ConsensusMaintenanceTimestamp,
-) -> Result<BTreeMap<RequestBindingKey, ProductionReservationRecord>, ProtectedRosterApplyError>
-{
+) -> Result<BTreeMap<RequestBindingKey, ProductionReservationRecord>, ProtectedRosterApplyError> {
     let cutoff = maintenance
         .as_nanos()
         .checked_sub(PROTECTED_ROSTER_TERMINAL_RETENTION_NANOS)
@@ -7422,9 +7441,8 @@ fn validate_protected_roster_state_sync(
                 terminal_evidence,
                 ..
             } => {
-                let original = protected_roster_original_authority_projection_sync(
-                    conn, identity, binding,
-                )?;
+                let original =
+                    protected_roster_original_authority_projection_sync(conn, identity, binding)?;
                 let root = read_roster_attestation_trust_root_sync(conn)
                     .map_err(|_| ProtectedRosterApplyError::Corrupt)?
                     .ok_or(ProtectedRosterApplyError::Corrupt)?;
@@ -7556,7 +7574,7 @@ fn protected_roster_record_matches_canonical_sync(
     {
         return Err(ReservationError::SnapshotMismatch);
     }
-    let row: Option<(Vec<u8>, i64, i64, Option<Vec<u8>>, Option<i64>, Vec<u8>)> = conn
+    let row: Option<ProtectedRosterCanonicalRecordSqlRow> = conn
         .query_row(
             "SELECT partition, history_epoch, state, terminalized_at, terminal_sequence, canonical_record \
              FROM consensus_protected_roster_rows \
@@ -7578,7 +7596,9 @@ fn protected_roster_record_matches_canonical_sync(
         )
         .optional()
         .map_err(|_| ReservationError::SnapshotMismatch)?;
-    let Some((partition, history_epoch, state, terminalized_at, terminal_sequence, canonical)) = row else {
+    let Some((partition, history_epoch, state, terminalized_at, terminal_sequence, canonical)) =
+        row
+    else {
         return Ok(false);
     };
     let expected_state = match expected.state() {
@@ -7599,8 +7619,7 @@ fn protected_roster_record_matches_canonical_sync(
             == checked_positive_i64(binding.history_epoch())
                 .map_err(|_| ReservationError::CanonicalEncoding)?
         && state == expected_state
-        && terminalized_at.as_deref()
-            == expected_terminal.as_ref().map(<[u8; 16]>::as_slice)
+        && terminalized_at.as_deref() == expected_terminal.as_ref().map(<[u8; 16]>::as_slice)
         && terminal_sequence == expected_sequence
         && canonical.as_slice() == expected_canonical)
 }
@@ -7723,11 +7742,15 @@ fn protected_roster_read_retirement_cursor_sync(
         )
         .optional()
         .map_err(|_| ReservationError::SnapshotMismatch)?;
-    let Some((epoch, canonical)) = row else { return Ok(None); };
+    let Some((epoch, canonical)) = row else {
+        return Ok(None);
+    };
     validate_epoch(epoch, identity).map_err(|_| ReservationError::SnapshotMismatch)?;
     let cursor = ProductionRetirementCursor::from_canonical_bytes(&canonical)
         .map_err(|_| ReservationError::SnapshotMismatch)?;
-    if cursor.key() != key { return Err(ReservationError::SnapshotMismatch); }
+    if cursor.key() != key {
+        return Err(ReservationError::SnapshotMismatch);
+    }
     Ok(Some(cursor))
 }
 
@@ -7737,7 +7760,9 @@ fn protected_roster_write_retirement_cursor_sync(
     cursor: &crate::fenced_mutation_roster_storage::ProductionRetirementCursorCas,
 ) -> Result<(), ReservationError> {
     let current = protected_roster_read_retirement_cursor_sync(conn, identity, cursor.key())?;
-    if current.as_ref() != cursor.expected() { return Err(ReservationError::FloorAdvance); }
+    if current.as_ref() != cursor.expected() {
+        return Err(ReservationError::FloorAdvance);
+    }
     match cursor.replacement() {
         Some(replacement) => {
             conn.execute(
@@ -7754,8 +7779,12 @@ fn protected_roster_write_retirement_cursor_sync(
                 "DELETE FROM consensus_protected_roster_retirement_cursors WHERE partition=?1 AND configuration_epoch=?2",
                 params![cursor.key().as_bytes().as_slice(), epoch_i64(identity).map_err(|_| ReservationError::CanonicalEncoding)?],
             ).map_err(|_| ReservationError::CanonicalEncoding)?;
-            if current.is_some() && changed != 1 { return Err(ReservationError::FloorAdvance); }
-            if current.is_none() && changed != 0 { return Err(ReservationError::FloorAdvance); }
+            if current.is_some() && changed != 1 {
+                return Err(ReservationError::FloorAdvance);
+            }
+            if current.is_none() && changed != 0 {
+                return Err(ReservationError::FloorAdvance);
+            }
         }
     }
     Ok(())
@@ -7793,11 +7822,8 @@ fn protected_roster_write_admission_sync(
     let command_slot = command
         .admission_slot()
         .map_err(|_| ReservationError::CanonicalEncoding)?;
-    let stable_slot = protected_roster_stable_slot(
-        admission.scope(),
-        admission.key(),
-        admission.roster_id(),
-    );
+    let stable_slot =
+        protected_roster_stable_slot(admission.scope(), admission.key(), admission.roster_id());
     if command_slot != stable_slot
         || command
             .request_id()
@@ -7850,17 +7876,14 @@ fn protected_roster_validate_reclaim_admission_sync(
         return Err(ReservationError::SnapshotMismatch);
     }
     let admission = record.admission()?;
-    let stable_slot = protected_roster_stable_slot(
-        admission.scope(),
-        admission.key(),
-        admission.roster_id(),
-    );
+    let stable_slot =
+        protected_roster_stable_slot(admission.scope(), admission.key(), admission.roster_id());
     let request = RosterRequestId::bind(binding.history_epoch(), &admission)
         .map_err(|_| ReservationError::CanonicalEncoding)?;
     let terminal_slot = request
         .terminal_slot_id(&admission)
         .map_err(|_| ReservationError::CanonicalEncoding)?;
-    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, i64)> = conn
+    let row: Option<ProtectedRosterAdmissionSqlRow> = conn
         .query_row(
             "SELECT stable_slot, admission_request_id, terminal_request_id, configuration_epoch \
              FROM consensus_protected_roster_admissions WHERE binding=?1",
@@ -7872,8 +7895,7 @@ fn protected_roster_validate_reclaim_admission_sync(
     let Some((stored_slot, admission_request_id, terminal_request_id, epoch)) = row else {
         return Err(ReservationError::SnapshotMismatch);
     };
-    if epoch
-        != epoch_i64(identity).map_err(|_| ReservationError::CanonicalEncoding)?
+    if epoch != epoch_i64(identity).map_err(|_| ReservationError::CanonicalEncoding)?
         || stored_slot.as_slice() != stable_slot.as_slice()
         || admission_request_id.as_slice() != protected_roster_request_id(stable_slot).as_slice()
         || terminal_request_id.as_slice()
@@ -8351,7 +8373,7 @@ pub(crate) fn read_protected_roster_recovery_sync(
         recovery.original_admission_fence(),
         current.generation(),
     )
-        .map_err(ProtectedRosterApplyError::store_error)?
+    .map_err(ProtectedRosterApplyError::store_error)?
     else {
         return Ok(ProtectedRosterReadResult::Missing);
     };
@@ -8360,16 +8382,7 @@ pub(crate) fn read_protected_roster_recovery_sync(
         .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
     if let HydratedProductionReservationPayload::Tombstone { tombstone, .. } = hydrated.payload() {
         tombstone
-            .validate_lookup(
-                binding.history_epoch(),
-                recovery.lookup().scope(),
-                current.key(),
-                recovery.lookup().roster_id(),
-                recovery.original_owner(),
-                recovery.original_admission_fence(),
-                current.fence(),
-                current.generation(),
-            )
+            .validate_lookup(recovery.compacted_terminal_lookup(binding.history_epoch()))
             .map_err(|_| ProtectedRosterApplyError::Rejected.store_error())?;
         return Ok(ProtectedRosterReadResult::Compacted {
             history_epoch: binding.history_epoch(),
@@ -8401,16 +8414,27 @@ pub(crate) fn read_protected_roster_recovery_sync(
 
 /// Exact terminal-status lookup. The registration and terminal commitment are
 /// mandatory so status cannot be used to upgrade a different terminal body.
+pub(crate) struct ProtectedRosterTerminalStatusRequest<'a> {
+    pub(crate) registration_parts: ([u8; 32], RosterRequestId, [u8; 32]),
+    pub(crate) current_authority: &'a AuthorityBinding,
+    pub(crate) terminal_body_commitment: [u8; 32],
+    pub(crate) terminal_evidence: &'a RosterCompactTerminalEvidenceV2,
+    pub(crate) logical_time: Timestamp,
+}
+
 pub(crate) fn read_protected_roster_terminal_status_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     binding: RequestBindingKey,
-    registration_parts: ([u8; 32], RosterRequestId, [u8; 32]),
-    current_authority: &AuthorityBinding,
-    terminal_body_commitment: [u8; 32],
-    terminal_evidence: &RosterCompactTerminalEvidenceV2,
-    logical_time: Timestamp,
+    request: ProtectedRosterTerminalStatusRequest<'_>,
 ) -> Result<ProtectedRosterReadResult, StoreError> {
+    let ProtectedRosterTerminalStatusRequest {
+        registration_parts,
+        current_authority,
+        terminal_body_commitment,
+        terminal_evidence,
+        logical_time,
+    } = request;
     let (_scope, _roster_id) =
         protected_roster_validate_binding_authority_before_lookup(binding, current_authority)
             .map_err(ProtectedRosterApplyError::store_error)?;
@@ -8746,8 +8770,9 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
             }
         }
         if let Some(guard) = transaction.partition_range_guard() {
-            let current_floor = protected_roster_read_floor_sync(self.conn, self.identity, guard.key())
-                .map_err(|_| ReservationError::SnapshotMismatch)?;
+            let current_floor =
+                protected_roster_read_floor_sync(self.conn, self.identity, guard.key())
+                    .map_err(|_| ReservationError::SnapshotMismatch)?;
             if current_floor.map(|floor| floor.retired_through())
                 != Some(guard.previous_floor_through())
                 || guard.selected().is_empty()
@@ -8755,9 +8780,18 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
             {
                 return Err(ReservationError::FloorAdvance);
             }
-            let cursor = protected_roster_read_retirement_cursor_sync(self.conn, self.identity, guard.key())?;
-            if cursor.as_ref().and_then(ProductionRetirementCursor::last_deleted) != guard.after()
-                || cursor.as_ref().is_some_and(|cursor| cursor.target_epoch() != guard.target_epoch())
+            let cursor = protected_roster_read_retirement_cursor_sync(
+                self.conn,
+                self.identity,
+                guard.key(),
+            )?;
+            if cursor
+                .as_ref()
+                .and_then(ProductionRetirementCursor::last_deleted)
+                != guard.after()
+                || cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.target_epoch() != guard.target_epoch())
             {
                 return Err(ReservationError::FloorAdvance);
             }
@@ -8766,17 +8800,22 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
                 params![guard.key().as_bytes().as_slice(), checked_positive_i64(guard.target_epoch()).map_err(|_| ReservationError::FloorAdvance)?],
                 |row| row.get(0),
             ).map_err(|_| ReservationError::SnapshotMismatch)?;
-            if lower_exists { return Err(ReservationError::FloorAdvance); }
-            let higher_exists: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
+            if lower_exists {
+                return Err(ReservationError::FloorAdvance);
+            }
+            let higher_exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
                  WHERE partition=?1 AND history_epoch>?2 LIMIT 1)",
-                params![
-                    guard.key().as_bytes().as_slice(),
-                    checked_positive_i64(guard.target_epoch())
-                        .map_err(|_| ReservationError::FloorAdvance)?,
-                ],
-                |row| row.get(0),
-            ).map_err(|_| ReservationError::SnapshotMismatch)?;
+                    params![
+                        guard.key().as_bytes().as_slice(),
+                        checked_positive_i64(guard.target_epoch())
+                            .map_err(|_| ReservationError::FloorAdvance)?,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|_| ReservationError::SnapshotMismatch)?;
             if guard.partition_empty_after() != (guard.final_batch() && !higher_exists) {
                 return Err(ReservationError::FloorAdvance);
             }
@@ -8806,33 +8845,67 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
                     None,
                 ),
             };
-            let mut statement = self.conn.prepare(sql).map_err(|_| ReservationError::SnapshotMismatch)?;
+            let mut statement = self
+                .conn
+                .prepare(sql)
+                .map_err(|_| ReservationError::SnapshotMismatch)?;
             let mut rows = match after {
-                Some(after) => statement.query(params![guard.key().as_bytes().as_slice(), checked_positive_i64(guard.target_epoch()).map_err(|_| ReservationError::FloorAdvance)?, after.as_slice()]),
-                None => statement.query(params![guard.key().as_bytes().as_slice(), checked_positive_i64(guard.target_epoch()).map_err(|_| ReservationError::FloorAdvance)?]),
-            }.map_err(|_| ReservationError::SnapshotMismatch)?;
+                Some(after) => statement.query(params![
+                    guard.key().as_bytes().as_slice(),
+                    checked_positive_i64(guard.target_epoch())
+                        .map_err(|_| ReservationError::FloorAdvance)?,
+                    after.as_slice()
+                ]),
+                None => statement.query(params![
+                    guard.key().as_bytes().as_slice(),
+                    checked_positive_i64(guard.target_epoch())
+                        .map_err(|_| ReservationError::FloorAdvance)?
+                ]),
+            }
+            .map_err(|_| ReservationError::SnapshotMismatch)?;
             let mut target = Vec::new();
-            while let Some(row) = rows.next().map_err(|_| ReservationError::SnapshotMismatch)? {
-                let binding: Vec<u8> = row.get(0).map_err(|_| ReservationError::SnapshotMismatch)?;
-                let binding: [u8; 120] = binding.try_into().map_err(|_| ReservationError::SnapshotMismatch)?;
-                let binding = RequestBindingKey::from_bytes(binding).map_err(|_| ReservationError::SnapshotMismatch)?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| ReservationError::SnapshotMismatch)?
+            {
+                let binding: Vec<u8> =
+                    row.get(0).map_err(|_| ReservationError::SnapshotMismatch)?;
+                let binding: [u8; 120] = binding
+                    .try_into()
+                    .map_err(|_| ReservationError::SnapshotMismatch)?;
+                let binding = RequestBindingKey::from_bytes(binding)
+                    .map_err(|_| ReservationError::SnapshotMismatch)?;
                 let epoch: i64 = row.get(1).map_err(|_| ReservationError::SnapshotMismatch)?;
                 let state: i64 = row.get(2).map_err(|_| ReservationError::SnapshotMismatch)?;
-                if epoch <= 0 || u64::try_from(epoch).map_err(|_| ReservationError::SnapshotMismatch)? != guard.target_epoch()
-                    || binding.history_epoch() != u64::try_from(epoch).map_err(|_| ReservationError::SnapshotMismatch)?
+                if epoch <= 0
+                    || u64::try_from(epoch).map_err(|_| ReservationError::SnapshotMismatch)?
+                        != guard.target_epoch()
+                    || binding.history_epoch()
+                        != u64::try_from(epoch).map_err(|_| ReservationError::SnapshotMismatch)?
                 {
                     return Err(ReservationError::FloorAdvance);
                 }
-                if state != 3 { return Err(ReservationError::FloorAdvance); }
+                if state != 3 {
+                    return Err(ReservationError::FloorAdvance);
+                }
                 target.push(binding);
             }
             // `None` begins at the epoch's first binding; a present cursor is
             // exclusive.  The query is capped at 1,025 solely to prove the
             // final-partial claim without unbounded decoding or scanning.
             let expected = guard.selected();
-            if target.iter().take(RECLAIM_BATCH).copied().collect::<Vec<_>>() != expected
+            if target
+                .iter()
+                .take(RECLAIM_BATCH)
+                .copied()
+                .collect::<Vec<_>>()
+                != expected
                 || transaction.rows().len() != expected.len()
-                || transaction.rows().iter().zip(expected).any(|(row, binding)| row.binding() != *binding || row.replacement().is_some())
+                || transaction
+                    .rows()
+                    .iter()
+                    .zip(expected)
+                    .any(|(row, binding)| row.binding() != *binding || row.replacement().is_some())
                 || (guard.final_batch() && target.len() != expected.len())
                 || (!guard.final_batch() && target.len() <= expected.len())
             {
@@ -8849,24 +8922,26 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
                 )
                 .map_err(|_| ReservationError::SnapshotMismatch)?;
             let mut rows = statement
-                .query([checked_i64(
-                    transaction.previous_witness().retired_terminal_sequence(),
-                )
-                .map_err(|_| ReservationError::SnapshotMismatch)?])
+                .query([
+                    checked_i64(transaction.previous_witness().retired_terminal_sequence())
+                        .map_err(|_| ReservationError::SnapshotMismatch)?,
+                ])
                 .map_err(|_| ReservationError::SnapshotMismatch)?;
             let mut terminal_history = Vec::new();
             while let Some(row) = rows
                 .next()
                 .map_err(|_| ReservationError::SnapshotMismatch)?
             {
-                let binding: Vec<u8> = row.get(0).map_err(|_| ReservationError::SnapshotMismatch)?;
+                let binding: Vec<u8> =
+                    row.get(0).map_err(|_| ReservationError::SnapshotMismatch)?;
                 let sequence: i64 = row.get(1).map_err(|_| ReservationError::SnapshotMismatch)?;
                 let state: i64 = row.get(2).map_err(|_| ReservationError::SnapshotMismatch)?;
                 let binding: [u8; 120] = binding
                     .try_into()
                     .map_err(|_| ReservationError::SnapshotMismatch)?;
                 terminal_history.push((
-                    checked_positive_u64(sequence).map_err(|_| ReservationError::SnapshotMismatch)?,
+                    checked_positive_u64(sequence)
+                        .map_err(|_| ReservationError::SnapshotMismatch)?,
                     RequestBindingKey::from_bytes(binding)
                         .map_err(|_| ReservationError::SnapshotMismatch)?,
                     state,
@@ -8874,21 +8949,27 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
             }
             let expected = terminal_history
                 .iter()
-                .take_while(|(_, _, state)| *state == protected_roster_snapshot_state_code(ReservationState::Tombstone))
+                .take_while(|(_, _, state)| {
+                    *state == protected_roster_snapshot_state_code(ReservationState::Tombstone)
+                })
                 .take(RECLAIM_BATCH)
                 .map(|(sequence, binding, _)| (*sequence, *binding))
                 .collect::<Vec<_>>();
             if expected.is_empty()
                 || expected != guard.selected()
                 || transaction.rows().len() != expected.len()
-                || transaction.rows().iter().zip(&expected).any(|(row, expected)| {
-                    row.binding() != expected.1
-                        || row.replacement().is_some()
-                        || row.expected().is_none_or(|record| {
-                            record.state() != ReservationState::Tombstone
-                                || record.terminal_sequence() != Some(expected.0)
-                        })
-                })
+                || transaction
+                    .rows()
+                    .iter()
+                    .zip(&expected)
+                    .any(|(row, expected)| {
+                        row.binding() != expected.1
+                            || row.replacement().is_some()
+                            || row.expected().is_none_or(|record| {
+                                record.state() != ReservationState::Tombstone
+                                    || record.terminal_sequence() != Some(expected.0)
+                            })
+                    })
                 || transaction.next_witness().retired_terminal_sequence()
                     != expected
                         .last()
@@ -8914,13 +8995,13 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
                         |row| row.get(0),
                     )
                     .map_err(|_| ReservationError::SnapshotMismatch)?;
-                if usize::try_from(total).map_err(|_| ReservationError::SnapshotMismatch)? == selected {
+                if usize::try_from(total).map_err(|_| ReservationError::SnapshotMismatch)?
+                    == selected
+                {
                     expected_releases.push(key);
-                    if let Some(cursor) = protected_roster_read_retirement_cursor_sync(
-                        self.conn,
-                        self.identity,
-                        key,
-                    )? {
+                    if let Some(cursor) =
+                        protected_roster_read_retirement_cursor_sync(self.conn, self.identity, key)?
+                    {
                         expected_cursor_releases.push((key, cursor));
                     }
                 }
@@ -8939,10 +9020,7 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
                     .released_floor_cas()
                     .iter()
                     .zip(&expected_releases)
-                    .any(|(floor, key)| {
-                        floor.key() != *key
-                            || floor.replacement().is_some()
-                    })
+                    .any(|(floor, key)| floor.key() != *key || floor.replacement().is_some())
                 || transaction.released_retirement_cursor_cas().len()
                     != expected_cursor_releases.len()
                 || transaction
@@ -8973,13 +9051,10 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
                 }
                 (_, Some(_)) => return Err(ReservationError::SnapshotMismatch),
                 (expected, None) => {
-                    let current = protected_roster_read_record_sync(
-                        self.conn,
-                        self.identity,
-                        row.binding(),
-                    )
-                    .map_err(|_| ReservationError::SnapshotMismatch)?
-                    .map(HydratedProductionReservationRecord::into_record);
+                    let current =
+                        protected_roster_read_record_sync(self.conn, self.identity, row.binding())
+                            .map_err(|_| ReservationError::SnapshotMismatch)?
+                            .map(HydratedProductionReservationRecord::into_record);
                     if current.as_ref() != expected {
                         return Err(ReservationError::SnapshotMismatch);
                     }
@@ -9033,7 +9108,9 @@ impl ProductionReservationTransactionAdapter for SqliteProductionReservationTran
                     params![row.binding().to_bytes().as_slice(), epoch_i64(self.identity).map_err(|_| ReservationError::CanonicalEncoding)?],
                     |row| row.get(0),
                 ).optional().map_err(|_| ReservationError::SnapshotMismatch)?;
-                if child.is_none() { return Err(ReservationError::SnapshotMismatch); }
+                if child.is_none() {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
             }
         }
         if let Some(reservation) = transaction.admission_business_reservation() {
@@ -9219,9 +9296,10 @@ fn reclaim_protected_rosters_sync(
     let witness = witness.ok_or_else(|| {
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })?;
-    let records = protected_roster_due_reclaim_records_sync(conn, identity, maintenance).map_err(|_| {
-        StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
-    })?;
+    let records =
+        protected_roster_due_reclaim_records_sync(conn, identity, maintenance).map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
     if records.is_empty() {
         return Err(StoreError::BackendUnavailable(
             "protected roster maintenance unavailable".into(),
@@ -9264,60 +9342,106 @@ fn retire_protected_rosters_sync(
     identity: SessionConsensusIdentity,
 ) -> Result<bool, StoreError> {
     let witness = protected_roster_read_witness_sync(conn, identity)
-        .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?
-        .ok_or_else(|| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?
+        .ok_or_else(|| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
     let mut statement = conn
         .prepare(
             "SELECT binding, terminal_sequence, state FROM consensus_protected_roster_rows \
              WHERE terminal_sequence>?1 AND state IN (2,3) \
              ORDER BY terminal_sequence ASC, binding ASC LIMIT 1025",
         )
-        .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
     let mut rows = statement
-        .query([checked_i64(witness.retired_terminal_sequence())
-            .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?])
-        .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
+        .query([
+            checked_i64(witness.retired_terminal_sequence()).map_err(|_| {
+                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+            })?,
+        ])
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
     let mut selected_bindings = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?
-    {
-        let state: i64 = row.get(2).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
+    while let Some(row) = rows.next().map_err(|_| {
+        StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+    })? {
+        let state: i64 = row.get(2).map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
         if state != protected_roster_snapshot_state_code(ReservationState::Tombstone) {
             break;
         }
-        let bytes: Vec<u8> = row.get(0).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
-        let binding = RequestBindingKey::from_bytes(bytes.try_into().map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?)
-            .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
+        let bytes: Vec<u8> = row.get(0).map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
+        let binding = RequestBindingKey::from_bytes(bytes.try_into().map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
         selected_bindings.push(binding);
-        if selected_bindings.len() == RECLAIM_BATCH { break; }
+        if selected_bindings.len() == RECLAIM_BATCH {
+            break;
+        }
     }
-    if selected_bindings.is_empty() { return Ok(false); }
+    if selected_bindings.is_empty() {
+        return Ok(false);
+    }
     let mut selected = Vec::with_capacity(selected_bindings.len());
     let mut selected_per_partition = BTreeMap::new();
     for binding in selected_bindings {
         let record = protected_roster_read_record_sync(conn, identity, binding)
-            .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?
-            .ok_or_else(|| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?
+            .map_err(|_| {
+                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+            })?
+            .ok_or_else(|| {
+                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+            })?
             .into_record();
-        let key = ProductionFloorKey::from_binding(binding)
-            .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
+        let key = ProductionFloorKey::from_binding(binding).map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
         *selected_per_partition.entry(key).or_insert(0_usize) += 1;
         selected.push((binding, record));
     }
     let mut released = Vec::new();
     for (key, selected_count) in selected_per_partition {
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM consensus_protected_roster_rows WHERE partition=?1",
-            [key.as_bytes().as_slice()],
-            |row| row.get(0),
-        ).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
-        if usize::try_from(total).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))? == selected_count {
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_protected_roster_rows WHERE partition=?1",
+                [key.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+            })?;
+        if usize::try_from(total).map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })? == selected_count
+        {
             let floor = protected_roster_read_floor_sync(conn, identity, key)
-                .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?
-                .ok_or_else(|| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "protected roster maintenance unavailable".into(),
+                    )
+                })?
+                .ok_or_else(|| {
+                    StoreError::BackendUnavailable(
+                        "protected roster maintenance unavailable".into(),
+                    )
+                })?;
             let cursor = protected_roster_read_retirement_cursor_sync(conn, identity, key)
-                .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "protected roster maintenance unavailable".into(),
+                    )
+                })?;
             released.push((floor, cursor));
         }
     }
@@ -9327,12 +9451,21 @@ fn retire_protected_rosters_sync(
         witness,
         GlobalChargeBudget::production(),
         ChargeProfile::v1(),
-    ).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
+    )
+    .map_err(|_| {
+        StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+    })?;
     let mut adapter = SqliteProductionReservationTransactionAdapter {
-        conn, identity, admission_command: None, terminal_authority: None,
+        conn,
+        identity,
+        admission_command: None,
+        terminal_authority: None,
     };
-    adapter.compare_and_apply_production(prepared)
-        .map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
+    adapter
+        .compare_and_apply_production(prepared)
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
     Ok(true)
 }
 
@@ -9391,12 +9524,18 @@ fn maintain_due_protected_roster_reclaim_sync(
         .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
-    let due_retirement: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows WHERE state=3 LIMIT 1)",
-        [],
-        |row| row.get(0),
-    ).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
-    if !due_reclaim && !due_retirement { return Ok(()); }
+    let due_retirement: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows WHERE state=3 LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
+    if !due_reclaim && !due_retirement {
+        return Ok(());
+    }
 
     // A due row makes this namespace security-relevant.  Re-run the exact
     // activation classifier before its maintenance mutation so a malformed
@@ -9485,14 +9624,10 @@ fn protected_roster_original_authority_sync(
         admission.scope().digest(),
         admission.key().clone(),
         projection.owner,
-        crate::model::FenceToken::new(
-            projection.fence,
-        ),
+        crate::model::FenceToken::new(projection.fence),
         AuthorityLeaseMetadata::new(
             projection.credential_id,
-            crate::model::Generation::new(
-                projection.generation,
-            ),
+            crate::model::Generation::new(projection.generation),
             projection.acquired_at,
             projection.expires_at,
         ),
@@ -10027,17 +10162,16 @@ fn apply_protected_roster_terminal_sync(
                 }
                 _ => return Err(ProtectedRosterCommandApplyError::Fatal),
             };
-            if committed.record() != &terminal
-                || retained_evidence != &terminal_evidence
-            {
+            if committed.record() != &terminal || retained_evidence != &terminal_evidence {
                 return Err(ProtectedRosterCommandApplyError::rejected(
                     ConsensusRosterRejection::TerminalConflict,
                 ));
             }
             #[cfg(any(test, feature = "test-control"))]
             let committed_outcome_started = Instant::now();
-            let outcome = ConsensusRosterTerminalOutcome::committed(command, true, &committed, &admission)
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
+            let outcome =
+                ConsensusRosterTerminalOutcome::committed(command, true, committed, &admission)
+                    .map_err(ProtectedRosterCommandApplyError::fatal)?;
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_terminal_apply_timing(
                 &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
@@ -10110,8 +10244,9 @@ fn apply_protected_roster_terminal_sync(
             );
             #[cfg(any(test, feature = "test-control"))]
             let committed_outcome_started = Instant::now();
-            let outcome = ConsensusRosterTerminalOutcome::committed(command, false, &committed, &admission)
-                .map_err(ProtectedRosterCommandApplyError::fatal)?;
+            let outcome =
+                ConsensusRosterTerminalOutcome::committed(command, false, &committed, &admission)
+                    .map_err(ProtectedRosterCommandApplyError::fatal)?;
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_terminal_apply_timing(
                 &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
@@ -19824,17 +19959,28 @@ fn store_replication_notification_sync(
     Ok(entry)
 }
 
+struct ProtectedRosterCommandApplyInput<'a> {
+    identity: SessionConsensusIdentity,
+    command: &'a SessionConsensusCommand,
+    roster: RosterCommandRef<'a>,
+    raft_log_index: u64,
+}
+
 fn apply_protected_roster_command_sync(
     tx: &mut Transaction<'_>,
-    identity: SessionConsensusIdentity,
-    command: &SessionConsensusCommand,
-    roster: RosterCommandRef<'_>,
-    raft_log_index: u64,
+    input: ProtectedRosterCommandApplyInput<'_>,
     machine: &mut (u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
     notifications: &mut Vec<ReplicationEntry>,
-    #[cfg(any(test, feature = "test-control"))]
-    terminal_transaction_remainder_started: &mut Option<Instant>,
+    #[cfg(any(test, feature = "test-control"))] terminal_transaction_remainder_started: &mut Option<
+        Instant,
+    >,
 ) -> io::Result<SessionConsensusResponse> {
+    let ProtectedRosterCommandApplyInput {
+        identity,
+        command,
+        roster,
+        raft_log_index,
+    } = input;
     let logical_time = machine.2.map_or(command.logical_time, |last_time| {
         last_time.max(command.logical_time)
     });
@@ -20101,10 +20247,12 @@ pub(crate) fn apply_entries_with_authority_sync(
             if let Some(roster) = roster_command(&command.intent) {
                 let response = apply_protected_roster_command_sync(
                     &mut tx,
-                    identity,
-                    command,
-                    roster,
-                    entry.log_id.index,
+                    ProtectedRosterCommandApplyInput {
+                        identity,
+                        command,
+                        roster,
+                        raft_log_index: entry.log_id.index,
+                    },
                     &mut machine,
                     &mut notifications,
                     #[cfg(any(test, feature = "test-control"))]
@@ -23286,9 +23434,7 @@ fn protected_roster_snapshot_admission_matches(
     binding: RequestBindingKey,
 ) -> io::Result<bool> {
     conn.query_row(
-        &format!(
-            "SELECT incoming.stable_slot = local.stable_slot AND incoming.admission_request_id = local.admission_request_id AND incoming.terminal_request_id = local.terminal_request_id AND incoming.configuration_epoch = local.configuration_epoch AND incoming.original_owner = local.original_owner AND incoming.original_fence = local.original_fence AND incoming.original_credential_id = local.original_credential_id AND incoming.original_generation = local.original_generation AND incoming.original_acquired_at = local.original_acquired_at AND incoming.original_expires_at = local.original_expires_at FROM main.consensus_protected_roster_admissions AS local JOIN consensus_incoming.consensus_protected_roster_admissions AS incoming ON incoming.binding = local.binding WHERE local.binding = ?1",
-        ),
+        "SELECT incoming.stable_slot = local.stable_slot AND incoming.admission_request_id = local.admission_request_id AND incoming.terminal_request_id = local.terminal_request_id AND incoming.configuration_epoch = local.configuration_epoch AND incoming.original_owner = local.original_owner AND incoming.original_fence = local.original_fence AND incoming.original_credential_id = local.original_credential_id AND incoming.original_generation = local.original_generation AND incoming.original_acquired_at = local.original_acquired_at AND incoming.original_expires_at = local.original_expires_at FROM main.consensus_protected_roster_admissions AS local JOIN consensus_incoming.consensus_protected_roster_admissions AS incoming ON incoming.binding = local.binding WHERE local.binding = ?1",
         [binding.to_bytes().as_slice()],
         |row| row.get(0),
     )
@@ -23435,8 +23581,10 @@ fn validate_attached_snapshot_protected_roster_floors_and_cursors(
             if local_witness.configuration_epoch == incoming_witness.configuration_epoch
                 && incoming_witness.witness.retired_terminal_sequence()
                     >= local_witness.witness.retired_terminal_sequence() => {}
-        (None, None) if local.rows.is_empty() && local.floors.is_empty() && local.cursors.is_empty() => {}
-        (None, Some(_)) if local.rows.is_empty() && local.floors.is_empty() && local.cursors.is_empty() => {}
+        (None, None)
+            if local.rows.is_empty() && local.floors.is_empty() && local.cursors.is_empty() => {}
+        (None, Some(_))
+            if local.rows.is_empty() && local.floors.is_empty() && local.cursors.is_empty() => {}
         _ => return Err(protected_roster_snapshot_monotonicity_error()),
     }
     for (partition, local_floor) in &local.floors {
@@ -23480,7 +23628,8 @@ fn validate_attached_snapshot_protected_roster_floors_and_cursors(
                     && incoming_cursor.cursor.target_epoch()
                         > local_cursor.cursor.target_epoch()
                     && floor_closed => {}
-            None if floor_closed || incoming_closure_covers_local_partition(local, incoming, partition) => {}
+            None if floor_closed
+                || incoming_closure_covers_local_partition(local, incoming, partition) => {}
             _ => return Err(protected_roster_snapshot_monotonicity_error()),
         }
     }
@@ -26399,7 +26548,9 @@ mod tests {
         .expect("admission")
     }
 
-    fn retirement_fixture_reservation(admission: &Admission) -> ProductionAdmissionBusinessReservation {
+    fn retirement_fixture_reservation(
+        admission: &Admission,
+    ) -> ProductionAdmissionBusinessReservation {
         ProductionAdmissionBusinessReservation::new(
             admission,
             ProductionBusinessState::present(
@@ -26504,11 +26655,8 @@ mod tests {
     ) {
         protected_roster_write_record_sync(conn, identity(), record).expect("persist roster row");
         let admission = record.admission().expect("fixture admission");
-        let stable_slot = protected_roster_stable_slot(
-            admission.scope(),
-            admission.key(),
-            admission.roster_id(),
-        );
+        let stable_slot =
+            protected_roster_stable_slot(admission.scope(), admission.key(), admission.roster_id());
         let terminal_slot = RosterRequestId::bind(record.binding().history_epoch(), &admission)
             .expect("terminal request")
             .terminal_slot_id(&admission)
@@ -26573,8 +26721,7 @@ mod tests {
         }
         for floor in floors.into_values() {
             counters = crate::fenced_mutation_roster_storage::counters_with_production_floor(
-                counters,
-                floor,
+                counters, floor,
             )
             .expect("charge fixture floor");
         }
@@ -26607,12 +26754,10 @@ mod tests {
             retired_terminal_sequence: u64,
         }
 
-        postcard::from_bytes::<Witness>(
-            &witness.to_canonical_bytes().expect("canonical witness"),
-        )
-        .expect("decode witness")
-        .roster
-        .durable_epoch_bindings
+        postcard::from_bytes::<Witness>(&witness.to_canonical_bytes().expect("canonical witness"))
+            .expect("decode witness")
+            .roster
+            .durable_epoch_bindings
     }
 
     fn snapshot_monotonic_state(application_sequence: u64) -> SnapshotMonotonicState {
@@ -26635,7 +26780,8 @@ mod tests {
     ) {
         let source = SqliteSessionBackend::open(path).expect("open incoming closure snapshot");
         let conn = source.conn.blocking_lock();
-        initialize_schema(&conn, identity(), &expected_members()).expect("incoming consensus schema");
+        initialize_schema(&conn, identity(), &expected_members())
+            .expect("incoming consensus schema");
         activate_protected_roster_schema_sync(&conn).expect("incoming protected roster schema");
         let empty = crate::fenced_mutation_roster_storage::validate_production_snapshot(
             &[],
@@ -26664,7 +26810,8 @@ mod tests {
         ] {
             let backend = SqliteSessionBackend::in_memory().expect("local backend");
             let conn = backend.conn.blocking_lock();
-            initialize_schema(&conn, identity(), &expected_members()).expect("local consensus schema");
+            initialize_schema(&conn, identity(), &expected_members())
+                .expect("local consensus schema");
             activate_protected_roster_schema_sync(&conn).expect("local protected roster schema");
             let record = retirement_fixture_retained(1, 0, 7, retained_at);
             let terminal_sequence = record.terminal_sequence().expect("retained sequence");
@@ -26695,7 +26842,7 @@ mod tests {
                 "ATTACH DATABASE ?1 AS consensus_incoming",
                 [incoming.to_string_lossy().as_ref()],
             )
-                .expect("attach incoming closure snapshot");
+            .expect("attach incoming closure snapshot");
             let result = validate_attached_snapshot_preserves_protected_roster_sync(
                 &conn,
                 &snapshot_monotonic_state(1),
@@ -26798,13 +26945,7 @@ mod tests {
         let maintenance_at = retained_at
             .add_seconds(2 * 24 * 60 * 60)
             .expect("maintenance time");
-        let record = retirement_fixture_retained_with_terminal_sequence(
-            0x36,
-            1,
-            7,
-            retained_at,
-            1,
-        );
+        let record = retirement_fixture_retained_with_terminal_sequence(0x36, 1, 7, retained_at, 1);
         assert_eq!(Some(1), record.terminal_sequence());
         write_retirement_fixture_record(&conn, &record, retained_at);
         write_retirement_fixture_floor(&conn, record.binding());
@@ -26909,7 +27050,9 @@ mod tests {
             .expect("first payload compaction");
         maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at)
             .expect("final payload compaction");
-        assert!(retire_protected_rosters_sync(&conn, identity()).expect("maximum retirement batch"));
+        assert!(
+            retire_protected_rosters_sync(&conn, identity()).expect("maximum retirement batch")
+        );
         assert!(
             protected_roster_read_retirement_cursor_sync(&conn, identity(), key)
                 .expect("read cursor")
@@ -27025,16 +27168,22 @@ mod tests {
         let maintenance_at = retained_at
             .add_seconds(2 * 24 * 60 * 60)
             .expect("maintenance time");
-        let first = retirement_fixture_admission(0x34, 1).binding_key(6).expect("first binding");
-        let second = retirement_fixture_admission(0x35, 1).binding_key(7).expect("second binding");
+        let first = retirement_fixture_admission(0x34, 1)
+            .binding_key(6)
+            .expect("first binding");
+        let second = retirement_fixture_admission(0x35, 1)
+            .binding_key(7)
+            .expect("second binding");
         let (blocked_partition, retired_partition) = if ProductionFloorKey::from_floor(
             IrreversibleHistoryFloor::initial(first).expect("first floor"),
         )
         .expect("first key")
         .as_bytes()
-            < ProductionFloorKey::from_floor(IrreversibleHistoryFloor::initial(second).expect("second floor"))
-                .expect("second key")
-                .as_bytes()
+            < ProductionFloorKey::from_floor(
+                IrreversibleHistoryFloor::initial(second).expect("second floor"),
+            )
+            .expect("second key")
+            .as_bytes()
         {
             (0x34, 0x35)
         } else {
@@ -27180,12 +27329,8 @@ mod tests {
                 admission,
                 &authority,
                 record,
-                ConsensusCommitMetadata::issue(
-                    terminal_sequence,
-                    terminal_sequence,
-                    committed_at,
-                )
-                .expect("commit metadata"),
+                ConsensusCommitMetadata::issue(terminal_sequence, terminal_sequence, committed_at)
+                    .expect("commit metadata"),
             )
             .expect("committed terminal")
         }
@@ -27228,10 +27373,8 @@ mod tests {
 
         let mut ordered_retained = records
             .iter()
-            .filter_map(|(binding, record)| {
-                (record.state() == ReservationState::Retained)
-                    .then(|| (record.terminalized_at().expect("retained time"), *binding))
-            })
+            .filter(|(_, record)| record.state() == ReservationState::Retained)
+            .map(|(binding, record)| (record.terminalized_at().expect("retained time"), *binding))
             .collect::<Vec<_>>();
         ordered_retained.sort_unstable();
         let final_first_turn_binding = ordered_retained[1_024].1;
@@ -27306,8 +27449,9 @@ mod tests {
             [guarded_binding.to_bytes().as_slice()],
         )
         .expect("corrupt selected admission child");
-        assert!(maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at)
-            .is_err());
+        assert!(
+            maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at).is_err()
+        );
         assert_eq!(
             1,
             conn.query_row(
@@ -27513,13 +27657,9 @@ mod tests {
             .expect("business reservation"),
         )
         .expect("production reservation");
-        let record = ProductionReservationRecord::live(
-            &admission,
-            1,
-            reservation,
-            ChargeProfile::v1(),
-        )
-        .expect("live production record");
+        let record =
+            ProductionReservationRecord::live(&admission, 1, reservation, ChargeProfile::v1())
+                .expect("live production record");
         let request = RosterRequestId::bind(record.binding().history_epoch(), &admission)
             .expect("terminal request");
         let terminal = TerminalRecord::new(
@@ -27562,15 +27702,13 @@ mod tests {
         let record = retained.replacement().expect("retained record");
         let stable_slot =
             protected_roster_stable_slot(admission.scope(), admission.key(), admission.roster_id());
-        let terminal_slot = request
-            .terminal_slot_id(&admission)
-            .expect("terminal slot");
+        let terminal_slot = request.terminal_slot_id(&admission).expect("terminal slot");
 
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
         initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
         activate_protected_roster_schema_sync(&conn).expect("activate protected roster");
-        protected_roster_write_record_sync(&conn, identity(), &record).expect("persist record");
+        protected_roster_write_record_sync(&conn, identity(), record).expect("persist record");
         protected_roster_write_floor_sync(
             &conn,
             identity(),
