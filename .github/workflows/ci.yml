@@ -159,6 +159,10 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      # The matrix includes literal authority and operation-deadline
+      # qualification. Keep those production bounds unchanged while avoiding
+      # unoptimized test code as hosted-runner scheduling noise.
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
