@@ -3768,6 +3768,12 @@ pub(crate) fn verify_compacted_tombstone_history_v2(
         return Err(RosterAttestationError);
     }
     for (proof, admitted) in terminal_evidence.proofs.iter().zip(&admission.members) {
+        proof.provider_certificate.verify_root(root)?;
+        if proof.provider_certificate.configuration_identity != configuration_identity
+            || proof.provider_certificate.scope != terminal.authority_scope
+        {
+            return Err(RosterAttestationError);
+        }
         if proof.member.ordinal != admitted.ordinal
             || proof.member.member_operation_id != admitted.member_operation_id
             || proof.member.descriptor_length != admitted.descriptor_length
@@ -3776,6 +3782,11 @@ pub(crate) fn verify_compacted_tombstone_history_v2(
         {
             return Err(RosterAttestationError);
         }
+        verify_digest_signature(
+            &proof.provider_certificate.public_key,
+            provider_receipt_compact_digest(terminal, &proof.member, &proof.provider_certificate)?,
+            &proof.provider_signature,
+        )?;
         let signed = RosterCompactTerminalMemberSigningInputV2 {
             binding: terminal.clone(),
             member: proof.member.clone(),
@@ -7523,14 +7534,14 @@ mod tests {
         ) = compact_v2_fixture(1);
         let tombstone = TerminalConflictTombstone::new(&admission, &terminal)
             .expect("compact terminal tombstone");
-        let verified =
+        let verify_evidence = |terminal_evidence: &RosterCompactTerminalEvidenceV2| {
             verify_compacted_tombstone_history_v2(CompactedTombstoneHistoryVerificationV2 {
                 root: &root,
                 configuration_identity: identity,
                 binding,
                 tombstone: &tombstone,
                 admission_provenance: &provenance,
-                terminal_evidence: &evidence,
+                terminal_evidence,
                 original_owner: authority.owner(),
                 original_fence: authority.fence().get(),
                 original_credential_id: authority.credential_id(),
@@ -7538,11 +7549,32 @@ mod tests {
                 original_acquired_at: authority.acquired_at(),
                 original_expires_at: authority.expires_at(),
             })
+        };
+        let verified = verify_evidence(&evidence)
             .expect("signed compact history verifies without admission bytes");
         assert_eq!(verified.stable_slot(), compact_admission_slot(&admission));
         assert_eq!(
             verified.terminal_slot(),
             command_id(TERMINAL_SLOT_DOMAIN, binding)
+        );
+
+        let provider_key = SigningKey::from_bytes((&[0x45; 32]).into()).expect("provider leaf");
+        let mut wrong_provider_signature = evidence.clone();
+        wrong_provider_signature.proofs[0].provider_signature =
+            sign_digest(&provider_key, [0xa1; 32]);
+        assert!(
+            verify_evidence(&wrong_provider_signature).is_err(),
+            "restart must reject a canonical but body-invalid Provider signature"
+        );
+
+        let root_key = SigningKey::from_bytes((&[0x41; 32]).into()).expect("root key");
+        let mut unrooted_provider = evidence.clone();
+        unrooted_provider.proofs[0]
+            .provider_certificate
+            .root_signature = sign_digest(&root_key, [0xa2; 32]);
+        assert!(
+            verify_evidence(&unrooted_provider).is_err(),
+            "restart must reject a structurally valid Provider certificate not signed by the root"
         );
 
         let substituted_owner = OwnerId::new("compacted-history-forged-owner").expect("owner");
