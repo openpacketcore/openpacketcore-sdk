@@ -5,30 +5,35 @@
 
 use super::{
     canonical::{
-        decode_frame, encode_frame, Admission, EstablishedPublicationProvider, MemberProvider,
-        RequestBindingKey, RequestId, RosterId, Scope, TerminalConflictTombstone,
-        MAX_ADMISSION_CODEC_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES,
+        Admission, EstablishedPublicationProvider, MAX_ADMISSION_CODEC_BYTES,
+        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MemberProvider, RequestBindingKey, RequestId, RosterId,
+        Scope, TerminalConflictTombstone, decode_frame, encode_frame,
     },
     client::FencedMutationRosterClient,
     diagnostics::{FencedMutationRosterDiagnostics, RosterDiagnostics},
     publication::PublicationAdapter,
     runtime::{
         AdmissionStatusRequest, AuthorityBinding, BackendRegistration, BackendRejection,
-        CommittedTerminal, FencedMutationRosterExecutorAttestor, RecoveryRequest,
-        RegistrationDecision, RegistrationRequest, RosterExecutor, RosterExecutorBackend,
-        TerminalBody, TerminalStatusDecision, TerminalStatusRequest, TerminalizeDecision,
-        TerminalizeRequest,
+        CommittedTerminal, CurrentPublicationAuthorityRead, FencedMutationRosterExecutorAttestor,
+        PublicationAuthorityReader, RecoveryRequest, RegistrationDecision, RegistrationRequest,
+        RosterExecutor, RosterExecutorBackend, TerminalBody, TerminalStatusDecision,
+        TerminalStatusRequest, TerminalizeDecision, TerminalizeRequest,
     },
 };
 use crate::consumer::{
     AuthenticatedRosterConsumer, PersistentSessionConsumerClient,
     PersistentSessionConsumerDiagnostics,
 };
-use opc_session_store::fenced_mutation_roster::MAX_EXECUTOR_PROOF_BUNDLE_BYTES;
+use opc_session_store::fenced_mutation_roster::{
+    MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
+    MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES, RosterCompactAdmissionProvenanceV2,
+};
 use opc_session_store::{
     FenceToken, Generation, OwnerId, SessionConsumerRequestId,
     SessionConsumerRosterAdmissionCapsule, SessionConsumerRosterAdmissionMutationResponse,
-    SessionConsumerRosterAdmissionReadResponse, SessionConsumerRosterRejection,
+    SessionConsumerRosterAdmissionReadResponse,
+    SessionConsumerRosterCurrentPublicationAuthorityCapsule,
+    SessionConsumerRosterCurrentPublicationAuthorityReadResponse, SessionConsumerRosterRejection,
     SessionConsumerRosterTerminalCapsule, SessionConsumerRosterTerminalMutationResponse,
     SessionConsumerRosterTerminalReadResponse, SessionConsumerScope, SessionKey, Timestamp,
 };
@@ -56,10 +61,12 @@ pub const MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES: usize = 512;
 /// Maximum admission-family capsule, including a terminal recovery reply.
 pub const MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES: usize = MAX_ADMISSION_CODEC_BYTES
     + MAX_COMMITTED_TERMINAL_CODEC_BYTES
+    + MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES
     + MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES;
 /// Maximum terminal-family capsule, including the committed terminal reply.
 pub const MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES: usize = MAX_COMMITTED_TERMINAL_CODEC_BYTES
     + MAX_EXECUTOR_PROOF_BUNDLE_BYTES
+    + MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES
     + MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES;
 
 /// Fixed redaction-safe refusal from consumed revision-five composition.
@@ -87,7 +94,7 @@ pub struct FencedMutationRosterProviderAdapterDiagnostics {
 /// Startup-fixed member and publication providers backed by one consumed pool.
 pub struct FencedMutationRosterProviderAdapter<Q> {
     client: FencedMutationRosterClient,
-    publication: PublicationAdapter<Q>,
+    publication: PublicationAdapter<Q, RosterQuorumPort>,
     diagnostics: RosterDiagnostics,
     pool_diagnostics: PersistentSessionConsumerClient,
 }
@@ -247,6 +254,19 @@ impl RosterQuorumPort {
     ) -> Result<SessionConsumerRosterTerminalReadResponse, ProtectedRosterTransportError> {
         self.consumer.terminal_status(request_id, capsule).await
     }
+
+    async fn current_publication_authority(
+        &self,
+        request_id: SessionConsumerRequestId,
+        capsule: SessionConsumerRosterCurrentPublicationAuthorityCapsule,
+    ) -> Result<
+        SessionConsumerRosterCurrentPublicationAuthorityReadResponse,
+        ProtectedRosterTransportError,
+    > {
+        self.consumer
+            .current_publication_authority(request_id, capsule)
+            .await
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -380,6 +400,61 @@ impl RosterExecutorBackend for RosterQuorumPort {
     }
 }
 
+#[async_trait::async_trait]
+impl PublicationAuthorityReader for RosterQuorumPort {
+    type Error = AdapterError;
+
+    async fn read_current_publication_authority(
+        &self,
+        request: CurrentPublicationAuthorityRead<'_>,
+    ) -> Result<(), Self::Error> {
+        let authority = request.current_authority();
+        if authority.scope() != self.scope {
+            return Err(AdapterError);
+        }
+        let (registration_handle, registration_request_id, registration_terminal_slot) =
+            request.current_registration().consensus_parts();
+        let capsule = SessionConsumerRosterCurrentPublicationAuthorityCapsule::new(
+            authority.scope().digest(),
+            authority.key().clone(),
+            *request.roster_id().as_bytes(),
+            request.admission_commitment(),
+            request.terminal_body_commitment(),
+            request.receipt_commitment(),
+            request.logical_owner().clone(),
+            request.admission_fence(),
+            registration_handle,
+            registration_request_id.to_bytes(),
+            *registration_terminal_slot.as_bytes(),
+            authority.owner().clone(),
+            request.current_fence(),
+            authority.credential_id(),
+            authority.generation(),
+            request.current_lease_acquired_at(),
+            request.current_lease_expires_at(),
+        )
+        .map_err(|_| AdapterError)?;
+        match self
+            .current_publication_authority(
+                recovery_request_id(
+                    AdmissionRequestKind::CurrentPublicationAuthority,
+                    authority.scope(),
+                    request.roster_id(),
+                ),
+                capsule,
+            )
+            .await
+            .map_err(|_| AdapterError)?
+        {
+            SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current => Ok(()),
+            SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Rejected => {
+                Err(AdapterError)
+            }
+            _ => Err(AdapterError),
+        }
+    }
+}
+
 impl From<SessionConsumerRosterRejection> for BackendRejection {
     fn from(value: SessionConsumerRosterRejection) -> Self {
         match value {
@@ -398,7 +473,7 @@ impl From<SessionConsumerRosterRejection> for BackendRejection {
             SessionConsumerRosterRejection::Malformed
             | SessionConsumerRosterRejection::Capability
             | SessionConsumerRosterRejection::Conflict => Self::TerminalConflict,
-            SessionConsumerRosterRejection::Unavailable => Self::RecoveryRequired,
+            SessionConsumerRosterRejection::Unavailable => Self::Unavailable,
             _ => Self::TerminalConflict,
         }
     }
@@ -409,6 +484,7 @@ enum AdmissionRequestKind {
     PollAdmit = 1,
     Recover = 3,
     Terminalize = 4,
+    CurrentPublicationAuthority = 6,
 }
 
 fn admission_mutation_request_id(admission: &Admission) -> SessionConsumerRequestId {
@@ -508,6 +584,8 @@ enum AdmissionRequestWire {
     Recover {
         scope: [u8; 32],
         roster_id: RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
         authority: AuthorityWire,
     },
 }
@@ -517,6 +595,7 @@ enum AdmissionResponseWire {
     Fresh {
         scope: [u8; 32],
         registration: RegistrationWire,
+        admission_provenance: Vec<u8>,
     },
     Replayed {
         scope: [u8; 32],
@@ -525,12 +604,14 @@ enum AdmissionResponseWire {
         scope: [u8; 32],
         registration: RegistrationWire,
         admission: Vec<u8>,
+        admission_provenance: Vec<u8>,
     },
     Terminal {
         scope: [u8; 32],
         registration: RegistrationWire,
         admission: Vec<u8>,
         committed: Vec<u8>,
+        admission_provenance: Vec<u8>,
     },
     Compacted {
         scope: [u8; 32],
@@ -551,6 +632,7 @@ struct TerminalRequestWire {
     authority: AuthorityWire,
     record: Vec<u8>,
     proof_bundle: Vec<u8>,
+    terminal_evidence: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -594,6 +676,8 @@ fn admission_capsule_for_recovery(
     let wire = AdmissionRequestWire::Recover {
         scope: request.lookup().scope().digest(),
         roster_id: request.lookup().roster_id(),
+        original_owner: request.original_owner().clone(),
+        original_admission_fence: request.original_admission_fence(),
         authority: request.authority().into(),
     };
     SessionConsumerRosterAdmissionCapsule::new(encode_admission_request(&wire)?).map_err(|_| ())
@@ -619,6 +703,11 @@ fn terminal_capsule(
             .map_err(|_| ())?,
         proof_bundle: body
             .bundle()
+            .map_err(|_| ())?
+            .canonical_bytes()
+            .map_err(|_| ())?,
+        terminal_evidence: body
+            .compact_evidence()
             .map_err(|_| ())?
             .canonical_bytes()
             .map_err(|_| ())?,
@@ -699,11 +788,16 @@ fn decode_admission_response(
         AdmissionResponseWire::Fresh {
             scope: actual,
             registration,
+            admission_provenance,
         } => {
             let admission = original_admission.ok_or(())?;
             expect_scope(actual, scope)?;
-            Ok(RegistrationDecision::FreshlyAdmitted(
+            let provenance =
+                RosterCompactAdmissionProvenanceV2::decode_canonical(&admission_provenance)
+                    .map_err(|_| ())?;
+            Ok(RegistrationDecision::FreshlyAdmittedWithProvenance(
                 registration.into_registration(admission)?,
+                provenance,
             ))
         }
         AdmissionResponseWire::Replayed { scope: actual } => {
@@ -714,12 +808,17 @@ fn decode_admission_response(
             scope: actual,
             registration,
             admission,
+            admission_provenance,
         } => {
             expect_scope(actual, scope)?;
             let admission = decode_admission(&admission, scope, original_admission)?;
-            Ok(RegistrationDecision::PollAdmitted {
+            let provenance =
+                RosterCompactAdmissionProvenanceV2::decode_canonical(&admission_provenance)
+                    .map_err(|_| ())?;
+            Ok(RegistrationDecision::PollAdmittedWithProvenance {
                 registration: registration.into_registration(&admission)?,
                 admission: Arc::new(admission),
+                admission_provenance: provenance,
             })
         }
         AdmissionResponseWire::Terminal {
@@ -727,9 +826,12 @@ fn decode_admission_response(
             registration,
             admission,
             committed,
+            admission_provenance,
         } => {
             expect_scope(actual, scope)?;
             let admission = decode_admission(&admission, scope, original_admission)?;
+            RosterCompactAdmissionProvenanceV2::decode_canonical(&admission_provenance)
+                .map_err(|_| ())?;
             let registration = registration.into_registration(&admission)?;
             let committed =
                 CommittedTerminal::from_canonical_bytes(&committed, &admission).map_err(|_| ())?;
@@ -921,57 +1023,96 @@ mod tests {
     use crate::fenced_mutation_roster::{client::ClientError, runtime::ExecutorError};
 
     #[test]
-    fn production_roster_rejection_adapter_preserves_documented_admission_errors() {
+    fn production_roster_rejection_adapter_preserves_wire_rejection_classes() {
         let scope = Scope::from_digest([0x53; 32]);
         let cases = [
             (
+                SessionConsumerRosterRejection::Malformed,
+                BackendRejection::TerminalConflict,
+                ExecutorError::TerminalConflict,
+                ClientError::TerminalConflict,
+            ),
+            (
+                SessionConsumerRosterRejection::Authority,
+                BackendRejection::Authority,
+                ExecutorError::AuthorityRejected,
+                ClientError::AuthorityRejected,
+            ),
+            (
                 SessionConsumerRosterRejection::RecoveryRequired,
                 BackendRejection::RecoveryRequired,
+                ExecutorError::RecoveryRequired,
                 ClientError::RecoveryRequired,
             ),
             (
                 SessionConsumerRosterRejection::RecordMissing,
                 BackendRejection::RecordMissing,
+                ExecutorError::AdmissionRecordMissing,
                 ClientError::AdmissionRecordMissing,
             ),
             (
                 SessionConsumerRosterRejection::GenerationConflict,
                 BackendRejection::GenerationConflict,
+                ExecutorError::AdmissionGenerationConflict,
                 ClientError::AdmissionGenerationConflict,
             ),
             (
                 SessionConsumerRosterRejection::GenerationExhausted,
                 BackendRejection::GenerationExhausted,
+                ExecutorError::AdmissionGenerationExhausted,
                 ClientError::AdmissionGenerationExhausted,
             ),
             (
                 SessionConsumerRosterRejection::BusinessKeyReserved,
                 BackendRejection::BusinessKeyReserved,
+                ExecutorError::AdmissionBusinessKeyReserved,
                 ClientError::AdmissionBusinessKeyReserved,
             ),
             (
                 SessionConsumerRosterRejection::InvalidProtectedCheckpoint,
                 BackendRejection::InvalidProtectedCheckpoint,
+                ExecutorError::AdmissionInvalidProtectedCheckpoint,
                 ClientError::AdmissionInvalidProtectedCheckpoint,
             ),
             (
                 SessionConsumerRosterRejection::AggregateBytesFull,
                 BackendRejection::AggregateBytesFull,
+                ExecutorError::AdmissionAggregateBytesFull,
                 ClientError::AdmissionAggregateCapacityFull,
             ),
             (
                 SessionConsumerRosterRejection::LiveFull,
                 BackendRejection::LiveFull,
+                ExecutorError::AdmissionLiveFull,
                 ClientError::AdmissionLiveCapacityFull,
             ),
             (
                 SessionConsumerRosterRejection::HistoryFull,
                 BackendRejection::HistoryFull,
+                ExecutorError::AdmissionHistoryFull,
                 ClientError::AdmissionHistoryCapacityFull,
+            ),
+            (
+                SessionConsumerRosterRejection::Conflict,
+                BackendRejection::TerminalConflict,
+                ExecutorError::TerminalConflict,
+                ClientError::TerminalConflict,
+            ),
+            (
+                SessionConsumerRosterRejection::Capability,
+                BackendRejection::TerminalConflict,
+                ExecutorError::TerminalConflict,
+                ClientError::TerminalConflict,
+            ),
+            (
+                SessionConsumerRosterRejection::Unavailable,
+                BackendRejection::Unavailable,
+                ExecutorError::BackendUnavailable,
+                ClientError::Unavailable,
             ),
         ];
 
-        for (rejection, backend, client) in cases {
+        for (rejection, backend, executor, client) in cases {
             let response = encode_admission_response(&AdmissionResponseWire::Reject {
                 scope: scope.digest(),
                 rejection,
@@ -982,10 +1123,24 @@ mod tests {
             {
                 RegistrationDecision::Reject(actual) => {
                     assert_eq!(actual, backend);
-                    assert_eq!(ClientError::from(ExecutorError::from(actual)), client);
+                    assert_eq!(ExecutorError::from(actual), executor);
+                    assert_eq!(ClientError::from(executor), client);
                 }
                 _ => panic!("rejection response must not decode as an admission"),
             }
         }
+    }
+
+    #[test]
+    fn unavailable_rejection_is_never_recovery_or_not_transmitted() {
+        let backend = BackendRejection::from(SessionConsumerRosterRejection::Unavailable);
+        let executor = ExecutorError::from(backend);
+
+        assert_eq!(backend, BackendRejection::Unavailable);
+        assert_eq!(executor, ExecutorError::BackendUnavailable);
+        assert_ne!(executor, ExecutorError::RecoveryRequired);
+        assert_ne!(executor, ExecutorError::AdmissionNotTransmitted);
+        assert_ne!(executor, ExecutorError::TerminalizeNotTransmitted);
+        assert_eq!(ClientError::from(executor), ClientError::Unavailable);
     }
 }

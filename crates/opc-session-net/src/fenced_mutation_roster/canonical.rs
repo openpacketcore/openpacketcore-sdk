@@ -4,11 +4,18 @@
 //! immutable proposal, its authenticated admission, and terminal persistence.
 
 use async_trait::async_trait;
-use opc_session_store::{FenceToken, Generation, OwnerId, SessionKey, StateType};
+use opc_session_store::{
+    FenceToken, Generation, OwnerId, SessionKey, StateType,
+    consensus::SessionConsensusIdentity,
+    fenced_mutation_roster::{
+        RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+        RosterProviderOperationV1, RosterProviderOutcomeV1,
+    },
+};
 use opc_types::Timestamp;
 use serde::{
-    de::{SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
+    de::{SeqAccess, Visitor},
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fmt, marker::PhantomData};
@@ -103,6 +110,8 @@ const ROSTER_ATTESTATION_CERTIFICATE_DOMAIN: &[u8] =
     b"openpacketcore/session-store/roster-attestation-certificate/v1\0";
 const ROSTER_ATTESTATION_PROOF_DOMAIN: &[u8] =
     b"openpacketcore/session-store/roster-attestation-proof/v1\0";
+const ROSTER_ATTESTATION_PROVIDER_RECEIPT_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/roster-attestation-provider-receipt/v1\0";
 const ROSTER_ATTESTATION_STABLE_PROOF_DOMAIN: &[u8] =
     b"openpacketcore/session-store/roster-attestation-stable-proof/v1\0";
 const ROSTER_ATTESTATION_EVIDENCE_DOMAIN: &[u8] =
@@ -112,15 +121,18 @@ const ROSTER_ATTESTATION_BUNDLE_DOMAIN: &[u8] =
 const ROSTER_INGRESS_ATTESTATION_DOMAIN: &[u8] =
     b"openpacketcore/session-store/roster-ingress-attestation/v1\0";
 const ROSTER_INGRESS_CAPSULE_DOMAIN: &[u8] = b"openpacketcore/session-consumer/roster-capsule/v1\0";
+const ROSTER_ATTESTATION_PROVIDER_RECEIPT_MAGIC: [u8; 8] = *b"OPCPRC1\0";
 const ROSTER_ATTESTATION_P256_COMPRESSED_PUBLIC_KEY_BYTES: usize = 33;
 const ROSTER_ATTESTATION_P256_SIGNATURE_BYTES: usize = 64;
 const MAX_EXECUTOR_PROOF_EVIDENCE_BYTES: usize = MAX_STATUS_BYTES;
-const MAX_EXECUTOR_PROOF_BUNDLE_BYTES: usize = 36 * 1024;
+const MAX_EXECUTOR_PROOF_BUNDLE_BYTES: usize = 40 * 1024;
+const MAX_COMPACT_TERMINAL_EVIDENCE_BYTES: usize = 8 * 1024;
 pub(crate) const PROVIDER_OPERATION_EXECUTE_TAG: u8 = 1;
 pub(crate) const PROVIDER_OPERATION_STATUS_TAG: u8 = 2;
 pub(crate) const PROVIDER_OPERATION_ADOPT_TAG: u8 = 3;
 pub(crate) const PROVIDER_OPERATION_COMPENSATE_TAG: u8 = 4;
 pub(crate) const PROVIDER_OPERATION_PREPARE_TAG: u8 = 5;
+pub(crate) const PROVIDER_OPERATION_RECONCILE_TAG: u8 = 6;
 const PUBLICATION_OPERATION_STATUS_TAG: u8 = 1;
 const PUBLICATION_OPERATION_BEGIN_INTENT_TAG: u8 = 2;
 const PUBLICATION_OPERATION_ADOPT_TAG: u8 = 3;
@@ -227,14 +239,14 @@ const PROFILE_DESCRIPTOR: &[u8] = concat!(
     "consumer-revision=5\n",
     "alpn=opc-session-consumer/3\n",
     "codec=postcard-canonical,frame-digest=sha256\n",
-    "domains=profile,admission,descriptor,terminal,terminal-slot,session-key-binding,tenant-scope-partition,provider-fence-binding,publication-id,publication-payload,publication-evidence,admission-frame,terminal-frame,committed-terminal-frame,tombstone-frame,history-floor-frame,executor-proof,executor-evidence,terminal-committing-guard,terminal-session-record,terminal-receipt,provider-scheduling,binding,descriptor,owner,credential,roster-attestation-root,roster-attestation-certificate,roster-attestation-proof,roster-attestation-stable-proof,roster-attestation-evidence,roster-attestation-bundle,roster-ingress-attestation,roster-ingress-capsule\n",
-    "magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB1\\0,OPCRHF1\\0\n",
-    "field-order=profile,roster,members,established-mutation,plan,checkpoint,result;key,scope,owner,fence,generation;binding:epoch,scope,tenant-scope-partition,session-key-commitment,roster-id;tombstone:binding,admission-commitment,terminal-commitment,admission-fence,generation,phase;history-floor:scope,tenant-scope-partition,retired-through\n",
-    "executor-field-order=proof-binding:roster-attestation-proof,profile,configuration-identity,certificate-subject,certificate-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,terminal-phase,terminal-body-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;proof-commitment:roster-attestation-stable-proof,binding,registration-request-id,terminal-slot,roster-id,admission-commitment,phase,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,outcome,evidence-commitment;certificate=roster-attestation-certificate,version,root-id,role,configuration-identity,scope,subject,leaf-epoch,key-id[32],not-before,not-after,compressed-p256-key;attestation=p256-sha256,compressed-sec1:33,low-s-p1363:64,roles:executor|transport-ingress;ingress=roster-ingress-attestation,profile-alpn,peer,scope,request,operation,capsule,authenticated-at,peer-cert-expires,material-generation,handshake-epoch;provider-operations=local-prepare-execute-status-adopt-compensate\n",
+    "domains=profile,admission,descriptor,terminal,terminal-slot,session-key-binding,tenant-scope-partition,provider-fence-binding,publication-id,publication-payload,publication-evidence,admission-frame,terminal-frame,committed-terminal-frame,tombstone-frame,history-floor-frame,executor-proof,executor-evidence,terminal-committing-guard,terminal-session-record,terminal-receipt,provider-scheduling,binding,descriptor,owner,credential,roster-attestation-root,roster-attestation-certificate,roster-attestation-proof,roster-attestation-provider-receipt,roster-attestation-stable-proof,roster-attestation-evidence,roster-attestation-bundle,roster-ingress-attestation,roster-ingress-capsule\n",
+    "magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB1\\0,OPCRHF1\\0,OPCPRC1\\0\n",
+    "field-order=profile,roster,members,established-mutation,plan,checkpoint,result;key,scope,owner,fence,generation;binding:epoch,scope,tenant-scope-partition,session-key-commitment,roster-id;tombstone:binding,admission-commitment,terminal-commitment,admission-owner,admission-fence,generation,phase;history-floor:scope,tenant-scope-partition,retired-through\n",
+    "executor-field-order=proof-binding:roster-attestation-proof,profile,configuration-identity,certificate-subject,certificate-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,terminal-phase,terminal-body-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;provider-receipt=roster-attestation-provider-receipt,profile,configuration-identity,provider-certificate-subject,provider-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;proof-commitment:roster-attestation-stable-proof,binding,registration-request-id,terminal-slot,roster-id,admission-commitment,phase,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,outcome,evidence-commitment;certificate=roster-attestation-certificate,version,root-id,role,configuration-identity,scope,subject,leaf-epoch,key-id[32],not-before,not-after,compressed-p256-key;attestation=p256-sha256,compressed-sec1:33,low-s-p1363:64,roles:executor|provider|transport-ingress;ingress=roster-ingress-attestation,profile-alpn,peer,scope,request,operation,capsule,authenticated-at,peer-cert-expires,material-generation,handshake-epoch;provider-operations=local-prepare-execute-status-adopt-compensate-reconcile\n",
     "committed-terminal-frame-field-order=record,commit-metadata(sequence,raft-log-index,committed-at),committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,committing-authority-scope,committing-authority-key,committing-authority-owner,committing-authority-fence,committing-authority-credential,committing-authority-generation,committing-authority-acquired-at,committing-authority-expires-at,committing-guard-commitment,materialization,receipt-commitment;materialization-postcard-tags=updated:0,deleted:1,no-op:2,aborted:3\n",
     "terminal-guard-field-order=profile,committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,admission-commitment,scope,key,owner,fence,credential,generation,acquired-at,expires-at\n",
     "terminal-receipt-field-order=profile,registration-request-id,terminal-slot-id,admission-commitment,terminal-body-commitment,phase,committing-fence,committing-guard-commitment,commit-metadata,materialization;materialization=updated-from-to-record-commitment|deleted-generation|no-op-generation|aborted\n",
-    "executor-operation-tags=execute:1,status:2,adopt:3,compensate:4,prepare:5\n",
+    "executor-operation-tags=execute:1,status:2,adopt:3,compensate:4,prepare:5,reconcile:6\n",
     "publication-operation-tags=status:1,begin-inert-intent:2,adopt:3;publication-outcome-tags=absent:1,not-transmitted:2,outcome-unknown:3,pending:4,published:5,conflict:6\n",
     "phase-tags=established:1,aborted:2\n",
     "established-mutation-tags=put-checkpoint:1,delete:2,no-op:3\n",
@@ -245,7 +257,7 @@ const PROFILE_DESCRIPTOR: &[u8] = concat!(
     "provider-scheduling=fail-fast,global-max:1024,exact-tenant-scope-cap:ceil(global/2),fixed-shards:16,no-wait-queue,no-per-subscriber-resource\n",
     "provider-tags=not-transmitted:1,outcome-unknown:2,not-found:3,pending:4,conclusive:5,prepared-not-run:6,ready-to-prepare:7\n",
     "outcome-tags=applied-executed:1,applied-adopted:2,not-applied-reconciled:3,compensated-reconciled:4\n",
-    "limits=max-members:8,accepted-members:1..8,fresh-target-members:6,plan:1048576,checkpoint:1048576,result:16384,roster-id:16,member-operation-id:16,descriptor:16384,status:4096,attestation-evidence:4096,attestation-bundle:36864,ingress-attestation:1024,admission-codec:2245658,terminal-codec:1065423,committed-terminal-codec:1069519,tombstone-codec:256,history-floor-codec:128,history-epoch-max:9223372036854775807,live:1024,live-plus-retained:131072,epoch-bindings:131072,operational-target:100000,reclaim:1024,retention-seconds:86400,quorum-mutations:fresh-success=2(admission,terminalization);remote-reads=admission-status,recover,terminal-status;local-authority-checks=provider-pre-post,publication-pre-post\n",
+    "limits=max-members:8,accepted-members:1..8,fresh-target-members:6,plan:1048576,checkpoint:1048576,result:16384,roster-id:16,member-operation-id:16,descriptor:16384,status:4096,attestation-evidence:4096,attestation-bundle:40960,compact-terminal-evidence:8192,ingress-attestation:1024,admission-codec:2245658,terminal-codec:1065423,committed-terminal-codec:1069519,tombstone-codec:256,history-floor-codec:128,history-epoch-max:9223372036854775807,live:1024,live-plus-retained:131072,epoch-bindings:131072,operational-target:100000,reclaim:1024,retention-seconds:86400,quorum-mutations:fresh-success=2(admission,terminalization);remote-reads=admission-status,recover,terminal-status,current-publication-authority;local-authority-checks=provider-pre-post,publication-pre-post\n",
     "maintenance=bounded-deterministic-reclaim-and-retirement,payload-compaction,irreversible-floor-retirement;never-on-fresh-success;local-provider-journal-only\n",
     "history=stable-slot-binds-epoch-scope-session-key-roster-id,new-v2-admission-atomically-selects-binds-current-epoch-greater-than-durable-exact-scope-floor-before-reserve,admit-reserves-one-terminal-slot,terminal-retention-starts-at-terminalization,reclaim-oldest-min-1024-eligible-to-v2-conflict-tombstone,never-reclaim-live,durable-canonical-scope-bound-irreversible-floor,never-reopen-before-scope-bound-irreversible-epoch-retirement\n",
     "retry=prepare-or-execute-only-after-same-call-not-transmitted,outcome-unknown-status-adopt-only,not-found-non-exclusionary\n",
@@ -291,6 +303,7 @@ pub fn profile_digest() -> [u8; 32] {
         ROSTER_ATTESTATION_ROOT_DOMAIN,
         ROSTER_ATTESTATION_CERTIFICATE_DOMAIN,
         ROSTER_ATTESTATION_PROOF_DOMAIN,
+        ROSTER_ATTESTATION_PROVIDER_RECEIPT_DOMAIN,
         ROSTER_ATTESTATION_STABLE_PROOF_DOMAIN,
         ROSTER_ATTESTATION_EVIDENCE_DOMAIN,
         ROSTER_ATTESTATION_BUNDLE_DOMAIN,
@@ -304,18 +317,21 @@ pub fn profile_digest() -> [u8; 32] {
     h.update(COMMITTED_TERMINAL_FRAME_MAGIC);
     h.update(TOMBSTONE_FRAME_MAGIC);
     h.update(HISTORY_FLOOR_FRAME_MAGIC);
+    h.update(ROSTER_ATTESTATION_PROVIDER_RECEIPT_MAGIC);
     h.update([
         PROVIDER_OPERATION_EXECUTE_TAG,
         PROVIDER_OPERATION_STATUS_TAG,
         PROVIDER_OPERATION_ADOPT_TAG,
         PROVIDER_OPERATION_COMPENSATE_TAG,
         PROVIDER_OPERATION_PREPARE_TAG,
+        PROVIDER_OPERATION_RECONCILE_TAG,
     ]);
     h.update([PHASE_ESTABLISHED, PHASE_ABORTED]);
     h.update((ROSTER_ATTESTATION_P256_COMPRESSED_PUBLIC_KEY_BYTES as u64).to_be_bytes());
     h.update((ROSTER_ATTESTATION_P256_SIGNATURE_BYTES as u64).to_be_bytes());
     h.update((MAX_EXECUTOR_PROOF_EVIDENCE_BYTES as u64).to_be_bytes());
     h.update((MAX_EXECUTOR_PROOF_BUNDLE_BYTES as u64).to_be_bytes());
+    h.update((MAX_COMPACT_TERMINAL_EVIDENCE_BYTES as u64).to_be_bytes());
     h.update([
         ESTABLISHED_MUTATION_PUT_CHECKPOINT,
         ESTABLISHED_MUTATION_DELETE,
@@ -1209,6 +1225,12 @@ impl TerminalRecord {
     pub(crate) fn protected_result(&self) -> &[u8] {
         &self.protected_result
     }
+    /// Immutable per-member stable proof commitments in ordinal order.
+    /// These are already part of the validated terminal record and are used
+    /// only to project the matching raw V1 member into compact V2 evidence.
+    pub(crate) fn proof_commitments(&self) -> &[[u8; 32]] {
+        &self.proof_commitments
+    }
     pub(crate) const fn body_commitment(&self) -> [u8; 32] {
         self.body_commitment
     }
@@ -1277,6 +1299,89 @@ pub struct MemberCall<'a> {
     current_fence: FenceToken,
     current_lease_acquired_at: Timestamp,
     current_lease_expires_at: Timestamp,
+    provider_proof_epoch: u64,
+    provider_receipt_challenge: ProviderReceiptChallenge,
+}
+
+/// Opaque, exact-call challenge for the separately protected Provider host.
+///
+/// It commits the SDK's immutable registration/member binding, the current
+/// authority, invoked operation, and proof epoch.  Application code cannot
+/// construct or reinterpret it as a conclusive provider disposition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ProviderReceiptChallenge {
+    bytes: [u8; 32],
+    operation: RosterProviderOperationV1,
+    proof_epoch: u64,
+}
+
+impl ProviderReceiptChallenge {
+    pub(crate) const fn from_executor(
+        bytes: [u8; 32],
+        operation: RosterProviderOperationV1,
+        proof_epoch: u64,
+    ) -> Self {
+        Self {
+            bytes,
+            operation,
+            proof_epoch,
+        }
+    }
+
+    /// Return the fixed opaque challenge sent to the protected Provider host.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
+    }
+
+    /// Build the fixed P-256 prehash for a receipt emitted by a separately
+    /// protected Provider leaf. This is an interoperability seam only: it
+    /// cannot choose the call binding, mint a certificate, or sign anything.
+    /// The executor and Q2 independently reconstruct this prehash and verify
+    /// the root-certified Provider certificate, current authority lease, and
+    /// signature before accepting the capsule.
+    pub fn protected_provider_leaf_receipt_digest(
+        &self,
+        provider_subject_identity_commitment: [u8; 32],
+        outcome: RosterProviderOutcomeV1,
+        evidence: &[u8],
+    ) -> Result<[u8; 32], Error> {
+        opc_session_store::fenced_mutation_roster::provider_receipt_digest_from_challenge_v1(
+            self.bytes,
+            provider_subject_identity_commitment,
+            self.proof_epoch,
+            self.operation,
+            outcome,
+            evidence,
+        )
+        .map_err(|_| Error::InvalidProviderEvidence)
+    }
+
+    /// Canonically assemble a receipt signed by the protected Provider leaf
+    /// for this exact SDK-issued call. Operation and proof epoch are frozen
+    /// inside this challenge and therefore cannot be selected by application
+    /// code at capsule assembly time.
+    pub fn protected_provider_leaf_signed_capsule(
+        &self,
+        outcome: RosterProviderOutcomeV1,
+        evidence: Vec<u8>,
+        certificate: RosterAttestationLeafCertificatePartsV1,
+        signature: [u8; 64],
+    ) -> Result<ProviderReceiptCapsule, Error> {
+        ProviderReceiptCapsule::from_protected_provider_leaf_signed_parts(
+            self.operation,
+            outcome,
+            self.proof_epoch,
+            evidence,
+            certificate,
+            signature,
+        )
+    }
+}
+
+impl fmt::Debug for ProviderReceiptChallenge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProviderReceiptChallenge(<redacted>)")
+    }
 }
 impl<'a> MemberCall<'a> {
     pub(crate) fn from_executor(
@@ -1285,6 +1390,8 @@ impl<'a> MemberCall<'a> {
         current_fence: FenceToken,
         current_lease_acquired_at: Timestamp,
         current_lease_expires_at: Timestamp,
+        provider_proof_epoch: u64,
+        provider_receipt_challenge: ProviderReceiptChallenge,
     ) -> Self {
         Self {
             roster_id: admission.roster_id(),
@@ -1293,6 +1400,8 @@ impl<'a> MemberCall<'a> {
             current_fence,
             current_lease_acquired_at,
             current_lease_expires_at,
+            provider_proof_epoch,
+            provider_receipt_challenge,
         }
     }
     /// Return the roster identity for this provider invocation.
@@ -1334,6 +1443,15 @@ impl<'a> MemberCall<'a> {
     /// current lease guard; it is never a replacement for provider fencing.
     pub const fn current_lease_expires_at(&self) -> Timestamp {
         self.current_lease_expires_at
+    }
+    /// Return the opaque exact-call challenge for Provider receipt issuance.
+    pub const fn provider_receipt_challenge(&self) -> ProviderReceiptChallenge {
+        self.provider_receipt_challenge
+    }
+    /// Return the exact nonzero epoch that the protected Provider leaf must
+    /// include in its receipt signature for this invocation.
+    pub const fn provider_proof_epoch(&self) -> u64 {
+        self.provider_proof_epoch
     }
     /// Validate that provider work is still inside the authenticated lease interval.
     ///
@@ -1737,23 +1855,6 @@ pub(crate) enum ProviderOutcome {
     CompensatedReconciled,
 }
 impl ProviderOutcome {
-    pub(crate) const fn from_member_states(
-        disposition: MemberDisposition,
-        adoption: MemberAdoption,
-    ) -> Option<Self> {
-        match (disposition, adoption) {
-            (MemberDisposition::Applied, MemberAdoption::Executed) => Some(Self::AppliedExecuted),
-            (MemberDisposition::Applied, MemberAdoption::Adopted) => Some(Self::AppliedAdopted),
-            (MemberDisposition::NotApplied, MemberAdoption::Reconciled) => {
-                Some(Self::NotAppliedReconciled)
-            }
-            (MemberDisposition::Compensated, MemberAdoption::Reconciled) => {
-                Some(Self::CompensatedReconciled)
-            }
-            _ => None,
-        }
-    }
-
     pub(crate) const fn tag(self) -> u8 {
         match self {
             Self::AppliedExecuted => OUTCOME_APPLIED_EXECUTED,
@@ -1763,11 +1864,188 @@ impl ProviderOutcome {
         }
     }
 }
+/// Bounded opaque Provider-leaf receipt returned by a protected provider host.
+///
+/// The SDK deliberately exposes only canonical bytes here.  It does not offer
+/// a constructor that accepts an `Applied`, `Executed`, or other conclusive
+/// state.  A provider host obtains these bytes from its separately protected
+/// Provider leaf after it has performed the exact descriptor-bound operation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderReceiptCapsule(Vec<u8>);
+
+impl ProviderReceiptCapsule {
+    /// Accept one bounded canonical receipt capsule from a protected provider
+    /// host.  This does not trust the bytes: the executor reconstructs and
+    /// verifies the exact Provider signature before issuing a proof.
+    pub fn from_canonical_bytes(bytes: Vec<u8>) -> Result<Self, Error> {
+        if bytes.is_empty() || bytes.len() > MAX_PROVIDER_RECEIPT_CAPSULE_BYTES {
+            return Err(Error::InvalidProviderEvidence);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Internal assembly behind the challenge-bound protected-host seam.
+    fn from_protected_provider_leaf_signed_parts(
+        operation: RosterProviderOperationV1,
+        outcome: RosterProviderOutcomeV1,
+        proof_epoch: u64,
+        evidence: Vec<u8>,
+        certificate: RosterAttestationLeafCertificatePartsV1,
+        signature: [u8; 64],
+    ) -> Result<Self, Error> {
+        let receipt = ProviderReceipt {
+            operation,
+            outcome,
+            proof_epoch,
+            evidence,
+            certificate,
+            signature,
+        };
+        // Validate the exact bounded wire before returning it to the caller;
+        // root and signature authority are intentionally checked by runtime.
+        let wire = receipt.to_wire();
+        ProviderReceipt::from_wire(wire.clone())?;
+        let bytes = postcard::to_allocvec(&wire).map_err(|_| Error::InvalidProviderEvidence)?;
+        Self::from_canonical_bytes(bytes)
+    }
+
+    pub(crate) fn decode(&self) -> Result<ProviderReceipt, Error> {
+        let wire: ProviderReceiptWire =
+            postcard::from_bytes(&self.0).map_err(|_| Error::InvalidProviderEvidence)?;
+        let receipt = ProviderReceipt::from_wire(wire)?;
+        let canonical = postcard::to_allocvec(&receipt.to_wire())
+            .map_err(|_| Error::InvalidProviderEvidence)?;
+        if canonical != self.0 {
+            return Err(Error::InvalidProviderEvidence);
+        }
+        Ok(receipt)
+    }
+}
+
+impl fmt::Debug for ProviderReceiptCapsule {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProviderReceiptCapsule(<redacted>)")
+    }
+}
+
+const MAX_PROVIDER_RECEIPT_CAPSULE_BYTES: usize = MAX_STATUS_BYTES + 1024;
+
+#[derive(Clone)]
+pub(crate) struct ProviderReceipt {
+    pub(crate) operation: RosterProviderOperationV1,
+    pub(crate) outcome: RosterProviderOutcomeV1,
+    pub(crate) proof_epoch: u64,
+    pub(crate) evidence: Vec<u8>,
+    pub(crate) certificate: RosterAttestationLeafCertificatePartsV1,
+    pub(crate) signature: [u8; 64],
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ProviderReceiptWire {
+    operation: RosterProviderOperationV1,
+    outcome: RosterProviderOutcomeV1,
+    proof_epoch: u64,
+    evidence: Vec<u8>,
+    certificate: ProviderCertificateWire,
+    signature: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ProviderCertificateWire {
+    root_id: [u8; 32],
+    role: RosterAttestationCertificateRoleV1,
+    configuration_identity: SessionConsensusIdentity,
+    scope: [u8; 32],
+    subject_identity_commitment: [u8; 32],
+    leaf_epoch: u64,
+    key_id: [u8; 32],
+    not_before: Timestamp,
+    not_after: Timestamp,
+    public_key: Vec<u8>,
+    root_signature: Vec<u8>,
+}
+
+impl ProviderReceipt {
+    fn from_wire(wire: ProviderReceiptWire) -> Result<Self, Error> {
+        let public_key: [u8; 33] = wire
+            .certificate
+            .public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::InvalidProviderEvidence)?;
+        let root_signature: [u8; 64] = wire
+            .certificate
+            .root_signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::InvalidProviderEvidence)?;
+        let signature: [u8; 64] = wire
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::InvalidProviderEvidence)?;
+        if wire.proof_epoch == 0
+            || wire.evidence.is_empty()
+            || wire.evidence.len() > MAX_STATUS_BYTES
+            || wire.certificate.role != RosterAttestationCertificateRoleV1::Provider
+            || wire.certificate.leaf_epoch == 0
+            || wire.certificate.key_id == [0; 32]
+            || wire.certificate.subject_identity_commitment == [0; 32]
+            || wire.certificate.not_after <= wire.certificate.not_before
+        {
+            return Err(Error::InvalidProviderEvidence);
+        }
+        Ok(Self {
+            operation: wire.operation,
+            outcome: wire.outcome,
+            proof_epoch: wire.proof_epoch,
+            evidence: wire.evidence,
+            certificate: RosterAttestationLeafCertificatePartsV1 {
+                root_id: wire.certificate.root_id,
+                role: wire.certificate.role,
+                configuration_identity: wire.certificate.configuration_identity,
+                scope: wire.certificate.scope,
+                subject_identity_commitment: wire.certificate.subject_identity_commitment,
+                leaf_epoch: wire.certificate.leaf_epoch,
+                key_id: wire.certificate.key_id,
+                not_before: wire.certificate.not_before,
+                not_after: wire.certificate.not_after,
+                public_key,
+                root_signature,
+            },
+            signature,
+        })
+    }
+
+    fn to_wire(&self) -> ProviderReceiptWire {
+        ProviderReceiptWire {
+            operation: self.operation,
+            outcome: self.outcome,
+            proof_epoch: self.proof_epoch,
+            evidence: self.evidence.clone(),
+            certificate: ProviderCertificateWire {
+                root_id: self.certificate.root_id,
+                role: self.certificate.role,
+                configuration_identity: self.certificate.configuration_identity,
+                scope: self.certificate.scope,
+                subject_identity_commitment: self.certificate.subject_identity_commitment,
+                leaf_epoch: self.certificate.leaf_epoch,
+                key_id: self.certificate.key_id,
+                not_before: self.certificate.not_before,
+                not_after: self.certificate.not_after,
+                public_key: self.certificate.public_key.to_vec(),
+                root_signature: self.certificate.root_signature.to_vec(),
+            },
+            signature: self.signature.to_vec(),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum ProviderEvidence {
     Empty,
     Bytes(Vec<u8>),
-    Conclusive(MemberDisposition, MemberAdoption, Vec<u8>),
+    Receipt(ProviderReceiptCapsule),
 }
 /// Bounded provider result; raw evidence storage is private.
 #[derive(Clone, PartialEq, Eq)]
@@ -1842,31 +2120,17 @@ impl ProviderCallOutcome {
             evidence: ProviderEvidence::Bytes(evidence),
         })
     }
-    /// Report a conclusive provider observation with nonempty bounded opaque evidence.
+    /// Return an already-signed opaque Provider receipt capsule.
     ///
-    /// Only `Applied` with `Executed` or `Adopted`, and `NotApplied` or
-    /// `Compensated` with `Reconciled`, are conclusive. All other combinations
-    /// remain observations and cannot be converted into an SDK-issued proof.
-    /// Constructing this provider response is not terminal authority: only the
-    /// startup-fixed provider can return it through an SDK-issued [`MemberCall`],
-    /// and only the executor can wrap it in a body-bound proof after both
-    /// current-authority read barriers succeed.
-    pub fn conclusive(
-        disposition: MemberDisposition,
-        adoption: MemberAdoption,
-        evidence: Vec<u8>,
-    ) -> Result<Self, Error> {
-        validate_status_bytes(&evidence)?;
-        if evidence.is_empty() {
-            return Err(Error::InvalidProviderEvidence);
-        }
-        if ProviderOutcome::from_member_states(disposition, adoption).is_none() {
-            return Err(Error::InvalidProviderState);
-        }
-        Ok(Self {
+    /// This API intentionally accepts no caller-authored disposition or
+    /// adoption enum.  The executor decodes the capsule only to reconstruct
+    /// the Provider's signed preimage and rejects it unless it matches the
+    /// exact SDK-issued call and allowed operation/outcome truth table.
+    pub fn conclusive_receipt(receipt: ProviderReceiptCapsule) -> Self {
+        Self {
             tag: PROVIDER_CONCLUSIVE,
-            evidence: ProviderEvidence::Conclusive(disposition, adoption, evidence),
-        })
+            evidence: ProviderEvidence::Receipt(receipt),
+        }
     }
     pub(crate) fn into_parts(self) -> ProviderCallOutcomeParts {
         match self.evidence {
@@ -1888,13 +2152,8 @@ impl ProviderCallOutcome {
             ProviderEvidence::Bytes(bytes) if self.tag == PROVIDER_PENDING => {
                 ProviderCallOutcomeParts::Pending(bytes)
             }
-            ProviderEvidence::Conclusive(disposition, adoption, evidence)
-                if self.tag == PROVIDER_CONCLUSIVE =>
-            {
-                match ProviderOutcome::from_member_states(disposition, adoption) {
-                    Some(outcome) => ProviderCallOutcomeParts::Conclusive { outcome, evidence },
-                    None => ProviderCallOutcomeParts::Malformed,
-                }
+            ProviderEvidence::Receipt(receipt) if self.tag == PROVIDER_CONCLUSIVE => {
+                ProviderCallOutcomeParts::Conclusive(receipt)
             }
             _ => ProviderCallOutcomeParts::Malformed,
         }
@@ -1907,10 +2166,7 @@ pub(crate) enum ProviderCallOutcomeParts {
     PreparedNotRun,
     ReadyToPrepare,
     Pending(Vec<u8>),
-    Conclusive {
-        outcome: ProviderOutcome,
-        evidence: Vec<u8>,
-    },
+    Conclusive(ProviderReceiptCapsule),
     Malformed,
 }
 impl fmt::Debug for ProviderCallOutcome {
@@ -1979,6 +2235,18 @@ pub trait MemberProvider: Send + Sync + 'static {
     /// blindly execute the effect.
     async fn adopt(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error>;
 
+    /// Reconcile one exact ambiguous member without replaying its effect.
+    ///
+    /// A conclusive response must be an opaque Provider receipt establishing
+    /// only `NotApplied + Reconciled` or `Compensated + Reconciled`.  `NotFound`
+    /// remains non-exclusionary and never restores execute authority.
+    async fn reconcile_member(
+        &self,
+        _call: &MemberCall<'_>,
+    ) -> Result<ProviderCallOutcome, Self::Error> {
+        Ok(ProviderCallOutcome::outcome_unknown())
+    }
+
     /// Compensate an SDK-proven applied exact member under the current fence.
     ///
     /// The SDK invokes this only after every roster member has a conclusive
@@ -2001,11 +2269,12 @@ pub trait MemberProvider: Send + Sync + 'static {
 ///
 /// This tombstone is retired only with the enclosing V2 history epoch. Age
 /// alone therefore never reopens a stable roster ID for a different body.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TerminalConflictTombstone {
     binding_key: RequestBindingKey,
     admission_body_commitment: [u8; 32],
     terminal_body_commitment: [u8; 32],
+    admission_owner: OwnerId,
     admission_fence: u64,
     expected_generation: u64,
     phase_tag: u8,
@@ -2020,6 +2289,7 @@ impl TerminalConflictTombstone {
             binding_key: admission.binding_key(record.request_id().history_epoch())?,
             admission_body_commitment: admission.body_commitment(),
             terminal_body_commitment: record.body_commitment(),
+            admission_owner: admission.logical_owner().clone(),
             admission_fence: admission.admission_fence().get(),
             expected_generation: admission.expected_generation().get(),
             phase_tag: record.phase()?.tag(),
@@ -2029,7 +2299,7 @@ impl TerminalConflictTombstone {
     }
 
     pub(crate) fn validate_admission(
-        self,
+        &self,
         history_epoch: u64,
         admission: &Admission,
     ) -> Result<CompactedTerminalStatus, Error> {
@@ -2040,7 +2310,8 @@ impl TerminalConflictTombstone {
         if self.admission_body_commitment != admission.body_commitment() {
             return Err(Error::RequestConflict);
         }
-        if self.admission_fence != admission.admission_fence().get()
+        if self.admission_owner != *admission.logical_owner()
+            || self.admission_fence != admission.admission_fence().get()
             || self.expected_generation != admission.expected_generation().get()
         {
             return Err(Error::RequestConflict);
@@ -2053,11 +2324,13 @@ impl TerminalConflictTombstone {
 
     /// Validate a compacted replay lookup without retaining an admission body.
     pub(crate) fn validate_lookup(
-        self,
+        &self,
         history_epoch: u64,
         scope: Scope,
         key: &SessionKey,
         roster_id: RosterId,
+        claimed_original_owner: &OwnerId,
+        claimed_original_admission_fence: FenceToken,
         current_fence: FenceToken,
         current_generation: Generation,
     ) -> Result<CompactedTerminalStatus, Error> {
@@ -2065,7 +2338,9 @@ impl TerminalConflictTombstone {
         if self.binding_key != binding_key {
             return Err(Error::InvalidAuthority);
         }
-        if current_fence.get() <= self.admission_fence
+        if self.admission_owner != *claimed_original_owner
+            || claimed_original_admission_fence.get() != self.admission_fence
+            || current_fence.get() <= self.admission_fence
             || current_generation.get() != self.expected_generation
         {
             return Err(Error::InvalidAuthority);
@@ -2076,7 +2351,7 @@ impl TerminalConflictTombstone {
         })
     }
 
-    pub(crate) fn to_canonical_bytes(self) -> Result<Vec<u8>, Error> {
+    pub(crate) fn to_canonical_bytes(&self) -> Result<Vec<u8>, Error> {
         encode_frame(
             TOMBSTONE_FRAME_MAGIC,
             TOMBSTONE_FRAME_DOMAIN,
@@ -2099,7 +2374,7 @@ impl TerminalConflictTombstone {
         Ok(value)
     }
 
-    fn validate(self) -> Result<(), Error> {
+    fn validate(&self) -> Result<(), Error> {
         self.binding_key.validate()?;
         if self.admission_body_commitment == [0; 32] || self.terminal_body_commitment == [0; 32] {
             return Err(Error::InvalidHistory);
@@ -2123,6 +2398,7 @@ struct TerminalConflictTombstoneWire {
     binding_key: RequestBindingKey,
     admission_body_commitment: [u8; 32],
     terminal_body_commitment: [u8; 32],
+    admission_owner: OwnerId,
     admission_fence: u64,
     expected_generation: u64,
     phase_tag: u8,
@@ -2135,6 +2411,7 @@ impl<'de> Deserialize<'de> for TerminalConflictTombstone {
             binding_key: wire.binding_key,
             admission_body_commitment: wire.admission_body_commitment,
             terminal_body_commitment: wire.terminal_body_commitment,
+            admission_owner: wire.admission_owner,
             admission_fence: wire.admission_fence,
             expected_generation: wire.expected_generation,
             phase_tag: wire.phase_tag,
@@ -2401,8 +2678,14 @@ impl std::error::Error for Error {}
 mod frozen_cross_crate_goldens {
     use super::*;
     use bytes::Bytes;
+    use opc_consensus::{ConsensusClusterId, ConsensusConfigurationEpoch, derive_configuration_id};
     use opc_session_store::{
         FenceToken, Generation, OwnerId, SessionKey, SessionKeyType, StableId,
+        consensus::SessionConsensusIdentity,
+        fenced_mutation_roster::{
+            RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+            RosterProviderOperationV1, RosterProviderOutcomeV1,
+        },
     };
     use opc_types::{NetworkFunctionKind, TenantId};
     use sha2::{Digest, Sha256};
@@ -2499,12 +2782,16 @@ mod frozen_cross_crate_goldens {
                 if expected_version != 0 {
                     assert_eq!(net_members.len(), width);
                     assert_eq!(store_members.len(), width);
-                    assert!(net_members
-                        .iter()
-                        .all(|member| member.expected_version() == expected_version));
-                    assert!(store_members
-                        .iter()
-                        .all(|member| member.expected_version() == expected_version));
+                    assert!(
+                        net_members
+                            .iter()
+                            .all(|member| member.expected_version() == expected_version)
+                    );
+                    assert!(
+                        store_members
+                            .iter()
+                            .all(|member| member.expected_version() == expected_version)
+                    );
                 }
             }
         }
@@ -2516,6 +2803,14 @@ mod frozen_cross_crate_goldens {
         // this exact corpus catches any client/server canonical-codec drift.
         assert_eq!(
             profile_digest(),
+            [
+                0x1f, 0xc9, 0xe4, 0xbd, 0xaf, 0xfd, 0x17, 0x46, 0xf1, 0xaf, 0x8d, 0x21, 0xc7, 0xb7,
+                0x34, 0x37, 0xc5, 0xba, 0x14, 0x22, 0x8e, 0xc4, 0x3b, 0xe4, 0xe2, 0xcf, 0x18, 0x2c,
+                0x6a, 0x3d, 0xda, 0x35,
+            ]
+        );
+        assert_eq!(
+            profile_digest(),
             opc_session_store::fenced_mutation_roster_profile_digest()
         );
         let admission = admission();
@@ -2525,9 +2820,9 @@ mod frozen_cross_crate_goldens {
         assert_eq!(
             sha256(&admission_frame),
             [
-                0x33, 0x03, 0x3e, 0xc3, 0x17, 0x3c, 0xf1, 0x79, 0xfd, 0xb0, 0x8b, 0x16, 0x54, 0xc7,
-                0xcb, 0x15, 0x46, 0x9e, 0xaf, 0xd0, 0xef, 0x89, 0xb4, 0x51, 0x02, 0x34, 0x8f, 0x77,
-                0xcc, 0x52, 0x8a, 0x7c,
+                0x15, 0x01, 0x83, 0x78, 0x2f, 0x28, 0x34, 0xd7, 0x9e, 0x5b, 0xc1, 0x93, 0x6b, 0x92,
+                0x20, 0x9f, 0xde, 0x7a, 0xa0, 0x29, 0xd9, 0xff, 0x63, 0xf5, 0xb6, 0x82, 0xf9, 0x02,
+                0xae, 0xed, 0x51, 0x05,
             ]
         );
         let terminal = TerminalRecord::new(
@@ -2543,10 +2838,61 @@ mod frozen_cross_crate_goldens {
         assert_eq!(
             sha256(&terminal_frame),
             [
-                0xa3, 0xfa, 0x58, 0x9d, 0x92, 0x19, 0x04, 0x94, 0x4f, 0x63, 0xdf, 0xa8, 0x74, 0x5f,
-                0x83, 0x2a, 0x3c, 0x05, 0xa0, 0xd4, 0x38, 0x17, 0x34, 0xda, 0x30, 0x54, 0xb8, 0xc9,
-                0x70, 0xbd, 0xdf, 0xcc,
+                0xf9, 0x95, 0xba, 0x81, 0x49, 0x17, 0x5b, 0x9b, 0xeb, 0x59, 0x6b, 0x07, 0x8b, 0x30,
+                0x0b, 0x7e, 0x1a, 0x53, 0x80, 0x42, 0x07, 0xae, 0xb1, 0xba, 0x7b, 0xb6, 0xdb, 0x1a,
+                0x35, 0xe6, 0xe8, 0xe8,
             ]
+        );
+    }
+
+    #[test]
+    fn protected_provider_leaf_challenge_is_public_wire_free_and_call_bound() {
+        let cluster = ConsensusClusterId::new("provider-capsule-test").expect("cluster ID");
+        let epoch = ConsensusConfigurationEpoch::new(1).expect("configuration epoch");
+        let configuration = derive_configuration_id(cluster, epoch, &[]);
+        let now = Timestamp::now_utc();
+        let certificate = RosterAttestationLeafCertificatePartsV1 {
+            root_id: [1; 32],
+            role: RosterAttestationCertificateRoleV1::Provider,
+            configuration_identity: SessionConsensusIdentity::new(cluster, configuration, epoch),
+            scope: [2; 32],
+            subject_identity_commitment: [3; 32],
+            leaf_epoch: 1,
+            key_id: [4; 32],
+            not_before: now.add_seconds(-60).expect("not before"),
+            not_after: now.add_seconds(60).expect("not after"),
+            public_key: [5; 33],
+            root_signature: [6; 64],
+        };
+        let challenge =
+            ProviderReceiptChallenge::from_executor([7; 32], RosterProviderOperationV1::Execute, 9);
+        let evidence = b"protected-provider-evidence";
+        let digest = challenge
+            .protected_provider_leaf_receipt_digest(
+                certificate.subject_identity_commitment,
+                RosterProviderOutcomeV1::AppliedExecuted,
+                evidence,
+            )
+            .expect("challenge-bound digest");
+        let capsule = challenge
+            .protected_provider_leaf_signed_capsule(
+                RosterProviderOutcomeV1::AppliedExecuted,
+                evidence.to_vec(),
+                certificate,
+                [8; 64],
+            )
+            .expect("opaque capsule without wire knowledge");
+        assert_eq!(capsule.decode().expect("canonical capsule").proof_epoch, 9);
+        assert_ne!(
+            digest,
+            ProviderReceiptChallenge::from_executor([7; 32], RosterProviderOperationV1::Status, 9,)
+                .protected_provider_leaf_receipt_digest(
+                    [3; 32],
+                    RosterProviderOutcomeV1::AppliedExecuted,
+                    evidence,
+                )
+                .expect("different operation digest"),
+            "the protected host cannot replay a receipt under another call operation"
         );
     }
 }

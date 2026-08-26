@@ -1,9 +1,9 @@
 //! Provider-local publication adapter for established fenced-mutation rosters.
 //!
 //! Publication intentionally sits after terminalization. It does not append a
-//! third roster command or make a backend read: a shared startup-owned local
-//! authority permit is checked immediately before and after each provider
-//! operation. The provider owns the idempotency journal keyed by
+//! third roster command: a narrow, read-only backend current-authority reader
+//! and a shared startup-owned local authority permit are checked immediately
+//! before and after each provider operation. The provider owns the idempotency journal keyed by
 //! [`super::canonical::PublicationId`]; this adapter never creates a
 //! per-caller task, channel, connection, or durable consensus record.
 
@@ -14,7 +14,9 @@ use super::{
     },
     client::{EstablishedPublication, PublicationState},
     diagnostics::{Counter as DiagnosticsCounter, RosterDiagnostics},
-    runtime::LocalAuthorityRegistry,
+    runtime::{
+        CurrentPublicationAuthorityRead, LocalAuthorityRegistry, PublicationAuthorityReader,
+    },
     scheduler::ProviderWorkScheduler,
 };
 use std::{fmt, sync::Arc, time::Duration};
@@ -68,20 +70,23 @@ impl std::error::Error for PublicationAdapterError {}
 
 /// Startup-owned provider-local publication seam.
 ///
-/// Clones share the exact provider, local authority registry, and bounded
-/// scheduler selected at process startup. Fresh success remains exactly the
-/// admission write plus the terminalization write.
-pub(crate) struct PublicationAdapter<P> {
+/// Clones share the exact provider, backend-current authority reader, local
+/// authority registry, and bounded scheduler selected at process startup.
+/// Fresh success remains exactly the admission write plus the terminalization
+/// write.
+pub(crate) struct PublicationAdapter<P, A> {
     provider: Arc<P>,
+    authority_reader: Arc<A>,
     scheduler: ProviderWorkScheduler,
     local_authority: LocalAuthorityRegistry,
     diagnostics: RosterDiagnostics,
 }
 
-impl<P> Clone for PublicationAdapter<P> {
+impl<P, A> Clone for PublicationAdapter<P, A> {
     fn clone(&self) -> Self {
         Self {
             provider: Arc::clone(&self.provider),
+            authority_reader: Arc::clone(&self.authority_reader),
             scheduler: self.scheduler.clone(),
             local_authority: self.local_authority.clone(),
             diagnostics: self.diagnostics.clone(),
@@ -89,27 +94,30 @@ impl<P> Clone for PublicationAdapter<P> {
     }
 }
 
-impl<P> fmt::Debug for PublicationAdapter<P> {
+impl<P, A> fmt::Debug for PublicationAdapter<P, A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PublicationAdapter(<redacted>)")
     }
 }
 
-impl<P> PublicationAdapter<P>
+impl<P, A> PublicationAdapter<P, A>
 where
     P: EstablishedPublicationProvider,
+    A: PublicationAuthorityReader,
 {
     /// Construct an adapter from the same startup-owned arcs and scheduler as
     /// the roster executor.  This module deliberately cannot accept a provider
     /// on an individual publish request.
     pub(crate) fn new(
         provider: Arc<P>,
+        authority_reader: Arc<A>,
         scheduler: ProviderWorkScheduler,
         local_authority: LocalAuthorityRegistry,
         diagnostics: RosterDiagnostics,
     ) -> Self {
         Self {
             provider,
+            authority_reader,
             scheduler,
             local_authority,
             diagnostics,
@@ -124,8 +132,8 @@ where
     /// roster, admission commitment, terminal commitment, receipt commitment,
     /// and exact checkpoint/result bytes.  Its stable ID deliberately excludes
     /// replaceable current successor authority; authority is instead checked
-    /// by the shared startup-owned local permit registry around every provider
-    /// effect.
+    /// by backend-current and shared startup-owned local permit validation
+    /// around every provider effect.
     pub(crate) async fn publish(
         &self,
         publication: &mut EstablishedPublication,
@@ -340,7 +348,7 @@ where
     ) -> Result<PublicationProviderOutcome, PublicationAdapterError> {
         let call = EstablishedPublicationCall::from_established(publication)
             .map_err(|_| PublicationAdapterError::RecoveryRequired)?;
-        self.validate_before(&call)?;
+        self.validate_before(&call).await?;
 
         self.diagnostics.increment(match operation {
             PublicationOperation::Status => DiagnosticsCounter::PublicationStatusCalls,
@@ -362,7 +370,7 @@ where
         // Do not move this barrier below result normalization.  Every outcome,
         // including a direct-begin NotTransmitted, is stale if the capability was
         // replaced or expired while the provider future was in flight.
-        if self.validate_after(&call).is_err() {
+        if self.validate_after(&call).await.is_err() {
             return Err(PublicationAdapterError::RecoveryRequired);
         }
 
@@ -390,20 +398,44 @@ where
         Ok(outcome)
     }
 
-    fn validate_before(
+    /// Check the local revocation ledger, then a linearizable backend current
+    /// authority read, then the local ledger again. The trailing local check
+    /// closes a same-process successor installed while the remote read was in
+    /// flight; a cross-process successor racing provider I/O is fenced by the
+    /// provider's durable monotonic fence floor and caught by `validate_after`.
+    async fn validate_before(
         &self,
         call: &EstablishedPublicationCall<'_>,
     ) -> Result<(), PublicationAdapterError> {
+        self.local_authority
+            .permit_for_publication(call)
+            .map_err(|_| PublicationAdapterError::AuthorityRejected)?;
+        let current = CurrentPublicationAuthorityRead::from_publication_call(call)
+            .map_err(|_| PublicationAdapterError::AuthorityRejected)?;
+        self.authority_reader
+            .read_current_publication_authority(current)
+            .await
+            .map_err(|_| PublicationAdapterError::AuthorityRejected)?;
         self.local_authority
             .permit_for_publication(call)
             .map(|_| ())
             .map_err(|_| PublicationAdapterError::AuthorityRejected)
     }
 
-    fn validate_after(
+    /// Repeat the backend-current read and local validation after every
+    /// provider operation. For a Published reply this read is the
+    /// acknowledgement linearization point: failure is always ambiguous and
+    /// cannot ACK.
+    async fn validate_after(
         &self,
         call: &EstablishedPublicationCall<'_>,
     ) -> Result<(), PublicationAdapterError> {
+        let current = CurrentPublicationAuthorityRead::from_publication_call(call)
+            .map_err(|_| PublicationAdapterError::RecoveryRequired)?;
+        self.authority_reader
+            .read_current_publication_authority(current)
+            .await
+            .map_err(|_| PublicationAdapterError::RecoveryRequired)?;
         self.local_authority
             .permit_for_publication(call)
             .map(|_| ())
@@ -423,9 +455,8 @@ mod tests {
     use super::*;
     use crate::fenced_mutation_roster::{
         canonical::{
-            AdmissionProposal, EstablishedMutation, Member, MemberAdoption, MemberDisposition,
-            MemberOperationId, MemberProvider, Profile, ProviderCallOutcome, RequestId, RosterId,
-            Scope,
+            AdmissionProposal, EstablishedMutation, Member, MemberOperationId, MemberProvider,
+            Profile, ProviderCallOutcome, RequestId, RosterId, Scope,
         },
         client::{
             AdmissionInput, AdmissionOutcome, CompleteProofSet, ExecuteOutcome,
@@ -433,30 +464,34 @@ mod tests {
             RecoveryOutcome, TerminalReceipt, TerminalizationOutcome,
         },
         runtime::{
-            BackendRegistration, ConsensusCommitMetadata, FencedMutationRosterExecutorAttestor,
-            RegistrationDecision, RosterExecutor, RosterExecutorBackend, TerminalStatusDecision,
-            TerminalizeDecision,
+            AuthorityBinding, BackendRegistration, ConsensusCommitMetadata,
+            CurrentPublicationAuthorityRead, FencedMutationRosterExecutorAttestor,
+            PublicationAuthorityReader, RegistrationDecision, RosterExecutor,
+            RosterExecutorBackend, TerminalStatusDecision, TerminalizeDecision,
         },
     };
     use async_trait::async_trait;
     use opc_session_store::{
-        fenced_mutation_roster::{
-            RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
-            RosterAttestationLeafCertificateV1, RosterAttestationTrustRootV1,
-            RosterTerminalAttestationSigningInputV1,
-        },
         Clock, FenceToken, Generation, OwnerId, SessionConsensusClusterId,
         SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
         SessionConsensusIdentity, SessionKey, SessionKeyType, SessionLeaseManager,
         SqliteSessionBackend, StableId,
+        fenced_mutation_roster::{
+            RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+            RosterAttestationLeafCertificateV1, RosterAttestationTrustRootV1,
+            RosterCompactAdmissionProvenanceSigningInputV2, RosterCompactAdmissionProvenanceV2,
+            RosterCompactTerminalMemberSigningInputV2, RosterIngressAttestationSigningInputV1,
+            RosterIngressAttestationV1, RosterProviderOutcomeV1,
+            RosterTerminalAttestationSigningInputV1,
+        },
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
-    use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+    use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
     use std::{
         num::NonZeroUsize,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex, MutexGuard,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -898,7 +933,214 @@ mod tests {
         }
     }
 
-    struct ConclusiveMemberProvider;
+    /// Shared provider journal that pauses precisely before its first intent
+    /// admission. The test drives a successor through the same journal while
+    /// the old call is paused, proving that the provider's durable fence floor
+    /// rejects the delayed lower-fence call and that the old adapter's post
+    /// read cannot acknowledge it.
+    struct GatedRestartJournalProvider {
+        journal: Arc<RestartPublicationJournal>,
+        gate_next_begin: AtomicBool,
+        begin_started: tokio::sync::Notify,
+        resume_begin: tokio::sync::Notify,
+    }
+
+    impl GatedRestartJournalProvider {
+        fn new(journal: Arc<RestartPublicationJournal>) -> Self {
+            Self {
+                journal,
+                gate_next_begin: AtomicBool::new(true),
+                begin_started: tokio::sync::Notify::new(),
+                resume_begin: tokio::sync::Notify::new(),
+            }
+        }
+
+        async fn wait_for_first_begin(&self) {
+            self.begin_started.notified().await;
+        }
+
+        fn resume_first_begin(&self) {
+            self.resume_begin.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl EstablishedPublicationProvider for GatedRestartJournalProvider {
+        type Error = ();
+
+        async fn status(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            let (snapshot, state) = self.journal.authorize(call)?;
+            self.journal.status_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(match state.intent.as_ref() {
+                None => PublicationProviderOutcome::Absent,
+                Some((retained, publication_state)) => {
+                    assert_same_durable_publication_body(retained, &snapshot);
+                    match publication_state {
+                        RestartPublicationState::Published => {
+                            PublicationProviderOutcome::Published(
+                                DurablePublicationProvider::evidence(call),
+                            )
+                        }
+                        RestartPublicationState::Reserved | RestartPublicationState::Attempted => {
+                            PublicationProviderOutcome::Pending(
+                                DurablePublicationProvider::evidence(call),
+                            )
+                        }
+                    }
+                }
+            })
+        }
+
+        async fn begin_publication(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            if self.gate_next_begin.swap(false, Ordering::SeqCst) {
+                self.begin_started.notify_one();
+                self.resume_begin.notified().await;
+            }
+            let (snapshot, mut state) = self.journal.authorize(call)?;
+            self.journal.begin_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(
+                match RestartPublicationJournal::admit_intent(&mut state, snapshot) {
+                    RestartPublicationState::Reserved | RestartPublicationState::Attempted => {
+                        PublicationProviderOutcome::Pending(DurablePublicationProvider::evidence(
+                            call,
+                        ))
+                    }
+                    RestartPublicationState::Published => PublicationProviderOutcome::Published(
+                        DurablePublicationProvider::evidence(call),
+                    ),
+                },
+            )
+        }
+
+        async fn adopt(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            let (snapshot, mut state) = self.journal.authorize(call)?;
+            self.journal.adopt_calls.fetch_add(1, Ordering::SeqCst);
+            let (retained, publication_state) = state
+                .intent
+                .as_mut()
+                .expect("adoption requires one exact durable intent");
+            assert_same_durable_publication_body(retained, &snapshot);
+            match *publication_state {
+                RestartPublicationState::Published => Ok(PublicationProviderOutcome::Published(
+                    DurablePublicationProvider::evidence(call),
+                )),
+                RestartPublicationState::Reserved | RestartPublicationState::Attempted => {
+                    *publication_state = RestartPublicationState::Attempted;
+                    self.journal.external_effects.fetch_add(1, Ordering::SeqCst);
+                    self.journal.effect_completed.store(true, Ordering::SeqCst);
+                    *publication_state = RestartPublicationState::Published;
+                    Ok(PublicationProviderOutcome::Published(
+                        DurablePublicationProvider::evidence(call),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Test-only protected Provider leaf. Its certificate chains to the same
+    /// root/configuration/scope as `TestAttestor`, while every receipt is
+    /// signed over the exact SDK-issued call challenge and proof epoch.
+    struct TestProviderReceiptIssuer {
+        certificate: RosterAttestationLeafCertificatePartsV1,
+        key: SigningKey,
+    }
+
+    impl TestProviderReceiptIssuer {
+        fn new(scope: Scope) -> Self {
+            let root_key =
+                SigningKey::from_bytes((&[0x31; 32]).into()).expect("fixed test root scalar");
+            let key =
+                SigningKey::from_bytes((&[0x33; 32]).into()).expect("fixed test provider scalar");
+            let root = RosterAttestationTrustRootV1::new(
+                [0xa1; 32],
+                root_key
+                    .verifying_key()
+                    .to_sec1_point(true)
+                    .as_bytes()
+                    .try_into()
+                    .expect("compressed root key width"),
+            )
+            .expect("test root");
+            let now = Timestamp::now_utc();
+            let mut certificate = RosterAttestationLeafCertificatePartsV1 {
+                root_id: root.root_id(),
+                role: RosterAttestationCertificateRoleV1::Provider,
+                configuration_identity: SessionConsensusIdentity::new(
+                    SessionConsensusClusterId::from_bytes([0x41; 32]),
+                    SessionConsensusConfigurationId::from_bytes([0x42; 32]),
+                    SessionConsensusConfigurationEpoch::new(1).expect("nonzero test epoch"),
+                ),
+                scope: scope.digest(),
+                subject_identity_commitment: [0x44; 32],
+                leaf_epoch: 1,
+                key_id: [0x45; 32],
+                not_before: now.add_seconds(-60).expect("test certificate start"),
+                not_after: now.add_seconds(3_600).expect("test certificate expiry"),
+                public_key: key
+                    .verifying_key()
+                    .to_sec1_point(true)
+                    .as_bytes()
+                    .try_into()
+                    .expect("compressed provider key width"),
+                root_signature: [0; 64],
+            };
+            certificate.root_signature = TestAttestor::sign(
+                &root_key,
+                RosterAttestationLeafCertificateV1::signing_digest(&certificate)
+                    .expect("test provider certificate digest"),
+            );
+            Self { certificate, key }
+        }
+
+        fn applied_executed(
+            &self,
+            call: &super::super::canonical::MemberCall<'_>,
+        ) -> Result<ProviderCallOutcome, ()> {
+            let evidence = vec![call.ordinal().saturating_add(1)];
+            let outcome = RosterProviderOutcomeV1::AppliedExecuted;
+            if call.provider_proof_epoch() == 0 {
+                return Err(());
+            }
+            let challenge = call.provider_receipt_challenge();
+            let digest = challenge
+                .protected_provider_leaf_receipt_digest(
+                    self.certificate.subject_identity_commitment,
+                    outcome,
+                    &evidence,
+                )
+                .map_err(|_| ())?;
+            let capsule = challenge
+                .protected_provider_leaf_signed_capsule(
+                    outcome,
+                    evidence,
+                    self.certificate.clone(),
+                    TestAttestor::sign(&self.key, digest),
+                )
+                .map_err(|_| ())?;
+            Ok(ProviderCallOutcome::conclusive_receipt(capsule))
+        }
+    }
+
+    struct ConclusiveMemberProvider {
+        receipts: TestProviderReceiptIssuer,
+    }
+
+    impl ConclusiveMemberProvider {
+        fn new(scope: Scope) -> Self {
+            Self {
+                receipts: TestProviderReceiptIssuer::new(scope),
+            }
+        }
+    }
 
     #[async_trait]
     impl MemberProvider for ConclusiveMemberProvider {
@@ -915,12 +1157,7 @@ mod tests {
             &self,
             call: &super::super::canonical::MemberCall<'_>,
         ) -> Result<ProviderCallOutcome, Self::Error> {
-            ProviderCallOutcome::conclusive(
-                MemberDisposition::Applied,
-                MemberAdoption::Executed,
-                vec![call.ordinal().saturating_add(1)],
-            )
-            .map_err(|_| ())
+            self.receipts.applied_executed(call)
         }
 
         async fn status(
@@ -942,8 +1179,21 @@ mod tests {
     struct CountingBackend {
         registrations: AtomicUsize,
         terminalizations: AtomicUsize,
+        authority_reads: AtomicUsize,
+        authority_read_expired: AtomicBool,
+        current_authority: Mutex<Option<AuthorityBinding>>,
         committed: Mutex<Option<super::super::runtime::CommittedTerminal>>,
         recovery: Mutex<Option<(BackendRegistration, Arc<super::super::canonical::Admission>)>>,
+    }
+
+    impl CountingBackend {
+        fn authority_reads(&self) -> usize {
+            self.authority_reads.load(Ordering::SeqCst)
+        }
+
+        fn expire_current_authority_for_read(&self) {
+            self.authority_read_expired.store(true, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -955,13 +1205,19 @@ mod tests {
             request: &super::super::runtime::RegistrationRequest,
         ) -> Result<RegistrationDecision, Self::Error> {
             self.registrations.fetch_add(1, Ordering::SeqCst);
-            Ok(RegistrationDecision::FreshlyAdmitted(
-                BackendRegistration::issue(
-                    [0x91; 32],
-                    RequestId::bind(1, request.admission()).expect("bound registration request"),
-                    request.admission(),
-                )
-                .expect("valid backend registration"),
+            let registration = BackendRegistration::issue(
+                [0x91; 32],
+                RequestId::bind(1, request.admission()).expect("bound registration request"),
+                request.admission(),
+            )
+            .expect("valid backend registration");
+            *self
+                .current_authority
+                .lock()
+                .expect("current authority lock") = Some(request.authority().clone());
+            Ok(RegistrationDecision::FreshlyAdmittedWithProvenance(
+                registration,
+                test_compact_admission_provenance(request.admission(), request.authority()),
             ))
         }
 
@@ -988,6 +1244,23 @@ mod tests {
             {
                 return Err(());
             }
+            let mut current = self
+                .current_authority
+                .lock()
+                .expect("current authority lock");
+            if current.as_ref().is_some_and(|existing| {
+                request.authority().fence() < existing.fence()
+                    || (request.authority().fence() == existing.fence()
+                        && request.authority() != existing)
+            }) {
+                return Err(());
+            }
+            // The test fixture models a successor lease already acquired in
+            // the shared durable backend before this read-only recovery. This
+            // updates only the fake's observable authority snapshot; neither
+            // roster mutation counter changes.
+            *current = Some(request.authority().clone());
+            drop(current);
             let committed = self
                 .committed
                 .lock()
@@ -1034,6 +1307,53 @@ mod tests {
                 Arc::new(request.admission().clone()),
             ));
             Ok(TerminalizeDecision::Terminalized(committed))
+        }
+    }
+
+    #[async_trait]
+    impl PublicationAuthorityReader for CountingBackend {
+        type Error = ();
+
+        async fn read_current_publication_authority(
+            &self,
+            request: CurrentPublicationAuthorityRead<'_>,
+        ) -> Result<(), Self::Error> {
+            self.authority_reads.fetch_add(1, Ordering::SeqCst);
+            let (registration, admission) = self
+                .recovery
+                .lock()
+                .expect("recovery test record lock")
+                .clone()
+                .ok_or(())?;
+            let committed = self
+                .committed
+                .lock()
+                .expect("terminal test record lock")
+                .clone()
+                .ok_or(())?;
+            let current = self
+                .current_authority
+                .lock()
+                .expect("current authority lock")
+                .clone()
+                .ok_or(())?;
+            if request.roster_id() != admission.roster_id()
+                || request.admission_commitment() != admission.body_commitment()
+                || request.terminal_body_commitment() != committed.record().body_commitment()
+                || request.receipt_commitment() != committed.receipt_commitment()
+                || request.logical_owner() != admission.logical_owner()
+                || request.admission_fence() != admission.admission_fence()
+            {
+                return Err(());
+            }
+            let now = if self.authority_read_expired.load(Ordering::SeqCst) {
+                current.expires_at()
+            } else {
+                Timestamp::now_utc()
+            };
+            request
+                .validate_backend_current(registration, &current, now)
+                .map_err(|_| ())
         }
     }
 
@@ -1125,6 +1445,98 @@ mod tests {
         }
     }
 
+    fn test_compact_admission_provenance(
+        admission: &super::super::canonical::Admission,
+        authority: &super::super::runtime::AuthorityBinding,
+    ) -> RosterCompactAdmissionProvenanceV2 {
+        let root_key = SigningKey::from_bytes((&[0x31; 32]).into()).expect("test root scalar");
+        let leaf_key = SigningKey::from_bytes((&[0x34; 32]).into()).expect("test ingress scalar");
+        let root = RosterAttestationTrustRootV1::new(
+            [0xa1; 32],
+            root_key
+                .verifying_key()
+                .to_sec1_point(true)
+                .as_bytes()
+                .try_into()
+                .expect("compressed root key width"),
+        )
+        .expect("test root");
+        let configuration_identity = SessionConsensusIdentity::new(
+            SessionConsensusClusterId::from_bytes([0x41; 32]),
+            SessionConsensusConfigurationId::from_bytes([0x42; 32]),
+            SessionConsensusConfigurationEpoch::new(1).expect("nonzero test epoch"),
+        );
+        let now = Timestamp::now_utc();
+        let ingress_input = RosterIngressAttestationSigningInputV1 {
+            peer_identity_commitment: [0x81; 32],
+            consumer_scope: admission.scope().digest(),
+            request_id: [0x82; 16],
+            operation_tag: 1,
+            canonical_capsule_digest: [0x83; 32],
+            authenticated_at: now,
+            peer_certificate_expires_at: now.add_seconds(60).expect("ingress expiry"),
+            material_generation: 1,
+            handshake_epoch: 1,
+        };
+        let mut certificate = RosterAttestationLeafCertificatePartsV1 {
+            root_id: root.root_id(),
+            role: RosterAttestationCertificateRoleV1::TransportIngress,
+            configuration_identity,
+            scope: admission.scope().digest(),
+            subject_identity_commitment: [0x84; 32],
+            leaf_epoch: 1,
+            key_id: [0x85; 32],
+            not_before: now.add_seconds(-60).expect("ingress not before"),
+            not_after: now.add_seconds(60).expect("ingress not after"),
+            public_key: leaf_key
+                .verifying_key()
+                .to_sec1_point(true)
+                .as_bytes()
+                .try_into()
+                .expect("compressed ingress key width"),
+            root_signature: [0; 64],
+        };
+        certificate.root_signature = TestAttestor::sign(
+            &root_key,
+            RosterAttestationLeafCertificateV1::signing_digest(&certificate)
+                .expect("ingress certificate digest"),
+        );
+        let _ingress = RosterIngressAttestationV1::issue_from_signed_parts(
+            &root,
+            certificate.clone(),
+            &ingress_input,
+            TestAttestor::sign(&leaf_key, ingress_input.digest().expect("ingress digest")),
+        )
+        .expect("ingress attestation");
+        let input = RosterCompactAdmissionProvenanceSigningInputV2::from_canonical_admission(
+            configuration_identity,
+            &admission
+                .to_canonical_bytes()
+                .expect("canonical admission bytes"),
+            authority.scope().digest(),
+            authority.key().clone(),
+            authority.owner().clone(),
+            authority.fence(),
+            authority.credential_id(),
+            authority.generation(),
+            authority.acquired_at(),
+            authority.expires_at(),
+            &ingress_input,
+            certificate.subject_identity_commitment,
+        )
+        .expect("compact provenance input");
+        RosterCompactAdmissionProvenanceV2::issue_from_signed_parts(
+            &root,
+            certificate,
+            &input,
+            TestAttestor::sign(
+                &leaf_key,
+                input.digest().expect("compact provenance digest"),
+            ),
+        )
+        .expect("compact provenance")
+    }
+
     #[async_trait]
     impl FencedMutationRosterExecutorAttestor for TestAttestor {
         fn trust_root(&self) -> RosterAttestationTrustRootV1 {
@@ -1149,10 +1561,22 @@ mod tests {
                     .map_err(|_| super::super::runtime::ExecutorError::AttestationUnavailable)?,
             ))
         }
+
+        async fn sign_compact_terminal(
+            &self,
+            input: &RosterCompactTerminalMemberSigningInputV2,
+        ) -> Result<[u8; 64], super::super::runtime::ExecutorError> {
+            Ok(Self::sign(
+                &self.key,
+                input
+                    .digest()
+                    .map_err(|_| super::super::runtime::ExecutorError::AttestationUnavailable)?,
+            ))
+        }
     }
 
     struct Fixture<P> {
-        adapter: PublicationAdapter<P>,
+        adapter: PublicationAdapter<P, CountingBackend>,
         client: FencedMutationRosterClient,
         publication: EstablishedPublication,
         terminal: super::super::client::PreparedRosterTerminal,
@@ -1162,6 +1586,8 @@ mod tests {
         scope: Scope,
         key: SessionKey,
         roster_id: RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
     }
 
     async fn fixture<P>(provider: Arc<P>) -> Fixture<P>
@@ -1175,7 +1601,7 @@ mod tests {
         let backend = Arc::new(CountingBackend::default());
         let executor_clock: Arc<dyn Clock> = clock.clone();
         let executor = RosterExecutor::new_with_clock(
-            Arc::new(ConclusiveMemberProvider),
+            Arc::new(ConclusiveMemberProvider::new(scope)),
             Arc::clone(&backend),
             Arc::new(TestAttestor::new(scope)),
             NonZeroUsize::new(1).expect("one provider lane"),
@@ -1199,6 +1625,8 @@ mod tests {
             )
             .await
             .expect("test lease");
+        let original_owner = lease.owner().clone();
+        let original_admission_fence = lease.fence();
         let members = (0..6)
             .map(|ordinal| {
                 Member::new(
@@ -1278,7 +1706,72 @@ mod tests {
             scope,
             key,
             roster_id: RosterId::from_bytes([0x61; 16]).expect("nonzero test roster ID"),
+            original_owner,
+            original_admission_fence,
         }
+    }
+
+    /// Model a second process: a distinct executor and local authority
+    /// registry, sharing only the durable roster backend, lease source, and
+    /// provider journal supplied by the test.
+    async fn recover_successor<P, Q>(
+        first: &Fixture<P>,
+        provider: Arc<Q>,
+    ) -> (
+        PublicationAdapter<Q, CountingBackend>,
+        FencedMutationRosterClient,
+        EstablishedPublication,
+        FenceToken,
+    )
+    where
+        P: EstablishedPublicationProvider,
+        Q: EstablishedPublicationProvider,
+    {
+        let successor_executor = RosterExecutor::new_with_clock(
+            Arc::new(ConclusiveMemberProvider::new(first.scope)),
+            Arc::clone(&first.backend),
+            Arc::new(TestAttestor::new(first.scope)),
+            NonZeroUsize::new(1).expect("one provider lane"),
+            Arc::new(TestClock {
+                expired: AtomicBool::new(false),
+            }),
+        );
+        let successor_adapter = successor_executor.publication_adapter(provider);
+        let successor_client = FencedMutationRosterClient::new(successor_executor, first.scope);
+        let successor_lease = first
+            .lease_backend
+            .acquire(
+                &first.key,
+                OwnerId::new("publication-test-owner").expect("bounded test owner"),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("same owner can acquire a strictly newer durable fence");
+        let successor_fence = successor_lease.fence();
+        let recovery = RecoveryInput::new(
+            first.roster_id,
+            first.original_owner.clone(),
+            first.original_admission_fence,
+            successor_lease,
+            Generation::new(1),
+        )
+        .expect("valid successor recovery input");
+        let successor_publication = match successor_client
+            .recover(&recovery)
+            .await
+            .expect("read exact committed terminal under the successor fence")
+        {
+            RecoveryOutcome::Terminal(TerminalReceipt::Established(established)) => {
+                established.into_publication()
+            }
+            _ => panic!("recovery must return the exact established terminal"),
+        };
+        (
+            successor_adapter,
+            successor_client,
+            successor_publication,
+            successor_fence,
+        )
     }
 
     fn assert_one_exact_capsule(provider: &DurablePublicationProvider) {
@@ -1398,10 +1891,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restarted_provider_and_executor_recover_one_durable_intent_without_a_third_consensus_mutation(
-    ) {
+    async fn restarted_provider_and_executor_recover_one_durable_intent_without_a_third_consensus_mutation()
+     {
         let journal = Arc::new(RestartPublicationJournal::default());
-        let (backend, lease_backend, scope, key, roster_id) = {
+        let (
+            backend,
+            lease_backend,
+            scope,
+            key,
+            roster_id,
+            original_owner,
+            original_admission_fence,
+        ) = {
             let first_provider = Arc::new(RestartJournalProvider::initial(Arc::clone(&journal)));
             let mut fixture = fixture(Arc::clone(&first_provider)).await;
 
@@ -1430,6 +1931,8 @@ mod tests {
                 fixture.scope,
                 fixture.key.clone(),
                 fixture.roster_id,
+                fixture.original_owner.clone(),
+                fixture.original_admission_fence,
             )
         };
 
@@ -1439,7 +1942,7 @@ mod tests {
         });
         let restarted_executor_clock: Arc<dyn Clock> = restarted_clock;
         let restarted_executor = RosterExecutor::new_with_clock(
-            Arc::new(ConclusiveMemberProvider),
+            Arc::new(ConclusiveMemberProvider::new(scope)),
             Arc::clone(&backend),
             Arc::new(TestAttestor::new(scope)),
             NonZeroUsize::new(1).expect("one provider lane"),
@@ -1460,8 +1963,14 @@ mod tests {
             successor_lease.fence().get() > journal.intent().fence.get(),
             "restart recovery must use a fence strictly higher than the original effect"
         );
-        let recovery = RecoveryInput::new(roster_id, successor_lease, Generation::new(1))
-            .expect("valid successor recovery input");
+        let recovery = RecoveryInput::new(
+            roster_id,
+            original_owner,
+            original_admission_fence,
+            successor_lease,
+            Generation::new(1),
+        )
+        .expect("valid successor recovery input");
         let mut recovered_publication = match restarted_client
             .recover(&recovery)
             .await
@@ -1541,7 +2050,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_successor_fence_rejects_delayed_old_provider_before_io() {
+    async fn backend_current_expiry_rejects_locally_unexpired_authority_before_provider_io() {
+        let provider = Arc::new(DurablePublicationProvider::begin_published());
+        let mut fixture = fixture(Arc::clone(&provider)).await;
+        let diagnostics_before = fixture.client.diagnostics();
+        let provider_calls_before = (
+            provider.status_calls.load(Ordering::SeqCst),
+            provider.begin_calls.load(Ordering::SeqCst),
+            provider.adopt_calls.load(Ordering::SeqCst),
+            provider.external_effects.load(Ordering::SeqCst),
+            provider.snapshots().len(),
+        );
+        let reads_before = fixture.backend.authority_reads();
+        let mutations_before = (
+            fixture.backend.registrations.load(Ordering::SeqCst),
+            fixture.backend.terminalizations.load(Ordering::SeqCst),
+        );
+
+        // The first executor's local test clock remains valid. Only the
+        // shared backend's half-open lease read is at expiry, so the adapter
+        // must fail before it enters provider status.
+        fixture.backend.expire_current_authority_for_read();
+        assert_eq!(
+            fixture.adapter.publish(&mut fixture.publication).await,
+            Err(PublicationAdapterError::AuthorityRejected)
+        );
+
+        let diagnostics_after = fixture.client.diagnostics();
+        assert_eq!(
+            diagnostics_after.publication_status_calls,
+            diagnostics_before.publication_status_calls
+        );
+        assert_eq!(
+            diagnostics_after.publication_begin_calls,
+            diagnostics_before.publication_begin_calls
+        );
+        assert_eq!(
+            diagnostics_after.publication_adopt_calls,
+            diagnostics_before.publication_adopt_calls
+        );
+        assert_eq!(
+            diagnostics_after.publication_acknowledged,
+            diagnostics_before.publication_acknowledged
+        );
+        assert_eq!(
+            (
+                provider.status_calls.load(Ordering::SeqCst),
+                provider.begin_calls.load(Ordering::SeqCst),
+                provider.adopt_calls.load(Ordering::SeqCst),
+                provider.external_effects.load(Ordering::SeqCst),
+                provider.snapshots().len(),
+            ),
+            provider_calls_before,
+            "backend expiry must prevent every publication-provider call and effect"
+        );
+        assert_eq!(fixture.backend.authority_reads(), reads_before + 1);
+        assert_eq!(
+            (
+                fixture.backend.registrations.load(Ordering::SeqCst),
+                fixture.backend.terminalizations.load(Ordering::SeqCst),
+            ),
+            mutations_before,
+            "the current-authority read is not a roster mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_current_successor_rejects_old_process_before_provider_io_then_successor_publishes()
+     {
         let journal = Arc::new(RestartPublicationJournal::default());
         let first_provider = Arc::new(RestartJournalProvider::initial(Arc::clone(&journal)));
         let mut fixture = fixture(first_provider).await;
@@ -1550,8 +2126,107 @@ mod tests {
             .current_fence();
 
         let successor_provider = Arc::new(RestartJournalProvider::recover(Arc::clone(&journal)));
+        let (successor_adapter, successor_client, mut successor_publication, successor_fence) =
+            recover_successor(&fixture, successor_provider).await;
+        assert!(successor_fence > stale_fence);
+        let calls_before_stale = (
+            journal.status_calls.load(Ordering::SeqCst),
+            journal.begin_calls.load(Ordering::SeqCst),
+            journal.adopt_calls.load(Ordering::SeqCst),
+            journal.external_effects.load(Ordering::SeqCst),
+            journal.snapshots().len(),
+        );
+        let stale_diagnostics_before = fixture.client.diagnostics();
+        let reads_before_stale = fixture.backend.authority_reads();
+        let mutations_before_stale = (
+            fixture.backend.registrations.load(Ordering::SeqCst),
+            fixture.backend.terminalizations.load(Ordering::SeqCst),
+        );
+
+        assert_eq!(
+            fixture.adapter.publish(&mut fixture.publication).await,
+            Err(PublicationAdapterError::AuthorityRejected),
+            "the first process's still-locally-current permit must fail at the backend-current read before provider I/O"
+        );
+        let stale_diagnostics_after = fixture.client.diagnostics();
+        assert_eq!(
+            stale_diagnostics_after.publication_status_calls,
+            stale_diagnostics_before.publication_status_calls,
+            "the old SDK process must not enter provider status after the backend-current read rejects it"
+        );
+        assert_eq!(
+            stale_diagnostics_after.publication_begin_calls,
+            stale_diagnostics_before.publication_begin_calls
+        );
+        assert_eq!(
+            stale_diagnostics_after.publication_adopt_calls,
+            stale_diagnostics_before.publication_adopt_calls
+        );
+        assert_eq!(
+            stale_diagnostics_after.publication_acknowledged,
+            stale_diagnostics_before.publication_acknowledged,
+            "rejected old authority cannot ACK the established receipt"
+        );
+        assert_eq!(
+            (
+                journal.status_calls.load(Ordering::SeqCst),
+                journal.begin_calls.load(Ordering::SeqCst),
+                journal.adopt_calls.load(Ordering::SeqCst),
+                journal.external_effects.load(Ordering::SeqCst),
+                journal.snapshots().len(),
+            ),
+            calls_before_stale,
+            "the delayed old fence is rejected before provider I/O"
+        );
+        assert_eq!(
+            fixture.backend.authority_reads(),
+            reads_before_stale + 1,
+            "the rejected attempt performs only its one read-only preflight"
+        );
+        assert_eq!(
+            (
+                fixture.backend.registrations.load(Ordering::SeqCst),
+                fixture.backend.terminalizations.load(Ordering::SeqCst),
+            ),
+            mutations_before_stale,
+            "current-authority reads must not add roster mutations"
+        );
+
+        successor_adapter
+            .publish(&mut successor_publication)
+            .await
+            .expect("successor publishes only after the old authority was rejected");
+        assert_eq!(journal.fence_floor(), successor_fence);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(successor_client.diagnostics().publication_acknowledged, 1);
+        assert_eq!(
+            (
+                fixture.backend.registrations.load(Ordering::SeqCst),
+                fixture.backend.terminalizations.load(Ordering::SeqCst),
+            ),
+            mutations_before_stale,
+            "the successor publication remains provider-local"
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_racing_provider_io_is_fenced_and_post_read_prevents_old_ack() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let provider = Arc::new(GatedRestartJournalProvider::new(Arc::clone(&journal)));
+        let fixture = fixture(Arc::clone(&provider)).await;
+        let stale_fence = EstablishedPublicationCall::from_established(&fixture.publication)
+            .expect("SDK-issued stale publication")
+            .current_fence();
+        let mutations_before = (
+            fixture.backend.registrations.load(Ordering::SeqCst),
+            fixture.backend.terminalizations.load(Ordering::SeqCst),
+        );
+
+        // Construct the second process and its distinct local registry before
+        // advancing the shared durable authority. It cannot touch the
+        // provider until recovery below.
         let successor_executor = RosterExecutor::new_with_clock(
-            Arc::new(ConclusiveMemberProvider),
+            Arc::new(ConclusiveMemberProvider::new(fixture.scope)),
             Arc::clone(&fixture.backend),
             Arc::new(TestAttestor::new(fixture.scope)),
             NonZeroUsize::new(1).expect("one provider lane"),
@@ -1559,9 +2234,21 @@ mod tests {
                 expired: AtomicBool::new(false),
             }),
         );
-        let successor_adapter =
-            successor_executor.publication_adapter(Arc::clone(&successor_provider));
+        let successor_adapter = successor_executor.publication_adapter(Arc::clone(&provider));
         let successor_client = FencedMutationRosterClient::new(successor_executor, fixture.scope);
+
+        let first_begin = provider.wait_for_first_begin();
+        let first_adapter = fixture.adapter.clone();
+        let first_publication = fixture.publication;
+        let first_publish = tokio::spawn(async move {
+            let mut publication = first_publication;
+            first_adapter.publish(&mut publication).await
+        });
+        first_begin.await;
+        assert_eq!(journal.status_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 0);
+
         let successor_lease = fixture
             .lease_backend
             .acquire(
@@ -1573,63 +2260,72 @@ mod tests {
             .expect("same owner can acquire a strictly newer durable fence");
         let successor_fence = successor_lease.fence();
         assert!(successor_fence > stale_fence);
-        let recovery = RecoveryInput::new(fixture.roster_id, successor_lease, Generation::new(1))
-            .expect("valid successor recovery input");
+        let recovery = RecoveryInput::new(
+            fixture.roster_id,
+            fixture.original_owner.clone(),
+            fixture.original_admission_fence,
+            successor_lease,
+            Generation::new(1),
+        )
+        .expect("valid successor recovery input");
         let mut successor_publication = match successor_client
             .recover(&recovery)
             .await
-            .expect("read exact committed terminal under the successor fence")
+            .expect("read exact committed terminal under successor authority")
         {
             RecoveryOutcome::Terminal(TerminalReceipt::Established(established)) => {
                 established.into_publication()
             }
             _ => panic!("recovery must return the exact established terminal"),
         };
+
         successor_adapter
             .publish(&mut successor_publication)
             .await
-            .expect("successor publishes under the durable higher fence");
-        assert_eq!(journal.fence_floor(), successor_fence);
-        let calls_before_stale = (
+            .expect("successor must fence and reconcile the shared provider journal");
+        let calls_after_successor = (
             journal.status_calls.load(Ordering::SeqCst),
             journal.begin_calls.load(Ordering::SeqCst),
             journal.adopt_calls.load(Ordering::SeqCst),
+            journal.external_effects.load(Ordering::SeqCst),
             journal.snapshots().len(),
         );
-        let stale_diagnostics_before = fixture.client.diagnostics();
+        assert_eq!(calls_after_successor, (2, 1, 1, 1, 4));
+        assert_eq!(journal.fence_floor(), successor_fence);
+        assert_eq!(successor_client.diagnostics().publication_acknowledged, 1);
+        let reads_before_old_postcheck = fixture.backend.authority_reads();
 
+        provider.resume_first_begin();
         assert_eq!(
-            fixture.adapter.publish(&mut fixture.publication).await,
+            first_publish.await.expect("old publication task joins"),
             Err(PublicationAdapterError::RecoveryRequired),
-            "the first process's still-locally-current permit cannot cross the durable provider fence floor"
-        );
-        let stale_diagnostics_after = fixture.client.diagnostics();
-        assert_eq!(
-            stale_diagnostics_after.publication_status_calls,
-            stale_diagnostics_before.publication_status_calls + 1,
-            "the old SDK process must enter provider status before the durable floor rejects it"
+            "provider fencing makes the old in-flight begin ambiguous and its post-read must not ACK"
         );
         assert_eq!(
-            stale_diagnostics_after.publication_begin_calls,
-            stale_diagnostics_before.publication_begin_calls
-        );
-        assert_eq!(
-            stale_diagnostics_after.publication_adopt_calls,
-            stale_diagnostics_before.publication_adopt_calls
+            fixture.backend.authority_reads(),
+            reads_before_old_postcheck + 1,
+            "the old provider error is still followed by one backend-current post-read"
         );
         assert_eq!(
             (
                 journal.status_calls.load(Ordering::SeqCst),
                 journal.begin_calls.load(Ordering::SeqCst),
                 journal.adopt_calls.load(Ordering::SeqCst),
+                journal.external_effects.load(Ordering::SeqCst),
                 journal.snapshots().len(),
             ),
-            calls_before_stale,
-            "the delayed old fence is rejected before provider I/O"
+            calls_after_successor,
+            "the delayed old provider operation cannot write an intent or effect after the successor floor"
         );
-        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
-        assert_eq!(fixture.backend.registrations.load(Ordering::SeqCst), 1);
-        assert_eq!(fixture.backend.terminalizations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.client.diagnostics().publication_acknowledged, 0);
+        assert_eq!(
+            (
+                fixture.backend.registrations.load(Ordering::SeqCst),
+                fixture.backend.terminalizations.load(Ordering::SeqCst),
+            ),
+            mutations_before,
+            "neither authority read nor provider takeover adds a roster mutation"
+        );
     }
 
     #[tokio::test]

@@ -3132,6 +3132,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::RestoreScanCursorStale => "restore_scan_cursor_stale",
         StoreError::RestoreScanWorkBudgetExceeded => "restore_scan_work_budget_exceeded",
         StoreError::RestoreScanResponseTooLarge { .. } => "restore_scan_response_too_large",
+        StoreError::SessionRecordReserved => "session_record_reserved",
     }
 }
 
