@@ -13632,6 +13632,21 @@ impl PersistentSessionConsumerClient {
         self.pool.snapshot(idle)
     }
 
+    /// Return a fixed numeric snapshot without pruning or touching transport.
+    ///
+    /// This is available only to the consumed protected-roster adapter, whose
+    /// synchronous composite diagnostics API cannot create or retire a pool
+    /// resource while reporting it.
+    pub(crate) fn diagnostics_without_io(&self) -> PersistentSessionConsumerDiagnostics {
+        let idle = self
+            .pool
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let idle = u64::try_from(idle.len()).unwrap_or(u64::MAX);
+        self.pool.snapshot(idle)
+    }
+
     /// Stop admission, bound the drain, and force idle transport closure.
     pub async fn shutdown(&self) -> PersistentSessionConsumerShutdownReport {
         // Both ALPN-isolated pools enter their cancellation-safe shutdown
