@@ -10,7 +10,8 @@
 use crate::{
     fenced_mutation_roster::{
         Admission, COMMITTED_TERMINAL_FRAME_DOMAIN, COMMITTED_TERMINAL_FRAME_MAGIC,
-        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_PLAN_BYTES, Phase, RequestId, Scope,
+        CompactedTerminalLookup, MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_PLAN_BYTES, Phase,
+        RequestId, Scope,
         TERMINAL_COMMITTING_GUARD_DOMAIN, TERMINAL_RECEIPT_COMMITMENT_DOMAIN,
         TERMINAL_RECORD_COMMITMENT_DOMAIN, TerminalRecord, TerminalSlotId, decode_frame,
         encode_frame,
@@ -298,7 +299,7 @@ pub(crate) struct RecoveryLookup {
 }
 
 impl RecoveryLookup {
-    fn new(scope: Scope, roster_id: crate::fenced_mutation_roster::RosterId) -> Self {
+    pub(crate) fn new(scope: Scope, roster_id: crate::fenced_mutation_roster::RosterId) -> Self {
         Self { scope, roster_id }
     }
 
@@ -328,26 +329,49 @@ pub(crate) struct RecoveryRequest {
     authority: AuthorityBinding,
 }
 
-impl RecoveryRequest {
-    pub(crate) fn new_with_lease_metadata(
-        scope: Scope,
-        roster_id: crate::fenced_mutation_roster::RosterId,
+/// Complete immutable provenance and current authority for one recovery.
+///
+/// Grouping these values makes the successor-takeover boundary explicit and
+/// prevents recovery construction from pairing a stable lookup with authority
+/// from a different scope, key, or lease.
+pub(crate) struct RecoveryRequestInput {
+    lookup: RecoveryLookup,
+    original_owner: OwnerId,
+    original_admission_fence: FenceToken,
+    authority: AuthorityBinding,
+}
+
+impl RecoveryRequestInput {
+    /// Assemble one recovery request from its immutable and current parts.
+    pub(crate) fn new(
+        lookup: RecoveryLookup,
         original_owner: OwnerId,
         original_admission_fence: FenceToken,
-        key: SessionKey,
-        owner: OwnerId,
-        fence: FenceToken,
-        lease: AuthorityLeaseMetadata,
-    ) -> Result<Self, ExecutorError> {
-        let authority = AuthorityBinding::for_recovery(scope, key, owner, fence, lease)?;
-        if original_admission_fence.get() == 0 || authority.fence() <= original_admission_fence {
-            return Err(ExecutorError::InvalidRegistration);
-        }
-        Ok(Self {
-            lookup: RecoveryLookup::new(scope, roster_id),
+        authority: AuthorityBinding,
+    ) -> Self {
+        Self {
+            lookup,
             original_owner,
             original_admission_fence,
             authority,
+        }
+    }
+}
+
+impl RecoveryRequest {
+    /// Validate one successor-takeover request before its durable lookup.
+    pub(crate) fn new(input: RecoveryRequestInput) -> Result<Self, ExecutorError> {
+        if input.authority.scope() != input.lookup.scope()
+            || input.original_admission_fence.get() == 0
+            || input.authority.fence() <= input.original_admission_fence
+        {
+            return Err(ExecutorError::InvalidRegistration);
+        }
+        Ok(Self {
+            lookup: input.lookup,
+            original_owner: input.original_owner,
+            original_admission_fence: input.original_admission_fence,
+            authority: input.authority,
         })
     }
 
@@ -369,6 +393,23 @@ impl RecoveryRequest {
     /// Current successor authority the backend must validate exactly.
     pub(crate) fn authority(&self) -> &AuthorityBinding {
         &self.authority
+    }
+
+    /// Exact compacted-terminal claim derived from this validated recovery.
+    pub(crate) fn compacted_terminal_lookup(
+        &self,
+        history_epoch: u64,
+    ) -> CompactedTerminalLookup<'_> {
+        CompactedTerminalLookup {
+            history_epoch,
+            scope: self.lookup.scope(),
+            key: self.authority.key(),
+            roster_id: self.lookup.roster_id(),
+            original_owner: &self.original_owner,
+            original_admission_fence: self.original_admission_fence,
+            current_fence: self.authority.fence(),
+            current_generation: self.authority.generation(),
+        }
     }
 }
 

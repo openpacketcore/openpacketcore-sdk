@@ -5301,6 +5301,30 @@ pub(crate) struct TerminalConflictTombstone {
     phase_tag: u8,
 }
 
+/// Complete caller claim for one compacted terminal lookup.
+///
+/// The immutable admission provenance and replaceable current authority are
+/// intentionally grouped so a recovery path cannot accidentally validate a
+/// mix of values from distinct lookups or leases.
+pub(crate) struct CompactedTerminalLookup<'a> {
+    /// Retained-history epoch bound into the original admission request ID.
+    pub(crate) history_epoch: u64,
+    /// Exact least-authority scope claimed by the caller.
+    pub(crate) scope: Scope,
+    /// Exact protected session key claimed by the caller.
+    pub(crate) key: &'a SessionKey,
+    /// Stable caller-owned roster identity.
+    pub(crate) roster_id: RosterId,
+    /// Immutable owner from the original admission.
+    pub(crate) original_owner: &'a OwnerId,
+    /// Immutable fence from the original admission.
+    pub(crate) original_admission_fence: FenceToken,
+    /// Current successor authority fence.
+    pub(crate) current_fence: FenceToken,
+    /// Current successor authority generation.
+    pub(crate) current_generation: Generation,
+}
+
 impl TerminalConflictTombstone {
     /// Construct the validated compact binding for an exact terminal record.
     pub(crate) fn new(admission: &Admission, record: &TerminalRecord) -> Result<Self, Error> {
@@ -5387,23 +5411,21 @@ impl TerminalConflictTombstone {
     /// Validate a compacted replay lookup without retaining an admission body.
     pub(crate) fn validate_lookup(
         &self,
-        history_epoch: u64,
-        scope: Scope,
-        key: &SessionKey,
-        roster_id: RosterId,
-        claimed_original_owner: &OwnerId,
-        claimed_original_admission_fence: FenceToken,
-        current_fence: FenceToken,
-        current_generation: Generation,
+        lookup: CompactedTerminalLookup<'_>,
     ) -> Result<CompactedTerminalStatus, Error> {
-        let binding_key = request_binding_key(history_epoch, scope, key, roster_id)?;
+        let binding_key = request_binding_key(
+            lookup.history_epoch,
+            lookup.scope,
+            lookup.key,
+            lookup.roster_id,
+        )?;
         if self.binding_key != binding_key {
             return Err(Error::InvalidAuthority);
         }
-        if self.admission_owner != *claimed_original_owner
-            || claimed_original_admission_fence.get() != self.admission_fence
-            || current_fence.get() <= self.admission_fence
-            || current_generation.get() != self.expected_generation
+        if self.admission_owner != *lookup.original_owner
+            || lookup.original_admission_fence.get() != self.admission_fence
+            || lookup.current_fence.get() <= self.admission_fence
+            || lookup.current_generation.get() != self.expected_generation
         {
             return Err(Error::InvalidAuthority);
         }
@@ -6139,6 +6161,23 @@ mod tests {
             Generation::new(1),
         )
         .unwrap()
+    }
+
+    fn compacted_terminal_lookup<'a>(
+        admission: &'a Admission,
+        current_fence: FenceToken,
+        current_generation: Generation,
+    ) -> CompactedTerminalLookup<'a> {
+        CompactedTerminalLookup {
+            history_epoch: 4,
+            scope: admission.scope(),
+            key: admission.key(),
+            roster_id: admission.roster_id(),
+            original_owner: admission.logical_owner(),
+            original_admission_fence: admission.admission_fence(),
+            current_fence,
+            current_generation,
+        }
     }
 
     #[test]
@@ -7023,140 +7062,105 @@ mod tests {
         assert_eq!(status.phase, Phase::Established);
         assert_ne!(status.terminal_body_commitment, [0; 32]);
         assert_eq!(
-            tombstone.validate_lookup(
-                4,
-                exact.scope(),
-                exact.key(),
-                exact.roster_id(),
-                exact.logical_owner(),
-                exact.admission_fence(),
+            tombstone.validate_lookup(compacted_terminal_lookup(
+                &exact,
                 exact.admission_fence(),
                 exact.expected_generation(),
-            ),
+            )),
             Err(Error::InvalidAuthority)
         );
         assert_eq!(
             tombstone
-                .validate_lookup(
-                    4,
-                    exact.scope(),
-                    exact.key(),
-                    exact.roster_id(),
-                    exact.logical_owner(),
-                    exact.admission_fence(),
+                .validate_lookup(compacted_terminal_lookup(
+                    &exact,
                     FenceToken::new(2),
                     exact.expected_generation(),
-                )
+                ))
                 .unwrap(),
             status
         );
+        let mut wrong_scope = compacted_terminal_lookup(
+            &exact,
+            FenceToken::new(2),
+            exact.expected_generation(),
+        );
+        wrong_scope.scope = Scope::from_digest([8; 32]);
         assert_eq!(
-            tombstone.validate_lookup(
-                4,
-                Scope::from_digest([8; 32]),
-                exact.key(),
-                exact.roster_id(),
-                exact.logical_owner(),
-                exact.admission_fence(),
-                FenceToken::new(2),
-                exact.expected_generation(),
-            ),
+            tombstone.validate_lookup(wrong_scope),
             Err(Error::InvalidAuthority)
         );
         let mut other_key = exact.key().clone();
         other_key.stable_id = StableId::new(Bytes::from_static(b"other-key")).unwrap();
+        let mut wrong_key = compacted_terminal_lookup(
+            &exact,
+            FenceToken::new(2),
+            exact.expected_generation(),
+        );
+        wrong_key.key = &other_key;
         assert_eq!(
-            tombstone.validate_lookup(
-                4,
-                exact.scope(),
-                &other_key,
-                exact.roster_id(),
-                exact.logical_owner(),
-                exact.admission_fence(),
-                FenceToken::new(2),
-                exact.expected_generation(),
-            ),
+            tombstone.validate_lookup(wrong_key),
             Err(Error::InvalidAuthority)
         );
         let mut other_tenant = exact.key().clone();
         other_tenant.tenant = TenantId::from_static("other-tenant");
+        let mut wrong_tenant = compacted_terminal_lookup(
+            &exact,
+            FenceToken::new(2),
+            exact.expected_generation(),
+        );
+        wrong_tenant.key = &other_tenant;
         assert_eq!(
-            tombstone.validate_lookup(
-                4,
-                exact.scope(),
-                &other_tenant,
-                exact.roster_id(),
-                exact.logical_owner(),
-                exact.admission_fence(),
-                FenceToken::new(2),
-                exact.expected_generation(),
-            ),
+            tombstone.validate_lookup(wrong_tenant),
+            Err(Error::InvalidAuthority)
+        );
+        let mut wrong_roster_id = compacted_terminal_lookup(
+            &exact,
+            FenceToken::new(2),
+            exact.expected_generation(),
+        );
+        wrong_roster_id.roster_id = RosterId::from_bytes([8; ROSTER_ID_BYTES]).unwrap();
+        assert_eq!(
+            tombstone.validate_lookup(wrong_roster_id),
+            Err(Error::InvalidAuthority)
+        );
+        let mut wrong_epoch = compacted_terminal_lookup(
+            &exact,
+            FenceToken::new(2),
+            exact.expected_generation(),
+        );
+        wrong_epoch.history_epoch = 5;
+        assert_eq!(
+            tombstone.validate_lookup(wrong_epoch),
             Err(Error::InvalidAuthority)
         );
         assert_eq!(
-            tombstone.validate_lookup(
-                4,
-                exact.scope(),
-                exact.key(),
-                RosterId::from_bytes([8; ROSTER_ID_BYTES]).unwrap(),
-                exact.logical_owner(),
-                exact.admission_fence(),
-                FenceToken::new(2),
-                exact.expected_generation(),
-            ),
-            Err(Error::InvalidAuthority)
-        );
-        assert_eq!(
-            tombstone.validate_lookup(
-                5,
-                exact.scope(),
-                exact.key(),
-                exact.roster_id(),
-                exact.logical_owner(),
-                exact.admission_fence(),
-                FenceToken::new(2),
-                exact.expected_generation(),
-            ),
-            Err(Error::InvalidAuthority)
-        );
-        assert_eq!(
-            tombstone.validate_lookup(
-                4,
-                exact.scope(),
-                exact.key(),
-                exact.roster_id(),
-                exact.logical_owner(),
-                exact.admission_fence(),
+            tombstone.validate_lookup(compacted_terminal_lookup(
+                &exact,
                 FenceToken::new(2),
                 Generation::new(exact.expected_generation().get() + 1),
-            ),
+            )),
             Err(Error::InvalidAuthority)
         );
         let wrong_original_owner = OwnerId::new("wrong-original-owner").unwrap();
+        let mut wrong_owner = compacted_terminal_lookup(
+            &exact,
+            FenceToken::new(2),
+            exact.expected_generation(),
+        );
+        wrong_owner.original_owner = &wrong_original_owner;
         assert_eq!(
-            tombstone.validate_lookup(
-                4,
-                exact.scope(),
-                exact.key(),
-                exact.roster_id(),
-                &wrong_original_owner,
-                exact.admission_fence(),
-                FenceToken::new(2),
-                exact.expected_generation(),
-            ),
+            tombstone.validate_lookup(wrong_owner),
             Err(Error::InvalidAuthority)
         );
+        let mut wrong_original_fence = compacted_terminal_lookup(
+            &exact,
+            FenceToken::new(3),
+            exact.expected_generation(),
+        );
+        wrong_original_fence.original_admission_fence =
+            FenceToken::new(exact.admission_fence().get() + 1);
         assert_eq!(
-            tombstone.validate_lookup(
-                4,
-                exact.scope(),
-                exact.key(),
-                exact.roster_id(),
-                exact.logical_owner(),
-                FenceToken::new(exact.admission_fence().get() + 1),
-                FenceToken::new(3),
-                exact.expected_generation(),
-            ),
+            tombstone.validate_lookup(wrong_original_fence),
             Err(Error::InvalidAuthority),
             "the compact lookup must bind the claimed original admission fence"
         );
