@@ -12487,16 +12487,30 @@ mod membership_tests {
         .expect("admission capsule")
     }
 
-    fn terminal_capsule(
+    struct TerminalCapsuleInput<'a> {
         scope: Scope,
         binding: crate::fenced_mutation_roster::RequestBindingKey,
         registration: BackendRegistration,
-        authority: &AuthorityBinding,
-        terminal: &TerminalRecord,
-        admission: &Admission,
-        proof_bundle: &RosterExecutorProofBundleV1,
-        terminal_evidence: &RosterCompactTerminalEvidenceV2,
+        authority: &'a AuthorityBinding,
+        terminal: &'a TerminalRecord,
+        admission: &'a Admission,
+        proof_bundle: &'a RosterExecutorProofBundleV1,
+        terminal_evidence: &'a RosterCompactTerminalEvidenceV2,
+    }
+
+    fn terminal_capsule(
+        input: TerminalCapsuleInput<'_>,
     ) -> crate::consumer::SessionConsumerRosterTerminalCapsule {
+        let TerminalCapsuleInput {
+            scope,
+            binding,
+            registration,
+            authority,
+            terminal,
+            admission,
+            proof_bundle,
+            terminal_evidence,
+        } = input;
         let wire = RosterIngressTerminalRequestWire {
             scope: scope.digest(),
             binding,
@@ -12530,6 +12544,17 @@ mod membership_tests {
         identity: SessionConsensusIdentity,
         valid_from: Timestamp,
         valid_until: Timestamp,
+    }
+
+    struct RosterIngressTestInput {
+        peer_identity_commitment: [u8; 32],
+        scope: [u8; 32],
+        request_id: SessionConsumerRequestId,
+        operation_tag: u8,
+        capsule: [u8; 32],
+        authenticated_at: Timestamp,
+        material_generation: u64,
+        handshake_epoch: u64,
     }
 
     fn roster_ingress_test_root() -> RosterAttestationTrustRootV1 {
@@ -12596,29 +12621,32 @@ mod membership_tests {
             operation_tag: u8,
             capsule: [u8; 32],
         ) -> RosterIngressAttestationV1 {
-            self.ingress_with_metadata(
+            self.ingress_with_metadata(RosterIngressTestInput {
                 peer_identity_commitment,
                 scope,
                 request_id,
                 operation_tag,
                 capsule,
-                self.valid_from,
-                1,
-                1,
-            )
+                authenticated_at: self.valid_from,
+                material_generation: 1,
+                handshake_epoch: 1,
+            })
         }
 
         fn ingress_with_metadata(
             &self,
-            peer_identity_commitment: [u8; 32],
-            scope: [u8; 32],
-            request_id: SessionConsumerRequestId,
-            operation_tag: u8,
-            capsule: [u8; 32],
-            authenticated_at: Timestamp,
-            material_generation: u64,
-            handshake_epoch: u64,
+            input: RosterIngressTestInput,
         ) -> RosterIngressAttestationV1 {
+            let RosterIngressTestInput {
+                peer_identity_commitment,
+                scope,
+                request_id,
+                operation_tag,
+                capsule,
+                authenticated_at,
+                material_generation,
+                handshake_epoch,
+            } = input;
             let input = RosterIngressAttestationSigningInputV1 {
                 peer_identity_commitment,
                 consumer_scope: scope,
@@ -16950,16 +16978,16 @@ mod membership_tests {
         let (replay_tag, replay_digest) =
             session_consumer_roster_ingress_operation(replay_request.operation())
                 .expect("replay ingress operation");
-        let replay_attestation = issuer.ingress_with_metadata(
+        let replay_attestation = issuer.ingress_with_metadata(RosterIngressTestInput {
             peer_identity_commitment,
-            roster_scope.digest(),
-            replay_request_id,
-            replay_tag,
-            replay_digest,
-            start.add_seconds(1).expect("replay authentication time"),
-            2,
-            2,
-        );
+            scope: roster_scope.digest(),
+            request_id: replay_request_id,
+            operation_tag: replay_tag,
+            capsule: replay_digest,
+            authenticated_at: start.add_seconds(1).expect("replay authentication time"),
+            material_generation: 2,
+            handshake_epoch: 2,
+        });
         let replay_provenance_input = service
             .prepare_compact_admission_provenance_input(
                 &roster_authorization,
@@ -17180,16 +17208,16 @@ mod membership_tests {
         let (conflicting_tag, conflicting_digest) =
             session_consumer_roster_ingress_operation(conflicting_request.operation())
                 .expect("conflicting admission operation");
-        let conflicting_attestation = issuer.ingress_with_metadata(
+        let conflicting_attestation = issuer.ingress_with_metadata(RosterIngressTestInput {
             peer_identity_commitment,
-            roster_scope.digest(),
-            conflicting_request_id,
-            conflicting_tag,
-            conflicting_digest,
-            start.add_seconds(1).expect("conflict authentication time"),
-            3,
-            3,
-        );
+            scope: roster_scope.digest(),
+            request_id: conflicting_request_id,
+            operation_tag: conflicting_tag,
+            capsule: conflicting_digest,
+            authenticated_at: start.add_seconds(1).expect("conflict authentication time"),
+            material_generation: 3,
+            handshake_epoch: 3,
+        });
         let conflicting_provenance_input = service
             .prepare_compact_admission_provenance_input(
                 &roster_authorization,
@@ -17256,16 +17284,16 @@ mod membership_tests {
             bundle: &proof_bundle,
         })
         .expect("terminal proof bundle verifies before ingress");
-        let terminal_capsule = terminal_capsule(
-            roster_scope,
+        let terminal_capsule = terminal_capsule(TerminalCapsuleInput {
+            scope: roster_scope,
             binding,
             registration,
-            &authority,
-            &terminal,
-            &admission,
-            &proof_bundle,
-            &terminal_evidence,
-        );
+            authority: &authority,
+            terminal: &terminal,
+            admission: &admission,
+            proof_bundle: &proof_bundle,
+            terminal_evidence: &terminal_evidence,
+        });
         let terminal_request_id = SessionConsumerRequestId::from_bytes([0x56; 16]);
         let terminal_request = SessionConsumerRequest::new(
             scope,
@@ -17750,16 +17778,16 @@ mod membership_tests {
             &successor_authority,
             &admission_provenance,
         );
-        let terminal_capsule = terminal_capsule(
-            roster_scope,
+        let terminal_capsule = terminal_capsule(TerminalCapsuleInput {
+            scope: roster_scope,
             binding,
             registration,
-            &successor_authority,
-            &terminal,
-            &admission,
-            &proof_bundle,
-            &terminal_evidence,
-        );
+            authority: &successor_authority,
+            terminal: &terminal,
+            admission: &admission,
+            proof_bundle: &proof_bundle,
+            terminal_evidence: &terminal_evidence,
+        });
         let terminal_request_id = SessionConsumerRequestId::from_bytes([0x67; 16]);
         let terminal_request = SessionConsumerRequest::new(
             scope,
