@@ -448,7 +448,14 @@ impl ThreeVoterConsumerFleet {
         pki: Arc<TestPki>,
         root: RosterAttestationTrustRootV1,
     ) -> Self {
-        Self::start_with_topology(pki, None, true, Some(root)).await
+        let fleet = Self::start_with_topology(pki, None, true, Some(root)).await;
+        let (leader, _, _) = fleet.wait_for_observed_leader().await;
+        fleet.stores[leader]
+            .activate_protected_roster_profile()
+            .await
+            .expect("activate protected-roster profile before advertising deployment readiness");
+        fleet.wait_all_ready().await;
+        fleet
     }
 
     async fn start_with_topology(
@@ -6802,6 +6809,10 @@ async fn persistent_three_voter_protected_roster_durable_crash_cut_matrix() {
             DurableRosterCrashCut::EstablishedBeforePublication => {
                 persistent_three_voter_protected_roster_established_before_publication().await;
             }
+            DurableRosterCrashCut::PublicationFirstSendNotTransmitted => {
+                persistent_three_voter_protected_roster_publication_first_send_not_transmitted()
+                    .await;
+            }
             DurableRosterCrashCut::PublicationPublishedBeforeAcknowledgement => {
                 persistent_three_voter_protected_roster_publication_before_acknowledgement().await;
             }
@@ -7023,7 +7034,10 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
             cut,
             DurableRosterCrashCut::PublicationPublishedBeforeAcknowledgement
         ),
-        false,
+        matches!(
+            cut,
+            DurableRosterCrashCut::PublicationFirstSendNotTransmitted
+        ),
     ));
     let initial_adapter = initial_persistent
         .into_fenced_mutation_roster_provider_adapter(
@@ -7124,23 +7138,6 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
         if matches!(cut, DurableRosterCrashCut::PreparedBeforeRun) {
             break;
         }
-        if cut.effect_applied_before_provider_return() {
-            let execution_client = initial_client.clone();
-            let task = tokio::spawn(async move { execution_client.execute(&mut member).await });
-            tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
-                loop {
-                    if initial_journal.phase_calls("apply", ordinal) == 1 {
-                        return;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("durable effect applies before the provider reply is lost");
-            task.abort();
-            let _ = task.await;
-            break;
-        }
         let outcome = initial_client
             .execute(&mut member)
             .await
@@ -7167,6 +7164,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
         cut,
         DurableRosterCrashCut::TerminalCommittedReplyOutcomeUnknown
             | DurableRosterCrashCut::EstablishedBeforePublication
+            | DurableRosterCrashCut::PublicationFirstSendNotTransmitted
             | DurableRosterCrashCut::PublicationPublishedBeforeAcknowledgement
     ) {
         let proofs = CompleteProofSet::new(initial_proofs)
@@ -7221,6 +7219,47 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
                     _ => panic!("Established-before-publication cut requires Established"),
                 }
             }
+            DurableRosterCrashCut::PublicationFirstSendNotTransmitted => {
+                let mut publication = match initial_client
+                    .terminalize(&mut terminal)
+                    .await
+                    .expect("commit Established before transport-conclusive publication loss")
+                {
+                    TerminalizationOutcome::Committed(TerminalReceipt::Established(
+                        established,
+                    )) => {
+                        assert_eq!(established.protected_checkpoint(), protected_checkpoint);
+                        assert_eq!(established.protected_result(), protected_result);
+                        established.into_publication()
+                    }
+                    _ => panic!("publication replay cut requires an Established receipt"),
+                };
+                assert!(
+                    initial_adapter.publish(&mut publication).await.is_err(),
+                    "the reply loss follows a retained transport-conclusive NotTransmitted marker"
+                );
+                assert_eq!(
+                    initial_publication
+                        .journal
+                        .state_count(DurableEstablishedPublicationState::NotTransmitted),
+                    1,
+                    "the first send's exact no-transmission evidence is durable before the crash"
+                );
+                assert_eq!(
+                    initial_publication
+                        .journal
+                        .state_results(DurableEstablishedPublicationState::NotTransmitted),
+                    vec![durable_roster_hex(&protected_result)],
+                    "the retained no-transmission marker is bound to the admitted protected result"
+                );
+                assert_eq!(
+                    initial_publication
+                        .journal
+                        .state_count(DurableEstablishedPublicationState::Published),
+                    0,
+                    "a transport-conclusive no-transmission cannot manufacture an external effect"
+                );
+            }
             DurableRosterCrashCut::PublicationPublishedBeforeAcknowledgement => {
                 let mut publication = match initial_client
                     .terminalize(&mut terminal)
@@ -7265,6 +7304,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
     let initial_terminals = initial_transport
         .roster_terminal_calls
         .load(Ordering::SeqCst);
+    let protected_payload_key_calls_before_restart = setup_provider.calls();
     #[cfg(feature = "test-control")]
     if force_snapshot_before_full_restart {
         const SNAPSHOT_COMMANDS: usize = 4_300;
@@ -7340,6 +7380,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
     let fleet = if matches!(
         cut,
         DurableRosterCrashCut::EstablishedBeforePublication
+            | DurableRosterCrashCut::PublicationFirstSendNotTransmitted
             | DurableRosterCrashCut::PublicationPublishedBeforeAcknowledgement
     ) || force_snapshot_before_full_restart
     {
@@ -7567,13 +7608,14 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
         cut,
         DurableRosterCrashCut::TerminalCommittedReplyOutcomeUnknown
             | DurableRosterCrashCut::EstablishedBeforePublication
+            | DurableRosterCrashCut::PublicationFirstSendNotTransmitted
             | DurableRosterCrashCut::PublicationPublishedBeforeAcknowledgement
     ) {
         let input = RecoveryInput::new(
             roster_id,
             original_owner,
             original_admission_fence,
-            current_guard,
+            current_guard.clone(),
             expected_generation,
         )
         .expect("current terminal crash-cut recovery input");
@@ -7629,6 +7671,56 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
             1,
             "the exact publication cannot be duplicated after restart recovery",
         );
+        if matches!(
+            cut,
+            DurableRosterCrashCut::PublicationFirstSendNotTransmitted
+        ) {
+            assert!(
+                current_guard.fence() > original_admission_fence,
+                "the replay must recover under higher current authority"
+            );
+            assert_eq!(
+                recovery_publication.begin_calls.load(Ordering::SeqCst),
+                0,
+                "a retained transport-conclusive marker permits status/adopt only, never a rebuilt intent"
+            );
+            assert_eq!(
+                recovery_publication.status_calls.load(Ordering::SeqCst),
+                1,
+                "the successor first reads the retained exact publication identity"
+            );
+            assert_eq!(
+                recovery_publication.adopt_calls.load(Ordering::SeqCst),
+                1,
+                "the successor performs one exact-byte resend through adoption"
+            );
+            assert_eq!(
+                recovery_publication
+                    .journal
+                    .state_count(DurableEstablishedPublicationState::NotTransmitted),
+                1,
+                "the original no-transmission evidence remains durable"
+            );
+            assert_eq!(
+                recovery_publication
+                    .journal
+                    .state_results(DurableEstablishedPublicationState::NotTransmitted),
+                vec![durable_roster_hex(&protected_result)],
+                "the retained marker remains bound to the admitted protected result"
+            );
+            assert_eq!(
+                recovery_publication
+                    .journal
+                    .state_results(DurableEstablishedPublicationState::Published),
+                vec![durable_roster_hex(&protected_result)],
+                "the one external send uses exactly the retained protected-result bytes"
+            );
+            assert_eq!(
+                setup_provider.calls(),
+                protected_payload_key_calls_before_restart,
+                "successor publication reuses retained opaque bytes without rebuilding, resealing, or drawing an IV"
+            );
+        }
         recovery_shutdown.shutdown().await;
         recovery_server.abort_and_wait().await;
         lease_server.abort_and_wait().await;
@@ -7813,6 +7905,14 @@ async fn persistent_three_voter_protected_roster_terminal_reply_outcome_unknown(
 async fn persistent_three_voter_protected_roster_established_before_publication() {
     persistent_three_voter_protected_roster_recovers_provider_crash_cut(
         DurableRosterCrashCut::EstablishedBeforePublication,
+        false,
+    )
+    .await;
+}
+
+async fn persistent_three_voter_protected_roster_publication_first_send_not_transmitted() {
+    persistent_three_voter_protected_roster_recovers_provider_crash_cut(
+        DurableRosterCrashCut::PublicationFirstSendNotTransmitted,
         false,
     )
     .await;
@@ -8110,7 +8210,6 @@ enum DurableRosterCrashCut {
     PreparePending,
     PreparedBeforeRun,
     RunOutcomeUnknown,
-    EffectAppliedBeforeProviderReturn,
     AppliedBeforeFinalize,
     AdmittedBeforeSixth,
     SixthDurableApplyLostReply,
@@ -8118,6 +8217,7 @@ enum DurableRosterCrashCut {
     TerminalCommittedReplyOutcomeUnknown,
     EstablishedBeforePublication,
     PublicationPublishedBeforeAcknowledgement,
+    PublicationFirstSendNotTransmitted,
 }
 
 const DURABLE_ROSTER_CRASH_CUT_MATRIX: [DurableRosterCrashCut; 13] = [
@@ -8126,7 +8226,6 @@ const DURABLE_ROSTER_CRASH_CUT_MATRIX: [DurableRosterCrashCut; 13] = [
     DurableRosterCrashCut::PreparePending,
     DurableRosterCrashCut::PreparedBeforeRun,
     DurableRosterCrashCut::RunOutcomeUnknown,
-    DurableRosterCrashCut::EffectAppliedBeforeProviderReturn,
     DurableRosterCrashCut::AppliedBeforeFinalize,
     DurableRosterCrashCut::AdmittedBeforeSixth,
     DurableRosterCrashCut::SixthDurableApplyLostReply,
@@ -8134,6 +8233,7 @@ const DURABLE_ROSTER_CRASH_CUT_MATRIX: [DurableRosterCrashCut; 13] = [
     DurableRosterCrashCut::TerminalCommittedReplyOutcomeUnknown,
     DurableRosterCrashCut::EstablishedBeforePublication,
     DurableRosterCrashCut::PublicationPublishedBeforeAcknowledgement,
+    DurableRosterCrashCut::PublicationFirstSendNotTransmitted,
 ];
 
 impl DurableRosterCrashCut {
@@ -8144,13 +8244,13 @@ impl DurableRosterCrashCut {
             Self::PreparePending => "PreparePending",
             Self::PreparedBeforeRun => "PreparedBeforeRun",
             Self::RunOutcomeUnknown => "RunOutcomeUnknown",
-            Self::EffectAppliedBeforeProviderReturn => "EffectAppliedBeforeProviderReturn",
             Self::AppliedBeforeFinalize => "AppliedBeforeFinalize",
             Self::AdmittedBeforeSixth => "RosterAdmittedBeforeSixth",
             Self::SixthDurableApplyLostReply => "SixthDurableApplyLostReply",
             Self::AllSixBeforeTerminalRequest => "AllSixConvergedBeforeTerminalRequest",
             Self::TerminalCommittedReplyOutcomeUnknown => "TerminalCommittedReplyOutcomeUnknown",
             Self::EstablishedBeforePublication => "EstablishedBeforePublication",
+            Self::PublicationFirstSendNotTransmitted => "PublicationFirstSendNotTransmitted",
             Self::PublicationPublishedBeforeAcknowledgement => {
                 "PublicationPublishedBeforeAcknowledgement"
             }
@@ -8163,13 +8263,13 @@ impl DurableRosterCrashCut {
             Self::PreparePending
             | Self::PreparedBeforeRun
             | Self::RunOutcomeUnknown
-            | Self::EffectAppliedBeforeProviderReturn
             | Self::AppliedBeforeFinalize => 1,
             Self::AdmittedBeforeSixth => 5,
             Self::SixthDurableApplyLostReply
             | Self::AllSixBeforeTerminalRequest
             | Self::TerminalCommittedReplyOutcomeUnknown
             | Self::EstablishedBeforePublication
+            | Self::PublicationFirstSendNotTransmitted
             | Self::PublicationPublishedBeforeAcknowledgement => 6,
         }
     }
@@ -8180,10 +8280,6 @@ impl DurableRosterCrashCut {
             Self::SixthDurableApplyLostReply => Some(5),
             _ => None,
         }
-    }
-
-    const fn effect_applied_before_provider_return(self) -> bool {
-        matches!(self, Self::EffectAppliedBeforeProviderReturn)
     }
 
     const fn pending_prepare(self) -> bool {
@@ -8199,7 +8295,6 @@ struct DurableCrashCutProvider {
     issuer: Arc<ProductionRosterAttestationIssuer>,
     pending_prepare: bool,
     outcome_unknown_ordinal: Option<u8>,
-    effect_applied_before_provider_return: bool,
     prepare_calls: AtomicUsize,
     execute_calls: AtomicUsize,
     status_calls: AtomicUsize,
@@ -8217,7 +8312,6 @@ impl DurableCrashCutProvider {
             issuer,
             pending_prepare: cut.pending_prepare(),
             outcome_unknown_ordinal: cut.outcome_unknown_ordinal(),
-            effect_applied_before_provider_return: cut.effect_applied_before_provider_return(),
             prepare_calls: AtomicUsize::new(0),
             execute_calls: AtomicUsize::new(0),
             status_calls: AtomicUsize::new(0),
@@ -8234,7 +8328,6 @@ impl DurableCrashCutProvider {
             issuer,
             pending_prepare: false,
             outcome_unknown_ordinal: None,
-            effect_applied_before_provider_return: false,
             prepare_calls: AtomicUsize::new(0),
             execute_calls: AtomicUsize::new(0),
             status_calls: AtomicUsize::new(0),
@@ -8305,10 +8398,6 @@ impl MemberProvider for DurableCrashCutProvider {
             .append("execute", call.ordinal(), call)
             .map_err(|_| ())?;
         self.record_apply_once(call)?;
-        if self.effect_applied_before_provider_return {
-            futures_util::future::pending::<()>().await;
-            unreachable!("the crash-cut provider never returns after its durable effect");
-        }
         if self.outcome_unknown_ordinal == Some(call.ordinal()) {
             Ok(ProviderCallOutcome::outcome_unknown())
         } else {
@@ -8375,6 +8464,7 @@ struct DurableEstablishedPublicationJournal {
 enum DurableEstablishedPublicationState {
     Reserved,
     Attempted,
+    NotTransmitted,
     Published,
 }
 
@@ -8408,6 +8498,7 @@ impl DurableEstablishedPublicationJournal {
         let state = match state {
             DurableEstablishedPublicationState::Reserved => "reserved",
             DurableEstablishedPublicationState::Attempted => "attempted",
+            DurableEstablishedPublicationState::NotTransmitted => "not_transmitted",
             DurableEstablishedPublicationState::Published => "published",
         };
         let mut file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
@@ -8464,6 +8555,7 @@ impl DurableEstablishedPublicationJournal {
                 let state = match state {
                     "reserved" => DurableEstablishedPublicationState::Reserved,
                     "attempted" => DurableEstablishedPublicationState::Attempted,
+                    "not_transmitted" => DurableEstablishedPublicationState::NotTransmitted,
                     "published" => DurableEstablishedPublicationState::Published,
                     _ => return None,
                 };
@@ -8516,6 +8608,15 @@ impl DurableEstablishedPublicationJournal {
             .filter(|entry| entry.state == state)
             .count()
     }
+
+    fn state_results(&self, state: DurableEstablishedPublicationState) -> Vec<String> {
+        self.entries()
+            .expect("read durable publication journal")
+            .into_iter()
+            .filter(|entry| entry.state == state)
+            .map(|entry| entry.result)
+            .collect()
+    }
 }
 
 /// Reopen-only provider: `begin_publication` records only Reserved, while
@@ -8523,7 +8624,7 @@ impl DurableEstablishedPublicationJournal {
 struct DurableEstablishedPublicationProvider {
     journal: DurableEstablishedPublicationJournal,
     lose_published_reply: AtomicBool,
-    lose_attempted_reply: AtomicBool,
+    lose_not_transmitted_reply: AtomicBool,
     force_absent_once: AtomicBool,
     lock: Mutex<()>,
     status_calls: AtomicUsize,
@@ -8535,12 +8636,12 @@ impl DurableEstablishedPublicationProvider {
     fn initial(
         journal: DurableEstablishedPublicationJournal,
         lose_published_reply: bool,
-        lose_attempted_reply: bool,
+        lose_not_transmitted_reply: bool,
     ) -> Self {
         Self {
             journal,
             lose_published_reply: AtomicBool::new(lose_published_reply),
-            lose_attempted_reply: AtomicBool::new(lose_attempted_reply),
+            lose_not_transmitted_reply: AtomicBool::new(lose_not_transmitted_reply),
             force_absent_once: AtomicBool::new(false),
             lock: Mutex::new(()),
             status_calls: AtomicUsize::new(0),
@@ -8553,7 +8654,7 @@ impl DurableEstablishedPublicationProvider {
         Self {
             journal,
             lose_published_reply: AtomicBool::new(false),
-            lose_attempted_reply: AtomicBool::new(false),
+            lose_not_transmitted_reply: AtomicBool::new(false),
             force_absent_once: AtomicBool::new(force_absent_once),
             lock: Mutex::new(()),
             status_calls: AtomicUsize::new(0),
@@ -8611,7 +8712,8 @@ impl EstablishedPublicationProvider for DurableEstablishedPublicationProvider {
                 Ok(PublicationProviderOutcome::Published(Self::evidence(call)?))
             }
             Some(DurableEstablishedPublicationState::Reserved)
-            | Some(DurableEstablishedPublicationState::Attempted) => {
+            | Some(DurableEstablishedPublicationState::Attempted)
+            | Some(DurableEstablishedPublicationState::NotTransmitted) => {
                 Ok(PublicationProviderOutcome::Pending(Self::evidence(call)?))
             }
             None => Ok(PublicationProviderOutcome::Absent),
@@ -8656,10 +8758,17 @@ impl EstablishedPublicationProvider for DurableEstablishedPublicationProvider {
                 self.journal
                     .append(DurableEstablishedPublicationState::Attempted, call)
                     .map_err(|_| ())?;
-                if self.lose_attempted_reply.swap(false, Ordering::SeqCst) {
-                    // The attempted marker is fsync'd before external I/O.
-                    // Simulate that one send completing while its ambiguous
-                    // adoption reply is lost before a Published tombstone.
+                if self
+                    .lose_not_transmitted_reply
+                    .swap(false, Ordering::SeqCst)
+                {
+                    // The transport provider conclusively proves this exact
+                    // attempted send never crossed transport, then its reply
+                    // is lost with the process. The durable marker lets only
+                    // successor status/adopt resend the retained bytes.
+                    self.journal
+                        .append(DurableEstablishedPublicationState::NotTransmitted, call)
+                        .map_err(|_| ())?;
                     return Err(());
                 }
                 // This record is the test's external-send boundary. It is
@@ -8680,6 +8789,20 @@ impl EstablishedPublicationProvider for DurableEstablishedPublicationProvider {
                 state: DurableEstablishedPublicationState::Attempted,
                 ..
             }) => {
+                self.journal
+                    .append(DurableEstablishedPublicationState::Published, call)
+                    .map_err(|_| ())?;
+                Ok(PublicationProviderOutcome::Published(Self::evidence(call)?))
+            }
+            // Only provider-local, transport-conclusive no-transmission for
+            // this exact identity restores one resend. The retained body is
+            // revalidated by `check_and_entry` before this external boundary.
+            Some(DurableEstablishedPublicationEntry {
+                state: DurableEstablishedPublicationState::NotTransmitted,
+                ..
+            }) => {
+                // This is the one simulated external-send boundary after the
+                // retained exact-byte no-transmission proof.
                 self.journal
                     .append(DurableEstablishedPublicationState::Published, call)
                     .map_err(|_| ())?;

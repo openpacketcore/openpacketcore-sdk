@@ -40,9 +40,9 @@ use super::raft_adapter::{
 use super::storage::{self, SessionConsensusStorageError};
 use super::types::{
     fenced_transition_v2_batch_outer_request_id, fenced_transition_voter_set_digest,
-    validate_fenced_transition_v2_batch, ConsensusRosterAdmissionCommand,
-    ConsensusRosterAdmissionOutcome, ConsensusRosterRejection, ConsensusRosterTerminalCommand,
-    ConsensusRosterTerminalOutcome,
+    protected_roster_profile_voter_set_digest, validate_fenced_transition_v2_batch,
+    ConsensusRosterAdmissionCommand, ConsensusRosterAdmissionOutcome, ConsensusRosterRejection,
+    ConsensusRosterTerminalCommand, ConsensusRosterTerminalOutcome,
 };
 use super::{
     SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusIdentity,
@@ -162,6 +162,8 @@ pub const DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT: Duration =
 
 const FENCED_TRANSITION_ACTIVATION_REQUEST_ID_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-activation-request/v1\0";
+const PROTECTED_ROSTER_PROFILE_ACTIVATION_REQUEST_ID_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/protected-roster-profile-activation-request/v1\0";
 
 #[cfg(test)]
 static CONSUMER_CONSENSUS_PROPOSAL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -271,6 +273,23 @@ fn fenced_transition_activation_request_id(
 ) -> SessionConsensusRequestId {
     let mut hasher = Sha256::new();
     hasher.update(FENCED_TRANSITION_ACTIVATION_REQUEST_ID_DOMAIN);
+    hasher.update(scope.cluster_id().as_bytes());
+    hasher.update(scope.configuration_id().as_bytes());
+    hasher.update(scope.configuration_epoch().get().to_be_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut request_id = [0_u8; 16];
+    request_id.copy_from_slice(&digest[..16]);
+    SessionConsensusRequestId::from_bytes(request_id)
+}
+
+/// Derive a separate idempotency namespace for immutable protected-roster
+/// profile activation. A prior generic V1 activation must not suppress this
+/// stronger exact-profile certificate proposal.
+fn protected_roster_profile_activation_request_id(
+    scope: SessionConsensusIdentity,
+) -> SessionConsensusRequestId {
+    let mut hasher = Sha256::new();
+    hasher.update(PROTECTED_ROSTER_PROFILE_ACTIVATION_REQUEST_ID_DOMAIN);
     hasher.update(scope.cluster_id().as_bytes());
     hasher.update(scope.configuration_id().as_bytes());
     hasher.update(scope.configuration_epoch().get().to_be_bytes());
@@ -786,6 +805,59 @@ fn fenced_transition_v2_capability_probe_reply(
     }
 }
 
+/// Exact immutable protected-roster profile probe. It is intentionally a
+/// separate wire shape from every fenced-transition probe, so an older peer,
+/// a mixed profile, or a future profile cannot be counted toward unanimity.
+const PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V1: [u8; 8] = *b"opc-rp-1";
+const PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1: u16 = 1;
+const PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V1: [u8; 8] = *b"opc-rr-1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedRosterProfileCapabilityProbe {
+    domain: [u8; 8],
+    schema_version: u16,
+    profile_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedRosterProfileCapabilityReply {
+    domain: [u8; 8],
+    schema_version: u16,
+    outcome: ProtectedRosterProfileCapabilityOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ProtectedRosterProfileCapabilityOutcome {
+    Supported { profile_digest: [u8; 32] },
+    Unsupported,
+}
+
+fn protected_roster_profile_capability_probe_reply(
+    probe: ProtectedRosterProfileCapabilityProbe,
+    local_capability: AtomicFencedTransitionCapability,
+) -> ProtectedRosterProfileCapabilityReply {
+    let profile_digest = crate::fenced_mutation_roster::profile_digest();
+    if probe.domain == PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V1
+        && probe.schema_version == PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1
+        && probe.profile_digest == profile_digest
+        && local_capability == AtomicFencedTransitionCapability::V1
+    {
+        ProtectedRosterProfileCapabilityReply {
+            domain: PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V1,
+            schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
+            outcome: ProtectedRosterProfileCapabilityOutcome::Supported { profile_digest },
+        }
+    } else {
+        ProtectedRosterProfileCapabilityReply {
+            domain: PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V1,
+            schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
+            outcome: ProtectedRosterProfileCapabilityOutcome::Unsupported,
+        }
+    }
+}
+
 /// Exact V1 admission at one linearizable membership scope.
 ///
 /// A fresh proof is intentionally not cached: only a committed activation
@@ -932,6 +1004,78 @@ pub struct ConsensusStoreDiagnosticSnapshot {
     pub consensus_log_prune_worker_high_water: u64,
 }
 
+/// Fixed number of logarithmic millisecond buckets in protected-roster store
+/// diagnostics. Bucket zero is below one millisecond, bucket `n` covers
+/// `[2^(n-1), 2^n)` milliseconds, and the final bucket includes all larger
+/// durations.
+pub const PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS: usize = 16;
+
+/// Fixed-cardinality, redaction-safe diagnostics for the protected-roster
+/// consensus and durable-storage path.
+///
+/// This is a separate additive snapshot so extending roster observability
+/// does not change the established [`ConsensusStoreDiagnosticSnapshot`]
+/// source or positional-serialization shape. It contains only numeric scalars
+/// and fixed arrays; no peer, scope, tenant, request, path, SQL, payload, or
+/// backend error can enter it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct ProtectedRosterConsensusDiagnosticSnapshot {
+    /// Admission proposal-to-applied-response latency while the initiating
+    /// store caller still awaited completion.
+    pub admission_applied_attached_latency_millis:
+        [u64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    /// Admission proposal-to-applied-response latency after the initiating
+    /// store caller detached or timed out.
+    pub admission_applied_detached_latency_millis:
+        [u64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    /// Terminal proposal-to-applied-response latency while the initiating
+    /// store caller still awaited completion.
+    pub terminal_applied_attached_latency_millis:
+        [u64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    /// Terminal proposal-to-applied-response latency after the initiating
+    /// store caller detached or timed out.
+    pub terminal_applied_detached_latency_millis:
+        [u64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    /// Successful SQLite transaction-commit duration for Raft-log batches
+    /// containing a protected-roster command. On production file-backed
+    /// stores this includes the configured synchronous durability path; it is
+    /// not represented as isolated VFS `xSync` duration.
+    pub log_append_sqlite_commit_latency_millis: [u64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    /// Successful SQLite state-machine transaction-commit duration when the
+    /// transaction contains a roster command or deterministic roster work.
+    pub state_machine_sqlite_commit_latency_millis:
+        [u64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    /// Number of deterministic roster maintenance turns performed inside an
+    /// ordinary response-path state-machine transaction.
+    pub response_path_maintenance_turns: u64,
+    /// Response-path roster maintenance latency before the enclosing commit.
+    pub response_path_maintenance_latency_millis:
+        [u64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    /// Store-wide proactive checkpoint-worker latency. This is explicitly
+    /// background work and is not attributed to a tenant or roster.
+    pub background_checkpoint_latency_millis: [u64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    /// Whether the following occupancy gauges are one coherent authenticated
+    /// witness projection (`0` or `1`).
+    pub occupancy_valid: u64,
+    /// Even publication generation for the coherent gauge group; it changes
+    /// after every complete publication.
+    pub occupancy_generation: u64,
+    /// Live protected-roster reservations.
+    pub live_reservations: u64,
+    /// Retained terminal protected-roster reservations.
+    pub retained_reservations: u64,
+    /// Compact terminal tombstone reservations.
+    pub tombstone_reservations: u64,
+    /// Durable partition history floors.
+    pub history_floors: u64,
+    /// Durable retirement cursors.
+    pub retirement_cursors: u64,
+    /// Materialized protected-roster charge.
+    pub materialized_charge_bytes: u64,
+    /// Reserved future protected-roster charge.
+    pub reserved_future_charge_bytes: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct ConsensusStoreDiagnosticCounters {
     sqlite_worker_permit_deadline: AtomicU64,
@@ -978,12 +1122,60 @@ pub(crate) struct ConsensusStoreDiagnosticCounters {
     consensus_log_prune_active_high_water: AtomicU64,
     consensus_log_prune_workers_active: AtomicU64,
     consensus_log_prune_worker_high_water: AtomicU64,
+    protected_roster_admission_applied_attached_latency_millis:
+        [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    protected_roster_admission_applied_detached_latency_millis:
+        [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    protected_roster_terminal_applied_attached_latency_millis:
+        [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    protected_roster_terminal_applied_detached_latency_millis:
+        [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    protected_roster_log_append_sqlite_commit_latency_millis:
+        [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    protected_roster_state_machine_sqlite_commit_latency_millis:
+        [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    protected_roster_response_path_maintenance_turns: AtomicU64,
+    protected_roster_response_path_maintenance_latency_millis:
+        [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    background_checkpoint_latency_millis: [AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+    protected_roster_occupancy_writer: AtomicBool,
+    protected_roster_occupancy_generation: AtomicU64,
+    protected_roster_occupancy_valid: AtomicBool,
+    protected_roster_live_reservations: AtomicU64,
+    protected_roster_retained_reservations: AtomicU64,
+    protected_roster_tombstone_reservations: AtomicU64,
+    protected_roster_history_floors: AtomicU64,
+    protected_roster_retirement_cursors: AtomicU64,
+    protected_roster_materialized_charge_bytes: AtomicU64,
+    protected_roster_reserved_future_charge_bytes: AtomicU64,
     // This is not a diagnostic value. Reusing the existing per-store Arc
     // keeps the hint store-scoped across every construction path.
     fixed_raw_v2_warm_route: AtomicBool,
 }
 
 impl ConsensusStoreDiagnosticCounters {
+    fn saturating_add(counter: &AtomicU64, value: u64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(value))
+        });
+    }
+
+    fn duration_bucket(duration: Duration) -> usize {
+        let milliseconds = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        if milliseconds == 0 {
+            return 0;
+        }
+        ((u64::BITS - milliseconds.leading_zeros()) as usize)
+            .min(PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS - 1)
+    }
+
+    fn record_latency(
+        buckets: &[AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS],
+        duration: Duration,
+    ) {
+        Self::saturating_add(&buckets[Self::duration_bucket(duration)], 1);
+    }
+
     pub(crate) fn increment_sqlite_worker_permit_deadline(&self) {
         self.sqlite_worker_permit_deadline
             .fetch_add(1, Ordering::Relaxed);
@@ -1015,9 +1207,10 @@ impl ConsensusStoreDiagnosticCounters {
             .fetch_max(active, Ordering::Relaxed);
     }
 
-    pub(crate) fn complete_proactive_checkpoint(&self, incomplete: bool) {
+    pub(crate) fn complete_proactive_checkpoint(&self, incomplete: bool, elapsed: Duration) {
         self.proactive_checkpoint_workers_active
             .fetch_sub(1, Ordering::Relaxed);
+        Self::record_latency(&self.background_checkpoint_latency_millis, elapsed);
         if incomplete {
             self.proactive_checkpoint_busy
                 .fetch_add(1, Ordering::Relaxed);
@@ -1027,11 +1220,104 @@ impl ConsensusStoreDiagnosticCounters {
         }
     }
 
-    pub(crate) fn fail_proactive_checkpoint(&self) {
+    pub(crate) fn fail_proactive_checkpoint(&self, elapsed: Duration) {
         self.proactive_checkpoint_workers_active
             .fetch_sub(1, Ordering::Relaxed);
+        Self::record_latency(&self.background_checkpoint_latency_millis, elapsed);
         self.proactive_checkpoint_failures
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_protected_roster_proposal_to_applied_response(
+        &self,
+        terminal: bool,
+        attached: bool,
+        elapsed: Duration,
+    ) {
+        let buckets = match (terminal, attached) {
+            (false, true) => &self.protected_roster_admission_applied_attached_latency_millis,
+            (false, false) => &self.protected_roster_admission_applied_detached_latency_millis,
+            (true, true) => &self.protected_roster_terminal_applied_attached_latency_millis,
+            (true, false) => &self.protected_roster_terminal_applied_detached_latency_millis,
+        };
+        Self::record_latency(buckets, elapsed);
+    }
+
+    pub(crate) fn observe_protected_roster_log_append_sqlite_commit(&self, elapsed: Duration) {
+        Self::record_latency(
+            &self.protected_roster_log_append_sqlite_commit_latency_millis,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn observe_protected_roster_state_machine_sqlite_commit(&self, elapsed: Duration) {
+        Self::record_latency(
+            &self.protected_roster_state_machine_sqlite_commit_latency_millis,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn observe_protected_roster_piggyback_maintenance(
+        &self,
+        turns: u64,
+        elapsed: Duration,
+    ) {
+        Self::saturating_add(
+            &self.protected_roster_response_path_maintenance_turns,
+            turns,
+        );
+        Self::record_latency(
+            &self.protected_roster_response_path_maintenance_latency_millis,
+            elapsed,
+        );
+    }
+
+    pub(crate) fn set_protected_roster_occupancy(
+        &self,
+        occupancy: crate::fenced_mutation_roster_storage::ProtectedRosterLedgerOccupancy,
+    ) {
+        self.publish_protected_roster_occupancy(Some(occupancy));
+    }
+
+    pub(crate) fn invalidate_protected_roster_occupancy(&self) {
+        self.publish_protected_roster_occupancy(None);
+    }
+
+    fn publish_protected_roster_occupancy(
+        &self,
+        occupancy: Option<crate::fenced_mutation_roster_storage::ProtectedRosterLedgerOccupancy>,
+    ) {
+        while self
+            .protected_roster_occupancy_writer
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        self.protected_roster_occupancy_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let valid = occupancy.is_some();
+        let occupancy = occupancy.unwrap_or_default();
+        self.protected_roster_live_reservations
+            .store(occupancy.live_reservations, Ordering::Relaxed);
+        self.protected_roster_retained_reservations
+            .store(occupancy.retained_reservations, Ordering::Relaxed);
+        self.protected_roster_tombstone_reservations
+            .store(occupancy.tombstone_reservations, Ordering::Relaxed);
+        self.protected_roster_history_floors
+            .store(occupancy.history_floors, Ordering::Relaxed);
+        self.protected_roster_retirement_cursors
+            .store(occupancy.retirement_cursors, Ordering::Relaxed);
+        self.protected_roster_materialized_charge_bytes
+            .store(occupancy.materialized_charge_bytes, Ordering::Relaxed);
+        self.protected_roster_reserved_future_charge_bytes
+            .store(occupancy.reserved_future_charge_bytes, Ordering::Relaxed);
+        self.protected_roster_occupancy_valid
+            .store(valid, Ordering::Relaxed);
+        self.protected_roster_occupancy_generation
+            .fetch_add(1, Ordering::Release);
+        self.protected_roster_occupancy_writer
+            .store(false, Ordering::Release);
     }
 
     pub(crate) fn observe_consensus_log_prune_signal(&self) {
@@ -1216,6 +1502,84 @@ impl ConsensusStoreDiagnosticCounters {
             consensus_log_prune_worker_high_water: self
                 .consensus_log_prune_worker_high_water
                 .load(Ordering::Relaxed),
+        }
+    }
+
+    fn protected_roster_snapshot(&self) -> ProtectedRosterConsensusDiagnosticSnapshot {
+        let occupancy = loop {
+            let before = self
+                .protected_roster_occupancy_generation
+                .load(Ordering::Acquire);
+            if !before.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+            let occupancy = (
+                self.protected_roster_occupancy_valid
+                    .load(Ordering::Relaxed),
+                self.protected_roster_live_reservations
+                    .load(Ordering::Relaxed),
+                self.protected_roster_retained_reservations
+                    .load(Ordering::Relaxed),
+                self.protected_roster_tombstone_reservations
+                    .load(Ordering::Relaxed),
+                self.protected_roster_history_floors.load(Ordering::Relaxed),
+                self.protected_roster_retirement_cursors
+                    .load(Ordering::Relaxed),
+                self.protected_roster_materialized_charge_bytes
+                    .load(Ordering::Relaxed),
+                self.protected_roster_reserved_future_charge_bytes
+                    .load(Ordering::Relaxed),
+            );
+            let after = self
+                .protected_roster_occupancy_generation
+                .load(Ordering::Acquire);
+            if before == after {
+                break (after, occupancy);
+            }
+        };
+        let load_buckets = |buckets: &[AtomicU64; PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS]| {
+            buckets
+                .each_ref()
+                .map(|counter| counter.load(Ordering::Relaxed))
+        };
+        ProtectedRosterConsensusDiagnosticSnapshot {
+            admission_applied_attached_latency_millis: load_buckets(
+                &self.protected_roster_admission_applied_attached_latency_millis,
+            ),
+            admission_applied_detached_latency_millis: load_buckets(
+                &self.protected_roster_admission_applied_detached_latency_millis,
+            ),
+            terminal_applied_attached_latency_millis: load_buckets(
+                &self.protected_roster_terminal_applied_attached_latency_millis,
+            ),
+            terminal_applied_detached_latency_millis: load_buckets(
+                &self.protected_roster_terminal_applied_detached_latency_millis,
+            ),
+            log_append_sqlite_commit_latency_millis: load_buckets(
+                &self.protected_roster_log_append_sqlite_commit_latency_millis,
+            ),
+            state_machine_sqlite_commit_latency_millis: load_buckets(
+                &self.protected_roster_state_machine_sqlite_commit_latency_millis,
+            ),
+            response_path_maintenance_turns: self
+                .protected_roster_response_path_maintenance_turns
+                .load(Ordering::Relaxed),
+            response_path_maintenance_latency_millis: load_buckets(
+                &self.protected_roster_response_path_maintenance_latency_millis,
+            ),
+            background_checkpoint_latency_millis: load_buckets(
+                &self.background_checkpoint_latency_millis,
+            ),
+            occupancy_valid: u64::from(occupancy.1 .0),
+            occupancy_generation: occupancy.0,
+            live_reservations: occupancy.1 .1,
+            retained_reservations: occupancy.1 .2,
+            tombstone_reservations: occupancy.1 .3,
+            history_floors: occupancy.1 .4,
+            retirement_cursors: occupancy.1 .5,
+            materialized_charge_bytes: occupancy.1 .6,
+            reserved_future_charge_bytes: occupancy.1 .7,
         }
     }
 }
@@ -2275,6 +2639,14 @@ impl ConsensusSessionStore {
         self.inner.diagnostics.snapshot()
     }
 
+    /// Return fixed-cardinality, redaction-safe diagnostics for protected
+    /// roster consensus, durable storage, and bounded background work.
+    pub fn protected_roster_diagnostic_snapshot(
+        &self,
+    ) -> ProtectedRosterConsensusDiagnosticSnapshot {
+        self.inner.diagnostics.protected_roster_snapshot()
+    }
+
     #[cfg(test)]
     fn inject_accepted_client_write_receiver_outcome(
         &self,
@@ -3149,6 +3521,145 @@ impl ConsensusSessionStore {
             && self.exact_membership_is_admitted())
     }
 
+    /// Require a prior exact-current-voter immutable protected-roster profile
+    /// certificate. Admission paths never turn a missing certificate into a
+    /// fresh proof: startup/deployment activation is the only place allowed
+    /// to append that reusable, non-roster transaction.
+    async fn require_protected_roster_profile_activation_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        self.require_exact_membership_admission()?;
+        self.linearizable_barrier_before(deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        if self
+            .activated_protected_roster_profile_scope_is_current()
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(StoreError::CapabilityNotSupported(
+                "protected_roster_profile_not_activated".into(),
+            ))
+        }
+    }
+
+    /// Continue a profile activation proof from the same local quorum
+    /// admission that fences its proposal. Every remote voter must answer the
+    /// exact frozen profile payload; decode failure, absence, and any future
+    /// profile are all fail-closed.
+    async fn require_protected_roster_profile_activation_after_read_admit(
+        &self,
+        read_admit: &LinearizableReadAdmit<SessionConsensusNodeId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionCapabilityAdmission, StoreError> {
+        self.require_exact_membership_admission()?;
+        self.inner
+            .read_barrier
+            .revalidate(read_admit, deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        let expected_scope = self.current_scope()?;
+        if self.local_fenced_transition_capability() != AtomicFencedTransitionCapability::V1
+            || !expected_scope.1.contains(&self.inner.local_node_id)
+        {
+            return Err(unsupported_fenced_transition());
+        }
+        if self
+            .inner
+            .backend
+            .consensus_protected_roster_profile_activation_matches_scope(
+                self.inner.storage_identity,
+                expected_scope.0,
+                expected_scope.1.clone(),
+            )
+            .await?
+        {
+            if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
+                return Err(consensus_unavailable());
+            }
+            return Ok(FencedTransitionCapabilityAdmission::Activated);
+        }
+        let profile_digest = crate::fenced_mutation_roster::profile_digest();
+        let probes = expected_scope
+            .1
+            .iter()
+            .copied()
+            .filter(|member| *member != self.inner.local_node_id)
+            .map(|member| async move {
+                let supported = match self
+                    .call_peer::<_, ProtectedRosterProfileCapabilityReply>(
+                        member,
+                        SessionConsensusRpcFamily::ReadBarrier,
+                        &ProtectedRosterProfileCapabilityProbe {
+                            domain: PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V1,
+                            schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
+                            profile_digest,
+                        },
+                        deadline,
+                    )
+                    .await
+                {
+                    Ok(ProtectedRosterProfileCapabilityReply {
+                        domain,
+                        schema_version,
+                        outcome:
+                            ProtectedRosterProfileCapabilityOutcome::Supported {
+                                profile_digest: peer_profile,
+                            },
+                    }) if domain == PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V1
+                        && schema_version == PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1
+                        && peer_profile == profile_digest =>
+                    {
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(_) => return Err(consensus_unavailable()),
+                };
+                Ok(supported)
+            });
+        for result in futures_util::future::join_all(probes).await {
+            if !result? {
+                return Err(unsupported_fenced_transition());
+            }
+        }
+        if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
+            return Err(consensus_unavailable());
+        }
+        Ok(FencedTransitionCapabilityAdmission::FreshUnanimous)
+    }
+
+    /// Check only the durable exact-profile fact; proposal apply repeats the
+    /// same proof against the committed membership scope.
+    async fn activated_protected_roster_profile_scope_is_current(
+        &self,
+    ) -> Result<bool, StoreError> {
+        self.require_exact_membership_admission()?;
+        let expected_scope = self.current_scope()?;
+        if self.local_fenced_transition_capability() != AtomicFencedTransitionCapability::V1
+            || !expected_scope.1.contains(&self.inner.local_node_id)
+        {
+            return Ok(false);
+        }
+        let activated = self
+            .inner
+            .backend
+            .consensus_protected_roster_profile_activation_matches_scope(
+                self.inner.storage_identity,
+                expected_scope.0,
+                expected_scope.1.clone(),
+            )
+            .await?;
+        Ok(activated
+            && self.current_scope()? == expected_scope
+            && self.exact_membership_is_admitted())
+    }
+
     /// Revalidate every local fact bound to one V1 quorum admission. The
     /// revalidation is intentionally the final action before `client_write_ff`.
     async fn revalidate_fenced_transition_proposal_admission_before(
@@ -3341,6 +3852,17 @@ impl ConsensusSessionStore {
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
         self.activate_fenced_transition_capability_before(deadline)
+            .await
+    }
+
+    /// Durably establish the immutable protected-roster profile for this
+    /// exact voter scope. This is reusable startup/deployment capability
+    /// negotiation, never a per-roster member write.
+    pub async fn activate_protected_roster_profile(&self) -> Result<(), StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.activate_protected_roster_profile_before(deadline)
             .await
     }
 
@@ -5775,12 +6297,35 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), StoreError> {
+        self.activate_capability_before(deadline, false).await
+    }
+
+    async fn activate_protected_roster_profile_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        self.activate_capability_before(deadline, true).await
+    }
+
+    async fn activate_capability_before(
+        &self,
+        deadline: tokio::time::Instant,
+        protected_roster_profile: bool,
+    ) -> Result<(), StoreError> {
         self.require_application_traffic_authority_before(deadline)
             .await?;
         let (scope_identity, _) = self.current_scope()?;
         let request = ForwardMutationRequest {
-            request_id: fenced_transition_activation_request_id(scope_identity),
-            intent: SessionMutationIntent::PreflightFencedTransitionCapability,
+            request_id: if protected_roster_profile {
+                protected_roster_profile_activation_request_id(scope_identity)
+            } else {
+                fenced_transition_activation_request_id(scope_identity)
+            },
+            intent: if protected_roster_profile {
+                SessionMutationIntent::PreflightProtectedRosterProfile
+            } else {
+                SessionMutationIntent::PreflightFencedTransitionCapability
+            },
             required_consumer_scope: ForwardConsumerScope::Internal,
         };
         let mut preferred = None;
@@ -5825,16 +6370,26 @@ impl ConsensusSessionStore {
                     self.require_application_traffic_authority_before(deadline)
                         .await?;
                     let (scope_identity, voters) = self.current_scope()?;
-                    if self
-                        .inner
-                        .backend
-                        .consensus_fenced_transition_activation_matches_scope(
-                            self.inner.storage_identity,
-                            scope_identity,
-                            voters,
-                        )
-                        .await?
-                    {
+                    let activated = if protected_roster_profile {
+                        self.inner
+                            .backend
+                            .consensus_protected_roster_profile_activation_matches_scope(
+                                self.inner.storage_identity,
+                                scope_identity,
+                                voters,
+                            )
+                            .await?
+                    } else {
+                        self.inner
+                            .backend
+                            .consensus_fenced_transition_activation_matches_scope(
+                                self.inner.storage_identity,
+                                scope_identity,
+                                voters,
+                            )
+                            .await?
+                    };
+                    if activated {
                         return Ok(());
                     }
                     return Err(consensus_unavailable());
@@ -6039,10 +6594,16 @@ impl ConsensusSessionStore {
                 Ok(guard) => guard,
                 Err(_) => return ForwardMutationReply::Unavailable,
             };
-        let activation_preflight = matches!(
+        let fenced_activation_preflight = matches!(
             &request.intent,
             SessionMutationIntent::PreflightFencedTransitionCapability
         );
+        let protected_roster_profile_preflight = matches!(
+            &request.intent,
+            SessionMutationIntent::PreflightProtectedRosterProfile
+        );
+        let activation_preflight =
+            fenced_activation_preflight || protected_roster_profile_preflight;
         let consumer_scoped = request.required_consumer_scope.is_consumer_scoped();
         let raw_v2_mutation =
             is_raw_fenced_transition_v2_mutation(&request.intent, allow_operator_recovery);
@@ -6056,6 +6617,20 @@ impl ConsensusSessionStore {
                 Ok(activated) => activated,
                 Err(_) => return ForwardMutationReply::Unavailable,
             };
+        let roster_profile_activated = if is_roster_mutation_intent(&request.intent) {
+            match self
+                .activated_protected_roster_profile_scope_is_current()
+                .await
+            {
+                Ok(activated) => activated,
+                Err(_) => return ForwardMutationReply::Unavailable,
+            }
+        } else {
+            true
+        };
+        if !roster_profile_activated {
+            return ForwardMutationReply::Unavailable;
+        }
         let initial_authority = if fixed_raw_v2_mutation || activated_fenced_transition {
             // The operation gate remains held, and the exact durable
             // authority is consumed at its respective final acceptance
@@ -6144,6 +6719,7 @@ impl ConsensusSessionStore {
             &request.intent,
             SessionMutationIntent::FencedTransition(_)
                 | SessionMutationIntent::PreflightFencedTransitionCapability
+                | SessionMutationIntent::PreflightProtectedRosterProfile
         ) {
             #[cfg(test)]
             FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -6287,14 +6863,20 @@ impl ConsensusSessionStore {
                 required_consumer_scope: request.required_consumer_scope.clone(),
             })
         } else if let Some(read_admit) = fenced_read_admit {
-            let capability = match self
-                .require_fenced_transition_capability_after_read_admit(
+            let capability = match if protected_roster_profile_preflight {
+                self.require_protected_roster_profile_activation_after_read_admit(
                     &read_admit,
-                    activation_preflight,
                     deadline,
                 )
                 .await
-            {
+            } else {
+                self.require_fenced_transition_capability_after_read_admit(
+                    &read_admit,
+                    fenced_activation_preflight,
+                    deadline,
+                )
+                .await
+            } {
                 Ok(capability) => capability,
                 Err(error) => {
                     return if activation_preflight {
@@ -6324,8 +6906,12 @@ impl ConsensusSessionStore {
                 voter_set_digest,
                 required_consumer_scope: request.required_consumer_scope.clone(),
             };
-            match (activation_preflight, capability) {
-                (true, FencedTransitionCapabilityAdmission::Activated) => {
+            match (
+                protected_roster_profile_preflight,
+                fenced_activation_preflight,
+                capability,
+            ) {
+                (true, false, FencedTransitionCapabilityAdmission::Activated) => {
                     if self
                         .revalidate_fenced_transition_proposal_admission_before(
                             &admission,
@@ -6355,14 +6941,54 @@ impl ConsensusSessionStore {
                         None => ForwardMutationReply::Unavailable,
                     };
                 }
-                (true, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                (true, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                    request.intent = SessionMutationIntent::ActivateFencedTransitionCapability {
+                        schema_version: FENCED_TRANSITION_SCHEMA_V1,
+                        scope_identity,
+                        voter_set_digest: protected_roster_profile_voter_set_digest(
+                            scope_identity,
+                            &voters,
+                        ),
+                    };
+                }
+                (false, true, FencedTransitionCapabilityAdmission::Activated) => {
+                    if self
+                        .revalidate_fenced_transition_proposal_admission_before(
+                            &admission,
+                            &request.required_consumer_scope,
+                            deadline,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return ForwardMutationReply::Unavailable;
+                    }
+                    let applied_log_index = self
+                        .inner
+                        .raft
+                        .metrics()
+                        .borrow()
+                        .last_applied
+                        .as_ref()
+                        .map(|log_id| log_id.index)
+                        .filter(|index| *index != 0);
+                    return match applied_log_index {
+                        Some(applied_log_index) => {
+                            ForwardMutationReply::FencedTransitionActivation(Ok(
+                                FencedTransitionActivationReply { applied_log_index },
+                            ))
+                        }
+                        None => ForwardMutationReply::Unavailable,
+                    };
+                }
+                (false, true, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
                     request.intent = SessionMutationIntent::ActivateFencedTransitionCapability {
                         schema_version: FENCED_TRANSITION_SCHEMA_V1,
                         scope_identity,
                         voter_set_digest,
                     };
                 }
-                (false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                (false, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
                     let SessionMutationIntent::FencedTransition(transition) = request.intent else {
                         return ForwardMutationReply::Unavailable;
                     };
@@ -6372,7 +6998,8 @@ impl ConsensusSessionStore {
                         voter_set_digest,
                     };
                 }
-                (false, FencedTransitionCapabilityAdmission::Activated) => {}
+                (false, false, FencedTransitionCapabilityAdmission::Activated) => {}
+                _ => return ForwardMutationReply::Unavailable,
             }
             Some(admission)
         } else {
@@ -6480,8 +7107,12 @@ impl ConsensusSessionStore {
                 return ForwardMutationReply::Unavailable;
             };
             if *scope_identity != current_identity
-                || *voter_set_digest
-                    != fenced_transition_voter_set_digest(current_identity, &current_voters)
+                || !fenced_transition_activation_voter_set_digest_matches_intent(
+                    &request.intent,
+                    voter_set_digest,
+                    current_identity,
+                    &current_voters,
+                )
                 || profile_digest.is_some_and(|profile_digest| {
                     *profile_digest
                         != crate::fenced_transition::fenced_transition_v2_profile_digest()
@@ -6571,7 +7202,12 @@ impl ConsensusSessionStore {
             fenced_transition_activation_scope(&request.intent)
         {
             if *scope_identity != identity
-                || *voter_set_digest != fenced_transition_voter_set_digest(identity, &voters)
+                || !fenced_transition_activation_voter_set_digest_matches_intent(
+                    &request.intent,
+                    voter_set_digest,
+                    identity,
+                    &voters,
+                )
                 || profile_digest.is_some_and(|profile_digest| {
                     *profile_digest
                         != crate::fenced_transition::fenced_transition_v2_profile_digest()
@@ -6589,6 +7225,7 @@ impl ConsensusSessionStore {
         let reroute_receiver_forward_to_leader =
             !mutation_requires_exact_status_resolution(&request);
         let roster_mutation = is_roster_mutation_intent(&request.intent);
+        let roster_terminal = matches!(&request.intent, SessionMutationIntent::RosterTerminal(_));
         let intent = match request.intent {
             intent @ SessionMutationIntent::FinalizeOperatorRecovery { .. }
             | intent @ SessionMutationIntent::MaintainFencedTransitionV2History { .. }
@@ -6679,6 +7316,13 @@ impl ConsensusSessionStore {
                 .fixed_raw_v2_proposals
                 .fetch_add(1, Ordering::Relaxed);
         }
+        let roster_response_observation = roster_mutation.then(|| {
+            (
+                Arc::clone(&self.inner.diagnostics),
+                roster_terminal,
+                std::time::Instant::now(),
+            )
+        });
         let response =
             match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
             {
@@ -6734,8 +7378,17 @@ impl ConsensusSessionStore {
                 // The test replaces only the receiver's observable result.
                 // Keep the actual accepted receiver supervised exactly as in
                 // production, including its proposal-admission lifetime.
+                let injected_observation = roster_response_observation.clone();
                 tokio::spawn(async move {
-                    let _ = response.await;
+                    if matches!(response.await, Ok(Ok(_))) {
+                        if let Some((diagnostics, terminal, started)) = injected_observation {
+                            diagnostics.observe_protected_roster_proposal_to_applied_response(
+                                terminal,
+                                false,
+                                started.elapsed(),
+                            );
+                        }
+                    }
                     drop(proposal_permit);
                     drop(operation_guard);
                 });
@@ -6745,14 +7398,25 @@ impl ConsensusSessionStore {
                 ));
                 return;
             }
-            let reply = match response.await {
-                Err(_) => ForwardMutationReply::OutcomeUnknown,
-                Ok(Ok(response)) => ForwardMutationReply::Applied(Box::new(response.data)),
-                Ok(Err(error)) => {
-                    client_write_receiver_error_reply(error, reroute_receiver_forward_to_leader)
-                }
+            let (reply, applied_observation) = match response.await {
+                Err(_) => (ForwardMutationReply::OutcomeUnknown, None),
+                Ok(Ok(response)) => (
+                    ForwardMutationReply::Applied(Box::new(response.data)),
+                    roster_response_observation,
+                ),
+                Ok(Err(error)) => (
+                    client_write_receiver_error_reply(error, reroute_receiver_forward_to_leader),
+                    None,
+                ),
             };
-            let _ = completion_tx.send(reply);
+            let attached = completion_tx.send(reply).is_ok();
+            if let Some((diagnostics, terminal, started)) = applied_observation {
+                diagnostics.observe_protected_roster_proposal_to_applied_response(
+                    terminal,
+                    attached,
+                    started.elapsed(),
+                );
+            }
             drop(proposal_permit);
             drop(operation_guard);
         });
@@ -8195,6 +8859,21 @@ fn fenced_transition_activation_scope(
     }
 }
 
+fn fenced_transition_activation_voter_set_digest_matches_intent(
+    intent: &SessionMutationIntent,
+    digest: &[u8; 32],
+    scope: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+) -> bool {
+    if *digest == fenced_transition_voter_set_digest(scope, voters) {
+        return true;
+    }
+    matches!(
+        intent,
+        SessionMutationIntent::ActivateFencedTransitionCapability { .. }
+    ) && *digest == protected_roster_profile_voter_set_digest(scope, voters)
+}
+
 fn consensus_outcome_unavailable(intent: &SessionMutationIntent) -> StoreError {
     match intent {
         SessionMutationIntent::CompareAndSet(_) => StoreError::CasIdempotencyOutcomeUnavailable,
@@ -8220,6 +8899,7 @@ fn mutation_requires_exact_status_resolution(request: &ForwardMutationRequest) -
             &request.intent,
             SessionMutationIntent::FencedTransition(_)
                 | SessionMutationIntent::PreflightFencedTransitionCapability
+                | SessionMutationIntent::PreflightProtectedRosterProfile
                 | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
                 | SessionMutationIntent::FencedTransitionV2(_)
                 | SessionMutationIntent::FencedTransitionV2Batch(_)
@@ -8837,6 +9517,7 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         | SessionMutationIntent::FinalizeTopologyTransition { .. }
         | SessionMutationIntent::ActivateFencedTransition { .. }
         | SessionMutationIntent::PreflightFencedTransitionCapability
+        | SessionMutationIntent::PreflightProtectedRosterProfile
         | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
         | SessionMutationIntent::RosterAdmission(_)
         | SessionMutationIntent::RosterTerminal(_)
@@ -9307,6 +9988,14 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                         FencedTransitionActivationCapabilityReply::Unsupported
                     };
                     return encode_service_reply(&reply);
+                }
+                if let Ok(probe) =
+                    decode_bounded::<ProtectedRosterProfileCapabilityProbe>(&request.payload)
+                {
+                    return encode_service_reply(&protected_roster_profile_capability_probe_reply(
+                        probe,
+                        self.store.local_fenced_transition_capability(),
+                    ));
                 }
                 let probe =
                     match decode_bounded::<FencedTransitionV2CapabilityProbe>(&request.payload) {
@@ -11121,6 +11810,19 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                 {
                     return admission_response(SessionConsumerRosterRejection::Authority);
                 }
+                // A roster admission is permitted only after the reusable
+                // immutable exact-voter profile certificate exists. This is
+                // read-only at ingress: deployment/startup activation owns
+                // the separate quorum transaction, so a fresh roster still
+                // has exactly Admission then Terminal mutations.
+                if self
+                    .store
+                    .require_protected_roster_profile_activation_before(deadline)
+                    .await
+                    .is_err()
+                {
+                    return admission_response(SessionConsumerRosterRejection::Capability);
+                }
                 let admission_guard = match self
                     .store
                     .admit_consumer_scope(request.scope(), deadline)
@@ -12148,6 +12850,10 @@ mod membership_tests {
         ReplicaId, ReplicaTlsIdentity,
     };
 
+    fn fixed_counter_total<const N: usize>(counters: &[u64; N]) -> u64 {
+        counters.iter().copied().sum()
+    }
+
     async fn wait_for_log_index_after(
         store: &ConsensusSessionStore,
         before: u64,
@@ -12209,6 +12915,8 @@ mod membership_tests {
         counters
             .fixed_raw_v2_proposals
             .fetch_add(15, Ordering::Relaxed);
+        counters.begin_proactive_checkpoint();
+        counters.complete_proactive_checkpoint(false, Duration::from_nanos(43));
         counters.observe_consensus_log_prune_signal();
         counters.begin_consensus_log_prune_worker();
         counters.begin_consensus_log_prune_turn();
@@ -12240,6 +12948,9 @@ mod membership_tests {
                 public_raw_v2_history_reads: 13,
                 fixed_raw_v2_acceptance_snapshots: 14,
                 fixed_raw_v2_proposals: 15,
+                proactive_checkpoint_attempts: 1,
+                proactive_checkpoint_completed: 1,
+                proactive_checkpoint_worker_high_water: 1,
                 consensus_log_prune_signals: 1,
                 consensus_log_prune_attempts: 4,
                 consensus_log_prune_completed_turns: 2,
@@ -12266,6 +12977,119 @@ mod membership_tests {
         assert!(encoded.contains("route_metrics_watch_closed"));
         assert!(encoded.contains("fixed_raw_v2_acceptance_snapshots"));
         assert!(encoded.contains("consensus_log_prune_permanent_failures"));
+    }
+
+    #[test]
+    fn protected_roster_diagnostics_are_fixed_numeric_coherent_and_saturating() {
+        let counters = ConsensusStoreDiagnosticCounters::default();
+        counters.observe_protected_roster_proposal_to_applied_response(false, true, Duration::ZERO);
+        counters.observe_protected_roster_proposal_to_applied_response(
+            false,
+            false,
+            Duration::from_millis(1),
+        );
+        counters.observe_protected_roster_proposal_to_applied_response(
+            true,
+            true,
+            Duration::from_millis(8),
+        );
+        counters.observe_protected_roster_proposal_to_applied_response(true, false, Duration::MAX);
+        counters.observe_protected_roster_log_append_sqlite_commit(Duration::from_millis(2));
+        counters.observe_protected_roster_state_machine_sqlite_commit(Duration::from_millis(4));
+        counters.observe_protected_roster_piggyback_maintenance(2, Duration::from_millis(16));
+        counters.begin_proactive_checkpoint();
+        counters.complete_proactive_checkpoint(false, Duration::from_millis(32));
+        counters.set_protected_roster_occupancy(
+            crate::fenced_mutation_roster_storage::ProtectedRosterLedgerOccupancy {
+                live_reservations: 2,
+                retained_reservations: 3,
+                tombstone_reservations: 5,
+                history_floors: 7,
+                retirement_cursors: 11,
+                materialized_charge_bytes: 37,
+                reserved_future_charge_bytes: 41,
+            },
+        );
+
+        let snapshot = counters.protected_roster_snapshot();
+        assert_eq!(snapshot.admission_applied_attached_latency_millis[0], 1);
+        assert_eq!(snapshot.admission_applied_detached_latency_millis[1], 1);
+        assert_eq!(snapshot.terminal_applied_attached_latency_millis[4], 1);
+        assert_eq!(
+            snapshot.terminal_applied_detached_latency_millis
+                [PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS - 1],
+            1
+        );
+        assert_eq!(snapshot.log_append_sqlite_commit_latency_millis[2], 1);
+        assert_eq!(snapshot.state_machine_sqlite_commit_latency_millis[3], 1);
+        assert_eq!(snapshot.response_path_maintenance_turns, 2);
+        assert_eq!(snapshot.response_path_maintenance_latency_millis[5], 1);
+        assert_eq!(snapshot.background_checkpoint_latency_millis[6], 1);
+        assert_eq!(snapshot.occupancy_valid, 1);
+        assert_eq!(snapshot.occupancy_generation, 2);
+        assert_eq!(snapshot.live_reservations, 2);
+        assert_eq!(snapshot.retained_reservations, 3);
+        assert_eq!(snapshot.tombstone_reservations, 5);
+        assert_eq!(snapshot.history_floors, 7);
+        assert_eq!(snapshot.retirement_cursors, 11);
+        assert_eq!(snapshot.materialized_charge_bytes, 37);
+        assert_eq!(snapshot.reserved_future_charge_bytes, 41);
+
+        let value = serde_json::to_value(snapshot).expect("serialize roster diagnostics");
+        let object = value.as_object().expect("diagnostics object");
+        let expected_keys = [
+            "admission_applied_attached_latency_millis",
+            "admission_applied_detached_latency_millis",
+            "terminal_applied_attached_latency_millis",
+            "terminal_applied_detached_latency_millis",
+            "log_append_sqlite_commit_latency_millis",
+            "state_machine_sqlite_commit_latency_millis",
+            "response_path_maintenance_turns",
+            "response_path_maintenance_latency_millis",
+            "background_checkpoint_latency_millis",
+            "occupancy_valid",
+            "occupancy_generation",
+            "live_reservations",
+            "retained_reservations",
+            "tombstone_reservations",
+            "history_floors",
+            "retirement_cursors",
+            "materialized_charge_bytes",
+            "reserved_future_charge_bytes",
+        ];
+        assert_eq!(object.len(), expected_keys.len());
+        for key in expected_keys {
+            let value = object.get(key).unwrap_or_else(|| panic!("missing {key}"));
+            if key.ends_with("_millis") {
+                let buckets = value.as_array().expect("fixed latency buckets");
+                assert_eq!(buckets.len(), PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS);
+                assert!(buckets.iter().all(serde_json::Value::is_u64));
+            } else {
+                assert!(value.is_u64(), "{key} must be numeric");
+            }
+        }
+
+        counters.protected_roster_log_append_sqlite_commit_latency_millis[0]
+            .store(u64::MAX, Ordering::Relaxed);
+        counters.observe_protected_roster_log_append_sqlite_commit(Duration::ZERO);
+        assert_eq!(
+            counters
+                .protected_roster_snapshot()
+                .log_append_sqlite_commit_latency_millis[0],
+            u64::MAX
+        );
+
+        counters.invalidate_protected_roster_occupancy();
+        let invalid = counters.protected_roster_snapshot();
+        assert_eq!(invalid.occupancy_valid, 0);
+        assert_eq!(invalid.occupancy_generation, 4);
+        assert_eq!(invalid.live_reservations, 0);
+        assert_eq!(invalid.retained_reservations, 0);
+        assert_eq!(invalid.tombstone_reservations, 0);
+        assert_eq!(invalid.history_floors, 0);
+        assert_eq!(invalid.retirement_cursors, 0);
+        assert_eq!(invalid.materialized_charge_bytes, 0);
+        assert_eq!(invalid.reserved_future_charge_bytes, 0);
     }
 
     #[test]
@@ -16010,6 +16834,151 @@ mod membership_tests {
     }
 
     #[test]
+    fn protected_roster_profile_probe_and_certificate_binding_fail_closed() {
+        let profile_digest = crate::fenced_mutation_roster::profile_digest();
+        let probe = ProtectedRosterProfileCapabilityProbe {
+            domain: PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V1,
+            schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
+            profile_digest,
+        };
+        let v1_reply = encode_bounded(&FencedTransitionCapabilityReply::V1)
+            .expect("bounded V1 capability reply");
+        assert!(
+            decode_bounded::<ProtectedRosterProfileCapabilityReply>(&v1_reply).is_err(),
+            "a V1-only voter reply cannot decode as protected-roster profile support",
+        );
+        assert!(matches!(
+            protected_roster_profile_capability_probe_reply(
+                probe,
+                AtomicFencedTransitionCapability::V1,
+            ),
+            ProtectedRosterProfileCapabilityReply {
+                domain,
+                schema_version,
+                outcome: ProtectedRosterProfileCapabilityOutcome::Supported {
+                    profile_digest: reply,
+                },
+            } if domain == PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V1
+                && schema_version == PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1
+                && reply == profile_digest
+        ));
+        assert_eq!(
+            protected_roster_profile_capability_probe_reply(
+                ProtectedRosterProfileCapabilityProbe {
+                    domain: PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V1,
+                    schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
+                    profile_digest: [0xA6; 32],
+                },
+                AtomicFencedTransitionCapability::V1,
+            ),
+            ProtectedRosterProfileCapabilityReply {
+                domain: PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V1,
+                schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
+                outcome: ProtectedRosterProfileCapabilityOutcome::Unsupported,
+            },
+            "a future or mixed immutable roster profile cannot be admitted",
+        );
+        let identity = singleton_topology()
+            .consensus_identity()
+            .expect("singleton identity");
+        let voters = BTreeSet::from([node(1)]);
+        assert_ne!(
+            fenced_transition_voter_set_digest(identity, &voters),
+            protected_roster_profile_voter_set_digest(identity, &voters),
+            "a generic V1 activation certificate is never roster-profile evidence",
+        );
+    }
+
+    #[test]
+    fn protected_roster_profile_wire_authority_is_decoder_disjoint() {
+        let profile_digest = crate::fenced_mutation_roster::profile_digest();
+        let profile_probe = encode_bounded(&ProtectedRosterProfileCapabilityProbe {
+            domain: PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V1,
+            schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
+            profile_digest,
+        })
+        .expect("bounded protected-roster profile probe");
+        assert!(decode_bounded::<ProtectedRosterProfileCapabilityProbe>(&profile_probe).is_ok());
+        assert!(decode_bounded::<ReadBarrierRequest>(&profile_probe).is_err());
+        assert!(decode_bounded::<FencedTransitionCapabilityProbe>(&profile_probe).is_err());
+        assert!(
+            decode_bounded::<FencedTransitionActivationCapabilityProbe>(&profile_probe).is_err()
+        );
+        assert!(decode_bounded::<FencedTransitionV2CapabilityProbe>(&profile_probe).is_err());
+
+        for existing_probe in [
+            encode_bounded(&ReadBarrierRequest).expect("read-barrier probe"),
+            encode_bounded(&FencedTransitionCapabilityProbe {
+                schema_version: FENCED_TRANSITION_SCHEMA_V1,
+            })
+            .expect("V1 transition probe"),
+            encode_bounded(&FencedTransitionActivationCapabilityProbe {
+                activation_probe_schema_version: FENCED_TRANSITION_ACTIVATION_PROBE_SCHEMA_V1,
+                activation_command_schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            })
+            .expect("V1 activation probe"),
+            encode_bounded(&FencedTransitionV2CapabilityProbe {
+                schema_version: FENCED_TRANSITION_SCHEMA_V2,
+                profile_digest: crate::fenced_transition::fenced_transition_v2_profile_digest(),
+            })
+            .expect("V2 transition probe"),
+        ] {
+            assert!(
+                decode_bounded::<ProtectedRosterProfileCapabilityProbe>(&existing_probe).is_err(),
+                "an existing read-family request cannot decode as roster-profile authority",
+            );
+        }
+
+        for profile_reply in [
+            encode_bounded(&ProtectedRosterProfileCapabilityReply {
+                domain: PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V1,
+                schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
+                outcome: ProtectedRosterProfileCapabilityOutcome::Supported { profile_digest },
+            })
+            .expect("bounded supported protected-roster profile reply"),
+            encode_bounded(&ProtectedRosterProfileCapabilityReply {
+                domain: PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V1,
+                schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
+                outcome: ProtectedRosterProfileCapabilityOutcome::Unsupported,
+            })
+            .expect("bounded unsupported protected-roster profile reply"),
+        ] {
+            assert!(
+                decode_bounded::<ProtectedRosterProfileCapabilityReply>(&profile_reply).is_ok()
+            );
+            assert!(decode_bounded::<ReadBarrierReply>(&profile_reply).is_err());
+            assert!(decode_bounded::<FencedTransitionCapabilityReply>(&profile_reply).is_err());
+            assert!(
+                decode_bounded::<FencedTransitionActivationCapabilityReply>(&profile_reply)
+                    .is_err()
+            );
+            assert!(decode_bounded::<FencedTransitionV2CapabilityReply>(&profile_reply).is_err());
+        }
+
+        for existing_reply in [
+            encode_bounded(&ReadBarrierReply::Ready(None)).expect("read-barrier reply"),
+            encode_bounded(&FencedTransitionCapabilityReply::V1).expect("V1 transition reply"),
+            encode_bounded(&FencedTransitionCapabilityReply::Unsupported)
+                .expect("unsupported V1 transition reply"),
+            encode_bounded(&FencedTransitionActivationCapabilityReply::V1)
+                .expect("V1 activation reply"),
+            encode_bounded(&FencedTransitionActivationCapabilityReply::Unsupported)
+                .expect("unsupported V1 activation reply"),
+            encode_bounded(&FencedTransitionV2CapabilityReply::V2 {
+                profile_digest: crate::fenced_transition::fenced_transition_v2_profile_digest(),
+            })
+            .expect("V2 transition reply"),
+            encode_bounded(&FencedTransitionV2CapabilityReply::Unsupported)
+                .expect("unsupported V2 transition reply"),
+        ] {
+            assert!(
+                decode_bounded::<ProtectedRosterProfileCapabilityReply>(&existing_reply).is_err(),
+                "an existing read-family reply cannot decode as roster-profile support",
+            );
+        }
+    }
+
+    #[test]
     fn v2_local_profile_mismatch_disables_advertisement_probe_and_activation() {
         let backend = SqliteSessionBackend::in_memory().expect("SQLite backend");
         let exact = backend.consensus_capabilities();
@@ -16807,6 +17776,36 @@ mod membership_tests {
         let authorization = manifest
             .authorize(&consumer_identity)
             .expect("consumer authorization");
+        let activation_deadline = tokio::time::Instant::now()
+            .checked_add(store.inner.operation_timeout)
+            .expect("activation deadline");
+        assert!(matches!(
+            store
+                .require_protected_roster_profile_activation_before(activation_deadline)
+                .await,
+            Err(StoreError::CapabilityNotSupported(reason))
+                if reason == "protected_roster_profile_not_activated"
+        ));
+        store
+            .activate_protected_roster_profile()
+            .await
+            .expect("activate immutable protected roster profile");
+        let first_profile_activation_log = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .expect("profile activation log index");
+        store
+            .activate_protected_roster_profile()
+            .await
+            .expect("reuse immutable protected roster profile activation");
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(first_profile_activation_log),
+            "the immutable profile certificate is reusable and does not add a roster mutation",
+        );
         let roster_authorization = authorization.roster_authorization();
         let roster_scope = Scope::from_digest(session_consumer_roster_scope_commitment(scope));
         let admission = Admission::authenticate(
@@ -16873,6 +17872,7 @@ mod membership_tests {
 
         reset_roster_ingress_test_counters();
         reset_consumer_consensus_proposal_count();
+        let diagnostics_before_admission = store.protected_roster_diagnostic_snapshot();
         let first_log = store
             .inner
             .raft
@@ -16924,6 +17924,46 @@ mod membership_tests {
             ) => panic!("expected recorded fresh roster admission, got {rejection:?}"),
             response => panic!("expected fresh roster admission, got {response:?}"),
         };
+        let diagnostics_after_admission = store.protected_roster_diagnostic_snapshot();
+        assert_eq!(
+            fixed_counter_total(
+                &diagnostics_after_admission.admission_applied_attached_latency_millis,
+            ),
+            fixed_counter_total(
+                &diagnostics_before_admission.admission_applied_attached_latency_millis,
+            ) + 1,
+            "one attached admission proposal reaches an applied response",
+        );
+        assert_eq!(
+            fixed_counter_total(
+                &diagnostics_after_admission.admission_applied_detached_latency_millis,
+            ),
+            fixed_counter_total(
+                &diagnostics_before_admission.admission_applied_detached_latency_millis,
+            ),
+            "the successful caller remains attached",
+        );
+        assert_eq!(
+            fixed_counter_total(
+                &diagnostics_after_admission.log_append_sqlite_commit_latency_millis
+            ),
+            fixed_counter_total(
+                &diagnostics_before_admission.log_append_sqlite_commit_latency_millis
+            ) + 1,
+            "one durable log append is measured for the admission",
+        );
+        assert_eq!(
+            fixed_counter_total(
+                &diagnostics_after_admission.state_machine_sqlite_commit_latency_millis,
+            ),
+            fixed_counter_total(
+                &diagnostics_before_admission.state_machine_sqlite_commit_latency_millis,
+            ) + 1,
+            "one durable state-machine commit is measured for the admission",
+        );
+        assert_eq!(diagnostics_after_admission.occupancy_valid, 1);
+        assert_eq!(diagnostics_after_admission.live_reservations, 1);
+        assert_eq!(diagnostics_after_admission.retained_reservations, 0);
         let admission_wire: RosterIngressAdmissionResponseWire =
             crate::fenced_mutation_roster::decode_frame(
                 admission_response_capsule.canonical_bytes(),
@@ -17307,6 +18347,7 @@ mod membership_tests {
             terminal_digest,
             "test terminal request must match the durable command reconstruction"
         );
+        let diagnostics_before_terminal = store.protected_roster_diagnostic_snapshot();
         let terminal_response = service
             .execute_roster_ingress(
                 &roster_authorization,
@@ -17321,12 +18362,52 @@ mod membership_tests {
                 None,
             )
             .await;
+        let diagnostics_after_terminal = store.protected_roster_diagnostic_snapshot();
         assert!(matches!(
             terminal_response,
             SessionConsumerResponse::FencedMutationRosterTerminalize(
                 SessionConsumerRosterTerminalMutationResponse::Recorded(_)
             )
         ));
+        assert_eq!(
+            fixed_counter_total(
+                &diagnostics_after_terminal.terminal_applied_attached_latency_millis,
+            ),
+            fixed_counter_total(
+                &diagnostics_before_terminal.terminal_applied_attached_latency_millis,
+            ) + 1,
+            "one attached terminal proposal reaches an applied response",
+        );
+        assert_eq!(
+            fixed_counter_total(
+                &diagnostics_after_terminal.terminal_applied_detached_latency_millis,
+            ),
+            fixed_counter_total(
+                &diagnostics_before_terminal.terminal_applied_detached_latency_millis,
+            ),
+            "the successful terminal caller remains attached",
+        );
+        assert_eq!(
+            fixed_counter_total(
+                &diagnostics_after_terminal.log_append_sqlite_commit_latency_millis
+            ),
+            fixed_counter_total(
+                &diagnostics_before_terminal.log_append_sqlite_commit_latency_millis
+            ) + 1,
+            "one durable log append is measured for terminalization",
+        );
+        assert_eq!(
+            fixed_counter_total(
+                &diagnostics_after_terminal.state_machine_sqlite_commit_latency_millis,
+            ),
+            fixed_counter_total(
+                &diagnostics_before_terminal.state_machine_sqlite_commit_latency_millis,
+            ) + 1,
+            "one durable state-machine commit is measured for terminalization",
+        );
+        assert_eq!(diagnostics_after_terminal.occupancy_valid, 1);
+        assert_eq!(diagnostics_after_terminal.live_reservations, 0);
+        assert_eq!(diagnostics_after_terminal.retained_reservations, 1);
         assert_eq!(
             store.inner.raft.metrics().borrow().last_log_index,
             Some(first_log + 5),
@@ -17363,6 +18444,7 @@ mod membership_tests {
 
         reset_roster_ingress_test_counters();
         reset_consumer_consensus_proposal_count();
+        let diagnostics_before_status = store.protected_roster_diagnostic_snapshot();
         let status_log = store.inner.raft.metrics().borrow().last_log_index;
         for (request_id, operation) in [
             (
@@ -17427,6 +18509,24 @@ mod membership_tests {
             ROSTER_INGRESS_LOGICAL_TIME_READ_COUNT.load(Ordering::Relaxed),
             0,
             "status uses its post-barrier projection read rather than terminalize's pre-write read"
+        );
+        let diagnostics_after_status = store.protected_roster_diagnostic_snapshot();
+        assert_eq!(
+            diagnostics_after_status.admission_applied_attached_latency_millis,
+            diagnostics_before_status.admission_applied_attached_latency_millis,
+        );
+        assert_eq!(
+            diagnostics_after_status.admission_applied_detached_latency_millis,
+            diagnostics_before_status.admission_applied_detached_latency_millis,
+        );
+        assert_eq!(
+            diagnostics_after_status.terminal_applied_attached_latency_millis,
+            diagnostics_before_status.terminal_applied_attached_latency_millis,
+        );
+        assert_eq!(
+            diagnostics_after_status.terminal_applied_detached_latency_millis,
+            diagnostics_before_status.terminal_applied_detached_latency_millis,
+            "read-only admission and terminal status cannot add a mutation sample",
         );
 
         clock.set(issuer.valid_until);
@@ -17516,6 +18616,10 @@ mod membership_tests {
             .initialize_cluster()
             .await
             .expect("initialize successor store");
+        store
+            .activate_protected_roster_profile()
+            .await
+            .expect("activate immutable roster profile before admission");
 
         let key = SessionKey {
             tenant: TenantId::new("roster-successor").expect("tenant"),

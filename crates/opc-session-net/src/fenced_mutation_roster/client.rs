@@ -13,7 +13,7 @@ use super::{
         Admission, AdmissionProposal, Error as RosterError, EstablishedPublicationCall, Member,
         Phase, Profile, RosterId, Scope, MAX_MEMBERS,
     },
-    diagnostics::{FencedMutationRosterDiagnostics, RosterDiagnostics},
+    diagnostics::{Counter, FencedMutationRosterDiagnostics, RosterDiagnostics},
     runtime::{
         AppliedProof, CallResult, ExecutorError, LeaseMetadata, PreparedTerminal,
         PublicationAuthority, RecoveryLeaseAuthority, RecoveryLookup, RecoveryRequest,
@@ -183,8 +183,26 @@ pub struct AdmissionInput {
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum AdmissionInputState {
     #[default]
-    Ready,
+    Fresh,
+    /// The exact retained admission was directly proven not transmitted.
+    RetryReady,
     RecoveryOnly,
+}
+
+impl AdmissionInputState {
+    fn begin_attempt(&mut self) -> Result<bool, ClientError> {
+        let is_resubmit = match self {
+            Self::Fresh => false,
+            Self::RetryReady => true,
+            Self::RecoveryOnly => return Err(ClientError::RecoveryRequired),
+        };
+        *self = Self::RecoveryOnly;
+        Ok(is_resubmit)
+    }
+
+    fn restore_after_not_transmitted(&mut self) {
+        *self = Self::RetryReady;
+    }
 }
 
 impl AdmissionInput {
@@ -201,7 +219,7 @@ impl AdmissionInput {
             lease,
             expected_generation,
             proposal,
-            state: AdmissionInputState::Ready,
+            state: AdmissionInputState::Fresh,
         })
     }
 
@@ -790,8 +808,26 @@ pub struct PreparedRosterTerminal {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreparedTerminalState {
-    Ready,
+    Fresh,
+    /// The exact retained terminal body was directly proven not transmitted.
+    RetryReady,
     StatusOnly,
+}
+
+impl PreparedTerminalState {
+    fn begin_attempt(&mut self) -> Result<bool, ClientError> {
+        let is_resubmit = match self {
+            Self::Fresh => false,
+            Self::RetryReady => true,
+            Self::StatusOnly => return Err(ClientError::RecoveryRequired),
+        };
+        *self = Self::StatusOnly;
+        Ok(is_resubmit)
+    }
+
+    fn restore_after_not_transmitted(&mut self) {
+        *self = Self::RetryReady;
+    }
 }
 
 impl PreparedRosterTerminal {
@@ -804,7 +840,7 @@ impl PreparedRosterTerminal {
             registration,
             roster_id,
             prepared,
-            state: PreparedTerminalState::Ready,
+            state: PreparedTerminalState::Fresh,
         }
     }
 
@@ -1245,19 +1281,18 @@ impl FencedMutationRosterClient {
     /// Perform the one immutable admission mutation.
     /// The input becomes recovery-only before this method awaits. Only a
     /// conclusive `NotTransmitted` permits the identical admission to retry;
-    /// cancellation and every ambiguous result require [`Self::recover`].
+    /// cancellation and every ambiguous result require [`Self::recover`]. A
+    /// retry is counted only for that direct, transport-proven transition.
     pub async fn admit(&self, input: &mut AdmissionInput) -> Result<AdmissionOutcome, ClientError> {
-        if input.state != AdmissionInputState::Ready {
-            return Err(ClientError::RecoveryRequired);
-        }
-        input.state = AdmissionInputState::RecoveryOnly;
+        let is_resubmit = input.state.begin_attempt()?;
         let request = input.registration_request(self.scope)?;
+        record_resubmit(&self.diagnostics, Counter::AdmissionResubmits, is_resubmit);
         match self.executor.register(request).await {
             Ok(registration) => Ok(AdmissionOutcome::Admitted(ActiveRoster::from_registration(
                 registration,
             ))),
             Err(ExecutorError::AdmissionNotTransmitted) => {
-                input.state = AdmissionInputState::Ready;
+                input.state.restore_after_not_transmitted();
                 Ok(AdmissionOutcome::NotTransmitted)
             }
             Err(ExecutorError::AdmissionOutcomeUnknown) => {
@@ -1485,10 +1520,12 @@ impl FencedMutationRosterClient {
         &self,
         prepared: &mut PreparedRosterTerminal,
     ) -> Result<TerminalizationOutcome, ClientError> {
-        if prepared.state != PreparedTerminalState::Ready {
-            return Err(ClientError::RecoveryRequired);
-        }
-        prepared.state = PreparedTerminalState::StatusOnly;
+        let is_resubmit = prepared.state.begin_attempt()?;
+        record_resubmit(
+            &self.diagnostics,
+            Counter::TerminalizeResubmits,
+            is_resubmit,
+        );
         match self
             .executor
             .terminalize(prepared.registration.as_ref(), &prepared.prepared)
@@ -1498,7 +1535,7 @@ impl FencedMutationRosterClient {
                 receipt,
             )?)),
             Err(ExecutorError::TerminalizeNotTransmitted) => {
-                prepared.state = PreparedTerminalState::Ready;
+                prepared.state.restore_after_not_transmitted();
                 Ok(TerminalizationOutcome::NotTransmitted)
             }
             Err(
@@ -1537,6 +1574,12 @@ impl FencedMutationRosterClient {
 impl fmt::Debug for FencedMutationRosterClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("FencedMutationRosterClient(<redacted>)")
+    }
+}
+
+fn record_resubmit(diagnostics: &RosterDiagnostics, counter: Counter, is_resubmit: bool) {
+    if is_resubmit {
+        diagnostics.increment(counter);
     }
 }
 
@@ -1599,5 +1642,65 @@ fn receipt_from_executor(receipt: TerminalCommitReceipt) -> Result<TerminalRecei
             }))
         }
         Phase::Established | Phase::Aborted => Err(ClientError::InvalidState),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::diagnostics::RosterDiagnosticsInner;
+    use super::{
+        record_resubmit, AdmissionInputState, ClientError, Counter, PreparedTerminalState,
+    };
+
+    #[test]
+    fn admission_resubmit_state_requires_direct_not_transmitted() {
+        let diagnostics = RosterDiagnosticsInner::new();
+        let mut state = AdmissionInputState::Fresh;
+        record_resubmit(
+            &diagnostics,
+            Counter::AdmissionResubmits,
+            state.begin_attempt().unwrap(),
+        );
+        assert_eq!(diagnostics.snapshot().admission_resubmits, 0);
+
+        // OutcomeUnknown leaves this state recovery-only, so status-only
+        // recovery cannot create a count or retry authority.
+        assert_eq!(state.begin_attempt(), Err(ClientError::RecoveryRequired));
+        assert_eq!(diagnostics.snapshot().admission_resubmits, 0);
+
+        state.restore_after_not_transmitted();
+        record_resubmit(
+            &diagnostics,
+            Counter::AdmissionResubmits,
+            state.begin_attempt().unwrap(),
+        );
+        assert_eq!(diagnostics.snapshot().admission_resubmits, 1);
+        assert_eq!(state.begin_attempt(), Err(ClientError::RecoveryRequired));
+    }
+
+    #[test]
+    fn terminalize_resubmit_state_requires_direct_not_transmitted() {
+        let diagnostics = RosterDiagnosticsInner::new();
+        let mut state = PreparedTerminalState::Fresh;
+        record_resubmit(
+            &diagnostics,
+            Counter::TerminalizeResubmits,
+            state.begin_attempt().unwrap(),
+        );
+        assert_eq!(diagnostics.snapshot().terminalize_resubmits, 0);
+
+        // OutcomeUnknown leaves this state status-only, so terminal-status
+        // reads cannot create a count or retry authority.
+        assert_eq!(state.begin_attempt(), Err(ClientError::RecoveryRequired));
+        assert_eq!(diagnostics.snapshot().terminalize_resubmits, 0);
+
+        state.restore_after_not_transmitted();
+        record_resubmit(
+            &diagnostics,
+            Counter::TerminalizeResubmits,
+            state.begin_attempt().unwrap(),
+        );
+        assert_eq!(diagnostics.snapshot().terminalize_resubmits, 1);
+        assert_eq!(state.begin_attempt(), Err(ClientError::RecoveryRequired));
     }
 }

@@ -2072,6 +2072,31 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Check the exact immutable protected-roster profile certificate after a
+    /// caller-owned consensus barrier. A generic V1 certificate is not
+    /// sufficient for this capability.
+    pub(crate) async fn consensus_protected_roster_profile_activation_matches_scope(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        scope_identity: crate::consensus::SessionConsensusIdentity,
+        voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::protected_roster_profile_activation_matches_scope_sync(
+                conn,
+                storage_identity,
+                scope_identity,
+                &voters,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "protected roster profile activation is unavailable".into(),
+                )
+            })
+        })
+        .await
+    }
+
     /// Check the exact V2 profile certificate after a caller-owned consensus
     /// barrier. A missing or stale certificate is a normal unsupported state;
     /// storage failure remains unavailable.

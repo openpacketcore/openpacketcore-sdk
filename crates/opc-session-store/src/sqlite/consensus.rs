@@ -17,9 +17,7 @@ use std::sync::Condvar;
 #[cfg(any(test, feature = "test-control"))]
 use std::sync::MutexGuard;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
-#[cfg(any(test, feature = "test-control"))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use opc_consensus::engine::{Entry, EntryPayload, LogId, Membership, StoredMembership, Vote};
 use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
@@ -40,14 +38,14 @@ use crate::consensus::storage::{ConsensusAuthorityProfile, SessionConsensusStora
 use crate::consensus::store::ConsensusStoreDiagnosticCounters;
 use crate::consensus::types::{
     fenced_transition_v2_batch_outer_request_id, fenced_transition_voter_set_digest,
-    roster_registration_handle, validate_fenced_transition_v2_batch,
-    validate_fenced_transition_v2_batch_outcomes, ConsensusRosterAdmissionCommand,
-    ConsensusRosterAdmissionOutcome, ConsensusRosterRejection, ConsensusRosterTerminalCommand,
-    ConsensusRosterTerminalOutcome, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
-    SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
-    SessionConsensusNodeId, SessionConsensusRequestId, SessionConsensusResponse,
-    SessionMutationIntent, SessionMutationOutcome, SessionTopologyMemberBinding,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    protected_roster_profile_voter_set_digest, roster_registration_handle,
+    validate_fenced_transition_v2_batch, validate_fenced_transition_v2_batch_outcomes,
+    ConsensusRosterAdmissionCommand, ConsensusRosterAdmissionOutcome, ConsensusRosterRejection,
+    ConsensusRosterTerminalCommand, ConsensusRosterTerminalOutcome, SessionConsensusCommand,
+    SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+    SessionConsensusEntryDigest, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusRequestId, SessionConsensusResponse, SessionMutationIntent,
+    SessionMutationOutcome, SessionTopologyMemberBinding, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::consensus::SessionRaftTypeConfig;
 use crate::error::{LeaseError, StoreError};
@@ -78,8 +76,8 @@ use crate::fenced_mutation_roster_storage::{
     HydratedProductionReservationRecord, PreparedProductionTransaction,
     ProductionAdmissionBusinessReservation, ProductionBusinessState, ProductionFloorKey,
     ProductionReservationRecord, ProductionReservationTransactionAdapter,
-    ProductionRetirementCursor, ProductionTerminalBusinessAction, ReservationError,
-    ReservationState,
+    ProductionRetirementCursor, ProductionTerminalBusinessAction, ProtectedRosterLedgerOccupancy,
+    ReservationError, ReservationState,
 };
 use crate::fenced_mutation_roster_transport::{
     roster_poll_admit_ingress_capsule_commitment, roster_terminal_ingress_capsule_commitment,
@@ -2888,15 +2886,15 @@ impl ProactiveCheckpointLane {
         }
     }
 
-    fn complete(&self, incomplete: bool) {
+    fn complete(&self, incomplete: bool, elapsed: Duration) {
         if let Some(diagnostics) = &self.diagnostics {
-            diagnostics.complete_proactive_checkpoint(incomplete);
+            diagnostics.complete_proactive_checkpoint(incomplete, elapsed);
         }
     }
 
-    fn fail(&self) {
+    fn fail(&self, elapsed: Duration) {
         if let Some(diagnostics) = &self.diagnostics {
-            diagnostics.fail_proactive_checkpoint();
+            diagnostics.fail_proactive_checkpoint(elapsed);
         }
     }
 }
@@ -3002,6 +3000,7 @@ async fn run_proactive_checkpoint_lane(
         }
 
         lane.begin();
+        let checkpoint_started = Instant::now();
         let interrupt = Arc::new(connection.get_interrupt_handle());
         {
             let mut active = lane
@@ -3026,17 +3025,20 @@ async fn run_proactive_checkpoint_lane(
         match checkpoint {
             Ok((returned_connection, Ok(disposition))) => {
                 connection = returned_connection;
-                lane.complete(matches!(
-                    disposition,
-                    ProactivePassiveCheckpointDisposition::Incomplete
-                ));
+                lane.complete(
+                    matches!(
+                        disposition,
+                        ProactivePassiveCheckpointDisposition::Incomplete
+                    ),
+                    checkpoint_started.elapsed(),
+                );
             }
             Ok((returned_connection, Err(()))) => {
                 connection = returned_connection;
-                lane.fail();
+                lane.fail(checkpoint_started.elapsed());
             }
             Err(_) => {
-                lane.fail();
+                lane.fail(checkpoint_started.elapsed());
                 return;
             }
         }
@@ -3132,6 +3134,9 @@ fn verify_proactive_checkpoint_connection(
 #[derive(Clone)]
 pub(crate) struct SqliteConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<Connection>>,
+    /// Store-scoped fixed-cardinality diagnostics. They are observational
+    /// only and never cross the replicated command or snapshot wire.
+    pub(crate) diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
     /// A duplicate of the actual live SQLite main-file descriptor, admitted
     /// from SQLite's VFS rather than from path metadata.
     pub(crate) database_file: Option<Arc<crate::consensus::snapshot::PinnedSqliteFile>>,
@@ -3305,6 +3310,7 @@ impl SqliteConsensusCore {
             database_file,
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
+            protected_roster_occupancy,
         ) = {
             let conn = backend.conn.lock().await;
             let storage_identity = initialize_schema_with_storage_anchor_and_pending_and_bindings(
@@ -3320,6 +3326,8 @@ impl SqliteConsensusCore {
             )?;
             let applied = read_applied_sync(&conn, storage_identity)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+            let protected_roster_occupancy =
+                protected_roster_diagnostic_occupancy_sync(&conn, storage_identity);
             let database_file = match &backend.database_path {
                 Some(path) => {
                     let file = opc_sqlite_file_control_sys::main_file_descriptor(&conn)
@@ -3381,12 +3389,21 @@ impl SqliteConsensusCore {
                 database_file,
                 proactive_checkpoint_lane,
                 consensus_log_prune_lane,
+                protected_roster_occupancy,
             )
         };
         let (applied_progress, _) = tokio::sync::watch::channel(applied);
 
+        if let Some(diagnostics) = backend.consensus_diagnostics.as_ref() {
+            match protected_roster_occupancy {
+                Ok(occupancy) => diagnostics.set_protected_roster_occupancy(occupancy),
+                Err(_) => diagnostics.invalidate_protected_roster_occupancy(),
+            }
+        }
+
         let core = Self {
             conn: Arc::clone(&backend.conn),
+            diagnostics: backend.consensus_diagnostics.clone(),
             database_file,
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
@@ -7774,6 +7791,23 @@ fn protected_roster_read_witness_sync(
         .map_err(|_| ProtectedRosterApplyError::Corrupt)
 }
 
+/// Read the authenticated fixed-width roster occupancy without enumerating a
+/// tenant, partition, request, or row. Prepared/legacy stores have no witness
+/// and therefore expose an all-zero gauge.
+pub(crate) fn protected_roster_diagnostic_occupancy_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<ProtectedRosterLedgerOccupancy> {
+    if !table_exists(conn, "consensus_protected_roster_witness").map_err(db_error)? {
+        return Ok(ProtectedRosterLedgerOccupancy::default());
+    }
+    protected_roster_read_witness_sync(conn, identity)
+        .map_err(|_| invalid_data("protected roster diagnostic witness is invalid"))?
+        .unwrap_or_else(GlobalChargeWitness::empty)
+        .diagnostic_occupancy()
+        .map_err(|_| invalid_data("protected roster diagnostic occupancy is invalid"))
+}
+
 fn protected_roster_write_witness_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -9611,7 +9645,7 @@ fn maintain_due_protected_roster_reclaim_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     logical_time: Timestamp,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     // The prepared namespace is intentionally inert.  Avoid probing roster
     // tables for legacy/prepared databases on every unrelated command while
     // still rejecting any unknown persisted schema revision fail-closed.
@@ -9623,7 +9657,7 @@ fn maintain_due_protected_roster_reclaim_sync(
                 || version == FENCED_TRANSITION_V1_DATABASE_FORMAT
                 || version == FENCED_TRANSITION_V2_DATABASE_FORMAT =>
         {
-            return Ok(());
+            return Ok(false);
         }
         PROTECTED_ROSTER_DATABASE_FORMAT => {}
         _ => {
@@ -9644,7 +9678,7 @@ fn maintain_due_protected_roster_reclaim_sync(
         // No nonnegative terminal timestamp can yet have aged for the fixed
         // retention period.  This remains a true no-op rather than asking the
         // planner to create an empty maintenance transaction.
-        return Ok(());
+        return Ok(false);
     };
     let due_reclaim: bool = conn
         .query_row(
@@ -9666,7 +9700,7 @@ fn maintain_due_protected_roster_reclaim_sync(
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
     if !due_reclaim && !due_retirement {
-        return Ok(());
+        return Ok(false);
     }
 
     // A due row makes this namespace security-relevant.  Re-run the exact
@@ -9681,9 +9715,9 @@ fn maintain_due_protected_roster_reclaim_sync(
         ));
     }
     if due_reclaim {
-        reclaim_protected_rosters_sync(conn, identity, logical_time)
+        reclaim_protected_rosters_sync(conn, identity, logical_time).map(|()| true)
     } else {
-        retire_protected_rosters_sync(conn, identity).map(|_| ())
+        retire_protected_rosters_sync(conn, identity)
     }
 }
 
@@ -10924,7 +10958,45 @@ pub(crate) fn fenced_transition_activation_matches_scope_sync(
         return Ok(false);
     };
     Ok(certificate_scope == scope_identity
-        && certificate_voters == fenced_transition_voter_set_digest(scope_identity, voters))
+        && fenced_transition_activation_voter_set_digest_matches_scope(
+            certificate_voters,
+            scope_identity,
+            voters,
+        ))
+}
+
+/// Return whether the existing immutable certificate is specifically the
+/// frozen protected-roster profile proof. A generic V1 certificate is never
+/// accepted here, even though it may share the certificate storage row.
+pub(crate) fn protected_roster_profile_activation_matches_scope_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    scope_identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<bool> {
+    if fenced_transition_receipt_ledger_layout_sync(conn)?
+        != FencedTransitionReceiptLedgerLayout::Activated
+        || scope_identity.cluster_id() != storage_identity.cluster_id()
+        || voters.is_empty()
+    {
+        return Ok(false);
+    }
+    let Some((certificate_scope, certificate_voters)) =
+        read_fenced_transition_activation_certificate_sync(conn, storage_identity, false)?
+    else {
+        return Ok(false);
+    };
+    Ok(certificate_scope == scope_identity
+        && certificate_voters == protected_roster_profile_voter_set_digest(scope_identity, voters))
+}
+
+fn fenced_transition_activation_voter_set_digest_matches_scope(
+    digest: [u8; 32],
+    scope_identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+) -> bool {
+    digest == fenced_transition_voter_set_digest(scope_identity, voters)
+        || digest == protected_roster_profile_voter_set_digest(scope_identity, voters)
 }
 
 /// Read the one optional activation certificate after validating every field
@@ -11011,8 +11083,11 @@ fn validate_fenced_transition_activation_certificate_sync(
     };
     let scope = read_membership_scope_sync(conn, storage_identity)?;
     if certificate_scope != scope.current_identity
-        || certificate_voters
-            != fenced_transition_voter_set_digest(scope.current_identity, &scope.current_members)
+        || !fenced_transition_activation_voter_set_digest_matches_scope(
+            certificate_voters,
+            scope.current_identity,
+            &scope.current_members,
+        )
     {
         return Err(invalid_data(
             "fenced transition activation certificate scope is stale",
@@ -11032,6 +11107,26 @@ fn activate_fenced_transition_scope_sync(
     scope_identity: SessionConsensusIdentity,
     voters: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<()> {
+    activate_fenced_transition_scope_with_voter_digest_sync(
+        conn,
+        storage_identity,
+        scope_identity,
+        voters,
+        fenced_transition_voter_set_digest(scope_identity, voters),
+    )
+}
+
+/// Persist a previously admitted V1 or protected-roster profile certificate.
+/// The digest is validated against the current scope before any format or
+/// certificate state is changed, so callers cannot use this shared storage
+/// primitive to synthesize arbitrary capability evidence.
+fn activate_fenced_transition_scope_with_voter_digest_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    scope_identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+    voter_digest: [u8; 32],
+) -> io::Result<()> {
     if scope_identity.cluster_id() != storage_identity.cluster_id() || voters.is_empty() {
         return Err(invalid_data(
             "fenced transition activation scope is invalid",
@@ -11039,7 +11134,15 @@ fn activate_fenced_transition_scope_sync(
     }
     let storage_epoch = epoch_i64(storage_identity)?;
     let scope_epoch = epoch_i64(scope_identity)?;
-    let voter_digest = fenced_transition_voter_set_digest(scope_identity, voters);
+    if !fenced_transition_activation_voter_set_digest_matches_scope(
+        voter_digest,
+        scope_identity,
+        voters,
+    ) {
+        return Err(invalid_data(
+            "fenced transition activation certificate voter set is invalid",
+        ));
+    }
     match fenced_transition_receipt_ledger_layout_sync(conn)? {
         FencedTransitionReceiptLedgerLayout::Published684 => {
             return Err(invalid_data(
@@ -11076,22 +11179,52 @@ fn activate_fenced_transition_scope_sync(
         }
         FencedTransitionReceiptLedgerLayout::Activated => {}
     }
+    // The shared row is a monotonic capability lattice for one exact scope:
+    // the protected-roster digest proves the generic V1 profile as well, but
+    // a later generic activation must never overwrite that stronger proof.
+    // This also closes the race where an in-flight generic activation could
+    // otherwise make a roster command accepted by the leader unappliable on
+    // its followers.
+    let protected_profile_digest =
+        protected_roster_profile_voter_set_digest(scope_identity, voters);
+    let persisted_voter_digest = if voter_digest
+        == fenced_transition_voter_set_digest(scope_identity, voters)
+        && protected_roster_profile_activation_matches_scope_sync(
+            conn,
+            storage_identity,
+            scope_identity,
+            voters,
+        )? {
+        protected_profile_digest
+    } else {
+        voter_digest
+    };
     conn.execute(
         "INSERT INTO consensus_fenced_transition_activation (singleton, storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, voter_set_digest) VALUES (1, ?1, ?2, ?3, ?4) ON CONFLICT(singleton) DO UPDATE SET storage_configuration_epoch = excluded.storage_configuration_epoch, scope_configuration_id = excluded.scope_configuration_id, scope_configuration_epoch = excluded.scope_configuration_epoch, voter_set_digest = excluded.voter_set_digest",
         params![
             storage_epoch,
             scope_identity.configuration_id().as_bytes().as_slice(),
             scope_epoch,
-            voter_digest.as_slice(),
+            persisted_voter_digest.as_slice(),
         ],
     )
     .map_err(db_error)?;
-    if !fenced_transition_activation_matches_scope_sync(
-        conn,
-        storage_identity,
-        scope_identity,
-        voters,
-    )? {
+    let profile_certificate = persisted_voter_digest == protected_profile_digest;
+    if !(if profile_certificate {
+        protected_roster_profile_activation_matches_scope_sync(
+            conn,
+            storage_identity,
+            scope_identity,
+            voters,
+        )?
+    } else {
+        fenced_transition_activation_matches_scope_sync(
+            conn,
+            storage_identity,
+            scope_identity,
+            voters,
+        )?
+    }) {
         return Err(invalid_data(
             "fenced transition activation certificate is invalid",
         ));
@@ -12971,7 +13104,8 @@ pub(crate) fn validate_command_for_log(
         }
     }
     match semantic_intent {
-        SessionMutationIntent::PreflightFencedTransitionCapability => {
+        SessionMutationIntent::PreflightFencedTransitionCapability
+        | SessionMutationIntent::PreflightProtectedRosterProfile => {
             return Err(invalid_data(
                 "session consensus activation preflight reached the log",
             ));
@@ -13207,6 +13341,7 @@ struct MembershipLogProjection {
     projected_fenced_receipt_count: usize,
     fenced_receipt_ledger_has_commitments: bool,
     fenced_transition_scope_activated: bool,
+    protected_roster_profile_scope_activated: bool,
     projected_v2_bound_requests: BTreeSet<[u8; FENCED_TRANSITION_V2_REQUEST_ID_BYTES]>,
     projected_v2_history: Option<FencedTransitionV2HistoryRow>,
     projected_v2_scope_activated: bool,
@@ -13251,6 +13386,13 @@ impl MembershipLogProjection {
             scope.current_identity,
             &scope.current_members,
         )?;
+        let protected_roster_profile_scope_activated =
+            protected_roster_profile_activation_matches_scope_sync(
+                conn,
+                storage_identity,
+                scope.current_identity,
+                &scope.current_members,
+            )?;
         let (projected_v2_history, projected_v2_scope_activated) =
             match fenced_transition_v2_ledger_layout_sync(conn)? {
                 FencedTransitionV2LedgerLayout::Absent => (None, false),
@@ -13276,6 +13418,7 @@ impl MembershipLogProjection {
             projected_fenced_receipt_count,
             fenced_receipt_ledger_has_commitments,
             fenced_transition_scope_activated,
+            protected_roster_profile_scope_activated,
             projected_v2_bound_requests: BTreeSet::new(),
             projected_v2_history,
             projected_v2_scope_activated,
@@ -13846,6 +13989,7 @@ impl MembershipLogProjection {
                 if promote {
                     self.promote_at(entry.log_id.index)?;
                     self.fenced_transition_scope_activated = false;
+                    self.protected_roster_profile_scope_activated = false;
                     self.projected_v2_scope_activated = false;
                 }
                 Ok(())
@@ -13879,17 +14023,25 @@ impl MembershipLogProjection {
                             fenced_transition_activation(&command.intent)
                                 .expect("checked capability activation");
                         if scope_identity != self.scope.current_identity
-                            || voter_set_digest
-                                != fenced_transition_voter_set_digest(
-                                    self.scope.current_identity,
-                                    &self.scope.current_members,
-                                )
+                            || !fenced_transition_activation_voter_set_digest_matches_scope(
+                                voter_set_digest,
+                                self.scope.current_identity,
+                                &self.scope.current_members,
+                            )
                         {
                             return Err(invalid_data(
                                 "projected fenced transition activation scope is stale",
                             ));
                         }
                         self.fenced_transition_scope_activated = true;
+                        if voter_set_digest
+                            == protected_roster_profile_voter_set_digest(
+                                self.scope.current_identity,
+                                &self.scope.current_members,
+                            )
+                        {
+                            self.protected_roster_profile_scope_activated = true;
+                        }
                         self.fenced_receipt_ledger_has_commitments = true;
                     }
                 }
@@ -13940,6 +14092,13 @@ impl MembershipLogProjection {
                         // scope appear activated.
                         Some(_) | None => {}
                     }
+                }
+                if roster_command(&command.intent).is_some()
+                    && !self.protected_roster_profile_scope_activated
+                {
+                    return Err(invalid_data(
+                        "projected protected roster lacks an exact profile certificate",
+                    ));
                 }
                 if self.projected_bound_requests.contains(&request_id) {
                     // A request-ID collision is a valid, deterministically
@@ -14318,6 +14477,7 @@ impl MembershipLogProjection {
             | SessionMutationIntent::FencedTransition(_)
             | SessionMutationIntent::ActivateFencedTransition { .. }
             | SessionMutationIntent::PreflightFencedTransitionCapability
+            | SessionMutationIntent::PreflightProtectedRosterProfile
             | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
             | SessionMutationIntent::FencedTransitionV2(_)
             | SessionMutationIntent::FencedTransitionV2Batch(_)
@@ -14835,19 +14995,36 @@ fn read_log_range_with_batch_sync(
     Ok(entries)
 }
 
+#[cfg(test)]
 pub(crate) fn append_logs_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     entries: &[Entry<SessionRaftTypeConfig>],
+) -> io::Result<()> {
+    append_logs_sync_with_diagnostics(conn, identity, entries, None)
+}
+
+fn append_logs_sync_with_diagnostics(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    entries: &[Entry<SessionRaftTypeConfig>],
+    diagnostics: Option<&ConsensusStoreDiagnosticCounters>,
 ) -> io::Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
     append_logs_in_tx(&tx, identity, entries)?;
-    tx.commit().map_err(db_error)
+    let observe_roster_commit = entries_contain_protected_roster_command(entries);
+    let commit_started = observe_roster_commit.then(Instant::now);
+    tx.commit().map_err(db_error)?;
+    if let (Some(diagnostics), Some(started)) = (diagnostics, commit_started) {
+        diagnostics.observe_protected_roster_log_append_sqlite_commit(started.elapsed());
+    }
+    Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn append_logs_with_authority_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -14857,8 +15034,31 @@ pub(crate) fn append_logs_with_authority_sync(
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     entries: &[Entry<SessionRaftTypeConfig>],
 ) -> io::Result<()> {
+    append_logs_with_authority_and_diagnostics_sync(
+        conn,
+        identity,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        entries,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_logs_with_authority_and_diagnostics_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    entries: &[Entry<SessionRaftTypeConfig>],
+    diagnostics: Option<&ConsensusStoreDiagnosticCounters>,
+) -> io::Result<()> {
     if authority_profile == ConsensusAuthorityProfile::Dynamic {
-        return append_logs_sync(conn, identity, entries);
+        return append_logs_sync_with_diagnostics(conn, identity, entries, diagnostics);
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
     validate_durable_authority_for_raw_access(
@@ -14884,7 +15084,22 @@ pub(crate) fn append_logs_with_authority_sync(
         ));
     }
     append_logs_in_tx(&tx, identity, entries)?;
-    tx.commit().map_err(db_error)
+    let observe_roster_commit = entries_contain_protected_roster_command(entries);
+    let commit_started = observe_roster_commit.then(Instant::now);
+    tx.commit().map_err(db_error)?;
+    if let (Some(diagnostics), Some(started)) = (diagnostics, commit_started) {
+        diagnostics.observe_protected_roster_log_append_sqlite_commit(started.elapsed());
+    }
+    Ok(())
+}
+
+fn entries_contain_protected_roster_command(entries: &[Entry<SessionRaftTypeConfig>]) -> bool {
+    entries.iter().any(|entry| {
+        matches!(
+            &entry.payload,
+            EntryPayload::Normal(command) if roster_command(&command.intent).is_some()
+        )
+    })
 }
 
 fn append_logs_in_tx(
@@ -19859,6 +20074,7 @@ fn execute_application_intent_sync(
         | SessionMutationIntent::AbortTopologyTransition { .. }
         | SessionMutationIntent::FinalizeTopologyTransition { .. }
         | SessionMutationIntent::PreflightFencedTransitionCapability
+        | SessionMutationIntent::PreflightProtectedRosterProfile
         | SessionMutationIntent::MaintainFencedTransitionV2History { .. }
         | SessionMutationIntent::FencedTransitionV2Batch(_)
         | SessionMutationIntent::RosterAdmission(_)
@@ -20165,6 +20381,22 @@ fn apply_protected_roster_command_sync(
         .calculate_applied_digest(sequence, machine.1, logical_time)
         .map_err(|_| invalid_data("session consensus command digest failed"))?;
 
+    // The profile certificate is immutable startup/deployment evidence, not a
+    // roster mutation. Require it again at deterministic follower apply so a
+    // mixed or stale leader can never append an admission that a restarted
+    // node, snapshot restore, or follower would interpret differently.
+    let scope = read_membership_scope_sync(tx, identity)?;
+    if !protected_roster_profile_activation_matches_scope_sync(
+        tx,
+        identity,
+        scope.current_identity,
+        &scope.current_members,
+    )? {
+        return Err(invalid_data(
+            "protected roster profile activation is missing",
+        ));
+    }
+
     // This fence belongs to the outer Raft-apply transaction, deliberately
     // outside the roster rejection savepoint. A canonical admission which
     // deterministically loses a capacity/authority race still publishes format four,
@@ -20324,6 +20556,7 @@ pub(crate) fn apply_entries_sync(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn apply_entries_with_authority_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -20333,6 +20566,31 @@ pub(crate) fn apply_entries_with_authority_sync(
     expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     entries: Vec<Entry<SessionRaftTypeConfig>>,
+) -> io::Result<AppliedBatch> {
+    apply_entries_with_authority_and_diagnostics_sync(
+        conn,
+        identity,
+        caps,
+        authority_profile,
+        expected_members,
+        expected_bindings,
+        fixed_placement_policy,
+        entries,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_entries_with_authority_and_diagnostics_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    caps: &BackendCapabilities,
+    authority_profile: ConsensusAuthorityProfile,
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    entries: Vec<Entry<SessionRaftTypeConfig>>,
+    diagnostics: Option<&ConsensusStoreDiagnosticCounters>,
 ) -> io::Result<AppliedBatch> {
     if entries.is_empty() && authority_profile == ConsensusAuthorityProfile::Dynamic {
         return Ok(AppliedBatch {
@@ -20381,6 +20639,9 @@ pub(crate) fn apply_entries_with_authority_sync(
     let mut machine = read_machine_sync(&tx, identity)?;
     let mut responses = Vec::with_capacity(entries.len());
     let mut notifications = Vec::new();
+    let mut protected_roster_changed = false;
+    let mut protected_roster_maintenance_turns = 0_u64;
+    let mut protected_roster_maintenance_nanos = 0_u64;
     #[cfg(any(test, feature = "test-control"))]
     let mut terminal_transaction_remainder_started = None;
 
@@ -20418,6 +20679,7 @@ pub(crate) fn apply_entries_with_authority_sync(
         // generic match so rustfmt does not obscure that mature apply path.
         if let EntryPayload::Normal(command) = &entry.payload {
             if let Some(roster) = roster_command(&command.intent) {
+                protected_roster_changed = true;
                 let response = apply_protected_roster_command_sync(
                     &mut tx,
                     ProtectedRosterCommandApplyInput {
@@ -20647,11 +20909,11 @@ pub(crate) fn apply_entries_with_authority_sync(
                                 fenced_transition_activation(&command.intent)
                                     .expect("checked capability activation");
                             if scope_identity != scope.current_identity
-                                || voter_set_digest
-                                    != fenced_transition_voter_set_digest(
-                                        scope.current_identity,
-                                        &scope.current_members,
-                                    )
+                                || !fenced_transition_activation_voter_set_digest_matches_scope(
+                                    voter_set_digest,
+                                    scope.current_identity,
+                                    &scope.current_members,
+                                )
                             {
                                 return Err(invalid_data(
                                     "fenced transition activation scope is stale",
@@ -20660,11 +20922,12 @@ pub(crate) fn apply_entries_with_authority_sync(
                             // This cluster-scope command has no tenant/session
                             // body. Its generic authenticated outcome and this
                             // certificate must commit in the same transaction.
-                            activate_fenced_transition_scope_sync(
+                            activate_fenced_transition_scope_with_voter_digest_sync(
                                 &tx,
                                 identity,
                                 scope.current_identity,
                                 &scope.current_members,
+                                voter_set_digest,
                             )?;
                         }
                     }
@@ -21128,8 +21391,18 @@ pub(crate) fn apply_entries_with_authority_sync(
         // This is maintenance within this Raft apply transaction, never a
         // separately proposed command and never a replication/watch event.
         if let Some(logical_time) = response.logical_time {
-            maintain_due_protected_roster_reclaim_sync(&tx, identity, logical_time)
-                .map_err(|_| invalid_data("protected roster maintenance failed"))?;
+            let maintenance_started = Instant::now();
+            if maintain_due_protected_roster_reclaim_sync(&tx, identity, logical_time)
+                .map_err(|_| invalid_data("protected roster maintenance failed"))?
+            {
+                protected_roster_changed = true;
+                protected_roster_maintenance_turns =
+                    protected_roster_maintenance_turns.saturating_add(1);
+                protected_roster_maintenance_nanos = protected_roster_maintenance_nanos
+                    .saturating_add(
+                        u64::try_from(maintenance_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+            }
         }
 
         save_log_pointer(&tx, "consensus_applied", identity, &entry.log_id)?;
@@ -21155,7 +21428,27 @@ pub(crate) fn apply_entries_with_authority_sync(
     }
 
     validate_persisted_membership_sync(&tx, identity)?;
+    let protected_roster_occupancy = if protected_roster_changed {
+        Some(protected_roster_diagnostic_occupancy_sync(&tx, identity)?)
+    } else {
+        None
+    };
+    let roster_commit_started = protected_roster_changed.then(Instant::now);
     tx.commit().map_err(db_error)?;
+    if let Some(diagnostics) = diagnostics {
+        if let Some(started) = roster_commit_started {
+            diagnostics.observe_protected_roster_state_machine_sqlite_commit(started.elapsed());
+        }
+        if protected_roster_maintenance_turns != 0 {
+            diagnostics.observe_protected_roster_piggyback_maintenance(
+                protected_roster_maintenance_turns,
+                Duration::from_nanos(protected_roster_maintenance_nanos),
+            );
+        }
+        if let Some(occupancy) = protected_roster_occupancy {
+            diagnostics.set_protected_roster_occupancy(occupancy);
+        }
+    }
     #[cfg(any(test, feature = "test-control"))]
     if let Some(started) = terminal_transaction_remainder_started {
         record_protected_roster_terminal_apply_timing(
@@ -24130,7 +24423,32 @@ fn validate_snapshot_preserves_current_fenced_transition_activation_sync(
     let incoming =
         read_fenced_transition_activation_certificate_sync(conn, storage_identity, true)?;
     match (local, incoming) {
-        (Some(local), Some(incoming)) if local == incoming => Ok(()),
+        (Some(local), Some(incoming))
+            if local == incoming
+                || (local
+                    == (
+                        local_scope.current_identity,
+                        fenced_transition_voter_set_digest(
+                            local_scope.current_identity,
+                            &local_scope.current_members,
+                        ),
+                    )
+                    && incoming
+                        == (
+                            incoming_scope.current_identity,
+                            protected_roster_profile_voter_set_digest(
+                                incoming_scope.current_identity,
+                                &incoming_scope.current_members,
+                            ),
+                        )) =>
+        {
+            // The protected-roster profile proof is a monotonic strengthening
+            // of the generic V1 certificate for this exact unchanged scope.
+            // A voter can legitimately miss that committed upgrade, restart,
+            // and receive it in a later snapshot. The inverse remains a
+            // forbidden downgrade.
+            Ok(())
+        }
         (Some(_), None) => Err(invalid_data(
             "session consensus snapshot erases current fenced transition activation",
         )),
@@ -26710,7 +27028,8 @@ mod tests {
 
     fn retirement_fixture_admission(partition: u8, roster: u16) -> Admission {
         use crate::fenced_mutation_roster::{
-            AdmissionProposal, EstablishedMutation, Member, MemberOperationId, Profile, RosterId,
+            Admission, AdmissionProposal, EstablishedMutation, Member, MemberOperationId, Profile,
+            RosterId, Scope,
         };
 
         let mut roster_id = [partition; 16];
@@ -27959,6 +28278,189 @@ mod tests {
     }
 
     #[test]
+    fn protected_roster_profile_projection_and_apply_are_monotonic_and_fail_closed() {
+        use crate::fenced_mutation_roster::{
+            AdmissionProposal, EstablishedMutation, Member, MemberOperationId, Profile, RosterId,
+        };
+        use crate::fenced_mutation_roster_executor::{AuthorityBinding, AuthorityLeaseMetadata};
+
+        fn activation_entry(
+            index: u64,
+            request_byte: u8,
+            voter_set_digest: [u8; 32],
+        ) -> Entry<SessionRaftTypeConfig> {
+            Entry {
+                log_id: log_id(index),
+                payload: EntryPayload::Normal(SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes([request_byte; 16]),
+                    logical_time: timestamp(u8::try_from(index).expect("test log index")),
+                    intent: SessionMutationIntent::Authorized {
+                        origin: node_id(),
+                        authority_identity: identity(),
+                        mutation: Box::new(
+                            SessionMutationIntent::ActivateFencedTransitionCapability {
+                                schema_version: FENCED_TRANSITION_SCHEMA_V1,
+                                scope_identity: identity(),
+                                voter_set_digest,
+                            },
+                        ),
+                    },
+                }),
+            }
+        }
+
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let membership = membership_entry();
+        let acquire = acquire_entry(1, [0xb0; 16], "roster-profile-owner");
+        append_logs_sync(&conn, identity(), &[membership.clone(), acquire.clone()])
+            .expect("append membership and lease");
+        let applied =
+            apply_entries_sync(&conn, identity(), &backend.caps, vec![membership, acquire])
+                .expect("form membership and lease");
+        let lease = match &applied.responses[1].result {
+            Ok(SessionMutationOutcome::Lease(lease)) => lease.clone(),
+            result => panic!("expected lease for roster profile fixture: {result:?}"),
+        };
+        let cas = capped_cas_entry(
+            2,
+            [0xb1; 16],
+            lease.clone(),
+            None,
+            Generation::new(1),
+            1_024,
+        );
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&cas))
+            .expect("append protected business record");
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![cas])
+            .expect("apply protected business record");
+
+        let proposal = AdmissionProposal::new(
+            Profile::v1(),
+            RosterId::from_bytes([0xb2; 16]).expect("roster ID"),
+            vec![Member::new(
+                0,
+                MemberOperationId::from_bytes([0xb3; 16]).expect("member operation ID"),
+                vec![0xb4],
+                1,
+            )
+            .expect("member")],
+            EstablishedMutation::no_op(),
+            vec![0xb5],
+            vec![0xb6],
+            vec![0xb7],
+        )
+        .expect("admission proposal");
+        let admission = Admission::authenticate(
+            proposal,
+            key(),
+            Scope::from_digest([0xb8; 32]),
+            lease.owner().clone(),
+            lease.fence(),
+            Generation::new(1),
+        )
+        .expect("authenticated admission");
+        let authority = AuthorityBinding::for_admission(
+            &admission,
+            lease.owner().clone(),
+            lease.fence(),
+            AuthorityLeaseMetadata::new(
+                lease.credential_id(),
+                Generation::new(1),
+                lease.acquired_at(),
+                lease.expires_at(),
+            ),
+        )
+        .expect("admission authority");
+        let roster = ConsensusRosterAdmissionCommand::new(admission, authority)
+            .expect("roster admission command");
+        let roster_entry = |index| Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: roster.request_id().expect("roster request ID"),
+                logical_time: timestamp(u8::try_from(index).expect("test log index")),
+                intent: SessionMutationIntent::RosterAdmission(Box::new(roster.clone())),
+            }),
+        };
+
+        let generic_digest = fenced_transition_voter_set_digest(identity(), &expected_members());
+        let profile_digest =
+            protected_roster_profile_voter_set_digest(identity(), &expected_members());
+        let generic_only = vec![activation_entry(3, 0xb9, generic_digest), roster_entry(4)];
+        assert_eq!(
+            append_logs_sync(&conn, identity(), &generic_only)
+                .expect_err("generic V1 does not authorize a roster follower append")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            apply_entries_sync(&conn, identity(), &backend.caps, generic_only)
+                .expect_err("generic V1 does not authorize roster apply")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert!(
+            !protected_roster_profile_activation_matches_scope_sync(
+                &conn,
+                identity(),
+                identity(),
+                &expected_members(),
+            )
+            .expect("generic-only activation state"),
+            "the rejected batch cannot manufacture a profile certificate",
+        );
+
+        let protected_then_generic = vec![
+            activation_entry(3, 0xba, profile_digest),
+            activation_entry(4, 0xbb, generic_digest),
+            roster_entry(5),
+        ];
+        append_logs_sync(&conn, identity(), &protected_then_generic)
+            .expect("profile then generic activation preserves follower authority");
+        let applied = apply_entries_sync(&conn, identity(), &backend.caps, protected_then_generic)
+            .expect("profile then generic activation permits roster apply");
+        match &applied.responses[2].result {
+            Ok(SessionMutationOutcome::RosterAdmission(
+                ConsensusRosterAdmissionOutcome::Admitted { .. },
+            )) => {}
+            Ok(SessionMutationOutcome::RosterAdmission(
+                ConsensusRosterAdmissionOutcome::Rejected { rejection, .. },
+            )) if *rejection == ConsensusRosterRejection::Authority => {
+                // This storage-only fixture deliberately has no production
+                // attestation root or ingress proof. Reaching the roster's
+                // ordinary authority rejection proves follower projection
+                // and deterministic apply both consumed the stronger profile
+                // certificate instead of rejecting at the profile gate. The
+                // service-level test supplies the real signed admission and
+                // proves its successful PollAdmitted result.
+            }
+            Ok(SessionMutationOutcome::RosterAdmission(
+                ConsensusRosterAdmissionOutcome::Rejected { .. },
+            )) => panic!("profile-authorized roster admission reached an unexpected rejection"),
+            Ok(SessionMutationOutcome::RosterAdmission(
+                ConsensusRosterAdmissionOutcome::Replayed { .. },
+            )) => panic!("profile-authorized roster admission unexpectedly replayed"),
+            _ => panic!("profile-authorized roster admission returned another outcome"),
+        }
+        assert!(protected_roster_profile_activation_matches_scope_sync(
+            &conn,
+            identity(),
+            identity(),
+            &expected_members(),
+        )
+        .expect("profile certificate after generic activation"));
+        let projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load protected follower projection");
+        assert!(projection.fenced_transition_scope_activated);
+        assert!(projection.protected_roster_profile_scope_activated);
+    }
+
+    #[test]
     fn fatal_protected_roster_corruption_does_not_advance_applied_state() {
         use crate::fenced_mutation_roster::{
             AdmissionProposal, EstablishedMutation, Member, MemberOperationId, Profile, RosterId,
@@ -27970,6 +28472,18 @@ mod tests {
         initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
         apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
             .expect("initial membership");
+        let scope = read_membership_scope_sync(&conn, identity()).expect("membership scope");
+        activate_fenced_transition_scope_with_voter_digest_sync(
+            &conn,
+            identity(),
+            scope.current_identity,
+            &scope.current_members,
+            protected_roster_profile_voter_set_digest(
+                scope.current_identity,
+                &scope.current_members,
+            ),
+        )
+        .expect("activate protected roster profile");
 
         let proposal = AdmissionProposal::new(
             Profile::v1(),
@@ -35753,6 +36267,91 @@ LIMIT 20000;
         .expect("target current certificate"));
 
         let directory = tempfile::tempdir().expect("snapshot directory");
+
+        // The profile certificate is a monotonic strengthening of generic
+        // V1 for one exact scope. A voter can miss that committed upgrade,
+        // restart, and learn it only from a later snapshot.
+        activate_fenced_transition_scope_with_voter_digest_sync(
+            &source_conn,
+            storage_identity,
+            storage_identity,
+            &current,
+            protected_roster_profile_voter_set_digest(storage_identity, &current),
+        )
+        .expect("upgrade source to protected roster profile");
+        assert!(protected_roster_profile_activation_matches_scope_sync(
+            &source_conn,
+            storage_identity,
+            storage_identity,
+            &current,
+        )
+        .expect("source profile certificate"));
+        let profile_upgrade_path = directory.path().join("same-scope-profile-upgrade.sqlite");
+        let (profile_upgrade_last_log, profile_upgrade_membership) =
+            build_snapshot_database_sync(&source_conn, storage_identity, &profile_upgrade_path)
+                .expect("build profile-upgrade snapshot");
+        let profile_upgrade_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: profile_upgrade_last_log,
+            last_membership: profile_upgrade_membership,
+            snapshot_id: "same-scope-profile-upgrade".into(),
+        };
+        install_snapshot_database_sync(
+            &target_conn,
+            storage_identity,
+            &profile_upgrade_path,
+            &profile_upgrade_meta,
+            "snapshot-00000000-0000-4000-8000-0000000000f0.opc",
+            [0xF0; 32],
+            std::fs::metadata(&profile_upgrade_path)
+                .expect("profile-upgrade snapshot metadata")
+                .len(),
+        )
+        .expect("same-scope profile certificate may strengthen generic V1");
+        assert!(protected_roster_profile_activation_matches_scope_sync(
+            &target_conn,
+            storage_identity,
+            storage_identity,
+            &current,
+        )
+        .expect("installed profile certificate"));
+
+        let profile_downgrade_path = directory.path().join("same-scope-profile-downgrade.sqlite");
+        let (profile_downgrade_last_log, profile_downgrade_membership) =
+            build_snapshot_database_sync(&source_conn, storage_identity, &profile_downgrade_path)
+                .expect("build profile-downgrade snapshot");
+        Connection::open(&profile_downgrade_path)
+            .expect("open profile-downgrade snapshot")
+            .execute(
+                "UPDATE consensus_fenced_transition_activation SET voter_set_digest = ?1 WHERE singleton = 1",
+                [fenced_transition_voter_set_digest(storage_identity, &current).as_slice()],
+            )
+            .expect("form generic-only same-scope snapshot");
+        let profile_downgrade_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: profile_downgrade_last_log,
+            last_membership: profile_downgrade_membership,
+            snapshot_id: "same-scope-profile-downgrade".into(),
+        };
+        let downgrade_error = install_snapshot_database_sync(
+            &target_conn,
+            storage_identity,
+            &profile_downgrade_path,
+            &profile_downgrade_meta,
+            "snapshot-00000000-0000-4000-8000-0000000000f1.opc",
+            [0xF1; 32],
+            std::fs::metadata(&profile_downgrade_path)
+                .expect("profile-downgrade snapshot metadata")
+                .len(),
+        )
+        .expect_err("same-scope snapshot must not downgrade the profile certificate");
+        assert_eq!(downgrade_error.kind(), io::ErrorKind::InvalidData);
+        assert!(protected_roster_profile_activation_matches_scope_sync(
+            &target_conn,
+            storage_identity,
+            storage_identity,
+            &current,
+        )
+        .expect("failed downgrade preserves local profile certificate"));
+
         let same_scope_path = directory.path().join("same-scope-zero-cert.sqlite");
         let (same_scope_last_log, same_scope_membership) =
             build_snapshot_database_sync(&source_conn, storage_identity, &same_scope_path)
@@ -35850,6 +36449,13 @@ LIMIT 20000;
             &successor_members,
         )
         .expect("promotion clears predecessor certificate"));
+        assert!(!protected_roster_profile_activation_matches_scope_sync(
+            &source_conn,
+            storage_identity,
+            successor_identity,
+            &successor_members,
+        )
+        .expect("promotion clears predecessor profile certificate"));
 
         let successor_path = directory.path().join("successor-zero-cert.sqlite");
         let (successor_last_log, successor_membership) =
@@ -35888,6 +36494,13 @@ LIMIT 20000;
             &successor_members,
         )
         .expect("successor remains deliberately unactivated"));
+        assert!(!protected_roster_profile_activation_matches_scope_sync(
+            &target_conn,
+            storage_identity,
+            successor_identity,
+            &successor_members,
+        )
+        .expect("successor profile remains deliberately unactivated"));
     }
 
     #[test]

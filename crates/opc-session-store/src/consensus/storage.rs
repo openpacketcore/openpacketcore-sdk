@@ -1095,7 +1095,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         let result = {
             let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
-            consensus::append_logs_with_authority_sync(
+            consensus::append_logs_with_authority_and_diagnostics_sync(
                 &conn,
                 self.core.storage_identity,
                 self.core.authority_profile,
@@ -1103,6 +1103,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                 &self.core.expected_bindings,
                 self.core.fixed_placement_policy,
                 &entries,
+                self.core.diagnostics.as_deref(),
             )
         };
         match result {
@@ -1265,7 +1266,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             };
             let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
-            let applied = consensus::apply_entries_with_authority_sync(
+            let applied = consensus::apply_entries_with_authority_and_diagnostics_sync(
                 &conn,
                 self.core.storage_identity,
                 &self.core.caps,
@@ -1274,6 +1275,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 &self.core.expected_bindings,
                 self.core.fixed_placement_policy,
                 entries,
+                self.core.diagnostics.as_deref(),
             )
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
             if applies_membership {
@@ -1559,6 +1561,16 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             Ok(previous) => previous,
             Err(error) => return Err(error),
         };
+        if let Some(diagnostics) = &self.core.diagnostics {
+            let conn = self.core.conn.lock().await;
+            match consensus::protected_roster_diagnostic_occupancy_sync(
+                &conn,
+                self.core.storage_identity,
+            ) {
+                Ok(occupancy) => diagnostics.set_protected_roster_occupancy(occupancy),
+                Err(_) => diagnostics.invalidate_protected_roster_occupancy(),
+            }
+        }
         self.core.signal_proactive_checkpoint();
         // The readback helper has disarmed the exact published-file guard, so
         // later staging reclamation cannot delete the authoritative image.

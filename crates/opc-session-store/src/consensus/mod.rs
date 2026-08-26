@@ -20,9 +20,11 @@ pub(crate) use store::OperatorRecoveryCommitError;
 pub use store::{
     validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
     ConsensusSessionStore, ConsensusSessionStoreOpenError, ConsensusStoreDiagnosticSnapshot,
-    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
+    ProtectedRosterConsensusDiagnosticSnapshot, SessionConsensusStatus,
+    SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
     SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS,
 };
 
 pub use types::{

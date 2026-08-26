@@ -2065,6 +2065,39 @@ impl GlobalChargeWitness {
         )
     }
 
+    /// Return the fixed numeric ledger occupancy authenticated by this
+    /// witness.  The projection deliberately contains no partition, tenant,
+    /// request, member, or descriptor material and therefore remains safe for
+    /// store-scoped diagnostics.
+    pub(crate) fn diagnostic_occupancy(
+        self,
+    ) -> Result<ProtectedRosterLedgerOccupancy, ReservationError> {
+        let retained_reservations = self
+            .roster
+            .retained_and_live_bindings
+            .checked_sub(self.roster.live_reservations)
+            .ok_or(ReservationError::SnapshotMismatch)?;
+        let tombstone_reservations = self
+            .roster
+            .durable_epoch_bindings
+            .checked_sub(self.roster.retained_and_live_bindings)
+            .ok_or(ReservationError::SnapshotMismatch)?;
+        Ok(ProtectedRosterLedgerOccupancy {
+            live_reservations: u64::try_from(self.roster.live_reservations)
+                .map_err(|_| ReservationError::SnapshotMismatch)?,
+            retained_reservations: u64::try_from(retained_reservations)
+                .map_err(|_| ReservationError::SnapshotMismatch)?,
+            tombstone_reservations: u64::try_from(tombstone_reservations)
+                .map_err(|_| ReservationError::SnapshotMismatch)?,
+            history_floors: u64::try_from(self.roster.floor_count)
+                .map_err(|_| ReservationError::SnapshotMismatch)?,
+            retirement_cursors: u64::try_from(self.roster.retirement_cursor_count)
+                .map_err(|_| ReservationError::SnapshotMismatch)?,
+            materialized_charge_bytes: self.roster.materialized_charge_bytes,
+            reserved_future_charge_bytes: self.roster.reserved_future_charge_bytes,
+        })
+    }
+
     /// Encode the exact fixed witness for one SQLite consensus row.
     pub(crate) fn to_canonical_bytes(self) -> Result<Vec<u8>, ReservationError> {
         postcard::to_allocvec(&self).map_err(|_| ReservationError::CanonicalEncoding)
@@ -2088,6 +2121,18 @@ impl GlobalChargeWitness {
         }
         Ok(())
     }
+}
+
+/// Fixed-cardinality, redaction-safe projection of one durable roster ledger.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProtectedRosterLedgerOccupancy {
+    pub(crate) live_reservations: u64,
+    pub(crate) retained_reservations: u64,
+    pub(crate) tombstone_reservations: u64,
+    pub(crate) history_floors: u64,
+    pub(crate) retirement_cursors: u64,
+    pub(crate) materialized_charge_bytes: u64,
+    pub(crate) reserved_future_charge_bytes: u64,
 }
 
 impl fmt::Debug for GlobalChargeWitness {

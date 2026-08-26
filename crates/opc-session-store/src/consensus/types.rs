@@ -95,6 +95,13 @@ pub const SESSION_CONSENSUS_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR: &str = concat!(
 );
 const FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-voter-set/v1\0";
+/// Domain-separated immutable protected-roster profile certificate binding.
+///
+/// This deliberately wraps the exact V1 voter scope rather than changing the
+/// certificate table shape: a V1-only activation can therefore never be
+/// mistaken for unanimous support of the frozen protected-roster profile.
+const PROTECTED_ROSTER_PROFILE_VOTER_SET_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/protected-roster-profile-voter-set/v1\0";
 const FENCED_TRANSITION_V2_BATCH_OUTER_REQUEST_ID_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition/v2/batch/outer-id/v1\0";
 
@@ -152,6 +159,23 @@ pub(crate) fn fenced_transition_voter_set_digest(
     for voter in voters {
         hasher.update(voter.get().to_be_bytes());
     }
+    hasher.finalize().into()
+}
+
+/// Bind the exact voter scope to the immutable protected-roster profile.
+///
+/// The profile itself is static SDK configuration, so retaining this digest in
+/// the existing activation certificate is sufficient for deterministic
+/// follower apply, snapshots, and restart without a second mutable profile
+/// record.
+pub(crate) fn protected_roster_profile_voter_set_digest(
+    identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PROTECTED_ROSTER_PROFILE_VOTER_SET_DIGEST_DOMAIN);
+    hasher.update(fenced_transition_voter_set_digest(identity, voters));
+    hasher.update(crate::fenced_mutation_roster::profile_digest());
     hasher.finalize().into()
 }
 
@@ -1564,6 +1588,12 @@ pub enum SessionMutationIntent {
     /// SDK-internal atomic Established-or-Aborted protected-roster terminalization.
     #[doc(hidden)]
     RosterTerminal(Box<ConsensusRosterTerminalCommand>),
+    /// SDK-internal unanimous exact-profile proof for the immutable protected
+    /// roster protocol. The leader turns this into the existing bounded
+    /// activation certificate only after every current voter confirms the
+    /// frozen profile; it must never reach the replicated log directly.
+    #[doc(hidden)]
+    PreflightProtectedRosterProfile,
 }
 
 impl fmt::Debug for SessionMutationIntent {
@@ -4107,6 +4137,11 @@ mod tests {
             )))
             .expect("terminal intent")[0],
             25
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationIntent::PreflightProtectedRosterProfile)
+                .expect("protected roster profile preflight intent")[0],
+            26
         );
         assert_eq!(
             postcard::to_allocvec(&SessionMutationOutcome::FencedTransition(

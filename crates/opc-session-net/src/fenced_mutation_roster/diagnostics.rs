@@ -20,6 +20,8 @@ const LATENCY_BUCKETS: usize = 16;
 pub struct FencedMutationRosterDiagnostics {
     /// Admission mutations sent to the consensus adapter.
     pub admission_calls: u64,
+    /// Admissions retransmitted only after the same retained request was proven not transmitted.
+    pub admission_resubmits: u64,
     /// Admissions proven not to have crossed transport.
     pub admission_not_transmitted: u64,
     /// Admissions whose transport result was ambiguous.
@@ -58,6 +60,8 @@ pub struct FencedMutationRosterDiagnostics {
     pub terminal_prepare_calls: u64,
     /// Atomic terminal mutations sent to the consensus adapter.
     pub terminalize_calls: u64,
+    /// Terminal mutations retransmitted only after the same retained body was proven not transmitted.
+    pub terminalize_resubmits: u64,
     /// Terminal mutations proven not to have crossed transport.
     pub terminalize_not_transmitted: u64,
     /// Terminal mutations whose outcome must be read back.
@@ -104,6 +108,7 @@ pub(crate) type RosterDiagnostics = Arc<RosterDiagnosticsInner>;
 
 pub(crate) struct RosterDiagnosticsInner {
     admission_calls: AtomicU64,
+    admission_resubmits: AtomicU64,
     admission_not_transmitted: AtomicU64,
     admission_outcome_unknown: AtomicU64,
     admission_conclusive: AtomicU64,
@@ -123,6 +128,7 @@ pub(crate) struct RosterDiagnosticsInner {
     member_provider_busy: AtomicU64,
     terminal_prepare_calls: AtomicU64,
     terminalize_calls: AtomicU64,
+    terminalize_resubmits: AtomicU64,
     terminalize_not_transmitted: AtomicU64,
     terminalize_outcome_unknown: AtomicU64,
     terminal_payload_compacted: AtomicU64,
@@ -148,6 +154,7 @@ impl RosterDiagnosticsInner {
     pub(crate) fn new() -> RosterDiagnostics {
         Arc::new(Self {
             admission_calls: AtomicU64::new(0),
+            admission_resubmits: AtomicU64::new(0),
             admission_not_transmitted: AtomicU64::new(0),
             admission_outcome_unknown: AtomicU64::new(0),
             admission_conclusive: AtomicU64::new(0),
@@ -167,6 +174,7 @@ impl RosterDiagnosticsInner {
             member_provider_busy: AtomicU64::new(0),
             terminal_prepare_calls: AtomicU64::new(0),
             terminalize_calls: AtomicU64::new(0),
+            terminalize_resubmits: AtomicU64::new(0),
             terminalize_not_transmitted: AtomicU64::new(0),
             terminalize_outcome_unknown: AtomicU64::new(0),
             terminal_payload_compacted: AtomicU64::new(0),
@@ -192,6 +200,7 @@ impl RosterDiagnosticsInner {
     pub(crate) fn snapshot(&self) -> FencedMutationRosterDiagnostics {
         FencedMutationRosterDiagnostics {
             admission_calls: load(&self.admission_calls),
+            admission_resubmits: load(&self.admission_resubmits),
             admission_not_transmitted: load(&self.admission_not_transmitted),
             admission_outcome_unknown: load(&self.admission_outcome_unknown),
             admission_conclusive: load(&self.admission_conclusive),
@@ -211,6 +220,7 @@ impl RosterDiagnosticsInner {
             member_provider_busy: load(&self.member_provider_busy),
             terminal_prepare_calls: load(&self.terminal_prepare_calls),
             terminalize_calls: load(&self.terminalize_calls),
+            terminalize_resubmits: load(&self.terminalize_resubmits),
             terminalize_not_transmitted: load(&self.terminalize_not_transmitted),
             terminalize_outcome_unknown: load(&self.terminalize_outcome_unknown),
             terminal_payload_compacted: load(&self.terminal_payload_compacted),
@@ -240,17 +250,17 @@ impl RosterDiagnosticsInner {
     }
 
     pub(crate) fn increment(&self, counter: Counter) {
-        counter.atomic(self).fetch_add(1, Ordering::Relaxed);
+        saturating_increment(counter.atomic(self));
     }
     pub(crate) fn record_width(&self, width: usize) {
         if let Some(counter) = self.roster_width.get(width.saturating_sub(1)) {
-            counter.fetch_add(1, Ordering::Relaxed);
+            saturating_increment(counter);
         }
     }
     pub(crate) fn record_latency(&self, latency: Latency, duration: Duration) {
         let milliseconds = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         let bucket = latency_bucket(milliseconds);
-        latency.atomic(self)[bucket].fetch_add(1, Ordering::Relaxed);
+        saturating_increment(&latency.atomic(self)[bucket]);
     }
     pub(crate) fn provider_in_flight(self: &RosterDiagnostics) -> ProviderInFlight {
         let current = self
@@ -279,6 +289,12 @@ fn load(counter: &AtomicU64) -> u64 {
     counter.load(Ordering::Relaxed)
 }
 
+fn saturating_increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(1))
+    });
+}
+
 pub(crate) struct ProviderInFlight {
     diagnostics: RosterDiagnostics,
 }
@@ -293,6 +309,7 @@ impl Drop for ProviderInFlight {
 #[derive(Clone, Copy)]
 pub(crate) enum Counter {
     AdmissionCalls,
+    AdmissionResubmits,
     AdmissionNotTransmitted,
     AdmissionOutcomeUnknown,
     AdmissionConclusive,
@@ -312,6 +329,7 @@ pub(crate) enum Counter {
     MemberProviderBusy,
     TerminalPrepareCalls,
     TerminalizeCalls,
+    TerminalizeResubmits,
     TerminalizeNotTransmitted,
     TerminalizeOutcomeUnknown,
     TerminalPayloadCompacted,
@@ -331,6 +349,7 @@ impl Counter {
     fn atomic(self, d: &RosterDiagnosticsInner) -> &AtomicU64 {
         match self {
             Self::AdmissionCalls => &d.admission_calls,
+            Self::AdmissionResubmits => &d.admission_resubmits,
             Self::AdmissionNotTransmitted => &d.admission_not_transmitted,
             Self::AdmissionOutcomeUnknown => &d.admission_outcome_unknown,
             Self::AdmissionConclusive => &d.admission_conclusive,
@@ -350,6 +369,7 @@ impl Counter {
             Self::MemberProviderBusy => &d.member_provider_busy,
             Self::TerminalPrepareCalls => &d.terminal_prepare_calls,
             Self::TerminalizeCalls => &d.terminalize_calls,
+            Self::TerminalizeResubmits => &d.terminalize_resubmits,
             Self::TerminalizeNotTransmitted => &d.terminalize_not_transmitted,
             Self::TerminalizeOutcomeUnknown => &d.terminalize_outcome_unknown,
             Self::TerminalPayloadCompacted => &d.terminal_payload_compacted,
@@ -393,6 +413,7 @@ fn latency_bucket(milliseconds: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use super::{Counter, Latency, RosterDiagnosticsInner};
@@ -402,8 +423,10 @@ mod tests {
         let diagnostics = RosterDiagnosticsInner::new();
         let clone = diagnostics.clone();
         diagnostics.increment(Counter::MemberCompensateCalls);
+        diagnostics.increment(Counter::AdmissionResubmits);
         diagnostics.increment(Counter::MemberReadyToPrepare);
         clone.increment(Counter::MemberPreparedNotRun);
+        clone.increment(Counter::TerminalizeResubmits);
         clone.increment(Counter::TerminalPayloadCompacted);
         clone.increment(Counter::PublicationAcknowledged);
         diagnostics.record_width(8);
@@ -413,10 +436,12 @@ mod tests {
         let second = clone.provider_in_flight();
         let snapshot = clone.snapshot();
         assert_eq!(snapshot.member_compensate_calls, 1);
+        assert_eq!(snapshot.admission_resubmits, 1);
         assert_eq!(snapshot.member_conclusive, 0);
         assert_eq!(snapshot.member_ready_to_prepare, 1);
         assert_eq!(snapshot.member_prepared_not_run, 1);
         assert_eq!(snapshot.terminal_payload_compacted, 1);
+        assert_eq!(snapshot.terminalize_resubmits, 1);
         assert_eq!(snapshot.publication_acknowledged, 1);
         assert_eq!(snapshot.provider_in_flight, 2);
         assert_eq!(snapshot.provider_in_flight_max, 2);
@@ -428,5 +453,18 @@ mod tests {
         assert!(!exported.contains("roster-secret"));
         drop((first, second));
         assert_eq!(diagnostics.snapshot().provider_in_flight, 0);
+    }
+
+    #[test]
+    fn counters_saturate_without_retaining_dimensions() {
+        let diagnostics = RosterDiagnosticsInner::new();
+        diagnostics
+            .admission_resubmits
+            .store(u64::MAX, Ordering::Relaxed);
+        diagnostics.increment(Counter::AdmissionResubmits);
+
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.admission_resubmits, u64::MAX);
+        assert_eq!(snapshot.terminalize_resubmits, 0);
     }
 }
