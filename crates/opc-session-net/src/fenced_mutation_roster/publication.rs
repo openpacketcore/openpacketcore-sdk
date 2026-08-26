@@ -429,8 +429,8 @@ mod tests {
         },
         client::{
             AdmissionInput, AdmissionOutcome, CompleteProofSet, ExecuteOutcome,
-            FencedMutationRosterClient, MemberOrdinal, MemberPrepareOutcome, TerminalReceipt,
-            TerminalizationOutcome,
+            FencedMutationRosterClient, MemberOrdinal, MemberPrepareOutcome, RecoveryInput,
+            RecoveryOutcome, TerminalReceipt, TerminalizationOutcome,
         },
         runtime::{
             BackendRegistration, ConsensusCommitMetadata, FencedMutationRosterExecutorAttestor,
@@ -456,7 +456,7 @@ mod tests {
         num::NonZeroUsize,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc, Mutex,
+            Arc, Mutex, MutexGuard,
         },
         time::Duration,
     };
@@ -492,6 +492,20 @@ mod tests {
                 lease_expires_at: call.current_lease_expires_at(),
             }
         }
+    }
+
+    fn assert_same_durable_publication_body(expected: &CallSnapshot, actual: &CallSnapshot) {
+        assert_eq!(expected.publication_id, actual.publication_id);
+        assert_eq!(expected.roster_id, actual.roster_id);
+        assert_eq!(expected.admission_commitment, actual.admission_commitment);
+        assert_eq!(
+            expected.terminal_body_commitment,
+            actual.terminal_body_commitment
+        );
+        assert_eq!(expected.receipt_commitment, actual.receipt_commitment);
+        assert_eq!(expected.payload_commitment, actual.payload_commitment);
+        assert_eq!(expected.checkpoint, actual.checkpoint);
+        assert_eq!(expected.result, actual.result);
     }
 
     #[derive(Clone, Copy)]
@@ -649,6 +663,241 @@ mod tests {
         }
     }
 
+    /// The only provider state retained across the restart proof below.  It is
+    /// deliberately smaller than a provider object: one admitted exact intent,
+    /// its externally-visible completion bit, and call counters/snapshots used
+    /// to make the test's safety claims observable.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RestartPublicationState {
+        Reserved,
+        Attempted,
+        Published,
+    }
+
+    #[derive(Default)]
+    struct RestartPublicationJournalState {
+        intent: Option<(CallSnapshot, RestartPublicationState)>,
+        fence_floor: Option<FenceToken>,
+    }
+
+    #[derive(Default)]
+    struct RestartPublicationJournal {
+        state: Mutex<RestartPublicationJournalState>,
+        effect_completed: AtomicBool,
+        provider_authority_expired: AtomicBool,
+        status_calls: AtomicUsize,
+        begin_calls: AtomicUsize,
+        adopt_calls: AtomicUsize,
+        external_effects: AtomicUsize,
+        snapshots: Mutex<Vec<CallSnapshot>>,
+    }
+
+    impl RestartPublicationJournal {
+        fn authorize<'a>(
+            &'a self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<(CallSnapshot, MutexGuard<'a, RestartPublicationJournalState>), ()> {
+            if self.provider_authority_expired.load(Ordering::SeqCst)
+                || call.current_lease_expires_at() <= call.current_lease_acquired_at()
+            {
+                return Err(());
+            }
+            let snapshot = CallSnapshot::capture(call);
+            let mut state = self
+                .state
+                .lock()
+                .expect("restart publication journal state lock");
+            if state
+                .fence_floor
+                .is_some_and(|floor| call.current_fence() < floor)
+            {
+                return Err(());
+            }
+            state.fence_floor = Some(call.current_fence());
+            self.snapshots
+                .lock()
+                .expect("restart publication journal snapshots lock")
+                .push(snapshot.clone());
+            Ok((snapshot, state))
+        }
+
+        fn admit_intent(
+            state: &mut RestartPublicationJournalState,
+            snapshot: CallSnapshot,
+        ) -> RestartPublicationState {
+            match state.intent.as_ref() {
+                Some((retained, state)) => {
+                    assert_same_durable_publication_body(retained, &snapshot);
+                    *state
+                }
+                None => {
+                    state.intent = Some((snapshot, RestartPublicationState::Reserved));
+                    RestartPublicationState::Reserved
+                }
+            }
+        }
+
+        fn intent(&self) -> CallSnapshot {
+            self.state
+                .lock()
+                .expect("restart publication journal state lock")
+                .intent
+                .as_ref()
+                .map(|(intent, _)| intent.clone())
+                .expect("first provider must durably retain exactly one intent")
+        }
+
+        fn state(&self) -> RestartPublicationState {
+            self.state
+                .lock()
+                .expect("restart publication journal state lock")
+                .intent
+                .as_ref()
+                .map(|(_, state)| *state)
+                .expect("first provider must durably retain exactly one intent")
+        }
+
+        fn fence_floor(&self) -> FenceToken {
+            self.state
+                .lock()
+                .expect("restart publication journal state lock")
+                .fence_floor
+                .expect("an authorized provider call raises the durable fence floor")
+        }
+
+        fn expire_provider_authority(&self) {
+            self.provider_authority_expired
+                .store(true, Ordering::SeqCst);
+        }
+
+        fn snapshots(&self) -> Vec<CallSnapshot> {
+            self.snapshots
+                .lock()
+                .expect("restart publication journal snapshots lock")
+                .clone()
+        }
+    }
+
+    /// A process-local provider façade. Reconstructing it from the journal is
+    /// the test's simulated provider process restart; it has no retained
+    /// adapter, executor, authority-registry, or provider-object state.
+    struct RestartJournalProvider {
+        journal: Arc<RestartPublicationJournal>,
+        lose_first_adopt_reply: bool,
+    }
+
+    impl RestartJournalProvider {
+        fn initial(journal: Arc<RestartPublicationJournal>) -> Self {
+            Self {
+                journal,
+                lose_first_adopt_reply: true,
+            }
+        }
+
+        fn recover(journal: Arc<RestartPublicationJournal>) -> Self {
+            Self {
+                journal,
+                lose_first_adopt_reply: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EstablishedPublicationProvider for RestartJournalProvider {
+        type Error = ();
+
+        async fn status(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            let (snapshot, state) = self.journal.authorize(call)?;
+            self.journal.status_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(match state.intent.as_ref() {
+                None => PublicationProviderOutcome::Absent,
+                Some((retained, publication_state)) => {
+                    assert_same_durable_publication_body(retained, &snapshot);
+                    match publication_state {
+                        RestartPublicationState::Published => {
+                            PublicationProviderOutcome::Published(
+                                DurablePublicationProvider::evidence(call),
+                            )
+                        }
+                        RestartPublicationState::Reserved | RestartPublicationState::Attempted => {
+                            PublicationProviderOutcome::Pending(
+                                DurablePublicationProvider::evidence(call),
+                            )
+                        }
+                    }
+                }
+            })
+        }
+
+        async fn begin_publication(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            let (snapshot, mut state) = self.journal.authorize(call)?;
+            self.journal.begin_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(
+                match RestartPublicationJournal::admit_intent(&mut state, snapshot) {
+                    RestartPublicationState::Reserved | RestartPublicationState::Attempted => {
+                        PublicationProviderOutcome::Pending(DurablePublicationProvider::evidence(
+                            call,
+                        ))
+                    }
+                    RestartPublicationState::Published => PublicationProviderOutcome::Published(
+                        DurablePublicationProvider::evidence(call),
+                    ),
+                },
+            )
+        }
+
+        async fn adopt(
+            &self,
+            call: &EstablishedPublicationCall<'_>,
+        ) -> Result<PublicationProviderOutcome, Self::Error> {
+            let (snapshot, mut journal_state) = self.journal.authorize(call)?;
+            self.journal.adopt_calls.fetch_add(1, Ordering::SeqCst);
+            let (retained, publication_state) = journal_state
+                .intent
+                .as_mut()
+                .expect("adoption requires one exact durable intent");
+            assert_same_durable_publication_body(retained, &snapshot);
+            match *publication_state {
+                RestartPublicationState::Published => Ok(PublicationProviderOutcome::Published(
+                    DurablePublicationProvider::evidence(call),
+                )),
+                RestartPublicationState::Attempted => {
+                    if !self.journal.effect_completed.load(Ordering::SeqCst) {
+                        return Ok(PublicationProviderOutcome::Pending(
+                            DurablePublicationProvider::evidence(call),
+                        ));
+                    }
+                    *publication_state = RestartPublicationState::Published;
+                    Ok(PublicationProviderOutcome::Published(
+                        DurablePublicationProvider::evidence(call),
+                    ))
+                }
+                RestartPublicationState::Reserved => {
+                    // The attempt marker becomes durable before the one
+                    // external effect. A successor can reconcile this state,
+                    // but it can never infer resend authority from it.
+                    *publication_state = RestartPublicationState::Attempted;
+                    self.journal.external_effects.fetch_add(1, Ordering::SeqCst);
+                    self.journal.effect_completed.store(true, Ordering::SeqCst);
+                    if self.lose_first_adopt_reply {
+                        Ok(PublicationProviderOutcome::OutcomeUnknown)
+                    } else {
+                        *publication_state = RestartPublicationState::Published;
+                        Ok(PublicationProviderOutcome::Published(
+                            DurablePublicationProvider::evidence(call),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
     struct ConclusiveMemberProvider;
 
     #[async_trait]
@@ -691,8 +940,10 @@ mod tests {
 
     #[derive(Default)]
     struct CountingBackend {
+        registrations: AtomicUsize,
         terminalizations: AtomicUsize,
         committed: Mutex<Option<super::super::runtime::CommittedTerminal>>,
+        recovery: Mutex<Option<(BackendRegistration, Arc<super::super::canonical::Admission>)>>,
     }
 
     #[async_trait]
@@ -703,6 +954,7 @@ mod tests {
             &self,
             request: &super::super::runtime::RegistrationRequest,
         ) -> Result<RegistrationDecision, Self::Error> {
+            self.registrations.fetch_add(1, Ordering::SeqCst);
             Ok(RegistrationDecision::FreshlyAdmitted(
                 BackendRegistration::issue(
                     [0x91; 32],
@@ -722,9 +974,31 @@ mod tests {
 
         async fn recover(
             &self,
-            _request: &super::super::runtime::RecoveryRequest,
+            request: &super::super::runtime::RecoveryRequest,
         ) -> Result<RegistrationDecision, Self::Error> {
-            unreachable!("fixture never recovers the roster")
+            let (registration, admission) = self
+                .recovery
+                .lock()
+                .expect("recovery test record lock")
+                .clone()
+                .expect("fixture persists the exact terminal before recovery");
+            if request.lookup().scope() != admission.scope()
+                || request.lookup().roster_id() != admission.roster_id()
+                || request.authority().fence().get() <= admission.admission_fence().get()
+            {
+                return Err(());
+            }
+            let committed = self
+                .committed
+                .lock()
+                .expect("terminal test record lock")
+                .clone()
+                .expect("fixture terminal is committed before recovery");
+            Ok(RegistrationDecision::Terminal {
+                registration,
+                admission,
+                committed: Box::new(committed),
+            })
         }
 
         async fn terminal_status(
@@ -755,6 +1029,10 @@ mod tests {
             )
             .expect("durable terminal must bind the exact prepared body");
             *self.committed.lock().expect("terminal test record lock") = Some(committed.clone());
+            *self.recovery.lock().expect("recovery test record lock") = Some((
+                request.registration(),
+                Arc::new(request.admission().clone()),
+            ));
             Ok(TerminalizeDecision::Terminalized(committed))
         }
     }
@@ -873,16 +1151,23 @@ mod tests {
         }
     }
 
-    struct Fixture {
-        adapter: PublicationAdapter<DurablePublicationProvider>,
+    struct Fixture<P> {
+        adapter: PublicationAdapter<P>,
         client: FencedMutationRosterClient,
         publication: EstablishedPublication,
         terminal: super::super::client::PreparedRosterTerminal,
         backend: Arc<CountingBackend>,
         clock: Arc<TestClock>,
+        lease_backend: SqliteSessionBackend,
+        scope: Scope,
+        key: SessionKey,
+        roster_id: RosterId,
     }
 
-    async fn fixture(provider: Arc<DurablePublicationProvider>) -> Fixture {
+    async fn fixture<P>(provider: Arc<P>) -> Fixture<P>
+    where
+        P: EstablishedPublicationProvider,
+    {
         let scope = Scope::from_digest([0x71; 32]);
         let clock = Arc::new(TestClock {
             expired: AtomicBool::new(false),
@@ -989,6 +1274,10 @@ mod tests {
             terminal,
             backend,
             clock,
+            lease_backend,
+            scope,
+            key,
+            roster_id: RosterId::from_bytes([0x61; 16]).expect("nonzero test roster ID"),
         }
     }
 
@@ -1106,6 +1395,241 @@ mod tests {
         );
         assert_eq!(fixture.backend.terminalizations.load(Ordering::SeqCst), 1);
         assert_one_exact_capsule(&provider);
+    }
+
+    #[tokio::test]
+    async fn restarted_provider_and_executor_recover_one_durable_intent_without_a_third_consensus_mutation(
+    ) {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let (backend, lease_backend, scope, key, roster_id) = {
+            let first_provider = Arc::new(RestartJournalProvider::initial(Arc::clone(&journal)));
+            let mut fixture = fixture(Arc::clone(&first_provider)).await;
+
+            assert_eq!(
+                fixture.adapter.publish(&mut fixture.publication).await,
+                Err(PublicationAdapterError::RecoveryRequired),
+                "the first provider completes its sole external effect but loses that reply"
+            );
+            assert_eq!(journal.status_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(journal.begin_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(journal.adopt_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
+            assert!(journal.effect_completed.load(Ordering::SeqCst));
+            assert!(matches!(
+                journal.state(),
+                RestartPublicationState::Attempted
+            ));
+
+            // Leaving this block destroys the first provider object, its
+            // adapter, client, executor, scheduler, and local authority
+            // registry. Only the durable provider journal, committed backend
+            // record, and independently durable lease source survive.
+            (
+                Arc::clone(&fixture.backend),
+                fixture.lease_backend.clone(),
+                fixture.scope,
+                fixture.key.clone(),
+                fixture.roster_id,
+            )
+        };
+
+        let restarted_provider = Arc::new(RestartJournalProvider::recover(Arc::clone(&journal)));
+        let restarted_clock = Arc::new(TestClock {
+            expired: AtomicBool::new(false),
+        });
+        let restarted_executor_clock: Arc<dyn Clock> = restarted_clock;
+        let restarted_executor = RosterExecutor::new_with_clock(
+            Arc::new(ConclusiveMemberProvider),
+            Arc::clone(&backend),
+            Arc::new(TestAttestor::new(scope)),
+            NonZeroUsize::new(1).expect("one provider lane"),
+            restarted_executor_clock,
+        );
+        let restarted_adapter =
+            restarted_executor.publication_adapter(Arc::clone(&restarted_provider));
+        let restarted_client = FencedMutationRosterClient::new(restarted_executor, scope);
+        let successor_lease = lease_backend
+            .acquire(
+                &key,
+                OwnerId::new("publication-test-owner").expect("bounded test owner"),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("same owner can acquire a strictly newer durable fence");
+        assert!(
+            successor_lease.fence().get() > journal.intent().fence.get(),
+            "restart recovery must use a fence strictly higher than the original effect"
+        );
+        let recovery = RecoveryInput::new(roster_id, successor_lease, Generation::new(1))
+            .expect("valid successor recovery input");
+        let mut recovered_publication = match restarted_client
+            .recover(&recovery)
+            .await
+            .expect("read exact committed terminal under the successor fence")
+        {
+            RecoveryOutcome::Terminal(TerminalReceipt::Established(established)) => {
+                established.into_publication()
+            }
+            _ => panic!("recovery must return the exact established terminal"),
+        };
+
+        let evidence = restarted_adapter
+            .publish(&mut recovered_publication)
+            .await
+            .expect("the recreated provider must status the durable effect into one exact ACK");
+        assert_eq!(journal.begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.adopt_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.status_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            journal.state(),
+            RestartPublicationState::Published
+        ));
+        assert_eq!(backend.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.terminalizations.load(Ordering::SeqCst), 1);
+
+        let intent = journal.intent();
+        let snapshots = journal.snapshots();
+        let recovered_status = snapshots
+            .last()
+            .expect("restarted provider must observe the recovered publication");
+        assert_same_durable_publication_body(&intent, recovered_status);
+        assert!(
+            recovered_status.fence.get() > intent.fence.get(),
+            "the exact checkpoint/result and publication identity survive while authority advances"
+        );
+        assert_eq!(
+            evidence.publication_id().as_bytes(),
+            &intent.publication_id,
+            "the acknowledgement remains bound to the one durable intent identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_publication_provider_rejects_expired_authority_before_any_io() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let provider = Arc::new(RestartJournalProvider::initial(Arc::clone(&journal)));
+        let mut fixture = fixture(provider).await;
+        journal.expire_provider_authority();
+        let diagnostics_before = fixture.client.diagnostics();
+
+        assert_eq!(
+            fixture.adapter.publish(&mut fixture.publication).await,
+            Err(PublicationAdapterError::RecoveryRequired)
+        );
+        let diagnostics_after = fixture.client.diagnostics();
+        assert_eq!(
+            diagnostics_after.publication_status_calls,
+            diagnostics_before.publication_status_calls + 1,
+            "the SDK must enter provider status before provider-clock rejection"
+        );
+        assert_eq!(
+            diagnostics_after.publication_begin_calls,
+            diagnostics_before.publication_begin_calls
+        );
+        assert_eq!(
+            diagnostics_after.publication_adopt_calls,
+            diagnostics_before.publication_adopt_calls
+        );
+        assert_eq!(journal.status_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.adopt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 0);
+        assert!(journal.snapshots().is_empty());
+        assert_eq!(fixture.backend.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.backend.terminalizations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_successor_fence_rejects_delayed_old_provider_before_io() {
+        let journal = Arc::new(RestartPublicationJournal::default());
+        let first_provider = Arc::new(RestartJournalProvider::initial(Arc::clone(&journal)));
+        let mut fixture = fixture(first_provider).await;
+        let stale_fence = EstablishedPublicationCall::from_established(&fixture.publication)
+            .expect("SDK-issued stale publication")
+            .current_fence();
+
+        let successor_provider = Arc::new(RestartJournalProvider::recover(Arc::clone(&journal)));
+        let successor_executor = RosterExecutor::new_with_clock(
+            Arc::new(ConclusiveMemberProvider),
+            Arc::clone(&fixture.backend),
+            Arc::new(TestAttestor::new(fixture.scope)),
+            NonZeroUsize::new(1).expect("one provider lane"),
+            Arc::new(TestClock {
+                expired: AtomicBool::new(false),
+            }),
+        );
+        let successor_adapter =
+            successor_executor.publication_adapter(Arc::clone(&successor_provider));
+        let successor_client = FencedMutationRosterClient::new(successor_executor, fixture.scope);
+        let successor_lease = fixture
+            .lease_backend
+            .acquire(
+                &fixture.key,
+                OwnerId::new("publication-test-owner").expect("bounded test owner"),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("same owner can acquire a strictly newer durable fence");
+        let successor_fence = successor_lease.fence();
+        assert!(successor_fence > stale_fence);
+        let recovery = RecoveryInput::new(fixture.roster_id, successor_lease, Generation::new(1))
+            .expect("valid successor recovery input");
+        let mut successor_publication = match successor_client
+            .recover(&recovery)
+            .await
+            .expect("read exact committed terminal under the successor fence")
+        {
+            RecoveryOutcome::Terminal(TerminalReceipt::Established(established)) => {
+                established.into_publication()
+            }
+            _ => panic!("recovery must return the exact established terminal"),
+        };
+        successor_adapter
+            .publish(&mut successor_publication)
+            .await
+            .expect("successor publishes under the durable higher fence");
+        assert_eq!(journal.fence_floor(), successor_fence);
+        let calls_before_stale = (
+            journal.status_calls.load(Ordering::SeqCst),
+            journal.begin_calls.load(Ordering::SeqCst),
+            journal.adopt_calls.load(Ordering::SeqCst),
+            journal.snapshots().len(),
+        );
+        let stale_diagnostics_before = fixture.client.diagnostics();
+
+        assert_eq!(
+            fixture.adapter.publish(&mut fixture.publication).await,
+            Err(PublicationAdapterError::RecoveryRequired),
+            "the first process's still-locally-current permit cannot cross the durable provider fence floor"
+        );
+        let stale_diagnostics_after = fixture.client.diagnostics();
+        assert_eq!(
+            stale_diagnostics_after.publication_status_calls,
+            stale_diagnostics_before.publication_status_calls + 1,
+            "the old SDK process must enter provider status before the durable floor rejects it"
+        );
+        assert_eq!(
+            stale_diagnostics_after.publication_begin_calls,
+            stale_diagnostics_before.publication_begin_calls
+        );
+        assert_eq!(
+            stale_diagnostics_after.publication_adopt_calls,
+            stale_diagnostics_before.publication_adopt_calls
+        );
+        assert_eq!(
+            (
+                journal.status_calls.load(Ordering::SeqCst),
+                journal.begin_calls.load(Ordering::SeqCst),
+                journal.adopt_calls.load(Ordering::SeqCst),
+                journal.snapshots().len(),
+            ),
+            calls_before_stale,
+            "the delayed old fence is rejected before provider I/O"
+        );
+        assert_eq!(journal.external_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.backend.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.backend.terminalizations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
