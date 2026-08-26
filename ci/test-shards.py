@@ -54,14 +54,14 @@ SELECTION = ["cargo", "test", *PACKAGES, "--quiet"]
 EXAMPLES = ["cargo", "build", *PACKAGES, "--quiet", "--examples"]
 HARNESS = ["--test-threads=4"]
 
-# This test intentionally proves that an ordinary write fits inside the public
-# 250 ms operation budget. Running it beside unrelated Tokio runtimes makes the
-# assertion measure process scheduling and unawaited fixture teardown instead
-# of the request path. Keep the production deadline exact and give this one
-# timing contract its own process.
+# These tests intentionally prove literal authority or operation budgets.
+# Running them beside unrelated Tokio runtimes makes the assertion measure
+# process scheduling and fixture teardown instead of the request path. Keep
+# the production bounds exact and give each timing contract its own process.
 QUIESCENT_INTEGRATION_TARGET = "stateless_quorum_consumer"
-QUIESCENT_INTEGRATION_TEST = (
-    "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum"
+QUIESCENT_INTEGRATION_TESTS = (
+    "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
+    "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
 )
 
 # A partition that collapses to a handful of targets would still be "total and
@@ -181,17 +181,18 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
 
     # libtest's skip filter is substring-based unless --exact is present. The
     # ordinary invocation still runs every other test in this target, while a
-    # fresh process runs the timing contract alone with no competing runtime.
-    return [
+    # fresh process runs each timing contract alone with no competing runtime.
+    skips = [
+        arg
+        for name in QUIESCENT_INTEGRATION_TESTS
+        for arg in ("--skip", name)
+    ]
+    ordinary = (
         SELECTION
         + selected
-        + [
-            "--",
-            *HARNESS,
-            "--exact",
-            "--skip",
-            QUIESCENT_INTEGRATION_TEST,
-        ],
+        + ["--", *HARNESS, "--exact", *skips]
+    )
+    isolated = [
         SELECTION
         + [
             "--test",
@@ -199,9 +200,11 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
             "--",
             "--test-threads=1",
             "--exact",
-            QUIESCENT_INTEGRATION_TEST,
-        ],
+            name,
+        ]
+        for name in QUIESCENT_INTEGRATION_TESTS
     ]
+    return [ordinary, *isolated]
 
 
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -284,20 +287,25 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
             f"integration shard, found {owners}"
         )
     owner_commands = commands(plan, owners[0], targets)
-    isolated = SELECTION + [
-        "--test",
-        QUIESCENT_INTEGRATION_TARGET,
-        "--",
-        "--test-threads=1",
-        "--exact",
-        QUIESCENT_INTEGRATION_TEST,
+    for name in QUIESCENT_INTEGRATION_TESTS:
+        isolated = SELECTION + [
+            "--test",
+            QUIESCENT_INTEGRATION_TARGET,
+            "--",
+            "--test-threads=1",
+            "--exact",
+            name,
+        ]
+        if owner_commands.count(isolated) != 1:
+            sys.exit(
+                f"{owners[0]} no longer runs {name!r} exactly once in its "
+                "isolated process"
+            )
+    skip = ["--exact"] + [
+        arg
+        for name in QUIESCENT_INTEGRATION_TESTS
+        for arg in ("--skip", name)
     ]
-    if owner_commands.count(isolated) != 1:
-        sys.exit(
-            f"{owners[0]} no longer runs {QUIESCENT_INTEGRATION_TEST!r} "
-            "exactly once in its isolated process"
-        )
-    skip = ["--exact", "--skip", QUIESCENT_INTEGRATION_TEST]
     ordinary = [
         command
         for command in owner_commands
@@ -308,7 +316,7 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     ]
     if len(ordinary) != 1:
         sys.exit(
-            f"{owners[0]} must skip {QUIESCENT_INTEGRATION_TEST!r} exactly "
+            f"{owners[0]} must skip every isolated timing contract exactly "
             "once in its ordinary multi-test process"
         )
     print(f"shard commands ok: misc issues {len(misc)} invocations")
@@ -373,7 +381,7 @@ def list_heavy_tests(plan: dict, extra: list[str]) -> set[str]:
     }
 
 
-def list_quiescent_integration_test() -> list[str]:
+def list_quiescent_integration_test(name: str) -> list[str]:
     """Resolve the isolated timing contract using its exact CI invocation."""
     command = SELECTION + [
         "--test",
@@ -381,7 +389,7 @@ def list_quiescent_integration_test() -> list[str]:
         "--",
         "--list",
         "--exact",
-        QUIESCENT_INTEGRATION_TEST,
+        name,
     ]
     out = subprocess.run(
         command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
@@ -412,14 +420,17 @@ def precheck(plan: dict, shard: str) -> None:
         shard in buckets
         and QUIESCENT_INTEGRATION_TARGET in buckets[shard]
     ):
-        selected = list_quiescent_integration_test()
-        if selected != [QUIESCENT_INTEGRATION_TEST]:
-            sys.exit(
-                f"{shard} cannot resolve isolated test "
-                f"{QUIESCENT_INTEGRATION_TEST!r} exactly once; selected "
-                f"{selected}"
-            )
-        print(f"{shard} isolated timing contract resolves exactly once")
+        for name in QUIESCENT_INTEGRATION_TESTS:
+            selected = list_quiescent_integration_test(name)
+            if selected != [name]:
+                sys.exit(
+                    f"{shard} cannot resolve isolated test {name!r} exactly "
+                    f"once; selected {selected}"
+                )
+        print(
+            f"{shard} isolated timing contracts resolve exactly once: "
+            f"{len(QUIESCENT_INTEGRATION_TESTS)}"
+        )
     if not shard.startswith("heavy-"):
         return
     group = plan["heavy"]["shards"][int(shard.split("-", 1)[1])]

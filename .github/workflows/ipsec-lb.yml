@@ -61,7 +61,14 @@ jobs:
       - name: Run conformance tests
         run: |
           set -euo pipefail
-          timing_contract=persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
+          timing_contracts=(
+            persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
+            persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal
+          )
+          skips=()
+          for timing_contract in "${timing_contracts[@]}"; do
+            skips+=(--skip "$timing_contract")
+          done
           cargo test --locked \
             -p opc-ipsec-lb \
             -p opc-ipsec-lb-ebpf-common \
@@ -71,16 +78,18 @@ jobs:
             -- \
             --test-threads=4 \
             --exact \
-            --skip "$timing_contract"
-          cargo test --locked \
-            -p opc-session-net \
-            --all-features \
-            --quiet \
-            --test stateless_quorum_consumer \
-            -- \
-            --test-threads=1 \
-            --exact \
-            "$timing_contract"
+            "${skips[@]}"
+          for timing_contract in "${timing_contracts[@]}"; do
+            cargo test --locked \
+              -p opc-session-net \
+              --all-features \
+              --quiet \
+              --test stateless_quorum_consumer \
+              -- \
+              --test-threads=1 \
+              --exact \
+              "$timing_contract"
+          done
 
   docs:
     name: Rust docs

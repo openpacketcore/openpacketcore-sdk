@@ -509,10 +509,44 @@ jobs:
           shared-key: opc-session-net-i686
 
       - name: Run opc-session-net tests on i686
-        # The stateless three-voter consumer proofs retain literal 100/250 ms
-        # caller budgets.  Serialize this 32-bit lane so unrelated quorum
-        # fixtures cannot consume those budgets through host contention.
-        run: cargo test --locked -p opc-session-net --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=1
+        # The stateless three-voter consumer proofs retain literal authority,
+        # snapshot, and 100/250 ms caller budgets. Run every test exactly once,
+        # but give each wall-time contract a fresh 32-bit process so completed
+        # fixture runtimes cannot consume a later contract's budget.
+        run: |
+          set -euo pipefail
+          timing_contracts=(
+            persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
+            persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction
+            persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal
+            persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart
+            protected_consumer_chain_after_activation_elides_outer_capability_wire_calls
+          )
+          skips=()
+          for timing_contract in "${timing_contracts[@]}"; do
+            skips+=(--skip "$timing_contract")
+          done
+          cargo test --locked \
+            -p opc-session-net \
+            --all-features \
+            --target i686-unknown-linux-gnu \
+            --quiet \
+            -- \
+            --test-threads=1 \
+            --exact \
+            "${skips[@]}"
+          for timing_contract in "${timing_contracts[@]}"; do
+            cargo test --locked \
+              -p opc-session-net \
+              --all-features \
+              --target i686-unknown-linux-gnu \
+              --quiet \
+              --test stateless_quorum_consumer \
+              -- \
+              --test-threads=1 \
+              --exact \
+              "$timing_contract"
+          done
 
       # Widened beyond opc-session-net: opc-protocol is the shared error type
       # whose layout every protocol crate depends on, and opc-proto-gtpv2c

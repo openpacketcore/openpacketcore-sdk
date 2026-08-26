@@ -6,18 +6,15 @@ end-to-end application latency.
 
 ## Candidate lineage
 
-The latest signed pre-dependency preservation checkpoint is
-`1f0d9ed2aec17b2e1a7c2d01b525f4c867cea57c`, tree
-`b06f29b5e7074653feed7bac6952ef40faf6a466`, based on
-`f2ed1181c85540cc01ea0b4611fa3620891375fd`. The complete invariant review was
-frozen one additive test commit earlier at
-`2441f30205f6369d7bf5de4603b610d4890704b1`, tree
-`7f6f99e1f762f25dd0bddfec30b6b614efcfd6bc`, with no P0, P1, or P2 finding.
-The final commit adds only the public-shutdown cancellation/retry regression
-described below. These commits are development evidence, not consumable pins.
-The final head/tree, normal dependency merge base, PR URL, hosted checks,
-frozen review, and normal merge SHA must be recorded here only after the #704
-successor lands and the minimal #707 delta is ported to that lineage.
+The signed semantic candidate immediately before this evidence-only refresh is
+`6b730906269e8d91ae1b76144558268916c66e8e`, tree
+`37c57e155604e45e1c21a1b521013a50ed031054`. It is based directly on the
+normal PR #717 merge at `ff3d41b08b73d987e52c9a87481f3ef7266f760c` and is
+published as [draft PR #729](https://github.com/openpacketcore/openpacketcore-sdk/pull/729).
+The PR remains a candidate, not a consumable pin: hosted checks and the final
+frozen-head review must complete before it leaves draft, and there is no merge
+SHA yet. The PR head ref, rather than the self-referential hash in this
+committed document, is authoritative for the final documentation-only commit.
 
 ## Focused behavior evidence
 
@@ -40,7 +37,7 @@ cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
   persistent_three_voter_protected_roster_durable_crash_cut_matrix \
   -- --exact --nocapture
 
-result: PASS within the complete 32-test production transport target
+result: PASS within the complete 39-test production transport target
 topology: three real Openraft voters over mTLS with durable provider journals
 cuts: exactly 13 enumerated admission/provider/terminal/publication/ACK cuts
 assertion: no blind replay and exactly two accepted mutations on every
@@ -65,16 +62,26 @@ The 13 frozen cuts are:
 
 ```text
 cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
-  persistent_three_voter_protected_roster_not_found_after_outcome_unknown_blocks_terminalization \
+  persistent_three_voter_protected_roster_not_found_after_outcome_unknown_requires_adoption \
   -- --exact --nocapture
 
 result: PASS
-assertion: NotFound is non-exclusionary; no terminal or publication mutation
+assertion: NotFound is non-exclusionary; no terminal or publication mutation;
+           exact same-member adoption is required for a conclusive proof
 ```
 
 ```text
-cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
-  survives_full_restart -- --nocapture
+cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-features \
+  persistent_three_voter_protected_roster_established_before_publication_survives_full_restart \
+  -- --exact --nocapture
+
+cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-features \
+  persistent_three_voter_protected_roster_publication_published_before_acknowledgement_survives_full_restart \
+  -- --exact --nocapture
+
+cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-features \
+  persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart \
+  -- --exact --nocapture
 
 result: PASS (all three full-process restart cases)
 assertions: higher-fence cross-node recovery; old/expired fence rejection;
@@ -91,76 +98,77 @@ election fleets competing on the qualification host.
 
 ```text
 cargo test --locked -p opc-session-store --all-features --lib \
-  protected_roster_advance_ -- --nocapture
+  fenced_mutation_roster_storage::production_tests::exact_live_combined_and_durable_limits_are_enforced \
+  -- --exact --nocapture
 
-result: PASS within the complete 551-test store library target
+cargo test --locked -p opc-session-store --all-features --lib \
+  fenced_mutation_roster_storage::production_tests::terminalization_reuses_its_admission_slot_at_capacity \
+  -- --exact --nocapture
+
+cargo test --locked -p opc-session-store --all-features --lib \
+  fenced_mutation_roster_storage::production_tests::reclaim_is_oldest_bounded_and_never_reclaims_live_or_young_rows \
+  -- --exact --nocapture
+
+cargo test --locked -p opc-session-store --all-features --lib \
+  fenced_mutation_roster_storage::production_tests::reclaim_compaction_requires_exact_24_hour_boundary_with_nanosecond_precision \
+  -- --exact --nocapture
+
+cargo test --locked -p opc-session-store --all-features --lib \
+  sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch \
+  -- --exact --nocapture
+
+cargo test --locked -p opc-session-store --all-features --lib \
+  sqlite::consensus::tests::due_protected_roster_maintenance_reclaims_the_oldest_bounded_prefix_only \
+  -- --exact --nocapture
+
+result: PASS
 assertions: fault rollback is atomic; retention begins at terminalization;
             exact 24-hour eligibility; no live/young reclaim; deterministic
-            oldest tie order; one page is exactly bounded to 1,024 rows
+            oldest tie order; each operation removes the oldest
+            min(1,024, eligible) rows, including the final partial batch
 ```
 
 Additional focused store tests cover admission reservation, live-to-retained
 conversion without a second capacity charge, snapshot/restart restoration,
 local and remote key rotation, terminal record plus receipt atomicity, exact
-replay/conflict, successor fencing, and fixed numeric diagnostics. The final
-lineage qualification must list each exact command and result here.
+replay/conflict, successor fencing, and fixed numeric diagnostics.
 
-## Preserved-branch gate audit
+## Successor gate audit
 
-The 2026-08-25 development-lineage audit completed these exact gates:
+The 2026-08-26 successor-lineage audit completed these exact local gates at
+the signed semantic candidate above:
 
 ```text
-cargo test --locked -p opc-session-net --all-features
-result: PASS
-detail: 322 library tests, all integration targets, 32/32 real transport tests,
-        45/45 three-node quorum tests, and 7 doctests
-
-cargo test --locked -p opc-session-store --all-features
-result: PASS
-detail: 551 library tests in 348.58 seconds, every integration target, and
-        10 doctests
-
-cargo check --locked --workspace --all-targets --all-features
-result: PASS
-
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 result: PASS
 
-cargo test -p opc-session-store --lib \
-  consensus::store::membership_tests::shutdown_retry_after_cancellation_waits_for_detached_snapshot_capture \
-  -- --exact
-result: PASS; cancelling public shutdown cannot authorize reopen while a real
-        detached snapshot capture worker still owns SQLite, and a retry
-        completes only after that tracked owner exits
-
-RUSTDOCFLAGS="-D warnings" cargo doc --locked \
-  -p opc-session-net -p opc-session-store --no-deps --all-features
+cargo fmt --all -- --check
+git diff --check
 result: PASS
 
-mdbook build
-result: PASS with the repository-pinned mdBook 0.4.40
-
-cargo deny check bans licenses sources
-result: PASS (repository-configured duplicate/version warnings only)
-
 python3 ci/test-shards.py verify
-python3 ci/test-shards.py verify-heavy
-result: PASS; 269 integration targets are total and disjoint, and all 48
-        heavyweight tests are assigned to a guarded lane
+result: PASS; six shards and seven guarded lanes cover 272 integration targets
+
+python3 scripts/check-management-plane-policy.py --self-test
+python3 scripts/check-management-plane-policy.py --check
+result: PASS
+
+python3 crates/opc-proto-diameter/fuzz/generate_corpus.py self-test
+result: PASS
+
+cargo test --locked -p opc-session-store --lib 'recovery::tests::' -- --nocapture
+result: PASS; 44 passed, 0 failed
+
+cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
+  -- --nocapture
+result: PASS; 37 passed, 0 failed, 2 release-only latency tests ignored
 ```
 
-Default, no-default-feature, and all-feature checks for both affected crates
-also pass. The management-policy self-test passes. Its full-tree check reports
-only four pre-existing adjacent-`SAFETY` findings in the unchanged
-`opc-sqlite-file-control-sys/src/lib.rs` (last changed by `946e4908`); the file
-is byte-identical to the preserved branch base and outside #707. The final
-successor must rerun the policy and formatter gates against its then-current
-normal dependency base rather than claim this baseline exception as a pass.
-
-The host's 2026-08-18 stable rustfmt reports broad mechanical drift in the
-stale development lineage, including untouched files. No broad formatter
-rewrite is included in the preservation checkpoint. The clean post-dependency
-successor must pass `cargo fmt --all --check` before publication.
+For the same candidate, hosted CI has passed strict Clippy, Rust gates, MSRV,
+generated-code drift, the persistence contract, security/advisory/license
+scans, and the completed privileged Linux datapath jobs. Remaining hosted test,
+documentation, feature, and platform lanes and the independent exact-head
+review are still pending; this document does not claim merge readiness.
 
 ## Required final gates
 
