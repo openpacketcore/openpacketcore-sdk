@@ -16,9 +16,9 @@ use super::{
     diagnostics::{FencedMutationRosterDiagnostics, RosterDiagnostics},
     runtime::{
         AppliedProof, CallResult, ExecutorError, LeaseMetadata, PreparedTerminal,
-        PublicationAuthority, RecoveryLookup, RecoveryRequest, RecoveryResult, Registration,
-        RegistrationRequest, RosterExecutor, RosterExecutorBackend, TerminalCommitReceipt,
-        TerminalStatusResult,
+        PublicationAuthority, RecoveryLeaseAuthority, RecoveryLookup, RecoveryRequest,
+        RecoveryResult, Registration, RegistrationRequest, RosterExecutor, RosterExecutorBackend,
+        TerminalCommitReceipt, TerminalStatusResult,
     },
 };
 use async_trait::async_trait;
@@ -313,12 +313,14 @@ impl RecoveryInput {
             RecoveryLookup::new(scope, self.roster_id),
             self.original_owner.clone(),
             self.original_admission_fence,
-            self.lease.key().clone(),
-            self.lease.owner().clone(),
-            self.lease.fence(),
-            self.lease.credential_id(),
-            self.expected_generation,
-            LeaseMetadata::new(self.lease.acquired_at(), self.lease.expires_at()),
+            RecoveryLeaseAuthority::new(
+                self.lease.key().clone(),
+                self.lease.owner().clone(),
+                self.lease.fence(),
+                self.lease.credential_id(),
+                self.expected_generation,
+                LeaseMetadata::new(self.lease.acquired_at(), self.lease.expires_at()),
+            ),
         )
         .map_err(Into::into)
     }
@@ -355,7 +357,7 @@ impl<'de> Deserialize<'de> for RecoveryInput {
             wire.lease,
             wire.expected_generation,
         )
-            .map_err(serde::de::Error::custom)
+        .map_err(serde::de::Error::custom)
     }
 }
 
