@@ -1006,6 +1006,67 @@ impl CommittedTerminal {
         Ok(value)
     }
 
+    /// Validate the self-contained commitment shape of retained terminal bytes.
+    ///
+    /// This does not grant publication authority: callers must still use
+    /// [`Self::from_canonical_bytes`] with the exact recovered admission. It is
+    /// used at the consensus response boundary to reject a response capsule
+    /// whose embedded terminal body differs from the submitted command.
+    pub(crate) fn canonical_terminal_body_commitment(
+        bytes: &[u8],
+    ) -> Result<[u8; 32], ExecutorError> {
+        let wire: CommittedTerminalWire = decode_frame(
+            bytes,
+            COMMITTED_TERMINAL_FRAME_MAGIC,
+            COMMITTED_TERMINAL_FRAME_DOMAIN,
+            MAX_COMMITTED_TERMINAL_CODEC_BYTES,
+        )
+        .map_err(|_| ExecutorError::InvalidTerminal)?;
+        wire.record
+            .validate_self_contained()
+            .map_err(|_| ExecutorError::InvalidTerminal)?;
+        wire.commit_metadata.validate()?;
+        AuthorityBinding::for_recovery(
+            Scope::from_digest(wire.committing_authority_scope),
+            wire.committing_authority_key.clone(),
+            wire.committing_authority_owner.clone(),
+            wire.committing_authority_fence,
+            AuthorityLeaseMetadata::new(
+                wire.committing_authority_credential_id,
+                wire.committing_authority_generation,
+                wire.committing_authority_acquired_at,
+                wire.committing_authority_expires_at,
+            ),
+        )?;
+        let phase_matches_materialization = matches!(
+            (wire.record.phase(), &wire.materialization),
+            (
+                Ok(Phase::Established),
+                TerminalMaterializationWire::Updated { .. }
+                    | TerminalMaterializationWire::Deleted { .. }
+                    | TerminalMaterializationWire::NoOp { .. }
+            ) | (Ok(Phase::Aborted), TerminalMaterializationWire::Aborted)
+        );
+        if wire.committing_registration_handle == [0; 32]
+            || wire.committing_registration_terminal_slot_id == [0; 32]
+            || wire.committing_registration_request_id != wire.record.request_id()
+            || wire.committing_guard_commitment == [0; 32]
+            || wire.receipt_commitment == [0; 32]
+            || !phase_matches_materialization
+            || encode_frame(
+                COMMITTED_TERMINAL_FRAME_MAGIC,
+                COMMITTED_TERMINAL_FRAME_DOMAIN,
+                &wire,
+                MAX_COMMITTED_TERMINAL_CODEC_BYTES,
+            )
+            .map_err(|_| ExecutorError::InvalidTerminal)?
+                != bytes
+        {
+            return Err(ExecutorError::InvalidTerminal);
+        }
+        Ok(wire.record.body_commitment())
+    }
+
     fn validate_common(
         &self,
         registration: BackendRegistration,
@@ -1070,6 +1131,23 @@ impl CommittedTerminal {
 
     pub(crate) fn record(&self) -> &TerminalRecord {
         &self.record
+    }
+
+    /// Exact registration that bound the historical terminal proof set.
+    ///
+    /// Storage uses this only to re-verify retained terminal evidence after a
+    /// restart or snapshot install. It is deliberately crate-private so a
+    /// caller cannot manufacture a terminal publication capability from it.
+    pub(crate) const fn committing_registration(&self) -> BackendRegistration {
+        self.committing_registration
+    }
+
+    /// Exact authority that committed the historical terminal proof set.
+    ///
+    /// This is provenance, not a current-leader authority grant. A later
+    /// same-body replay may carry proofs issued for a newer authority.
+    pub(crate) fn committing_authority(&self) -> &AuthorityBinding {
+        &self.committing_authority
     }
 
     pub(crate) const fn commit_metadata(&self) -> ConsensusCommitMetadata {
