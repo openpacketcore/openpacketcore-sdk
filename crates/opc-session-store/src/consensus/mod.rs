@@ -16,6 +16,9 @@ pub use network::{
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub use store::test_support;
 pub(crate) use store::OperatorRecoveryCommitError;
 pub use store::{
     validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,

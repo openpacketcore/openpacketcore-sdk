@@ -148,6 +148,11 @@ pub fn validate_consensus_physical_fenced_transition_request(
 
 mod membership;
 
+/// Feature-gated signing fixtures for live consensus integration coverage.
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub mod test_support;
+
 use membership::SessionTopologyCoordinatorState;
 pub use membership::{
     SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
@@ -13588,6 +13593,7 @@ mod membership_tests {
                         expected_member_version: member.expected_version(),
                         admission_generation: admission.expected_generation().get(),
                         authority_scope: authority.scope().digest(),
+                        authority_ingress_scope: authority.ingress_scope().digest(),
                         authority_key_canonical: authority.key().canonical_digest_input(),
                         authority_owner: authority.owner().as_str().as_bytes().to_vec(),
                         authority_fence: authority.fence().get(),
@@ -13612,7 +13618,7 @@ mod membership_tests {
                         evidence: input.evidence.clone(),
                         provider_certificate: self.certificate(
                             RosterAttestationCertificateRoleV1::Provider,
-                            authority.scope().digest(),
+                            authority.ingress_scope().digest(),
                             [0x4a; 32],
                             [0x4b; 32],
                             self.executor_key.verifying_key(),
@@ -13632,7 +13638,7 @@ mod membership_tests {
                 &self.root,
                 self.certificate(
                     RosterAttestationCertificateRoleV1::Executor,
-                    authority.scope().digest(),
+                    authority.ingress_scope().digest(),
                     [0x47; 32],
                     [0x48; 32],
                     self.executor_key.verifying_key(),
@@ -13673,7 +13679,7 @@ mod membership_tests {
                     };
                     let provider_certificate = self.certificate(
                         RosterAttestationCertificateRoleV1::Provider,
-                        authority.scope().digest(),
+                        authority.ingress_scope().digest(),
                         [0x4a; 32],
                         [0x4b; 32],
                         self.executor_key.verifying_key(),
@@ -13711,7 +13717,7 @@ mod membership_tests {
                 &self.root,
                 self.certificate(
                     RosterAttestationCertificateRoleV1::Executor,
-                    authority.scope().digest(),
+                    authority.ingress_scope().digest(),
                     [0x47; 32],
                     [0x48; 32],
                     self.executor_key.verifying_key(),
@@ -16836,6 +16842,15 @@ mod membership_tests {
     #[test]
     fn protected_roster_profile_probe_and_certificate_binding_fail_closed() {
         let profile_digest = crate::fenced_mutation_roster::profile_digest();
+        let single_scope_profile_digest = [
+            0x1f, 0xc9, 0xe4, 0xbd, 0xaf, 0xfd, 0x17, 0x46, 0xf1, 0xaf, 0x8d, 0x21, 0xc7, 0xb7,
+            0x34, 0x37, 0xc5, 0xba, 0x14, 0x22, 0x8e, 0xc4, 0x3b, 0xe4, 0xe2, 0xcf, 0x18, 0x2c,
+            0x6a, 0x3d, 0xda, 0x35,
+        ];
+        assert_ne!(
+            profile_digest, single_scope_profile_digest,
+            "the successor-ingress proof format must have a distinct capability digest",
+        );
         let probe = ProtectedRosterProfileCapabilityProbe {
             domain: PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V1,
             schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
@@ -16867,7 +16882,7 @@ mod membership_tests {
                 ProtectedRosterProfileCapabilityProbe {
                     domain: PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V1,
                     schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V1,
-                    profile_digest: [0xA6; 32],
+                    profile_digest: single_scope_profile_digest,
                 },
                 AtomicFencedTransitionCapability::V1,
             ),
@@ -18982,12 +18997,12 @@ mod membership_tests {
                 admission.body_commitment(),
                 terminal.body_commitment(),
                 receipt_commitment,
-                original_owner,
+                original_owner.clone(),
                 original_lease.fence(),
                 registration_handle,
                 registration_request_id.to_bytes(),
                 *registration_terminal_slot.as_bytes(),
-                successor_owner,
+                successor_owner.clone(),
                 successor_lease.fence(),
                 successor_lease.credential_id(),
                 Generation::new(1),
@@ -19023,6 +19038,58 @@ mod membership_tests {
                 .await,
             SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
                 SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current
+            )
+        ));
+
+        let wrong_ingress_publication =
+            crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule::new(
+                [0x70; 32],
+                key.clone(),
+                *admission.roster_id().as_bytes(),
+                admission.body_commitment(),
+                terminal.body_commitment(),
+                receipt_commitment,
+                original_owner,
+                original_lease.fence(),
+                registration_handle,
+                registration_request_id.to_bytes(),
+                *registration_terminal_slot.as_bytes(),
+                successor_owner,
+                successor_lease.fence(),
+                successor_lease.credential_id(),
+                Generation::new(1),
+                successor_lease.acquired_at(),
+                successor_lease.expires_at(),
+            )
+            .expect("foreign-ingress publication query");
+        let wrong_ingress_request_id = SessionConsumerRequestId::from_bytes([0x6a; 16]);
+        let wrong_ingress_request = SessionConsumerRequest::new(
+            scope,
+            wrong_ingress_request_id,
+            SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
+                request: Box::new(wrong_ingress_publication),
+            },
+        );
+        let (wrong_ingress_tag, wrong_ingress_digest) =
+            session_consumer_roster_ingress_operation(wrong_ingress_request.operation())
+                .expect("foreign-ingress publication operation");
+        assert!(matches!(
+            service
+                .execute_roster_ingress(
+                    &roster_authorization,
+                    wrong_ingress_request,
+                    issuer.ingress(
+                        peer_identity_commitment,
+                        roster_scope.digest(),
+                        wrong_ingress_request_id,
+                        wrong_ingress_tag,
+                        wrong_ingress_digest,
+                    ),
+                    None,
+                )
+                .await,
+            SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
+                SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Rejected
             )
         ));
 
@@ -19065,19 +19132,6 @@ mod membership_tests {
             ),
         )
         .expect("old owner authority");
-        let wrong_scope = AuthorityBinding::from_consensus_parts(
-            [0x70; 32],
-            key.clone(),
-            successor_authority.owner().clone(),
-            successor_lease.fence(),
-            AuthorityLeaseMetadata::new(
-                successor_lease.credential_id(),
-                Generation::new(1),
-                successor_lease.acquired_at(),
-                successor_lease.expires_at(),
-            ),
-        )
-        .expect("wrong scope authority");
         let wrong_tenant = AuthorityBinding::from_consensus_parts(
             roster_scope.digest(),
             SessionKey {
@@ -19163,7 +19217,6 @@ mod membership_tests {
             equal_fence,
             lower_fence,
             old_owner,
-            wrong_scope,
             wrong_tenant,
             wrong_key,
             wrong_generation,

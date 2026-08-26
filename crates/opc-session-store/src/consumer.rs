@@ -28,6 +28,7 @@ use crate::consensus::types::{
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
 };
+use crate::fenced_mutation_roster::RosterAttestationTrustRootIdentityV1;
 use crate::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
     FenceToken, FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
@@ -860,6 +861,7 @@ pub struct SessionConsumerRoster {
     scope: SessionConsumerScope,
     consensus_members: BTreeMap<SessionConsensusNodeId, SessionConsumerRosterMember>,
     roster_commitment: SessionConsumerRosterCommitment,
+    roster_attestation_root_identity: Option<RosterAttestationTrustRootIdentityV1>,
 }
 
 impl SessionConsumerRoster {
@@ -874,6 +876,25 @@ impl SessionConsumerRoster {
         scope: SessionConsumerScope,
         expected_members: &BTreeSet<SessionConsensusNodeId>,
         descriptors: impl IntoIterator<Item = (u64, QuorumReplicaDescriptor)>,
+    ) -> Result<Self, SessionConsumerRosterError> {
+        Self::try_new_with_roster_attestation_root_identity(
+            scope,
+            expected_members,
+            descriptors,
+            None,
+        )
+    }
+
+    /// Construct a roster from validated topology while retaining only the
+    /// opaque identity of its protected-roster verifier root. This cannot
+    /// configure a root or expose its key; it merely lets the consumed
+    /// protected-roster client reject a caller-selected attestor root.
+    #[doc(hidden)]
+    pub(crate) fn try_new_with_roster_attestation_root_identity(
+        scope: SessionConsumerScope,
+        expected_members: &BTreeSet<SessionConsensusNodeId>,
+        descriptors: impl IntoIterator<Item = (u64, QuorumReplicaDescriptor)>,
+        roster_attestation_root_identity: Option<RosterAttestationTrustRootIdentityV1>,
     ) -> Result<Self, SessionConsumerRosterError> {
         validate_expected_roster_members(expected_members)?;
 
@@ -916,6 +937,7 @@ impl SessionConsumerRoster {
             scope,
             consensus_members,
             roster_commitment,
+            roster_attestation_root_identity,
         })
     }
 
@@ -960,6 +982,7 @@ impl SessionConsumerRoster {
                 member,
                 voter_count: self.consensus_members.len(),
                 roster_commitment: self.roster_commitment,
+                roster_attestation_root_identity: self.roster_attestation_root_identity,
             })
     }
 
@@ -999,6 +1022,7 @@ pub struct SessionConsumerVoterAuthority {
     member: SessionConsumerRosterMember,
     voter_count: usize,
     roster_commitment: SessionConsumerRosterCommitment,
+    roster_attestation_root_identity: Option<RosterAttestationTrustRootIdentityV1>,
 }
 
 impl SessionConsumerVoterAuthority {
@@ -1025,6 +1049,16 @@ impl SessionConsumerVoterAuthority {
     /// Exact canonical roster commitment expected from this server.
     pub const fn roster_commitment(&self) -> SessionConsumerRosterCommitment {
         self.roster_commitment
+    }
+
+    /// Return the topology-issued opaque verifier-root identity for the
+    /// protected-roster profile. `None` keeps the ordinary consumer usable
+    /// but makes protected-roster composition fail closed.
+    #[doc(hidden)]
+    pub const fn roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<RosterAttestationTrustRootIdentityV1> {
+        self.roster_attestation_root_identity
     }
 }
 

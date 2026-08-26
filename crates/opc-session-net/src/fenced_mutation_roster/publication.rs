@@ -476,9 +476,8 @@ mod tests {
             RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
             RosterAttestationLeafCertificateV1, RosterAttestationTrustRootV1,
             RosterCompactAdmissionProvenanceSigningInputV2, RosterCompactAdmissionProvenanceV2,
-            RosterCompactTerminalMemberSigningInputV2, RosterIngressAttestationSigningInputV1,
-            RosterIngressAttestationV1, RosterProviderOutcomeV1,
-            RosterTerminalAttestationSigningInputV1,
+            RosterIngressAttestationSigningInputV1, RosterIngressAttestationV1,
+            RosterProviderOutcomeV1,
         },
         Clock, FenceToken, Generation, OwnerId, SessionConsensusClusterId,
         SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
@@ -1200,6 +1199,35 @@ mod tests {
     impl RosterExecutorBackend for CountingBackend {
         type Error = ();
 
+        fn expected_roster_attestation_trust_root_identity(
+            &self,
+        ) -> Option<opc_session_store::fenced_mutation_roster::RosterAttestationTrustRootIdentityV1>
+        {
+            let root_key =
+                SigningKey::from_bytes((&[0x31; 32]).into()).expect("fixed test root scalar");
+            Some(
+                RosterAttestationTrustRootV1::new(
+                    [0xa1; 32],
+                    root_key
+                        .verifying_key()
+                        .to_sec1_point(true)
+                        .as_bytes()
+                        .try_into()
+                        .expect("compressed root key width"),
+                )
+                .expect("test root")
+                .identity(),
+            )
+        }
+
+        fn current_roster_configuration_identity(&self) -> Option<SessionConsensusIdentity> {
+            Some(SessionConsensusIdentity::new(
+                SessionConsensusClusterId::from_bytes([0x41; 32]),
+                SessionConsensusConfigurationId::from_bytes([0x42; 32]),
+                SessionConsensusConfigurationEpoch::new(1).expect("nonzero test epoch"),
+            ))
+        }
+
         async fn register(
             &self,
             request: &super::super::runtime::RegistrationRequest,
@@ -1238,7 +1266,7 @@ mod tests {
                 .expect("recovery test record lock")
                 .clone()
                 .expect("fixture persists the exact terminal before recovery");
-            if request.lookup().scope() != admission.scope()
+            if request.lookup().scope() != request.authority().ingress_scope()
                 || request.lookup().roster_id() != admission.roster_id()
                 || request.authority().fence().get() <= admission.admission_fence().get()
             {
@@ -1259,7 +1287,9 @@ mod tests {
             // the shared durable backend before this read-only recovery. This
             // updates only the fake's observable authority snapshot; neither
             // roster mutation counter changes.
-            *current = Some(request.authority().clone());
+            *current = Some(
+                AuthorityBinding::for_successor(&admission, request.authority()).map_err(|_| ())?,
+            );
             drop(current);
             let committed = self
                 .committed
@@ -1539,39 +1569,35 @@ mod tests {
 
     #[async_trait]
     impl FencedMutationRosterExecutorAttestor for TestAttestor {
-        fn trust_root(&self) -> RosterAttestationTrustRootV1 {
-            self.root.clone()
+        fn trust_root(&self) -> super::super::FencedMutationRosterAttestationTrustRootV1 {
+            super::super::FencedMutationRosterAttestationTrustRootV1::from_store(self.root.clone())
         }
 
         fn executor_certificate(
             &self,
-        ) -> Result<RosterAttestationLeafCertificatePartsV1, super::super::runtime::ExecutorError>
-        {
-            Ok(self.certificate.clone())
+        ) -> Result<
+            super::super::FencedMutationRosterExecutorCertificatePartsV1,
+            super::super::runtime::ExecutorError,
+        > {
+            Ok(
+                super::super::FencedMutationRosterExecutorCertificatePartsV1::from_store(
+                    self.certificate.clone(),
+                ),
+            )
         }
 
         async fn sign_terminal(
             &self,
-            input: &RosterTerminalAttestationSigningInputV1,
+            input: &super::super::FencedMutationRosterTerminalAttestationSigningInputV1<'_>,
         ) -> Result<[u8; 64], super::super::runtime::ExecutorError> {
-            Ok(Self::sign(
-                &self.key,
-                input
-                    .digest()
-                    .map_err(|_| super::super::runtime::ExecutorError::AttestationUnavailable)?,
-            ))
+            Ok(Self::sign(&self.key, input.signing_digest()?))
         }
 
         async fn sign_compact_terminal(
             &self,
-            input: &RosterCompactTerminalMemberSigningInputV2,
+            input: &super::super::FencedMutationRosterCompactTerminalMemberSigningInputV2<'_>,
         ) -> Result<[u8; 64], super::super::runtime::ExecutorError> {
-            Ok(Self::sign(
-                &self.key,
-                input
-                    .digest()
-                    .map_err(|_| super::super::runtime::ExecutorError::AttestationUnavailable)?,
-            ))
+            Ok(Self::sign(&self.key, input.signing_digest()?))
         }
     }
 
@@ -1727,17 +1753,22 @@ mod tests {
         P: EstablishedPublicationProvider,
         Q: EstablishedPublicationProvider,
     {
+        let successor_scope = Scope::from_digest([0xB7; 32]);
+        assert_ne!(
+            successor_scope, first.scope,
+            "the successor publication fixture must exercise a new ingress scope"
+        );
         let successor_executor = RosterExecutor::new_with_clock(
-            Arc::new(ConclusiveMemberProvider::new(first.scope)),
+            Arc::new(ConclusiveMemberProvider::new(successor_scope)),
             Arc::clone(&first.backend),
-            Arc::new(TestAttestor::new(first.scope)),
+            Arc::new(TestAttestor::new(successor_scope)),
             NonZeroUsize::new(1).expect("one provider lane"),
             Arc::new(TestClock {
                 expired: AtomicBool::new(false),
             }),
         );
         let successor_adapter = successor_executor.publication_adapter(provider);
-        let successor_client = FencedMutationRosterClient::new(successor_executor, first.scope);
+        let successor_client = FencedMutationRosterClient::new(successor_executor, successor_scope);
         let successor_lease = first
             .lease_backend
             .acquire(

@@ -282,7 +282,7 @@ pub(crate) fn roster_poll_admit_ingress_capsule_commitment(
     authority: &AuthorityBinding,
 ) -> Result<[u8; 32], ()> {
     let wire = AdmissionRequestWire::Register {
-        scope: authority.scope().digest(),
+        scope: authority.ingress_scope().digest(),
         admission: admission.to_canonical_bytes().map_err(|_| ())?,
         authority: authority.into(),
     };
@@ -303,7 +303,7 @@ pub(crate) fn roster_terminal_ingress_capsule_commitment(
     terminal_evidence: &RosterCompactTerminalEvidenceV2,
 ) -> Result<[u8; 32], ()> {
     let wire = TerminalRequestWire {
-        scope: authority.scope().digest(),
+        scope: authority.ingress_scope().digest(),
         binding,
         registration: RegistrationWire::from_registration(registration),
         authority: authority.into(),
@@ -377,12 +377,9 @@ fn response_scope(consumer_scope: SessionConsumerScope) -> [u8; 32] {
 }
 
 fn admission_bytes_for_consumer_scope(
-    consumer_scope: SessionConsumerScope,
+    _consumer_scope: SessionConsumerScope,
     admission: &Admission,
 ) -> Result<Vec<u8>, ProtectedRosterTransportError> {
-    (admission.scope().digest() == response_scope(consumer_scope))
-        .then_some(())
-        .ok_or(ProtectedRosterTransportError)?;
     admission
         .to_canonical_bytes()
         .map_err(|_| ProtectedRosterTransportError)
@@ -534,9 +531,7 @@ pub(crate) fn encode_terminal_terminalized_validated_bytes_response(
     admission: &Admission,
     committed: Vec<u8>,
 ) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
-    (admission.scope().digest() == response_scope(consumer_scope))
-        .then_some(())
-        .ok_or(ProtectedRosterTransportError)?;
+    let _ = admission;
     encode_terminal_committed_bytes_response(consumer_scope, committed, false)
 }
 
@@ -797,12 +792,9 @@ impl DecodedTerminalRequest {
         admission: &Admission,
     ) -> Result<(BackendRegistration, AuthorityBinding, TerminalBody), ProtectedRosterTransportError>
     {
-        if self.authority.scope() != admission.scope()
-            || self.authority.key() != admission.key()
-            || self.authority.generation() != admission.expected_generation()
-        {
-            return Err(ProtectedRosterTransportError);
-        }
+        let authority =
+            AuthorityBinding::for_validated_admission(admission, &self.authority, false)
+                .map_err(|_| ProtectedRosterTransportError)?;
         let registration = self
             .registration
             .into_registration(admission)
@@ -818,7 +810,7 @@ impl DecodedTerminalRequest {
             .map_err(|_| ProtectedRosterTransportError)?;
         let body = TerminalBody::from_record(record, admission)
             .map_err(|_| ProtectedRosterTransportError)?;
-        Ok((registration, self.authority, body))
+        Ok((registration, authority, body))
     }
 }
 

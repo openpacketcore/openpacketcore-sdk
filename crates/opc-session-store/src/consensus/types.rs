@@ -895,6 +895,22 @@ impl ConsensusRosterTerminalCommand {
         )
     }
 
+    /// Construct only the bounded command shell needed to prove that a
+    /// compacted tombstone rejects mutation before any raw proof or ingress
+    /// decode. This is test-only and cannot cross the production wire path.
+    #[cfg(test)]
+    pub(crate) fn new_for_compacted_tombstone_rejection_test(
+        input: ConsensusRosterTerminalCommandInput,
+    ) -> Result<Self, StoreError> {
+        Self::new_from_parts(
+            input,
+            BoundedRosterCapsule::new(Vec::new())?,
+            BoundedRosterCapsule::new(Vec::new())?,
+            [0; 16],
+            BoundedRosterCapsule::new(Vec::new())?,
+        )
+    }
+
     /// Construct the only production terminal command form.  Raw V1 proofs
     /// remain for the initial correspondence check, while compact V2 evidence
     /// is retained so followers and later compaction can verify the same
@@ -1244,6 +1260,7 @@ impl ConsensusRosterTerminalOutcome {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn compacted(
         command: &ConsensusRosterTerminalCommand,
         history_epoch: u64,

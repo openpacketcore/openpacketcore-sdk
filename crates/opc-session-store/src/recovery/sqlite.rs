@@ -19,6 +19,7 @@ use super::{
     RecoveryIntegrityKey, RecoveryLimits, RecoveryPlan, RecoveryReplica, RecoveryReplicaEvidence,
     RecoveryReplicaFormat,
 };
+use crate::consensus::snapshot::{SNAPSHOT_DATABASE_MAX_BYTES, SNAPSHOT_ENVELOPE_FOOTER_BYTES};
 use crate::consensus::{
     SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId, SessionConsensusIdentity,
     SessionConsensusNodeId, SESSION_CONSENSUS_SCHEMA_VERSION,
@@ -36,7 +37,6 @@ use crate::{
 const PATH_MAX_BYTES: usize = 4_096;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
-const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 8 + 32;
 const PLAN_MAC_DOMAIN: &[u8] = b"openpacketcore/session-recovery/plan-seal/v1\0";
 const WORKFLOW_MAC_DOMAIN: &[u8] = b"openpacketcore/session-recovery/workflow/v1\0";
 const BACKUP_MAC_DOMAIN: &[u8] = b"openpacketcore/session-recovery/backup/v1\0";
@@ -51,10 +51,6 @@ const PROTECTED_ROSTER_LAYOUT_DOMAIN: &[u8] =
 const PROTECTED_ROSTER_TRUST_ROOT_DOMAIN: &[u8] =
     b"openpacketcore/session-recovery/protected-roster-trust-root/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
-// Six base SQLite objects plus bounded consensus/recovery tables. V3 adds
-// three ledger objects and two required indexes. The protected roster adds
-// six tables and three required indexes.
-const MAX_CURRENT_SCHEMA_OBJECTS: usize = 37;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
 
 type FencedTransitionV2HistorySqlRow = (
@@ -2114,7 +2110,7 @@ fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let mut manifest = BTreeMap::new();
     while let Some(row) = rows.next().map_err(|_| RecoveryError::CorruptReplica)? {
-        if manifest.len() >= MAX_CURRENT_SCHEMA_OBJECTS {
+        if manifest.len() >= consensus::CONSENSUS_SCHEMA_MAX_OBJECTS {
             return Err(RecoveryError::CorruptReplica);
         }
         let kind = row
@@ -4708,17 +4704,20 @@ fn verify_snapshot_file(
     }
     let mut file = open_regular_read(path).map_err(|_| RecoveryError::CorruptReplica)?;
     let metadata = file.metadata().map_err(|_| RecoveryError::CorruptReplica)?;
-    if !metadata.is_file() || metadata.len() <= SNAPSHOT_FOOTER_BYTES || metadata.len() > max_bytes
+    if !metadata.is_file()
+        || metadata.len() <= SNAPSHOT_ENVELOPE_FOOTER_BYTES
+        || metadata.len() > max_bytes
     {
         return Err(RecoveryError::CorruptReplica);
     }
     let total = metadata.len();
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::End(
-        -i64::try_from(SNAPSHOT_FOOTER_BYTES).map_err(|_| RecoveryError::CorruptReplica)?,
+        -i64::try_from(SNAPSHOT_ENVELOPE_FOOTER_BYTES)
+            .map_err(|_| RecoveryError::CorruptReplica)?,
     ))
     .map_err(|_| RecoveryError::CorruptReplica)?;
-    let mut footer = [0_u8; SNAPSHOT_FOOTER_BYTES as usize];
+    let mut footer = [0_u8; SNAPSHOT_ENVELOPE_FOOTER_BYTES as usize];
     file.read_exact(&mut footer)
         .map_err(|_| RecoveryError::CorruptReplica)?;
     if &footer[..8] != SNAPSHOT_FOOTER_MAGIC {
@@ -4732,7 +4731,7 @@ fn verify_snapshot_file(
     let expected: [u8; 32] = footer[16..]
         .try_into()
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    if length == 0 || length.checked_add(SNAPSHOT_FOOTER_BYTES) != Some(total) {
+    if length == 0 || length.checked_add(SNAPSHOT_ENVELOPE_FOOTER_BYTES) != Some(total) {
         return Err(RecoveryError::CorruptReplica);
     }
     file.seek(SeekFrom::Start(0))
@@ -4839,6 +4838,10 @@ fn validate_path_text(path: &Path) -> Result<(), RecoveryError> {
 }
 
 fn open_read_only(path: &Path) -> Result<Connection, RecoveryError> {
+    let metadata = fs::metadata(path).map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > SNAPSHOT_DATABASE_MAX_BYTES {
+        return Err(RecoveryError::WorkLimitExceeded);
+    }
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -4848,6 +4851,8 @@ fn open_read_only(path: &Path) -> Result<Connection, RecoveryError> {
     .map_err(|_| RecoveryError::DatabaseUnavailable)?;
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
         .map_err(|_| RecoveryError::DatabaseUnavailable)?;
+    consensus::snapshot_database_extent_sync(&conn)
+        .map_err(|_| RecoveryError::WorkLimitExceeded)?;
     conn.execute_batch(
         "PRAGMA query_only = ON; PRAGMA trusted_schema = OFF; BEGIN DEFERRED TRANSACTION;",
     )
@@ -4866,6 +4871,8 @@ fn open_read_write(path: &Path) -> Result<Connection, RecoveryError> {
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
         .map_err(|_| RecoveryError::FileOperationFailed)?;
     conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA trusted_schema = OFF;")
+        .map_err(|_| RecoveryError::FileOperationFailed)?;
+    consensus::install_snapshot_database_extent_guard_sync(&conn)
         .map_err(|_| RecoveryError::FileOperationFailed)?;
     Ok(conn)
 }
@@ -4906,6 +4913,8 @@ fn sqlite_backup(source: &Path, destination: &Path, max: u64) -> Result<(), Reco
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|_| RecoveryError::FileOperationFailed)?;
+    consensus::install_snapshot_database_extent_guard_sync(&destination_conn)
+        .map_err(|_| RecoveryError::FileOperationFailed)?;
     {
         let backup = Backup::new(&source, &mut destination_conn)
             .map_err(|_| RecoveryError::FileOperationFailed)?;

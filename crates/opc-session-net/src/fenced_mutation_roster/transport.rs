@@ -11,6 +11,7 @@ use super::{
     },
     client::FencedMutationRosterClient,
     diagnostics::{FencedMutationRosterDiagnostics, RosterDiagnostics},
+    protected_roster_scope_from_consensus_identity,
     publication::PublicationAdapter,
     runtime::{
         AdmissionStatusRequest, AuthorityBinding, BackendRegistration, BackendRejection,
@@ -25,11 +26,12 @@ use crate::consumer::{
     PersistentSessionConsumerDiagnostics,
 };
 use opc_session_store::fenced_mutation_roster::{
-    RosterCompactAdmissionProvenanceV2, MAX_EXECUTOR_PROOF_BUNDLE_BYTES,
-    MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES, MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES,
+    RosterAttestationTrustRootIdentityV1, RosterCompactAdmissionProvenanceV2,
+    MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
+    MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES,
 };
 use opc_session_store::{
-    FenceToken, Generation, OwnerId, SessionConsumerRequestId,
+    FenceToken, Generation, OwnerId, SessionConsensusIdentity, SessionConsumerRequestId,
     SessionConsumerRosterAdmissionCapsule, SessionConsumerRosterAdmissionMutationResponse,
     SessionConsumerRosterAdmissionReadResponse,
     SessionConsumerRosterCurrentPublicationAuthorityCapsule,
@@ -53,7 +55,6 @@ const TERMINAL_REQUEST_DOMAIN: &[u8] =
     b"openpacketcore/protected-roster/terminal-port/request/v1\0";
 const TERMINAL_RESPONSE_DOMAIN: &[u8] =
     b"openpacketcore/protected-roster/terminal-port/response/v1\0";
-const SCOPE_DOMAIN: &[u8] = b"openpacketcore/protected-roster/consumer-scope/v1\0";
 const REQUEST_ID_DOMAIN: &[u8] = b"openpacketcore/protected-roster/consumer-request/v1\0";
 
 /// Reserved deterministic envelope allowance around canonical roster bodies.
@@ -193,26 +194,31 @@ where
 }
 
 fn protected_roster_scope_from_consumer_scope(scope: SessionConsumerScope) -> Scope {
-    let identity = scope.consensus_identity();
-    let mut hasher = Sha256::new();
-    hasher.update(SCOPE_DOMAIN);
-    hasher.update(identity.cluster_id().as_bytes());
-    hasher.update(identity.configuration_id().as_bytes());
-    hasher.update(identity.configuration_epoch().get().to_be_bytes());
-    Scope::from_digest(hasher.finalize().into())
+    protected_roster_scope_from_consensus_identity(scope.consensus_identity())
 }
 
 #[derive(Clone)]
 pub(crate) struct RosterQuorumPort {
     consumer: AuthenticatedRosterConsumer,
     scope: Scope,
+    configuration_identity: SessionConsensusIdentity,
+    roster_attestation_root_identity: RosterAttestationTrustRootIdentityV1,
 }
 
 impl RosterQuorumPort {
     fn new(consumer: AuthenticatedRosterConsumer) -> Result<Self, ProtectedRosterTransportError> {
+        let roster_attestation_root_identity = consumer
+            .roster_attestation_root_identity()
+            .ok_or(ProtectedRosterTransportError)?;
         consumer.claim_roster_executor()?;
         let scope = protected_roster_scope_from_consumer_scope(consumer.scope());
-        Ok(Self { consumer, scope })
+        let configuration_identity = consumer.scope().consensus_identity();
+        Ok(Self {
+            consumer,
+            scope,
+            configuration_identity,
+            roster_attestation_root_identity,
+        })
     }
 
     async fn poll_admit(
@@ -281,6 +287,16 @@ impl fmt::Debug for AdapterError {
 #[async_trait::async_trait]
 impl RosterExecutorBackend for RosterQuorumPort {
     type Error = AdapterError;
+
+    fn expected_roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<RosterAttestationTrustRootIdentityV1> {
+        Some(self.roster_attestation_root_identity)
+    }
+
+    fn current_roster_configuration_identity(&self) -> Option<SessionConsensusIdentity> {
+        Some(self.configuration_identity)
+    }
 
     async fn register(
         &self,
@@ -409,13 +425,13 @@ impl PublicationAuthorityReader for RosterQuorumPort {
         request: CurrentPublicationAuthorityRead<'_>,
     ) -> Result<(), Self::Error> {
         let authority = request.current_authority();
-        if authority.scope() != self.scope {
+        if authority.ingress_scope() != self.scope {
             return Err(AdapterError);
         }
         let (registration_handle, registration_request_id, registration_terminal_slot) =
             request.current_registration().consensus_parts();
         let capsule = SessionConsumerRosterCurrentPublicationAuthorityCapsule::new(
-            authority.scope().digest(),
+            authority.ingress_scope().digest(),
             authority.key().clone(),
             *request.roster_id().as_bytes(),
             request.admission_commitment(),
@@ -438,7 +454,7 @@ impl PublicationAuthorityReader for RosterQuorumPort {
             .current_publication_authority(
                 recovery_request_id(
                     AdmissionRequestKind::CurrentPublicationAuthority,
-                    authority.scope(),
+                    authority.ingress_scope(),
                     request.roster_id(),
                 ),
                 capsule,
@@ -663,7 +679,7 @@ fn admission_capsule_for_registration(
     request: &RegistrationRequest,
 ) -> Result<SessionConsumerRosterAdmissionCapsule, ()> {
     let wire = AdmissionRequestWire::Register {
-        scope: request.authority().scope().digest(),
+        scope: request.authority().ingress_scope().digest(),
         admission: request.admission().to_canonical_bytes().map_err(|_| ())?,
         authority: request.authority().into(),
     };
@@ -691,7 +707,7 @@ fn terminal_capsule(
 ) -> Result<SessionConsumerRosterTerminalCapsule, ()> {
     let (_, request_id, _) = registration.consensus_parts();
     let wire = TerminalRequestWire {
-        scope: authority.scope().digest(),
+        scope: authority.ingress_scope().digest(),
         binding: admission
             .binding_key(request_id.history_epoch())
             .map_err(|_| ())?,
@@ -811,7 +827,7 @@ fn decode_admission_response(
             admission_provenance,
         } => {
             expect_scope(actual, scope)?;
-            let admission = decode_admission(&admission, scope, original_admission)?;
+            let admission = decode_admission(&admission, original_admission)?;
             let provenance =
                 RosterCompactAdmissionProvenanceV2::decode_canonical(&admission_provenance)
                     .map_err(|_| ())?;
@@ -829,7 +845,7 @@ fn decode_admission_response(
             admission_provenance,
         } => {
             expect_scope(actual, scope)?;
-            let admission = decode_admission(&admission, scope, original_admission)?;
+            let admission = decode_admission(&admission, original_admission)?;
             RosterCompactAdmissionProvenanceV2::decode_canonical(&admission_provenance)
                 .map_err(|_| ())?;
             let registration = registration.into_registration(&admission)?;
@@ -979,15 +995,9 @@ fn decode_terminal_status_response(
     }
 }
 
-fn decode_admission(
-    bytes: &[u8],
-    scope: Scope,
-    original_admission: Option<&Admission>,
-) -> Result<Admission, ()> {
+fn decode_admission(bytes: &[u8], original_admission: Option<&Admission>) -> Result<Admission, ()> {
     let admission = Admission::from_canonical_bytes(bytes).map_err(|_| ())?;
-    if admission.scope() != scope
-        || original_admission.is_some_and(|original| original != &admission)
-    {
+    if original_admission.is_some_and(|original| original != &admission) {
         return Err(());
     }
     Ok(admission)

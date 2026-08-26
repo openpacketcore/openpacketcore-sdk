@@ -1081,10 +1081,13 @@ impl ValidatedQuorumTopology {
                 .expect("validated topology retains every member node ID");
             (node_id.get(), descriptor.clone())
         });
-        SessionConsumerRoster::try_new(
+        SessionConsumerRoster::try_new_with_roster_attestation_root_identity(
             SessionConsumerScope::new(identity),
             &expected_members,
             descriptors,
+            self.roster_attestation_trust_root
+                .as_ref()
+                .map(RosterAttestationTrustRootV1::identity),
         )
     }
 }

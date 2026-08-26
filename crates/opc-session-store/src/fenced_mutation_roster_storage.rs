@@ -2457,6 +2457,16 @@ impl ConsensusMaintenanceTimestamp {
         Ok(Self(nanos))
     }
 
+    /// Recover the exact consensus timestamp retained for a terminal event.
+    /// The stored maintenance time is nonnegative by construction, but its
+    /// durable canonical form still has to be range-checked before it is used
+    /// as the cryptographic verification time during restart hydration.
+    pub(crate) fn to_consensus_timestamp(self) -> Result<Timestamp, ReservationError> {
+        time::OffsetDateTime::from_unix_timestamp_nanos(self.0)
+            .map(Timestamp::from_offset_datetime)
+            .map_err(|_| ReservationError::InvalidMaintenanceTime)
+    }
+
     fn checked_add_retention(self) -> Result<Self, ReservationError> {
         self.0
             .checked_add(TERMINAL_RETENTION_NANOS)
@@ -2517,32 +2527,16 @@ pub(crate) struct HydratedProductionReservationRecord {
 pub(crate) enum HydratedProductionReservationPayload {
     Live {
         admission: Admission,
-        #[expect(
-            dead_code,
-            reason = "retained after canonical hydration for recovery-time ingress revalidation"
-        )]
         admission_ingress: RosterIngressAttestationV1,
         admission_provenance: RosterCompactAdmissionProvenanceV2,
     },
     Retained {
         admission: Admission,
-        #[expect(
-            dead_code,
-            reason = "retained after canonical hydration for recovery-time ingress revalidation"
-        )]
         admission_ingress: RosterIngressAttestationV1,
         admission_provenance: RosterCompactAdmissionProvenanceV2,
         committed_terminal: Box<CommittedTerminal>,
         committed_canonical: Vec<u8>,
-        #[expect(
-            dead_code,
-            reason = "retained after canonical hydration for recovery-time executor-proof revalidation"
-        )]
         terminal_proof_bundle: RosterExecutorProofBundleV1,
-        #[expect(
-            dead_code,
-            reason = "retained after canonical hydration for recovery-time ingress revalidation"
-        )]
         terminal_ingress: RosterIngressAttestationV1,
         terminal_evidence: RosterCompactTerminalEvidenceV2,
     },
@@ -3481,6 +3475,7 @@ fn reclaim_oldest_eligible(
 /// The length guard runs before any identity-index allocation. Each decoder
 /// rejects truncated, trailing, and noncanonical frames; duplicate bindings
 /// and cross-lifecycle aliases are rejected before the result is returned.
+#[cfg(test)]
 pub(crate) fn validate_production_snapshot(
     records: &[ProductionReservationRecord],
     profile: ChargeProfile,
@@ -3603,6 +3598,128 @@ pub(crate) fn validate_production_snapshot_witness(
     Ok(counters)
 }
 
+/// Incremental restart/snapshot validator for an already SQL-ordered roster
+/// namespace.  It intentionally retains only aggregate counters: SQLite's
+/// primary/unique indexes prove binding, business-key, and terminal-sequence
+/// uniqueness while the caller merge-joins the normalized side tables.
+///
+/// This is deliberately separate from the slice-based conformance validator
+/// below.  The latter remains useful to pure-domain tests which intentionally
+/// supply unordered, duplicate fixtures; durable recovery must never turn a
+/// legal 131,072-row ledger into a second in-memory copy merely to re-prove
+/// those SQLite-enforced keys.
+pub(crate) struct ProductionSnapshotStreamValidator {
+    application_sequence: u64,
+    counters: AggregateCounters,
+    record_count: usize,
+    floor_count: usize,
+    cursor_count: usize,
+}
+
+impl ProductionSnapshotStreamValidator {
+    /// Start an empty SQL-stream validation pass.
+    pub(crate) const fn new(application_sequence: u64) -> Self {
+        Self {
+            application_sequence,
+            counters: zero_counters(),
+            record_count: 0,
+            floor_count: 0,
+            cursor_count: 0,
+        }
+    }
+
+    /// Account for one fully canonicalized durable row, then let the caller
+    /// immediately drop its raw and decoded bodies.
+    pub(crate) fn add_record(
+        &mut self,
+        record: &ProductionReservationRecord,
+        witness: GlobalChargeWitness,
+        profile: ChargeProfile,
+    ) -> Result<(), ReservationError> {
+        record.validate(profile)?;
+        if record
+            .terminal_sequence()
+            .is_some_and(|sequence| sequence <= witness.retired_terminal_sequence())
+        {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        if record
+            .terminal_sequence()
+            .is_some_and(|sequence| sequence > self.application_sequence)
+        {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        self.record_count = self
+            .record_count
+            .checked_add(1)
+            .ok_or(ReservationError::Arithmetic)?;
+        if self.record_count > MAX_RESERVED_AND_RETAINED {
+            return Err(ReservationError::DurableBindingLimit);
+        }
+        self.counters = counters_with_production_record(self.counters, record, profile)?;
+        Ok(())
+    }
+
+    /// Account for one normalized floor after its SQL key projection has been
+    /// checked by the caller.
+    pub(crate) fn add_floor(
+        &mut self,
+        floor: IrreversibleHistoryFloor,
+    ) -> Result<(), ReservationError> {
+        self.floor_count = self
+            .floor_count
+            .checked_add(1)
+            .ok_or(ReservationError::Arithmetic)?;
+        if self.floor_count > MAX_RESERVED_AND_RETAINED {
+            return Err(ReservationError::FloorLimit);
+        }
+        self.counters = counters_with_production_floor(self.counters, floor)?;
+        Ok(())
+    }
+
+    /// Account for one normalized cursor after its matching floor has been
+    /// checked by the caller.
+    pub(crate) fn add_cursor(
+        &mut self,
+        cursor: &ProductionRetirementCursor,
+    ) -> Result<(), ReservationError> {
+        self.cursor_count = self
+            .cursor_count
+            .checked_add(1)
+            .ok_or(ReservationError::Arithmetic)?;
+        if self.cursor_count > MAX_RESERVED_AND_RETAINED {
+            return Err(ReservationError::FloorLimit);
+        }
+        self.counters = counters_with_retirement_cursor(self.counters, cursor)?;
+        Ok(())
+    }
+
+    /// Complete the aggregate witness proof after every SQL stream reaches
+    /// EOF.  Empty namespaces are intentionally represented by no witness.
+    pub(crate) fn finish(
+        self,
+        witness: Option<GlobalChargeWitness>,
+        budget: GlobalChargeBudget,
+    ) -> Result<(), ReservationError> {
+        match witness {
+            None if self.record_count == 0 && self.floor_count == 0 && self.cursor_count == 0 => {
+                Ok(())
+            }
+            None => Err(ReservationError::SnapshotMismatch),
+            Some(witness) => {
+                if witness.retired_terminal_sequence() > self.application_sequence {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                witness.admits(budget)?;
+                if witness.roster != self.counters {
+                    return Err(ReservationError::WitnessMismatch);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Restart/follower validation with the exact persisted tenant/scope floors.
 ///
 /// Every durable row must remain strictly above its partition floor. Direct
@@ -3610,6 +3727,7 @@ pub(crate) fn validate_production_snapshot_witness(
 /// 24 hours, up to 1,024 per final-or-partial batch, and never deletes live
 /// rows. Legacy cursor/tombstone snapshots remain subject to their original
 /// floor consistency checks during restart validation.
+#[cfg(test)]
 pub(crate) fn validate_production_snapshot_with_floors(
     records: &[ProductionReservationRecord],
     floors: &[IrreversibleHistoryFloor],

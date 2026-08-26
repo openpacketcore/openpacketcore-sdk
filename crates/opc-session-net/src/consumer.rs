@@ -5496,6 +5496,16 @@ impl ConsumerVoterBinding {
             Self::Test { tls_identity, .. } => tls_identity,
         }
     }
+
+    fn roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<RosterAttestationTrustRootIdentityV1> {
+        match self {
+            Self::Authority(authority) => authority.roster_attestation_trust_root_identity(),
+            #[cfg(test)]
+            Self::Test { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5761,6 +5771,8 @@ impl StatelessSessionConsumerClient {
             && self.voter.voter_count() == voter_authority.voter_count()
             && self.voter.roster_commitment() == *voter_authority.roster_commitment().as_bytes()
             && self.voter.tls_identity() == voter_authority.tls_identity()
+            && self.voter.roster_attestation_trust_root_identity()
+                == voter_authority.roster_attestation_trust_root_identity()
     }
 
     /// Return redaction-safe current mTLS material health.
@@ -11932,6 +11944,7 @@ pub struct PersistentSessionConsumerClient {
 #[derive(Clone)]
 pub(crate) struct AuthenticatedRosterConsumer {
     client: PersistentSessionConsumerClient,
+    roster_attestation_root_identity: Option<RosterAttestationTrustRootIdentityV1>,
 }
 
 impl fmt::Debug for AuthenticatedRosterConsumer {
@@ -11969,6 +11982,15 @@ impl AuthenticatedRosterConsumer {
     /// Return the fixed authenticated scope only to the internal roster port.
     pub(crate) fn scope(&self) -> SessionConsumerScope {
         self.client.scope()
+    }
+
+    /// Return only the opaque root identity carried by the validated
+    /// topology-issued voter authority. The roster transport cannot select or
+    /// replace this value.
+    pub(crate) const fn roster_attestation_root_identity(
+        &self,
+    ) -> Option<RosterAttestationTrustRootIdentityV1> {
+        self.roster_attestation_root_identity
     }
 
     pub(crate) async fn poll_admit(
@@ -12246,11 +12268,25 @@ impl PersistentSessionConsumerClient {
         {
             return Err(ProtectedRosterTransportError);
         }
-        Ok(AuthenticatedRosterConsumer { client: self })
+        let roster_attestation_root_identity = self
+            .pool
+            .client
+            .voter
+            .roster_attestation_trust_root_identity();
+        Ok(AuthenticatedRosterConsumer {
+            client: self,
+            roster_attestation_root_identity,
+        })
     }
 
     /// Consume this exact revision-five pool into the public protected-roster
-    /// client bound to one startup-owned provider.
+    /// client bound to one startup-owned provider and terminal attestor.
+    ///
+    /// Compose topology-provisioned public attestation material and a local
+    /// HSM/KMS signer with
+    /// [`FencedMutationRosterExecutorAttestorAdapter`](crate::FencedMutationRosterExecutorAttestorAdapter).
+    /// The executor retains the attestor for its lifetime and constructs every
+    /// signed terminal preimage after checking its authority and proof state.
     pub fn into_fenced_mutation_roster_client<P>(
         self,
         provider: Arc<P>,
@@ -12269,7 +12305,12 @@ impl PersistentSessionConsumerClient {
     }
 
     /// Consume this exact revision-five pool into an opaque roster client
-    /// with both startup-owned provider seams fixed for its lifetime.
+    /// with both startup-owned provider seams and one terminal attestor fixed
+    /// for its lifetime.
+    ///
+    /// Use
+    /// [`FencedMutationRosterExecutorAttestorAdapter`](crate::FencedMutationRosterExecutorAttestorAdapter)
+    /// to bind topology-provisioned public material to a local HSM/KMS signer.
     pub fn into_fenced_mutation_roster_provider_adapter<P, Q>(
         self,
         member_provider: Arc<P>,

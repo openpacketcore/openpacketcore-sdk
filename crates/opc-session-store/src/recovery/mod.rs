@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::consensus::snapshot::{SNAPSHOT_DATABASE_MAX_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES};
 use crate::consensus::{
     OperatorRecoveryCommitError, SessionConsensusIdentity, SessionConsensusNodeId,
     SessionConsensusRequestId,
@@ -45,6 +46,12 @@ const RECOVERY_PLAN_VERSION: u16 = 1;
 const RECOVERY_PATH: &str = "/opc-session-store:legacy-recovery";
 const LEGACY_ACKNOWLEDGEMENT: &str = "ACKNOWLEDGE-UNPROVEN-LEGACY-BRANCH-DISCARD";
 const PRINCIPAL_DESCRIPTOR_MAX_BYTES: usize = 2_048;
+/// Recovery walks selected SQLite values through several bounded validation
+/// and digest passes. Keep this finite multiplier tied to the same accepted
+/// physical extent instead of leaving a smaller stale logical-ledger limit.
+const RECOVERY_DEFAULT_VALUE_SCAN_MULTIPLIER: u64 = 8;
+const RECOVERY_DEFAULT_MAX_TOTAL_VALUE_BYTES: u64 =
+    SNAPSHOT_DATABASE_MAX_BYTES * RECOVERY_DEFAULT_VALUE_SCAN_MULTIPLIER;
 
 /// Purpose-separated integrity key for plans, workflow journals, and backups.
 ///
@@ -382,19 +389,24 @@ impl RecoveryLimits {
         max_value_bytes: u64,
     ) -> Result<Self, RecoveryError> {
         if max_database_bytes == 0
+            || max_database_bytes > SNAPSHOT_DATABASE_MAX_BYTES
             || max_snapshot_bytes == 0
+            || max_snapshot_bytes > SNAPSHOT_ENVELOPE_MAX_BYTES
             || max_rows == 0
             || max_value_bytes == 0
             || max_value_bytes > i64::MAX as u64
         {
             return Err(RecoveryError::InvalidRequest);
         }
+        let max_total_value_bytes = max_database_bytes
+            .checked_mul(RECOVERY_DEFAULT_VALUE_SCAN_MULTIPLIER)
+            .ok_or(RecoveryError::InvalidRequest)?;
         Ok(Self {
             max_database_bytes,
             max_snapshot_bytes,
             max_rows,
             max_value_bytes,
-            max_total_value_bytes: max_database_bytes.saturating_mul(8),
+            max_total_value_bytes,
             max_duration: Duration::from_secs(30),
         })
     }
@@ -414,7 +426,14 @@ impl RecoveryLimits {
             max_rows,
             max_value_bytes,
         )?;
-        if max_total_value_bytes == 0 || max_duration.is_zero() {
+        // A caller may make recovery work stricter, but cannot detach its
+        // cumulative scan allowance from the checked database extent admitted
+        // above. This retains the finite physical-envelope policy for every
+        // constructor, not only `Default`.
+        if max_total_value_bytes == 0
+            || max_total_value_bytes > limits.max_total_value_bytes
+            || max_duration.is_zero()
+        {
             return Err(RecoveryError::InvalidRequest);
         }
         limits.max_total_value_bytes = max_total_value_bytes;
@@ -456,14 +475,50 @@ impl RecoveryLimits {
 impl Default for RecoveryLimits {
     fn default() -> Self {
         Self {
-            max_database_bytes: 64 * 1024 * 1024 * 1024,
-            max_snapshot_bytes: 64 * 1024 * 1024 * 1024,
+            max_database_bytes: SNAPSHOT_DATABASE_MAX_BYTES,
+            max_snapshot_bytes: SNAPSHOT_ENVELOPE_MAX_BYTES,
             max_rows: 10_000_000,
             max_value_bytes: 16 * 1024 * 1024,
-            max_total_value_bytes: 256 * 1024 * 1024 * 1024,
+            max_total_value_bytes: RECOVERY_DEFAULT_MAX_TOTAL_VALUE_BYTES,
             max_duration: Duration::from_secs(30),
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn default_recovery_limits_share_the_snapshot_physical_envelope() {
+    let limits = RecoveryLimits::default();
+    assert_eq!(limits.max_database_bytes(), SNAPSHOT_DATABASE_MAX_BYTES);
+    assert_eq!(limits.max_snapshot_bytes(), SNAPSHOT_ENVELOPE_MAX_BYTES);
+    assert_eq!(
+        limits.max_total_value_bytes(),
+        SNAPSHOT_DATABASE_MAX_BYTES * RECOVERY_DEFAULT_VALUE_SCAN_MULTIPLIER
+    );
+    assert_eq!(limits.max_duration(), Duration::from_secs(30));
+    assert!(RecoveryLimits::try_new(
+        SNAPSHOT_DATABASE_MAX_BYTES + 1,
+        SNAPSHOT_ENVELOPE_MAX_BYTES,
+        1,
+        1,
+    )
+    .is_err());
+    assert!(RecoveryLimits::try_new(
+        SNAPSHOT_DATABASE_MAX_BYTES,
+        SNAPSHOT_ENVELOPE_MAX_BYTES + 1,
+        1,
+        1,
+    )
+    .is_err());
+    assert!(RecoveryLimits::try_new_with_work_budget(
+        SNAPSHOT_DATABASE_MAX_BYTES,
+        SNAPSHOT_ENVELOPE_MAX_BYTES,
+        1,
+        1,
+        RECOVERY_DEFAULT_MAX_TOTAL_VALUE_BYTES + 1,
+        Duration::from_secs(1),
+    )
+    .is_err());
 }
 
 /// Persisted replica format found during inspection.

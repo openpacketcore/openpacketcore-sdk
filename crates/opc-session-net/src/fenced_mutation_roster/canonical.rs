@@ -121,6 +121,18 @@ const ROSTER_ATTESTATION_BUNDLE_DOMAIN: &[u8] =
 const ROSTER_INGRESS_ATTESTATION_DOMAIN: &[u8] =
     b"openpacketcore/session-store/roster-ingress-attestation/v1\0";
 const ROSTER_INGRESS_CAPSULE_DOMAIN: &[u8] = b"openpacketcore/session-consumer/roster-capsule/v1\0";
+const ROSTER_COMPACT_ADMISSION_PROVENANCE_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/roster-compact-admission-provenance/v2\0";
+const ROSTER_COMPACT_ADMISSION_COMMITMENT_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/roster-compact-admission-commitment/v2\0";
+const ROSTER_COMPACT_ADMISSION_FIELD_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/roster-compact-admission-field/v2\0";
+const ROSTER_COMPACT_ADMISSION_SLOT_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/roster-admission-slot/v2\0";
+const ROSTER_COMPACT_TERMINAL_EVIDENCE_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/roster-compact-terminal-evidence/v2\0";
+const ROSTER_COMPACT_TERMINAL_COMMITMENT_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/roster-compact-terminal-commitment/v2\0";
 const ROSTER_ATTESTATION_PROVIDER_RECEIPT_MAGIC: [u8; 8] = *b"OPCPRC1\0";
 const ROSTER_ATTESTATION_P256_COMPRESSED_PUBLIC_KEY_BYTES: usize = 33;
 const ROSTER_ATTESTATION_P256_SIGNATURE_BYTES: usize = 64;
@@ -239,12 +251,14 @@ const PROFILE_DESCRIPTOR: &[u8] = concat!(
     "consumer-revision=5\n",
     "alpn=opc-session-consumer/3\n",
     "codec=postcard-canonical,frame-digest=sha256\n",
-    "domains=profile,admission,descriptor,terminal,terminal-slot,session-key-binding,tenant-scope-partition,provider-fence-binding,publication-id,publication-payload,publication-evidence,admission-frame,terminal-frame,committed-terminal-frame,tombstone-frame,history-floor-frame,executor-proof,executor-evidence,terminal-committing-guard,terminal-session-record,terminal-receipt,provider-scheduling,binding,descriptor,owner,credential,roster-attestation-root,roster-attestation-certificate,roster-attestation-proof,roster-attestation-provider-receipt,roster-attestation-stable-proof,roster-attestation-evidence,roster-attestation-bundle,roster-ingress-attestation,roster-ingress-capsule\n",
+    "domains=profile,admission,descriptor,terminal,terminal-slot,session-key-binding,tenant-scope-partition,provider-fence-binding,publication-id,publication-payload,publication-evidence,admission-frame,terminal-frame,committed-terminal-frame,tombstone-frame,history-floor-frame,executor-proof,executor-evidence,terminal-committing-guard,terminal-session-record,terminal-receipt,provider-scheduling,binding,descriptor,owner,credential,roster-attestation-root,roster-attestation-certificate,roster-attestation-proof,roster-attestation-provider-receipt,roster-attestation-stable-proof,roster-attestation-evidence,roster-attestation-bundle,roster-ingress-attestation,roster-ingress-capsule,roster-compact-admission-provenance,roster-compact-admission-commitment,roster-compact-admission-field,roster-compact-admission-slot,roster-compact-terminal-evidence,roster-compact-terminal-commitment\n",
     "magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB1\\0,OPCRHF1\\0,OPCPRC1\\0\n",
     "field-order=profile,roster,members,established-mutation,plan,checkpoint,result;key,scope,owner,fence,generation;binding:epoch,scope,tenant-scope-partition,session-key-commitment,roster-id;tombstone:binding,admission-commitment,terminal-commitment,admission-owner,admission-fence,generation,phase;history-floor:scope,tenant-scope-partition,retired-through\n",
-    "executor-field-order=proof-binding:roster-attestation-proof,profile,configuration-identity,certificate-subject,certificate-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,terminal-phase,terminal-body-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;provider-receipt=roster-attestation-provider-receipt,profile,configuration-identity,provider-certificate-subject,provider-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;proof-commitment:roster-attestation-stable-proof,binding,registration-request-id,terminal-slot,roster-id,admission-commitment,phase,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,outcome,evidence-commitment;certificate=roster-attestation-certificate,version,root-id,role,configuration-identity,scope,subject,leaf-epoch,key-id[32],not-before,not-after,compressed-p256-key;attestation=p256-sha256,compressed-sec1:33,low-s-p1363:64,roles:executor|provider|transport-ingress;ingress=roster-ingress-attestation,profile-alpn,peer,scope,request,operation,capsule,authenticated-at,peer-cert-expires,material-generation,handshake-epoch;provider-operations=local-prepare-execute-status-adopt-compensate-reconcile\n",
-    "committed-terminal-frame-field-order=record,commit-metadata(sequence,raft-log-index,committed-at),committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,committing-authority-scope,committing-authority-key,committing-authority-owner,committing-authority-fence,committing-authority-credential,committing-authority-generation,committing-authority-acquired-at,committing-authority-expires-at,committing-guard-commitment,materialization,receipt-commitment;materialization-postcard-tags=updated:0,deleted:1,no-op:2,aborted:3\n",
-    "terminal-guard-field-order=profile,committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,admission-commitment,scope,key,owner,fence,credential,generation,acquired-at,expires-at\n",
+    "executor-field-order=proof-binding:roster-attestation-proof,profile,configuration-identity,certificate-subject,certificate-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,terminal-phase,terminal-body-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,immutable-authority-scope,current-ingress-scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;provider-receipt=roster-attestation-provider-receipt,profile,configuration-identity,provider-certificate-subject,provider-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,immutable-authority-scope,current-ingress-scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;proof-commitment:roster-attestation-stable-proof,binding,registration-request-id,terminal-slot,roster-id,admission-commitment,phase,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,outcome,evidence-commitment;certificate=roster-attestation-certificate,version,root-id,role,configuration-identity,scope,subject,leaf-epoch,key-id[32],not-before,not-after,compressed-p256-key;attestation=p256-sha256,compressed-sec1:33,low-s-p1363:64,roles:executor|provider|transport-ingress;ingress=roster-ingress-attestation,profile-alpn,peer,scope,request,operation,capsule,authenticated-at,peer-cert-expires,material-generation,handshake-epoch;provider-operations=local-prepare-execute-status-adopt-compensate-reconcile\n",
+    "committed-terminal-frame-field-order=record,commit-metadata(sequence,raft-log-index,committed-at),committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,committing-authority-scope,committing-authority-ingress-scope,committing-authority-key,committing-authority-owner,committing-authority-fence,committing-authority-credential,committing-authority-generation,committing-authority-acquired-at,committing-authority-expires-at,committing-guard-commitment,materialization,receipt-commitment;materialization-postcard-tags=updated:0,deleted:1,no-op:2,aborted:3\n",
+    "terminal-guard-field-order=profile,committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,admission-commitment,immutable-authority-scope,current-ingress-scope,key,owner,fence,credential,generation,acquired-at,expires-at\n",
+    "compact-admission-provenance-field-order=input:profile,configuration-identity,certificate-subject,certificate-role,scope,tenant-scope-partition,session-key-commitment,admission-slot,roster-id,admission-commitment,members(count;ordinal,stable-member-operation-id,descriptor-length,descriptor-commitment,expected-version),established-mutation-tag,optional-established-state-type(length,commitment),protected-plan(length,commitment),protected-checkpoint(length,commitment),protected-result(length,commitment),logical-owner-commitment,admission-fence,expected-generation,authority-scope,authority-key-commitment,authority-owner-commitment,authority-fence,authority-credential-id,authority-generation,authority-acquired-at,authority-expires-at,ingress;envelope=certificate,input,signature\n",
+    "compact-terminal-evidence-field-order=binding:profile,configuration-identity,certificate-subject,certificate-role,admission-provenance-commitment,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,terminal-phase,terminal-body-commitment,checkpoint-length,checkpoint-commitment,result-length,result-commitment,immutable-authority-scope,current-ingress-scope,key-commitment,owner-commitment,fence,credential,generation,acquired-at,expires-at;member:ordinal,stable-member-operation-id,descriptor-length,descriptor-commitment,expected-version,expected-generation,proof-epoch,operation,outcome,evidence-length,evidence-commitment,stable-proof-commitment;proof=member,provider-certificate,provider-signature,executor-signature;bundle=executor-certificate,binding,proofs\n",
     "terminal-receipt-field-order=profile,registration-request-id,terminal-slot-id,admission-commitment,terminal-body-commitment,phase,committing-fence,committing-guard-commitment,commit-metadata,materialization;materialization=updated-from-to-record-commitment|deleted-generation|no-op-generation|aborted\n",
     "executor-operation-tags=execute:1,status:2,adopt:3,compensate:4,prepare:5,reconcile:6\n",
     "publication-operation-tags=status:1,begin-inert-intent:2,adopt:3;publication-outcome-tags=absent:1,not-transmitted:2,outcome-unknown:3,pending:4,published:5,conflict:6\n",
@@ -257,10 +271,11 @@ const PROFILE_DESCRIPTOR: &[u8] = concat!(
     "provider-scheduling=fail-fast,global-max:1024,exact-tenant-scope-cap:ceil(global/2),fixed-shards:16,no-wait-queue,no-per-subscriber-resource\n",
     "provider-tags=not-transmitted:1,outcome-unknown:2,not-found:3,pending:4,conclusive:5,prepared-not-run:6,ready-to-prepare:7\n",
     "outcome-tags=applied-executed:1,applied-adopted:2,not-applied-reconciled:3,compensated-reconciled:4\n",
+    "conclusive-matrix=prepare:none;execute:applied-executed;status:applied-executed|applied-adopted|not-applied-reconciled|compensated-reconciled;adopt:applied-adopted|not-applied-reconciled|compensated-reconciled;compensate:compensated-reconciled;reconcile:not-applied-reconciled|compensated-reconciled\n",
     "limits=max-members:8,accepted-members:1..8,fresh-target-members:6,plan:1048576,checkpoint:1048576,result:16384,roster-id:16,member-operation-id:16,descriptor:16384,status:4096,attestation-evidence:4096,attestation-bundle:40960,compact-terminal-evidence:8192,ingress-attestation:1024,admission-codec:2245658,terminal-codec:1065423,committed-terminal-codec:1069519,tombstone-codec:256,history-floor-codec:128,history-epoch-max:9223372036854775807,live:1024,live-plus-retained:131072,epoch-bindings:131072,operational-target:100000,reclaim:1024,retention-seconds:86400,quorum-mutations:fresh-success=2(admission,terminalization);remote-reads=admission-status,recover,terminal-status,current-publication-authority;local-authority-checks=provider-pre-post,publication-pre-post\n",
     "maintenance=bounded-deterministic-reclaim-and-retirement,payload-compaction,irreversible-floor-retirement;never-on-fresh-success;local-provider-journal-only\n",
     "history=stable-slot-binds-epoch-scope-session-key-roster-id,new-v2-admission-atomically-selects-binds-current-epoch-greater-than-durable-exact-scope-floor-before-reserve,admit-reserves-one-terminal-slot,terminal-retention-starts-at-terminalization,reclaim-oldest-min-1024-eligible-to-v2-conflict-tombstone,never-reclaim-live,durable-canonical-scope-bound-irreversible-floor,never-reopen-before-scope-bound-irreversible-epoch-retirement\n",
-    "retry=prepare-or-execute-only-after-same-call-not-transmitted,outcome-unknown-status-adopt-only,not-found-non-exclusionary\n",
+    "retry=any-provider-operation-only-after-its-direct-identical-retained-call-not-transmitted,outcome-unknown-status-adopt-only,not-found-non-exclusionary\n",
     "provider-fence=atomically-track-monotonic-current-execution-fence-per-exact-member-binding(roster-id,admission-commitment,scope,tenant,ordinal,stable-member-operation-id,descriptor,expected-version),reject-delayed-lower-fence-execute-after-higher-fence-status-or-adopt-conclusive-not-applied-or-compensated\n",
     "terminal=phase-inferred-from-complete-local-provider-proofs,prepared-body-local,first-conclusive-member-outcome-and-evidence-commitment-immutable-across-successors,established-alone-mints-publication-authority,aborted-nonpublishing,checkpoint-and-result-retained-exactly-through-terminal-retention,then-full-copies-atomically-deleted-and-payload-compacted-to-nonpublishing-conflict-status\n",
     "publication=provider-local-durable-inert-intent-then-adopt,no-consensus-mutation,stable-id-excludes-replaceable-current-fence,current-authority-read-before-and-after-effect,status-first,monotonic-state:absent-to-reserved-to-attempted-to-published,conflict-sticky,created-state-never-reverts-to-absent,logical-state-may-compact-but-not-gc,absent-non-exclusionary-never-effect-authority,begin-never-crosses-effect,adopt-durably-marks-attempted-before-effect,attempted-resend-only-after-provider-retained-exact-not-transmitted,each-call-atomically-raises-durable-fence-floor-and-rejects-lower-or-expired-before-io,outcome-unknown-status-adopt-only,published-tombstone-outlives-terminal-retention,ack-only-after-exact-established-and-postcheck\n"
@@ -309,6 +324,12 @@ pub fn profile_digest() -> [u8; 32] {
         ROSTER_ATTESTATION_BUNDLE_DOMAIN,
         ROSTER_INGRESS_ATTESTATION_DOMAIN,
         ROSTER_INGRESS_CAPSULE_DOMAIN,
+        ROSTER_COMPACT_ADMISSION_PROVENANCE_DOMAIN,
+        ROSTER_COMPACT_ADMISSION_COMMITMENT_DOMAIN,
+        ROSTER_COMPACT_ADMISSION_FIELD_DOMAIN,
+        ROSTER_COMPACT_ADMISSION_SLOT_DOMAIN,
+        ROSTER_COMPACT_TERMINAL_EVIDENCE_DOMAIN,
+        ROSTER_COMPACT_TERMINAL_COMMITMENT_DOMAIN,
     ] {
         h.update(domain);
     }
@@ -2056,9 +2077,9 @@ pub struct ProviderCallOutcome {
 impl ProviderCallOutcome {
     /// Report that the current provider call was definitely not transmitted.
     ///
-    /// This permits retrying only the identical retained `prepare` or `execute`
-    /// call which directly produced it. A status call's non-transmission says
-    /// nothing about an earlier prepare or execute attempt.
+    /// This permits retrying only the identical retained call which directly
+    /// produced it. A status call's non-transmission says nothing about an
+    /// earlier prepare or execute attempt.
     pub fn not_transmitted() -> Self {
         Self {
             tag: PROVIDER_NOT_TRANSMITTED,
@@ -2191,7 +2212,7 @@ fn validate_status_bytes(bytes: &[u8]) -> Result<(), Error> {
 /// scope and tenant, ordinal, stable operation identity, descriptor, and expected
 /// version—they must atomically enforce monotonically increasing
 /// [`MemberCall::current_fence`] values. If a higher-fence
-/// [`Self::prepare`], [`Self::status`], or [`Self::adopt`] call yields
+/// [`Self::status`] or [`Self::adopt`] call yields
 /// conclusive [`MemberDisposition::NotApplied`] or
 /// [`MemberDisposition::Compensated`] evidence with
 /// [`MemberAdoption::Reconciled`], a delayed lower-fence
@@ -2208,6 +2229,21 @@ fn validate_status_bytes(bytes: &[u8]) -> Result<(), Error> {
 /// body after a lost terminal reply without inventing state or changing phase.
 /// Terminal member commitments deliberately exclude the execution fence so
 /// that reconstruction remains byte-identical.
+///
+/// The conclusive operation/outcome matrix is fixed:
+///
+/// | Operation | Permitted signed conclusive outcome |
+/// | --- | --- |
+/// | `prepare` | none; only the durable pre-effect observation |
+/// | `execute` | `Applied + Executed` |
+/// | `status` | either applied outcome, `NotApplied + Reconciled`, or `Compensated + Reconciled` |
+/// | `adopt` | `Applied + Adopted`, `NotApplied + Reconciled`, or `Compensated + Reconciled` |
+/// | `compensate_member` | `Compensated + Reconciled` only |
+/// | `reconcile_member` | `NotApplied + Reconciled` or `Compensated + Reconciled` |
+///
+/// Every other observation stays nonconclusive. In particular, `NotFound` is
+/// never exclusionary and cannot authorize an execution retry or Aborted
+/// terminal.
 pub trait MemberProvider: Send + Sync + 'static {
     /// Provider-specific error returned while executing or observing an operation.
     type Error: Send;
@@ -2218,7 +2254,9 @@ pub trait MemberProvider: Send + Sync + 'static {
     /// [`ProviderCallOutcome::prepared_not_run`]. The provider journal must be
     /// keyed by the stable fence binding (which excludes the replaceable current
     /// fence) while atomically enforcing the current monotonic fence. This call
-    /// is provider-local and must not write SDK consensus.
+    /// is provider-local and must not write SDK consensus. A preparation never
+    /// returns a conclusive terminal receipt: a prior effect must instead be
+    /// re-observed through [`Self::status`] or [`Self::adopt`].
     async fn prepare(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error>;
     /// Attempt the requested effect exactly once when the executor permits it.
     ///
@@ -2227,12 +2265,18 @@ pub trait MemberProvider: Send + Sync + 'static {
     /// status/adopt-only and never restores execute authority.
     async fn execute(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error>;
     /// Observe provider state after an unknown, pending, or otherwise unresolved result.
+    ///
+    /// A conclusive signed receipt may report the immutable applied outcome,
+    /// `NotApplied + Reconciled`, or a final `Compensated + Reconciled`
+    /// outcome. `NotFound` remains non-exclusionary and cannot restore direct
+    /// execution authority.
     async fn status(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error>;
     /// Adopt a durable exact provider intent after an ambiguity boundary.
     ///
-    /// This may return conclusive applied or provider-local reconciled
-    /// non-applied evidence, but must never create a new member identity or
-    /// blindly execute the effect.
+    /// This may return conclusive adopted-applied or provider-local reconciled
+    /// non-applied/compensated evidence, but must never create a new member
+    /// identity or blindly execute the effect. `NotFound` remains
+    /// non-exclusionary and cannot restore direct execution authority.
     async fn adopt(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error>;
 
     /// Reconcile one exact ambiguous member without replaying its effect.
@@ -2288,8 +2332,6 @@ pub(crate) struct TerminalConflictTombstone {
 pub(crate) struct CompactedTerminalLookup<'a> {
     /// Retained-history epoch bound into the original admission request ID.
     pub(crate) history_epoch: u64,
-    /// Exact least-authority scope claimed by the caller.
-    pub(crate) scope: Scope,
     /// Exact protected session key claimed by the caller.
     pub(crate) key: &'a SessionKey,
     /// Stable caller-owned roster identity.
@@ -2351,9 +2393,12 @@ impl TerminalConflictTombstone {
         &self,
         lookup: CompactedTerminalLookup<'_>,
     ) -> Result<CompactedTerminalStatus, Error> {
+        // The current authenticated ingress may belong to a successor
+        // configuration. Historical scope is resolved only from the durable
+        // tombstone, while the exact caller key and roster remain bound to it.
         let binding_key = request_binding_key(
             lookup.history_epoch,
-            lookup.scope,
+            self.binding_key.scope,
             lookup.key,
             lookup.roster_id,
         )?;
@@ -2822,9 +2867,9 @@ mod frozen_cross_crate_goldens {
         assert_eq!(
             profile_digest(),
             [
-                0x1f, 0xc9, 0xe4, 0xbd, 0xaf, 0xfd, 0x17, 0x46, 0xf1, 0xaf, 0x8d, 0x21, 0xc7, 0xb7,
-                0x34, 0x37, 0xc5, 0xba, 0x14, 0x22, 0x8e, 0xc4, 0x3b, 0xe4, 0xe2, 0xcf, 0x18, 0x2c,
-                0x6a, 0x3d, 0xda, 0x35,
+                0xb9, 0xb1, 0xe7, 0xce, 0xbb, 0x01, 0x58, 0xb2, 0x75, 0xf6, 0xfc, 0x5d, 0x17, 0x70,
+                0x97, 0xe3, 0xab, 0xa5, 0x09, 0x22, 0x24, 0x07, 0x98, 0x23, 0xeb, 0x7a, 0x41, 0x8f,
+                0xae, 0x53, 0x07, 0x6c,
             ]
         );
         assert_eq!(
@@ -2838,9 +2883,9 @@ mod frozen_cross_crate_goldens {
         assert_eq!(
             sha256(&admission_frame),
             [
-                0x15, 0x01, 0x83, 0x78, 0x2f, 0x28, 0x34, 0xd7, 0x9e, 0x5b, 0xc1, 0x93, 0x6b, 0x92,
-                0x20, 0x9f, 0xde, 0x7a, 0xa0, 0x29, 0xd9, 0xff, 0x63, 0xf5, 0xb6, 0x82, 0xf9, 0x02,
-                0xae, 0xed, 0x51, 0x05,
+                0xa0, 0xbc, 0x24, 0x32, 0x57, 0x4a, 0xe7, 0x6e, 0x30, 0x97, 0x2d, 0xd4, 0x9b, 0x47,
+                0x28, 0x19, 0x23, 0xed, 0x4d, 0x87, 0x77, 0x69, 0xf4, 0xe7, 0x8a, 0x73, 0x83, 0x4d,
+                0x68, 0x7f, 0xde, 0x06,
             ]
         );
         let terminal = TerminalRecord::new(
@@ -2856,9 +2901,9 @@ mod frozen_cross_crate_goldens {
         assert_eq!(
             sha256(&terminal_frame),
             [
-                0xf9, 0x95, 0xba, 0x81, 0x49, 0x17, 0x5b, 0x9b, 0xeb, 0x59, 0x6b, 0x07, 0x8b, 0x30,
-                0x0b, 0x7e, 0x1a, 0x53, 0x80, 0x42, 0x07, 0xae, 0xb1, 0xba, 0x7b, 0xb6, 0xdb, 0x1a,
-                0x35, 0xe6, 0xe8, 0xe8,
+                0x5b, 0xa8, 0x2b, 0x31, 0xe5, 0x0b, 0x15, 0x1b, 0x1f, 0xaa, 0xb1, 0xf4, 0x67, 0x24,
+                0xc4, 0x91, 0xef, 0x25, 0x54, 0xa4, 0x49, 0xf0, 0xa3, 0x19, 0x14, 0xb8, 0xf3, 0x5f,
+                0xef, 0x53, 0xf0, 0x11,
             ]
         );
     }

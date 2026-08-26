@@ -22,8 +22,36 @@ use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::linux::fs::MetadataExt as _;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use crate::fenced_mutation_roster::PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES;
+
+/// SQLite backup reports page counts as a signed 32-bit integer, while SQLite
+/// accepts a 512-byte page.  This is the one physical database payload ceiling
+/// enforced by every SDK writer through `max_page_count`, and independently
+/// checked by snapshot, transport, and recovery readers.  It bounds the whole
+/// SQLite image--roster blobs, authoritative session rows, schema, indexes,
+/// freelist, WAL-derived backup, and arbitrary non-roster rows--rather than
+/// treating the roster's logical charge budget as a file-size quota.  The
+/// final 512 bytes make the minimum-page representation fit the backup API's
+/// `i32::MAX` page-count limit exactly.
+const SNAPSHOT_MIN_PAGE_BYTES: u64 = 512;
+const SNAPSHOT_MAX_BACKUP_PAGES: u64 = i32::MAX as u64;
+pub(crate) const SNAPSHOT_DATABASE_MAX_BYTES: u64 =
+    SNAPSHOT_MAX_BACKUP_PAGES * SNAPSHOT_MIN_PAGE_BYTES;
 /// Maximum payload bytes admitted in one consensus snapshot envelope.
-pub(crate) const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub(crate) const SNAPSHOT_MAX_BYTES: u64 = SNAPSHOT_DATABASE_MAX_BYTES;
+/// Fixed authenticated footer appended after an otherwise complete SQLite
+/// payload.  The envelope has its own bound because it is a different file
+/// from the database image.
+pub(crate) const SNAPSHOT_ENVELOPE_FOOTER_BYTES: u64 = 8 + 8 + 32;
+/// Maximum complete snapshot file accepted by transport and offline recovery.
+pub(crate) const SNAPSHOT_ENVELOPE_MAX_BYTES: u64 =
+    SNAPSHOT_DATABASE_MAX_BYTES + SNAPSHOT_ENVELOPE_FOOTER_BYTES;
+const _: () =
+    assert!(SNAPSHOT_DATABASE_MAX_BYTES == SNAPSHOT_MAX_BACKUP_PAGES * SNAPSHOT_MIN_PAGE_BYTES);
+const _: () = assert!(
+    SNAPSHOT_DATABASE_MAX_BYTES
+        == PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES * 4 - SNAPSHOT_MIN_PAGE_BYTES
+);
 /// Maximum bytes retained while checking an idempotent receiver replay.
 const SNAPSHOT_REPLAY_VERIFY_BYTES: usize = 64 * 1024;
 
@@ -1781,11 +1809,94 @@ mod tests {
     use super::PinnedSqliteFile;
     #[cfg(target_os = "linux")]
     use super::{PinnedSqliteFile, UnpublishedSnapshotArtifact};
-    use super::{SessionSnapshotFile, SnapshotArtifactGate, SnapshotReplayRead};
+    use super::{
+        SessionSnapshotFile, SnapshotArtifactGate, SnapshotReplayRead, SNAPSHOT_DATABASE_MAX_BYTES,
+        SNAPSHOT_ENVELOPE_FOOTER_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES, SNAPSHOT_MAX_BACKUP_PAGES,
+        SNAPSHOT_MAX_BYTES, SNAPSHOT_MIN_PAGE_BYTES,
+    };
+    use crate::fenced_mutation_roster::{
+        MAX_ADMISSION_CODEC_BYTES, MAX_BUSINESS_SESSION_HEADER_BYTES, MAX_CHECKPOINT_BYTES,
+        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_LIVE_ROSTERS,
+        MAX_RESERVED_AND_RETAINED, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
+        MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES, MAX_ROSTER_INGRESS_ATTESTATION_BYTES,
+        MAX_TOMBSTONE_CODEC_BYTES, PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES,
+    };
     #[cfg(target_os = "linux")]
     use sha2::Digest as _;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncSeek as _, AsyncSeekExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn physical_snapshot_ceiling_covers_the_frozen_roster_ledger_without_overflow() {
+        // One canonical row contains the bounded admission (including plan
+        // and member descriptors), terminal/result, tombstone, provenance,
+        // proof/evidence, ingress, and reserved authoritative business body.
+        // The SQL primary-key/index values are small next to this body and the
+        // common page cap below remains the final authority for all SQLite
+        // pages, including arbitrary non-roster tables.
+        let maximum_canonical_row = u64::try_from(
+            MAX_ADMISSION_CODEC_BYTES
+                + MAX_COMMITTED_TERMINAL_CODEC_BYTES
+                + MAX_TOMBSTONE_CODEC_BYTES
+                + MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES
+                + MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES
+                + MAX_EXECUTOR_PROOF_BUNDLE_BYTES
+                + 2 * MAX_ROSTER_INGRESS_ATTESTATION_BYTES
+                + MAX_CHECKPOINT_BYTES
+                + MAX_BUSINESS_SESSION_HEADER_BYTES
+                + 512,
+        )
+        .expect("frozen canonical-row bound fits u64");
+        let maximum_canonical_ledger = maximum_canonical_row
+            .checked_mul(MAX_RESERVED_AND_RETAINED as u64)
+            .expect("frozen canonical ledger fits u64");
+        let maximum_live_business_rows =
+            u64::try_from(MAX_CHECKPOINT_BYTES + MAX_BUSINESS_SESSION_HEADER_BYTES)
+                .expect("frozen business-row bound fits u64")
+                .checked_mul(MAX_LIVE_ROSTERS as u64)
+                .expect("frozen business rows fit u64");
+        let roster_row_values = 120_u64 + 64 + 16;
+        let history_floor_values = 64_u64 + 128;
+        let retirement_cursor_values = 64_u64 + 256;
+        let admission_values = 120_u64 + 32 + 16 + 16 + 128 + 30 + 30 + 4 * 8;
+        let roster_side_values = (roster_row_values
+            + history_floor_values
+            + retirement_cursor_values
+            + admission_values)
+            .checked_mul(MAX_RESERVED_AND_RETAINED as u64)
+            .and_then(|values| values.checked_add(maximum_live_business_rows))
+            .and_then(|values| values.checked_add(1_024))
+            .expect("frozen roster side values fit u64");
+        assert_eq!(
+            SNAPSHOT_DATABASE_MAX_BYTES,
+            PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES * 4 - SNAPSHOT_MIN_PAGE_BYTES
+        );
+        assert_eq!(
+            SNAPSHOT_DATABASE_MAX_BYTES,
+            SNAPSHOT_MAX_BACKUP_PAGES * SNAPSHOT_MIN_PAGE_BYTES
+        );
+        assert_eq!(SNAPSHOT_MAX_BYTES, SNAPSHOT_DATABASE_MAX_BYTES);
+        assert_eq!(
+            SNAPSHOT_ENVELOPE_MAX_BYTES,
+            SNAPSHOT_DATABASE_MAX_BYTES + SNAPSHOT_ENVELOPE_FOOTER_BYTES
+        );
+        let maximum_roster_sqlite_content = maximum_canonical_ledger
+            .checked_add(roster_side_values)
+            .expect("frozen roster SQLite content fits u64");
+        let sqlite_page_index_and_freelist_slack = SNAPSHOT_DATABASE_MAX_BYTES
+            .checked_sub(maximum_roster_sqlite_content)
+            .expect("the full frozen roster field envelope fits the physical page cap");
+        // The field envelope above intentionally permits every row to take
+        // every individual maximum even where the authenticated 256 GiB
+        // logical witness would reject that combination. The remaining
+        // physical slack is therefore available for SQLite pages, table and
+        // index cells, schema, freelist, and any bounded non-roster contents
+        // that share this database under the same max-page policy.
+        assert!(
+            sqlite_page_index_and_freelist_slack >= PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES,
+            "the physical cap leaves an additional logical-ledger-sized SQLite-layout slack"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

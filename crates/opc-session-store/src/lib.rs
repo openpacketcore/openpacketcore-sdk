@@ -133,6 +133,10 @@ pub use capability::{
     SessionStoreHaCompatibility, SessionStorePlatformProfile,
 };
 pub use clock::{Clock, MonotonicClock, SystemClock, TokioVirtualClock};
+/// Non-production signing fixtures for live consensus integration coverage.
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub use consensus::test_support;
 pub use consensus::types::{
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,

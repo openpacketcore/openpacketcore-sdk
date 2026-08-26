@@ -17,9 +17,11 @@ use crate::consensus::{
     SessionConsensusClusterId, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
     SessionConsensusIdentity, SessionConsensusNodeId, SessionTopologyMemberBinding,
 };
+use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
 use crate::topology::{
-    QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyError, ReplicaId,
-    ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
+    derive_durable_quorum_consensus_identity_with_roster_attestation_root, QuorumReplicaDescriptor,
+    QuorumTopologyConfig, QuorumTopologyError, ReplicaId, ValidatedQuorumTopology,
+    QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 
 const TRANSITION_REQUEST_DIGEST_DOMAIN: &[u8] =
@@ -226,8 +228,87 @@ impl SessionTopologyTransitionRequest {
         cluster_id: SessionConsensusClusterId,
         expected_epoch: SessionConsensusConfigurationEpoch,
         desired_epoch: SessionConsensusConfigurationEpoch,
+        desired_members: Vec<QuorumReplicaDescriptor>,
+        operation_timeout: Duration,
+    ) -> Result<Self, SessionTopologyTransitionError> {
+        Self::try_new_with_optional_roster_attestation_trust_root(
+            transition_id,
+            cluster_id,
+            expected_epoch,
+            desired_epoch,
+            desired_members,
+            operation_timeout,
+            None,
+        )
+    }
+
+    /// Construct the next transition from an already validated current
+    /// topology. The current cluster, epoch, and optional roster-attestation
+    /// root are copied only from that admitted topology; callers cannot supply
+    /// a root or select a configuration identity.
+    pub fn try_new_from_validated_current_topology(
+        current_topology: &ValidatedQuorumTopology,
+        transition_id: SessionTopologyTransitionId,
+        desired_members: Vec<QuorumReplicaDescriptor>,
+        operation_timeout: Duration,
+    ) -> Result<Self, SessionTopologyTransitionError> {
+        let current_identity = current_topology
+            .consensus_identity()
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        let desired_epoch = SessionConsensusConfigurationEpoch::new(
+            current_identity
+                .configuration_epoch()
+                .get()
+                .checked_add(1)
+                .ok_or(SessionTopologyTransitionError::EpochOverflow)?,
+        )
+        .map_err(|_| SessionTopologyTransitionError::EpochOverflow)?;
+        Self::try_new_with_optional_roster_attestation_trust_root(
+            transition_id,
+            current_identity.cluster_id(),
+            current_identity.configuration_epoch(),
+            desired_epoch,
+            desired_members,
+            operation_timeout,
+            current_topology.roster_attestation_trust_root(),
+        )
+    }
+
+    /// Construct a transition whose existing desired configuration identity
+    /// additionally commits the immutable currently provisioned roster root.
+    ///
+    /// This crate-private constructor adds no request field: the root affects only
+    /// the existing desired configuration ID and its already-bound request
+    /// digest. Candidate opening and route staging independently derive that
+    /// ID from their current validated topology root before acceptance.
+    pub(crate) fn try_new_with_roster_attestation_trust_root(
+        transition_id: SessionTopologyTransitionId,
+        cluster_id: SessionConsensusClusterId,
+        expected_epoch: SessionConsensusConfigurationEpoch,
+        desired_epoch: SessionConsensusConfigurationEpoch,
+        desired_members: Vec<QuorumReplicaDescriptor>,
+        operation_timeout: Duration,
+        roster_attestation_trust_root: RosterAttestationTrustRootV1,
+    ) -> Result<Self, SessionTopologyTransitionError> {
+        Self::try_new_with_optional_roster_attestation_trust_root(
+            transition_id,
+            cluster_id,
+            expected_epoch,
+            desired_epoch,
+            desired_members,
+            operation_timeout,
+            Some(&roster_attestation_trust_root),
+        )
+    }
+
+    fn try_new_with_optional_roster_attestation_trust_root(
+        transition_id: SessionTopologyTransitionId,
+        cluster_id: SessionConsensusClusterId,
+        expected_epoch: SessionConsensusConfigurationEpoch,
+        desired_epoch: SessionConsensusConfigurationEpoch,
         mut desired_members: Vec<QuorumReplicaDescriptor>,
         operation_timeout: Duration,
+        roster_attestation_trust_root: Option<&RosterAttestationTrustRootV1>,
     ) -> Result<Self, SessionTopologyTransitionError> {
         let next_epoch = expected_epoch
             .get()
@@ -245,8 +326,21 @@ impl SessionTopologyTransitionRequest {
         // Reject oversized caller input before sorting or fingerprinting it.
         validate_member_count(desired_members.len())?;
         desired_members.sort_by(|left, right| left.replica_id().cmp(right.replica_id()));
-        let desired_configuration_id =
+        let rootless_configuration_id =
             validate_desired_membership(cluster_id, desired_epoch, desired_members.as_slice())?;
+        let desired_configuration_id =
+            roster_attestation_trust_root.map_or(rootless_configuration_id, |root| {
+                derive_durable_quorum_consensus_identity_with_roster_attestation_root(
+                    cluster_id,
+                    desired_epoch,
+                    &desired_members
+                        .iter()
+                        .map(QuorumReplicaDescriptor::configuration_fingerprint)
+                        .collect::<Vec<_>>(),
+                    Some(root),
+                )
+                .configuration_id()
+            });
         let member_count = u32::try_from(desired_members.len()).map_err(|_| {
             invalid_topology(QuorumTopologyError::MemberCountTooLarge {
                 configured: desired_members.len(),
@@ -387,6 +481,29 @@ impl SessionTopologyTransitionRequest {
             Err(SessionTopologyTransitionError::IdempotencyConflict)
         }
     }
+}
+
+/// Require the request's already-carried desired identity to match the
+/// immutable roster root admitted by the current topology. This trusts only
+/// topology configuration, never a root asserted by a transition caller.
+pub(crate) fn validate_transition_request_roster_attestation_root(
+    roster_attestation_trust_root: Option<&RosterAttestationTrustRootV1>,
+    request: &SessionTopologyTransitionRequest,
+) -> Result<(), SessionTopologyTransitionError> {
+    let expected_identity = derive_durable_quorum_consensus_identity_with_roster_attestation_root(
+        request.cluster_id(),
+        request.desired_epoch(),
+        &request
+            .desired_members()
+            .iter()
+            .map(QuorumReplicaDescriptor::configuration_fingerprint)
+            .collect::<Vec<_>>(),
+        roster_attestation_trust_root,
+    );
+    if request.desired_identity() != expected_identity {
+        return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+    }
+    Ok(())
 }
 
 fn member_binding(descriptor: &QuorumReplicaDescriptor) -> SessionTopologyMemberBinding {

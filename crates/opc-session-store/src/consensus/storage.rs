@@ -27,7 +27,8 @@ use super::snapshot::{
     fixed_prepublication_scan_boundary, FixedPrepublicationScanGateGuard, SnapshotArtifactGate,
 };
 use super::snapshot::{
-    PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact, SNAPSHOT_MAX_BYTES,
+    PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact,
+    SNAPSHOT_ENVELOPE_FOOTER_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES, SNAPSHOT_MAX_BYTES,
 };
 use super::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
@@ -40,7 +41,7 @@ use crate::sqlite::consensus::{self, SqliteConsensusCore};
 use crate::sqlite::SqliteSessionBackend;
 
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
-const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 8 + 32;
+const SNAPSHOT_FOOTER_BYTES: u64 = SNAPSHOT_ENVELOPE_FOOTER_BYTES;
 // At most one published image and a bounded set of interrupted-attempt
 // artifacts may coexist under the one snapshot gate.
 const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 32;
@@ -845,12 +846,29 @@ async fn validate_and_clean_snapshot_directory(
             .file_type()
             .await
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-        if !file_type.is_file() && !file_type.is_symlink() {
+        // Never follow or unlink a replacement by pathname alone. Staging is
+        // constrained to the exact prefixes above; after this type check the
+        // cleanup guard rechecks the observed inode immediately before unlink.
+        // A raced replacement remains visible and fails this startup instead
+        // of being deleted as an SDK artifact.
+        if !file_type.is_file() {
             return Err(SessionConsensusStorageError::CorruptState);
         }
-        tokio::fs::remove_file(entry.path())
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
             .await
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        if !metadata.is_file() {
+            return Err(SessionConsensusStorageError::CorruptState);
+        }
+        let cleanup = UnpublishedSnapshotArtifact::from_metadata(path.clone(), &metadata, false)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        drop(cleanup);
+        match tokio::fs::symlink_metadata(&path).await {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(SessionConsensusStorageError::BackendUnavailable),
+        }
         removed = true;
     }
     if removed {
@@ -1330,15 +1348,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         SessionSnapshotFile::create_with_cleanup_bounded(
             path,
             Some(Arc::clone(&self.core.snapshot_cleanup_failed)),
-            SNAPSHOT_MAX_BYTES
-                .checked_add(SNAPSHOT_FOOTER_BYTES)
-                .ok_or_else(|| {
-                    storage_error(
-                        ErrorSubject::Snapshot(None),
-                        ErrorVerb::Write,
-                        consensus::invalid_data("session consensus snapshot size limit is invalid"),
-                    )
-                })?,
+            SNAPSHOT_ENVELOPE_MAX_BYTES,
             Some(receive_admission),
         )
         .await
@@ -1842,7 +1852,7 @@ async fn build_file_backed_snapshot_database(
                 )
                 // Keep both guards through sealing and publication.  The raw
                 // source is explicitly removed only after metadata commits;
-                // only the independently verified `VACUUM INTO` descriptor
+                // only the independently verified compacted descriptor
                 // may proceed to sealing.
                 .map(|raw_snapshot| {
                     (
@@ -1940,7 +1950,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             captured_wal_bytes,
         ) = if let Some((membership, raw_snapshot, wal_bytes)) = file_backed {
             // `raw_snapshot` is the independently validated, descriptor-pinned
-            // `VACUUM INTO` inode. Seal that exact inode in place: copying it
+            // compacted inode. Seal that exact inode in place: copying it
             // into a third full-payload artifact would multiply peak snapshot
             // storage and leave a second publication boundary to defend.
             let sealed = seal_snapshot_database_in_place(raw_snapshot, &final_path)
@@ -2351,9 +2361,7 @@ async fn verify_snapshot_envelope_reader(
     file: &mut SessionSnapshotFile,
 ) -> io::Result<(u64, [u8; 32], u64)> {
     let total_length = file.seek(io::SeekFrom::End(0)).await?;
-    if total_length <= SNAPSHOT_FOOTER_BYTES
-        || total_length > SNAPSHOT_MAX_BYTES.saturating_add(SNAPSHOT_FOOTER_BYTES)
-    {
+    if total_length <= SNAPSHOT_FOOTER_BYTES || total_length > SNAPSHOT_ENVELOPE_MAX_BYTES {
         return Err(consensus::invalid_data(
             "session consensus snapshot size is invalid",
         ));
@@ -4355,6 +4363,14 @@ mod tests {
         let interrupted_install_wal = snapshots.join("install-interrupted.sqlite-wal");
         let interrupted_vacuum = snapshots.join("vacuum-interrupted.sqlite");
         let interrupted_vacuum_wal = snapshots.join("vacuum-interrupted.sqlite-wal");
+        // Model process loss after the dynamic/in-memory builder has created
+        // its descriptor-pinned raw sibling but before its RAII owner can
+        // drop. The sibling and every SQLite sidecar deliberately use the
+        // same strict `vacuum-*.sqlite` staging namespace.
+        let interrupted_dynamic_raw = snapshots.join("vacuum-raw-4242-7.sqlite");
+        let interrupted_dynamic_raw_journal = snapshots.join("vacuum-raw-4242-7.sqlite-journal");
+        let interrupted_dynamic_raw_wal = snapshots.join("vacuum-raw-4242-7.sqlite-wal");
+        let interrupted_dynamic_raw_shm = snapshots.join("vacuum-raw-4242-7.sqlite-shm");
         let orphan_promoted = snapshots.join("snapshot-orphan.opc");
         tokio::fs::write(&cancelled_receive, b"partial authenticated stream")
             .await
@@ -4371,6 +4387,30 @@ mod tests {
         tokio::fs::write(&interrupted_vacuum_wal, b"partial compacted SQLite WAL")
             .await
             .expect("write interrupted vacuum WAL artifact");
+        tokio::fs::write(
+            &interrupted_dynamic_raw,
+            b"interrupted dynamic raw SQLite snapshot",
+        )
+        .await
+        .expect("write interrupted dynamic raw artifact");
+        tokio::fs::write(
+            &interrupted_dynamic_raw_journal,
+            b"interrupted dynamic raw SQLite journal",
+        )
+        .await
+        .expect("write interrupted dynamic raw journal artifact");
+        tokio::fs::write(
+            &interrupted_dynamic_raw_wal,
+            b"interrupted dynamic raw SQLite WAL",
+        )
+        .await
+        .expect("write interrupted dynamic raw WAL artifact");
+        tokio::fs::write(
+            &interrupted_dynamic_raw_shm,
+            b"interrupted dynamic raw SQLite SHM",
+        )
+        .await
+        .expect("write interrupted dynamic raw SHM artifact");
         tokio::fs::write(&orphan_promoted, b"promoted before metadata commit")
             .await
             .expect("write orphan promoted artifact");
@@ -4382,6 +4422,10 @@ mod tests {
         assert!(!interrupted_install_wal.exists());
         assert!(!interrupted_vacuum.exists());
         assert!(!interrupted_vacuum_wal.exists());
+        assert!(!interrupted_dynamic_raw.exists());
+        assert!(!interrupted_dynamic_raw_journal.exists());
+        assert!(!interrupted_dynamic_raw_wal.exists());
+        assert!(!interrupted_dynamic_raw_shm.exists());
         assert!(!orphan_promoted.exists());
         let error = match open(&backend, &snapshots, identity(2), expected_members()).await {
             Ok(_) => panic!("different configuration must fail"),

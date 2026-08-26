@@ -115,7 +115,13 @@ impl AuthorityLeaseMetadata {
 /// from this binding instead of making a quorum read.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct AuthorityBinding {
+    /// Immutable scope selected by the durable admission/binding lineage.
     scope: Scope,
+    /// Authenticated current consumer scope which carried this guard.
+    ///
+    /// This is distinct from `scope` after a configuration successor takes
+    /// over an admission created by an earlier configuration.
+    ingress_scope: Scope,
     key: SessionKey,
     owner: OwnerId,
     fence: FenceToken,
@@ -148,6 +154,7 @@ impl AuthorityBinding {
         }
         Ok(Self {
             scope: admission.scope(),
+            ingress_scope: admission.scope(),
             key: admission.key().clone(),
             owner,
             fence,
@@ -172,6 +179,7 @@ impl AuthorityBinding {
         }
         Ok(Self {
             scope,
+            ingress_scope: scope,
             key,
             owner,
             fence,
@@ -195,9 +203,65 @@ impl AuthorityBinding {
         Self::for_recovery(Scope::from_digest(scope_digest), key, owner, fence, lease)
     }
 
+    /// Rehydrate a retained terminal guard. Both scopes are sealed in the
+    /// canonical terminal record; this is not an ingress constructor.
+    fn from_retained_parts(
+        scope_digest: [u8; 32],
+        ingress_scope_digest: [u8; 32],
+        key: SessionKey,
+        owner: OwnerId,
+        fence: FenceToken,
+        lease: AuthorityLeaseMetadata,
+    ) -> Result<Self, ExecutorError> {
+        let mut authority =
+            Self::for_recovery(Scope::from_digest(scope_digest), key, owner, fence, lease)?;
+        authority.ingress_scope = Scope::from_digest(ingress_scope_digest);
+        Ok(authority)
+    }
+
+    /// Bind an authenticated current guard to the immutable admission only
+    /// after the caller has resolved that exact durable admission.  Consumers
+    /// cannot supply the historical scope: it is copied solely from `admission`.
+    pub(crate) fn for_validated_admission(
+        admission: &Admission,
+        current: &Self,
+        require_successor: bool,
+    ) -> Result<Self, ExecutorError> {
+        if current.key() != admission.key()
+            || current.generation() != admission.expected_generation()
+            || current.fence() < admission.admission_fence()
+        {
+            return Err(ExecutorError::InvalidRegistration);
+        }
+        if current.fence() == admission.admission_fence()
+            && (require_successor
+                || current.ingress_scope() != admission.scope()
+                || current.owner() != admission.logical_owner())
+        {
+            return Err(ExecutorError::InvalidRegistration);
+        }
+        Ok(Self {
+            scope: admission.scope(),
+            ingress_scope: current.ingress_scope(),
+            key: admission.key().clone(),
+            owner: current.owner().clone(),
+            fence: current.fence(),
+            credential_id: current.credential_id(),
+            generation: current.generation(),
+            acquired_at: current.acquired_at(),
+            expires_at: current.expires_at(),
+        })
+    }
+
     /// Authenticated least-authority scope commitment.
     pub(crate) const fn scope(&self) -> Scope {
         self.scope
+    }
+
+    /// Exact authenticated current consumer scope, used only for outer
+    /// ingress/certificate validation. Durable binding checks use `scope`.
+    pub(crate) const fn ingress_scope(&self) -> Scope {
+        self.ingress_scope
     }
 
     /// Exact protected session key, including tenant.
@@ -290,7 +354,11 @@ impl fmt::Debug for RegistrationRequest {
     }
 }
 
-/// Stable durable lookup key for recovery of one exact immutable admission.
+/// Authenticated current-ingress lookup for one stable roster identity.
+///
+/// The durable historical scope is not caller supplied: the backend resolves
+/// it from the admitted row only after this least-authority ingress scope and
+/// the current execution guard authenticate.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RecoveryLookup {
     scope: Scope,
@@ -302,7 +370,7 @@ impl RecoveryLookup {
         Self { scope, roster_id }
     }
 
-    /// Exact least-authority scope for the durable lookup.
+    /// Exact current least-authority ingress scope for this lookup.
     pub(crate) const fn scope(&self) -> Scope {
         self.scope
     }
@@ -331,8 +399,9 @@ pub(crate) struct RecoveryRequest {
 /// Complete immutable provenance and current authority for one recovery.
 ///
 /// Grouping these values makes the successor-takeover boundary explicit and
-/// prevents recovery construction from pairing a stable lookup with authority
-/// from a different scope, key, or lease.
+/// prevents recovery construction from pairing the current-ingress lookup
+/// with authority from a different scope, key, or lease. The historical scope
+/// is resolved from the durable admission rather than accepted here.
 pub(crate) struct RecoveryRequestInput {
     lookup: RecoveryLookup,
     original_owner: OwnerId,
@@ -374,7 +443,7 @@ impl RecoveryRequest {
         })
     }
 
-    /// Stable durable lookup key; no prior in-memory capability is required.
+    /// Current-ingress lookup; no prior in-memory capability is required.
     pub(crate) const fn lookup(&self) -> RecoveryLookup {
         self.lookup
     }
@@ -401,7 +470,6 @@ impl RecoveryRequest {
     ) -> CompactedTerminalLookup<'_> {
         CompactedTerminalLookup {
             history_epoch,
-            scope: self.lookup.scope(),
             key: self.authority.key(),
             roster_id: self.lookup.roster_id(),
             original_owner: &self.original_owner,
@@ -864,6 +932,7 @@ struct CommittedTerminalWireRef<'a> {
     committing_registration_request_id: RequestId,
     committing_registration_terminal_slot_id: [u8; 32],
     committing_authority_scope: [u8; 32],
+    committing_authority_ingress_scope: [u8; 32],
     committing_authority_key: &'a SessionKey,
     committing_authority_owner: &'a OwnerId,
     committing_authority_fence: FenceToken,
@@ -884,6 +953,7 @@ struct CommittedTerminalWire {
     committing_registration_request_id: RequestId,
     committing_registration_terminal_slot_id: [u8; 32],
     committing_authority_scope: [u8; 32],
+    committing_authority_ingress_scope: [u8; 32],
     committing_authority_key: SessionKey,
     committing_authority_owner: OwnerId,
     committing_authority_fence: FenceToken,
@@ -996,6 +1066,7 @@ impl CommittedTerminal {
                 .terminal_slot_id()
                 .as_bytes(),
             committing_authority_scope: self.committing_authority.scope().digest(),
+            committing_authority_ingress_scope: self.committing_authority.ingress_scope().digest(),
             committing_authority_key: self.committing_authority.key(),
             committing_authority_owner: self.committing_authority.owner(),
             committing_authority_fence: self.committing_authority.fence(),
@@ -1041,8 +1112,9 @@ impl CommittedTerminal {
         {
             return Err(ExecutorError::InvalidTerminal);
         }
-        let committing_authority = AuthorityBinding::for_recovery(
-            Scope::from_digest(wire.committing_authority_scope),
+        let committing_authority = AuthorityBinding::from_retained_parts(
+            wire.committing_authority_scope,
+            wire.committing_authority_ingress_scope,
             wire.committing_authority_key,
             wire.committing_authority_owner,
             wire.committing_authority_fence,
@@ -1095,8 +1167,9 @@ impl CommittedTerminal {
             .validate_self_contained()
             .map_err(|_| ExecutorError::InvalidTerminal)?;
         wire.commit_metadata.validate()?;
-        AuthorityBinding::for_recovery(
-            Scope::from_digest(wire.committing_authority_scope),
+        AuthorityBinding::from_retained_parts(
+            wire.committing_authority_scope,
+            wire.committing_authority_ingress_scope,
             wire.committing_authority_key.clone(),
             wire.committing_authority_owner.clone(),
             wire.committing_authority_fence,
@@ -1202,6 +1275,19 @@ impl CommittedTerminal {
         &self.record
     }
 
+    /// Return the exact opaque registration retained with this committed
+    /// terminal. Durable roster revalidation uses this only to reconstruct
+    /// the already-applied terminal proof and ingress capsules.
+    pub(crate) const fn committing_registration(&self) -> BackendRegistration {
+        self.committing_registration
+    }
+
+    /// Return the historical authority that committed this terminal. This is
+    /// immutable provenance, not current publication authority.
+    pub(crate) fn committing_authority(&self) -> &AuthorityBinding {
+        &self.committing_authority
+    }
+
     /// Return the immutable receipt commitment retained with this exact
     /// terminal composite.  The current-publication-authority reader compares
     /// it under its backend read lock; it never constructs a receipt.
@@ -1252,7 +1338,8 @@ fn validate_terminal_request_shape(
         || authority.fence().get() == 0
         || authority.expires_at() <= authority.acquired_at()
         || (authority.fence() == admission.admission_fence()
-            && authority.owner() != admission.logical_owner())
+            && (authority.owner() != admission.logical_owner()
+                || authority.ingress_scope() != admission.scope()))
         || authority.fence() < admission.admission_fence()
     {
         return Err(ExecutorError::InvalidTerminal);
@@ -1275,6 +1362,7 @@ fn terminal_committing_guard_commitment(
     hasher.update(registration.terminal_slot_id().as_bytes());
     hasher.update(admission.body_commitment());
     hasher.update(authority.scope().digest());
+    hasher.update(authority.ingress_scope().digest());
     update_terminal_commitment_bytes(&mut hasher, &authority.key().canonical_digest_input());
     update_terminal_commitment_bytes(&mut hasher, authority.owner().as_str().as_bytes());
     hasher.update(authority.fence().get().to_be_bytes());

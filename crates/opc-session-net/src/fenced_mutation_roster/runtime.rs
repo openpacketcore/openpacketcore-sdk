@@ -29,19 +29,26 @@ use super::{
         RosterDiagnosticsInner,
     },
     scheduler::ProviderWorkScheduler,
+    FencedMutationRosterAttestationTrustRootV1,
+    FencedMutationRosterCompactTerminalMemberSigningInputV2,
+    FencedMutationRosterExecutorCertificatePartsV1,
+    FencedMutationRosterTerminalAttestationSigningInputV1,
 };
 use async_trait::async_trait;
 use opc_session_store::fenced_mutation_roster::{
     verify_roster_provider_receipt_v1, RosterAttestationCertificateRoleV1,
     RosterAttestationLeafCertificatePartsV1, RosterAttestationLeafCertificateV1,
-    RosterAttestationTrustRootV1, RosterCompactAdmissionProvenanceV2,
-    RosterCompactTerminalEvidenceBindingV2, RosterCompactTerminalEvidenceV2,
-    RosterCompactTerminalMemberProjectionV2, RosterCompactTerminalMemberProofPartsV2,
-    RosterCompactTerminalMemberSigningInputV2, RosterExecutorMemberProofPartsV1,
-    RosterExecutorProofBundleV1, RosterProviderOperationV1, RosterProviderOutcomeV1,
-    RosterProviderReceiptSigningInputV1, RosterTerminalAttestationSigningInputV1,
+    RosterAttestationTrustRootIdentityV1, RosterAttestationTrustRootV1,
+    RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceBindingV2,
+    RosterCompactTerminalEvidenceV2, RosterCompactTerminalMemberProjectionV2,
+    RosterCompactTerminalMemberProofPartsV2, RosterCompactTerminalMemberSigningInputV2,
+    RosterExecutorMemberProofPartsV1, RosterExecutorProofBundleV1, RosterProviderOperationV1,
+    RosterProviderOutcomeV1, RosterProviderReceiptSigningInputV1,
+    RosterTerminalAttestationSigningInputV1,
 };
-use opc_session_store::{Clock, FenceToken, Generation, OwnerId, SessionKey, SystemClock};
+use opc_session_store::{
+    Clock, FenceToken, Generation, OwnerId, SessionConsensusIdentity, SessionKey, SystemClock,
+};
 use opc_types::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -102,7 +109,6 @@ impl ProviderOperation {
 /// Fixed, redaction-safe executor failure classification.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
-#[doc(hidden)]
 pub enum ExecutorError {
     /// Registration input is malformed or contradicts its immutable admission.
     InvalidRegistration,
@@ -199,26 +205,35 @@ impl std::error::Error for ExecutorError {}
 
 /// Startup-owned HSM/KMS seam for terminal attestation.
 ///
-/// This narrow interface deliberately accepts only a store-defined, typed
-/// terminal preimage. It exposes neither a generic signing operation nor a
+/// This narrow interface deliberately accepts only SDK-constructed, typed
+/// terminal preimages. It exposes neither a generic signing operation nor a
 /// consensus, administrative, or root-private-key capability. The executor
-/// freezes the returned root and Executor leaf once for each preparation.
-#[doc(hidden)]
+/// freezes the returned root and Executor leaf once for each preparation,
+/// requiring the root identity and leaf configuration/scope to match the
+/// authenticated current topology. Immutable admission provenance remains
+/// separately retained and verified. The executor then independently checks
+/// the authority fence, tenant scope, body, and provider proof before and after
+/// each signing operation.
+///
+/// Most callers should compose a topology-provisioned trust root, already
+/// root-signed Executor certificate, and local HSM/KMS signer with
+/// [`FencedMutationRosterExecutorAttestorAdapter`]. Implement this trait
+/// directly only when those three concerns must be supplied by one component.
 #[async_trait]
 pub trait FencedMutationRosterExecutorAttestor: Send + Sync + 'static {
     /// Return the topology-provisioned public trust root used to verify the
     /// already-root-signed Executor leaf.
-    fn trust_root(&self) -> RosterAttestationTrustRootV1;
+    fn trust_root(&self) -> FencedMutationRosterAttestationTrustRootV1;
 
     /// Return one already root-signed Executor leaf certificate.
     fn executor_certificate(
         &self,
-    ) -> Result<RosterAttestationLeafCertificatePartsV1, ExecutorError>;
+    ) -> Result<FencedMutationRosterExecutorCertificatePartsV1, ExecutorError>;
 
     /// Sign exactly one SDK-constructed terminal member preimage.
     async fn sign_terminal(
         &self,
-        input: &RosterTerminalAttestationSigningInputV1,
+        input: &FencedMutationRosterTerminalAttestationSigningInputV1<'_>,
     ) -> Result<[u8; 64], ExecutorError>;
 
     /// Sign one SDK-constructed compact terminal member preimage.  The
@@ -226,9 +241,101 @@ pub trait FencedMutationRosterExecutorAttestor: Send + Sync + 'static {
     /// mutation must never be sent without all compact member signatures.
     async fn sign_compact_terminal(
         &self,
-        _input: &RosterCompactTerminalMemberSigningInputV2,
+        _input: &FencedMutationRosterCompactTerminalMemberSigningInputV2<'_>,
     ) -> Result<[u8; 64], ExecutorError> {
         Err(ExecutorError::AttestationUnavailable)
+    }
+}
+
+/// HSM/KMS signing half of [`FencedMutationRosterExecutorAttestorAdapter`].
+///
+/// This trait receives only exact preimages constructed by the SDK. It has no
+/// access to protected-roster authority, tenant selection, terminal body
+/// construction, consensus, or storage APIs. The compact-signing default is
+/// fail-closed so a V1-only signer cannot emit a partial V2 terminal proof.
+#[async_trait]
+pub trait FencedMutationRosterExecutorTerminalSigner: Send + Sync + 'static {
+    /// Sign one SDK-constructed V1 terminal member preimage.
+    ///
+    /// Use [`super::fenced_mutation_roster_terminal_attestation_signing_digest_v1`]
+    /// when the signing service accepts a P-256 prehash.
+    async fn sign_terminal(
+        &self,
+        input: &FencedMutationRosterTerminalAttestationSigningInputV1<'_>,
+    ) -> Result<[u8; 64], ExecutorError>;
+
+    /// Sign one SDK-constructed V2 compact terminal member preimage.
+    ///
+    /// Use [`super::fenced_mutation_roster_compact_terminal_member_signing_digest_v2`]
+    /// when the signing service accepts a P-256 prehash.
+    async fn sign_compact_terminal(
+        &self,
+        _input: &FencedMutationRosterCompactTerminalMemberSigningInputV2<'_>,
+    ) -> Result<[u8; 64], ExecutorError> {
+        Err(ExecutorError::AttestationUnavailable)
+    }
+}
+
+/// Net-owned adapter that binds topology-provisioned attestation material to
+/// one local HSM/KMS signer for the executor lifetime.
+///
+/// Construct this once during startup and pass it as
+/// `Arc<dyn FencedMutationRosterExecutorAttestor>` to a protected-roster
+/// consumer constructor. The root and certificate are public verification
+/// material only; this adapter cannot mint an accepted terminal. The executor
+/// verifies the certificate and its exact scope, then reconstructs and checks
+/// all authority, tenant, terminal-body, and proof bindings around signing.
+#[derive(Clone)]
+pub struct FencedMutationRosterExecutorAttestorAdapter {
+    trust_root: FencedMutationRosterAttestationTrustRootV1,
+    executor_certificate: FencedMutationRosterExecutorCertificatePartsV1,
+    signer: Arc<dyn FencedMutationRosterExecutorTerminalSigner>,
+}
+
+impl FencedMutationRosterExecutorAttestorAdapter {
+    /// Bind fixed topology attestation material and one local terminal signer.
+    pub fn new(
+        trust_root: FencedMutationRosterAttestationTrustRootV1,
+        executor_certificate: FencedMutationRosterExecutorCertificatePartsV1,
+        signer: Arc<dyn FencedMutationRosterExecutorTerminalSigner>,
+    ) -> Result<Self, ExecutorError> {
+        RosterAttestationLeafCertificateV1::issue_from_signed_parts(
+            &trust_root.as_store(),
+            executor_certificate.as_store(),
+        )
+        .map_err(|_| ExecutorError::AttestationUnavailable)?;
+        Ok(Self {
+            trust_root,
+            executor_certificate,
+            signer,
+        })
+    }
+}
+
+#[async_trait]
+impl FencedMutationRosterExecutorAttestor for FencedMutationRosterExecutorAttestorAdapter {
+    fn trust_root(&self) -> FencedMutationRosterAttestationTrustRootV1 {
+        self.trust_root.clone()
+    }
+
+    fn executor_certificate(
+        &self,
+    ) -> Result<FencedMutationRosterExecutorCertificatePartsV1, ExecutorError> {
+        Ok(self.executor_certificate.clone())
+    }
+
+    async fn sign_terminal(
+        &self,
+        input: &FencedMutationRosterTerminalAttestationSigningInputV1<'_>,
+    ) -> Result<[u8; 64], ExecutorError> {
+        self.signer.sign_terminal(input).await
+    }
+
+    async fn sign_compact_terminal(
+        &self,
+        input: &FencedMutationRosterCompactTerminalMemberSigningInputV2<'_>,
+    ) -> Result<[u8; 64], ExecutorError> {
+        self.signer.sign_compact_terminal(input).await
     }
 }
 
@@ -240,10 +347,14 @@ struct FrozenExecutorAttestation {
 
 fn freeze_executor_attestation(
     attestor: &dyn FencedMutationRosterExecutorAttestor,
-    admission: &Admission,
+    _admission: &Admission,
+    _admission_provenance: &RosterCompactAdmissionProvenanceV2,
+    expected_root_identity: RosterAttestationTrustRootIdentityV1,
+    current_configuration_identity: SessionConsensusIdentity,
+    current_scope: Scope,
 ) -> Result<FrozenExecutorAttestation, ExecutorError> {
-    let root = attestor.trust_root();
-    let certificate = attestor.executor_certificate()?;
+    let root = attestor.trust_root().as_store();
+    let certificate = attestor.executor_certificate()?.as_store();
     let issued =
         RosterAttestationLeafCertificateV1::issue_from_signed_parts(&root, certificate.clone())
             .map_err(|_| ExecutorError::AttestationUnavailable)?;
@@ -251,7 +362,9 @@ fn freeze_executor_attestation(
         .role()
         .map_err(|_| ExecutorError::AttestationUnavailable)?
         != RosterAttestationCertificateRoleV1::Executor
-        || certificate.scope != admission.scope().digest()
+        || certificate.scope != current_scope.digest()
+        || root.identity() != expected_root_identity
+        || certificate.configuration_identity != current_configuration_identity
     {
         return Err(ExecutorError::AttestationUnavailable);
     }
@@ -267,7 +380,10 @@ fn freeze_executor_attestation(
 /// from this binding instead of making a quorum read.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct AuthorityBinding {
+    /// Immutable scope selected by the durable admission/binding lineage.
     scope: Scope,
+    /// Authenticated current consumer scope which carried this guard.
+    ingress_scope: Scope,
     key: SessionKey,
     owner: OwnerId,
     fence: FenceToken,
@@ -318,6 +434,7 @@ impl AuthorityBinding {
         }
         Ok(Self {
             scope: admission.scope(),
+            ingress_scope: admission.scope(),
             key: admission.key().clone(),
             owner,
             fence,
@@ -334,31 +451,28 @@ impl AuthorityBinding {
     /// historical provenance.  A recovered registration instead binds the
     /// backend's current successor owner, credential, and strictly higher
     /// fence while keeping the same key, scope, and expected generation.
-    fn for_successor(
+    pub(crate) fn for_successor(
         admission: &Admission,
-        owner: OwnerId,
-        fence: FenceToken,
-        credential_id: u64,
-        generation: Generation,
-        acquired_at: Timestamp,
-        expires_at: Timestamp,
+        current: &Self,
     ) -> Result<Self, ExecutorError> {
-        if credential_id == 0
-            || fence <= admission.admission_fence()
-            || generation != admission.expected_generation()
-            || expires_at <= acquired_at
+        if current.credential_id() == 0
+            || current.fence() <= admission.admission_fence()
+            || current.key() != admission.key()
+            || current.generation() != admission.expected_generation()
+            || current.expires_at() <= current.acquired_at()
         {
             return Err(ExecutorError::InvalidRegistration);
         }
         Ok(Self {
             scope: admission.scope(),
+            ingress_scope: current.ingress_scope(),
             key: admission.key().clone(),
-            owner,
-            fence,
-            credential_id,
-            generation,
-            acquired_at,
-            expires_at,
+            owner: current.owner().clone(),
+            fence: current.fence(),
+            credential_id: current.credential_id(),
+            generation: current.generation(),
+            acquired_at: current.acquired_at(),
+            expires_at: current.expires_at(),
         })
     }
 
@@ -378,6 +492,7 @@ impl AuthorityBinding {
         }
         Ok(Self {
             scope,
+            ingress_scope: scope,
             key,
             owner,
             fence,
@@ -388,6 +503,18 @@ impl AuthorityBinding {
         })
     }
 
+    /// Rehydrate a retained terminal guard. Both scopes were sealed by the
+    /// SDK's canonical terminal record and are never caller supplied here.
+    fn from_retained_parts(
+        scope_digest: [u8; 32],
+        ingress_scope_digest: [u8; 32],
+        retained: RecoveryLeaseAuthority,
+    ) -> Result<Self, ExecutorError> {
+        let mut authority = retained.into_authority(Scope::from_digest(scope_digest))?;
+        authority.ingress_scope = Scope::from_digest(ingress_scope_digest);
+        Ok(authority)
+    }
+
     /// Authenticated tenant derived from the exact protected session key.
     pub(crate) fn tenant(&self) -> &opc_types::TenantId {
         &self.key.tenant
@@ -396,6 +523,12 @@ impl AuthorityBinding {
     /// Authenticated least-authority scope commitment.
     pub(crate) const fn scope(&self) -> Scope {
         self.scope
+    }
+
+    /// Current authenticated consumer scope. This is deliberately separate
+    /// from the immutable admission scope after a successor takeover.
+    pub(crate) const fn ingress_scope(&self) -> Scope {
+        self.ingress_scope
     }
 
     /// Exact protected session key, including tenant.
@@ -1077,7 +1210,11 @@ impl fmt::Debug for AdmissionStatusRequest<'_> {
     }
 }
 
-/// Stable durable lookup key for recovery of one exact immutable admission.
+/// Authenticated current-ingress lookup for one stable roster identity.
+///
+/// The durable historical scope is not caller supplied: the backend resolves
+/// it from the admitted row only after this least-authority ingress scope and
+/// the current execution guard authenticate.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RecoveryLookup {
     scope: Scope,
@@ -1089,7 +1226,7 @@ impl RecoveryLookup {
         Self { scope, roster_id }
     }
 
-    /// Exact least-authority scope for the durable lookup.
+    /// Exact current least-authority ingress scope for this lookup.
     pub(crate) const fn scope(&self) -> Scope {
         self.scope
     }
@@ -1118,8 +1255,9 @@ pub(crate) struct RecoveryRequest {
 /// Complete immutable provenance and current authority for one recovery.
 ///
 /// Grouping these values makes the successor-takeover boundary explicit and
-/// prevents recovery construction from pairing a stable lookup with authority
-/// from a different scope, key, or lease.
+/// prevents recovery construction from pairing the current-ingress lookup
+/// with authority from a different scope, key, or lease. The historical scope
+/// is resolved from the durable admission rather than accepted here.
 pub(crate) struct RecoveryRequestInput {
     lookup: RecoveryLookup,
     original_owner: OwnerId,
@@ -1220,7 +1358,7 @@ impl RecoveryRequest {
         ))
     }
 
-    /// Stable durable lookup key; no prior in-memory capability is required.
+    /// Current-ingress lookup; no prior in-memory capability is required.
     pub(crate) const fn lookup(&self) -> RecoveryLookup {
         self.lookup
     }
@@ -1240,6 +1378,20 @@ impl RecoveryRequest {
         &self.authority
     }
 
+    /// Replace the pre-lookup, current-ingress guard with a binding whose
+    /// historical scope was copied from the exact durable admission returned
+    /// by the backend. This is the only successor constructor; no consumer
+    /// can provide historical authority or scope.
+    fn resolve_for_admission(mut self, admission: &Admission) -> Result<Self, ExecutorError> {
+        if self.lookup.roster_id() != admission.roster_id()
+            || self.authority.ingress_scope() != self.lookup.scope()
+        {
+            return Err(ExecutorError::InvalidRegistration);
+        }
+        self.authority = AuthorityBinding::for_successor(admission, &self.authority)?;
+        Ok(self)
+    }
+
     /// Exact compacted-terminal claim derived from this validated recovery.
     pub(crate) fn compacted_terminal_lookup(
         &self,
@@ -1247,7 +1399,6 @@ impl RecoveryRequest {
     ) -> CompactedTerminalLookup<'_> {
         CompactedTerminalLookup {
             history_epoch,
-            scope: self.lookup.scope(),
             key: self.authority.key(),
             roster_id: self.lookup.roster_id(),
             original_owner: &self.original_owner,
@@ -1519,6 +1670,20 @@ struct ConclusiveObservation {
     evidence: Vec<u8>,
     provider_certificate: RosterAttestationLeafCertificatePartsV1,
     provider_signature: [u8; 64],
+}
+
+impl ConclusiveObservation {
+    /// Compare only the immutable terminal contribution of two independently
+    /// reverified Provider receipts. Receipt operation, certificate, and
+    /// signature are deliberately excluded: recovery may re-observe the same
+    /// provider-durable final state through Status, Adopt, or Reconcile under
+    /// the current authority. The raw evidence remains byte-exact even though
+    /// its commitment is also retained.
+    fn same_terminal_contribution(&self, other: &Self) -> bool {
+        self.outcome == other.outcome
+            && self.evidence_commitment == other.evidence_commitment
+            && self.evidence == other.evidence
+    }
 }
 
 enum LocalTerminalState {
@@ -2263,6 +2428,7 @@ struct CommittedTerminalWireRef<'a> {
     committing_registration_request_id: RequestId,
     committing_registration_terminal_slot_id: [u8; 32],
     committing_authority_scope: [u8; 32],
+    committing_authority_ingress_scope: [u8; 32],
     committing_authority_key: &'a SessionKey,
     committing_authority_owner: &'a OwnerId,
     committing_authority_fence: FenceToken,
@@ -2283,6 +2449,7 @@ struct CommittedTerminalWire {
     committing_registration_request_id: RequestId,
     committing_registration_terminal_slot_id: [u8; 32],
     committing_authority_scope: [u8; 32],
+    committing_authority_ingress_scope: [u8; 32],
     committing_authority_key: SessionKey,
     committing_authority_owner: OwnerId,
     committing_authority_fence: FenceToken,
@@ -2384,6 +2551,7 @@ impl CommittedTerminal {
                 .terminal_slot_id()
                 .as_bytes(),
             committing_authority_scope: self.committing_authority.scope().digest(),
+            committing_authority_ingress_scope: self.committing_authority.ingress_scope().digest(),
             committing_authority_key: self.committing_authority.key(),
             committing_authority_owner: self.committing_authority.owner(),
             committing_authority_fence: self.committing_authority.fence(),
@@ -2429,16 +2597,19 @@ impl CommittedTerminal {
         {
             return Err(ExecutorError::InvalidTerminal);
         }
-        let committing_authority = AuthorityBinding::for_recovery(
-            Scope::from_digest(wire.committing_authority_scope),
-            wire.committing_authority_key,
-            wire.committing_authority_owner,
-            wire.committing_authority_fence,
-            wire.committing_authority_credential_id,
-            wire.committing_authority_generation,
-            LeaseMetadata::new(
-                wire.committing_authority_acquired_at,
-                wire.committing_authority_expires_at,
+        let committing_authority = AuthorityBinding::from_retained_parts(
+            wire.committing_authority_scope,
+            wire.committing_authority_ingress_scope,
+            RecoveryLeaseAuthority::new(
+                wire.committing_authority_key,
+                wire.committing_authority_owner,
+                wire.committing_authority_fence,
+                wire.committing_authority_credential_id,
+                wire.committing_authority_generation,
+                LeaseMetadata::new(
+                    wire.committing_authority_acquired_at,
+                    wire.committing_authority_expires_at,
+                ),
             ),
         )?;
         let value = Self {
@@ -2923,7 +3094,8 @@ fn validate_terminal_request_shape(
         || authority.fence().get() == 0
         || authority.expires_at() <= authority.acquired_at()
         || (authority.fence() == admission.admission_fence()
-            && authority.owner() != admission.logical_owner())
+            && (authority.owner() != admission.logical_owner()
+                || authority.ingress_scope() != admission.scope()))
         || authority.fence() < admission.admission_fence()
     {
         return Err(ExecutorError::InvalidTerminal);
@@ -2946,6 +3118,7 @@ fn terminal_committing_guard_commitment(
     hasher.update(registration.terminal_slot_id().as_bytes());
     hasher.update(admission.body_commitment());
     hasher.update(authority.scope().digest());
+    hasher.update(authority.ingress_scope().digest());
     update_terminal_commitment_bytes(
         &mut hasher,
         &session_key_canonical_digest_input(authority.key()),
@@ -3169,6 +3342,22 @@ pub(crate) trait RosterExecutorBackend: Send + Sync {
     /// Adapter-local backend error whose contents never enter SDK diagnostics.
     type Error: Send + Sync + 'static;
 
+    /// Return the immutable opaque verifier-root identity carried by the
+    /// authenticated consumer topology. The default protects legacy and test
+    /// backends by making executor attestation unavailable rather than
+    /// accepting a root selected by provider composition.
+    fn expected_roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<RosterAttestationTrustRootIdentityV1> {
+        None
+    }
+
+    /// Return the exact current authenticated consumer configuration. This is
+    /// private topology input, not caller-supplied historical authority.
+    fn current_roster_configuration_identity(&self) -> Option<SessionConsensusIdentity> {
+        None
+    }
+
     /// Persist and authenticate an immutable admission plus exact authority binding.
     ///
     /// In one linearization this MUST authenticate the full binding, select
@@ -3242,6 +3431,8 @@ pub(crate) struct RosterExecutor<P, B> {
     provider: Arc<P>,
     backend: Arc<B>,
     attestor: Arc<dyn FencedMutationRosterExecutorAttestor>,
+    topology_attestation_root_identity: Option<RosterAttestationTrustRootIdentityV1>,
+    topology_configuration_identity: Option<SessionConsensusIdentity>,
     scheduler: ProviderWorkScheduler,
     local_authority: LocalAuthorityRegistry,
     diagnostics: RosterDiagnostics,
@@ -3253,6 +3444,8 @@ impl<P, B> Clone for RosterExecutor<P, B> {
             provider: Arc::clone(&self.provider),
             backend: Arc::clone(&self.backend),
             attestor: Arc::clone(&self.attestor),
+            topology_attestation_root_identity: self.topology_attestation_root_identity,
+            topology_configuration_identity: self.topology_configuration_identity,
             scheduler: self.scheduler.clone(),
             local_authority: self.local_authority.clone(),
             diagnostics: self.diagnostics.clone(),
@@ -3297,6 +3490,9 @@ where
         let scheduler = ProviderWorkScheduler::new(max_in_flight)
             .expect("nonzero clamped provider capacity is within the live-roster limit");
         Self {
+            topology_attestation_root_identity: backend
+                .expected_roster_attestation_trust_root_identity(),
+            topology_configuration_identity: backend.current_roster_configuration_identity(),
             provider,
             backend,
             attestor,
@@ -3440,21 +3636,7 @@ where
                 RegistrationDecision::Compacted { .. } => unreachable!("handled compacted result"),
                 RegistrationDecision::Reject(rejection) => return Err(rejection.into()),
             };
-        let recovered_authority = AuthorityBinding::for_successor(
-            &admission,
-            request.authority.owner.clone(),
-            request.authority.fence,
-            request.authority.credential_id,
-            request.authority.generation,
-            request.authority.acquired_at,
-            request.authority.expires_at,
-        )?;
-        if recovered_authority != request.authority
-            || admission.scope() != request.lookup.scope()
-            || admission.roster_id() != request.lookup.roster_id()
-        {
-            return Err(ExecutorError::InvalidRegistration);
-        }
+        let request = request.resolve_for_admission(&admission)?;
         let registration = Registration::recover(
             request,
             admission,
@@ -3698,7 +3880,16 @@ where
             local.terminal = LocalTerminalState::StatusOnly;
             body
         };
-        let frozen = freeze_executor_attestation(self.attestor.as_ref(), registration.admission())?;
+        let frozen = freeze_executor_attestation(
+            self.attestor.as_ref(),
+            registration.admission(),
+            registration.admission_provenance()?,
+            self.topology_attestation_root_identity
+                .ok_or(ExecutorError::AttestationUnavailable)?,
+            self.topology_configuration_identity
+                .ok_or(ExecutorError::AttestationUnavailable)?,
+            registration.authority().ingress_scope(),
+        )?;
         let mut signed_parts = Vec::with_capacity(proofs.len());
         let mut signing_inputs = Vec::with_capacity(proofs.len());
         for proof in &proofs {
@@ -3709,12 +3900,12 @@ where
                 proof,
                 &frozen.certificate,
             )?;
-            input
-                .digest()
-                .map_err(|_| ExecutorError::AttestationUnavailable)?;
+            let signer_input =
+                FencedMutationRosterTerminalAttestationSigningInputV1::from_store(&input);
+            signer_input.signing_digest()?;
             let signature = tokio::time::timeout(
                 PROVIDER_EFFECT_DEADLINE,
-                self.attestor.sign_terminal(&input),
+                self.attestor.sign_terminal(&signer_input),
             )
             .await
             .map_err(|_| ExecutorError::AttestationUnavailable)??;
@@ -3762,12 +3953,12 @@ where
                 binding: compact_binding.clone(),
                 member: member.clone(),
             };
-            compact_input
-                .digest()
-                .map_err(|_| ExecutorError::AttestationUnavailable)?;
+            let signer_input =
+                FencedMutationRosterCompactTerminalMemberSigningInputV2::from_store(&compact_input);
+            signer_input.signing_digest()?;
             let signature = tokio::time::timeout(
                 PROVIDER_EFFECT_DEADLINE,
-                self.attestor.sign_compact_terminal(&compact_input),
+                self.attestor.sign_compact_terminal(&signer_input),
             )
             .await
             .map_err(|_| ExecutorError::AttestationUnavailable)??;
@@ -4108,8 +4299,16 @@ where
         let local = Arc::clone(&registration.local);
         let backend_registration = registration.backend_registration();
         let diagnostics = self.diagnostics.clone();
-        let frozen_provider_topology =
-            freeze_executor_attestation(self.attestor.as_ref(), registration.admission())?;
+        let frozen_provider_topology = freeze_executor_attestation(
+            self.attestor.as_ref(),
+            registration.admission(),
+            registration.admission_provenance()?,
+            self.topology_attestation_root_identity
+                .ok_or(ExecutorError::AttestationUnavailable)?,
+            self.topology_configuration_identity
+                .ok_or(ExecutorError::AttestationUnavailable)?,
+            registration.authority().ingress_scope(),
+        )?;
         let provider_root = frozen_provider_topology.root;
         let expected_configuration_identity =
             frozen_provider_topology.certificate.configuration_identity;
@@ -4174,7 +4373,7 @@ where
         .get(task.ordinal as usize)
         .ok_or(ExecutorError::InvalidMember)?;
     let binding = task.binding(member);
-    let prior_attempt = {
+    let (prior_attempt, prior_proof_epoch, advanced_proof_epoch) = {
         let mut local = task
             .local
             .lock()
@@ -4217,6 +4416,7 @@ where
             .proof_epochs
             .get_mut(index)
             .ok_or(ExecutorError::InvalidMember)?;
+        let prior_proof_epoch = *epoch;
         if (prior_attempt == LocalAttempt::Conclusive
             && task.operation != ProviderOperation::Compensate)
             || recovering_compensation
@@ -4232,13 +4432,14 @@ where
             {
                 return Err(ExecutorError::OutcomeUnknown);
             }
+            (prior_attempt, prior_proof_epoch, false)
         } else {
             if epoch.checked_add(1) != Some(task.proof_epoch) {
                 return Err(ExecutorError::OutcomeUnknown);
             }
             *epoch = task.proof_epoch;
+            (prior_attempt, prior_proof_epoch, true)
         }
-        prior_attempt
     };
 
     if task.local_authority.check(&task.authority_permit) != LocalAuthorityCheck::Current {
@@ -4346,7 +4547,7 @@ where
                             ..
                         },
                     ),
-                ) if matches!(task.operation, ProviderOperation::Reconcile) => {
+                ) if compensation_observation_allowed(task.operation) => {
                     *local
                         .compensations
                         .get_mut(index)
@@ -4368,18 +4569,34 @@ where
                 }
                 (Some(_), Some(existing), Some(observed))
                     if observed.outcome == ProviderOutcome::CompensatedReconciled
-                        && existing != observed =>
+                        && !existing.same_terminal_contribution(&observed) =>
                 {
                     return Err(ExecutorError::InvalidProviderResponse);
                 }
-                (Some(_), Some(existing), Some(observed))
+                (Some(_), Some(_), Some(observed))
                     if observed.outcome == ProviderOutcome::CompensatedReconciled
-                        && existing == observed
-                        && matches!(task.operation, ProviderOperation::Reconcile) => {}
+                        && compensation_observation_allowed(task.operation) =>
+                {
+                    *local
+                        .compensations
+                        .get_mut(index)
+                        .ok_or(ExecutorError::InvalidMember)? = Some(observed);
+                }
                 (None, Some(existing), Some(observed))
                     if observed.outcome == ProviderOutcome::CompensatedReconciled
-                        && existing == observed
-                        && matches!(task.operation, ProviderOperation::Reconcile) => {}
+                        && !existing.same_terminal_contribution(&observed) =>
+                {
+                    return Err(ExecutorError::InvalidProviderResponse);
+                }
+                (None, Some(_), Some(observed))
+                    if observed.outcome == ProviderOutcome::CompensatedReconciled
+                        && compensation_observation_allowed(task.operation) =>
+                {
+                    *local
+                        .compensations
+                        .get_mut(index)
+                        .ok_or(ExecutorError::InvalidMember)? = Some(observed);
+                }
                 (None, Some(_), Some(observed))
                     if observed.outcome == ProviderOutcome::CompensatedReconciled =>
                 {
@@ -4393,12 +4610,26 @@ where
                 {
                     return Err(ExecutorError::InvalidProviderResponse);
                 }
-                (Some(first), _, Some(observed)) if first != observed => {
+                (Some(first), None, Some(observed))
+                    if !first.same_terminal_contribution(&observed) =>
+                {
                     // A trusted provider must make its first conclusive outcome
                     // immutable. Preserve the original proof epoch and state so a
                     // contradictory later observation cannot change terminal phase
                     // or destroy a previously issued proof.
                     return Err(ExecutorError::InvalidProviderResponse);
+                }
+                (Some(_), None, Some(observed)) => {
+                    // The new receipt has already been verified against the
+                    // exact current call, certificate, tenant/body binding,
+                    // and authority. Replace only its volatile signing
+                    // material after preserving the byte-exact terminal
+                    // contribution, so the returned SDK proof can be used for
+                    // terminal signing under the current observation.
+                    *local
+                        .first_conclusive
+                        .get_mut(index)
+                        .ok_or(ExecutorError::InvalidMember)? = Some(observed);
                 }
                 (Some(_), _, None)
                     if response_error.is_none()
@@ -4412,7 +4643,7 @@ where
                 (None, None, Some(observed))
                     if observed.outcome == ProviderOutcome::CompensatedReconciled
                         && recovered_member
-                        && matches!(task.operation, ProviderOperation::Reconcile) =>
+                        && compensation_observation_allowed(task.operation) =>
                 {
                     // A successor has no SDK-local Applied proof, but the
                     // provider has durably reached the final compensation
@@ -4446,19 +4677,23 @@ where
                 .get(index)
                 .cloned()
                 .ok_or(ExecutorError::InvalidMember)?;
+            if matches!(observation, Observation::NotTransmitted) && advanced_proof_epoch {
+                // `NotTransmitted` is transport proof for this exact direct
+                // invocation. Restore the epoch captured before its first
+                // await so every retry rebuilds the same MemberCall,
+                // including its receipt challenge. Never do this for an
+                // ambiguous result or an invocation that retained its epoch.
+                *local
+                    .proof_epochs
+                    .get_mut(index)
+                    .ok_or(ExecutorError::InvalidMember)? = prior_proof_epoch;
+            }
             if task.operation == ProviderOperation::Compensate
                 && matches!(observation, Observation::NotTransmitted)
             {
                 // A transport-proven non-transmission is the only direct
                 // compensation result that restores the exact Applied proof
                 // and permits an identical same-body retry.
-                *local
-                    .proof_epochs
-                    .get_mut(index)
-                    .ok_or(ExecutorError::InvalidMember)? = task
-                    .proof_epoch
-                    .checked_sub(1)
-                    .ok_or(ExecutorError::OutcomeUnknown)?;
                 *local
                     .attempts
                     .get_mut(index)
@@ -4475,24 +4710,6 @@ where
                 && (prior_attempt == LocalAttempt::OutcomeUnknown
                     || task.operation == ProviderOperation::Compensate);
             let has_conclusive = first_conclusive.is_some();
-            if matches!(observation, Observation::NotTransmitted)
-                && matches!(
-                    task.operation,
-                    ProviderOperation::Prepare | ProviderOperation::Execute
-                )
-            {
-                // A transport-proven non-transmission is the only direct
-                // prepare/execute result that restores a same-ID, same-body
-                // retry. Restore the epoch before returning this ordinal to
-                // its effect-capable lane so its receipt challenge is exact.
-                *local
-                    .proof_epochs
-                    .get_mut(index)
-                    .ok_or(ExecutorError::InvalidMember)? = task
-                    .proof_epoch
-                    .checked_sub(1)
-                    .ok_or(ExecutorError::OutcomeUnknown)?;
-            }
             let attempt = local
                 .attempts
                 .get_mut(index)
@@ -4588,6 +4805,7 @@ fn provider_receipt_challenge<P>(
         expected_member_version: member.expected_version(),
         admission_generation: task.admission.expected_generation().get(),
         authority_scope: task.authority.scope().digest(),
+        authority_ingress_scope: task.authority.ingress_scope().digest(),
         authority_key_canonical: session_key_canonical_digest_input(task.authority.key()),
         authority_owner: task.authority.owner().as_str().as_bytes().to_vec(),
         authority_fence: task.authority.fence().get(),
@@ -4653,6 +4871,7 @@ fn verify_provider_observation<P>(
         expected_member_version: member.expected_version(),
         admission_generation: task.admission.expected_generation().get(),
         authority_scope: task.authority.scope().digest(),
+        authority_ingress_scope: task.authority.ingress_scope().digest(),
         authority_key_canonical: session_key_canonical_digest_input(task.authority.key()),
         authority_owner: task.authority.owner().as_str().as_bytes().to_vec(),
         authority_fence: task.authority.fence().get(),
@@ -4760,6 +4979,10 @@ fn normalize_provider_result<E>(
 }
 
 fn provider_outcome_allowed(operation: ProviderOperation, outcome: ProviderOutcome) -> bool {
+    // This is the runtime enforcement of MemberProvider's public operation /
+    // conclusive-outcome matrix. Keep every validation path routed through
+    // this one function so a provider cannot obtain a terminal proof from an
+    // undocumented operation/outcome pair.
     match operation {
         // A prepare never issues terminal evidence. A prior same-identity
         // effect must be re-observed through status/adopt after this local
@@ -4767,21 +4990,36 @@ fn provider_outcome_allowed(operation: ProviderOperation, outcome: ProviderOutco
         // with a provider-side effect boundary.
         ProviderOperation::Prepare => false,
         ProviderOperation::Execute => outcome == ProviderOutcome::AppliedExecuted,
-        // Recovery operations report the provider's immutable first
-        // conclusive classification. They must therefore be able to reproduce
-        // an Executed observation (and its exact terminal commitment) rather
-        // than translating it into Adopted merely because a successor read it.
-        ProviderOperation::Status => matches!(
+        // Status re-observes the provider's immutable terminal state under a
+        // current fence. It may therefore reproduce either applied proof or
+        // a provider-durable reconciled negative/final compensation proof.
+        ProviderOperation::Status => true,
+        ProviderOperation::Adopt => matches!(
             outcome,
-            ProviderOutcome::AppliedExecuted | ProviderOutcome::AppliedAdopted
+            ProviderOutcome::AppliedAdopted
+                | ProviderOutcome::NotAppliedReconciled
+                | ProviderOutcome::CompensatedReconciled
         ),
-        ProviderOperation::Adopt => outcome == ProviderOutcome::AppliedAdopted,
-        ProviderOperation::Compensate => false,
+        // Direct compensation is allowed only after the local state has a
+        // complete aborting proof set and the target is an uncompensated
+        // SDK-proven applied member. The signed final result is then safe to
+        // retain as the terminal's sole contribution for that member.
+        ProviderOperation::Compensate => outcome == ProviderOutcome::CompensatedReconciled,
         ProviderOperation::Reconcile => matches!(
             outcome,
             ProviderOutcome::NotAppliedReconciled | ProviderOutcome::CompensatedReconciled
         ),
     }
+}
+
+fn compensation_observation_allowed(operation: ProviderOperation) -> bool {
+    matches!(
+        operation,
+        ProviderOperation::Status
+            | ProviderOperation::Adopt
+            | ProviderOperation::Compensate
+            | ProviderOperation::Reconcile
+    )
 }
 
 fn provider_outcome_tag(outcome: ProviderOutcome) -> u8 {
@@ -4866,7 +5104,7 @@ fn terminal_attestation_signing_input(
     certificate: &RosterAttestationLeafCertificatePartsV1,
 ) -> Result<RosterTerminalAttestationSigningInputV1, ExecutorError> {
     if certificate.role != RosterAttestationCertificateRoleV1::Executor
-        || certificate.scope != registration.admission().scope().digest()
+        || certificate.scope != registration.authority().ingress_scope().digest()
     {
         return Err(ExecutorError::AttestationUnavailable);
     }
@@ -4904,6 +5142,7 @@ fn terminal_attestation_signing_input(
         expected_member_version: member.expected_version(),
         admission_generation: registration.admission().expected_generation().get(),
         authority_scope: authority.scope().digest(),
+        authority_ingress_scope: authority.ingress_scope().digest(),
         authority_key_canonical: session_key_canonical_digest_input(authority.key()),
         authority_owner: authority.owner().as_str().as_bytes().to_vec(),
         authority_fence: authority.fence().get(),
@@ -4981,6 +5220,7 @@ fn proof_binding_commitment(
     hasher.update(binding.member.expected_version().to_be_bytes());
     hasher.update(binding.admission.expected_generation().get().to_be_bytes());
     hasher.update(binding.authority.scope().digest());
+    hasher.update(binding.authority.ingress_scope().digest());
     hasher.update(binding.authority.key().digest());
     hasher.update(owner_commitment(binding.authority.owner()));
     hasher.update(binding.authority.fence().get().to_be_bytes());
@@ -5147,6 +5387,21 @@ mod local_authority_registry_tests {
             first != same_commitment_different_bytes,
             "terminal proof preparation must retain and compare raw provider evidence"
         );
+        assert!(
+            !first.same_terminal_contribution(&same_commitment_different_bytes),
+            "a changed evidence body cannot be recovered under a fresh receipt"
+        );
+        let fresh_signed_receipt = ConclusiveObservation {
+            outcome: first.outcome,
+            evidence_commitment: first.evidence_commitment,
+            evidence: first.evidence.clone(),
+            provider_certificate: conclusive_test_provider_certificate(),
+            provider_signature: [8; 64],
+        };
+        assert!(
+            first.same_terminal_contribution(&fresh_signed_receipt),
+            "only fully reverified current receipt material may change during recovery"
+        );
     }
 
     #[test]
@@ -5161,10 +5416,54 @@ mod local_authority_registry_tests {
     }
 
     #[test]
-    fn prepare_conclusive_is_not_a_terminal_proof() {
-        assert!(!provider_outcome_allowed(
-            ProviderOperation::Prepare,
+    fn provider_outcome_matrix_preserves_recovery_and_compensation_liveness() {
+        for outcome in [
             ProviderOutcome::AppliedExecuted,
+            ProviderOutcome::AppliedAdopted,
+            ProviderOutcome::NotAppliedReconciled,
+            ProviderOutcome::CompensatedReconciled,
+        ] {
+            assert!(!provider_outcome_allowed(
+                ProviderOperation::Prepare,
+                outcome
+            ));
+            assert!(provider_outcome_allowed(ProviderOperation::Status, outcome));
+        }
+        assert!(provider_outcome_allowed(
+            ProviderOperation::Execute,
+            ProviderOutcome::AppliedExecuted,
+        ));
+        assert!(!provider_outcome_allowed(
+            ProviderOperation::Execute,
+            ProviderOutcome::NotAppliedReconciled,
+        ));
+        assert!(provider_outcome_allowed(
+            ProviderOperation::Adopt,
+            ProviderOutcome::NotAppliedReconciled,
+        ));
+        assert!(provider_outcome_allowed(
+            ProviderOperation::Adopt,
+            ProviderOutcome::CompensatedReconciled,
+        ));
+        assert!(!provider_outcome_allowed(
+            ProviderOperation::Adopt,
+            ProviderOutcome::AppliedExecuted,
+        ));
+        assert!(provider_outcome_allowed(
+            ProviderOperation::Compensate,
+            ProviderOutcome::CompensatedReconciled,
+        ));
+        assert!(!provider_outcome_allowed(
+            ProviderOperation::Compensate,
+            ProviderOutcome::NotAppliedReconciled,
+        ));
+        assert!(provider_outcome_allowed(
+            ProviderOperation::Reconcile,
+            ProviderOutcome::NotAppliedReconciled,
+        ));
+        assert!(provider_outcome_allowed(
+            ProviderOperation::Reconcile,
+            ProviderOutcome::CompensatedReconciled,
         ));
         let (observation, error) = normalize_provider_result::<()>(
             ProviderOperation::Prepare,
@@ -5350,6 +5649,15 @@ mod production_runtime_cut_matrix_tests {
         outcome: RosterProviderOutcomeV1,
         evidence: Vec<u8>,
     ) -> Result<ProviderCallOutcome, ()> {
+        signed_provider_receipt_for_scope(call, Scope::from_digest([0xD2; 32]), outcome, evidence)
+    }
+
+    fn signed_provider_receipt_for_scope(
+        call: &MemberCall<'_>,
+        certificate_scope: Scope,
+        outcome: RosterProviderOutcomeV1,
+        evidence: Vec<u8>,
+    ) -> Result<ProviderCallOutcome, ()> {
         let root_key = SigningKey::from_bytes((&[0x31; 32]).into()).map_err(|_| ())?;
         let provider_key = SigningKey::from_bytes((&[0x34; 32]).into()).map_err(|_| ())?;
         let root = RosterAttestationTrustRootV1::new(
@@ -5365,7 +5673,7 @@ mod production_runtime_cut_matrix_tests {
             root_id: root.root_id(),
             role: RosterAttestationCertificateRoleV1::Provider,
             configuration_identity: SessionConsensusIdentity::new(cluster, configuration, epoch),
-            scope: [0xD2; 32],
+            scope: certificate_scope.digest(),
             subject_identity_commitment: [0x79; 32],
             leaf_epoch: 1,
             key_id: [0x7A; 32],
@@ -5593,10 +5901,185 @@ mod production_runtime_cut_matrix_tests {
         }
     }
 
+    struct RetryIdentityProvider {
+        status_not_transmitted_once: AtomicBool,
+        adopt_not_transmitted_once: AtomicBool,
+        reconcile_not_transmitted_once: AtomicBool,
+        compensate_not_transmitted_once: AtomicBool,
+        calls: Mutex<Vec<(ProviderOperation, MemberCallSnapshot)>>,
+    }
+
+    impl RetryIdentityProvider {
+        fn new() -> Self {
+            Self {
+                status_not_transmitted_once: AtomicBool::new(true),
+                adopt_not_transmitted_once: AtomicBool::new(true),
+                reconcile_not_transmitted_once: AtomicBool::new(true),
+                compensate_not_transmitted_once: AtomicBool::new(true),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, operation: ProviderOperation, call: &MemberCall<'_>) {
+            self.calls.lock().expect("test provider call ledger").push((
+                operation,
+                MemberCallSnapshot {
+                    roster_id: *call.roster_id().as_bytes(),
+                    admission_commitment: call.admission_commitment(),
+                    ordinal: call.ordinal(),
+                    operation_id: *call.operation_id().as_bytes(),
+                    descriptor: call.descriptor().to_vec(),
+                    expected_version: call.expected_version(),
+                    fence: call.current_fence(),
+                    lease_acquired_at: call.current_lease_acquired_at(),
+                    lease_expires_at: call.current_lease_expires_at(),
+                    provider_proof_epoch: call.provider_proof_epoch(),
+                    provider_receipt_challenge: *call.provider_receipt_challenge().as_bytes(),
+                },
+            ));
+        }
+    }
+
+    #[async_trait]
+    impl MemberProvider for RetryIdentityProvider {
+        type Error = ();
+
+        async fn prepare(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
+            self.record(ProviderOperation::Prepare, call);
+            Ok(ProviderCallOutcome::prepared_not_run())
+        }
+
+        async fn execute(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
+            self.record(ProviderOperation::Execute, call);
+            if call.ordinal() < 3 {
+                Ok(ProviderCallOutcome::outcome_unknown())
+            } else {
+                signed_provider_receipt(
+                    call,
+                    RosterProviderOutcomeV1::AppliedExecuted,
+                    vec![0xD7, call.ordinal()],
+                )
+            }
+        }
+
+        async fn status(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
+            self.record(ProviderOperation::Status, call);
+            if self
+                .status_not_transmitted_once
+                .swap(false, Ordering::SeqCst)
+            {
+                Ok(ProviderCallOutcome::not_transmitted())
+            } else {
+                signed_provider_receipt(
+                    call,
+                    RosterProviderOutcomeV1::AppliedExecuted,
+                    vec![0xD8, call.ordinal()],
+                )
+            }
+        }
+
+        async fn adopt(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
+            self.record(ProviderOperation::Adopt, call);
+            if self
+                .adopt_not_transmitted_once
+                .swap(false, Ordering::SeqCst)
+            {
+                Ok(ProviderCallOutcome::not_transmitted())
+            } else {
+                signed_provider_receipt(
+                    call,
+                    RosterProviderOutcomeV1::AppliedAdopted,
+                    vec![0xD9, call.ordinal()],
+                )
+            }
+        }
+
+        async fn reconcile_member(
+            &self,
+            call: &MemberCall<'_>,
+        ) -> Result<ProviderCallOutcome, Self::Error> {
+            self.record(ProviderOperation::Reconcile, call);
+            if self
+                .reconcile_not_transmitted_once
+                .swap(false, Ordering::SeqCst)
+            {
+                Ok(ProviderCallOutcome::not_transmitted())
+            } else {
+                signed_provider_receipt(
+                    call,
+                    RosterProviderOutcomeV1::NotAppliedReconciled,
+                    vec![0xDA, call.ordinal()],
+                )
+            }
+        }
+
+        async fn compensate_member(
+            &self,
+            call: &MemberCall<'_>,
+        ) -> Result<ProviderCallOutcome, Self::Error> {
+            self.record(ProviderOperation::Compensate, call);
+            if self
+                .compensate_not_transmitted_once
+                .swap(false, Ordering::SeqCst)
+            {
+                Ok(ProviderCallOutcome::not_transmitted())
+            } else {
+                signed_provider_receipt(
+                    call,
+                    RosterProviderOutcomeV1::CompensatedReconciled,
+                    vec![0xDB, call.ordinal()],
+                )
+            }
+        }
+    }
+
+    struct SuccessorStatusProvider {
+        scope: Scope,
+    }
+
+    #[async_trait]
+    impl MemberProvider for SuccessorStatusProvider {
+        type Error = ();
+
+        async fn prepare(
+            &self,
+            _call: &MemberCall<'_>,
+        ) -> Result<ProviderCallOutcome, Self::Error> {
+            Ok(ProviderCallOutcome::outcome_unknown())
+        }
+
+        async fn execute(
+            &self,
+            _call: &MemberCall<'_>,
+        ) -> Result<ProviderCallOutcome, Self::Error> {
+            Ok(ProviderCallOutcome::outcome_unknown())
+        }
+
+        async fn status(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
+            signed_provider_receipt_for_scope(
+                call,
+                self.scope,
+                RosterProviderOutcomeV1::AppliedExecuted,
+                vec![0xCE, call.ordinal()],
+            )
+        }
+
+        async fn adopt(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
+            signed_provider_receipt_for_scope(
+                call,
+                self.scope,
+                RosterProviderOutcomeV1::AppliedAdopted,
+                vec![0xCF, call.ordinal()],
+            )
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum CompensationMode {
         AllApplied,
         Conclusive,
+        DirectConclusive,
+        RecoveryNegative,
         NotTransmittedThenConclusive,
         OutcomeUnknownThenStatusCompensated,
         ConclusiveThenStaleAppliedStatus,
@@ -5659,7 +6142,9 @@ mod production_runtime_cut_matrix_tests {
         }
 
         async fn execute(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
-            if call.ordinal() == 0 || matches!(self.mode, CompensationMode::AllApplied) {
+            if (call.ordinal() == 0 && !matches!(self.mode, CompensationMode::RecoveryNegative))
+                || matches!(self.mode, CompensationMode::AllApplied)
+            {
                 Self::applied(call, RosterProviderOperationV1::Execute)
             } else {
                 Ok(ProviderCallOutcome::outcome_unknown())
@@ -5671,6 +6156,9 @@ mod production_runtime_cut_matrix_tests {
             if call.ordinal() != 0 {
                 if matches!(self.mode, CompensationMode::AllApplied) {
                     return Self::applied(call, RosterProviderOperationV1::Status);
+                }
+                if matches!(self.mode, CompensationMode::RecoveryNegative) {
+                    return Self::not_applied(call);
                 }
                 return Ok(ProviderCallOutcome::outcome_unknown());
             }
@@ -5685,6 +6173,8 @@ mod production_runtime_cut_matrix_tests {
                 | CompensationMode::OutcomeUnknownThenStatusCompensated => {
                     Ok(ProviderCallOutcome::outcome_unknown())
                 }
+                CompensationMode::DirectConclusive => Self::compensated(call),
+                CompensationMode::RecoveryNegative => Self::not_applied(call),
                 CompensationMode::NotTransmittedThenConclusive => {
                     Self::applied(call, RosterProviderOperationV1::Status)
                 }
@@ -5692,18 +6182,23 @@ mod production_runtime_cut_matrix_tests {
         }
 
         async fn adopt(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
-            Self::applied(call, RosterProviderOperationV1::Adopt)
+            if matches!(self.mode, CompensationMode::RecoveryNegative) {
+                Self::not_applied(call)
+            } else {
+                Self::applied(call, RosterProviderOperationV1::Adopt)
+            }
         }
 
         async fn compensate_member(
             &self,
-            _call: &MemberCall<'_>,
+            call: &MemberCall<'_>,
         ) -> Result<ProviderCallOutcome, Self::Error> {
             let attempt = self.compensate_calls.fetch_add(1, Ordering::SeqCst);
             match self.mode {
                 CompensationMode::NotTransmittedThenConclusive if attempt == 0 => {
                     Ok(ProviderCallOutcome::not_transmitted())
                 }
+                CompensationMode::DirectConclusive => Self::compensated(call),
                 CompensationMode::OutcomeUnknownThenStatusCompensated => {
                     Ok(ProviderCallOutcome::outcome_unknown())
                 }
@@ -5721,6 +6216,8 @@ mod production_runtime_cut_matrix_tests {
             match self.mode {
                 CompensationMode::AllApplied => Self::not_applied(call),
                 CompensationMode::Conclusive
+                | CompensationMode::DirectConclusive
+                | CompensationMode::RecoveryNegative
                 | CompensationMode::NotTransmittedThenConclusive
                 | CompensationMode::OutcomeUnknownThenStatusCompensated
                 | CompensationMode::ConclusiveThenStaleAppliedStatus => Self::compensated(call),
@@ -5816,6 +6313,16 @@ mod production_runtime_cut_matrix_tests {
     impl RosterExecutorBackend for CutBackend {
         type Error = ();
 
+        fn expected_roster_attestation_trust_root_identity(
+            &self,
+        ) -> Option<RosterAttestationTrustRootIdentityV1> {
+            Some(CutAttestor::topology_root_identity())
+        }
+
+        fn current_roster_configuration_identity(&self) -> Option<SessionConsensusIdentity> {
+            Some(CutAttestor::configuration_identity())
+        }
+
         async fn register(
             &self,
             request: &RegistrationRequest,
@@ -5903,7 +6410,7 @@ mod production_runtime_cut_matrix_tests {
             let Some(current) = state.current_authority.as_ref() else {
                 return Ok(RegistrationDecision::Reject(BackendRejection::Authority));
             };
-            if request.lookup().scope() != admission.scope()
+            if request.lookup().scope() != request.authority().ingress_scope()
                 || request.lookup().roster_id() != admission.roster_id()
                 || request.authority().key() != admission.key()
                 || request.authority().fence() <= admission.admission_fence()
@@ -6016,25 +6523,45 @@ mod production_runtime_cut_matrix_tests {
 
     impl CutAttestor {
         fn new(scope: Scope) -> Arc<Self> {
+            Self::with_keys(scope, [0x31; 32], [0x32; 32])
+        }
+
+        fn unanchored(scope: Scope) -> Arc<Self> {
+            // Deliberately retain the topology root ID: identity comparison
+            // must bind the public key too, not merely a caller-chosen ID.
+            Self::with_keys(scope, [0x51; 32], [0x52; 32])
+        }
+
+        fn topology_root_identity() -> RosterAttestationTrustRootIdentityV1 {
             let root_key = SigningKey::from_bytes((&[0x31; 32]).into()).expect("root key");
-            let key = SigningKey::from_bytes((&[0x32; 32]).into()).expect("executor key");
+            RosterAttestationTrustRootV1::new(
+                [0x71; 32],
+                Self::compressed_key(root_key.verifying_key()),
+            )
+            .expect("test root")
+            .identity()
+        }
+
+        fn configuration_identity() -> SessionConsensusIdentity {
+            let cluster = ConsensusClusterId::new("runtime-cut-matrix").expect("cluster ID");
+            let epoch = ConsensusConfigurationEpoch::new(1).expect("configuration epoch");
+            let configuration = derive_configuration_id(cluster, epoch, &[]);
+            SessionConsensusIdentity::new(cluster, configuration, epoch)
+        }
+
+        fn with_keys(scope: Scope, root_scalar: [u8; 32], executor_scalar: [u8; 32]) -> Arc<Self> {
+            let root_key = SigningKey::from_bytes((&root_scalar).into()).expect("root key");
+            let key = SigningKey::from_bytes((&executor_scalar).into()).expect("executor key");
             let root = RosterAttestationTrustRootV1::new(
                 [0x71; 32],
                 Self::compressed_key(root_key.verifying_key()),
             )
             .expect("test root");
-            let cluster = ConsensusClusterId::new("runtime-cut-matrix").expect("cluster ID");
-            let epoch = ConsensusConfigurationEpoch::new(1).expect("configuration epoch");
-            let configuration = derive_configuration_id(cluster, epoch, &[]);
             let now = Timestamp::now_utc();
             let mut certificate = RosterAttestationLeafCertificatePartsV1 {
                 root_id: root.root_id(),
                 role: RosterAttestationCertificateRoleV1::Executor,
-                configuration_identity: SessionConsensusIdentity::new(
-                    cluster,
-                    configuration,
-                    epoch,
-                ),
+                configuration_identity: Self::configuration_identity(),
                 scope: scope.digest(),
                 subject_identity_commitment: [0x72; 32],
                 leaf_epoch: 1,
@@ -6149,39 +6676,301 @@ mod production_runtime_cut_matrix_tests {
 
     #[async_trait]
     impl FencedMutationRosterExecutorAttestor for CutAttestor {
-        fn trust_root(&self) -> RosterAttestationTrustRootV1 {
-            self.root.clone()
+        fn trust_root(&self) -> FencedMutationRosterAttestationTrustRootV1 {
+            FencedMutationRosterAttestationTrustRootV1::from_store(self.root.clone())
         }
 
         fn executor_certificate(
             &self,
-        ) -> Result<RosterAttestationLeafCertificatePartsV1, ExecutorError> {
-            Ok(self.certificate.clone())
+        ) -> Result<FencedMutationRosterExecutorCertificatePartsV1, ExecutorError> {
+            Ok(FencedMutationRosterExecutorCertificatePartsV1::from_store(
+                self.certificate.clone(),
+            ))
         }
 
         async fn sign_terminal(
             &self,
-            input: &RosterTerminalAttestationSigningInputV1,
+            input: &FencedMutationRosterTerminalAttestationSigningInputV1<'_>,
         ) -> Result<[u8; 64], ExecutorError> {
-            Ok(Self::sign(
-                &self.key,
-                input
-                    .digest()
-                    .map_err(|_| ExecutorError::AttestationUnavailable)?,
-            ))
+            Ok(Self::sign(&self.key, input.signing_digest()?))
         }
 
         async fn sign_compact_terminal(
             &self,
-            input: &RosterCompactTerminalMemberSigningInputV2,
+            input: &FencedMutationRosterCompactTerminalMemberSigningInputV2<'_>,
         ) -> Result<[u8; 64], ExecutorError> {
-            Ok(Self::sign(
-                &self.key,
-                input
-                    .digest()
-                    .map_err(|_| ExecutorError::AttestationUnavailable)?,
-            ))
+            Ok(Self::sign(&self.key, input.signing_digest()?))
         }
+    }
+
+    struct RootOnlyTerminalSigner;
+
+    #[async_trait]
+    impl crate::FencedMutationRosterExecutorTerminalSigner for RootOnlyTerminalSigner {
+        async fn sign_terminal(
+            &self,
+            input: &crate::FencedMutationRosterTerminalAttestationSigningInputV1<'_>,
+        ) -> Result<[u8; 64], crate::FencedMutationRosterExecutorError> {
+            let _ = input.signing_digest()?;
+            Ok([0; 64])
+        }
+
+        async fn sign_compact_terminal(
+            &self,
+            input: &crate::FencedMutationRosterCompactTerminalMemberSigningInputV2<'_>,
+        ) -> Result<[u8; 64], crate::FencedMutationRosterExecutorError> {
+            let _ = input.signing_digest()?;
+            Ok([0; 64])
+        }
+    }
+
+    #[test]
+    fn net_root_attestor_configuration_is_self_contained_and_fails_closed() {
+        // This uses only `opc_session_net` root exports for every public
+        // attestor input and signer-facing input type. The test key is merely
+        // topology provisioning material; the resulting adapter has no root
+        // signing or terminal-proof construction capability.
+        let root_key = SigningKey::from_bytes((&[0x51; 32]).into()).expect("root key");
+        let executor_key = SigningKey::from_bytes((&[0x52; 32]).into()).expect("executor key");
+        let root_id = [0x53; 32];
+        let root = crate::FencedMutationRosterAttestationTrustRootV1::new(
+            root_id,
+            CutAttestor::compressed_key(root_key.verifying_key()),
+        )
+        .expect("public net trust-root constructor");
+        assert!(crate::FencedMutationRosterAttestationTrustRootV1::new(root_id, [0; 33]).is_err());
+
+        let cluster = crate::ConsensusClusterId::new("net-root-attestor").expect("cluster");
+        let epoch = crate::ConsensusConfigurationEpoch::new(1).expect("epoch");
+        let configuration = crate::ConsensusConfigurationId::from_bytes([0x57; 32]);
+        let identity = crate::ConsensusIdentity::new(cluster, configuration, epoch);
+        let before = crate::Timestamp::now_utc()
+            .add_seconds(-60)
+            .expect("not-before");
+        let after = before.add_seconds(120).expect("not-after");
+        let subject = [0x55; 32];
+        let key_id = [0x56; 32];
+        let public_key = CutAttestor::compressed_key(executor_key.verifying_key());
+        let digest = crate::FencedMutationRosterExecutorCertificatePartsV1::signing_digest(
+            root_id, identity, subject, 1, key_id, before, after, public_key,
+        )
+        .expect("public net Executor certificate digest");
+        let certificate = crate::FencedMutationRosterExecutorCertificatePartsV1::new(
+            root_id,
+            identity,
+            subject,
+            1,
+            key_id,
+            before,
+            after,
+            public_key,
+            CutAttestor::sign(&root_key, digest),
+        )
+        .expect("public net Executor certificate constructor");
+        let adapter = crate::FencedMutationRosterExecutorAttestorAdapter::new(
+            root.clone(),
+            certificate,
+            Arc::new(RootOnlyTerminalSigner),
+        )
+        .expect("public net adapter constructor");
+        let wrong_scope_request = request_with_members(1);
+        assert_ne!(
+            super::super::protected_roster_scope_from_consensus_identity(identity).digest(),
+            wrong_scope_request.admission().scope().digest(),
+            "the runtime fixture deliberately carries a different private roster scope"
+        );
+        let provenance = cut_compact_admission_provenance(
+            wrong_scope_request.admission(),
+            wrong_scope_request.authority(),
+        );
+        assert!(freeze_executor_attestation(
+            &adapter,
+            wrong_scope_request.admission(),
+            &provenance,
+            root.as_store().identity(),
+            identity,
+            wrong_scope_request.admission().scope(),
+        )
+        .is_err());
+
+        let invalid_signature = crate::FencedMutationRosterExecutorCertificatePartsV1::new(
+            root_id, identity, subject, 1, key_id, before, after, public_key, [0; 64],
+        )
+        .expect("structurally valid but unsigned certificate material");
+        assert!(crate::FencedMutationRosterExecutorAttestorAdapter::new(
+            root,
+            invalid_signature,
+            Arc::new(RootOnlyTerminalSigner),
+        )
+        .is_err());
+        assert!(crate::FencedMutationRosterExecutorCertificatePartsV1::new(
+            root_id, identity, subject, 1, key_id, after, before, public_key, [0; 64],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn executor_attestation_binds_successor_topology_not_admission_provenance() {
+        let predecessor = request_with_members(1);
+        let predecessor_provenance =
+            cut_compact_admission_provenance(predecessor.admission(), predecessor.authority());
+        let successor_scope = Scope::from_digest([0xD3; 32]);
+        let successor = CutAttestor::new(successor_scope);
+        let current_identity = CutAttestor::configuration_identity();
+
+        assert!(freeze_executor_attestation(
+            successor.as_ref(),
+            predecessor.admission(),
+            &predecessor_provenance,
+            CutAttestor::topology_root_identity(),
+            current_identity,
+            successor_scope,
+        )
+        .is_ok());
+
+        let predecessor_certificate = CutAttestor::new(predecessor.admission().scope());
+        assert!(freeze_executor_attestation(
+            predecessor_certificate.as_ref(),
+            predecessor.admission(),
+            &predecessor_provenance,
+            CutAttestor::topology_root_identity(),
+            current_identity,
+            successor_scope,
+        )
+        .is_err());
+
+        let stale_epoch = ConsensusConfigurationEpoch::new(2).expect("stale epoch");
+        let stale_identity = SessionConsensusIdentity::new(
+            ConsensusClusterId::new("runtime-cut-matrix").expect("cluster ID"),
+            derive_configuration_id(
+                ConsensusClusterId::new("runtime-cut-matrix").expect("cluster ID"),
+                stale_epoch,
+                &[],
+            ),
+            stale_epoch,
+        );
+        assert!(freeze_executor_attestation(
+            successor.as_ref(),
+            predecessor.admission(),
+            &predecessor_provenance,
+            CutAttestor::topology_root_identity(),
+            stale_identity,
+            successor_scope,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn successor_scope_provider_status_builds_conclusive_established_terminal() {
+        let request = request_with_members(1);
+        let backend = Arc::new(CutBackend::default());
+        let predecessor = executor(
+            Arc::new(CutProvider::for_cut(Cut::PreparedBeforeRun)),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let predecessor_registration = predecessor
+            .register(request.clone())
+            .await
+            .expect("predecessor admission");
+        let successor_scope = Scope::from_digest([0xD3; 32]);
+        let recovery = successor_in_scope(&request, 2, successor_scope);
+        backend.install_successor_authority(recovery.authority().clone());
+        let successor = RosterExecutor::new(
+            Arc::new(SuccessorStatusProvider {
+                scope: successor_scope,
+            }),
+            Arc::clone(&backend),
+            CutAttestor::new(successor_scope),
+            NonZeroUsize::new(1).expect("provider capacity"),
+        );
+        let recovered = recovered(
+            successor
+                .recover(recovery)
+                .await
+                .expect("cross-scope successor recovery"),
+        );
+        assert_eq!(
+            recovered.authority().scope(),
+            predecessor_registration.admission().scope(),
+            "immutable admission scope remains predecessor-owned"
+        );
+        assert_eq!(
+            recovered.authority().ingress_scope(),
+            successor_scope,
+            "provider execution is authenticated by current successor ingress"
+        );
+        backend.install_successor_authority(recovered.authority().clone());
+        let proof = conclusive(
+            successor
+                .status(&recovered, 0)
+                .await
+                .expect("successor Provider status proof"),
+        );
+        let prepared = successor
+            .prepare_terminal(&recovered, vec![proof])
+            .await
+            .expect("successor terminal proof bundle");
+        let receipt = successor
+            .terminalize(&recovered, &prepared)
+            .await
+            .expect("successor terminalization");
+        assert_eq!(receipt.phase(), Phase::Established);
+        assert!(
+            receipt.publication_authority().is_some(),
+            "only exact Established returns publication authority"
+        );
+        assert_eq!(backend.admission_calls().len(), 1);
+        assert_eq!(backend.terminal_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unanchored_attestor_root_cannot_mint_provider_proof() {
+        let request = request_with_members(1);
+        let unanchored_provider = Arc::new(CutProvider::for_cut(Cut::PreparedBeforeRun));
+        let unanchored_backend = Arc::new(CutBackend::default());
+        let unanchored = RosterExecutor::new(
+            Arc::clone(&unanchored_provider),
+            unanchored_backend,
+            CutAttestor::unanchored(request.admission().scope()),
+            NonZeroUsize::new(1).expect("provider capacity"),
+        );
+        let registration = unanchored
+            .register(request.clone())
+            .await
+            .expect("durable admission remains independent of local signer selection");
+        assert!(matches!(
+            unanchored.prepare(&registration, 0).await,
+            Err(ExecutorError::AttestationUnavailable)
+        ));
+        assert_eq!(
+            unanchored_provider.prepare_calls.load(Ordering::SeqCst),
+            0,
+            "an unanchored root is rejected before a provider receipt can be requested"
+        );
+        assert_eq!(unanchored_provider.execute_calls.load(Ordering::SeqCst), 0);
+
+        let anchored_provider = Arc::new(CutProvider::for_cut(Cut::PreparedBeforeRun));
+        let anchored_backend = Arc::new(CutBackend::default());
+        let anchored = executor(
+            Arc::clone(&anchored_provider),
+            anchored_backend,
+            request.admission().scope(),
+        );
+        let registration = anchored
+            .register(request)
+            .await
+            .expect("authenticated topology root admits the matching attestor");
+        assert!(matches!(
+            anchored.prepare(&registration, 0).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        let _proof = conclusive(
+            anchored
+                .execute(&registration, 0)
+                .await
+                .expect("matching topology root can mint the SDK proof"),
+        );
     }
 
     fn request() -> RegistrationRequest {
@@ -6241,8 +7030,16 @@ mod production_runtime_cut_matrix_tests {
     }
 
     fn successor(request: &RegistrationRequest, fence: u64) -> RecoveryRequest {
+        successor_in_scope(request, fence, request.admission().scope())
+    }
+
+    fn successor_in_scope(
+        request: &RegistrationRequest,
+        fence: u64,
+        current_ingress_scope: Scope,
+    ) -> RecoveryRequest {
         RecoveryRequest::new_with_lease_metadata(
-            RecoveryLookup::new(request.admission().scope(), request.admission().roster_id()),
+            RecoveryLookup::new(current_ingress_scope, request.admission().roster_id()),
             request.admission().logical_owner().clone(),
             request.admission().admission_fence(),
             RecoveryLeaseAuthority::new(
@@ -6852,6 +7649,140 @@ mod production_runtime_cut_matrix_tests {
     }
 
     #[tokio::test]
+    async fn recovery_not_transmitted_retries_preserve_every_member_call_field() {
+        let request = request_with_members(4);
+        let provider = Arc::new(RetryIdentityProvider::new());
+        let backend = Arc::new(CutBackend::default());
+        let executor = RosterExecutor::new(
+            Arc::clone(&provider),
+            backend,
+            CutAttestor::new(request.admission().scope()),
+            NonZeroUsize::new(6).expect("provider capacity"),
+        );
+        let registration = executor.register(request).await.expect("registered");
+
+        for ordinal in 0_u8..3 {
+            assert!(matches!(
+                executor.prepare(&registration, ordinal).await,
+                Ok(CallResult::PreparedNotRun)
+            ));
+            assert!(matches!(
+                executor.execute(&registration, ordinal).await,
+                Ok(CallResult::OutcomeUnknown)
+            ));
+        }
+        assert!(matches!(
+            executor.status(&registration, 0).await,
+            Ok(CallResult::NotTransmitted)
+        ));
+        assert!(matches!(
+            executor.status(&registration, 0).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+        assert!(matches!(
+            executor.adopt(&registration, 1).await,
+            Ok(CallResult::NotTransmitted)
+        ));
+        assert!(matches!(
+            executor.adopt(&registration, 1).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+        assert!(matches!(
+            executor.reconcile_member(&registration, 2).await,
+            Ok(CallResult::NotTransmitted)
+        ));
+        assert!(matches!(
+            executor.reconcile_member(&registration, 2).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+
+        assert!(matches!(
+            executor.prepare(&registration, 3).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        assert!(matches!(
+            executor.execute(&registration, 3).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+        assert!(matches!(
+            executor.compensate_member(&registration, 3).await,
+            Ok(CallResult::NotTransmitted)
+        ));
+        assert!(matches!(
+            executor.compensate_member(&registration, 3).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+
+        let calls = provider
+            .calls
+            .lock()
+            .expect("test provider call ledger")
+            .clone();
+        for operation in [
+            ProviderOperation::Status,
+            ProviderOperation::Adopt,
+            ProviderOperation::Reconcile,
+            ProviderOperation::Compensate,
+        ] {
+            let retries: Vec<_> = calls
+                .iter()
+                .filter(|(recorded, _)| *recorded == operation)
+                .map(|(_, call)| call)
+                .collect();
+            assert_eq!(
+                retries.len(),
+                2,
+                "each direct {operation:?} retry invokes the provider twice"
+            );
+            assert_eq!(
+                retries[0], retries[1],
+                "a direct {operation:?} NotTransmitted retry preserves its complete MemberCall"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_stays_status_only_without_rolling_back_the_epoch() {
+        let request = request_with_members(1);
+        let provider = Arc::new(CutProvider::with_execute_outcome_unknown(0));
+        let backend = Arc::new(CutBackend::default());
+        let executor = executor(Arc::clone(&provider), backend, request.admission().scope());
+        let registration = executor.register(request).await.expect("registered");
+
+        assert!(matches!(
+            executor.prepare(&registration, 0).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        assert!(matches!(
+            executor.execute(&registration, 0).await,
+            Ok(CallResult::OutcomeUnknown)
+        ));
+        assert!(matches!(
+            executor.execute(&registration, 0).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            executor.status(&registration, 0).await,
+            Ok(CallResult::Conclusive(_))
+        ));
+
+        let calls = provider
+            .calls
+            .lock()
+            .expect("test provider call ledger")
+            .clone();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[1].0, ProviderOperation::Execute);
+        assert_eq!(calls[2].0, ProviderOperation::Status);
+        assert_eq!(
+            calls[2].1.provider_proof_epoch,
+            calls[1].1.provider_proof_epoch + 1,
+            "OutcomeUnknown retains its advanced epoch for status-only recovery"
+        );
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn run_outcome_unknown_is_status_only_and_never_reexecutes() {
         let request = request_with_members(1);
         let provider = Arc::new(CutProvider::with_execute_outcome_unknown(0));
@@ -7244,7 +8175,9 @@ mod production_runtime_cut_matrix_tests {
     async fn lost_compensated_response_is_recovered_by_exact_status_and_prepares_aborted_terminal()
     {
         let request = request_with_members(2);
-        let provider = Arc::new(CompensationProvider::new(CompensationMode::Conclusive));
+        let provider = Arc::new(CompensationProvider::new(
+            CompensationMode::DirectConclusive,
+        ));
         let backend = Arc::new(CutBackend::default());
         let executor =
             compensation_executor(Arc::clone(&provider), backend, request.admission().scope());
@@ -7268,13 +8201,21 @@ mod production_runtime_cut_matrix_tests {
                 .await
                 .expect("complete aborting reconciliation"),
         );
-        // The provider finishes compensation, but the SDK caller loses that
-        // one response. A status replay must reproduce the exact retained
-        // compensation proof; it must not authorize a second compensate.
+        // The provider finishes the direct Compensate+Compensated call, but
+        // the SDK caller loses that response. Status and Reconcile each carry
+        // newly signed receipts, so recovery must retain their reverified
+        // immutable evidence while replacing the stale receipt material; it
+        // must not authorize a second compensate.
         let _lost_response = executor
             .compensate_member(&registration, 0)
             .await
             .expect("provider compensation completed");
+        let _status_recovered = conclusive(
+            executor
+                .status(&registration, 0)
+                .await
+                .expect("exact compensated status"),
+        );
         let recovered = conclusive(
             executor
                 .reconcile_member(&registration, 0)
@@ -7282,11 +8223,107 @@ mod production_runtime_cut_matrix_tests {
                 .expect("exact compensated reconciliation"),
         );
         assert_eq!(provider.compensate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.status_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             executor
                 .prepare_terminal(&registration, vec![recovered, not_applied])
                 .await
                 .expect("recovered aborted terminal")
+                .body
+                .phase(),
+            Phase::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_compensation_receipt_completes_the_aborting_terminal() {
+        let request = request_with_members(2);
+        let provider = Arc::new(CompensationProvider::new(
+            CompensationMode::DirectConclusive,
+        ));
+        let backend = Arc::new(CutBackend::default());
+        let executor =
+            compensation_executor(Arc::clone(&provider), backend, request.admission().scope());
+        let registration = executor.register(request).await.expect("registered");
+        assert!(matches!(
+            executor.prepare(&registration, 0).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        let _ = conclusive(executor.execute(&registration, 0).await.expect("applied"));
+        assert!(matches!(
+            executor.prepare(&registration, 1).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        assert!(matches!(
+            executor.execute(&registration, 1).await,
+            Ok(CallResult::OutcomeUnknown)
+        ));
+        let not_applied = conclusive(
+            executor
+                .reconcile_member(&registration, 1)
+                .await
+                .expect("complete aborting reconciliation"),
+        );
+        let compensated = conclusive(
+            executor
+                .compensate_member(&registration, 0)
+                .await
+                .expect("signed direct compensation"),
+        );
+        assert_eq!(provider.compensate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            executor
+                .prepare_terminal(&registration, vec![compensated, not_applied])
+                .await
+                .expect("complete aborted terminal")
+                .body
+                .phase(),
+            Phase::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn status_and_adopt_signed_negative_receipts_complete_an_aborted_terminal() {
+        let request = request_with_members(2);
+        let provider = Arc::new(CompensationProvider::new(
+            CompensationMode::RecoveryNegative,
+        ));
+        let backend = Arc::new(CutBackend::default());
+        let executor = compensation_executor(provider, backend, request.admission().scope());
+        let registration = executor.register(request).await.expect("registered");
+        assert!(matches!(
+            executor.prepare(&registration, 0).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        assert!(matches!(
+            executor.execute(&registration, 0).await,
+            Ok(CallResult::OutcomeUnknown)
+        ));
+        let status_not_applied = conclusive(
+            executor
+                .status(&registration, 0)
+                .await
+                .expect("signed status reconciliation"),
+        );
+        assert!(matches!(
+            executor.prepare(&registration, 1).await,
+            Ok(CallResult::PreparedNotRun)
+        ));
+        assert!(matches!(
+            executor.execute(&registration, 1).await,
+            Ok(CallResult::OutcomeUnknown)
+        ));
+        let adopted_not_applied = conclusive(
+            executor
+                .adopt(&registration, 1)
+                .await
+                .expect("signed adoption reconciliation"),
+        );
+        assert_eq!(
+            executor
+                .prepare_terminal(&registration, vec![status_not_applied, adopted_not_applied],)
+                .await
+                .expect("complete aborted terminal")
                 .body
                 .phase(),
             Phase::Aborted

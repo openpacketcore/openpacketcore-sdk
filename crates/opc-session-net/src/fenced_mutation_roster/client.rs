@@ -695,11 +695,15 @@ pub enum ExecuteOutcome {
 }
 
 /// Result of durably preparing one exact provider-local member request.
+///
+/// This is the public prepare row of the fixed provider matrix: a preparation
+/// is either retained pre-effect, proven not transmitted, or recovery-only.
+/// It never returns a terminal proof; a prior effect must be re-observed by
+/// [`FencedMutationRosterClient::status`] or
+/// [`FencedMutationRosterClient::adopt`].
 pub enum MemberPrepareOutcome {
     /// The provider retained the exact request and proved execution has not run.
     Prepared,
-    /// Preparation discovered a prior immutable conclusive provider outcome.
-    Conclusive(Box<MemberProof>),
     /// No prepare byte crossed transport; retry the same retained prepare stage.
     NotTransmitted,
     /// The retained member is now recovery-only.
@@ -718,7 +722,14 @@ impl fmt::Debug for ExecuteOutcome {
     }
 }
 
-/// Result of a status or adoption operation.
+/// Result of a status, adoption, reconciliation, or compensation operation.
+///
+/// The `Conclusive` variant is an SDK-issued proof only. Status or adoption
+/// can yield applied, reconciled non-applied, or final compensated evidence;
+/// reconciliation can yield reconciled non-applied or compensated evidence;
+/// direct compensation can yield final compensated evidence only. `NotFound`
+/// remains `Ambiguous` and never authorizes an execution retry or Aborted
+/// terminal on its own.
 pub enum MemberRecoveryOutcome {
     /// The SDK issued a conclusive, nonconstructible proof.
     Conclusive(Box<MemberProof>),
@@ -1371,9 +1382,7 @@ impl FencedMutationRosterClient {
                 member.state = ReadyMemberState::ExecuteReady;
                 Ok(MemberPrepareOutcome::Prepared)
             }
-            Ok(CallResult::Conclusive(proof)) => Ok(MemberPrepareOutcome::Conclusive(Box::new(
-                MemberProof(*proof),
-            ))),
+            Ok(CallResult::Conclusive(_)) => Err(ClientError::InvalidState),
             Ok(CallResult::NotTransmitted) => {
                 member.state = ReadyMemberState::PrepareReady;
                 Ok(MemberPrepareOutcome::NotTransmitted)
