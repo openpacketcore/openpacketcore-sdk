@@ -17717,23 +17717,18 @@ mod membership_tests {
             admission_status,
             crate::sqlite::consensus::ProtectedRosterReadResult::Admitted(_)
         ));
-        let recovery =
-            crate::fenced_mutation_roster_executor::RecoveryRequest::new_with_lease_metadata(
-                roster_scope,
-                admission.roster_id(),
+        let recovery = crate::fenced_mutation_roster_executor::RecoveryRequest::new(
+            crate::fenced_mutation_roster_executor::RecoveryRequestInput::new(
+                crate::fenced_mutation_roster_executor::RecoveryLookup::new(
+                    roster_scope,
+                    admission.roster_id(),
+                ),
                 admission.logical_owner().clone(),
                 admission.admission_fence(),
-                key.clone(),
-                successor_owner.clone(),
-                successor_lease.fence(),
-                AuthorityLeaseMetadata::new(
-                    successor_lease.credential_id(),
-                    Generation::new(1),
-                    successor_lease.acquired_at(),
-                    successor_lease.expires_at(),
-                ),
-            )
-            .expect("successor recovery request");
+                successor_authority.clone(),
+            ),
+        )
+        .expect("successor recovery request");
         assert!(matches!(
             store
                 .inner

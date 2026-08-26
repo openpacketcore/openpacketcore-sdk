@@ -14,9 +14,8 @@ use opc_session_store::{
     next_replication_sequence, record_expiry_preflights, validate_replication_log_page_owned,
     validate_replication_prefix_owned, validate_session_ttl, BackendCapabilities,
     BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
-    ProtectedRosterEstablishedSuccessor, RecordExpiryPreflight, ReplicationEntry,
-    ReplicationLogRange, ReplicationOp, SessionBackend, SessionKey, SessionOp, SessionOpResult,
-    StoreError, StoredSessionRecord,
+    RecordExpiryPreflight, ReplicationEntry, ReplicationLogRange, ReplicationOp, SessionBackend,
+    SessionKey, SessionOp, SessionOpResult, StoreError, StoredSessionRecord,
 };
 
 /// A local, in-memory read-through session cache that stays coherent with the
@@ -493,10 +492,6 @@ impl SessionCache {
                 }
                 ReplicationOp::ProtectedRosterEstablished {
                     key,
-                    successor:
-                        ProtectedRosterEstablishedSuccessor::Put { .. }
-                        | ProtectedRosterEstablishedSuccessor::Delete
-                        | ProtectedRosterEstablishedSuccessor::NoOp,
                     ..
                 } => {
                     debug!(
@@ -701,10 +696,6 @@ fn collect_replication_op_keys(op: &ReplicationOp, keys: &mut Vec<SessionKey>) {
             }
             ReplicationOp::ProtectedRosterEstablished {
                 key,
-                successor:
-                    ProtectedRosterEstablishedSuccessor::Put { .. }
-                    | ProtectedRosterEstablishedSuccessor::Delete
-                    | ProtectedRosterEstablishedSuccessor::NoOp,
                 ..
             } => keys.push(key.clone()),
             ReplicationOp::Batch { ops } => pending.extend(ops),
@@ -756,6 +747,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::RestoreScanResponseTooLarge { .. } => "restore_scan_response_too_large",
         StoreError::RestoreScanCursorStale => "restore_scan_cursor_stale",
         StoreError::RestoreScanWorkBudgetExceeded => "restore_scan_work_budget_exceeded",
+        StoreError::SessionRecordReserved => "session_record_reserved",
     }
 }
 
@@ -767,9 +759,9 @@ mod tests {
     use futures_util::{stream, StreamExt};
     use opc_session_store::{
         validate_replication_page_owned, Clock, EncryptedSessionPayload, FakeSessionBackend,
-        FenceToken, Generation, OwnerId, SessionKeyType, SessionLeaseManager, StateClass,
-        StateType, MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
-        MAX_SESSION_TTL,
+        FenceToken, Generation, OwnerId, ProtectedRosterEstablishedSuccessor, SessionKeyType,
+        SessionLeaseManager, StateClass, StateType, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+        MAX_REPLICATION_OPERATION_DEPTH, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
     use std::sync::atomic::Ordering;
@@ -1057,7 +1049,7 @@ mod tests {
         ReplicationOp::ProtectedRosterEstablished {
             expected_record: test_record(key.clone(), 1),
             key,
-            successor,
+            successor: Box::new(successor),
             owner: OwnerId::new("owner-a").expect("owner"),
             fence: FenceToken::new(2),
             credential_id: 2,
@@ -1121,7 +1113,7 @@ mod tests {
 
         for successor in [
             ProtectedRosterEstablishedSuccessor::Put {
-                record: test_record(target_key.clone(), 2),
+                record: Box::new(test_record(target_key.clone(), 2)),
             },
             ProtectedRosterEstablishedSuccessor::Delete,
             ProtectedRosterEstablishedSuccessor::NoOp,
@@ -1152,7 +1144,7 @@ mod tests {
 
         for successor in [
             ProtectedRosterEstablishedSuccessor::Put {
-                record: test_record(target_key.clone(), 2),
+                record: Box::new(test_record(target_key.clone(), 2)),
             },
             ProtectedRosterEstablishedSuccessor::Delete,
             ProtectedRosterEstablishedSuccessor::NoOp,
