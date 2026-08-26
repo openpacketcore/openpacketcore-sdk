@@ -10,8 +10,8 @@ use opc_types::Timestamp;
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use serde::{
-    Deserialize, Deserializer, Serialize,
     de::{SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fmt, marker::PhantomData, time::Duration};
@@ -3422,7 +3422,7 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SESSION_KEY_TYPE_MAX_BYTES, SessionKeyType, StableId};
+    use crate::{SessionKeyType, StableId, SESSION_KEY_TYPE_MAX_BYTES};
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId};
     use p256::ecdsa::SigningKey;
@@ -3583,12 +3583,10 @@ mod tests {
             )
             .expect("supported roster width and version");
             assert_eq!(value.members().len(), width);
-            assert!(
-                value
-                    .members()
-                    .iter()
-                    .all(|member| member.expected_version() == expected_version)
-            );
+            assert!(value
+                .members()
+                .iter()
+                .all(|member| member.expected_version() == expected_version));
         }
 
         let invalid_member = Member {
@@ -3627,11 +3625,8 @@ mod tests {
         assert!(profile_lines.contains(
             b"domains=profile,admission,descriptor,terminal,terminal-slot,session-key-binding,tenant-scope-partition,provider-fence-binding,publication-id,publication-payload,publication-evidence,admission-frame,terminal-frame,committed-terminal-frame,tombstone-frame,history-floor-frame,executor-proof,executor-evidence,terminal-committing-guard,terminal-session-record,terminal-receipt,provider-scheduling,binding,descriptor,owner,credential,roster-attestation-root,roster-attestation-certificate,roster-attestation-proof,roster-attestation-stable-proof,roster-attestation-evidence,roster-attestation-bundle,roster-ingress-attestation,roster-ingress-capsule".as_slice()
         ));
-        assert!(
-            profile_lines.contains(
-                b"magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB1\\0,OPCRHF1\\0".as_slice()
-            )
-        );
+        assert!(profile_lines
+            .contains(b"magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB1\\0,OPCRHF1\\0".as_slice()));
         assert!(profile_lines.contains(
             b"limits=max-members:8,accepted-members:1..8,fresh-target-members:6,plan:1048576,checkpoint:1048576,result:16384,roster-id:16,member-operation-id:16,descriptor:16384,status:4096,attestation-evidence:4096,attestation-bundle:36864,ingress-attestation:1024,admission-codec:2245658,terminal-codec:1065423,committed-terminal-codec:1069519,tombstone-codec:256,history-floor-codec:128,history-epoch-max:9223372036854775807,live:1024,live-plus-retained:131072,epoch-bindings:131072,operational-target:100000,reclaim:1024,retention-seconds:86400,quorum-mutations:fresh-success=2(admission,terminalization);remote-reads=admission-status,recover,terminal-status;local-authority-checks=provider-pre-post,publication-pre-post".as_slice()
         ));
@@ -3770,11 +3765,9 @@ mod tests {
             rehydrated.validate_new_binding(next_admission.binding_key(4).unwrap()),
             Err(Error::InvalidHistory)
         );
-        assert!(
-            rehydrated
-                .permits_binding(next_admission.binding_key(4).unwrap())
-                .is_ok()
-        );
+        assert!(rehydrated
+            .permits_binding(next_admission.binding_key(4).unwrap())
+            .is_ok());
         assert_eq!(
             rehydrated.permits_binding(next_admission.binding_key(5).unwrap()),
             Err(Error::InvalidHistory)
@@ -3801,12 +3794,10 @@ mod tests {
                 .and_then(|()| RequestId::bind(4, &next_admission).map(|_| ())),
             Err(Error::InvalidHistory)
         );
-        assert!(
-            rehydrated
-                .validate_new_binding(next_admission.binding_key(5).unwrap())
-                .and_then(|()| RequestId::bind(5, &next_admission).map(|_| ()))
-                .is_ok()
-        );
+        assert!(rehydrated
+            .validate_new_binding(next_admission.binding_key(5).unwrap())
+            .and_then(|()| RequestId::bind(5, &next_admission).map(|_| ()))
+            .is_ok());
         assert_eq!(
             initial.strictly_advances(rehydrated),
             Err(Error::InvalidHistory)
@@ -3933,17 +3924,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.roster_id(), p.roster_id());
-        assert!(
-            Admission::authenticate(
-                p,
-                key(),
-                Scope::from_digest([0; 32]),
-                OwnerId::new("owner").unwrap(),
-                FenceToken::new(1),
-                Generation::new(2)
-            )
-            .is_err()
-        );
+        assert!(Admission::authenticate(
+            p,
+            key(),
+            Scope::from_digest([0; 32]),
+            OwnerId::new("owner").unwrap(),
+            FenceToken::new(1),
+            Generation::new(2)
+        )
+        .is_err());
     }
     #[test]
     fn protected_plan_checkpoint_and_result_have_independent_exact_bounds() {
@@ -4208,18 +4197,16 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        assert!(
-            AdmissionProposal::new(
-                Profile::v1(),
-                RosterId::from_bytes([1; ROSTER_ID_BYTES]).unwrap(),
-                members,
-                EstablishedMutation::no_op(),
-                vec![],
-                vec![],
-                vec![],
-            )
-            .is_ok()
-        );
+        assert!(AdmissionProposal::new(
+            Profile::v1(),
+            RosterId::from_bytes([1; ROSTER_ID_BYTES]).unwrap(),
+            members,
+            EstablishedMutation::no_op(),
+            vec![],
+            vec![],
+            vec![],
+        )
+        .is_ok());
     }
     #[test]
     fn compacted_terminal_tombstone_never_reopens_changed_body() {
@@ -4242,18 +4229,16 @@ mod tests {
         let terminal_body_commitment =
             TerminalRecord::canonical_body_commitment(&terminal_bytes).unwrap();
         assert_eq!(terminal_body_commitment, terminal.body_commitment());
-        assert!(
-            tombstone
-                .validate_compacted_terminal(
-                    binding,
-                    request_id,
-                    terminal_slot,
-                    FenceToken::new(2),
-                    original_admission.expected_generation(),
-                    terminal_body_commitment,
-                )
-                .is_ok()
-        );
+        assert!(tombstone
+            .validate_compacted_terminal(
+                binding,
+                request_id,
+                terminal_slot,
+                FenceToken::new(2),
+                original_admission.expected_generation(),
+                terminal_body_commitment,
+            )
+            .is_ok());
         assert_eq!(
             tombstone.validate_compacted_terminal(
                 binding,

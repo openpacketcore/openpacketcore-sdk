@@ -77,6 +77,333 @@ pub const SESSION_CONSUMER_REQUEST_ID_BYTES: usize = 16;
 /// Maximum UTF-8 width of an authenticated consumer identity.
 pub const SESSION_CONSUMER_IDENTITY_MAX_BYTES: usize = 253;
 
+/// ALPN selected only by the protected fenced-mutation-roster consumer
+/// capability.
+///
+/// This is deliberately separate from the general consumer lane. A peer that
+/// did not opt into this ALPN cannot submit a roster capsule.
+pub const SESSION_CONSUMER_ROSTER_ALPN: &[u8] = b"opc-session-consumer/3";
+
+/// Wire revision required by [`SESSION_CONSUMER_ROSTER_ALPN`].
+pub const SESSION_CONSUMER_ROSTER_TRANSPORT_REVISION: u16 = 5;
+
+/// Largest byte-exact canonical admission capsule accepted by the consumer
+/// boundary. One admission remains one quorum mutation.
+pub const MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES: usize =
+    crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES;
+
+/// Largest byte-exact canonical terminal capsule accepted by the consumer
+/// boundary. This includes the committed-terminal receipt envelope.
+pub const MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES: usize =
+    crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES;
+
+/// Largest authenticated consumer JSON frame accepted for a complete
+/// protected-roster admission capsule and its consumer envelope.
+pub const MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES: usize =
+    MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES * 4 + 4 * 1024;
+
+/// Largest authenticated consumer JSON frame accepted for a complete
+/// protected-roster terminal capsule and its consumer envelope.
+pub const MAX_SESSION_CONSUMER_ROSTER_TERMINAL_FRAME_BYTES: usize =
+    MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES * 4 + 4 * 1024;
+
+/// Exact profile negotiated before a protected-roster consumer operation is
+/// admitted.
+///
+/// The roster profile is opaque at this boundary: consumers can compare it
+/// only as one fixed capability, never relax individual resource or semantic
+/// limits. Its frame fields apply only to the consumer envelope.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerRosterTransportProfile {
+    roster_profile: crate::fenced_mutation_roster::Profile,
+    admission_capsule_bytes: u32,
+    terminal_capsule_bytes: u32,
+    admission_frame_bytes: u32,
+    terminal_frame_bytes: u32,
+}
+
+impl SessionConsumerRosterTransportProfile {
+    /// Return the sole roster profile supported by this SDK build.
+    pub fn current() -> Self {
+        Self {
+            roster_profile: crate::fenced_mutation_roster::Profile::v1(),
+            admission_capsule_bytes: MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES as u32,
+            terminal_capsule_bytes: MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES as u32,
+            admission_frame_bytes: MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES as u32,
+            terminal_frame_bytes: MAX_SESSION_CONSUMER_ROSTER_TERMINAL_FRAME_BYTES as u32,
+        }
+    }
+
+    /// Return whether this is exactly the profile supported by this SDK build.
+    pub fn is_current(self) -> bool {
+        self == Self::current()
+    }
+
+    /// Return the exact frame budget required for a whole admission capsule.
+    pub const fn admission_frame_bytes(self) -> usize {
+        self.admission_frame_bytes as usize
+    }
+
+    /// Return the exact frame budget required for a whole terminal capsule.
+    pub const fn terminal_frame_bytes(self) -> usize {
+        self.terminal_frame_bytes as usize
+    }
+}
+
+impl fmt::Debug for SessionConsumerRosterTransportProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterTransportProfile(<redacted>)")
+    }
+}
+
+/// Redaction-safe invalid protected-roster capsule error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid protected roster capsule")]
+pub struct SessionConsumerRosterCapsuleError;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionConsumerRosterCapsuleWire {
+    bytes: Vec<u8>,
+}
+
+fn validate_session_consumer_roster_capsule(
+    bytes: &[u8],
+    maximum: usize,
+) -> Result<(), SessionConsumerRosterCapsuleError> {
+    if bytes.is_empty() || bytes.len() > maximum {
+        Err(SessionConsumerRosterCapsuleError)
+    } else {
+        Ok(())
+    }
+}
+
+/// Opaque canonical bytes for one protected-roster admission request or its
+/// admission/recovery response.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SessionConsumerRosterAdmissionCapsule {
+    bytes: Vec<u8>,
+}
+
+impl SessionConsumerRosterAdmissionCapsule {
+    /// Construct one bounded opaque admission capsule from canonical SDK bytes.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, SessionConsumerRosterCapsuleError> {
+        validate_session_consumer_roster_capsule(
+            &bytes,
+            MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES,
+        )?;
+        Ok(Self { bytes })
+    }
+
+    /// Return the bounded canonical byte length without exposing its contents.
+    pub const fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Return whether the canonical capsule is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Borrow the bounded opaque bytes for an SDK transport adapter.
+    #[doc(hidden)]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionConsumerRosterAdmissionCapsule {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = SessionConsumerRosterCapsuleWire::deserialize(deserializer)?;
+        Self::new(wire.bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Debug for SessionConsumerRosterAdmissionCapsule {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterAdmissionCapsule(<redacted>)")
+    }
+}
+
+/// Opaque canonical bytes for one protected-roster terminal request, terminal
+/// status, or terminal response.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SessionConsumerRosterTerminalCapsule {
+    bytes: Vec<u8>,
+}
+
+impl SessionConsumerRosterTerminalCapsule {
+    /// Construct one bounded opaque terminal capsule from canonical SDK bytes.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, SessionConsumerRosterCapsuleError> {
+        validate_session_consumer_roster_capsule(
+            &bytes,
+            MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES,
+        )?;
+        Ok(Self { bytes })
+    }
+
+    /// Return the bounded canonical byte length without exposing its contents.
+    pub const fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Return whether the canonical capsule is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Borrow the bounded opaque bytes for an SDK transport adapter.
+    #[doc(hidden)]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionConsumerRosterTerminalCapsule {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = SessionConsumerRosterCapsuleWire::deserialize(deserializer)?;
+        Self::new(wire.bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Debug for SessionConsumerRosterTerminalCapsule {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterTerminalCapsule(<redacted>)")
+    }
+}
+
+/// Closed, redaction-safe protected-roster consumer rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionConsumerRosterRejection {
+    /// The opaque capsule did not satisfy a fixed bound or canonical profile.
+    Malformed,
+    /// The authenticated caller or current durable authority was not eligible.
+    Authority,
+    /// The operation is only legal after recovering an ambiguous admission.
+    RecoveryRequired,
+    /// Admission found no exact protected business record.
+    RecordMissing,
+    /// Admission found a different protected business generation.
+    GenerationConflict,
+    /// Admission could not produce a checked successor generation.
+    GenerationExhausted,
+    /// A live admission already reserves the exact protected business key.
+    BusinessKeyReserved,
+    /// The proposed protected checkpoint cannot become the authoritative record.
+    InvalidProtectedCheckpoint,
+    /// Admission could not reserve its deterministic aggregate storage peak.
+    AggregateBytesFull,
+    /// Admission could not reserve a bounded live-roster slot.
+    LiveFull,
+    /// Admission could not reserve a bounded retained-history slot.
+    HistoryFull,
+    /// The exact stable roster identity is already bound to different canonical bytes.
+    Conflict,
+    /// A required roster profile/capability was absent or did not match exactly.
+    Capability,
+    /// The bounded quorum path could not dispatch the operation.
+    Unavailable,
+}
+
+/// Exact safe outcome of the sole admission mutation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerRosterAdmissionMutationResponse {
+    /// The exact admission result is available in an opaque bounded capsule.
+    Recorded(SessionConsumerRosterAdmissionCapsule),
+    /// No admission byte reached the quorum boundary.
+    NotTransmitted,
+    /// Admission may have committed; only admission status or recovery may follow.
+    OutcomeUnknown,
+    /// The request was rejected without exposing implementation details.
+    Rejected(SessionConsumerRosterRejection),
+}
+
+impl fmt::Debug for SessionConsumerRosterAdmissionMutationResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterAdmissionMutationResponse(<redacted>)")
+    }
+}
+
+/// Exact safe outcome of the sole terminal mutation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerRosterTerminalMutationResponse {
+    /// The exact terminal result is available in an opaque bounded capsule.
+    Recorded(SessionConsumerRosterTerminalCapsule),
+    /// No terminalization byte reached the quorum boundary.
+    NotTransmitted,
+    /// Terminalization may have committed; only terminal status may follow.
+    OutcomeUnknown,
+    /// The request was rejected without exposing implementation details.
+    Rejected(SessionConsumerRosterRejection),
+}
+
+impl fmt::Debug for SessionConsumerRosterTerminalMutationResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterTerminalMutationResponse(<redacted>)")
+    }
+}
+
+/// Bounded opaque result of a read-only admission or recovery operation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerRosterAdmissionReadResponse {
+    /// The exact read result is available in an opaque bounded capsule.
+    Recorded(SessionConsumerRosterAdmissionCapsule),
+    /// The request was rejected without exposing implementation details.
+    Rejected(SessionConsumerRosterRejection),
+}
+
+impl fmt::Debug for SessionConsumerRosterAdmissionReadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterAdmissionReadResponse(<redacted>)")
+    }
+}
+
+/// Bounded opaque result of a read-only terminal-status operation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerRosterTerminalReadResponse {
+    /// The exact read result is available in an opaque bounded capsule.
+    Recorded(SessionConsumerRosterTerminalCapsule),
+    /// The request was rejected without exposing implementation details.
+    Rejected(SessionConsumerRosterRejection),
+}
+
+impl fmt::Debug for SessionConsumerRosterTerminalReadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterTerminalReadResponse(<redacted>)")
+    }
+}
+
 /// Maximum distinct authenticated application consumers in one manifest.
 pub const MAX_SESSION_CONSUMER_AUTHORIZATION_IDENTITIES: usize = 256;
 /// Maximum tenant/NF grants retained for one authenticated consumer.
@@ -872,6 +1199,36 @@ pub enum SessionConsumerOperation {
         /// Complete canonical transition body.
         request: Box<FencedTransitionRequest>,
     },
+    /// Perform the only fresh protected-roster quorum mutation: immutable
+    /// admission. The opaque body is one canonical admission and is never
+    /// split across consumer or consensus mutations.
+    FencedMutationRosterPollAdmit {
+        /// Exact bounded opaque admission capsule.
+        request: Box<SessionConsumerRosterAdmissionCapsule>,
+    },
+    /// Read the exact original admission after ambiguity without submitting a
+    /// second admission mutation.
+    FencedMutationRosterAdmissionStatus {
+        /// Exact bounded opaque admission-status capsule.
+        request: Box<SessionConsumerRosterAdmissionCapsule>,
+    },
+    /// Recover a durable protected roster under current authority without a
+    /// quorum mutation.
+    FencedMutationRosterRecover {
+        /// Exact bounded opaque recovery capsule.
+        request: Box<SessionConsumerRosterAdmissionCapsule>,
+    },
+    /// Perform the only terminal protected-roster quorum mutation. The exact
+    /// body is one canonical terminalization and is never split.
+    FencedMutationRosterTerminalize {
+        /// Exact bounded opaque terminal capsule.
+        request: Box<SessionConsumerRosterTerminalCapsule>,
+    },
+    /// Read one exact prepared terminal body without a quorum mutation.
+    FencedMutationRosterTerminalStatus {
+        /// Exact bounded opaque terminal-status capsule.
+        request: Box<SessionConsumerRosterTerminalCapsule>,
+    },
     /// Release an existing lease.
     ReleaseLease {
         /// Existing lease credential.
@@ -900,6 +1257,13 @@ impl fmt::Debug for SessionConsumerOperation {
             Self::ObserveFencedTransition { .. } => "ObserveFencedTransition",
             Self::FencedTransition { .. } => "FencedTransition",
             Self::FencedTransitionStatus { .. } => "FencedTransitionStatus",
+            Self::FencedMutationRosterPollAdmit { .. } => "FencedMutationRosterPollAdmit",
+            Self::FencedMutationRosterAdmissionStatus { .. } => {
+                "FencedMutationRosterAdmissionStatus"
+            }
+            Self::FencedMutationRosterRecover { .. } => "FencedMutationRosterRecover",
+            Self::FencedMutationRosterTerminalize { .. } => "FencedMutationRosterTerminalize",
+            Self::FencedMutationRosterTerminalStatus { .. } => "FencedMutationRosterTerminalStatus",
         };
         formatter.write_str(name)
     }
@@ -944,6 +1308,17 @@ impl SessionConsumerOperation {
                     .validate()
                     .map_err(|_| SessionConsumerRejection::MalformedRequest)
             }
+            Self::FencedMutationRosterPollAdmit { request }
+            | Self::FencedMutationRosterAdmissionStatus { request }
+            | Self::FencedMutationRosterRecover { request } => (!request.is_empty()
+                && request.len() <= MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES)
+                .then_some(())
+                .ok_or(SessionConsumerRejection::MalformedRequest),
+            Self::FencedMutationRosterTerminalize { request }
+            | Self::FencedMutationRosterTerminalStatus { request } => (!request.is_empty()
+                && request.len() <= MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES)
+                .then_some(())
+                .ok_or(SessionConsumerRejection::MalformedRequest),
             Self::Capabilities
             | Self::Get { .. }
             | Self::Watch { .. }
@@ -1213,7 +1588,13 @@ impl fmt::Debug for SessionConsumerLeaseMutationRequest {
 }
 
 impl SessionConsumerAuthorization {
-    pub(crate) fn identity(&self) -> &SessionConsumerIdentity {
+    /// Return the authenticated peer identity bound to this authority token.
+    ///
+    /// The dedicated protected-roster ingress uses this only to bind its
+    /// transport-issued attestation after the normal manifest authorization
+    /// and operation grant have already succeeded.
+    #[doc(hidden)]
+    pub fn identity(&self) -> &SessionConsumerIdentity {
         &self.identity
     }
 
@@ -1286,7 +1667,17 @@ impl SessionConsumerAuthorization {
             // tenants' mutation timing and ordering even when every change
             // item is filtered. Scoped consumers therefore cannot subscribe
             // until the protocol has an identity-and-scope-bound cursor.
-            SessionConsumerOperation::Watch { .. } => false,
+            SessionConsumerOperation::Watch { .. }
+            // The general consumer authorization token deliberately grants
+            // no opaque roster call. The `/3` listener separately requires
+            // mTLS identity and scope, a current root-matched ingress signer,
+            // and its exact attestation before the private ingress can look
+            // up or decode a capsule.
+            | SessionConsumerOperation::FencedMutationRosterPollAdmit { .. }
+            | SessionConsumerOperation::FencedMutationRosterAdmissionStatus { .. }
+            | SessionConsumerOperation::FencedMutationRosterRecover { .. }
+            | SessionConsumerOperation::FencedMutationRosterTerminalize { .. }
+            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. } => false,
             SessionConsumerOperation::Get { key }
             | SessionConsumerOperation::AcquireLease { key, .. }
             | SessionConsumerOperation::ObserveFencedTransition { key } => self.permits_key(key),
@@ -2420,6 +2811,16 @@ pub enum SessionConsumerResponse {
     FencedTransitionStatus(
         Result<SessionConsumerFencedTransitionStatus, SessionConsumerStoreError>,
     ),
+    /// Outcome of the sole fresh protected-roster admission mutation.
+    FencedMutationRosterPollAdmit(SessionConsumerRosterAdmissionMutationResponse),
+    /// Read-only exact status of an original protected-roster admission.
+    FencedMutationRosterAdmissionStatus(SessionConsumerRosterAdmissionReadResponse),
+    /// Read-only protected-roster recovery under current authority.
+    FencedMutationRosterRecover(SessionConsumerRosterAdmissionReadResponse),
+    /// Outcome of the sole protected-roster terminal mutation.
+    FencedMutationRosterTerminalize(SessionConsumerRosterTerminalMutationResponse),
+    /// Read-only exact protected-roster terminal status.
+    FencedMutationRosterTerminalStatus(SessionConsumerRosterTerminalReadResponse),
     /// A mutation outcome is ambiguous and must never be automatically replayed.
     OutcomeUnknown(SessionConsumerOutcomeUnknown),
     /// A request was rejected before dispatch.
@@ -2498,6 +2899,11 @@ impl fmt::Debug for SessionConsumerResponse {
             Self::ObserveFencedTransition(_) => "ObserveFencedTransition",
             Self::FencedTransition(_) => "FencedTransition",
             Self::FencedTransitionStatus(_) => "FencedTransitionStatus",
+            Self::FencedMutationRosterPollAdmit(_) => "FencedMutationRosterPollAdmit",
+            Self::FencedMutationRosterAdmissionStatus(_) => "FencedMutationRosterAdmissionStatus",
+            Self::FencedMutationRosterRecover(_) => "FencedMutationRosterRecover",
+            Self::FencedMutationRosterTerminalize(_) => "FencedMutationRosterTerminalize",
+            Self::FencedMutationRosterTerminalStatus(_) => "FencedMutationRosterTerminalStatus",
             Self::OutcomeUnknown(_) => "OutcomeUnknown",
             Self::Rejected(_) => "Rejected",
         };
@@ -2546,6 +2952,92 @@ pub trait SessionQuorumConsumer: Send + Sync {
         BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
         SessionConsumerRejection,
     >;
+}
+
+/// Dedicated protected-roster ingress port.
+///
+/// Unlike [`SessionQuorumConsumer`], this port is usable only with a
+/// root-certified transport-ingress attestation for one exact roster request.
+/// The ordinary service must reject every roster operation before it decodes
+/// or looks up the opaque capsule.
+#[async_trait]
+pub trait SessionQuorumRosterIngress: Send + Sync {
+    /// Return the topology-provisioned verifier-root identity expected by this
+    /// ingress. The fail-closed default keeps legacy/custom implementations
+    /// source compatible but prevents them from enabling the protected lane.
+    fn expected_roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<crate::fenced_mutation_roster::RosterAttestationTrustRootIdentityV1> {
+        None
+    }
+
+    /// Dispatch one already-authenticated revision-five protected-roster
+    /// request. Implementations verify `attestation` before capsule decoding,
+    /// roster lookup, or consensus work.
+    async fn execute_roster_ingress(
+        &self,
+        identity: &SessionConsumerIdentity,
+        request: SessionConsumerRequest,
+        attestation: crate::fenced_mutation_roster::RosterIngressAttestationV1,
+    ) -> SessionConsumerResponse;
+}
+
+/// Derive the exact opaque commitment of an authenticated peer identity for a
+/// root-certified transport-ingress statement.
+#[doc(hidden)]
+pub fn session_consumer_identity_commitment(identity: &SessionConsumerIdentity) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-consumer/ingress-peer/v1\0");
+    digest.update(
+        u16::try_from(identity.as_str().len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    digest.update(identity.as_str().as_bytes());
+    digest.finalize().into()
+}
+
+/// Return the fixed protected-roster authority scope committed by the ingress
+/// certificate and statement for one consumer scope.
+#[doc(hidden)]
+pub fn session_consumer_roster_scope_commitment(scope: SessionConsumerScope) -> [u8; 32] {
+    crate::fenced_mutation_roster_transport::protected_roster_scope_from_consumer_scope(scope)
+        .digest()
+}
+
+/// Return the fixed operation tag and canonical opaque capsule digest for a
+/// protected-roster ingress statement.
+///
+/// This deliberately does not decode the capsule. The dedicated ingress
+/// service verifies the resulting statement before it hands exact bytes to
+/// the roster transport decoder.
+#[doc(hidden)]
+pub fn session_consumer_roster_ingress_operation(
+    operation: &SessionConsumerOperation,
+) -> Result<(u8, [u8; 32]), SessionConsumerRosterRejection> {
+    let (tag, capsule) = match operation {
+        SessionConsumerOperation::FencedMutationRosterPollAdmit { request } => {
+            (1_u8, request.canonical_bytes())
+        }
+        SessionConsumerOperation::FencedMutationRosterAdmissionStatus { request } => {
+            (2_u8, request.canonical_bytes())
+        }
+        SessionConsumerOperation::FencedMutationRosterRecover { request } => {
+            (3_u8, request.canonical_bytes())
+        }
+        SessionConsumerOperation::FencedMutationRosterTerminalize { request } => {
+            (4_u8, request.canonical_bytes())
+        }
+        SessionConsumerOperation::FencedMutationRosterTerminalStatus { request } => {
+            (5_u8, request.canonical_bytes())
+        }
+        _ => return Err(SessionConsumerRosterRejection::Capability),
+    };
+    let digest = crate::fenced_mutation_roster::roster_ingress_capsule_commitment(tag, capsule)
+        .map_err(|_| SessionConsumerRosterRejection::Capability)?;
+    Ok((tag, digest))
 }
 
 /// Convert an application batch result into its wire-safe counterpart.

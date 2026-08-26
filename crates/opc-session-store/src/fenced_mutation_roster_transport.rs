@@ -203,9 +203,7 @@ enum AdmissionResponseWire {
     // This producer does not emit the legacy replay response, but its
     // revision-five discriminant is part of the persistent /3 wire ABI.
     #[allow(dead_code)]
-    Replayed {
-        scope: [u8; 32],
-    },
+    Replayed { scope: [u8; 32] },
     PollAdmitted {
         scope: [u8; 32],
         registration: RegistrationWire,

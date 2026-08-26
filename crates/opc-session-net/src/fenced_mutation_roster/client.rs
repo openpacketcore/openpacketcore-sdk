@@ -15,9 +15,9 @@ use super::{
     },
     diagnostics::{FencedMutationRosterDiagnostics, RosterDiagnostics},
     runtime::{
-        AppliedProof, CallResult, ExecutorError, PreparedTerminal, PublicationAuthority,
-        RecoveryRequest, RecoveryResult, Registration, RegistrationRequest, RosterExecutor,
-        LeaseMetadata, RecoveryLookup, RosterExecutorBackend, TerminalCommitReceipt,
+        AppliedProof, CallResult, ExecutorError, LeaseMetadata, PreparedTerminal,
+        PublicationAuthority, RecoveryLookup, RecoveryRequest, RecoveryResult, Registration,
+        RegistrationRequest, RosterExecutor, RosterExecutorBackend, TerminalCommitReceipt,
         TerminalStatusResult,
     },
 };
