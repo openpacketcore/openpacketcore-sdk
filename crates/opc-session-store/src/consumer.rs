@@ -24,21 +24,21 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use crate::backend::ProtectedRosterEstablishedSuccessor;
 use crate::consensus::types::{
-    validate_fenced_transition_v2_batch, MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
-    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
+    MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES, validate_fenced_transition_v2_batch,
 };
 use crate::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-    FenceToken, FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2Capability,
-    FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2RequestId,
-    FencedTransitionV2Status, Generation, LeaseError, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
+    FENCED_TRANSITION_REQUEST_ID_BYTES, FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
+    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, FenceToken, FencedTransitionObservation,
+    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
+    FencedTransitionStatus, FencedTransitionV2Capability, FencedTransitionV2HistoryState,
+    FencedTransitionV2Request, FencedTransitionV2RequestId, FencedTransitionV2Status, Generation,
+    LeaseError, LeaseGuard, OwnerId, QUORUM_TOPOLOGY_MAX_MEMBERS, QuorumReplicaDescriptor,
     RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionConsensusIdentity,
     SessionConsensusNodeId, SessionConsensusRequestId, SessionKey, SessionOp, SessionOpResult,
-    StoreError, StoredSessionRecord, Timestamp, FENCED_TRANSITION_REQUEST_ID_BYTES,
-    FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
-    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, QUORUM_TOPOLOGY_MAX_MEMBERS,
+    StoreError, StoredSessionRecord, Timestamp,
 };
 
 #[cfg(test)]
@@ -3665,27 +3665,28 @@ pub trait StatelessSessionConsumer: Send + Sync {}
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_consumer_consensus_request_id, derive_consumer_fenced_transition_request,
-        SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationGrantError,
-        SessionConsumerAuthorizationManifestError, SessionConsumerFencedTransitionError,
-        SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerOperation,
-        SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
-        SessionConsumerRoster, SessionConsumerRosterError, SessionConsumerScope,
-        SessionConsumerStoreError, SessionConsumerTenantNfScope,
-        SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
-        SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
-        SESSION_CONSUMER_IDENTITY_MAX_BYTES,
+        SESSION_CONSUMER_IDENTITY_MAX_BYTES, SessionConsumerAuthorizationGrant,
+        SessionConsumerAuthorizationGrantError, SessionConsumerAuthorizationManifestError,
+        SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+        SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
+        SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerRoster,
+        SessionConsumerRosterError, SessionConsumerScope, SessionConsumerStoreError,
+        SessionConsumerTenantNfScope, SessionConsumerV2FencedTransitionError,
+        SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation,
+        SessionConsumerV2Request, SessionConsumerV2Response, derive_consumer_consensus_request_id,
+        derive_consumer_fenced_transition_request,
     };
     use crate::{
         AtomicFencedTransitionCapability, FenceToken, FencedTransitionLease,
         FencedTransitionMutation, FencedTransitionRequest, FencedTransitionRequestId,
         FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
         FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2Status,
-        Generation, OwnerId, QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint,
-        ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, RestoreScanScope,
-        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsensusNodeId,
-        SessionKey, SessionKeyType, SessionOp, StableId, StoreError, QUORUM_TOPOLOGY_MAX_MEMBERS,
+        Generation, OwnerId, QUORUM_TOPOLOGY_MAX_MEMBERS, QuorumReplicaDescriptor,
+        ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
+        ReplicaTlsIdentity, RestoreScanRequest, RestoreScanScope, SessionConsensusClusterId,
+        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+        SessionConsensusIdentity, SessionConsensusNodeId, SessionKey, SessionKeyType, SessionOp,
+        StableId, StoreError,
     };
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
@@ -3912,19 +3913,21 @@ mod tests {
             Err(SessionConsumerRejection::Unauthorized),
             "restore requires both exact tenant and NF instead of a prefix filter"
         );
-        assert!(authorization
-            .authorize_operation(&SessionConsumerOperation::ScanRestoreRecords {
-                request: RestoreScanRequest {
-                    scope: RestoreScanScope {
-                        tenant: Some(key.tenant.clone()),
-                        nf_kind: Some(key.nf_kind.clone()),
-                        ..RestoreScanScope::all()
+        assert!(
+            authorization
+                .authorize_operation(&SessionConsumerOperation::ScanRestoreRecords {
+                    request: RestoreScanRequest {
+                        scope: RestoreScanScope {
+                            tenant: Some(key.tenant.clone()),
+                            nf_kind: Some(key.nf_kind.clone()),
+                            ..RestoreScanScope::all()
+                        },
+                        cursor: None,
+                        limit: 1,
                     },
-                    cursor: None,
-                    limit: 1,
-                },
-            })
-            .is_ok());
+                })
+                .is_ok()
+        );
         assert_eq!(
             authorization
                 .authorize_operation(&SessionConsumerOperation::Watch { start_sequence: 77 }),

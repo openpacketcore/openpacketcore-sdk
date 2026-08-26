@@ -1,5 +1,5 @@
 use opc_types::Timestamp;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::str::FromStr;
 
 use super::ops::{
@@ -9,9 +9,9 @@ use super::ops::{
 };
 use crate::{
     backend::{
+        ProtectedRosterEstablishedSuccessor, REPLICATION_TX_ID_MAX_BYTES,
+        REPLICATION_TX_ID_MIN_BYTES, ReplicationEntry, ReplicationOp, ReplicationTxId,
         next_replication_sequence, validate_replication_prefix,
-        ProtectedRosterEstablishedSuccessor, ReplicationEntry, ReplicationOp, ReplicationTxId,
-        REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
     },
     capability::BackendCapabilities,
     error::StoreError,

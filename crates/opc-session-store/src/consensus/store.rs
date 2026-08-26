@@ -21,11 +21,11 @@ use futures_util::stream::{BoxStream, StreamExt};
 use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError};
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
-    decode_bounded, decode_roster_bounded, durable_openraft_config, encode_bounded,
-    encode_roster_bounded, DurableOpenraftDomain, EnsureLinearizableOutcome,
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS, DurableOpenraftDomain, EnsureLinearizableOutcome,
     EnsureLinearizableSupervisor, LinearizableReadAdmit, LinearizableReadBarrier,
-    LinearizableReadBarrierError, LinearizableReadLease, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
-    DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    LinearizableReadBarrierError, LinearizableReadLease, decode_bounded, decode_roster_bounded,
+    durable_openraft_config, encode_bounded, encode_roster_bounded,
 };
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
@@ -39,35 +39,31 @@ use super::raft_adapter::{
 };
 use super::storage::{self, SessionConsensusStorageError};
 use super::types::{
+    ConsensusRosterAdmissionCommand, ConsensusRosterAdmissionOutcome, ConsensusRosterRejection,
+    ConsensusRosterTerminalCommand, ConsensusRosterTerminalOutcome,
     fenced_transition_v2_batch_outer_request_id, fenced_transition_voter_set_digest,
-    validate_fenced_transition_v2_batch, ConsensusRosterAdmissionCommand,
-    ConsensusRosterAdmissionOutcome, ConsensusRosterRejection, ConsensusRosterTerminalCommand,
-    ConsensusRosterTerminalOutcome,
+    validate_fenced_transition_v2_batch,
 };
 use super::{
+    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
     SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusIdentity,
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpcFamily,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SessionMutationIntent, SessionMutationOutcome, SessionRaft, SessionRaftTypeConfig,
-    SessionTopologyMemberBinding, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionTopologyMemberBinding,
 };
 use crate::backend::{
-    record_expiry_preflights, validate_record_expiry_preflights_at,
-    validate_record_expiry_preflights_profile, validate_replication_log_page_owned,
-    validate_replication_prefix_owned, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+    BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
     RecordExpiryPreflight, ReplicationEntry, ReplicationLogRange, SessionBackend, SessionOp,
-    SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
+    SessionOpResult, record_expiry_preflights, validate_record_expiry_preflights_at,
+    validate_record_expiry_preflights_profile, validate_replication_log_page_owned,
+    validate_replication_prefix_owned,
 };
 use crate::capability::{BackendCapabilities, SessionStorePlatformProfile};
 use crate::clock::{Clock, SystemClock};
 use crate::consumer::{
-    consumer_request_commitment, derive_consumer_consensus_request_id,
-    derive_consumer_consensus_request_id_from_commitment,
-    derive_consumer_fenced_transition_request, derive_consumer_request_binding_id,
-    session_consumer_identity_commitment, session_consumer_roster_ingress_operation,
-    session_consumer_roster_scope_commitment, SessionConsumerAuthorization,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, SessionConsumerAuthorization,
     SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationManifest,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerCompareAndSetRequest,
     SessionConsumerCompareAndSetStatus, SessionConsumerFencedTransitionError,
@@ -82,14 +78,18 @@ use crate::consumer::{
     SessionConsumerV2FencedTransitionBatchResult, SessionConsumerV2FencedTransitionError,
     SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
     SessionConsumerV2Response, SessionQuorumConsumer, SessionQuorumRosterIngress,
-    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    consumer_request_commitment, derive_consumer_consensus_request_id,
+    derive_consumer_consensus_request_id_from_commitment,
+    derive_consumer_fenced_transition_request, derive_consumer_request_binding_id,
+    session_consumer_identity_commitment, session_consumer_roster_ingress_operation,
+    session_consumer_roster_scope_commitment,
 };
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_mutation_roster::{
-    verify_compact_admission_provenance_v2, CompactAdmissionProvenanceVerificationV2,
-    RosterAttestationTrustRootV1, RosterCompactAdmissionProvenanceSigningInputV2,
-    RosterCompactAdmissionProvenanceV2, RosterIngressAttestationV1,
-    RosterIngressAttestationVerificationInputV1,
+    CompactAdmissionProvenanceVerificationV2, RosterAttestationTrustRootV1,
+    RosterCompactAdmissionProvenanceSigningInputV2, RosterCompactAdmissionProvenanceV2,
+    RosterIngressAttestationV1, RosterIngressAttestationVerificationInputV1,
+    verify_compact_admission_provenance_v2,
 };
 use crate::fenced_mutation_roster_transport::{
     decode_admission_request_for_scope, decode_terminal_request_for_scope,
@@ -101,15 +101,15 @@ use crate::fenced_mutation_roster_transport::{
     encode_terminal_terminalized_validated_bytes_response,
 };
 use crate::fenced_transition::{
-    AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
-    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionStatus,
-    FencedTransitionV2Capability, FencedTransitionV2Effect, FencedTransitionV2HistoryEpoch,
-    FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2Status,
-    PreparedFencedTransition, PreparedFencedTransitionProtection, FENCED_TRANSITION_SCHEMA_V1,
-    FENCED_TRANSITION_SCHEMA_V2, FENCED_TRANSITION_V2_CONSENSUS_SCHEMA_VERSION,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES,
+    AtomicFencedTransitionCapability, FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_SCHEMA_V2,
+    FENCED_TRANSITION_V2_CONSENSUS_SCHEMA_VERSION, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES,
     FENCED_TRANSITION_V2_MIN_CONSENSUS_RPC_PAYLOAD_BYTES,
-    FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES,
+    FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES, FencedTransitionExecuteError,
+    FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
+    FencedTransitionStatus, FencedTransitionV2Capability, FencedTransitionV2Effect,
+    FencedTransitionV2HistoryEpoch, FencedTransitionV2HistoryState, FencedTransitionV2Request,
+    FencedTransitionV2Status, PreparedFencedTransition, PreparedFencedTransitionProtection,
 };
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
@@ -12103,32 +12103,31 @@ impl SessionLeaseManager for ConsensusSessionStore {
 #[cfg(test)]
 mod membership_tests {
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use futures_util::{FutureExt, StreamExt};
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, Membership, Vote};
     use opc_consensus::{
-        derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+        ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity, derive_configuration_id,
     };
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
-        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider,
-        SessionAad, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN,
+        AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN, AeadAlgorithm,
+        EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider, SessionAad, Zeroizing,
+        serialize_bound_aad,
     };
-    use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+    use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
     use serde::{Deserialize, Serialize};
 
     use super::*;
     use crate::backend::ReplicationOp;
     use crate::consumer::SessionConsumerTenantNfScope;
     use crate::fenced_mutation_roster::{
-        roster_executor_evidence_commitment, stable_terminal_proof_commitment,
-        verify_compact_terminal_evidence_v2, verify_executor_terminal_proof_bundle, Admission,
-        AdmissionProposal, CompactTerminalEvidenceVerificationV2, EstablishedMutation,
-        ExecutorTerminalProofVerification, Member, MemberOperationId, Phase, Profile,
-        RequestId as RosterRequestId, RosterAttestationCertificateRoleV1,
+        Admission, AdmissionProposal, CompactTerminalEvidenceVerificationV2, EstablishedMutation,
+        ExecutorTerminalProofVerification, FRESH_ROSTER_MEMBERS, Member, MemberOperationId, Phase,
+        Profile, RequestId as RosterRequestId, RosterAttestationCertificateRoleV1,
         RosterAttestationLeafCertificatePartsV1, RosterAttestationLeafCertificateV1,
         RosterAttestationTrustRootV1, RosterCompactAdmissionProvenanceV2,
         RosterCompactTerminalEvidenceBindingV2, RosterCompactTerminalEvidenceV2,
@@ -12136,7 +12135,9 @@ mod membership_tests {
         RosterCompactTerminalMemberSigningInputV2, RosterExecutorMemberProofPartsV1,
         RosterExecutorProofBundleV1, RosterId, RosterIngressAttestationSigningInputV1,
         RosterProviderOperationV1, RosterProviderOutcomeV1, RosterProviderReceiptSigningInputV1,
-        RosterTerminalAttestationSigningInputV1, Scope, TerminalRecord, FRESH_ROSTER_MEMBERS,
+        RosterTerminalAttestationSigningInputV1, Scope, TerminalRecord,
+        roster_executor_evidence_commitment, stable_terminal_proof_commitment,
+        verify_compact_terminal_evidence_v2, verify_executor_terminal_proof_bundle,
     };
     use crate::fenced_mutation_roster_executor::{
         AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration,
@@ -13084,12 +13085,14 @@ mod membership_tests {
             store.inner.consensus_log_prune_lane.is_some(),
             "fixed durable storage constructs the owned physical-prune lane"
         );
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            checkpoint_workers.wait_for_worker_count(1),
-        )
-        .await
-        .expect("checkpoint worker starts"));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                checkpoint_workers.wait_for_worker_count(1),
+            )
+            .await
+            .expect("checkpoint worker starts")
+        );
 
         let hold = store.hold_raft_shutdown_before_core_for_test();
         let gate = Arc::clone(&hold.gate);
@@ -13101,12 +13104,14 @@ mod membership_tests {
                 .expect("join Raft shutdown gate observer"),
             "the public shutdown reaches the held core phase only after both maintenance joins"
         );
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            checkpoint_workers.wait_for_worker_count(0),
-        )
-        .await
-        .expect("checkpoint worker exits before core shutdown"));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                checkpoint_workers.wait_for_worker_count(0),
+            )
+            .await
+            .expect("checkpoint worker exits before core shutdown")
+        );
         assert_eq!(
             store
                 .inner
@@ -13160,12 +13165,14 @@ mod membership_tests {
         )
         .await
         .expect("open fixed store with bounded shutdown deadline");
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            checkpoint_workers.wait_for_worker_count(1),
-        )
-        .await
-        .expect("checkpoint worker starts"));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                checkpoint_workers.wait_for_worker_count(1),
+            )
+            .await
+            .expect("checkpoint worker starts")
+        );
 
         let hold = store.hold_raft_shutdown_before_core_for_test();
         let gate = Arc::clone(&hold.gate);
@@ -13179,12 +13186,14 @@ mod membership_tests {
                 .expect("join Raft shutdown gate observer"),
             "the shared shutdown reaches the deliberately stalled core"
         );
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            checkpoint_workers.wait_for_worker_count(0),
-        )
-        .await
-        .expect("checkpoint worker exits before either caller times out"));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                checkpoint_workers.wait_for_worker_count(0),
+            )
+            .await
+            .expect("checkpoint worker exits before either caller times out")
+        );
 
         let first = tokio::time::timeout(Duration::from_secs(1), first)
             .await
@@ -14591,8 +14600,8 @@ mod membership_tests {
     }
 
     #[tokio::test]
-    async fn accepted_receiver_forward_to_leader_is_terminal_unknown_for_singleton_and_batch_effects(
-    ) {
+    async fn accepted_receiver_forward_to_leader_is_terminal_unknown_for_singleton_and_batch_effects()
+     {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let open = |label: &'static str| async move {
             let directory = tempfile::tempdir().expect("accepted receiver effect directory");
@@ -15130,21 +15139,24 @@ mod membership_tests {
             },
         );
 
-        assert!(fixed_durable_v2_status_for_batch_dispatch(
-            QuorumTopologyMode::FixedDurableQuorum,
-            &status,
-        )
-        .is_some());
-        assert!(fixed_durable_v2_status_for_batch_dispatch(
-            QuorumTopologyMode::LabSingleton,
-            &status,
-        )
-        .is_none());
-        assert!(fixed_durable_v2_status_for_batch_dispatch(
-            QuorumTopologyMode::FixedDurableQuorum,
-            &non_status,
-        )
-        .is_none());
+        assert!(
+            fixed_durable_v2_status_for_batch_dispatch(
+                QuorumTopologyMode::FixedDurableQuorum,
+                &status,
+            )
+            .is_some()
+        );
+        assert!(
+            fixed_durable_v2_status_for_batch_dispatch(QuorumTopologyMode::LabSingleton, &status,)
+                .is_none()
+        );
+        assert!(
+            fixed_durable_v2_status_for_batch_dispatch(
+                QuorumTopologyMode::FixedDurableQuorum,
+                &non_status,
+            )
+            .is_none()
+        );
         let batch = SessionConsumerV2Request::new(
             scope,
             SessionConsumerV2Operation::FencedTransitionV2Batch {

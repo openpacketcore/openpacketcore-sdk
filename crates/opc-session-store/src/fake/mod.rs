@@ -20,12 +20,12 @@ use tokio::sync::Mutex;
 
 use crate::{
     backend::{
+        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+        MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, ProtectedRosterEstablishedSuccessor,
+        ReplicationEntry, ReplicationLogRange, ReplicationOp, ReplicationTxId,
+        ReplicationWatchCursor, SessionBackend, SessionOp, SessionOpResult,
         next_replication_sequence, validate_replication_log_page_owned,
         validate_replication_prefix, validate_replication_prefix_owned, validate_session_ops_at,
-        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
-        ProtectedRosterEstablishedSuccessor, ReplicationEntry, ReplicationLogRange, ReplicationOp,
-        ReplicationTxId, ReplicationWatchCursor, SessionBackend, SessionOp, SessionOpResult,
-        MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -33,11 +33,11 @@ use crate::{
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, OwnerId, SessionKey, SessionKeyType, StableId},
     record::StoredSessionRecord,
-    replication_watch::{prepare_watch_registration, ReplicationWatcher},
+    replication_watch::{ReplicationWatcher, prepare_watch_registration},
     restore::{
-        compare_restore_records, restore_record_retained_bytes, RestoreScanCursor, RestoreScanPage,
-        RestoreScanRequest, RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
-        RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
+        RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES, RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
+        RestoreScanCursor, RestoreScanPage, RestoreScanRequest, compare_restore_records,
+        restore_record_retained_bytes,
     },
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
 };

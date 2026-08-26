@@ -9,24 +9,24 @@
 //! is the only mutation and read-authority path.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "test-vfs")]
 use std::sync::Condvar;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use rusqlite::{
-    params, Connection, InterruptHandle, OptionalExtension, Transaction, TransactionBehavior,
+    Connection, InterruptHandle, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
 use crate::consensus::store::ConsensusStoreDiagnosticCounters;
 use crate::{
     backend::{
-        validate_replication_log_page_owned, validate_replication_prefix_owned,
-        validate_session_ops_at, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
-        ReplicationEntry, ReplicationLogRange, ReplicationWatchCursor, SessionBackend, SessionOp,
-        SessionOpResult, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
+        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, REPLICATION_TX_ID_MAX_BYTES,
+        REPLICATION_TX_ID_MIN_BYTES, ReplicationEntry, ReplicationLogRange, ReplicationWatchCursor,
+        SessionBackend, SessionOp, SessionOpResult, validate_replication_log_page_owned,
+        validate_replication_prefix_owned, validate_session_ops_at,
     },
     capability::BackendCapabilities,
     clock::Clock,
@@ -35,7 +35,7 @@ use crate::{
     model::{OwnerId, SessionKey},
     record::{SessionPayloadEncoding, StoredSessionRecord},
     replication_watch::{
-        prepare_watch_registration, watch_backlog_query_limit, ReplicationWatcher,
+        ReplicationWatcher, prepare_watch_registration, watch_backlog_query_limit,
     },
     restore::{RestoreScanPage, RestoreScanRequest},
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
@@ -49,10 +49,9 @@ pub(crate) mod consensus;
 #[doc(hidden)]
 pub mod test_support {
     pub use super::consensus::{
-        protected_roster_terminal_apply_timing_test_guard,
+        ProtectedRosterTerminalApplyTimings, protected_roster_terminal_apply_timing_test_guard,
         protected_roster_terminal_apply_timings_for_test,
         reset_protected_roster_terminal_apply_timings_for_test,
-        ProtectedRosterTerminalApplyTimings,
     };
 }
 
@@ -3527,8 +3526,8 @@ mod operation_lifetime_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn file_backed_consensus_acceptance_reader_pool_admits_unrelated_probes_and_uses_fresh_snapshots(
-    ) {
+    async fn file_backed_consensus_acceptance_reader_pool_admits_unrelated_probes_and_uses_fresh_snapshots()
+     {
         let directory = tempfile::tempdir().expect("SQLite acceptance-reader directory");
         let path = directory.path().join("store.sqlite");
         let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
@@ -4233,7 +4232,7 @@ mod consensus_readiness_deadline_tests {
     use std::collections::BTreeMap;
 
     use opc_consensus::{
-        derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+        ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity, derive_configuration_id,
     };
 
     use super::*;

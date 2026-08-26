@@ -472,6 +472,10 @@ mod tests {
     };
     use async_trait::async_trait;
     use opc_session_store::{
+        Clock, FenceToken, Generation, OwnerId, SessionConsensusClusterId,
+        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+        SessionConsensusIdentity, SessionKey, SessionKeyType, SessionLeaseManager,
+        SqliteSessionBackend, StableId,
         fenced_mutation_roster::{
             RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
             RosterAttestationLeafCertificateV1, RosterAttestationTrustRootV1,
@@ -480,18 +484,14 @@ mod tests {
             RosterIngressAttestationV1, RosterProviderOutcomeV1,
             RosterTerminalAttestationSigningInputV1,
         },
-        Clock, FenceToken, Generation, OwnerId, SessionConsensusClusterId,
-        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-        SessionConsensusIdentity, SessionKey, SessionKeyType, SessionLeaseManager,
-        SqliteSessionBackend, StableId,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
-    use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+    use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
     use std::{
         num::NonZeroUsize,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex, MutexGuard,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -1891,8 +1891,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restarted_provider_and_executor_recover_one_durable_intent_without_a_third_consensus_mutation(
-    ) {
+    async fn restarted_provider_and_executor_recover_one_durable_intent_without_a_third_consensus_mutation()
+     {
         let journal = Arc::new(RestartPublicationJournal::default());
         let (
             backend,
@@ -2116,8 +2116,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_current_successor_rejects_old_process_before_provider_io_then_successor_publishes(
-    ) {
+    async fn backend_current_successor_rejects_old_process_before_provider_io_then_successor_publishes()
+     {
         let journal = Arc::new(RestartPublicationJournal::default());
         let first_provider = Arc::new(RestartJournalProvider::initial(Arc::clone(&journal)));
         let mut fixture = fixture(first_provider).await;

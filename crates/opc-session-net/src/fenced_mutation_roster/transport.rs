@@ -5,9 +5,9 @@
 
 use super::{
     canonical::{
-        decode_frame, encode_frame, Admission, EstablishedPublicationProvider, MemberProvider,
-        RequestBindingKey, RequestId, RosterId, Scope, TerminalConflictTombstone,
-        MAX_ADMISSION_CODEC_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES,
+        Admission, EstablishedPublicationProvider, MAX_ADMISSION_CODEC_BYTES,
+        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MemberProvider, RequestBindingKey, RequestId, RosterId,
+        Scope, TerminalConflictTombstone, decode_frame, encode_frame,
     },
     client::FencedMutationRosterClient,
     diagnostics::{FencedMutationRosterDiagnostics, RosterDiagnostics},
@@ -25,8 +25,8 @@ use crate::consumer::{
     PersistentSessionConsumerDiagnostics,
 };
 use opc_session_store::fenced_mutation_roster::{
-    RosterCompactAdmissionProvenanceV2, MAX_EXECUTOR_PROOF_BUNDLE_BYTES,
-    MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES, MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES,
+    MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
+    MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES, RosterCompactAdmissionProvenanceV2,
 };
 use opc_session_store::{
     FenceToken, Generation, OwnerId, SessionConsumerRequestId,

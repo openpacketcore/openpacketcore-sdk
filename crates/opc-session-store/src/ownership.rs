@@ -44,7 +44,7 @@ use crate::model::{
     Generation, OwnerId, SessionKey, SessionKeyType, StableId, StateClass, StateType,
 };
 use crate::record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
-use crate::{checked_session_deadline, validate_session_ttl, SessionBackend};
+use crate::{SessionBackend, checked_session_deadline, validate_session_ttl};
 
 const OWNERSHIP_KEY_TYPE: &str = "fenced-ownership-v1";
 const OWNERSHIP_RECORD_MAGIC: [u8; 4] = *b"OPFO";

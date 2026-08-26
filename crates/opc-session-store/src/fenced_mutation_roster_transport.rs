@@ -9,24 +9,24 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 use crate::{
+    FenceToken, Generation, OwnerId, SessionKey, Timestamp,
     consumer::{
         SessionConsumerRosterAdmissionCapsule, SessionConsumerRosterRejection,
         SessionConsumerRosterTerminalCapsule, SessionConsumerScope,
     },
     fenced_mutation_roster::{
-        decode_frame, encode_frame, roster_ingress_capsule_commitment, Admission,
-        RequestBindingKey, RequestId, RosterCompactAdmissionProvenanceV2,
-        RosterCompactTerminalEvidenceV2, RosterExecutorProofBundleV1, RosterId, Scope,
-        TerminalConflictTombstone, TerminalRecord, MAX_ADMISSION_CODEC_BYTES,
-        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES,
-        MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES, MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES,
+        Admission, MAX_ADMISSION_CODEC_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES,
+        MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
+        MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES, RequestBindingKey, RequestId,
+        RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceV2,
+        RosterExecutorProofBundleV1, RosterId, Scope, TerminalConflictTombstone, TerminalRecord,
+        decode_frame, encode_frame, roster_ingress_capsule_commitment,
     },
     fenced_mutation_roster_executor::{
         AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration, BackendRejection,
         CommittedTerminal, RecoveryLookup, RecoveryRequest, RecoveryRequestInput,
         RegistrationRequest, TerminalBody,
     },
-    FenceToken, Generation, OwnerId, SessionKey, Timestamp,
 };
 
 const ADMISSION_REQUEST_MAGIC: [u8; 8] = *b"OPCRPA1\0";
@@ -206,9 +206,7 @@ enum AdmissionResponseWire {
         admission_provenance: Vec<u8>,
     },
     // Its revision-five discriminant is part of the persistent /3 wire ABI.
-    Replayed {
-        scope: [u8; 32],
-    },
+    Replayed { scope: [u8; 32] },
     PollAdmitted {
         scope: [u8; 32],
         registration: RegistrationWire,
@@ -859,7 +857,8 @@ mod tests {
             tenant: TenantId::from_static("recovery-wire-tenant"),
             nf_kind: NetworkFunctionKind::smf(),
             key_type: SessionKeyType::PduSession,
-            stable_id: StableId::new(Bytes::from_static(b"recovery-wire-key")).expect("stable ID"),
+            stable_id: StableId::new(Bytes::from_static(b"recovery-wire-key"))
+                .expect("stable ID"),
         };
         let authority = AuthorityWire {
             key,
@@ -993,14 +992,16 @@ mod tests {
             encode_admission_response(&decoded).expect("response reencodes"),
             capsule.canonical_bytes(),
         );
-        assert!(expect_scope(
-            match decoded {
-                AdmissionResponseWire::Replayed { scope } => scope,
-                _ => unreachable!("encoded replay response"),
-            },
-            protected_roster_scope_from_consumer_scope(consumer_scope(0xB4, 8)),
-        )
-        .is_err());
+        assert!(
+            expect_scope(
+                match decoded {
+                    AdmissionResponseWire::Replayed { scope } => scope,
+                    _ => unreachable!("encoded replay response"),
+                },
+                protected_roster_scope_from_consumer_scope(consumer_scope(0xB4, 8)),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1018,14 +1019,16 @@ mod tests {
             encode_terminal_response(&decoded).expect("response reencodes"),
             capsule.canonical_bytes(),
         );
-        assert!(expect_scope(
-            match decoded {
-                TerminalResponseWire::Admitted { scope } => scope,
-                _ => unreachable!("encoded admitted response"),
-            },
-            protected_roster_scope_from_consumer_scope(consumer_scope(0xB4, 8)),
-        )
-        .is_err());
+        assert!(
+            expect_scope(
+                match decoded {
+                    TerminalResponseWire::Admitted { scope } => scope,
+                    _ => unreachable!("encoded admitted response"),
+                },
+                protected_roster_scope_from_consumer_scope(consumer_scope(0xB4, 8)),
+            )
+            .is_err()
+        );
     }
 
     #[test]
