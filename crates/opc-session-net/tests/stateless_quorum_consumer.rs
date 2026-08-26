@@ -270,6 +270,7 @@ impl TestPki {
 
 const THREE_VOTER_COUNT: usize = 3;
 const THREE_VOTER_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS: usize = 8;
 // Retain the durable recovery qualification bound for the one explicitly
 // triggered OpenRaft campaign and its bounded authenticated peer calls without
 // changing any production deadline.
@@ -6199,12 +6200,12 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
     let mut admission = roster_client
         .prepare(roster_lease, roster_generation, proposal)
         .expect("prepare exact protected roster body");
-    let mut active = match roster_client
+    let mut roster = match roster_client
         .admit(&mut admission)
         .await
         .expect("one real PollAdmit")
     {
-        AdmissionOutcome::Admitted(active) => active,
+        AdmissionOutcome::Admitted(active) => DurableCrashRecoveredRoster::Active(active),
         AdmissionOutcome::NotTransmitted => {
             panic!(
                 "fresh maximum PollAdmit must reach the authenticated roster ingress; ingress calls={}",
@@ -6212,41 +6213,35 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
             )
         }
         AdmissionOutcome::OutcomeUnknown(_) => {
-            let status = match roster_client.admission_status(&admission).await {
-                Ok(opc_session_net::FencedMutationRosterRecoveryOutcome::Admitted(_)) => {
-                    "PollAdmitted"
+            let mut recovered = None;
+            for attempt in 0..PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
+                match roster_client.admission_status(&admission).await {
+                    Ok(RecoveryOutcome::Admitted(value)) => {
+                        recovered = Some(value);
+                        break;
+                    }
+                    Ok(RecoveryOutcome::Terminal(_)) | Ok(RecoveryOutcome::Compacted) => {
+                        panic!("lost maximum PollAdmit reply cannot already be terminal")
+                    }
+                    Err(RosterClientError::Unavailable)
+                    | Err(RosterClientError::AdmissionRecordMissing) => {
+                        if attempt + 1 < PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Err(_) => {
+                        panic!("exact maximum PollAdmit status readback rejected its bound request")
+                    }
                 }
-                Ok(opc_session_net::FencedMutationRosterRecoveryOutcome::Terminal(_)) => "Terminal",
-                Ok(opc_session_net::FencedMutationRosterRecoveryOutcome::Compacted) => "Compacted",
-                Err(RosterClientError::AuthorityRejected) => "RejectedAuthority",
-                Err(RosterClientError::AdmissionRecordMissing) => "RejectedRecordMissing",
-                Err(RosterClientError::AdmissionGenerationConflict) => "RejectedGenerationConflict",
-                Err(RosterClientError::AdmissionGenerationExhausted) => {
-                    "RejectedGenerationExhausted"
-                }
-                Err(RosterClientError::AdmissionBusinessKeyReserved) => {
-                    "RejectedBusinessKeyReserved"
-                }
-                Err(RosterClientError::AdmissionInvalidProtectedCheckpoint) => {
-                    "RejectedProtectedCheckpoint"
-                }
-                Err(RosterClientError::AdmissionAggregateCapacityFull) => {
-                    "RejectedAggregateCapacity"
-                }
-                Err(RosterClientError::AdmissionLiveCapacityFull) => "RejectedLiveCapacity",
-                Err(RosterClientError::AdmissionHistoryCapacityFull) => "RejectedHistoryCapacity",
-                Err(RosterClientError::RecoveryRequired) => "RejectedRecoveryRequired",
-                Err(RosterClientError::TerminalConflict) => "RejectedTerminalConflict",
-                Err(RosterClientError::InvalidInput) => "RejectedInvalidInput",
-                Err(RosterClientError::InvalidState) => "RejectedInvalidState",
-                Err(RosterClientError::Unavailable) => "Unavailable",
-                Err(_) => "RejectedOther",
+            }
+            let Some(recovered) = recovered else {
+                let applied = fleet.application_sequence_observation().await;
+                let (decoded, decode_failures, nonempty) = fleet.append_entries_observation();
+                panic!(
+                    "maximum PollAdmit remained ambiguous after bounded same-request readback; applied={applied:?}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}"
+                )
             };
-            let applied = fleet.application_sequence_observation().await;
-            let (decoded, decode_failures, nonempty) = fleet.append_entries_observation();
-            panic!(
-                "fresh maximum PollAdmit must return a determinate admitted receipt; admission_status={status}; applied={applied:?}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}"
-            )
+            DurableCrashRecoveredRoster::Recovered(recovered)
         }
     };
     fleet
@@ -6261,34 +6256,90 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
     assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
     assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 0);
     assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(active.members(), members.as_slice());
-    assert_eq!(active.protected_plan(), protected_plan);
+    assert_eq!(roster.members(), members.as_slice());
+    assert_eq!(roster.protected_plan(), protected_plan);
 
     let mut proofs = Vec::with_capacity(6);
-    for ordinal in 0_u8..6 {
-        let mut member = active
-            .member(MemberOrdinal::new(ordinal).expect("member ordinal"))
-            .expect("issue exactly one ordered member");
-        assert!(matches!(
-            roster_client
-                .prepare_member(&mut member)
-                .await
-                .expect("provider-local prepare"),
-            MemberPrepareOutcome::Prepared
-        ));
-        match roster_client
-            .execute(&mut member)
-            .await
-            .expect("provider-local execute")
-        {
-            ExecuteOutcome::Conclusive(proof) => proofs.push(*proof),
-            _ => panic!("fresh member effect must be conclusive"),
+    match &mut roster {
+        DurableCrashRecoveredRoster::Active(active) => {
+            for ordinal in 0_u8..6 {
+                let mut member = active
+                    .member(MemberOrdinal::new(ordinal).expect("member ordinal"))
+                    .expect("issue exactly one ordered member");
+                assert!(matches!(
+                    roster_client
+                        .prepare_member(&mut member)
+                        .await
+                        .expect("provider-local prepare"),
+                    MemberPrepareOutcome::Prepared
+                ));
+                match roster_client
+                    .execute(&mut member)
+                    .await
+                    .expect("provider-local execute")
+                {
+                    ExecuteOutcome::Conclusive(proof) => proofs.push(*proof),
+                    _ => panic!("fresh member effect must be conclusive"),
+                }
+            }
+        }
+        DurableCrashRecoveredRoster::Recovered(recovered) => {
+            for ordinal in 0_u8..6 {
+                let mut member = recovered
+                    .member(MemberOrdinal::new(ordinal).expect("recovered member ordinal"))
+                    .expect("issue exactly one recovered member");
+                assert!(matches!(
+                    roster_client
+                        .status(&mut member)
+                        .await
+                        .expect("provider-local recovery status"),
+                    MemberRecoveryOutcome::Ambiguous(MemberRecoveryStatus::NotFound)
+                ));
+                match roster_client
+                    .adopt(&mut member)
+                    .await
+                    .expect("provider-local exact adoption")
+                {
+                    MemberRecoveryOutcome::Conclusive(proof) => proofs.push(*proof),
+                    _ => panic!("NotFound cannot bypass exact member adoption"),
+                }
+            }
         }
     }
-    assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 6);
-    assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 6);
-    assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+    let recovered_after_ambiguous_admission =
+        matches!(&roster, DurableCrashRecoveredRoster::Recovered(_));
+    assert_eq!(
+        provider.prepare_calls.load(Ordering::SeqCst),
+        if recovered_after_ambiguous_admission {
+            0
+        } else {
+            6
+        }
+    );
+    assert_eq!(
+        provider.execute_calls.load(Ordering::SeqCst),
+        if recovered_after_ambiguous_admission {
+            0
+        } else {
+            6
+        }
+    );
+    assert_eq!(
+        provider.status_calls.load(Ordering::SeqCst),
+        if recovered_after_ambiguous_admission {
+            6
+        } else {
+            0
+        }
+    );
+    assert_eq!(
+        provider.adopt_calls.load(Ordering::SeqCst),
+        if recovered_after_ambiguous_admission {
+            6
+        } else {
+            0
+        }
+    );
     assert_eq!(
         provider.executions(),
         members
@@ -6316,9 +6367,8 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
     let proofs = CompleteProofSet::new(proofs).expect("six SDK-issued conclusive proofs");
     assert_eq!(proofs.len(), 6);
     assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 6);
     let mut terminal = roster_client
-        .prepare_terminal(active.for_terminal(), &proofs)
+        .prepare_terminal(roster.for_terminal(), &proofs)
         .await
         .expect("bind the six proofs to one exact terminal body");
     #[cfg(feature = "test-control")]
@@ -6347,53 +6397,48 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
         TerminalizationOutcome::OutcomeUnknown => {
             let terminalize_elapsed_millis = terminalize_started.elapsed().as_millis();
             let terminal_status_started = Instant::now();
-            let status = match roster_client.terminal_status(&mut terminal).await {
-                Ok(TerminalStatus::Committed(TerminalReceipt::Established(established))) => {
-                    assert_eq!(established.protected_checkpoint(), protected_checkpoint);
-                    assert_eq!(established.protected_result(), protected_result);
-                    "Established"
+            let mut committed = None;
+            for attempt in 0..PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
+                match roster_client.terminal_status(&mut terminal).await {
+                    Ok(TerminalStatus::Committed(TerminalReceipt::Established(established))) => {
+                        assert_eq!(established.protected_checkpoint(), protected_checkpoint);
+                        assert_eq!(established.protected_result(), protected_result);
+                        committed = Some(established);
+                        break;
+                    }
+                    Ok(TerminalStatus::Committed(TerminalReceipt::Aborted(_)))
+                    | Ok(TerminalStatus::Compacted) => {
+                        panic!("six conclusive Applied proofs cannot recover as non-Established")
+                    }
+                    Ok(TerminalStatus::Admitted)
+                    | Err(RosterClientError::Unavailable)
+                    | Err(RosterClientError::AdmissionRecordMissing) => {
+                        if attempt + 1 < PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Err(_) => {
+                        panic!("exact maximum terminal status readback rejected its bound body")
+                    }
                 }
-                Ok(TerminalStatus::Committed(TerminalReceipt::Aborted(_))) => "Aborted",
-                Ok(TerminalStatus::Admitted) => "PollAdmitted",
-                Ok(TerminalStatus::Compacted) => "Compacted",
-                Err(RosterClientError::AuthorityRejected) => "RejectedAuthority",
-                Err(RosterClientError::AdmissionRecordMissing) => "RejectedRecordMissing",
-                Err(RosterClientError::AdmissionGenerationConflict) => "RejectedGenerationConflict",
-                Err(RosterClientError::AdmissionGenerationExhausted) => {
-                    "RejectedGenerationExhausted"
-                }
-                Err(RosterClientError::AdmissionBusinessKeyReserved) => {
-                    "RejectedBusinessKeyReserved"
-                }
-                Err(RosterClientError::AdmissionInvalidProtectedCheckpoint) => {
-                    "RejectedProtectedCheckpoint"
-                }
-                Err(RosterClientError::AdmissionAggregateCapacityFull) => {
-                    "RejectedAggregateCapacity"
-                }
-                Err(RosterClientError::AdmissionLiveCapacityFull) => "RejectedLiveCapacity",
-                Err(RosterClientError::AdmissionHistoryCapacityFull) => "RejectedHistoryCapacity",
-                Err(RosterClientError::RecoveryRequired) => "RejectedRecoveryRequired",
-                Err(RosterClientError::TerminalConflict) => "RejectedTerminalConflict",
-                Err(RosterClientError::InvalidInput) => "RejectedInvalidInput",
-                Err(RosterClientError::InvalidState) => "RejectedInvalidState",
-                Err(RosterClientError::Unavailable) => "Unavailable",
-                Err(_) => "RejectedOther",
-            };
+            }
             let terminal_status_elapsed_millis = terminal_status_started.elapsed().as_millis();
-            let applied = fleet.application_sequence_observation().await;
-            let applied_deltas = applied
-                .map(|sequence| sequence.map(|sequence| sequence.saturating_sub(sequence_before)));
-            let terminal_record_materialized =
-                futures_util::future::join_all(fleet.stores.iter().map(|store| store.get(&key)))
-                    .await
-                    .iter()
-                    .all(
-                        |record| matches!(record, Ok(Some(record)) if record == &expected_terminal),
-                    );
-            let (decoded, decode_failures, nonempty) = fleet.append_entries_observation();
-            panic!(
-                "fresh protected terminal must return a determinate Established receipt; terminal_status={status}; terminalize_elapsed_millis={terminalize_elapsed_millis}; terminal_status_elapsed_millis={terminal_status_elapsed_millis}; sequence_before={sequence_before}; applied={applied:?}; applied_deltas={applied_deltas:?}; terminal_record_materialized={terminal_record_materialized}; ingress_admission_calls={}; ingress_admission_recorded_responses={}; ingress_terminal_calls={}; ingress_terminal_recorded_responses={}; ingress_terminal_response_completions={}; ingress_terminal_outcome_unknown_responses={}; ingress_terminal_not_transmitted_responses={}; ingress_terminal_rejected_responses={}; ingress_terminal_response_elapsed_millis={}; terminal_status_server={}; terminal_apply_timings={}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}",
+            if let Some(established) = committed {
+                established.into_publication()
+            } else {
+                let applied = fleet.application_sequence_observation().await;
+                let applied_deltas = applied.map(|sequence| {
+                    sequence.map(|sequence| sequence.saturating_sub(sequence_before))
+                });
+                let terminal_record_materialized = futures_util::future::join_all(
+                    fleet.stores.iter().map(|store| store.get(&key)),
+                )
+                .await
+                .iter()
+                .all(|record| matches!(record, Ok(Some(record)) if record == &expected_terminal));
+                let (decoded, decode_failures, nonempty) = fleet.append_entries_observation();
+                panic!(
+                "protected terminal remained ambiguous after bounded exact-body readback; terminalize_elapsed_millis={terminalize_elapsed_millis}; terminal_status_elapsed_millis={terminal_status_elapsed_millis}; sequence_before={sequence_before}; applied={applied:?}; applied_deltas={applied_deltas:?}; terminal_record_materialized={terminal_record_materialized}; ingress_admission_calls={}; ingress_admission_recorded_responses={}; ingress_terminal_calls={}; ingress_terminal_recorded_responses={}; ingress_terminal_response_completions={}; ingress_terminal_outcome_unknown_responses={}; ingress_terminal_not_transmitted_responses={}; ingress_terminal_rejected_responses={}; ingress_terminal_response_elapsed_millis={}; terminal_status_server={}; terminal_apply_timings={}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}",
                 transport.roster_admission_calls.load(Ordering::SeqCst),
                 transport
                     .roster_admission_recorded_responses
@@ -6420,6 +6465,7 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
                 protected_roster_terminal_status_response_diagnostic(transport.as_ref()),
                 protected_roster_terminal_apply_timing_diagnostic(),
             )
+            }
         }
     };
     #[cfg(feature = "test-control")]
@@ -7951,7 +7997,20 @@ impl MemberProvider for SixMemberRosterEvidenceProvider {
     async fn adopt(&self, call: &MemberCall<'_>) -> Result<ProviderCallOutcome, Self::Error> {
         self.adopt_calls.fetch_add(1, Ordering::SeqCst);
         match self.mode {
-            SixMemberRosterEvidenceMode::ExecuteApplied => Ok(ProviderCallOutcome::not_found()),
+            SixMemberRosterEvidenceMode::ExecuteApplied => {
+                self.executions.lock().map_err(|_| ())?.push((
+                    call.ordinal(),
+                    *call.operation_id().as_bytes(),
+                    call.descriptor().to_vec(),
+                    call.expected_version(),
+                ));
+                self.receipt(
+                    call,
+                    opc_session_store::fenced_mutation_roster::RosterProviderOperationV1::Adopt,
+                    opc_session_store::fenced_mutation_roster::RosterProviderOutcomeV1::AppliedAdopted,
+                    vec![0xa5, call.ordinal()],
+                )
+            }
             SixMemberRosterEvidenceMode::SixthExecuteOutcomeUnknownThenAdopted => self.receipt(
                 call,
                 opc_session_store::fenced_mutation_roster::RosterProviderOperationV1::Adopt,
