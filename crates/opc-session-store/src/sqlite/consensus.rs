@@ -8547,15 +8547,9 @@ pub(crate) fn read_protected_roster_current_publication_authority_sync(
     )
     .map_err(|_| reject())?;
 
-    // This validates the exact scope/key projection before any retained
-    // terminal material is selected, then proves the complete lease is the
-    // backend's still-live half-open authority at its own logical time.
-    let slot = protected_roster_stable_slot(scope, request.key(), roster_id);
-    let binding = protected_roster_binding_by_stable_slot_sync(conn, slot)
-        .map_err(ProtectedRosterApplyError::store_error)?
-        .ok_or_else(reject)?;
-    protected_roster_validate_binding_authority_before_lookup(binding, &current)
-        .map_err(ProtectedRosterApplyError::store_error)?;
+    // Reject a stale or expired same-key guard before even resolving the
+    // roster's stable slot. Besides fencing publication, this keeps the
+    // redacted rejection from becoming a retained-roster existence oracle.
     protected_roster_validate_live_authority_sync(
         conn,
         &current,
@@ -8563,6 +8557,15 @@ pub(crate) fn read_protected_roster_current_publication_authority_sync(
         logical_time,
     )
     .map_err(ProtectedRosterApplyError::store_error)?;
+
+    // The now-current guard may resolve only its exact scope/key projection
+    // before any retained terminal material is selected.
+    let slot = protected_roster_stable_slot(scope, request.key(), roster_id);
+    let binding = protected_roster_binding_by_stable_slot_sync(conn, slot)
+        .map_err(ProtectedRosterApplyError::store_error)?
+        .ok_or_else(reject)?;
+    protected_roster_validate_binding_authority_before_lookup(binding, &current)
+        .map_err(ProtectedRosterApplyError::store_error)?;
 
     let hydrated = protected_roster_read_record_sync(conn, identity, binding)
         .map_err(ProtectedRosterApplyError::store_error)?
