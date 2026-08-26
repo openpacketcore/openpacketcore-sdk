@@ -6602,9 +6602,9 @@ mod tests {
         assert_eq!(
             frame_sha256(&admission_frame),
             [
-                0x54, 0xdb, 0x6e, 0x9f, 0x73, 0x4e, 0xc7, 0xa2, 0xa4, 0xe8, 0xe0, 0x44, 0xb9, 0x12,
-                0x86, 0x1d, 0xd2, 0x8c, 0xe8, 0x6e, 0x94, 0x68, 0x96, 0x06, 0x43, 0x54, 0x8c, 0x1d,
-                0x82, 0x22, 0x8f, 0x7a,
+                0x15, 0x01, 0x83, 0x78, 0x2f, 0x28, 0x34, 0xd7, 0x9e, 0x5b, 0xc1, 0x93, 0x6b, 0x92,
+                0x20, 0x9f, 0xde, 0x7a, 0xa0, 0x29, 0xd9, 0xff, 0x63, 0xf5, 0xb6, 0x82, 0xf9, 0x02,
+                0xae, 0xed, 0x51, 0x05,
             ]
         );
         let decoded_admission = Admission::from_canonical_bytes(&admission_frame).unwrap();
@@ -7143,22 +7143,54 @@ mod tests {
             "the compact lookup must bind the claimed original admission fence"
         );
 
+        let reauthenticate = |proposal, scope, owner, fence| {
+            Admission::authenticate(
+                proposal,
+                exact.key().clone(),
+                scope,
+                owner,
+                fence,
+                exact.expected_generation(),
+            )
+            .unwrap()
+        };
         let mut changed_bodies = Vec::new();
-        let mut changed_plan = exact.clone();
-        changed_plan.proposal.protected_plan.push(4);
-        changed_bodies.push(changed_plan);
-        let mut changed_checkpoint = exact.clone();
-        changed_checkpoint.proposal.terminal_checkpoint.push(4);
-        changed_bodies.push(changed_checkpoint);
-        let mut changed_result = exact.clone();
-        changed_result.proposal.terminal_result.push(4);
-        changed_bodies.push(changed_result);
-        let mut changed_owner = exact.clone();
-        changed_owner.logical_owner = OwnerId::new("other-owner").unwrap();
-        changed_bodies.push(changed_owner);
-        let mut changed_fence = exact.clone();
-        changed_fence.admission_fence = FenceToken::new(2);
-        changed_bodies.push(changed_fence);
+        let mut changed_plan_proposal = exact.proposal.clone();
+        changed_plan_proposal.protected_plan.push(4);
+        changed_bodies.push(reauthenticate(
+            changed_plan_proposal,
+            exact.scope(),
+            exact.logical_owner().clone(),
+            exact.admission_fence(),
+        ));
+        let mut changed_checkpoint_proposal = exact.proposal.clone();
+        changed_checkpoint_proposal.terminal_checkpoint.push(4);
+        changed_bodies.push(reauthenticate(
+            changed_checkpoint_proposal,
+            exact.scope(),
+            exact.logical_owner().clone(),
+            exact.admission_fence(),
+        ));
+        let mut changed_result_proposal = exact.proposal.clone();
+        changed_result_proposal.terminal_result.push(4);
+        changed_bodies.push(reauthenticate(
+            changed_result_proposal,
+            exact.scope(),
+            exact.logical_owner().clone(),
+            exact.admission_fence(),
+        ));
+        changed_bodies.push(reauthenticate(
+            exact.proposal.clone(),
+            exact.scope(),
+            OwnerId::new("other-owner").unwrap(),
+            exact.admission_fence(),
+        ));
+        changed_bodies.push(reauthenticate(
+            exact.proposal.clone(),
+            exact.scope(),
+            exact.logical_owner().clone(),
+            FenceToken::new(2),
+        ));
         for changed in changed_bodies {
             assert_eq!(
                 tombstone.validate_admission(4, &changed),
@@ -7166,8 +7198,12 @@ mod tests {
             );
         }
 
-        let mut other_scope = exact.clone();
-        other_scope.scope = Scope::from_digest([8; 32]);
+        let other_scope = reauthenticate(
+            exact.proposal.clone(),
+            Scope::from_digest([8; 32]),
+            exact.logical_owner().clone(),
+            exact.admission_fence(),
+        );
         assert_eq!(
             tombstone.validate_admission(4, &other_scope),
             Err(Error::InvalidAuthority)
@@ -7562,7 +7598,7 @@ mod tests {
         let admission_bytes = provenance.canonical_bytes().expect("provenance bytes");
         let terminal_bytes = evidence.canonical_bytes().expect("terminal bytes");
         assert_eq!(admission_bytes.len(), 1_715);
-        assert_eq!(terminal_bytes.len(), 2_621);
+        assert_eq!(terminal_bytes.len(), 5_909);
         assert!(
             admission_bytes.len() <= MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
             "{} <= {}",
