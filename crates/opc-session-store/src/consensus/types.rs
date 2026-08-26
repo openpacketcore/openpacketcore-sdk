@@ -4,17 +4,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{CompareAndSet, CompareAndSetResult};
 use crate::error::StoreError;
+use crate::fenced_mutation_roster::{
+    Admission, RequestBindingKey, RequestId as RosterRequestId, RosterExecutorProofBundleV1,
+    RosterIngressAttestationV1, MAX_ADMISSION_CODEC_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES,
+    MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_ROSTER_INGRESS_ATTESTATION_BYTES,
+    MAX_TERMINAL_CODEC_BYTES,
+};
+use crate::fenced_mutation_roster_executor::{
+    AuthorityBinding, AuthorityLeaseMetadata, CommittedTerminal,
+};
 use crate::fenced_transition::{
     FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionV2HistoryEpoch,
     FencedTransitionV2Request,
 };
 use crate::lease::LeaseGuard;
-use crate::model::{OwnerId, SessionKey};
+use crate::model::{FenceToken, Generation, OwnerId, SessionKey};
 use crate::record::StoredSessionRecord;
 
 pub use opc_consensus::{
@@ -101,6 +111,18 @@ pub const MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES: usize = 1024 * 1
 /// existing consensus response and consumer frame profiles.
 pub const MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES: usize = 1024 * 1024;
 
+const ROSTER_REGISTRATION_HANDLE_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/roster-registration-handle/v1\0";
+const ROSTER_ADMISSION_SLOT_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/roster-admission-slot/v2\0";
+const ROSTER_CONSENSUS_REQUEST_ID_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/roster-request-id/v1\0";
+const ROSTER_ADMISSION_PAYLOAD_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/roster-admission-payload/v1\0";
+const ROSTER_TERMINAL_PAYLOAD_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/roster-terminal-payload/v1\0";
+const ROSTER_COMMAND_REJECTED: &str = "roster consensus command rejected";
+
 /// Produce the canonical, non-describing binding of one exact voter scope.
 ///
 /// The durable activation certificate stores this digest rather than a second
@@ -171,6 +193,699 @@ impl SessionTopologyMemberBinding {
 impl fmt::Debug for SessionTopologyMemberBinding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SessionTopologyMemberBinding(<redacted>)")
+    }
+}
+
+/// Bounded opaque canonical roster bytes retained only in private consensus
+/// commands. Its visitor rejects oversized sequences before retaining them.
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct BoundedRosterCapsule<const MAX: usize>(Vec<u8>);
+
+impl<const MAX: usize> BoundedRosterCapsule<MAX> {
+    fn new(bytes: Vec<u8>) -> Result<Self, StoreError> {
+        if bytes.len() > MAX {
+            return Err(StoreError::PayloadTooLarge {
+                actual: bytes.len(),
+                max: MAX,
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl<const MAX: usize> Serialize for BoundedRosterCapsule<MAX> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de, const MAX: usize> Deserialize<'de> for BoundedRosterCapsule<MAX> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CapsuleVisitor<const MAX: usize>;
+
+        impl<'de, const MAX: usize> Visitor<'de> for CapsuleVisitor<MAX> {
+            type Value = BoundedRosterCapsule<MAX>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded opaque roster capsule")
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() > MAX {
+                    return Err(E::custom("bounded roster capsule exceeds limit"));
+                }
+                Ok(BoundedRosterCapsule(value.to_vec()))
+            }
+
+            fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_bytes(value)
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() > MAX {
+                    return Err(E::custom("bounded roster capsule exceeds limit"));
+                }
+                Ok(BoundedRosterCapsule(value))
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence.size_hint().is_some_and(|length| length > MAX) {
+                    return Err(serde::de::Error::custom(
+                        "bounded roster capsule exceeds limit",
+                    ));
+                }
+                let mut bytes = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX));
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    if bytes.len() == MAX {
+                        return Err(serde::de::Error::custom(
+                            "bounded roster capsule exceeds limit",
+                        ));
+                    }
+                    bytes.push(byte);
+                }
+                Ok(BoundedRosterCapsule(bytes))
+            }
+        }
+
+        deserializer.deserialize_bytes(CapsuleVisitor::<MAX>)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConsensusRosterAuthorityWire {
+    scope: [u8; 32],
+    key: SessionKey,
+    owner: OwnerId,
+    fence: FenceToken,
+    credential_id: u64,
+    generation: Generation,
+    acquired_at: opc_types::Timestamp,
+    expires_at: opc_types::Timestamp,
+}
+
+impl From<&AuthorityBinding> for ConsensusRosterAuthorityWire {
+    fn from(value: &AuthorityBinding) -> Self {
+        Self {
+            scope: value.scope().digest(),
+            key: value.key().clone(),
+            owner: value.owner().clone(),
+            fence: value.fence(),
+            credential_id: value.credential_id(),
+            generation: value.generation(),
+            acquired_at: value.acquired_at(),
+            expires_at: value.expires_at(),
+        }
+    }
+}
+
+impl ConsensusRosterAuthorityWire {
+    fn into_authority(self) -> Result<AuthorityBinding, StoreError> {
+        AuthorityBinding::from_consensus_parts(
+            self.scope,
+            self.key,
+            self.owner,
+            self.fence,
+            AuthorityLeaseMetadata::new(
+                self.credential_id,
+                self.generation,
+                self.acquired_at,
+                self.expires_at,
+            ),
+        )
+        .map_err(|_| roster_command_rejected())
+    }
+}
+
+fn roster_command_rejected() -> StoreError {
+    StoreError::InvalidKey(ROSTER_COMMAND_REJECTED.into())
+}
+
+pub(crate) fn roster_registration_handle(binding: RequestBindingKey) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ROSTER_REGISTRATION_HANDLE_DOMAIN);
+    hasher.update(binding.to_bytes());
+    let mut handle: [u8; 32] = hasher.finalize().into();
+    if handle == [0; 32] {
+        handle[0] = 1;
+    }
+    handle
+}
+
+fn roster_admission_slot(admission: &Admission) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ROSTER_ADMISSION_SLOT_DOMAIN);
+    hasher.update(admission.scope().digest());
+    let key = admission.key().canonical_digest_input();
+    hasher.update((key.len() as u64).to_be_bytes());
+    hasher.update(key);
+    hasher.update(admission.roster_id().as_bytes());
+    hasher.finalize().into()
+}
+
+fn roster_consensus_request_id(slot: [u8; 32]) -> SessionConsensusRequestId {
+    let mut hasher = Sha256::new();
+    hasher.update(ROSTER_CONSENSUS_REQUEST_ID_DOMAIN);
+    hasher.update(slot);
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut request_id = [0; 16];
+    request_id.copy_from_slice(&digest[..16]);
+    if request_id == [0; 16] {
+        request_id[0] = 1;
+    }
+    SessionConsensusRequestId::from_bytes(request_id)
+}
+
+/// The sole replicated immutable roster-admission mutation.
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConsensusRosterAdmissionCommand {
+    admission: Admission,
+    authority: AuthorityBinding,
+    ingress_request_id: [u8; 16],
+    ingress_attestation: BoundedRosterCapsule<MAX_ROSTER_INGRESS_ATTESTATION_BYTES>,
+}
+
+impl ConsensusRosterAdmissionCommand {
+    pub(crate) fn new(
+        admission: Admission,
+        authority: AuthorityBinding,
+    ) -> Result<Self, StoreError> {
+        if authority.scope() != admission.scope()
+            || authority.key() != admission.key()
+            || authority.owner() != admission.logical_owner()
+            || authority.fence() != admission.admission_fence()
+            || authority.generation() != admission.expected_generation()
+        {
+            return Err(roster_command_rejected());
+        }
+        Ok(Self {
+            admission,
+            authority,
+            ingress_request_id: [0; 16],
+            ingress_attestation: BoundedRosterCapsule::new(Vec::new())?,
+        })
+    }
+
+    pub(crate) fn new_with_ingress(
+        admission: Admission,
+        authority: AuthorityBinding,
+        ingress_attestation: RosterIngressAttestationV1,
+    ) -> Result<Self, StoreError> {
+        let ingress_request_id = ingress_attestation.request_id();
+        Self::new_with_ingress_request_id(
+            admission,
+            authority,
+            ingress_request_id,
+            ingress_attestation,
+        )
+    }
+
+    pub(crate) fn new_with_ingress_request_id(
+        admission: Admission,
+        authority: AuthorityBinding,
+        ingress_request_id: [u8; 16],
+        ingress_attestation: RosterIngressAttestationV1,
+    ) -> Result<Self, StoreError> {
+        if ingress_request_id == [0; 16] || ingress_attestation.request_id() != ingress_request_id {
+            return Err(roster_command_rejected());
+        }
+        let mut value = Self::new(admission, authority)?;
+        value.ingress_request_id = ingress_request_id;
+        value.ingress_attestation = BoundedRosterCapsule::new(
+            ingress_attestation
+                .canonical_bytes()
+                .map_err(|_| roster_command_rejected())?,
+        )?;
+        Ok(value)
+    }
+
+    pub(crate) fn admission(&self) -> &Admission {
+        &self.admission
+    }
+
+    pub(crate) fn authority(&self) -> &AuthorityBinding {
+        &self.authority
+    }
+
+    pub(crate) fn ingress_attestation(&self) -> Result<RosterIngressAttestationV1, StoreError> {
+        RosterIngressAttestationV1::decode_canonical(&self.ingress_attestation.0)
+            .map_err(|_| roster_command_rejected())
+    }
+
+    pub(crate) const fn ingress_request_id(&self) -> [u8; 16] {
+        self.ingress_request_id
+    }
+
+    pub(crate) fn request_id(&self) -> Result<SessionConsensusRequestId, StoreError> {
+        Ok(roster_consensus_request_id(self.admission_slot()?))
+    }
+
+    pub(crate) fn admission_slot(&self) -> Result<[u8; 32], StoreError> {
+        Ok(roster_admission_slot(&self.admission))
+    }
+
+    pub(crate) fn immutable_payload_digest(&self) -> Result<[u8; 32], StoreError> {
+        let admission = self
+            .admission
+            .to_canonical_bytes()
+            .map_err(|_| roster_command_rejected())?;
+        let authority = postcard::to_allocvec(&ConsensusRosterAuthorityWire::from(&self.authority))
+            .map_err(|_| roster_command_rejected())?;
+        let mut hasher = Sha256::new();
+        hasher.update(ROSTER_ADMISSION_PAYLOAD_DIGEST_DOMAIN);
+        hasher.update((admission.len() as u64).to_be_bytes());
+        hasher.update(admission);
+        hasher.update((authority.len() as u64).to_be_bytes());
+        hasher.update(authority);
+        Ok(hasher.finalize().into())
+    }
+}
+
+impl fmt::Debug for ConsensusRosterAdmissionCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsensusRosterAdmissionCommand(<redacted>)")
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ConsensusRosterAdmissionWire {
+    admission: BoundedRosterCapsule<MAX_ADMISSION_CODEC_BYTES>,
+    authority: ConsensusRosterAuthorityWire,
+    ingress_request_id: [u8; 16],
+    ingress_attestation: BoundedRosterCapsule<MAX_ROSTER_INGRESS_ATTESTATION_BYTES>,
+}
+
+impl Serialize for ConsensusRosterAdmissionCommand {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let admission = self
+            .admission
+            .to_canonical_bytes()
+            .map_err(serde::ser::Error::custom)?;
+        ConsensusRosterAdmissionWire {
+            admission: BoundedRosterCapsule::new(admission).map_err(serde::ser::Error::custom)?,
+            authority: (&self.authority).into(),
+            ingress_request_id: self.ingress_request_id,
+            ingress_attestation: self.ingress_attestation.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConsensusRosterAdmissionCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ConsensusRosterAdmissionWire::deserialize(deserializer)?;
+        let admission = Admission::from_canonical_bytes(&wire.admission.into_inner())
+            .map_err(serde::de::Error::custom)?;
+        let authority = wire
+            .authority
+            .into_authority()
+            .map_err(serde::de::Error::custom)?;
+        let mut command = Self::new(admission, authority).map_err(serde::de::Error::custom)?;
+        if wire.ingress_attestation.0.is_empty() {
+            if wire.ingress_request_id != [0; 16] {
+                return Err(serde::de::Error::custom(roster_command_rejected()));
+            }
+        } else {
+            let ingress = RosterIngressAttestationV1::decode_canonical(&wire.ingress_attestation.0)
+                .map_err(serde::de::Error::custom)?;
+            if wire.ingress_request_id == [0; 16] || ingress.request_id() != wire.ingress_request_id
+            {
+                return Err(serde::de::Error::custom(roster_command_rejected()));
+            }
+            command.ingress_request_id = wire.ingress_request_id;
+            command.ingress_attestation = BoundedRosterCapsule::new(
+                ingress
+                    .canonical_bytes()
+                    .map_err(serde::de::Error::custom)?,
+            )
+            .map_err(serde::de::Error::custom)?;
+        }
+        Ok(command)
+    }
+}
+
+/// The sole replicated Established-or-Aborted roster terminal mutation.
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConsensusRosterTerminalCommand {
+    binding: RequestBindingKey,
+    registration_handle: [u8; 32],
+    registration_request_id: RosterRequestId,
+    registration_terminal_slot: [u8; 32],
+    authority: AuthorityBinding,
+    record: BoundedRosterCapsule<MAX_TERMINAL_CODEC_BYTES>,
+    proof_bundle: BoundedRosterCapsule<MAX_EXECUTOR_PROOF_BUNDLE_BYTES>,
+    ingress_request_id: [u8; 16],
+    ingress_attestation: BoundedRosterCapsule<MAX_ROSTER_INGRESS_ATTESTATION_BYTES>,
+}
+
+/// Immutable terminal command body kept separate from its replaceable guards.
+#[doc(hidden)]
+pub(crate) struct ConsensusRosterTerminalCommandInput {
+    pub(crate) binding: RequestBindingKey,
+    pub(crate) registration_handle: [u8; 32],
+    pub(crate) registration_request_id: RosterRequestId,
+    pub(crate) registration_terminal_slot: [u8; 32],
+    pub(crate) authority: AuthorityBinding,
+    pub(crate) record: Vec<u8>,
+}
+
+impl ConsensusRosterTerminalCommand {
+    fn new_with_encoded_proof_bundle(
+        input: ConsensusRosterTerminalCommandInput,
+        proof_bundle: BoundedRosterCapsule<MAX_EXECUTOR_PROOF_BUNDLE_BYTES>,
+    ) -> Result<Self, StoreError> {
+        let ConsensusRosterTerminalCommandInput {
+            binding,
+            registration_handle,
+            registration_request_id,
+            registration_terminal_slot,
+            authority,
+            record,
+        } = input;
+        if registration_handle == [0; 32]
+            || registration_terminal_slot == [0; 32]
+            || record.is_empty()
+            || binding.history_epoch() != registration_request_id.history_epoch()
+        {
+            return Err(roster_command_rejected());
+        }
+        Ok(Self {
+            binding,
+            registration_handle,
+            registration_request_id,
+            registration_terminal_slot,
+            authority,
+            record: BoundedRosterCapsule::new(record)?,
+            proof_bundle,
+            ingress_request_id: [0; 16],
+            ingress_attestation: BoundedRosterCapsule::new(Vec::new())?,
+        })
+    }
+
+    pub(crate) fn new_with_proof_bundle(
+        input: ConsensusRosterTerminalCommandInput,
+        proof_bundle: RosterExecutorProofBundleV1,
+    ) -> Result<Self, StoreError> {
+        let proof_bundle = BoundedRosterCapsule::new(
+            proof_bundle
+                .canonical_bytes()
+                .map_err(|_| roster_command_rejected())?,
+        )?;
+        Self::new_with_encoded_proof_bundle(input, proof_bundle)
+    }
+
+    pub(crate) fn new_with_proof_bundle_and_ingress(
+        input: ConsensusRosterTerminalCommandInput,
+        proof_bundle: RosterExecutorProofBundleV1,
+        ingress_attestation: RosterIngressAttestationV1,
+    ) -> Result<Self, StoreError> {
+        let ingress_request_id = ingress_attestation.request_id();
+        Self::new_with_proof_bundle_and_ingress_request_id(
+            input,
+            proof_bundle,
+            ingress_request_id,
+            ingress_attestation,
+        )
+    }
+
+    pub(crate) fn new_with_proof_bundle_and_ingress_request_id(
+        input: ConsensusRosterTerminalCommandInput,
+        proof_bundle: RosterExecutorProofBundleV1,
+        ingress_request_id: [u8; 16],
+        ingress_attestation: RosterIngressAttestationV1,
+    ) -> Result<Self, StoreError> {
+        if ingress_request_id == [0; 16] || ingress_attestation.request_id() != ingress_request_id {
+            return Err(roster_command_rejected());
+        }
+        let mut value = Self::new_with_proof_bundle(input, proof_bundle)?;
+        value.ingress_request_id = ingress_request_id;
+        value.ingress_attestation = BoundedRosterCapsule::new(
+            ingress_attestation
+                .canonical_bytes()
+                .map_err(|_| roster_command_rejected())?,
+        )?;
+        Ok(value)
+    }
+
+    pub(crate) const fn binding(&self) -> RequestBindingKey {
+        self.binding
+    }
+
+    pub(crate) const fn registration_parts(&self) -> ([u8; 32], RosterRequestId, [u8; 32]) {
+        (
+            self.registration_handle,
+            self.registration_request_id,
+            self.registration_terminal_slot,
+        )
+    }
+
+    pub(crate) fn authority(&self) -> &AuthorityBinding {
+        &self.authority
+    }
+
+    pub(crate) fn record_bytes(&self) -> &[u8] {
+        &self.record.0
+    }
+
+    pub(crate) fn proof_bundle(&self) -> Result<RosterExecutorProofBundleV1, StoreError> {
+        RosterExecutorProofBundleV1::decode_canonical(&self.proof_bundle.0)
+            .map_err(|_| roster_command_rejected())
+    }
+
+    pub(crate) fn ingress_attestation(&self) -> Result<RosterIngressAttestationV1, StoreError> {
+        RosterIngressAttestationV1::decode_canonical(&self.ingress_attestation.0)
+            .map_err(|_| roster_command_rejected())
+    }
+
+    pub(crate) const fn ingress_request_id(&self) -> [u8; 16] {
+        self.ingress_request_id
+    }
+
+    pub(crate) fn request_id(&self) -> Result<SessionConsensusRequestId, StoreError> {
+        Ok(roster_consensus_request_id(self.terminal_slot()?))
+    }
+
+    pub(crate) fn terminal_slot(&self) -> Result<[u8; 32], StoreError> {
+        Ok(self.registration_terminal_slot)
+    }
+
+    pub(crate) fn immutable_payload_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(ROSTER_TERMINAL_PAYLOAD_DIGEST_DOMAIN);
+        hasher.update(self.binding.to_bytes());
+        hasher.update(self.registration_handle);
+        hasher.update(self.registration_request_id.to_bytes());
+        hasher.update(self.registration_terminal_slot);
+        hasher.update((self.record.0.len() as u64).to_be_bytes());
+        hasher.update(&self.record.0);
+        hasher.finalize().into()
+    }
+}
+
+impl fmt::Debug for ConsensusRosterTerminalCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsensusRosterTerminalCommand(<redacted>)")
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ConsensusRosterTerminalWire {
+    binding: RequestBindingKey,
+    registration_handle: [u8; 32],
+    registration_request_id: RosterRequestId,
+    registration_terminal_slot: [u8; 32],
+    authority: ConsensusRosterAuthorityWire,
+    record: BoundedRosterCapsule<MAX_TERMINAL_CODEC_BYTES>,
+    proof_bundle: BoundedRosterCapsule<MAX_EXECUTOR_PROOF_BUNDLE_BYTES>,
+    ingress_request_id: [u8; 16],
+    ingress_attestation: BoundedRosterCapsule<MAX_ROSTER_INGRESS_ATTESTATION_BYTES>,
+}
+
+impl Serialize for ConsensusRosterTerminalCommand {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ConsensusRosterTerminalWire {
+            binding: self.binding,
+            registration_handle: self.registration_handle,
+            registration_request_id: self.registration_request_id,
+            registration_terminal_slot: self.registration_terminal_slot,
+            authority: (&self.authority).into(),
+            record: self.record.clone(),
+            proof_bundle: self.proof_bundle.clone(),
+            ingress_request_id: self.ingress_request_id,
+            ingress_attestation: self.ingress_attestation.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConsensusRosterTerminalCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ConsensusRosterTerminalWire::deserialize(deserializer)?;
+        let authority = wire
+            .authority
+            .into_authority()
+            .map_err(serde::de::Error::custom)?;
+        let proof_bundle = RosterExecutorProofBundleV1::decode_canonical(&wire.proof_bundle.0)
+            .map_err(serde::de::Error::custom)?;
+        let mut command = Self::new_with_proof_bundle(
+            ConsensusRosterTerminalCommandInput {
+                binding: wire.binding,
+                registration_handle: wire.registration_handle,
+                registration_request_id: wire.registration_request_id,
+                registration_terminal_slot: wire.registration_terminal_slot,
+                authority,
+                record: wire.record.into_inner(),
+            },
+            proof_bundle,
+        )
+        .map_err(serde::de::Error::custom)?;
+        if wire.ingress_attestation.0.is_empty() {
+            if wire.ingress_request_id != [0; 16] {
+                return Err(serde::de::Error::custom(roster_command_rejected()));
+            }
+        } else {
+            let ingress = RosterIngressAttestationV1::decode_canonical(&wire.ingress_attestation.0)
+                .map_err(serde::de::Error::custom)?;
+            if wire.ingress_request_id == [0; 16] || ingress.request_id() != wire.ingress_request_id
+            {
+                return Err(serde::de::Error::custom(roster_command_rejected()));
+            }
+            command.ingress_request_id = wire.ingress_request_id;
+            command.ingress_attestation = BoundedRosterCapsule::new(
+                ingress
+                    .canonical_bytes()
+                    .map_err(serde::de::Error::custom)?,
+            )
+            .map_err(serde::de::Error::custom)?;
+        }
+        Ok(command)
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsensusRosterAdmissionOutcome {
+    Admitted {
+        slot: [u8; 32],
+        binding: Box<RequestBindingKey>,
+        registration_handle: [u8; 32],
+        registration_request_id: RosterRequestId,
+        registration_terminal_slot: [u8; 32],
+    },
+    Rejected(ConsensusRosterRejection),
+}
+
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsensusRosterTerminalOutcome {
+    Committed {
+        slot: [u8; 32],
+        replayed: bool,
+        committed: BoundedRosterCapsule<MAX_COMMITTED_TERMINAL_CODEC_BYTES>,
+    },
+    Compacted {
+        slot: [u8; 32],
+    },
+    Rejected(ConsensusRosterRejection),
+}
+
+impl ConsensusRosterTerminalOutcome {
+    pub(crate) fn committed(
+        slot: [u8; 32],
+        replayed: bool,
+        committed: &CommittedTerminal,
+        admission: &Admission,
+    ) -> Result<Self, StoreError> {
+        let committed = committed
+            .to_canonical_bytes(admission)
+            .map_err(|_| roster_command_rejected())?;
+        Ok(Self::Committed {
+            slot,
+            replayed,
+            committed: BoundedRosterCapsule::new(committed)?,
+        })
+    }
+
+    pub(crate) fn committed_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Committed { committed, .. } => Some(&committed.0),
+            Self::Compacted { .. } | Self::Rejected(_) => None,
+        }
+    }
+
+    pub(crate) const fn is_replayed(&self) -> bool {
+        matches!(self, Self::Committed { replayed: true, .. })
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsensusRosterRejection {
+    Authority,
+    RecoveryRequired,
+    TerminalLocked,
+    TerminalConflict,
+    RecordMissing,
+    GenerationConflict,
+    GenerationExhausted,
+    BusinessKeyReserved,
+    InvalidProtectedCheckpoint,
+    AggregateBytesFull,
+    LiveFull,
+    HistoryFull,
+}
+
+impl fmt::Debug for ConsensusRosterAdmissionOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsensusRosterAdmissionOutcome(<redacted>)")
+    }
+}
+
+impl fmt::Debug for ConsensusRosterTerminalOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsensusRosterTerminalOutcome(<redacted>)")
+    }
+}
+
+impl fmt::Debug for ConsensusRosterRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsensusRosterRejection(<redacted>)")
     }
 }
 
@@ -399,6 +1114,12 @@ pub enum SessionMutationIntent {
         /// Canonical digest of the exact voter IDs in that scope.
         voter_set_digest: [u8; 32],
     },
+    /// SDK-internal atomic immutable protected-roster admission.
+    #[doc(hidden)]
+    RosterAdmission(Box<ConsensusRosterAdmissionCommand>),
+    /// SDK-internal atomic Established-or-Aborted protected-roster terminalization.
+    #[doc(hidden)]
+    RosterTerminal(Box<ConsensusRosterTerminalCommand>),
 }
 
 impl fmt::Debug for SessionMutationIntent {
@@ -712,6 +1433,12 @@ pub enum SessionMutationOutcome {
     /// successful item does not make sibling logical effects conditional or
     /// all-or-nothing.
     FencedTransitionV2Batch(Vec<Result<FencedTransitionOutcome, StoreError>>),
+    /// Compact outcome of one immutable protected-roster admission.
+    #[doc(hidden)]
+    RosterAdmission(ConsensusRosterAdmissionOutcome),
+    /// Compact outcome of one atomic protected-roster terminalization.
+    #[doc(hidden)]
+    RosterTerminal(ConsensusRosterTerminalOutcome),
 }
 
 impl fmt::Debug for SessionMutationOutcome {
@@ -802,8 +1529,18 @@ mod tests {
 
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId};
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use p256::ecdsa::SigningKey;
 
     use super::*;
+    use crate::fenced_mutation_roster::{
+        AdmissionProposal, EstablishedMutation, Member, MemberOperationId, Phase, Profile,
+        RequestId, RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+        RosterAttestationTrustRootV1, RosterExecutorMemberProofPartsV1, RosterId,
+        RosterProviderOperationV1, RosterProviderOutcomeV1, Scope, TerminalRecord,
+        FRESH_ROSTER_MEMBERS,
+    };
+    use crate::fenced_mutation_roster_executor::{AuthorityBinding, BackendRegistration};
     use crate::{
         EncryptedSessionPayload, FenceToken, FencedTransitionLease, FencedTransitionMutation,
         FencedTransitionMutationResult, FencedTransitionRequestId, FencedTransitionV2CallerNonce,
@@ -937,6 +1674,129 @@ mod tests {
             expires_at: None,
             payload: EncryptedSessionPayload::new(b"legacy-payload"),
         }
+    }
+
+    fn roster_digest_admission(plan_byte: u8) -> Admission {
+        let proposal = AdmissionProposal::new(
+            Profile::v1(),
+            RosterId::from_bytes([0x71; 16]).expect("roster ID"),
+            (0..FRESH_ROSTER_MEMBERS)
+                .map(|ordinal| {
+                    Member::new(
+                        ordinal as u8,
+                        MemberOperationId::from_bytes([ordinal as u8 + 1; 16])
+                            .expect("member operation ID"),
+                        vec![ordinal as u8 + 1],
+                        1,
+                    )
+                    .expect("member")
+                })
+                .collect(),
+            EstablishedMutation::no_op(),
+            vec![plan_byte],
+            vec![0x73],
+            vec![0x74],
+        )
+        .expect("admission proposal");
+        Admission::authenticate(
+            proposal,
+            SessionKey {
+                tenant: TenantId::from_static("roster-digest-tenant"),
+                nf_kind: NetworkFunctionKind::smf(),
+                key_type: SessionKeyType::PduSession,
+                stable_id: StableId::new(Bytes::from_static(b"roster-digest-key"))
+                    .expect("stable ID"),
+            },
+            Scope::from_digest([0x75; 32]),
+            OwnerId::new("roster-original-owner").expect("owner"),
+            FenceToken::new(7),
+            Generation::new(3),
+        )
+        .expect("authenticated admission")
+    }
+
+    fn roster_digest_authority(
+        admission: &Admission,
+        credential_id: u64,
+        acquired_at: i64,
+        expires_at: i64,
+    ) -> AuthorityBinding {
+        AuthorityBinding::from_consensus_parts(
+            admission.scope().digest(),
+            admission.key().clone(),
+            admission.logical_owner().clone(),
+            admission.admission_fence(),
+            AuthorityLeaseMetadata::new(
+                credential_id,
+                admission.expected_generation(),
+                legacy_time(acquired_at),
+                legacy_time(expires_at),
+            ),
+        )
+        .expect("authority")
+    }
+
+    fn compressed_key(key: &p256::ecdsa::VerifyingKey) -> [u8; 33] {
+        key.to_sec1_point(true)
+            .as_bytes()
+            .try_into()
+            .expect("compressed P-256 key")
+    }
+
+    fn sign_digest(key: &SigningKey, digest: [u8; 32]) -> [u8; 64] {
+        let signature: p256::ecdsa::Signature = key.sign_prehash(&digest).expect("sign digest");
+        signature.normalize_s().to_bytes().into()
+    }
+
+    fn roster_test_proof_bundle(admission: &Admission) -> RosterExecutorProofBundleV1 {
+        let root_key = SigningKey::from_bytes((&[0x31; 32]).into()).expect("root key");
+        let leaf_key = SigningKey::from_bytes((&[0x32; 32]).into()).expect("leaf key");
+        let root =
+            RosterAttestationTrustRootV1::new([0x81; 32], compressed_key(root_key.verifying_key()))
+                .expect("test root");
+        let mut certificate = RosterAttestationLeafCertificatePartsV1 {
+            root_id: root.root_id(),
+            role: RosterAttestationCertificateRoleV1::Executor,
+            configuration_identity: legacy_identity(),
+            scope: admission.scope().digest(),
+            subject_identity_commitment: [0x82; 32],
+            leaf_epoch: 1,
+            key_id: [0x83; 32],
+            not_before: legacy_time(1),
+            not_after: legacy_time(61),
+            public_key: compressed_key(leaf_key.verifying_key()),
+            root_signature: [0; 64],
+        };
+        certificate.root_signature = sign_digest(
+            &root_key,
+            RosterExecutorProofBundleV1::certificate_signing_digest(&certificate)
+                .expect("certificate digest"),
+        );
+        let proofs = admission
+            .members()
+            .iter()
+            .map(|member| RosterExecutorMemberProofPartsV1 {
+                ordinal: member.ordinal(),
+                provider_operation: RosterProviderOperationV1::Execute,
+                outcome: RosterProviderOutcomeV1::AppliedExecuted,
+                proof_epoch: 1,
+                evidence: vec![0x84, member.ordinal()],
+                signature: sign_digest(&leaf_key, [member.ordinal().saturating_add(1); 32]),
+            })
+            .collect();
+        RosterExecutorProofBundleV1::issue_from_signed_parts(&root, certificate, proofs)
+            .expect("structurally valid proof bundle")
+    }
+
+    fn roster_terminal_command(
+        admission: &Admission,
+        input: ConsensusRosterTerminalCommandInput,
+    ) -> ConsensusRosterTerminalCommand {
+        ConsensusRosterTerminalCommand::new_with_proof_bundle(
+            input,
+            roster_test_proof_bundle(admission),
+        )
+        .expect("terminal command")
     }
 
     fn legacy_identity() -> SessionConsensusIdentity {
@@ -1647,6 +2507,286 @@ mod tests {
                 assert!(!error.to_string().contains("165"));
             }
         }
+    }
+
+    #[test]
+    fn bounded_roster_capsule_enforces_maximum_before_retention() {
+        assert!(BoundedRosterCapsule::<3>::new(vec![1, 2, 3]).is_ok());
+        assert!(BoundedRosterCapsule::<3>::new(vec![1, 2, 3, 4]).is_err());
+        assert!(
+            serde_json::from_value::<BoundedRosterCapsule<3>>(serde_json::json!([1_u8, 2, 3]))
+                .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<BoundedRosterCapsule<3>>(serde_json::json!([1_u8, 2, 3, 4]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn roster_admission_serialization_revalidates_canonical_body_and_authority() {
+        let admission = roster_digest_admission(0x76);
+        let authority = roster_digest_authority(&admission, 11, 1, 61);
+        let command =
+            ConsensusRosterAdmissionCommand::new(admission, authority).expect("admission command");
+        let encoded = postcard::to_allocvec(&command).expect("admission wire");
+        let decoded = postcard::from_bytes::<ConsensusRosterAdmissionCommand>(&encoded)
+            .expect("validated admission wire");
+        assert_eq!(
+            command.immutable_payload_digest().expect("digest"),
+            decoded.immutable_payload_digest().expect("digest")
+        );
+        let malformed = ConsensusRosterAdmissionWire {
+            admission: BoundedRosterCapsule::new(
+                command
+                    .admission()
+                    .to_canonical_bytes()
+                    .expect("canonical admission"),
+            )
+            .expect("bounded admission"),
+            authority: command.authority().into(),
+            ingress_request_id: [0x81; 16],
+            ingress_attestation: BoundedRosterCapsule::new(Vec::new())
+                .expect("empty compatibility ingress"),
+        };
+        let malformed = postcard::to_allocvec(&malformed).expect("malformed admission wire");
+        assert!(postcard::from_bytes::<ConsensusRosterAdmissionCommand>(&malformed).is_err());
+    }
+
+    #[test]
+    fn roster_admission_digest_conflicts_on_exact_body_or_original_provenance() {
+        let admission = roster_digest_admission(0x76);
+        let command = ConsensusRosterAdmissionCommand::new(
+            admission.clone(),
+            roster_digest_authority(&admission, 11, 1, 61),
+        )
+        .expect("admission command");
+        let changed_provenance = ConsensusRosterAdmissionCommand::new(
+            admission,
+            roster_digest_authority(command.admission(), 12, 1, 61),
+        )
+        .expect("changed provenance");
+        let changed_admission = roster_digest_admission(0x77);
+        let changed_body = ConsensusRosterAdmissionCommand::new(
+            changed_admission.clone(),
+            roster_digest_authority(&changed_admission, 11, 1, 61),
+        )
+        .expect("changed body");
+
+        assert_eq!(
+            command.request_id().expect("request ID"),
+            changed_body.request_id().expect("request ID")
+        );
+        assert_ne!(
+            command.immutable_payload_digest().expect("digest"),
+            changed_provenance
+                .immutable_payload_digest()
+                .expect("digest")
+        );
+        assert_ne!(
+            command.immutable_payload_digest().expect("digest"),
+            changed_body.immutable_payload_digest().expect("digest")
+        );
+    }
+
+    #[test]
+    fn roster_terminal_digest_replaces_current_guard_but_not_immutable_body() {
+        let admission = roster_digest_admission(0x76);
+        let request_id = RequestId::bind(9, &admission).expect("request ID");
+        let binding = admission.binding_key(9).expect("binding");
+        let registration =
+            BackendRegistration::from_consensus_parts([0x78; 32], request_id, &admission)
+                .expect("registration");
+        let (handle, request_id, terminal_slot) = registration.consensus_parts();
+        let established = TerminalRecord::new(
+            &admission,
+            request_id,
+            Phase::Established,
+            vec![[0x79; 32]; FRESH_ROSTER_MEMBERS],
+        )
+        .expect("established record")
+        .to_canonical_bytes(&admission)
+        .expect("established bytes");
+        let changed_body = TerminalRecord::new(
+            &admission,
+            request_id,
+            Phase::Aborted,
+            vec![[0x79; 32]; FRESH_ROSTER_MEMBERS],
+        )
+        .expect("aborted record")
+        .to_canonical_bytes(&admission)
+        .expect("aborted bytes");
+
+        let original = roster_terminal_command(
+            &admission,
+            ConsensusRosterTerminalCommandInput {
+                binding,
+                registration_handle: handle,
+                registration_request_id: request_id,
+                registration_terminal_slot: *terminal_slot.as_bytes(),
+                authority: roster_digest_authority(&admission, 11, 1, 61),
+                record: established.clone(),
+            },
+        );
+        let encoded = postcard::to_allocvec(&original).expect("production terminal command wire");
+        let decoded = postcard::from_bytes::<ConsensusRosterTerminalCommand>(&encoded)
+            .expect("production terminal command round trip");
+        assert_eq!(
+            original.immutable_payload_digest(),
+            decoded.immutable_payload_digest()
+        );
+        assert_eq!(
+            original
+                .proof_bundle()
+                .expect("original proof bundle")
+                .canonical_bytes()
+                .expect("original proof bytes"),
+            decoded
+                .proof_bundle()
+                .expect("decoded proof bundle")
+                .canonical_bytes()
+                .expect("decoded proof bytes")
+        );
+        let successor = AuthorityBinding::from_consensus_parts(
+            admission.scope().digest(),
+            admission.key().clone(),
+            OwnerId::new("roster-successor-owner").expect("successor owner"),
+            FenceToken::new(8),
+            AuthorityLeaseMetadata::new(
+                12,
+                admission.expected_generation(),
+                legacy_time(2),
+                legacy_time(62),
+            ),
+        )
+        .expect("successor authority");
+        let takeover = roster_terminal_command(
+            &admission,
+            ConsensusRosterTerminalCommandInput {
+                binding,
+                registration_handle: handle,
+                registration_request_id: request_id,
+                registration_terminal_slot: *terminal_slot.as_bytes(),
+                authority: successor,
+                record: established,
+            },
+        );
+        let conflicting = roster_terminal_command(
+            &admission,
+            ConsensusRosterTerminalCommandInput {
+                binding,
+                registration_handle: handle,
+                registration_request_id: request_id,
+                registration_terminal_slot: *terminal_slot.as_bytes(),
+                authority: roster_digest_authority(&admission, 13, 3, 63),
+                record: changed_body,
+            },
+        );
+
+        assert_eq!(
+            original.request_id().expect("request ID"),
+            takeover.request_id().expect("request ID")
+        );
+        assert_eq!(
+            original.immutable_payload_digest(),
+            takeover.immutable_payload_digest()
+        );
+        assert_ne!(
+            original.immutable_payload_digest(),
+            conflicting.immutable_payload_digest()
+        );
+    }
+
+    #[test]
+    fn roster_variants_append_after_existing_consensus_wire_tags() {
+        let admission = roster_digest_admission(0x76);
+        let admission_command = ConsensusRosterAdmissionCommand::new(
+            admission.clone(),
+            roster_digest_authority(&admission, 11, 1, 61),
+        )
+        .expect("admission command");
+        let request_id = RequestId::bind(9, &admission).expect("request ID");
+        let binding = admission.binding_key(9).expect("binding");
+        let registration =
+            BackendRegistration::from_consensus_parts([0x78; 32], request_id, &admission)
+                .expect("registration");
+        let (handle, request_id, terminal_slot) = registration.consensus_parts();
+        let record = TerminalRecord::new(
+            &admission,
+            request_id,
+            Phase::Established,
+            vec![[0x79; 32]; FRESH_ROSTER_MEMBERS],
+        )
+        .expect("terminal record")
+        .to_canonical_bytes(&admission)
+        .expect("terminal bytes");
+        let terminal_command = roster_terminal_command(
+            &admission,
+            ConsensusRosterTerminalCommandInput {
+                binding,
+                registration_handle: handle,
+                registration_request_id: request_id,
+                registration_terminal_slot: *terminal_slot.as_bytes(),
+                authority: roster_digest_authority(&admission, 11, 1, 61),
+                record,
+            },
+        );
+
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationIntent::PreflightFencedTransitionCapability)
+                .expect("existing intent")[0],
+            18
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationIntent::ActivateFencedTransitionCapability {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                scope_identity: legacy_identity(),
+                voter_set_digest: [0x82; 32],
+            })
+            .expect("existing intent")[0],
+            19
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationIntent::RosterAdmission(Box::new(
+                admission_command
+            )))
+            .expect("admission intent")[0],
+            20
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationIntent::RosterTerminal(Box::new(
+                terminal_command
+            )))
+            .expect("terminal intent")[0],
+            21
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationOutcome::FencedTransition(
+                FencedTransitionOutcome::new(
+                    legacy_lease(legacy_key(), OwnerId::new("legacy-owner").expect("owner")),
+                    Generation::new(3),
+                    FencedTransitionMutationResult::Created,
+                    legacy_time(1),
+                )
+                .expect("existing outcome")
+            ))
+            .expect("existing outcome")[0],
+            4
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationOutcome::RosterAdmission(
+                ConsensusRosterAdmissionOutcome::Rejected(ConsensusRosterRejection::Authority)
+            ))
+            .expect("admission outcome")[0],
+            5
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationOutcome::RosterTerminal(
+                ConsensusRosterTerminalOutcome::Rejected(ConsensusRosterRejection::Authority)
+            ))
+            .expect("terminal outcome")[0],
+            6
+        );
     }
 
     #[test]
