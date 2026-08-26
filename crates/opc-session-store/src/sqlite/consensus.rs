@@ -6768,27 +6768,27 @@ fn protected_roster_layout_in_sync(
         {
             Ok(ProtectedRosterLayout::Legacy)
         }
-        (version, FencedTransitionReceiptLedgerLayout::Activated, false, true, _, _)
-            if matches!(
-                version,
-                FENCED_TRANSITION_V1_DATABASE_FORMAT | FENCED_TRANSITION_V2_DATABASE_FORMAT
-            ) =>
-        {
-            Ok(ProtectedRosterLayout::Legacy)
-        }
+        (
+            FENCED_TRANSITION_V1_DATABASE_FORMAT | FENCED_TRANSITION_V2_DATABASE_FORMAT,
+            FencedTransitionReceiptLedgerLayout::Activated,
+            false,
+            true,
+            _,
+            _,
+        ) => Ok(ProtectedRosterLayout::Legacy),
         (version, FencedTransitionReceiptLedgerLayout::Prepared, true, false, true, true)
             if version == i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) =>
         {
             Ok(ProtectedRosterLayout::Prepared)
         }
-        (version, FencedTransitionReceiptLedgerLayout::Activated, true, false, true, true)
-            if matches!(
-                version,
-                FENCED_TRANSITION_V1_DATABASE_FORMAT | FENCED_TRANSITION_V2_DATABASE_FORMAT
-            ) =>
-        {
-            Ok(ProtectedRosterLayout::Prepared)
-        }
+        (
+            FENCED_TRANSITION_V1_DATABASE_FORMAT | FENCED_TRANSITION_V2_DATABASE_FORMAT,
+            FencedTransitionReceiptLedgerLayout::Activated,
+            true,
+            false,
+            true,
+            true,
+        ) => Ok(ProtectedRosterLayout::Prepared),
         (
             PROTECTED_ROSTER_DATABASE_FORMAT,
             FencedTransitionReceiptLedgerLayout::Prepared
