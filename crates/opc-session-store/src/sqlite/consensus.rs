@@ -10288,15 +10288,17 @@ fn protected_roster_established_replication(
                 ProtectedRosterEstablishedSuccessor::NoOp
             } else {
                 ProtectedRosterEstablishedSuccessor::Put {
-                    record: successor
-                        .authoritative_record()
-                        .map_err(protected_roster_reservation_error)?,
+                    record: Box::new(
+                        successor
+                            .authoritative_record()
+                            .map_err(protected_roster_reservation_error)?,
+                    ),
                 }
             };
             Ok(Some(ReplicationOp::ProtectedRosterEstablished {
                 key: expected.key().clone(),
                 expected_record,
-                successor,
+                successor: Box::new(successor),
                 owner: authority.owner().clone(),
                 fence: authority.fence(),
                 credential_id: authority.credential_id(),
@@ -10315,7 +10317,7 @@ fn protected_roster_established_replication(
                 expected_record: expected
                     .authoritative_record()
                     .map_err(protected_roster_reservation_error)?,
-                successor: ProtectedRosterEstablishedSuccessor::Delete,
+                successor: Box::new(ProtectedRosterEstablishedSuccessor::Delete),
                 owner: authority.owner().clone(),
                 fence: authority.fence(),
                 credential_id: authority.credential_id(),

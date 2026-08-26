@@ -4979,7 +4979,7 @@ mod protected_session_backend_tests {
         let op = ReplicationOp::ProtectedRosterEstablished {
             key: expected_record.key.clone(),
             expected_record,
-            successor: ProtectedRosterEstablishedSuccessor::NoOp,
+            successor: Box::new(ProtectedRosterEstablishedSuccessor::NoOp),
             owner: lease.owner().clone(),
             fence: lease.fence(),
             credential_id: lease.credential_id(),

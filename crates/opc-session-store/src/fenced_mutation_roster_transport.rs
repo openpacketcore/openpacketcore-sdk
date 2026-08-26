@@ -24,7 +24,8 @@ use crate::{
     },
     fenced_mutation_roster_executor::{
         AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration, BackendRejection,
-        CommittedTerminal, RecoveryRequest, RegistrationRequest, TerminalBody,
+        CommittedTerminal, RecoveryLookup, RecoveryRequest, RecoveryRequestInput,
+        RegistrationRequest, TerminalBody,
     },
 };
 
@@ -633,21 +634,12 @@ pub(crate) fn decode_admission_request_for_scope(
             let authority = authority
                 .into_authority(scope)
                 .map_err(|_| ProtectedRosterTransportError)?;
-            let request = RecoveryRequest::new_with_lease_metadata(
-                scope,
-                roster_id,
+            let request = RecoveryRequest::new(RecoveryRequestInput::new(
+                RecoveryLookup::new(scope, roster_id),
                 original_owner,
                 original_admission_fence,
-                authority.key().clone(),
-                authority.owner().clone(),
-                authority.fence(),
-                AuthorityLeaseMetadata::new(
-                    authority.credential_id(),
-                    authority.generation(),
-                    authority.acquired_at(),
-                    authority.expires_at(),
-                ),
-            )
+                authority,
+            ))
             .map_err(|_| ProtectedRosterTransportError)?;
             Ok(DecodedAdmissionRequest::Recover(request))
         }
