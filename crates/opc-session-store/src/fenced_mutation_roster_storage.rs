@@ -13,15 +13,17 @@
 #[cfg(test)]
 use crate::fenced_mutation_roster::MAX_HISTORY_FLOOR_CODEC_BYTES;
 use crate::fenced_mutation_roster::{
-    Admission, IrreversibleHistoryFloor, RequestBindingKey, TerminalConflictTombstone,
-    CHARGE_WITNESS_VERSION, MAX_ADMISSION_CODEC_BYTES, MAX_BUSINESS_SESSION_HEADER_BYTES,
-    MAX_CHECKPOINT_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES,
-    MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_HISTORY_EPOCH, MAX_LIVE_ROSTERS,
-    MAX_RESERVED_AND_RETAINED, MAX_ROSTER_INGRESS_ATTESTATION_BYTES, MAX_TOMBSTONE_CODEC_BYTES,
-    PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES, RECLAIM_BATCH, STORAGE_CHARGE_LIVE_INDEX_BYTES,
-    STORAGE_CHARGE_LIVE_ROW_BYTES, STORAGE_CHARGE_PAGE_BYTES, STORAGE_CHARGE_RETAINED_INDEX_BYTES,
-    STORAGE_CHARGE_RETAINED_ROW_BYTES, STORAGE_CHARGE_TOMBSTONE_INDEX_BYTES,
-    STORAGE_CHARGE_TOMBSTONE_ROW_BYTES,
+    Admission, IrreversibleHistoryFloor, RequestBindingKey, RosterCompactAdmissionProvenanceV2,
+    RosterCompactTerminalEvidenceV2, RosterExecutorProofBundleV1, RosterIngressAttestationV1,
+    TerminalConflictTombstone, CHARGE_WITNESS_VERSION, MAX_ADMISSION_CODEC_BYTES,
+    MAX_BUSINESS_SESSION_HEADER_BYTES, MAX_CHECKPOINT_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES,
+    MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_HISTORY_EPOCH,
+    MAX_LIVE_ROSTERS, MAX_RESERVED_AND_RETAINED, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
+    MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES, MAX_ROSTER_INGRESS_ATTESTATION_BYTES,
+    MAX_TOMBSTONE_CODEC_BYTES, PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES, RECLAIM_BATCH,
+    STORAGE_CHARGE_LIVE_INDEX_BYTES, STORAGE_CHARGE_LIVE_ROW_BYTES, STORAGE_CHARGE_PAGE_BYTES,
+    STORAGE_CHARGE_RETAINED_INDEX_BYTES, STORAGE_CHARGE_RETAINED_ROW_BYTES,
+    STORAGE_CHARGE_TOMBSTONE_INDEX_BYTES, STORAGE_CHARGE_TOMBSTONE_ROW_BYTES,
 };
 use crate::fenced_mutation_roster_executor::{
     CommittedTerminal, EstablishedMaterialization, TerminalMaterialization,
@@ -39,6 +41,11 @@ use std::{collections::BTreeMap, fmt};
 /// This is derived from the roster profile, rather than being an independently
 /// configurable storage version.
 pub(crate) const GLOBAL_CHARGE_WITNESS_V1: u16 = CHARGE_WITNESS_VERSION as u16;
+/// V2 adds the fixed-size authenticated terminal-history closure horizon.
+/// Older V1 bytes are deliberately not accepted: they cannot prove that an
+/// omitted final-partition tombstone was retired instead of rolled back.
+const GLOBAL_CHARGE_WITNESS_V2: u16 = GLOBAL_CHARGE_WITNESS_V1 + 1;
+const GLOBAL_CHARGE_WITNESS_VERSION: u16 = GLOBAL_CHARGE_WITNESS_V2;
 
 /// A valid production snapshot may contain every durable row at its frozen
 /// per-field maximum.  This is deliberately derived from the protocol bounds
@@ -49,6 +56,9 @@ pub(crate) const GLOBAL_CHARGE_WITNESS_V1: u16 = CHARGE_WITNESS_VERSION as u16;
 const MAX_PRODUCTION_RECORD_SNAPSHOT_BYTES: usize = MAX_ADMISSION_CODEC_BYTES
     + MAX_COMMITTED_TERMINAL_CODEC_BYTES
     + MAX_TOMBSTONE_CODEC_BYTES
+    + MAX_COMPACT_PROVENANCE_BYTES
+    + MAX_EXECUTOR_PROOF_BUNDLE_BYTES
+    + 2 * MAX_ROSTER_INGRESS_ATTESTATION_BYTES
     + MAX_BUSINESS_SESSION_COPY_BYTES
     + 512;
 /// The complete V3 stream is bounded in `u64`, rather than `usize` or a
@@ -156,27 +166,6 @@ mod production_tests {
             Timestamp::now_utc().add_seconds(2 * 24 * 60 * 60).unwrap(),
         )
         .unwrap()
-    }
-
-    fn retirement_selected_prefix(
-        records: &BTreeMap<RequestBindingKey, ProductionReservationRecord>,
-        previous: IrreversibleHistoryFloor,
-        next: IrreversibleHistoryFloor,
-        cursor: Option<&ProductionRetirementCursor>,
-    ) -> Vec<(RequestBindingKey, ProductionReservationRecord)> {
-        let key = ProductionFloorKey::from_floor(previous).unwrap();
-        records
-            .iter()
-            .filter(|(binding, _)| {
-                ProductionFloorKey::from_binding(**binding) == Ok(key)
-                    && binding.history_epoch() == next.retired_through()
-                    && cursor
-                        .and_then(|cursor| cursor.last_deleted)
-                        .is_none_or(|after| **binding > after)
-            })
-            .take(RECLAIM_BATCH)
-            .map(|(binding, record)| (*binding, record.clone()))
-            .collect()
     }
 
     fn v3_stream(chunks: &[(u8, Vec<u8>)]) -> Vec<u8> {
@@ -293,23 +282,23 @@ mod production_tests {
                                 && cursor
                                     .expected
                                     .as_ref()
-                                    .and_then(|expected| expected.last_deleted)
+                                    .and_then(|cursor| cursor.last_deleted)
                                     == guard.after
                         });
-                let floor_present = transaction.floor.is_some();
                 if self
                     .floors
                     .get(&guard.key)
                     .map(|floor| floor.retired_through())
                     != Some(guard.previous_floor_through)
-                    || guard.selected.len() > RECLAIM_BATCH
                     || guard.selected.is_empty()
+                    || guard.selected.len() > RECLAIM_BATCH
                     || !cursor_matches_guard
-                    || (guard.final_batch != floor_present)
+                    || (guard.final_batch != transaction.floor.is_some())
                 {
                     return Err(ReservationError::SnapshotMismatch);
                 }
                 let mut target = Vec::new();
+                let mut higher_epoch_exists = false;
                 for (binding, record) in &self.rows {
                     if ProductionFloorKey::from_binding(*binding) != Ok(guard.key) {
                         continue;
@@ -326,6 +315,8 @@ mod production_tests {
                             return Err(ReservationError::SnapshotMismatch);
                         }
                         target.push(*binding);
+                    } else if binding.history_epoch() > guard.target_epoch {
+                        higher_epoch_exists = true;
                     }
                 }
                 let expected = target
@@ -333,6 +324,23 @@ mod production_tests {
                     .copied()
                     .take(RECLAIM_BATCH)
                     .collect::<Vec<_>>();
+                let floor_transition_matches = match (guard.final_batch, transaction.floor) {
+                    (false, None) => true,
+                    (true, Some(floor))
+                        if floor.key == guard.key
+                            && floor.expected == self.floors.get(&guard.key).copied() =>
+                    {
+                        match floor.replacement {
+                            None => guard.partition_empty_after,
+                            Some(replacement) => {
+                                !guard.partition_empty_after
+                                    && ProductionFloorKey::from_floor(replacement) == Ok(guard.key)
+                                    && replacement.retired_through() == guard.target_epoch
+                            }
+                        }
+                    }
+                    _ => false,
+                };
                 if expected != guard.selected
                     || transaction.rows.len() != guard.selected.len()
                     || transaction
@@ -342,6 +350,93 @@ mod production_tests {
                         .any(|(row, binding)| row.binding != *binding || row.replacement.is_some())
                     || (guard.final_batch && target.len() != guard.selected.len())
                     || (!guard.final_batch && target.len() <= guard.selected.len())
+                    || guard.partition_empty_after != (guard.final_batch && !higher_epoch_exists)
+                    || !floor_transition_matches
+                {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+            }
+            if let Some(guard) = transaction.global_terminal_retirement_guard.as_ref() {
+                let mut terminal_history = self
+                    .rows
+                    .iter()
+                    .filter_map(|(binding, record)| {
+                        record
+                            .terminal_sequence
+                            .map(|sequence| (sequence, *binding, record.state))
+                    })
+                    .filter(|(sequence, _, _)| {
+                        *sequence > transaction.previous.retired_terminal_sequence
+                    })
+                    .collect::<Vec<_>>();
+                terminal_history
+                    .sort_unstable_by_key(|(sequence, binding, _)| (*sequence, *binding));
+                let expected = terminal_history
+                    .iter()
+                    .take_while(|(_, _, state)| *state == ReservationState::Tombstone)
+                    .take(RECLAIM_BATCH)
+                    .map(|(sequence, binding, _)| (*sequence, *binding))
+                    .collect::<Vec<_>>();
+                if expected != guard.selected
+                    || transaction.rows.len() != expected.len()
+                    || transaction
+                        .rows
+                        .iter()
+                        .zip(&expected)
+                        .any(|(row, expected)| {
+                            row.binding != expected.1
+                                || row.replacement.is_some()
+                                || row.expected.as_ref().is_none_or(|record| {
+                                    record.state != ReservationState::Tombstone
+                                        || record.terminal_sequence != Some(expected.0)
+                                })
+                        })
+                    || transaction.next.retired_terminal_sequence
+                        != expected
+                            .last()
+                            .map(|(sequence, _)| *sequence)
+                            .ok_or(ReservationError::SnapshotMismatch)?
+                {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                let mut selected_per_partition = BTreeMap::new();
+                for (_, binding) in &expected {
+                    let key = ProductionFloorKey::from_binding(*binding)?;
+                    *selected_per_partition.entry(key).or_insert(0_usize) += 1;
+                }
+                let expected_releases = selected_per_partition
+                    .iter()
+                    .filter_map(|(key, selected)| {
+                        let total = self
+                            .rows
+                            .keys()
+                            .filter(|binding| {
+                                ProductionFloorKey::from_binding(**binding) == Ok(*key)
+                            })
+                            .count();
+                        (total == *selected).then_some(*key)
+                    })
+                    .collect::<Vec<_>>();
+                if expected_releases != guard.released_partitions
+                    || transaction.released_floors.len() != expected_releases.len()
+                    || transaction
+                        .released_floors
+                        .iter()
+                        .zip(&expected_releases)
+                        .any(|(floor, key)| {
+                            floor.key != *key
+                                || floor.expected != self.floors.get(key).copied()
+                                || floor.replacement.is_some()
+                        })
+                    || transaction
+                        .released_retirement_cursors
+                        .iter()
+                        .any(|cursor| {
+                            !expected_releases.contains(&cursor.key)
+                                || cursor.expected.as_ref()
+                                    != self.retirement_cursors.get(&cursor.key)
+                                || cursor.replacement.is_some()
+                        })
                 {
                     return Err(ReservationError::SnapshotMismatch);
                 }
@@ -380,6 +475,20 @@ mod production_tests {
             }
             if let Some(cursor) = transaction.retirement_cursor.as_ref() {
                 if self.retirement_cursors.get(&cursor.key) != cursor.expected.as_ref() {
+                    return Err(ReservationError::FloorAdvance);
+                }
+            }
+            for floor in &transaction.released_floors {
+                if self.floors.get(&floor.key) != floor.expected.as_ref()
+                    || floor.replacement.is_some()
+                {
+                    return Err(ReservationError::FloorAdvance);
+                }
+            }
+            for cursor in &transaction.released_retirement_cursors {
+                if self.retirement_cursors.get(&cursor.key) != cursor.expected.as_ref()
+                    || cursor.replacement.is_some()
+                {
                     return Err(ReservationError::FloorAdvance);
                 }
             }
@@ -423,7 +532,14 @@ mod production_tests {
                 business_reservation = None;
             }
             if let Some(floor) = transaction.floor {
-                floors.insert(floor.key(), floor.replacement());
+                match floor.replacement() {
+                    Some(replacement) => {
+                        floors.insert(floor.key(), replacement);
+                    }
+                    None => {
+                        floors.remove(&floor.key());
+                    }
+                }
             }
             if let Some(cursor) = transaction.retirement_cursor {
                 match cursor.replacement {
@@ -434,6 +550,12 @@ mod production_tests {
                         retirement_cursors.remove(&cursor.key);
                     }
                 }
+            }
+            for cursor in transaction.released_retirement_cursors {
+                retirement_cursors.remove(&cursor.key);
+            }
+            for floor in transaction.released_floors {
+                floors.remove(&floor.key);
             }
             self.rows = rows;
             self.floors = floors;
@@ -488,6 +610,17 @@ mod production_tests {
     }
 
     fn terminal_at(admission: &Admission, epoch: u64) -> CommittedTerminal {
+        // Test admissions encode their unique identity in the stable id. Keep
+        // the synthetic commit sequence globally unique so snapshot/restart
+        // validation exercises the production total-order invariant. Identity
+        // zero intentionally yields sequence one for the H=0 boundary.
+        let terminal_sequence = admission
+            .key()
+            .stable_id
+            .as_ref()
+            .iter()
+            .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte))
+            + 1;
         let record = TerminalRecord::new(
             admission,
             RequestId::bind(epoch, admission).unwrap(),
@@ -515,7 +648,8 @@ mod production_tests {
             admission,
             &authority,
             record,
-            ConsensusCommitMetadata::issue(1, 1, committed_at).unwrap(),
+            ConsensusCommitMetadata::issue(terminal_sequence, terminal_sequence, committed_at)
+                .unwrap(),
         )
         .unwrap()
     }
@@ -644,7 +778,7 @@ mod production_tests {
             MAX_TOMBSTONE_CODEC_BYTES,
         )
         .unwrap();
-        let reserved = production_components(&live.admission, None, None).unwrap();
+        let reserved = production_components(&live.admission, None, None, 0).unwrap();
         assert_eq!(
             reserved.terminal_evidence_envelope_bytes,
             MAX_EXECUTOR_PROOF_BUNDLE_BYTES + 16 + MAX_ROSTER_INGRESS_ATTESTATION_BYTES
@@ -676,6 +810,102 @@ mod production_tests {
     }
 
     #[test]
+    fn production_compact_evidence_reserves_the_complete_tombstone_envelope() {
+        let components = production_components(&[], None, None, MAX_COMPACT_PROVENANCE_BYTES)
+            .expect("current bounded production components");
+        let charges = ChargeProfile::v1()
+            .charge(components)
+            .expect("current compact evidence fits the frozen charge profile");
+
+        assert_eq!(MAX_COMPACT_PROVENANCE_BYTES, 10 * 1024);
+        assert_eq!(MAX_TOMBSTONE_CHARGE_BYTES, 3 * STORAGE_CHARGE_PAGE_BYTES);
+        assert_eq!(charges.tombstone, MAX_TOMBSTONE_CHARGE_BYTES);
+    }
+
+    #[test]
+    fn prevalidated_terminal_finalizer_preserves_exact_canonical_cas_witness() {
+        let profile = profile();
+        let admission = admission(33);
+        let current = live(&admission, 1, profile);
+        let terminal = terminal(&admission);
+        let witness = GlobalChargeWitness::v1(
+            0,
+            0,
+            validate_production_snapshot(std::slice::from_ref(&current), profile).unwrap(),
+        );
+        let budget = GlobalChargeBudget::v1(u64::MAX);
+        let ordinary = prepare_production_terminalization(
+            &current,
+            current.binding,
+            &terminal,
+            witness,
+            budget,
+            profile,
+        )
+        .unwrap();
+        let expected_canonical = current.to_canonical_bytes().unwrap();
+        let reservation = current.business_reservation.as_ref().unwrap();
+        let business =
+            ProductionTerminalBusinessCas::from_committed(&admission, &terminal, reservation)
+                .unwrap();
+        let mut replacement = current.clone();
+        replacement.terminalize(&terminal, profile).unwrap();
+        let prepared =
+            prepare_production_transition_prevalidated(ProductionTransitionPreparation {
+                current: Some(current),
+                expected_canonical: Some(expected_canonical.clone()),
+                binding: ordinary.binding().unwrap(),
+                replacement,
+                replacement_canonical: None,
+                insertion: false,
+                floor: None,
+                retirement_cursor: None,
+                partition_guard: None,
+                admission_business_reservation: None,
+                business: Some(business),
+                witness,
+                budget,
+                profile,
+            })
+            .unwrap();
+        let ordinary_row = ordinary.rows().first().unwrap();
+        let prepared_row = prepared.rows().first().unwrap();
+        assert_eq!(
+            prepared_row.expected_canonical_bytes(),
+            Some(expected_canonical.as_slice())
+        );
+        assert_eq!(
+            ordinary_row
+                .replacement()
+                .unwrap()
+                .to_canonical_bytes()
+                .unwrap(),
+            prepared_row
+                .replacement()
+                .unwrap()
+                .to_canonical_bytes()
+                .unwrap(),
+        );
+        assert_eq!(ordinary.next_witness(), prepared.next_witness());
+    }
+
+    #[test]
+    fn hydrated_production_terminal_gate_rejects_legacy_payload() {
+        let profile = profile();
+        let admission = admission(34);
+        let current = live(&admission, 1, profile);
+        let binding = current.binding;
+        let hydrated = ProductionReservationRecord::from_canonical_vec_hydrated(
+            current.to_canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            into_hydrated_live_terminal_parts(hydrated, binding),
+            Err(ReservationError::InvalidState)
+        ));
+    }
+
+    #[test]
     fn admission_rejects_one_byte_short_global_budget_and_unknown_witness() {
         let profile = profile();
         let admission = admission(2);
@@ -699,7 +929,7 @@ mod production_tests {
             Err(ReservationError::BudgetExceeded)
         ));
         let unknown = GlobalChargeWitness {
-            version: GLOBAL_CHARGE_WITNESS_V1 + 1,
+            version: GLOBAL_CHARGE_WITNESS_VERSION + 1,
             ..empty_witness()
         };
         assert!(matches!(
@@ -723,7 +953,7 @@ mod production_tests {
             exact.maximum_total_charge_bytes,
             PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES
         );
-        assert_eq!(exact.version, CHARGE_WITNESS_VERSION as u16);
+        assert_eq!(exact.version, GLOBAL_CHARGE_WITNESS_VERSION);
         assert!(exact.validate_frozen_profile().is_ok());
         assert!(matches!(
             GlobalChargeBudget {
@@ -735,7 +965,7 @@ mod production_tests {
         ));
         assert!(matches!(
             GlobalChargeBudget {
-                version: GLOBAL_CHARGE_WITNESS_V1 + 1,
+                version: GLOBAL_CHARGE_WITNESS_VERSION + 1,
                 ..exact
             }
             .validate_frozen_profile(),
@@ -743,7 +973,7 @@ mod production_tests {
         ));
         assert!(matches!(
             GlobalChargeWitness {
-                version: GLOBAL_CHARGE_WITNESS_V1 + 1,
+                version: GLOBAL_CHARGE_WITNESS_VERSION + 1,
                 ..empty_witness()
             }
             .validate_for(exact),
@@ -941,14 +1171,9 @@ mod production_tests {
     }
 
     #[test]
-    fn counter_growth_caps_floors_and_cursors_before_any_collection_growth() {
+    fn counter_growth_caps_floors_before_any_collection_growth() {
         let record = live(&admission(u16::MAX - 3), 1, profile());
         let floor = IrreversibleHistoryFloor::initial(record.binding).unwrap();
-        let cursor = ProductionRetirementCursor::initial(
-            ProductionFloorKey::from_floor(floor).unwrap(),
-            record.binding.history_epoch(),
-        )
-        .unwrap();
         assert!(matches!(
             counters_with_production_floor(
                 AggregateCounters {
@@ -956,16 +1181,6 @@ mod production_tests {
                     ..zero_counters()
                 },
                 floor,
-            ),
-            Err(ReservationError::FloorLimit)
-        ));
-        assert!(matches!(
-            counters_with_retirement_cursor(
-                AggregateCounters {
-                    retirement_cursor_count: MAX_RESERVED_AND_RETAINED,
-                    ..zero_counters()
-                },
-                &cursor,
             ),
             Err(ReservationError::FloorLimit)
         ));
@@ -987,6 +1202,34 @@ mod production_tests {
             ),
             Err(ReservationError::WitnessMismatch)
         ));
+    }
+
+    #[test]
+    fn terminalization_reuses_its_admission_slot_at_capacity() {
+        let profile = profile();
+        let admitted = admission(55);
+        let live = live(&admitted, 1, profile);
+        let mut counters =
+            validate_production_snapshot(std::slice::from_ref(&live), profile).unwrap();
+        counters.retained_and_live_bindings = MAX_RESERVED_AND_RETAINED;
+        counters.durable_epoch_bindings = MAX_RESERVED_AND_RETAINED;
+        let prepared = prepare_production_terminalization(
+            &live,
+            live.binding,
+            &terminal(&admitted),
+            GlobalChargeWitness::v1(0, 0, counters),
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .expect("live-to-retained must not consume another capacity/history slot");
+        assert_eq!(
+            prepared.next_witness().roster.retained_and_live_bindings(),
+            MAX_RESERVED_AND_RETAINED
+        );
+        assert_eq!(
+            prepared.next_witness().roster.durable_epoch_bindings(),
+            MAX_RESERVED_AND_RETAINED
+        );
     }
 
     #[test]
@@ -1080,65 +1323,10 @@ mod production_tests {
     }
 
     #[test]
-    fn retirement_requires_a_strict_same_scope_floor_and_releases_tombstone_charge() {
-        let profile = profile();
-        let fixture = admission(6);
-        let mut record = live(&fixture, 1, profile);
-        record.terminalize(&terminal(&fixture), profile).unwrap();
-        record.reclaim_at(aged_maintenance_time(), profile).unwrap();
-        let previous = IrreversibleHistoryFloor::initial(record.binding).unwrap();
-        let counters = counters_with_production_floor(
-            validate_production_snapshot(std::slice::from_ref(&record), profile).unwrap(),
-            previous,
-        )
-        .unwrap();
-        let witness = GlobalChargeWitness::v1(0, 0, counters);
-        let next = previous.advance_to(1).unwrap();
-        let records = BTreeMap::from([(record.binding, record.clone())]);
-        let prepared = prepare_production_retirement(
-            ProductionRetirementPrefix::new(
-                previous,
-                next,
-                &retirement_selected_prefix(&records, previous, next, None),
-                true,
-            )
-            .unwrap(),
-            previous,
-            next,
-            None,
-            witness,
-            GlobalChargeBudget::v1(u64::MAX),
-            profile,
-        )
-        .unwrap();
-        assert_eq!(prepared.next_witness().roster.floor_count(), 1);
-        assert_eq!(prepared.next_witness().roster.durable_epoch_bindings(), 0);
-        assert!(matches!(
-            prepare_production_retirement(
-                ProductionRetirementPrefix::new(
-                    previous,
-                    next,
-                    &retirement_selected_prefix(&records, previous, next, None),
-                    true,
-                )
-                .unwrap(),
-                previous,
-                previous,
-                None,
-                witness,
-                GlobalChargeBudget::v1(u64::MAX),
-                profile,
-            ),
-            Err(ReservationError::FloorAdvance)
-        ));
-    }
-
-    #[test]
     fn complete_transaction_adapter_commits_rows_witness_and_floor_together() {
         let profile = profile();
         let admitted = admission(42);
         let live = live(&admitted, 1, profile);
-        let floor = IrreversibleHistoryFloor::initial(live.binding).unwrap();
         let mut store = InMemoryProductionStore {
             rows: BTreeMap::new(),
             witness: empty_witness(),
@@ -1214,34 +1402,128 @@ mod production_tests {
         store
             .compare_and_apply_production(reclaim.transaction.clone())
             .unwrap();
-        let next_floor = floor.advance_to(1).unwrap();
-        let retire = prepare_production_retirement(
-            ProductionRetirementPrefix::new(
-                floor,
-                next_floor,
-                &retirement_selected_prefix(&store.rows, floor, next_floor, None),
-                true,
-            )
-            .unwrap(),
-            floor,
-            next_floor,
+        assert_eq!(store.rows[&binding].state, ReservationState::Tombstone);
+        assert_eq!(store.witness.roster.floor_count(), 1);
+        assert_eq!(store.witness.roster.durable_epoch_bindings(), 1);
+    }
+
+    #[test]
+    fn retirement_deletes_a_completed_empty_partition_and_releases_its_floor() {
+        let profile = profile();
+        let admitted = admission(43);
+        let mut record = live(&admitted, 7, profile);
+        record
+            .terminalize(&terminal_at(&admitted, 7), profile)
+            .unwrap();
+        record.reclaim_at(aged_maintenance_time(), profile).unwrap();
+        let previous = IrreversibleHistoryFloor::initial(record.binding).unwrap();
+        let counters = counters_with_production_floor(
+            validate_production_snapshot(std::slice::from_ref(&record), profile).unwrap(),
+            previous,
+        )
+        .unwrap();
+        let witness = GlobalChargeWitness::v1(0, 0, counters);
+        let next = previous.advance_to(record.binding.history_epoch()).unwrap();
+        let selected = vec![(record.binding, record.clone())];
+        let prepared = prepare_production_retirement(
+            ProductionRetirementPrefix::new(previous, next, &selected, true, true).unwrap(),
+            previous,
+            next,
             None,
-            store.witness,
+            witness,
             GlobalChargeBudget::v1(u64::MAX),
             profile,
         )
         .unwrap();
-        let mut wrong_floor = retire.clone();
-        wrong_floor.floor.as_mut().unwrap().expected = Some(next_floor);
-        assert!(matches!(
-            store.compare_and_apply_production(wrong_floor),
-            Err(ReservationError::FloorAdvance)
-        ));
-        assert!(store.rows.contains_key(&binding));
-        store.compare_and_apply_production(retire).unwrap();
+        let mut store = InMemoryProductionStore {
+            rows: BTreeMap::from([(record.binding, record)]),
+            witness,
+            floors: BTreeMap::from([(ProductionFloorKey::from_floor(previous).unwrap(), previous)]),
+            retirement_cursors: BTreeMap::new(),
+            business: None,
+            business_reservation: None,
+            fail_at: None,
+        };
+        store.compare_and_apply_production(prepared).unwrap();
         assert!(store.rows.is_empty());
-        assert_eq!(store.witness.roster.floor_count(), 1);
+        assert!(store.floors.is_empty());
+        assert_eq!(
+            next.retired_through(),
+            7,
+            "sparse history epochs advance directly"
+        );
         assert_eq!(store.witness.roster.durable_epoch_bindings(), 0);
+        assert_eq!(store.witness.roster.floor_count(), 0);
+    }
+
+    #[test]
+    fn retirement_advances_the_floor_when_a_higher_epoch_remains() {
+        let profile = profile();
+        let admitted = admission(143);
+        let mut retired = live(&admitted, 7, profile);
+        retired
+            .terminalize(&terminal_at(&admitted, 7), profile)
+            .unwrap();
+        retired
+            .reclaim_at(aged_maintenance_time(), profile)
+            .unwrap();
+        let later_admission = admission(144);
+        let later = live(&later_admission, 8, profile);
+        let previous = IrreversibleHistoryFloor::initial(retired.binding).unwrap();
+        let next = previous.advance_to(7).unwrap();
+        let records = vec![retired.clone(), later.clone()];
+        let counters = counters_with_production_floor(
+            validate_production_snapshot(&records, profile).unwrap(),
+            previous,
+        )
+        .unwrap();
+        let witness = GlobalChargeWitness::v1(0, 0, counters);
+        let selected = vec![(retired.binding, retired.clone())];
+        let incorrectly_empty = prepare_production_retirement(
+            ProductionRetirementPrefix::new(previous, next, &selected, true, true).unwrap(),
+            previous,
+            next,
+            None,
+            witness,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+        let mut store = InMemoryProductionStore {
+            rows: BTreeMap::from([
+                (retired.binding, retired.clone()),
+                (later.binding, later.clone()),
+            ]),
+            witness,
+            floors: BTreeMap::from([(ProductionFloorKey::from_floor(previous).unwrap(), previous)]),
+            retirement_cursors: BTreeMap::new(),
+            business: None,
+            business_reservation: None,
+            fail_at: None,
+        };
+        assert!(matches!(
+            store.compare_and_apply_production(incorrectly_empty),
+            Err(ReservationError::SnapshotMismatch)
+        ));
+
+        let prepared = prepare_production_retirement(
+            ProductionRetirementPrefix::new(previous, next, &selected, true, false).unwrap(),
+            previous,
+            next,
+            None,
+            witness,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+        store.compare_and_apply_production(prepared).unwrap();
+        assert_eq!(store.rows, BTreeMap::from([(later.binding, later)]));
+        assert_eq!(
+            store.floors[&ProductionFloorKey::from_floor(next).unwrap()],
+            next
+        );
+        assert_eq!(store.witness.roster.durable_epoch_bindings(), 1);
+        assert_eq!(store.witness.roster.floor_count(), 1);
     }
 
     #[test]
@@ -1293,7 +1575,7 @@ mod production_tests {
     }
 
     #[test]
-    fn reclaim_requires_exact_24_hour_boundary_with_nanosecond_precision() {
+    fn reclaim_compaction_requires_exact_24_hour_boundary_with_nanosecond_precision() {
         let profile = profile();
         let admitted = admission(45);
         let mut retained = live(&admitted, 1, profile);
@@ -1304,381 +1586,55 @@ mod production_tests {
             .checked_add_retention()
             .unwrap();
         let just_young = ConsensusMaintenanceTimestamp(exact.0 - 1);
-
-        assert!(matches!(
-            retained.clone().reclaim_at(just_young, profile),
-            Err(ReservationError::NotEligible)
-        ));
-        let mut reclaimed = retained;
-        reclaimed.reclaim_at(exact, profile).unwrap();
-        assert_eq!(reclaimed.state, ReservationState::Tombstone);
-    }
-
-    #[test]
-    fn retirement_can_jump_sparse_epochs_but_never_crosses_a_live_binding() {
-        let profile = profile();
-        let admitted = admission(46);
-        let mut tombstone = live(&admitted, 5, profile);
-        tombstone
-            .terminalize(&terminal_at(&admitted, 5), profile)
-            .unwrap();
-        tombstone
-            .reclaim_at(aged_maintenance_time(), profile)
-            .unwrap();
-        let previous = IrreversibleHistoryFloor::initial(tombstone.binding).unwrap();
-        let sparse_next = previous.advance_to(5).unwrap();
-        let sparse_records = BTreeMap::from([(tombstone.binding, tombstone.clone())]);
-        let sparse_witness = GlobalChargeWitness::v1(
-            0,
-            0,
-            counters_with_production_floor(
-                validate_production_snapshot(std::slice::from_ref(&tombstone), profile).unwrap(),
-                previous,
-            )
-            .unwrap(),
-        );
-        assert!(prepare_production_retirement(
-            ProductionRetirementPrefix::new(
-                previous,
-                sparse_next,
-                &retirement_selected_prefix(&sparse_records, previous, sparse_next, None),
-                true,
-            )
-            .unwrap(),
-            previous,
-            sparse_next,
-            None,
-            sparse_witness,
-            GlobalChargeBudget::v1(u64::MAX),
-            profile,
-        )
-        .is_ok());
-
-        let live_binding = live(&admitted, 6, profile);
-        let records = BTreeMap::from([
-            (tombstone.binding, tombstone),
-            (live_binding.binding, live_binding),
-        ]);
-        let crossing_witness = GlobalChargeWitness::v1(
-            0,
-            0,
-            counters_with_production_floor(
-                validate_production_snapshot(
-                    &records.values().cloned().collect::<Vec<_>>(),
-                    profile,
-                )
-                .unwrap(),
-                previous,
-            )
-            .unwrap(),
-        );
-        let crossing = previous.advance_to(6).unwrap();
-        assert!(matches!(
-            prepare_production_retirement(
-                ProductionRetirementPrefix::new(
-                    previous,
-                    crossing,
-                    &retirement_selected_prefix(&records, previous, crossing, None),
-                    true,
-                )
-                .unwrap(),
-                previous,
-                crossing,
-                None,
-                crossing_witness,
-                GlobalChargeBudget::v1(u64::MAX),
-                profile,
-            ),
-            Err(ReservationError::FloorAdvance)
-        ));
-    }
-
-    #[test]
-    fn retirement_deletes_every_tombstone_at_its_lowest_epoch_even_above_reclaim_batch() {
-        let profile = profile();
-        let epoch = 7;
-        let mut records = BTreeMap::new();
-        let mut floors = None;
-        for identity in 0..=RECLAIM_BATCH {
-            let admitted = admission(identity as u16);
-            let mut record = live(&admitted, epoch, profile);
-            record
-                .terminalize(&terminal_at(&admitted, epoch), profile)
-                .unwrap();
-            record.reclaim_at(aged_maintenance_time(), profile).unwrap();
-            floors.get_or_insert(IrreversibleHistoryFloor::initial(record.binding).unwrap());
-            records.insert(record.binding, record);
-        }
-        let previous = floors.unwrap();
-        let next = previous.advance_to(epoch).unwrap();
+        let records = BTreeMap::from([(retained.binding, retained)]);
         let witness = GlobalChargeWitness::v1(
             0,
             0,
-            counters_with_production_floor(
-                validate_production_snapshot(
-                    &records.values().cloned().collect::<Vec<_>>(),
-                    profile,
-                )
+            validate_production_snapshot(&records.values().cloned().collect::<Vec<_>>(), profile)
                 .unwrap(),
-                previous,
-            )
-            .unwrap(),
         );
-        let first = prepare_production_retirement(
-            ProductionRetirementPrefix::new(
-                previous,
-                next,
-                &retirement_selected_prefix(&records, previous, next, None),
-                false,
-            )
-            .unwrap(),
-            previous,
-            next,
-            None,
+        let before = prepare_production_reclaim(
+            &records,
+            just_young,
             witness,
             GlobalChargeBudget::v1(u64::MAX),
             profile,
         )
         .unwrap();
-        assert_eq!(first.rows().len(), RECLAIM_BATCH);
-        assert!(first.rows().len() <= RECLAIM_BATCH);
-        assert!(first
-            .partition_range_guard()
-            .is_some_and(|guard| guard.selected().len() <= RECLAIM_BATCH));
-        assert!(first.floor.is_none());
-        let cursor = first
-            .retirement_cursor
-            .as_ref()
-            .and_then(|cas| cas.replacement.clone())
-            .unwrap();
-        for row in first.rows() {
-            records.remove(&row.binding);
-        }
-        let final_batch = prepare_production_retirement(
-            ProductionRetirementPrefix::new(
-                previous,
-                next,
-                &retirement_selected_prefix(&records, previous, next, Some(&cursor)),
-                true,
-            )
-            .unwrap(),
-            previous,
-            next,
-            Some(&cursor),
-            first.next_witness(),
-            GlobalChargeBudget::v1(u64::MAX),
-            profile,
-        )
-        .unwrap();
-        assert_eq!(final_batch.rows().len(), 1);
-        assert!(final_batch.rows().len() <= RECLAIM_BATCH);
-        assert!(final_batch
-            .partition_range_guard()
-            .is_some_and(|guard| guard.selected().len() <= RECLAIM_BATCH));
-        assert!(final_batch.floor.is_some());
-        assert!(final_batch
-            .retirement_cursor
-            .as_ref()
-            .is_some_and(|cas| cas.replacement.is_none()));
-    }
-
-    #[test]
-    fn adapter_rejects_retirement_when_the_prepared_range_omits_a_live_row() {
-        let profile = profile();
-        let tombstone_admission = admission(47);
-        let live_admission = admission(48);
-        let mut tombstone = live(&tombstone_admission, 5, profile);
-        tombstone
-            .terminalize(&terminal_at(&tombstone_admission, 5), profile)
-            .unwrap();
-        tombstone
-            .reclaim_at(aged_maintenance_time(), profile)
-            .unwrap();
-        let live_row = live(&live_admission, 3, profile);
-        let floor = IrreversibleHistoryFloor::initial(tombstone.binding).unwrap();
-        let next = floor.advance_to(5).unwrap();
-        let rows = BTreeMap::from([
-            (tombstone.binding, tombstone.clone()),
-            (live_row.binding, live_row),
-        ]);
-        let witness = GlobalChargeWitness::v1(
-            0,
-            0,
-            counters_with_production_floor(
-                validate_production_snapshot(&rows.values().cloned().collect::<Vec<_>>(), profile)
-                    .unwrap(),
-                floor,
-            )
-            .unwrap(),
-        );
-        let partial = BTreeMap::from([(tombstone.binding, tombstone)]);
-        let transaction = prepare_production_retirement(
-            ProductionRetirementPrefix::new(
-                floor,
-                next,
-                &retirement_selected_prefix(&partial, floor, next, None),
-                true,
-            )
-            .unwrap(),
-            floor,
-            next,
-            None,
+        assert_eq!(before.selected(), 0);
+        let at_boundary = prepare_production_reclaim(
+            &records,
+            exact,
             witness,
             GlobalChargeBudget::v1(u64::MAX),
             profile,
         )
         .unwrap();
-        let mut store = InMemoryProductionStore {
-            rows: rows.clone(),
-            witness,
-            floors: BTreeMap::from([(ProductionFloorKey::from_floor(floor).unwrap(), floor)]),
-            retirement_cursors: BTreeMap::new(),
-            business: None,
-            business_reservation: None,
-            fail_at: None,
-        };
-        assert!(matches!(
-            store.compare_and_apply_production(transaction),
-            Err(ReservationError::SnapshotMismatch)
-        ));
-        assert_eq!(store.rows, rows);
+        assert_eq!(at_boundary.selected(), 1);
         assert_eq!(
-            store.floors.values().copied().collect::<Vec<_>>(),
-            vec![floor]
+            at_boundary.transaction.rows[0]
+                .replacement
+                .as_ref()
+                .expect("compact replacement")
+                .state,
+            ReservationState::Tombstone
         );
-        assert_eq!(store.witness, witness);
-
-        let first_admission = admission(70);
-        let second_admission = admission(71);
-        let mut first = live(&first_admission, 5, profile);
-        let mut second = live(&second_admission, 5, profile);
-        first
-            .terminalize(&terminal_at(&first_admission, 5), profile)
-            .unwrap();
-        second
-            .terminalize(&terminal_at(&second_admission, 5), profile)
-            .unwrap();
-        first.reclaim_at(aged_maintenance_time(), profile).unwrap();
-        second.reclaim_at(aged_maintenance_time(), profile).unwrap();
-        let tombstone_floor = IrreversibleHistoryFloor::initial(first.binding).unwrap();
         assert_eq!(
-            ProductionFloorKey::from_binding(second.binding).unwrap(),
-            ProductionFloorKey::from_floor(tombstone_floor).unwrap()
+            at_boundary
+                .transaction()
+                .next_witness()
+                .roster
+                .retained_and_live_bindings(),
+            0
         );
-        let tombstone_next = tombstone_floor.advance_to(5).unwrap();
-        let all_tombstones = BTreeMap::from([
-            (first.binding, first.clone()),
-            (second.binding, second.clone()),
-        ]);
-        let tombstone_witness = GlobalChargeWitness::v1(
-            0,
-            0,
-            counters_with_production_floor(
-                validate_production_snapshot(
-                    &all_tombstones.values().cloned().collect::<Vec<_>>(),
-                    profile,
-                )
-                .unwrap(),
-                tombstone_floor,
-            )
-            .unwrap(),
+        assert_eq!(
+            at_boundary
+                .transaction()
+                .next_witness()
+                .roster
+                .durable_epoch_bindings(),
+            1
         );
-        let partial_tombstones = BTreeMap::from([(first.binding, first)]);
-        let omitted_tombstone = prepare_production_retirement(
-            ProductionRetirementPrefix::new(
-                tombstone_floor,
-                tombstone_next,
-                &retirement_selected_prefix(
-                    &partial_tombstones,
-                    tombstone_floor,
-                    tombstone_next,
-                    None,
-                ),
-                true,
-            )
-            .unwrap(),
-            tombstone_floor,
-            tombstone_next,
-            None,
-            tombstone_witness,
-            GlobalChargeBudget::v1(u64::MAX),
-            profile,
-        )
-        .unwrap();
-        let mut tombstone_store = InMemoryProductionStore {
-            rows: all_tombstones,
-            witness: tombstone_witness,
-            floors: BTreeMap::from([(
-                ProductionFloorKey::from_floor(tombstone_floor).unwrap(),
-                tombstone_floor,
-            )]),
-            retirement_cursors: BTreeMap::new(),
-            business: None,
-            business_reservation: None,
-            fail_at: None,
-        };
-        assert!(matches!(
-            tombstone_store.compare_and_apply_production(omitted_tombstone),
-            Err(ReservationError::SnapshotMismatch)
-        ));
-    }
-
-    #[test]
-    fn cursor_blocks_admission_and_round_trips_with_its_charge_witness() {
-        let profile = profile();
-        let admitted = admission(49);
-        let mut tombstone = live(&admitted, 4, profile);
-        tombstone
-            .terminalize(&terminal_at(&admitted, 4), profile)
-            .unwrap();
-        tombstone
-            .reclaim_at(aged_maintenance_time(), profile)
-            .unwrap();
-        let floor = IrreversibleHistoryFloor::initial(tombstone.binding).unwrap();
-        let cursor =
-            ProductionRetirementCursor::initial(ProductionFloorKey::from_floor(floor).unwrap(), 4)
-                .unwrap();
-        let counters = counters_with_retirement_cursor(
-            counters_with_production_floor(
-                validate_production_snapshot(std::slice::from_ref(&tombstone), profile).unwrap(),
-                floor,
-            )
-            .unwrap(),
-            &cursor,
-        )
-        .unwrap();
-        let witness = GlobalChargeWitness::v1(0, 0, counters);
-        let snapshot = ProductionSnapshot::new(
-            vec![tombstone],
-            vec![floor],
-            vec![cursor.clone()],
-            witness,
-            GlobalChargeBudget::v1(u64::MAX),
-            profile,
-        )
-        .unwrap();
-        let bytes = snapshot.to_canonical_bytes().unwrap();
-        let restored = ProductionSnapshot::from_canonical_bytes(
-            &bytes,
-            GlobalChargeBudget::v1(u64::MAX),
-            profile,
-        )
-        .unwrap();
-        assert_eq!(restored.retirement_cursors(), std::slice::from_ref(&cursor));
-
-        let blocked = live(&admitted, 4, profile);
-        assert!(matches!(
-            prepare_production_admission(
-                None,
-                blocked,
-                Some(floor),
-                Some(&cursor),
-                witness,
-                GlobalChargeBudget::v1(u64::MAX),
-                profile,
-            ),
-            Err(ReservationError::FloorAdvance)
-        ));
     }
 
     #[test]
@@ -1741,6 +1697,66 @@ mod production_tests {
             ),
             Err(ReservationError::CanonicalEncoding)
         ));
+    }
+
+    #[test]
+    fn restart_snapshot_rejects_a_present_terminal_at_or_below_global_closure() {
+        let profile = profile();
+        let admitted = admission(45);
+        let mut tombstone = live(&admitted, 7, profile);
+        tombstone
+            .terminalize(&terminal_at(&admitted, 7), profile)
+            .expect("terminalize fixture");
+        tombstone
+            .reclaim_at(aged_maintenance_time(), profile)
+            .expect("compact fixture");
+        let floor = IrreversibleHistoryFloor::initial(tombstone.binding).expect("fixture floor");
+        let counters = counters_with_production_floor(
+            validate_production_snapshot(std::slice::from_ref(&tombstone), profile)
+                .expect("fixture counters"),
+            floor,
+        )
+        .expect("fixture floor counters");
+        let witness = GlobalChargeWitness::v1(0, 0, counters);
+        validate_production_snapshot_with_floors(
+            std::slice::from_ref(&tombstone),
+            &[floor],
+            &[],
+            witness,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .expect("unclosed tombstone snapshot");
+        let closed_with_present_row = witness
+            .retired_through_terminal_sequence_for_test(
+                tombstone.terminal_sequence().expect("terminal sequence"),
+            )
+            .expect("closure witness");
+        assert!(matches!(
+            validate_production_snapshot_with_floors(
+                std::slice::from_ref(&tombstone),
+                &[floor],
+                &[],
+                closed_with_present_row,
+                GlobalChargeBudget::v1(u64::MAX),
+                profile,
+            ),
+            Err(ReservationError::SnapshotMismatch)
+        ));
+        let closed_empty = GlobalChargeWitness::v1(0, 0, zero_counters())
+            .retired_through_terminal_sequence_for_test(
+                tombstone.terminal_sequence().expect("terminal sequence"),
+            )
+            .expect("empty closure witness");
+        validate_production_snapshot_with_floors(
+            &[],
+            &[],
+            &[],
+            closed_empty,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .expect("closed empty snapshot");
     }
 
     #[test]
@@ -1910,26 +1926,8 @@ impl GlobalChargeBudget {
     /// not a SQLite-file, global-store, allocator, or physical-snapshot cap.
     pub(crate) const fn production() -> Self {
         Self {
-            version: GLOBAL_CHARGE_WITNESS_V1,
+            version: GLOBAL_CHARGE_WITNESS_VERSION,
             maximum_total_charge_bytes: PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES,
-        }
-    }
-
-    /// Decode a production budget claimed by a legacy caller.
-    ///
-    /// Kept source-compatible for callers that previously supplied the same
-    /// profile constant. Production validation rejects every value other than
-    /// [`PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES`]; new callers should use
-    /// [`Self::production`].
-    #[cfg(not(test))]
-    pub(crate) const fn v1(maximum_total_charge_bytes: u64) -> Self {
-        if maximum_total_charge_bytes == PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES {
-            Self::production()
-        } else {
-            Self {
-                version: GLOBAL_CHARGE_WITNESS_V1,
-                maximum_total_charge_bytes,
-            }
         }
     }
 
@@ -1937,14 +1935,14 @@ impl GlobalChargeBudget {
     #[cfg(test)]
     pub(crate) const fn v1(maximum_total_charge_bytes: u64) -> Self {
         Self {
-            version: GLOBAL_CHARGE_WITNESS_V1,
+            version: GLOBAL_CHARGE_WITNESS_VERSION,
             maximum_total_charge_bytes,
         }
     }
 
     /// Validate the immutable production profile independently of test seams.
     fn validate_frozen_profile(self) -> Result<(), ReservationError> {
-        if self.version != GLOBAL_CHARGE_WITNESS_V1 {
+        if self.version != GLOBAL_CHARGE_WITNESS_VERSION {
             return Err(ReservationError::UnknownWitnessVersion);
         }
         if self.maximum_total_charge_bytes != PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES {
@@ -1954,7 +1952,7 @@ impl GlobalChargeBudget {
     }
 
     fn validate(self) -> Result<(), ReservationError> {
-        if self.version != GLOBAL_CHARGE_WITNESS_V1 {
+        if self.version != GLOBAL_CHARGE_WITNESS_VERSION {
             return Err(ReservationError::UnknownWitnessVersion);
         }
         #[cfg(not(test))]
@@ -1983,6 +1981,11 @@ pub(crate) struct GlobalChargeWitness {
     fixed_roster_metadata_charge_bytes: u64,
     reserved_roster_auxiliary_charge_bytes: u64,
     roster: AggregateCounters,
+    /// The greatest globally ordered terminal consensus sequence whose
+    /// compact tombstone has been deterministically retired. Sequence zero
+    /// denotes no retired terminal history; committed terminal sequences are
+    /// always positive.
+    retired_terminal_sequence: u64,
 }
 
 impl GlobalChargeWitness {
@@ -1991,23 +1994,28 @@ impl GlobalChargeWitness {
         Self::v1(0, 0, zero_counters())
     }
 
-    /// Construct a V1 witness from fixed roster-only metadata and rows.
+    /// Construct the current witness from fixed roster-only metadata and rows.
+    ///
+    /// The legacy `v1` constructor name is retained for the internal callers
+    /// that build the fixed charge projection; the encoded witness is the
+    /// current version and starts with an empty terminal-history closure.
     pub(crate) const fn v1(
         fixed_roster_metadata_charge_bytes: u64,
         reserved_roster_auxiliary_charge_bytes: u64,
         roster: AggregateCounters,
     ) -> Self {
         Self {
-            version: GLOBAL_CHARGE_WITNESS_V1,
+            version: GLOBAL_CHARGE_WITNESS_VERSION,
             fixed_roster_metadata_charge_bytes,
             reserved_roster_auxiliary_charge_bytes,
             roster,
+            retired_terminal_sequence: 0,
         }
     }
 
     fn validate_for(self, budget: GlobalChargeBudget) -> Result<(), ReservationError> {
         budget.validate()?;
-        if self.version != GLOBAL_CHARGE_WITNESS_V1 {
+        if self.version != GLOBAL_CHARGE_WITNESS_VERSION {
             return Err(ReservationError::UnknownWitnessVersion);
         }
         self.total_charge_bytes()?;
@@ -2016,6 +2024,35 @@ impl GlobalChargeWitness {
 
     fn with_roster(self, roster: AggregateCounters) -> Self {
         Self { roster, ..self }
+    }
+
+    /// Return the authenticated terminal-history closure horizon.
+    pub(crate) const fn retired_terminal_sequence(self) -> u64 {
+        self.retired_terminal_sequence
+    }
+
+    /// Advance the closure only from deterministic terminal-history
+    /// maintenance.  Admission, terminalization, and payload reclaim carry
+    /// the witness unchanged.
+    fn retire_through_terminal_sequence(self, sequence: u64) -> Result<Self, ReservationError> {
+        if sequence == 0 || sequence <= self.retired_terminal_sequence {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        Ok(Self {
+            retired_terminal_sequence: sequence,
+            ..self
+        })
+    }
+
+    /// Test-only constructor for authenticated snapshots that have already
+    /// completed a deterministic terminal-history closure. Production code
+    /// can advance this field only through the guarded maintenance planner.
+    #[cfg(test)]
+    pub(crate) fn retired_through_terminal_sequence_for_test(
+        self,
+        sequence: u64,
+    ) -> Result<Self, ReservationError> {
+        self.retire_through_terminal_sequence(sequence)
     }
 
     /// Return the checked aggregate charge across this complete roster ledger.
@@ -2071,6 +2108,25 @@ const MAX_BUSINESS_SESSION_COPY_BYTES: usize =
 /// schema-charge components below.
 const MAX_TERMINAL_EVIDENCE_ENVELOPE_BYTES: usize =
     MAX_EXECUTOR_PROOF_BUNDLE_BYTES + 16 + MAX_ROSTER_INGRESS_ATTESTATION_BYTES;
+
+/// The root-verifiable admission provenance and direct per-member terminal
+/// evidence are retained with a terminal row through its fixed retention
+/// interval. They are charged as a fixed 2048 + 8192 byte component,
+/// independent of the raw admission, terminal, proof, and ingress bytes.
+const MAX_COMPACT_PROVENANCE_BYTES: usize =
+    MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES + MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES;
+
+/// The frozen page-rounded maximum for one terminal tombstone snapshot row.
+/// Derive it from the same evidence and codec bounds charged below so
+/// strengthening a bounded proof cannot make every otherwise-valid admission
+/// fail during its pre-effect capacity reservation.
+const MAX_TOMBSTONE_UNROUNDED_CHARGE_BYTES: u64 = STORAGE_CHARGE_TOMBSTONE_ROW_BYTES
+    + STORAGE_CHARGE_TOMBSTONE_INDEX_BYTES
+    + MAX_TOMBSTONE_CODEC_BYTES as u64
+    + MAX_COMPACT_PROVENANCE_BYTES as u64;
+const MAX_TOMBSTONE_CHARGE_BYTES: u64 = MAX_TOMBSTONE_UNROUNDED_CHARGE_BYTES
+    .div_ceil(STORAGE_CHARGE_PAGE_BYTES)
+    * STORAGE_CHARGE_PAGE_BYTES;
 
 /// Fixed, versioned schema charge parameters.
 ///
@@ -2139,7 +2195,7 @@ impl ChargeProfile {
             self.live_row_bytes,
             self.live_index_bytes,
             as_u64(components.canonical_admission_bytes)?,
-            0,
+            as_u64(components.compact_provenance_bytes)?,
         )?)?;
         let retained = self.page_round(add4(
             self.retained_row_bytes,
@@ -2149,14 +2205,23 @@ impl ChargeProfile {
                 as_u64(components.terminal_record_bytes)?,
                 as_u64(components.business_session_copy_bytes)?,
                 as_u64(components.composite_receipt_bytes)?,
-                as_u64(components.terminal_evidence_envelope_bytes)?,
+                add2(
+                    as_u64(components.terminal_evidence_envelope_bytes)?,
+                    as_u64(components.compact_provenance_bytes)?,
+                )?,
             )?,
         )?)?;
         let tombstone = self.page_round(add3(
             self.tombstone_row_bytes,
             self.tombstone_index_bytes,
-            as_u64(components.tombstone_bytes)?,
+            add2(
+                as_u64(components.tombstone_bytes)?,
+                as_u64(components.compact_provenance_bytes)?,
+            )?,
         )?)?;
+        if self == Self::v1() && tombstone > MAX_TOMBSTONE_CHARGE_BYTES {
+            return Err(ReservationError::ComponentBounds);
+        }
         let peak = live.max(retained);
         Ok(Charges {
             live,
@@ -2197,10 +2262,12 @@ pub(crate) struct ComponentBytes {
     business_session_copy_bytes: usize,
     composite_receipt_bytes: usize,
     terminal_evidence_envelope_bytes: usize,
+    compact_provenance_bytes: usize,
     tombstone_bytes: usize,
 }
 
 impl ComponentBytes {
+    #[cfg(test)]
     fn from_exact(
         canonical_admission_bytes: usize,
         terminal_record_bytes: usize,
@@ -2209,12 +2276,33 @@ impl ComponentBytes {
         terminal_evidence_envelope_bytes: usize,
         tombstone_bytes: usize,
     ) -> Result<Self, ReservationError> {
+        Self::from_exact_with_compact(
+            canonical_admission_bytes,
+            terminal_record_bytes,
+            business_session_copy_bytes,
+            composite_receipt_bytes,
+            terminal_evidence_envelope_bytes,
+            0,
+            tombstone_bytes,
+        )
+    }
+
+    fn from_exact_with_compact(
+        canonical_admission_bytes: usize,
+        terminal_record_bytes: usize,
+        business_session_copy_bytes: usize,
+        composite_receipt_bytes: usize,
+        terminal_evidence_envelope_bytes: usize,
+        compact_provenance_bytes: usize,
+        tombstone_bytes: usize,
+    ) -> Result<Self, ReservationError> {
         let result = Self {
             canonical_admission_bytes,
             terminal_record_bytes,
             business_session_copy_bytes,
             composite_receipt_bytes,
             terminal_evidence_envelope_bytes,
+            compact_provenance_bytes,
             tombstone_bytes,
         };
         result.validate()?;
@@ -2227,6 +2315,7 @@ impl ComponentBytes {
             || self.business_session_copy_bytes > MAX_BUSINESS_SESSION_COPY_BYTES
             || self.composite_receipt_bytes > MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES
             || self.terminal_evidence_envelope_bytes > MAX_TERMINAL_EVIDENCE_ENVELOPE_BYTES
+            || self.compact_provenance_bytes > MAX_COMPACT_PROVENANCE_BYTES
             || self.tombstone_bytes > MAX_TOMBSTONE_CODEC_BYTES
         {
             return Err(ReservationError::ComponentBounds);
@@ -2248,7 +2337,7 @@ pub(crate) enum ReservationState {
     Live,
     /// Terminal material is retained exactly through its retention interval.
     Retained,
-    /// The compact conflict tombstone remains until irreversible retirement.
+    /// Compact conflict evidence awaiting bounded irreversible epoch retirement.
     Tombstone,
 }
 
@@ -2348,9 +2437,18 @@ impl fmt::Debug for ConsensusMaintenanceTimestamp {
 pub(crate) struct ProductionReservationRecord {
     binding: RequestBindingKey,
     admission: Vec<u8>,
+    admission_ingress: Vec<u8>,
+    admission_provenance: Vec<u8>,
     terminal: Option<Vec<u8>>,
+    terminal_proof_bundle: Option<Vec<u8>>,
+    terminal_ingress: Option<Vec<u8>>,
+    terminal_evidence: Option<Vec<u8>>,
     tombstone: Option<Vec<u8>>,
     terminalized_at: Option<ConsensusMaintenanceTimestamp>,
+    /// Exact globally monotonic sequence from the authenticated committed
+    /// terminal.  It is absent for live rows, checked against the retained
+    /// frame, and carried unchanged into the compact tombstone.
+    terminal_sequence: Option<u64>,
     business_reservation: Option<ProductionAdmissionBusinessReservation>,
     state: ReservationState,
     peak_charge_bytes: u64,
@@ -2369,30 +2467,61 @@ pub(crate) struct HydratedProductionReservationRecord {
 }
 
 /// Decoded payload retained by one validated production roster row.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub(crate) enum HydratedProductionReservationPayload {
     Live {
         admission: Admission,
+        #[expect(
+            dead_code,
+            reason = "retained after canonical hydration for recovery-time ingress revalidation"
+        )]
+        admission_ingress: RosterIngressAttestationV1,
+        admission_provenance: RosterCompactAdmissionProvenanceV2,
     },
     Retained {
         admission: Admission,
+        #[expect(
+            dead_code,
+            reason = "retained after canonical hydration for recovery-time ingress revalidation"
+        )]
+        admission_ingress: RosterIngressAttestationV1,
+        admission_provenance: RosterCompactAdmissionProvenanceV2,
         committed_terminal: Box<CommittedTerminal>,
         committed_canonical: Vec<u8>,
+        #[expect(
+            dead_code,
+            reason = "retained after canonical hydration for recovery-time executor-proof revalidation"
+        )]
+        terminal_proof_bundle: RosterExecutorProofBundleV1,
+        #[expect(
+            dead_code,
+            reason = "retained after canonical hydration for recovery-time ingress revalidation"
+        )]
+        terminal_ingress: RosterIngressAttestationV1,
+        terminal_evidence: RosterCompactTerminalEvidenceV2,
     },
     Tombstone {
         tombstone: TerminalConflictTombstone,
+        admission_provenance: RosterCompactAdmissionProvenanceV2,
+        terminal_evidence: RosterCompactTerminalEvidenceV2,
+        #[expect(
+            dead_code,
+            reason = "retained for legacy tombstone snapshot validation"
+        )]
+        terminalized_at: ConsensusMaintenanceTimestamp,
     },
+    /// Rootless fixture state exists only in crate tests. Production does not
+    /// compile its constructors or this variant, so durable recovery always
+    /// requires the root-verifiable V2 evidence above.
+    #[cfg(test)]
+    Legacy,
 }
 
 impl HydratedProductionReservationRecord {
     /// Return the validated durable row projection.
     pub(crate) const fn record(&self) -> &ProductionReservationRecord {
         &self.record
-    }
-
-    /// Return the exact canonical row bytes read from durable storage.
-    pub(crate) fn canonical_bytes(&self) -> &[u8] {
-        &self.canonical
     }
 
     /// Return the decoded payload that was validated with this row.
@@ -2423,9 +2552,17 @@ impl<'de> Deserialize<'de> for ProductionReservationRecord {
         struct Wire {
             binding: RequestBindingKey,
             admission: BoundedSnapshotBytes<MAX_ADMISSION_CODEC_BYTES>,
+            admission_ingress: BoundedSnapshotBytes<MAX_ROSTER_INGRESS_ATTESTATION_BYTES>,
+            admission_provenance:
+                BoundedSnapshotBytes<MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES>,
             terminal: Option<BoundedSnapshotBytes<MAX_COMMITTED_TERMINAL_CODEC_BYTES>>,
+            terminal_proof_bundle: Option<BoundedSnapshotBytes<MAX_EXECUTOR_PROOF_BUNDLE_BYTES>>,
+            terminal_ingress: Option<BoundedSnapshotBytes<MAX_ROSTER_INGRESS_ATTESTATION_BYTES>>,
+            terminal_evidence:
+                Option<BoundedSnapshotBytes<MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES>>,
             tombstone: Option<BoundedSnapshotBytes<MAX_TOMBSTONE_CODEC_BYTES>>,
             terminalized_at: Option<ConsensusMaintenanceTimestamp>,
+            terminal_sequence: Option<u64>,
             business_reservation: Option<ProductionAdmissionBusinessReservation>,
             state: ReservationState,
             peak_charge_bytes: u64,
@@ -2436,9 +2573,15 @@ impl<'de> Deserialize<'de> for ProductionReservationRecord {
         Ok(Self {
             binding: wire.binding,
             admission: wire.admission.0,
+            admission_ingress: wire.admission_ingress.0,
+            admission_provenance: wire.admission_provenance.0,
             terminal: wire.terminal.map(|value| value.0),
+            terminal_proof_bundle: wire.terminal_proof_bundle.map(|value| value.0),
+            terminal_ingress: wire.terminal_ingress.map(|value| value.0),
+            terminal_evidence: wire.terminal_evidence.map(|value| value.0),
             tombstone: wire.tombstone.map(|value| value.0),
             terminalized_at: wire.terminalized_at,
+            terminal_sequence: wire.terminal_sequence,
             business_reservation: wire.business_reservation,
             state: wire.state,
             peak_charge_bytes: wire.peak_charge_bytes,
@@ -2497,6 +2640,12 @@ impl ProductionReservationRecord {
         self.terminalized_at
     }
 
+    /// Return the globally ordered terminal sequence carried by terminal
+    /// history. Live rows deliberately have no terminal sequence.
+    pub(crate) const fn terminal_sequence(&self) -> Option<u64> {
+        self.terminal_sequence
+    }
+
     /// Return the exact business-key reservation carried only by a live row.
     /// SQLite restart and snapshot validation compare this projection with
     /// the separate exclusion table; it is never an enumeration surface.
@@ -2529,8 +2678,8 @@ impl ProductionReservationRecord {
             .map_err(|_| ReservationError::CanonicalEncoding)
     }
 
-    /// Rehydrate the exact compact conflict evidence retained after terminal
-    /// payload reclamation. Non-tombstone rows return `None`; a malformed or
+    /// Rehydrate exact compact conflict evidence from a legacy tombstone
+    /// snapshot row. Non-tombstone rows return `None`; a malformed or
     /// binding-mismatched tombstone fails closed instead of being exposed as
     /// conclusive history.
     pub(crate) fn tombstone(&self) -> Result<Option<TerminalConflictTombstone>, ReservationError> {
@@ -2553,7 +2702,60 @@ impl ProductionReservationRecord {
         Ok(Some(tombstone))
     }
 
-    /// Build a live durable record from one SDK-authenticated admission.
+    /// Build the production live row from exact root-certified ingress and
+    /// compact admission provenance. The raw ingress is retained only until
+    /// fixed-duration reclaim; the compact proof survives all later states.
+    pub(crate) fn live_with_provenance_and_ingress(
+        admission: &Admission,
+        admission_ingress: &RosterIngressAttestationV1,
+        admission_provenance: &RosterCompactAdmissionProvenanceV2,
+        epoch: u64,
+        business_reservation: ProductionAdmissionBusinessReservation,
+        profile: ChargeProfile,
+    ) -> Result<Self, ReservationError> {
+        validate_epoch(epoch)?;
+        let admission_bytes = admission
+            .to_canonical_bytes()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let admission_ingress = admission_ingress
+            .canonical_bytes()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let admission_provenance = admission_provenance
+            .canonical_bytes()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let binding = admission
+            .binding_key(epoch)
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let charges = profile.charge(production_components(
+            &admission_bytes,
+            None,
+            None,
+            MAX_COMPACT_PROVENANCE_BYTES,
+        )?)?;
+        business_reservation.validate_for(admission)?;
+        Ok(Self {
+            binding,
+            admission: admission_bytes,
+            admission_ingress,
+            admission_provenance,
+            terminal: None,
+            terminal_proof_bundle: None,
+            terminal_ingress: None,
+            terminal_evidence: None,
+            tombstone: None,
+            terminalized_at: None,
+            terminal_sequence: None,
+            business_reservation: Some(business_reservation),
+            state: ReservationState::Live,
+            peak_charge_bytes: charges.peak,
+            retained_charge_bytes: charges.retained,
+            tombstone_charge_bytes: charges.tombstone,
+        })
+    }
+
+    /// Build a test-only legacy row. It is rejected in every production
+    /// decode/write path, so no rootless V1 row can activate this profile.
+    #[cfg(test)]
     pub(crate) fn live(
         admission: &Admission,
         epoch: u64,
@@ -2567,14 +2769,20 @@ impl ProductionReservationRecord {
         let binding = admission
             .binding_key(epoch)
             .map_err(|_| ReservationError::CanonicalEncoding)?;
-        let charges = profile.charge(production_components(&admission_bytes, None, None)?)?;
+        let charges = profile.charge(production_components(&admission_bytes, None, None, 0)?)?;
         business_reservation.validate_for(admission)?;
         Ok(Self {
             binding,
             admission: admission_bytes,
+            admission_ingress: Vec::new(),
+            admission_provenance: Vec::new(),
             terminal: None,
+            terminal_proof_bundle: None,
+            terminal_ingress: None,
+            terminal_evidence: None,
             tombstone: None,
             terminalized_at: None,
+            terminal_sequence: None,
             business_reservation: Some(business_reservation),
             state: ReservationState::Live,
             peak_charge_bytes: charges.peak,
@@ -2583,17 +2791,34 @@ impl ProductionReservationRecord {
         })
     }
 
-    /// Consume the pre-reserved admission peak using an exact terminal frame.
+    /// Test-only legacy terminal transition. Production requires the exact
+    /// compact evidence and both original raw proof materials above.
+    #[cfg(test)]
     pub(crate) fn terminalize(
         &mut self,
         terminal: &CommittedTerminal,
         profile: ChargeProfile,
     ) -> Result<(), ReservationError> {
+        let admission = Admission::from_canonical_bytes(&self.admission)
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        self.terminalize_with_hydrated_admission(&admission, terminal, None, None, None, profile)
+    }
+
+    /// Terminalize from the decoded admission retained by an authenticated
+    /// hydration. This is intentionally private: the production terminal
+    /// path receives its admission only from an authenticated hydration.
+    fn terminalize_with_hydrated_admission(
+        &mut self,
+        admission: &Admission,
+        terminal: &CommittedTerminal,
+        proof_bundle: Option<&RosterExecutorProofBundleV1>,
+        terminal_ingress: Option<&RosterIngressAttestationV1>,
+        terminal_evidence: Option<&RosterCompactTerminalEvidenceV2>,
+        profile: ChargeProfile,
+    ) -> Result<(), ReservationError> {
         if self.state != ReservationState::Live {
             return Err(ReservationError::InvalidState);
         }
-        let admission = Admission::from_canonical_bytes(&self.admission)
-            .map_err(|_| ReservationError::CanonicalEncoding)?;
         if admission
             .binding_key(self.binding.history_epoch())
             .map_err(|_| ReservationError::CanonicalEncoding)?
@@ -2603,24 +2828,71 @@ impl ProductionReservationRecord {
             return Err(ReservationError::SnapshotMismatch);
         }
         let terminal_bytes = terminal
-            .to_canonical_bytes(&admission)
+            .to_canonical_bytes(admission)
             .map_err(|_| ReservationError::CanonicalEncoding)?;
-        let live = profile.charge(production_components(&self.admission, None, None)?)?;
+        let compact_bytes = match (&self.admission_provenance[..], terminal_evidence) {
+            (admission_provenance, Some(terminal_evidence)) if !admission_provenance.is_empty() => {
+                let compact = terminal_evidence
+                    .canonical_bytes()
+                    .map_err(|_| ReservationError::CanonicalEncoding)?;
+                terminal_evidence
+                    .verify_raw_terminal(admission, terminal.record())
+                    .map_err(|_| ReservationError::CanonicalEncoding)?;
+                admission_provenance
+                    .len()
+                    .checked_add(compact.len())
+                    .ok_or(ReservationError::Arithmetic)?
+            }
+            _ if cfg!(test)
+                && self.admission_provenance.is_empty()
+                && proof_bundle.is_none()
+                && terminal_ingress.is_none()
+                && terminal_evidence.is_none() =>
+            {
+                0
+            }
+            _ => return Err(ReservationError::StateShape),
+        };
+        let live = profile.charge(production_components(
+            &self.admission,
+            None,
+            None,
+            if self.admission_provenance.is_empty() {
+                0
+            } else {
+                MAX_COMPACT_PROVENANCE_BYTES
+            },
+        )?)?;
         let retained = profile.charge(production_components(
             &self.admission,
             Some(&terminal_bytes),
             None,
+            compact_bytes,
         )?)?;
         if self.peak_charge_bytes != live.peak || retained.retained > self.peak_charge_bytes {
             return Err(ReservationError::SnapshotMismatch);
         }
         self.terminal = Some(terminal_bytes);
+        self.terminal_proof_bundle = proof_bundle
+            .map(RosterExecutorProofBundleV1::canonical_bytes)
+            .transpose()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        self.terminal_ingress = terminal_ingress
+            .map(RosterIngressAttestationV1::canonical_bytes)
+            .transpose()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        self.terminal_evidence = terminal_evidence
+            .map(RosterCompactTerminalEvidenceV2::canonical_bytes)
+            .transpose()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
         self.terminalized_at = Some(ConsensusMaintenanceTimestamp::from_consensus_timestamp(
             terminal.commit_metadata().committed_at(),
         )?);
+        self.terminal_sequence = Some(terminal.terminal_sequence());
         self.business_reservation = None;
         self.state = ReservationState::Retained;
         self.retained_charge_bytes = retained.retained;
+        self.tombstone_charge_bytes = retained.tombstone;
         Ok(())
     }
 
@@ -2638,12 +2910,18 @@ impl ProductionReservationRecord {
         validate_epoch(self.binding.history_epoch())?;
         if self.state == ReservationState::Tombstone {
             if !self.admission.is_empty()
+                || !self.admission_ingress.is_empty()
                 || self.terminal.is_some()
-                || self.terminalized_at.is_some()
+                || self.terminal_proof_bundle.is_some()
+                || self.terminal_ingress.is_some()
                 || self.business_reservation.is_some()
             {
                 return Err(ReservationError::StateShape);
             }
+            let terminalized_at = self.terminalized_at.ok_or(ReservationError::StateShape)?;
+            self.terminal_sequence
+                .filter(|sequence| *sequence > 0)
+                .ok_or(ReservationError::StateShape)?;
             let tombstone = self
                 .tombstone
                 .as_deref()
@@ -2653,12 +2931,51 @@ impl ProductionReservationRecord {
             if decoded.binding_key() != self.binding {
                 return Err(ReservationError::SnapshotMismatch);
             }
-            let charges = profile.charge(production_components(&[], None, Some(tombstone))?)?;
+            #[cfg(test)]
+            if self.admission_provenance.is_empty() && self.terminal_evidence.is_none() {
+                let charges =
+                    profile.charge(production_components(&[], None, Some(tombstone), 0)?)?;
+                return if self.peak_charge_bytes == 0
+                    && self.retained_charge_bytes == 0
+                    && self.tombstone_charge_bytes == charges.tombstone
+                {
+                    Ok(HydratedProductionReservationPayload::Legacy)
+                } else {
+                    Err(ReservationError::SnapshotMismatch)
+                };
+            }
+            let admission_provenance =
+                RosterCompactAdmissionProvenanceV2::decode_canonical(&self.admission_provenance)
+                    .map_err(|_| ReservationError::CanonicalEncoding)?;
+            let terminal_evidence = self
+                .terminal_evidence
+                .as_deref()
+                .ok_or(ReservationError::StateShape)
+                .and_then(|bytes| {
+                    RosterCompactTerminalEvidenceV2::decode_canonical(bytes)
+                        .map_err(|_| ReservationError::CanonicalEncoding)
+                })?;
+            let compact_bytes = self
+                .admission_provenance
+                .len()
+                .checked_add(self.terminal_evidence.as_ref().map_or(0, Vec::len))
+                .ok_or(ReservationError::Arithmetic)?;
+            let charges = profile.charge(production_components(
+                &[],
+                None,
+                Some(tombstone),
+                compact_bytes,
+            )?)?;
             return if self.peak_charge_bytes == 0
                 && self.retained_charge_bytes == 0
                 && self.tombstone_charge_bytes == charges.tombstone
             {
-                Ok(HydratedProductionReservationPayload::Tombstone { tombstone: decoded })
+                Ok(HydratedProductionReservationPayload::Tombstone {
+                    tombstone: decoded,
+                    admission_provenance,
+                    terminal_evidence,
+                    terminalized_at,
+                })
             } else {
                 Err(ReservationError::SnapshotMismatch)
             };
@@ -2672,6 +2989,24 @@ impl ProductionReservationRecord {
         {
             return Err(ReservationError::SnapshotMismatch);
         }
+        let legacy =
+            cfg!(test) && self.admission_ingress.is_empty() && self.admission_provenance.is_empty();
+        let admission_ingress = if legacy {
+            None
+        } else {
+            Some(
+                RosterIngressAttestationV1::decode_canonical(&self.admission_ingress)
+                    .map_err(|_| ReservationError::CanonicalEncoding)?,
+            )
+        };
+        let admission_provenance = if legacy {
+            None
+        } else {
+            Some(
+                RosterCompactAdmissionProvenanceV2::decode_canonical(&self.admission_provenance)
+                    .map_err(|_| ReservationError::CanonicalEncoding)?,
+            )
+        };
         match self.state {
             ReservationState::Live => self
                 .business_reservation
@@ -2684,16 +3019,41 @@ impl ProductionReservationRecord {
         match self.state {
             ReservationState::Live
                 if self.terminal.is_none()
+                    && self.terminal_proof_bundle.is_none()
+                    && self.terminal_ingress.is_none()
+                    && self.terminal_evidence.is_none()
                     && self.tombstone.is_none()
-                    && self.terminalized_at.is_none() =>
+                    && self.terminalized_at.is_none()
+                    && self.terminal_sequence.is_none() =>
             {
-                let charges =
-                    profile.charge(production_components(&self.admission, None, None)?)?;
+                #[cfg(test)]
+                if legacy {
+                    return Ok(HydratedProductionReservationPayload::Legacy);
+                }
+                let charges = profile.charge(production_components(
+                    &self.admission,
+                    None,
+                    None,
+                    if legacy {
+                        0
+                    } else {
+                        MAX_COMPACT_PROVENANCE_BYTES
+                    },
+                )?)?;
                 if self.peak_charge_bytes == charges.peak
                     && self.retained_charge_bytes == charges.retained
                     && self.tombstone_charge_bytes == charges.tombstone
                 {
-                    Ok(HydratedProductionReservationPayload::Live { admission })
+                    match (admission_ingress, admission_provenance) {
+                        (Some(admission_ingress), Some(admission_provenance)) => {
+                            Ok(HydratedProductionReservationPayload::Live {
+                                admission,
+                                admission_ingress,
+                                admission_provenance,
+                            })
+                        }
+                        _ => Err(ReservationError::StateShape),
+                    }
                 } else {
                     Err(ReservationError::SnapshotMismatch)
                 }
@@ -2710,27 +3070,100 @@ impl ProductionReservationRecord {
                 if decoded.record().request_id().history_epoch() != self.binding.history_epoch() {
                     return Err(ReservationError::SnapshotMismatch);
                 }
+                if self.terminal_sequence != Some(decoded.terminal_sequence()) {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
                 let committed_at = ConsensusMaintenanceTimestamp::from_consensus_timestamp(
                     decoded.commit_metadata().committed_at(),
                 )?;
                 if self.terminalized_at != Some(committed_at) {
                     return Err(ReservationError::SnapshotMismatch);
                 }
-                let live = profile.charge(production_components(&self.admission, None, None)?)?;
+                #[cfg(test)]
+                if legacy {
+                    return Ok(HydratedProductionReservationPayload::Legacy);
+                }
+                let proof_bundle = self
+                    .terminal_proof_bundle
+                    .as_deref()
+                    .map(RosterExecutorProofBundleV1::decode_canonical)
+                    .transpose()
+                    .map_err(|_| ReservationError::CanonicalEncoding)?;
+                let terminal_ingress = self
+                    .terminal_ingress
+                    .as_deref()
+                    .map(RosterIngressAttestationV1::decode_canonical)
+                    .transpose()
+                    .map_err(|_| ReservationError::CanonicalEncoding)?;
+                let terminal_evidence = self
+                    .terminal_evidence
+                    .as_deref()
+                    .map(RosterCompactTerminalEvidenceV2::decode_canonical)
+                    .transpose()
+                    .map_err(|_| ReservationError::CanonicalEncoding)?;
+                let compact_bytes = match (&admission_provenance, &terminal_evidence) {
+                    (Some(_), Some(_)) => self
+                        .admission_provenance
+                        .len()
+                        .checked_add(self.terminal_evidence.as_ref().map_or(0, Vec::len))
+                        .ok_or(ReservationError::Arithmetic)?,
+                    (None, None)
+                        if legacy && proof_bundle.is_none() && terminal_ingress.is_none() =>
+                    {
+                        0
+                    }
+                    _ => return Err(ReservationError::StateShape),
+                };
+                if let Some(evidence) = terminal_evidence.as_ref() {
+                    evidence
+                        .verify_raw_terminal(&admission, decoded.record())
+                        .map_err(|_| ReservationError::CanonicalEncoding)?;
+                }
+                let live = profile.charge(production_components(
+                    &self.admission,
+                    None,
+                    None,
+                    if legacy {
+                        0
+                    } else {
+                        MAX_COMPACT_PROVENANCE_BYTES
+                    },
+                )?)?;
                 let retained = profile.charge(production_components(
                     &self.admission,
                     Some(terminal),
                     None,
+                    compact_bytes,
                 )?)?;
                 if self.peak_charge_bytes == live.peak
                     && self.retained_charge_bytes == retained.retained
                     && self.tombstone_charge_bytes == retained.tombstone
                 {
-                    Ok(HydratedProductionReservationPayload::Retained {
-                        admission,
-                        committed_terminal: Box::new(decoded),
-                        committed_canonical: terminal.to_vec(),
-                    })
+                    match (
+                        admission_ingress,
+                        admission_provenance,
+                        proof_bundle,
+                        terminal_ingress,
+                        terminal_evidence,
+                    ) {
+                        (
+                            Some(admission_ingress),
+                            Some(admission_provenance),
+                            Some(terminal_proof_bundle),
+                            Some(terminal_ingress),
+                            Some(terminal_evidence),
+                        ) => Ok(HydratedProductionReservationPayload::Retained {
+                            admission,
+                            admission_ingress,
+                            admission_provenance,
+                            committed_terminal: Box::new(decoded),
+                            committed_canonical: terminal.to_vec(),
+                            terminal_proof_bundle,
+                            terminal_ingress,
+                            terminal_evidence,
+                        }),
+                        _ => Err(ReservationError::StateShape),
+                    }
                 } else {
                     Err(ReservationError::SnapshotMismatch)
                 }
@@ -2740,6 +3173,10 @@ impl ProductionReservationRecord {
         }
     }
 
+    /// Compact one conclusively terminal row after the fixed retention age.
+    /// The exact protected admission/checkpoint/result and raw proof material
+    /// are removed, while the bounded commitments required to reject replay or
+    /// a changed body remain durable until irreversible epoch retirement.
     fn reclaim_at(
         &mut self,
         maintenance_time: ConsensusMaintenanceTimestamp,
@@ -2768,11 +3205,27 @@ impl ProductionReservationRecord {
         let tombstone_bytes = tombstone
             .to_canonical_bytes()
             .map_err(|_| ReservationError::CanonicalEncoding)?;
-        let charges = profile.charge(production_components(&[], None, Some(&tombstone_bytes))?)?;
+        let compact_bytes = self
+            .admission_provenance
+            .len()
+            .checked_add(self.terminal_evidence.as_ref().map_or(0, Vec::len))
+            .ok_or(ReservationError::Arithmetic)?;
+        if !cfg!(test) && (self.admission_provenance.is_empty() || self.terminal_evidence.is_none())
+        {
+            return Err(ReservationError::StateShape);
+        }
+        let charges = profile.charge(production_components(
+            &[],
+            None,
+            Some(&tombstone_bytes),
+            compact_bytes,
+        )?)?;
         self.admission.clear();
+        self.admission_ingress.clear();
         self.terminal = None;
+        self.terminal_proof_bundle = None;
+        self.terminal_ingress = None;
         self.tombstone = Some(tombstone_bytes);
-        self.terminalized_at = None;
         self.business_reservation = None;
         self.state = ReservationState::Tombstone;
         self.peak_charge_bytes = 0;
@@ -2792,21 +3245,23 @@ fn production_components(
     admission: &[u8],
     terminal: Option<&[u8]>,
     tombstone: Option<&[u8]>,
+    compact_provenance_bytes: usize,
 ) -> Result<ComponentBytes, ReservationError> {
-    ComponentBytes::from_exact(
+    ComponentBytes::from_exact_with_compact(
         admission.len(),
         terminal.map_or(MAX_COMMITTED_TERMINAL_CODEC_BYTES, <[u8]>::len),
         MAX_BUSINESS_SESSION_COPY_BYTES,
         MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES,
         MAX_TERMINAL_EVIDENCE_ENVELOPE_BYTES,
+        compact_provenance_bytes,
         tombstone.map_or(MAX_TOMBSTONE_CODEC_BYTES, <[u8]>::len),
     )
 }
 
 /// Pure, prevalidated deterministic retained-to-tombstone batch.
 ///
-/// The adapter compares every `rows` entry before it makes any replacement.
-/// This makes a malformed or stale later row fail the entire reclaim batch.
+/// The adapter compares every `rows` entry before it replaces any row. This
+/// makes a malformed or stale later row fail the entire reclaim batch.
 #[derive(Clone)]
 pub(crate) struct PreparedProductionReclaim {
     transaction: PreparedProductionTransaction,
@@ -2876,8 +3331,9 @@ impl fmt::Debug for PreparedProductionReclaim {
 ///
 /// Terminal time is authenticated by the retained `CommittedTerminal` frame;
 /// the maintenance value merely chooses which already committed rows have
-/// reached their fixed age.  Ordering is `(terminalized_at, binding)` and the
-/// exact batch is `min(RECLAIM_BATCH, eligible)`.
+/// reached the fixed 24-hour age. Ordering is `(terminalized_at, binding)` and
+/// the exact batch is the oldest `min(1024, eligible)`, including a smaller
+/// final batch. A live or ambiguous row is never selected.
 pub(crate) fn prepare_production_reclaim(
     records: &BTreeMap<RequestBindingKey, ProductionReservationRecord>,
     maintenance_time: ConsensusMaintenanceTimestamp,
@@ -2885,7 +3341,6 @@ pub(crate) fn prepare_production_reclaim(
     budget: GlobalChargeBudget,
     profile: ChargeProfile,
 ) -> Result<PreparedProductionReclaim, ReservationError> {
-    witness.admits(budget)?;
     let mut eligible = Vec::new();
     for (binding, record) in records.iter() {
         if record.state == ReservationState::Retained {
@@ -2915,13 +3370,16 @@ pub(crate) fn prepare_production_reclaim(
         rows.push(ProductionRowCas {
             binding,
             expected: Some(current.clone()),
+            expected_canonical: None,
             replacement: Some(replacement),
+            replacement_canonical: None,
         });
     }
     let next = witness.with_roster(next_counters);
     next.admits(budget)?;
     Ok(PreparedProductionReclaim {
         transaction: PreparedProductionTransaction {
+            #[cfg(test)]
             canonical_rows_validated: u32::try_from(selected)
                 .map_err(|_| ReservationError::Arithmetic)?,
             rows,
@@ -2929,7 +3387,10 @@ pub(crate) fn prepare_production_reclaim(
             next,
             floor: None,
             retirement_cursor: None,
+            released_floors: Vec::new(),
+            released_retirement_cursors: Vec::new(),
             partition_guard: None,
+            global_terminal_retirement_guard: None,
             reclaim_oldest_guard: Some(oldest_guard),
             admission_business_reservation: None,
             business: None,
@@ -2987,6 +3448,11 @@ pub(crate) fn validate_production_snapshot(
     // includes the history epoch, so binding uniqueness alone would otherwise
     // accept two simultaneous live reservations for one authoritative key.
     let mut seen_business_keys = BTreeMap::new();
+    // Terminal commit sequences are a global total order.  Reconstructing
+    // this uniqueness only at snapshot/restart boundaries keeps Q1/Q2 on
+    // their fixed single-row paths while making a forged/duplicated closure
+    // fail closed before it can influence retirement.
+    let mut seen_terminal_sequences = BTreeMap::new();
     let mut counters = AggregateCounters {
         materialized_charge_bytes: 0,
         reserved_future_charge_bytes: 0,
@@ -3002,6 +3468,14 @@ pub(crate) fn validate_production_snapshot(
         record.validate(profile)?;
         if seen.insert(record.binding, record.state).is_some() {
             return Err(ReservationError::Duplicate);
+        }
+        if let Some(sequence) = record.terminal_sequence {
+            if seen_terminal_sequences
+                .insert(sequence, record.binding)
+                .is_some()
+            {
+                return Err(ReservationError::Duplicate);
+            }
         }
         if record.state == ReservationState::Live {
             let reservation = record
@@ -3019,18 +3493,35 @@ pub(crate) fn validate_production_snapshot(
             }
         }
         let charges = match record.state {
-            ReservationState::Live => {
-                profile.charge(production_components(&record.admission, None, None)?)?
-            }
+            ReservationState::Live => profile.charge(production_components(
+                &record.admission,
+                None,
+                None,
+                if record.admission_provenance.is_empty() {
+                    0
+                } else {
+                    MAX_COMPACT_PROVENANCE_BYTES
+                },
+            )?)?,
             ReservationState::Retained => profile.charge(production_components(
                 &record.admission,
                 record.terminal.as_deref(),
                 None,
+                record
+                    .admission_provenance
+                    .len()
+                    .checked_add(record.terminal_evidence.as_ref().map_or(0, Vec::len))
+                    .ok_or(ReservationError::Arithmetic)?,
             )?)?,
             ReservationState::Tombstone => profile.charge(production_components(
                 &[],
                 None,
                 record.tombstone.as_deref(),
+                record
+                    .admission_provenance
+                    .len()
+                    .checked_add(record.terminal_evidence.as_ref().map_or(0, Vec::len))
+                    .ok_or(ReservationError::Arithmetic)?,
             )?)?,
         };
         counters = counters_for_record(counters, record.state, charges)?;
@@ -3054,6 +3545,13 @@ pub(crate) fn validate_production_snapshot_witness(
 ) -> Result<AggregateCounters, ReservationError> {
     let counters = validate_production_snapshot(records, profile)?;
     witness.admits(budget)?;
+    if records.iter().any(|record| {
+        record
+            .terminal_sequence()
+            .is_some_and(|sequence| sequence <= witness.retired_terminal_sequence())
+    }) {
+        return Err(ReservationError::SnapshotMismatch);
+    }
     if witness.roster != counters {
         return Err(ReservationError::WitnessMismatch);
     }
@@ -3062,10 +3560,11 @@ pub(crate) fn validate_production_snapshot_witness(
 
 /// Restart/follower validation with the exact persisted tenant/scope floors.
 ///
-/// Every durable row, including a tombstone, must remain strictly above its
-/// partition floor.  A transaction that advances a floor therefore deletes all
-/// covered tombstones in the same linearization; a partial floor/row snapshot
-/// is never accepted after restart.
+/// Every durable row must remain strictly above its partition floor. Direct
+/// reclaim deletes the globally oldest eligible retained rows at or beyond
+/// 24 hours, up to 1,024 per final-or-partial batch, and never deletes live
+/// rows. Legacy cursor/tombstone snapshots remain subject to their original
+/// floor consistency checks during restart validation.
 pub(crate) fn validate_production_snapshot_with_floors(
     records: &[ProductionReservationRecord],
     floors: &[IrreversibleHistoryFloor],
@@ -3075,6 +3574,14 @@ pub(crate) fn validate_production_snapshot_with_floors(
     profile: ChargeProfile,
 ) -> Result<AggregateCounters, ReservationError> {
     let mut counters = validate_production_snapshot(records, profile)?;
+    witness.admits(budget)?;
+    if records.iter().any(|record| {
+        record
+            .terminal_sequence()
+            .is_some_and(|sequence| sequence <= witness.retired_terminal_sequence())
+    }) {
+        return Err(ReservationError::SnapshotMismatch);
+    }
     if floors.len() > MAX_RESERVED_AND_RETAINED {
         return Err(ReservationError::FloorLimit);
     }
@@ -3126,9 +3633,9 @@ pub(crate) fn validate_production_snapshot_with_floors(
         used_floors.insert(key, ());
     }
     for (key, floor) in floor_index {
-        // A nonzero floor is still meaningful after retirement deletes the
-        // final tombstone in its partition.  A zero initial floor without a
-        // row is instead an unused, accidentally persisted partition.
+        // A nonzero floor is meaningful after an older snapshot's legacy
+        // cursor/tombstone cleanup. A zero initial floor without a row is an
+        // unused, accidentally persisted partition.
         if !used_floors.contains_key(&key) && floor.retired_through() == 0 {
             return Err(ReservationError::FloorAdvance);
         }
@@ -3138,7 +3645,6 @@ pub(crate) fn validate_production_snapshot_with_floors(
             return Err(ReservationError::FloorAdvance);
         }
     }
-    witness.admits(budget)?;
     if witness.roster != counters {
         return Err(ReservationError::WitnessMismatch);
     }
@@ -3426,12 +3932,6 @@ impl ProductionSnapshot {
     pub(crate) fn witness(&self) -> GlobalChargeWitness {
         self.witness
     }
-
-    /// Return the sorted bounded in-epoch cursor set. Cursors are part of the
-    /// same restart envelope as roster rows, floors, and the charge witness.
-    pub(crate) fn retirement_cursors(&self) -> &[ProductionRetirementCursor] {
-        &self.retirement_cursors
-    }
 }
 
 /// Bounded streaming encoder for the canonical snapshot fixture.
@@ -3643,7 +4143,14 @@ impl fmt::Debug for ProductionSnapshot {
 pub(crate) struct ProductionRowCas {
     binding: RequestBindingKey,
     expected: Option<ProductionReservationRecord>,
+    /// Exact durable expected bytes when a caller consumed a validated SQLite
+    /// hydration. Adapters may use this instead of recanonicalizing the row.
+    expected_canonical: Option<Vec<u8>>,
     replacement: Option<ProductionReservationRecord>,
+    /// Exact validated replacement bytes prepared once by the hydrated hot
+    /// path. Ordinary/maintenance paths leave this absent and retain the
+    /// adapter's full validation-and-encoding fallback.
+    replacement_canonical: Option<Vec<u8>>,
 }
 
 impl ProductionRowCas {
@@ -3655,8 +4162,19 @@ impl ProductionRowCas {
         self.expected.as_ref()
     }
 
+    /// Return the sealed exact SQLite CAS witness, when preparation started
+    /// from a fully canonical hydrated row.
+    pub(crate) fn expected_canonical_bytes(&self) -> Option<&[u8]> {
+        self.expected_canonical.as_deref()
+    }
+
     pub(crate) fn replacement(&self) -> Option<&ProductionReservationRecord> {
         self.replacement.as_ref()
+    }
+
+    /// Return the exact replacement bytes already validated by preparation.
+    pub(crate) fn replacement_canonical_bytes(&self) -> Option<&[u8]> {
+        self.replacement_canonical.as_deref()
     }
 }
 
@@ -3720,7 +4238,7 @@ impl ProductionFloorKey {
         Ok(Self(key))
     }
 
-    fn from_binding(binding: RequestBindingKey) -> Result<Self, ReservationError> {
+    pub(crate) fn from_binding(binding: RequestBindingKey) -> Result<Self, ReservationError> {
         Self::from_floor(
             IrreversibleHistoryFloor::initial(binding)
                 .map_err(|_| ReservationError::FloorAdvance)?,
@@ -3742,14 +4260,15 @@ impl fmt::Debug for ProductionFloorKey {
 /// Exact partition-keyed irreversible-floor compare-and-swap.
 ///
 /// `expected: None` proves absence and is used only by admission to insert the
-/// initial floor.  A present expected floor is compared byte-for-byte before
-/// its replacement is persisted.  The partition key is carried separately so
-/// an adapter never searches for a matching retired epoch value.
+/// initial floor. A present expected floor is compared byte-for-byte before it
+/// is advanced, or deleted once the final bounded retirement page proves the
+/// partition is empty. The partition key is carried separately so an adapter
+/// never searches for a matching retired epoch value.
 #[derive(Clone, Copy)]
 pub(crate) struct ProductionFloorCas {
     key: ProductionFloorKey,
     expected: Option<IrreversibleHistoryFloor>,
-    replacement: IrreversibleHistoryFloor,
+    replacement: Option<IrreversibleHistoryFloor>,
 }
 
 impl ProductionFloorCas {
@@ -3761,7 +4280,7 @@ impl ProductionFloorCas {
         self.expected
     }
 
-    pub(crate) const fn replacement(&self) -> IrreversibleHistoryFloor {
+    pub(crate) const fn replacement(&self) -> Option<IrreversibleHistoryFloor> {
         self.replacement
     }
 }
@@ -3772,31 +4291,34 @@ impl fmt::Debug for ProductionFloorCas {
     }
 }
 
-/// Bounded page from the authoritative partition index used to prepare one
-/// retirement operation. It contains only the selected prefix (at most
-/// `RECLAIM_BATCH` rows), never a partition-wide binding list. `final_batch`
-/// is deliberately only a hint: the adapter independently proves it against
-/// the indexed partition range in the committing transaction.
+/// Bounded page from one authoritative partition's next retireable epoch.
+///
+/// This is retained only for the legacy unit fixtures. Production maintenance
+/// uses the global terminal-sequence closure below.
+#[cfg(test)]
 pub(crate) struct ProductionRetirementPrefix<'a> {
     key: ProductionFloorKey,
     target_epoch: u64,
     selected: &'a [(RequestBindingKey, ProductionReservationRecord)],
     final_batch: bool,
+    partition_empty_after: bool,
 }
 
+#[cfg(test)]
 impl<'a> ProductionRetirementPrefix<'a> {
-    /// Bind a bounded contiguous target-epoch prefix to the expected floor.
     pub(crate) fn new(
         previous_floor: IrreversibleHistoryFloor,
         next_floor: IrreversibleHistoryFloor,
         selected: &'a [(RequestBindingKey, ProductionReservationRecord)],
         final_batch: bool,
+        partition_empty_after: bool,
     ) -> Result<Self, ReservationError> {
         let key = ProductionFloorKey::from_floor(previous_floor)?;
         if key != ProductionFloorKey::from_floor(next_floor)?
             || next_floor.retired_through() <= previous_floor.retired_through()
             || selected.is_empty()
             || selected.len() > RECLAIM_BATCH
+            || (partition_empty_after && !final_batch)
         {
             return Err(ReservationError::FloorAdvance);
         }
@@ -3816,21 +4338,20 @@ impl<'a> ProductionRetirementPrefix<'a> {
             target_epoch,
             selected,
             final_batch,
+            partition_empty_after,
         })
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for ProductionRetirementPrefix<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ProductionRetirementPrefix(<redacted>)")
     }
 }
 
-/// Exact bounded indexed-range predicate carried into a retirement
-/// transaction. This is not a caller promise: the adapter must evaluate the
-/// lower-epoch no-gap predicate and selected target-epoch prefix against its
-/// authoritative partition index in the same transaction as row deletion and
-/// floor/cursor CAS.
+/// Exact indexed-range predicate that the storage adapter re-proves in its
+/// committing transaction before deleting a bounded tombstone prefix.
 #[derive(Clone)]
 pub(crate) struct ProductionPartitionRangeGuard {
     key: ProductionFloorKey,
@@ -3839,9 +4360,11 @@ pub(crate) struct ProductionPartitionRangeGuard {
     after: Option<RequestBindingKey>,
     selected: Vec<RequestBindingKey>,
     final_batch: bool,
+    partition_empty_after: bool,
 }
 
 impl ProductionPartitionRangeGuard {
+    #[cfg(test)]
     fn from_prefix(
         prefix: &ProductionRetirementPrefix<'_>,
         previous_floor: IrreversibleHistoryFloor,
@@ -3853,50 +4376,41 @@ impl ProductionPartitionRangeGuard {
         {
             return Err(ReservationError::FloorAdvance);
         }
-        let selected = prefix
-            .selected
-            .iter()
-            .map(|(binding, _)| *binding)
-            .collect();
         Ok(Self {
             key: prefix.key,
             previous_floor_through: previous_floor.retired_through(),
             target_epoch: prefix.target_epoch,
             after: cursor.last_deleted,
-            selected,
+            selected: prefix
+                .selected
+                .iter()
+                .map(|(binding, _)| *binding)
+                .collect(),
             final_batch: prefix.final_batch,
+            partition_empty_after: prefix.partition_empty_after,
         })
     }
 
-    /// Stable partition key the adapter must range-check.
     pub(crate) const fn key(&self) -> ProductionFloorKey {
         self.key
     }
-
-    /// Persisted floor position immediately before this operation.
     pub(crate) const fn previous_floor_through(&self) -> u64 {
         self.previous_floor_through
     }
-
-    /// Target epoch whose next contiguous tombstone prefix is deleted.
     pub(crate) const fn target_epoch(&self) -> u64 {
         self.target_epoch
     }
-
-    /// Cursor boundary after which the selected prefix begins.
     pub(crate) const fn after(&self) -> Option<RequestBindingKey> {
         self.after
     }
-
-    /// Exact selected prefix; its length is permanently bounded by 1,024.
     pub(crate) fn selected(&self) -> &[RequestBindingKey] {
         &self.selected
     }
-
-    /// Whether this operation claims the target epoch is exhausted and may
-    /// atomically advance the floor and delete its cursor.
     pub(crate) const fn final_batch(&self) -> bool {
         self.final_batch
+    }
+    pub(crate) const fn partition_empty_after(&self) -> bool {
+        self.partition_empty_after
     }
 }
 
@@ -3906,13 +4420,58 @@ impl fmt::Debug for ProductionPartitionRangeGuard {
     }
 }
 
-/// Durable in-epoch retirement range marker.
-///
-/// A floor advances only after all tombstones at its next target epoch are
-/// gone.  When more than `RECLAIM_BATCH` bindings share that epoch, this
-/// cursor blocks new admissions through the target and records the last
-/// contiguous binding already deleted.  That makes each bounded delete safe
-/// across a restart without ever allowing a partial floor/row state.
+/// Exact globally ordered terminal-history prefix that may be removed in one
+/// maintenance transaction.  The adapter re-proves it against the indexed
+/// `(terminal_sequence, binding)` projection before any deletion.  This is
+/// the trust anchor for the witness high-water: a live row has no sequence,
+/// so it cannot block unrelated terminal-history closure.
+#[derive(Clone)]
+pub(crate) struct ProductionGlobalTerminalRetirementGuard {
+    selected: Vec<(u64, RequestBindingKey)>,
+    released_partitions: Vec<ProductionFloorKey>,
+}
+
+impl ProductionGlobalTerminalRetirementGuard {
+    fn new(
+        selected: Vec<(u64, RequestBindingKey)>,
+        mut released_partitions: Vec<ProductionFloorKey>,
+    ) -> Result<Self, ReservationError> {
+        if selected.is_empty()
+            || selected.len() > RECLAIM_BATCH
+            || selected.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        released_partitions.sort_unstable();
+        if released_partitions
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        Ok(Self {
+            selected,
+            released_partitions,
+        })
+    }
+
+    pub(crate) fn selected(&self) -> &[(u64, RequestBindingKey)] {
+        &self.selected
+    }
+
+    pub(crate) fn released_partitions(&self) -> &[ProductionFloorKey] {
+        &self.released_partitions
+    }
+}
+
+impl fmt::Debug for ProductionGlobalTerminalRetirementGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProductionGlobalTerminalRetirementGuard(<redacted>)")
+    }
+}
+
+/// Durable in-epoch retirement marker. It closes admissions through a partly
+/// deleted target epoch until its final bounded tombstone prefix advances the floor.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProductionRetirementCursor {
     key: ProductionFloorKey,
@@ -3921,6 +4480,7 @@ pub(crate) struct ProductionRetirementCursor {
 }
 
 impl ProductionRetirementCursor {
+    #[cfg(test)]
     fn initial(key: ProductionFloorKey, target_epoch: u64) -> Result<Self, ReservationError> {
         validate_epoch(target_epoch)?;
         Ok(Self {
@@ -3930,6 +4490,7 @@ impl ProductionRetirementCursor {
         })
     }
 
+    #[cfg(test)]
     fn advance_through(&self, binding: RequestBindingKey) -> Result<Self, ReservationError> {
         if ProductionFloorKey::from_binding(binding)? != self.key
             || binding.history_epoch() != self.target_epoch
@@ -3943,7 +4504,6 @@ impl ProductionRetirementCursor {
             last_deleted: Some(binding),
         })
     }
-
     pub(crate) fn validate_for_floor(
         &self,
         floor: IrreversibleHistoryFloor,
@@ -4016,9 +4576,7 @@ impl fmt::Debug for ProductionRetirementCursor {
     }
 }
 
-/// Exact durable cursor compare-and-swap coupled to a bounded retirement
-/// range.  A `None` replacement deletes the cursor only in the same
-/// transaction that advances the floor past its target.
+/// Exact durable cursor compare-and-swap carried by an admission transaction.
 #[derive(Clone)]
 pub(crate) struct ProductionRetirementCursorCas {
     key: ProductionFloorKey,
@@ -4038,7 +4596,7 @@ impl ProductionRetirementCursorCas {
         }
     }
 
-    /// Return the exact partition cursor key to compare.
+    /// Return the exact prior cursor, or absence assertion.
     pub(crate) const fn key(&self) -> ProductionFloorKey {
         self.key
     }
@@ -4376,31 +4934,6 @@ impl ProductionTerminalBusinessCas {
         }
     }
 
-    /// Return the exact business pre-state for legacy compare validation.
-    ///
-    /// New adapters must dispatch through [`Self::action`] so the aborted
-    /// compare-and-release operation cannot be represented as a replacement.
-    pub(crate) fn expected(&self) -> Option<&ProductionBusinessState> {
-        match self {
-            Self::AbortedCompareRelease { expected }
-            | Self::EstablishedPut { expected, .. }
-            | Self::EstablishedDelete { expected } => Some(expected),
-        }
-    }
-
-    /// Legacy replacement projection for the pre-#707 SQLite adapter.
-    ///
-    /// New adapters must use [`Self::action`]. In particular, this projection
-    /// preserves the previous no-op write for Aborted only while callers are
-    /// migrated; it is not the prepared Aborted business operation.
-    pub(crate) fn replacement(&self) -> Option<&ProductionBusinessState> {
-        match self {
-            Self::AbortedCompareRelease { expected } => Some(expected),
-            Self::EstablishedPut { successor, .. } => Some(successor),
-            Self::EstablishedDelete { .. } => None,
-        }
-    }
-
     fn from_committed(
         admission: &Admission,
         terminal: &CommittedTerminal,
@@ -4458,12 +4991,11 @@ impl fmt::Debug for ProductionTerminalBusinessCas {
 
 /// Complete prepared durable mutation.
 ///
-/// A consensus storage adapter must compare all rows, the global witness, the
-/// optional exact tenant/scope floor, optional cursor, and retirement range
-/// predicate, then apply every replacement and the next witness together. The
-/// type intentionally offers no witness-only operation, so a terminal receipt,
-/// reclaim, or retirement cannot release or reserve charge separately from its
-/// durable rows.
+/// A consensus storage adapter must compare all rows, the global witness, and
+/// optional exact tenant/scope floor/cursor, then apply every replacement and
+/// the next witness together. The type intentionally offers no witness-only
+/// operation, so a terminal receipt or reclaim cannot release or reserve
+/// charge separately from its durable rows.
 #[derive(Clone)]
 pub(crate) struct PreparedProductionTransaction {
     rows: Vec<ProductionRowCas>,
@@ -4471,26 +5003,26 @@ pub(crate) struct PreparedProductionTransaction {
     next: GlobalChargeWitness,
     floor: Option<ProductionFloorCas>,
     retirement_cursor: Option<ProductionRetirementCursorCas>,
+    released_floors: Vec<ProductionFloorCas>,
+    released_retirement_cursors: Vec<ProductionRetirementCursorCas>,
     partition_guard: Option<ProductionPartitionRangeGuard>,
+    global_terminal_retirement_guard: Option<ProductionGlobalTerminalRetirementGuard>,
     reclaim_oldest_guard: Option<ProductionReclaimOldestGuard>,
     admission_business_reservation: Option<ProductionAdmissionBusinessReservation>,
     business: Option<ProductionTerminalBusinessCas>,
+    #[cfg(test)]
     canonical_rows_validated: u32,
 }
 
 /// Consensus adapter contract for one all-or-none prepared roster mutation.
 pub(crate) trait ProductionReservationTransactionAdapter {
     /// Compare the exact expected rows, business reservation/CAS, witness,
-    /// optional floor/cursor, and both bounded guards, then atomically persist
+    /// optional floor/cursor, and the bounded reclaim guard, then atomically persist
     /// all replacements and the next witness. For a reclaim-oldest guard, the
     /// adapter must use its retained-terminal index to prove the carried rows
-    /// equal the global `min(1024, eligible)` prefix. For a retirement range
-    /// guard, it must use the partition index in the same transaction to prove
-    /// no row exists below the target and that the carried rows are exactly
-    /// the next cursor-delimited target-epoch prefix; floor advance/cursor
-    /// deletion is legal only when that target has no remainder. An admission
-    /// reservation is a compare-only business barrier; a terminal CAS is the
-    /// sole business-row materialization.
+    /// equal the global `min(1024, eligible)` prefix. An admission reservation
+    /// is a compare-only business barrier; a terminal CAS is the sole
+    /// business-row materialization.
     fn compare_and_apply_production(
         &mut self,
         transaction: PreparedProductionTransaction,
@@ -4509,6 +5041,7 @@ impl PreparedProductionTransaction {
     }
 
     /// Return whether this is the single-row absent-key admission mutation.
+    #[cfg(test)]
     pub(crate) fn is_insertion(&self) -> bool {
         self.rows.len() == 1
             && self.rows[0].expected.is_none()
@@ -4542,22 +5075,35 @@ impl PreparedProductionTransaction {
         self.floor
     }
 
-    /// Return the bounded retirement cursor CAS, when this transaction either
-    /// enters, advances, or closes an in-epoch retirement range.
+    /// Return the exact admission cursor assertion, when present.
     pub(crate) fn retirement_cursor_cas(&self) -> Option<&ProductionRetirementCursorCas> {
         self.retirement_cursor.as_ref()
     }
 
-    /// Return the mandatory adapter-enforced exact range predicate for a
-    /// bounded retirement batch.
+    /// Return fixed per-partition metadata releases coupled to an indexed
+    /// global terminal-history deletion prefix.
+    pub(crate) fn released_floor_cas(&self) -> &[ProductionFloorCas] {
+        &self.released_floors
+    }
+
+    pub(crate) fn released_retirement_cursor_cas(&self) -> &[ProductionRetirementCursorCas] {
+        &self.released_retirement_cursors
+    }
+
     pub(crate) fn partition_range_guard(&self) -> Option<&ProductionPartitionRangeGuard> {
         self.partition_guard.as_ref()
     }
 
     /// Return the adapter-enforced global-oldest reclaim predicate, when this
-    /// transaction converts retained rows into tombstones.
+    /// transaction converts retained rows into durable tombstones.
     pub(crate) fn reclaim_oldest_guard(&self) -> Option<&ProductionReclaimOldestGuard> {
         self.reclaim_oldest_guard.as_ref()
+    }
+
+    pub(crate) fn global_terminal_retirement_guard(
+        &self,
+    ) -> Option<&ProductionGlobalTerminalRetirementGuard> {
+        self.global_terminal_retirement_guard.as_ref()
     }
 
     /// Return the exact business CAS carried only by a terminal transaction.
@@ -4579,6 +5125,7 @@ impl PreparedProductionTransaction {
     /// Admission validates its proposed row; terminalization validates the
     /// fetched current row and its replacement is derived from it.  Aggregate
     /// reconstruction deliberately remains a restart-only operation.
+    #[cfg(test)]
     pub(crate) const fn canonical_rows_validated(&self) -> u32 {
         self.canonical_rows_validated
     }
@@ -4592,10 +5139,12 @@ impl fmt::Debug for PreparedProductionTransaction {
 
 /// Compatibility name for the one-row admission/terminal production path.
 pub(crate) type PreparedProductionChargeTransition = PreparedProductionTransaction;
-/// Compatibility name for the floor-bound delete production path.
 pub(crate) type PreparedProductionRetirement = PreparedProductionTransaction;
 
-/// Prepare one atomic consensus admission plus witness transition.
+/// Prepare one atomic consensus admission plus its capacity reservation and
+/// witness transition. The terminal-history slot is charged here, before any
+/// provider effect, so a valid live admission cannot fail terminalization for
+/// retained-history capacity.
 pub(crate) fn prepare_production_admission(
     existing: Option<&ProductionReservationRecord>,
     record: ProductionReservationRecord,
@@ -4618,17 +5167,17 @@ pub(crate) fn prepare_production_admission(
             ProductionFloorCas {
                 key: ProductionFloorKey::from_binding(record.binding)?,
                 expected: Some(existing_floor),
-                replacement: existing_floor,
+                replacement: Some(existing_floor),
             }
         }
         None => ProductionFloorCas {
             key: ProductionFloorKey::from_binding(record.binding)?,
             expected: None,
-            replacement: initial_floor,
+            replacement: Some(initial_floor),
         },
     };
     if let Some(cursor) = existing_retirement_cursor {
-        cursor.validate_for_floor(floor.replacement)?;
+        cursor.validate_for_floor(floor.replacement.ok_or(ReservationError::FloorAdvance)?)?;
         if record.binding.history_epoch() <= cursor.target_epoch {
             return Err(ReservationError::FloorAdvance);
         }
@@ -4643,8 +5192,10 @@ pub(crate) fn prepare_production_admission(
     let binding = record.binding;
     prepare_production_transition(ProductionTransitionPreparation {
         current: None,
+        expected_canonical: None,
         binding,
         replacement: record,
+        replacement_canonical: None,
         insertion: true,
         floor: Some(floor),
         retirement_cursor: Some(ProductionRetirementCursorCas::assert_existing(
@@ -4660,7 +5211,97 @@ pub(crate) fn prepare_production_admission(
     })
 }
 
-/// Prepare one atomic consensus terminalization plus witness transition.
+/// Prepare a production terminal transition from one fully authenticated
+/// SQLite hydration. The consumed hydration retains both the exact prior row
+/// bytes for the compare-and-swap and its already-decoded live admission, so
+/// this hot path never reparses the protected admission body.
+///
+/// Proof, ingress, and compact-evidence semantics are exactly those of the
+/// ordinary production terminalizer: the raw materials are canonicalized and
+/// the compact evidence is bound to the admission and terminal before the
+/// retained row is built. Recovery and snapshot paths deliberately retain the
+/// ordinary `validate_and_hydrate` validation boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_production_terminalization_hydrated_with_evidence_and_ingress(
+    current: HydratedProductionReservationRecord,
+    binding: RequestBindingKey,
+    terminal: &CommittedTerminal,
+    proof_bundle: &RosterExecutorProofBundleV1,
+    terminal_ingress: &RosterIngressAttestationV1,
+    terminal_evidence: &RosterCompactTerminalEvidenceV2,
+    witness: GlobalChargeWitness,
+    budget: GlobalChargeBudget,
+    profile: ChargeProfile,
+) -> Result<PreparedProductionChargeTransition, ReservationError> {
+    let (expected, expected_canonical, admission) =
+        into_hydrated_live_terminal_parts(current, binding)?;
+    let reservation = expected
+        .business_reservation
+        .as_ref()
+        .ok_or(ReservationError::StateShape)?;
+    reservation.validate_for(&admission)?;
+    let business =
+        ProductionTerminalBusinessCas::from_committed(&admission, terminal, reservation)?;
+    let mut replacement = expected.clone();
+    replacement.terminalize_with_hydrated_admission(
+        &admission,
+        terminal,
+        Some(proof_bundle),
+        Some(terminal_ingress),
+        Some(terminal_evidence),
+        profile,
+    )?;
+    // Validate and encode the derived retained row exactly once. The sealed
+    // bytes travel with the prepared transaction through SQLite writeback.
+    let replacement_canonical = replacement.to_canonical_bytes()?;
+    prepare_production_transition_prevalidated(ProductionTransitionPreparation {
+        current: Some(expected),
+        expected_canonical: Some(expected_canonical),
+        binding,
+        replacement,
+        replacement_canonical: Some(replacement_canonical),
+        insertion: false,
+        floor: None,
+        retirement_cursor: None,
+        partition_guard: None,
+        admission_business_reservation: None,
+        business: Some(business),
+        witness,
+        budget,
+        profile,
+    })
+}
+
+/// Consume the sealed read-side hydration and expose only the checked live
+/// pieces needed by production terminalization. Keeping this gate separate
+/// makes it impossible for the fast path to accidentally accept the
+/// test-only rootless `Legacy` payload.
+fn into_hydrated_live_terminal_parts(
+    current: HydratedProductionReservationRecord,
+    binding: RequestBindingKey,
+) -> Result<(ProductionReservationRecord, Vec<u8>, Admission), ReservationError> {
+    let (expected, expected_canonical, payload) = current.into_parts();
+    if expected.binding != binding {
+        return Err(ReservationError::Unknown);
+    }
+    // `HydratedProductionReservationRecord` is sealed and can only be issued
+    // after `from_canonical_vec_hydrated` has decoded, fully validated, and
+    // byte-for-byte recanonicalized this row. Repeating that multi-megabyte
+    // serialization here would discard the proof carried by the type.
+    if expected_canonical.is_empty()
+        || expected_canonical.len() > MAX_PRODUCTION_RECORD_SNAPSHOT_BYTES
+    {
+        return Err(ReservationError::CanonicalEncoding);
+    }
+    let HydratedProductionReservationPayload::Live { admission, .. } = payload else {
+        return Err(ReservationError::InvalidState);
+    };
+    Ok((expected, expected_canonical, admission))
+}
+
+/// Test-only legacy terminalization constructor. Production must use the
+/// evidence-carrying form above.
+#[cfg(test)]
 pub(crate) fn prepare_production_terminalization(
     current: &ProductionReservationRecord,
     binding: RequestBindingKey,
@@ -4683,9 +5324,11 @@ pub(crate) fn prepare_production_terminalization(
     let mut replacement = current.clone();
     replacement.terminalize(terminal, profile)?;
     prepare_production_transition(ProductionTransitionPreparation {
-        current: Some(current),
+        current: Some(current.clone()),
+        expected_canonical: None,
         binding,
         replacement,
+        replacement_canonical: None,
         insertion: false,
         floor: None,
         retirement_cursor: None,
@@ -4698,12 +5341,10 @@ pub(crate) fn prepare_production_terminalization(
     })
 }
 
-/// Prepare a compare-and-apply deletion that advances the exact same-scope floor.
-///
-/// The consensus transaction must atomically delete this binding, persist
-/// `next_floor`, and compare/apply the witness transition.  Separating any of
-/// those writes would make capacity release reversible, so this type exposes
-/// only the complete three-part transition.
+/// Prepare one bounded exact-partition tombstone deletion.  Retained rows are
+/// never deleted by this path: only a completed 24-hour reclaim produces the
+/// tombstones whose stable admission slot can then be retired.
+#[cfg(test)]
 pub(crate) fn prepare_production_retirement(
     selected_prefix: ProductionRetirementPrefix<'_>,
     previous_floor: IrreversibleHistoryFloor,
@@ -4714,11 +5355,11 @@ pub(crate) fn prepare_production_retirement(
     profile: ChargeProfile,
 ) -> Result<PreparedProductionRetirement, ReservationError> {
     witness.admits(budget)?;
-    let previous_key = ProductionFloorKey::from_floor(previous_floor)?;
-    if previous_key != ProductionFloorKey::from_floor(next_floor)?
-        || previous_key != selected_prefix.key
-        || next_floor.retired_through() <= previous_floor.retired_through()
+    let key = ProductionFloorKey::from_floor(previous_floor)?;
+    if key != ProductionFloorKey::from_floor(next_floor)?
+        || key != selected_prefix.key
         || selected_prefix.target_epoch != next_floor.retired_through()
+        || next_floor.retired_through() <= previous_floor.retired_through()
     {
         return Err(ReservationError::FloorAdvance);
     }
@@ -4726,25 +5367,23 @@ pub(crate) fn prepare_production_retirement(
         .strictly_advances(previous_floor)
         .map_err(|_| ReservationError::FloorAdvance)?;
     let cursor = match existing_retirement_cursor {
-        Some(cursor) => {
+        Some(cursor)
+            if cursor.key == key && cursor.target_epoch == next_floor.retired_through() =>
+        {
             cursor.validate_for_floor(previous_floor)?;
-            if cursor.key != previous_key || cursor.target_epoch != next_floor.retired_through() {
-                return Err(ReservationError::FloorAdvance);
-            }
             cursor.clone()
         }
-        None => ProductionRetirementCursor::initial(previous_key, next_floor.retired_through())?,
+        Some(_) => return Err(ReservationError::FloorAdvance),
+        None => ProductionRetirementCursor::initial(key, next_floor.retired_through())?,
     };
-    let range_guard =
+    let guard =
         ProductionPartitionRangeGuard::from_prefix(&selected_prefix, previous_floor, &cursor)?;
-    let mut rows = Vec::new();
-    rows.try_reserve(selected_prefix.selected.len())
-        .map_err(|_| ReservationError::Arithmetic)?;
     let mut next_counters = witness.roster;
+    let mut rows = Vec::with_capacity(selected_prefix.selected.len());
     let mut previous_binding = cursor.last_deleted;
     for (binding, record) in selected_prefix.selected {
         if previous_binding.is_some_and(|last| *binding <= last)
-            || ProductionFloorKey::from_binding(*binding)? != previous_key
+            || ProductionFloorKey::from_binding(*binding)? != key
             || binding.history_epoch() != next_floor.retired_through()
             || record.state != ReservationState::Tombstone
         {
@@ -4758,17 +5397,21 @@ pub(crate) fn prepare_production_retirement(
         rows.push(ProductionRowCas {
             binding: *binding,
             expected: Some(record.clone()),
+            expected_canonical: None,
             replacement: None,
+            replacement_canonical: None,
         });
         previous_binding = Some(*binding);
     }
-    let final_batch = selected_prefix.final_batch;
-    let cursor_cas = if final_batch {
-        Some(ProductionRetirementCursorCas {
-            key: previous_key,
+    let cursor_cas = if selected_prefix.final_batch {
+        if let Some(existing) = existing_retirement_cursor {
+            next_counters = counters_without_retirement_cursor(next_counters, existing)?;
+        }
+        ProductionRetirementCursorCas {
+            key,
             expected: existing_retirement_cursor.cloned(),
             replacement: None,
-        })
+        }
     } else {
         let advanced =
             cursor.advance_through(rows.last().ok_or(ReservationError::FloorAdvance)?.binding)?;
@@ -4776,42 +5419,155 @@ pub(crate) fn prepare_production_retirement(
             next_counters = counters_without_retirement_cursor(next_counters, existing)?;
         }
         next_counters = counters_with_retirement_cursor(next_counters, &advanced)?;
-        Some(ProductionRetirementCursorCas {
-            key: previous_key,
+        ProductionRetirementCursorCas {
+            key,
             expected: existing_retirement_cursor.cloned(),
             replacement: Some(advanced),
-        })
+        }
     };
-    if final_batch {
-        if let Some(existing) = existing_retirement_cursor {
-            next_counters = counters_without_retirement_cursor(next_counters, existing)?;
+    if selected_prefix.final_batch {
+        next_counters = counters_without_production_floor(next_counters, previous_floor)?;
+        if !selected_prefix.partition_empty_after {
+            next_counters = counters_with_production_floor(next_counters, next_floor)?;
         }
     }
     let next = witness.with_roster(next_counters);
     next.admits(budget)?;
     Ok(PreparedProductionTransaction {
+        rows,
         previous: witness,
         next,
-        floor: final_batch.then_some(ProductionFloorCas {
-            key: previous_key,
+        floor: selected_prefix.final_batch.then_some(ProductionFloorCas {
+            key,
             expected: Some(previous_floor),
-            replacement: next_floor,
+            replacement: (!selected_prefix.partition_empty_after).then_some(next_floor),
         }),
-        retirement_cursor: cursor_cas,
-        partition_guard: Some(range_guard),
+        retirement_cursor: Some(cursor_cas),
+        released_floors: Vec::new(),
+        released_retirement_cursors: Vec::new(),
+        partition_guard: Some(guard),
+        global_terminal_retirement_guard: None,
         reclaim_oldest_guard: None,
         admission_business_reservation: None,
         business: None,
-        canonical_rows_validated: u32::try_from(rows.len())
+        #[cfg(test)]
+        canonical_rows_validated: u32::try_from(selected_prefix.selected.len())
             .map_err(|_| ReservationError::Arithmetic)?,
-        rows,
     })
 }
 
-struct ProductionTransitionPreparation<'a> {
-    current: Option<&'a ProductionReservationRecord>,
+/// Prepare one globally ordered compact-tombstone retirement prefix.
+///
+/// The caller supplies only rows already selected by the terminal-sequence
+/// index plus any partitions which become empty after this exact prefix.  The
+/// adapter re-proves that it is the complete `min(RECLAIM_BATCH, tombstone
+/// prefix before the first retained terminal)` and that every empty partition
+/// is released.  Consequently this function never scans the whole roster and
+/// Q1/Q2 remain single-row operations; only deterministic maintenance can
+/// advance `retired_terminal_sequence`.
+pub(crate) fn prepare_production_global_terminal_retirement(
+    selected: &[(RequestBindingKey, ProductionReservationRecord)],
+    released_partitions: &[(IrreversibleHistoryFloor, Option<ProductionRetirementCursor>)],
+    witness: GlobalChargeWitness,
+    budget: GlobalChargeBudget,
+    profile: ChargeProfile,
+) -> Result<PreparedProductionRetirement, ReservationError> {
+    witness.admits(budget)?;
+    if selected.is_empty() || selected.len() > RECLAIM_BATCH {
+        return Err(ReservationError::SnapshotMismatch);
+    }
+    let mut next_counters = witness.roster;
+    let mut rows = Vec::with_capacity(selected.len());
+    let mut ordered = Vec::with_capacity(selected.len());
+    let mut selected_partitions = BTreeMap::new();
+    let mut previous_sequence = witness.retired_terminal_sequence();
+    for (binding, record) in selected {
+        if *binding != record.binding
+            || record.state != ReservationState::Tombstone
+            || record
+                .terminal_sequence
+                .is_none_or(|sequence| sequence <= previous_sequence)
+        {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        record.validate(profile)?;
+        let sequence = record
+            .terminal_sequence
+            .ok_or(ReservationError::SnapshotMismatch)?;
+        previous_sequence = sequence;
+        let key = ProductionFloorKey::from_binding(*binding)?;
+        selected_partitions
+            .entry(key)
+            .and_modify(|count| *count += 1_usize)
+            .or_insert(1_usize);
+        next_counters = counters_without_production_record(next_counters, record, profile)?;
+        rows.push(ProductionRowCas {
+            binding: *binding,
+            expected: Some(record.clone()),
+            expected_canonical: None,
+            replacement: None,
+            replacement_canonical: None,
+        });
+        ordered.push((sequence, *binding));
+    }
+    let mut released_floors = Vec::with_capacity(released_partitions.len());
+    let mut released_retirement_cursors = Vec::new();
+    let mut released_keys = Vec::with_capacity(released_partitions.len());
+    for (floor, cursor) in released_partitions {
+        let key = ProductionFloorKey::from_floor(*floor)?;
+        if !selected_partitions.contains_key(&key) {
+            return Err(ReservationError::FloorAdvance);
+        }
+        if released_keys.contains(&key) {
+            return Err(ReservationError::Duplicate);
+        }
+        if let Some(cursor) = cursor {
+            cursor.validate_for_floor(*floor)?;
+            next_counters = counters_without_retirement_cursor(next_counters, cursor)?;
+            released_retirement_cursors.push(ProductionRetirementCursorCas {
+                key,
+                expected: Some(cursor.clone()),
+                replacement: None,
+            });
+        }
+        next_counters = counters_without_production_floor(next_counters, *floor)?;
+        released_floors.push(ProductionFloorCas {
+            key,
+            expected: Some(*floor),
+            replacement: None,
+        });
+        released_keys.push(key);
+    }
+    let guard = ProductionGlobalTerminalRetirementGuard::new(ordered, released_keys)?;
+    let next = witness
+        .with_roster(next_counters)
+        .retire_through_terminal_sequence(previous_sequence)?;
+    next.admits(budget)?;
+    Ok(PreparedProductionTransaction {
+        rows,
+        previous: witness,
+        next,
+        floor: None,
+        retirement_cursor: None,
+        released_floors,
+        released_retirement_cursors,
+        partition_guard: None,
+        global_terminal_retirement_guard: Some(guard),
+        reclaim_oldest_guard: None,
+        admission_business_reservation: None,
+        business: None,
+        #[cfg(test)]
+        canonical_rows_validated: u32::try_from(selected.len())
+            .map_err(|_| ReservationError::Arithmetic)?,
+    })
+}
+
+struct ProductionTransitionPreparation {
+    current: Option<ProductionReservationRecord>,
+    expected_canonical: Option<Vec<u8>>,
     binding: RequestBindingKey,
     replacement: ProductionReservationRecord,
+    replacement_canonical: Option<Vec<u8>>,
     insertion: bool,
     floor: Option<ProductionFloorCas>,
     retirement_cursor: Option<ProductionRetirementCursorCas>,
@@ -4824,12 +5580,14 @@ struct ProductionTransitionPreparation<'a> {
 }
 
 fn prepare_production_transition(
-    transition: ProductionTransitionPreparation<'_>,
+    transition: ProductionTransitionPreparation,
 ) -> Result<PreparedProductionChargeTransition, ReservationError> {
     let ProductionTransitionPreparation {
         current,
+        expected_canonical,
         binding,
         replacement,
+        replacement_canonical,
         insertion,
         floor,
         retirement_cursor,
@@ -4854,21 +5612,105 @@ fn prepare_production_transition(
         return Err(ReservationError::SnapshotMismatch);
     }
     replacement.validate(profile)?;
-    if let Some(current) = current {
+    if let Some(current) = current.as_ref() {
         if current.binding != binding {
             return Err(ReservationError::Unknown);
         }
         current.validate(profile)?;
     }
-    let without_current = match current {
+    prepare_production_transition_prevalidated(ProductionTransitionPreparation {
+        current,
+        expected_canonical,
+        binding,
+        replacement,
+        replacement_canonical,
+        insertion,
+        floor,
+        retirement_cursor,
+        partition_guard,
+        admission_business_reservation,
+        business,
+        witness,
+        budget,
+        profile,
+    })
+}
+
+/// Finish a transition after its row inputs have been fully validated. The
+/// hydrated terminal path reaches this only after deriving and checking the
+/// replacement from its authenticated live payload; legacy/recovery paths
+/// retain the full validation above.
+fn prepare_production_transition_prevalidated(
+    transition: ProductionTransitionPreparation,
+) -> Result<PreparedProductionChargeTransition, ReservationError> {
+    let ProductionTransitionPreparation {
+        current,
+        expected_canonical,
+        binding,
+        replacement,
+        replacement_canonical,
+        insertion,
+        floor,
+        retirement_cursor,
+        partition_guard,
+        admission_business_reservation,
+        business,
+        witness,
+        budget,
+        profile,
+    } = transition;
+    witness.admits(budget)?;
+    if admission_business_reservation.is_some() && business.is_some() {
+        return Err(ReservationError::InvalidState);
+    }
+    if insertion != admission_business_reservation.is_some() {
+        return Err(ReservationError::InvalidState);
+    }
+    if insertion != current.is_none() {
+        return Err(ReservationError::InvalidState);
+    }
+    if replacement.binding != binding {
+        return Err(ReservationError::SnapshotMismatch);
+    }
+    // A fresh Q2 terminal receipt must linearize after the authenticated
+    // closure horizon. This is a fixed comparison against its own committed
+    // sequence, not a roster scan; Q1 has no terminal sequence at all.
+    if replacement
+        .terminal_sequence()
+        .is_some_and(|sequence| sequence <= witness.retired_terminal_sequence())
+    {
+        return Err(ReservationError::SnapshotMismatch);
+    }
+    if current
+        .as_ref()
+        .is_some_and(|current| current.binding != binding)
+    {
+        return Err(ReservationError::Unknown);
+    }
+    if expected_canonical.is_some() && current.is_none() {
+        return Err(ReservationError::InvalidState);
+    }
+    if replacement_canonical.as_ref().is_some_and(|canonical| {
+        canonical.is_empty() || canonical.len() > MAX_PRODUCTION_RECORD_SNAPSHOT_BYTES
+    }) {
+        return Err(ReservationError::CanonicalEncoding);
+    }
+    let without_current = match current.as_ref() {
         Some(current) => counters_without_production_record(witness.roster, current, profile)?,
         None => witness.roster,
     };
     let mut next_counters =
         counters_with_production_record(without_current, &replacement, profile)?;
     if let Some(floor) = floor {
-        if floor.expected.is_none() {
-            next_counters = counters_with_production_floor(next_counters, floor.replacement)?;
+        match (floor.expected, floor.replacement) {
+            (None, Some(replacement)) => {
+                next_counters = counters_with_production_floor(next_counters, replacement)?;
+            }
+            (Some(expected), Some(replacement)) => {
+                next_counters = counters_without_production_floor(next_counters, expected)?;
+                next_counters = counters_with_production_floor(next_counters, replacement)?;
+            }
+            _ => return Err(ReservationError::FloorAdvance),
         }
     }
     if next_counters.live_reservations > MAX_LIVE_ROSTERS {
@@ -4894,17 +5736,23 @@ fn prepare_production_transition(
     Ok(PreparedProductionTransaction {
         rows: vec![ProductionRowCas {
             binding,
-            expected: current.cloned(),
+            expected: current,
+            expected_canonical,
             replacement: Some(replacement),
+            replacement_canonical,
         }],
         previous: witness,
         next,
         floor,
         retirement_cursor,
+        released_floors: Vec::new(),
+        released_retirement_cursors: Vec::new(),
         partition_guard,
+        global_terminal_retirement_guard: None,
         reclaim_oldest_guard: None,
         admission_business_reservation,
         business,
+        #[cfg(test)]
         canonical_rows_validated: 1,
     })
 }
@@ -4921,7 +5769,7 @@ fn counters_with_production_record(
     )
 }
 
-fn counters_with_production_floor(
+pub(crate) fn counters_with_production_floor(
     mut counters: AggregateCounters,
     floor: IrreversibleHistoryFloor,
 ) -> Result<AggregateCounters, ReservationError> {
@@ -4943,6 +5791,28 @@ fn counters_with_production_floor(
         .materialized_charge_bytes
         .checked_add(as_u64(bytes.len())?)
         .ok_or(ReservationError::Arithmetic)?;
+    Ok(counters)
+}
+
+fn counters_without_production_floor(
+    mut counters: AggregateCounters,
+    floor: IrreversibleHistoryFloor,
+) -> Result<AggregateCounters, ReservationError> {
+    let bytes = floor
+        .to_canonical_bytes()
+        .map_err(|_| ReservationError::CanonicalEncoding)?;
+    counters.floor_count = counters
+        .floor_count
+        .checked_sub(1)
+        .ok_or(ReservationError::WitnessMismatch)?;
+    counters.floor_charge_bytes = counters
+        .floor_charge_bytes
+        .checked_sub(as_u64(bytes.len())?)
+        .ok_or(ReservationError::WitnessMismatch)?;
+    counters.materialized_charge_bytes = counters
+        .materialized_charge_bytes
+        .checked_sub(as_u64(bytes.len())?)
+        .ok_or(ReservationError::WitnessMismatch)?;
     Ok(counters)
 }
 
@@ -5027,18 +5897,35 @@ fn production_record_charges(
     profile: ChargeProfile,
 ) -> Result<Charges, ReservationError> {
     match record.state {
-        ReservationState::Live => {
-            profile.charge(production_components(&record.admission, None, None)?)
-        }
+        ReservationState::Live => profile.charge(production_components(
+            &record.admission,
+            None,
+            None,
+            if record.admission_provenance.is_empty() {
+                0
+            } else {
+                MAX_COMPACT_PROVENANCE_BYTES
+            },
+        )?),
         ReservationState::Retained => profile.charge(production_components(
             &record.admission,
             record.terminal.as_deref(),
             None,
+            record
+                .admission_provenance
+                .len()
+                .checked_add(record.terminal_evidence.as_ref().map_or(0, Vec::len))
+                .ok_or(ReservationError::Arithmetic)?,
         )?),
         ReservationState::Tombstone => profile.charge(production_components(
             &[],
             None,
             record.tombstone.as_deref(),
+            record
+                .admission_provenance
+                .len()
+                .checked_add(record.terminal_evidence.as_ref().map_or(0, Vec::len))
+                .ok_or(ReservationError::Arithmetic)?,
         )?),
     }
 }
@@ -5073,6 +5960,12 @@ fn add3(first: u64, second: u64, third: u64) -> Result<u64, ReservationError> {
     first
         .checked_add(second)
         .and_then(|value| value.checked_add(third))
+        .ok_or(ReservationError::Arithmetic)
+}
+
+fn add2(first: u64, second: u64) -> Result<u64, ReservationError> {
+    first
+        .checked_add(second)
         .ok_or(ReservationError::Arithmetic)
 }
 
@@ -5191,7 +6084,7 @@ pub(crate) enum ReservationError {
     Unknown,
     /// The lifecycle transition does not match the durable state.
     InvalidState,
-    /// A retained record has not reached the frozen reclaim age.
+    /// A terminal row has not reached the fixed retention age.
     NotEligible,
     /// A maintenance timestamp was not derived from the supported consensus clock.
     InvalidMaintenanceTime,
@@ -5227,7 +6120,7 @@ impl fmt::Display for ReservationError {
             Self::Duplicate => "duplicate reservation identity",
             Self::Unknown => "reservation identity is unavailable",
             Self::InvalidState => "reservation lifecycle transition is invalid",
-            Self::NotEligible => "retained reservation is not reclaim eligible",
+            Self::NotEligible => "terminal reservation is not eligible for reclaim",
             Self::InvalidMaintenanceTime => "maintenance timestamp is invalid",
             Self::InvalidEpoch => "reservation epoch is invalid",
             Self::SnapshotMismatch => "reservation snapshot validation failed",

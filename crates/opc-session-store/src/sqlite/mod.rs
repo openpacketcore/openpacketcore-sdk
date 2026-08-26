@@ -9,24 +9,24 @@
 //! is the only mutation and read-authority path.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "test-vfs")]
 use std::sync::Condvar;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use rusqlite::{
-    params, Connection, InterruptHandle, OptionalExtension, Transaction, TransactionBehavior,
+    Connection, InterruptHandle, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
 use crate::consensus::store::ConsensusStoreDiagnosticCounters;
 use crate::{
     backend::{
-        validate_replication_log_page_owned, validate_replication_prefix_owned,
-        validate_session_ops_at, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
-        ReplicationEntry, ReplicationLogRange, ReplicationWatchCursor, SessionBackend, SessionOp,
-        SessionOpResult, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
+        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, REPLICATION_TX_ID_MAX_BYTES,
+        REPLICATION_TX_ID_MIN_BYTES, ReplicationEntry, ReplicationLogRange, ReplicationWatchCursor,
+        SessionBackend, SessionOp, SessionOpResult, validate_replication_log_page_owned,
+        validate_replication_prefix_owned, validate_session_ops_at,
     },
     capability::BackendCapabilities,
     clock::Clock,
@@ -35,7 +35,7 @@ use crate::{
     model::{OwnerId, SessionKey},
     record::{SessionPayloadEncoding, StoredSessionRecord},
     replication_watch::{
-        prepare_watch_registration, watch_backlog_query_limit, ReplicationWatcher,
+        ReplicationWatcher, prepare_watch_registration, watch_backlog_query_limit,
     },
     restore::{RestoreScanPage, RestoreScanRequest},
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
@@ -43,6 +43,19 @@ use crate::{
 
 pub mod audit;
 pub(crate) mod consensus;
+
+/// Non-production consensus timing hooks for deterministic integration tests.
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub mod test_support {
+    pub use super::consensus::{
+        ProtectedRosterTerminalApplyTimings,
+        protected_roster_terminal_apply_timing_test_guard,
+        protected_roster_terminal_apply_timings_for_test,
+        reset_protected_roster_terminal_apply_timings_for_test,
+    };
+}
+
 pub(crate) mod lease;
 pub(crate) mod ops;
 pub(crate) mod replication;
@@ -1907,15 +1920,16 @@ impl SqliteSessionBackend {
         .await
     }
 
-    /// Read one exact original protected-roster admission and the effective
+    /// Read one exact immutable protected-roster admission and the effective
     /// authority time under one backend lock after a caller-owned linearizable
-    /// barrier. This path never allocates a consensus request or advances
-    /// logical time.
+    /// barrier. The current authority may be the original live lease or a
+    /// strictly higher-fence successor; this path never allocates a consensus
+    /// request or advances logical time.
     pub(crate) async fn consensus_protected_roster_admission_status(
         &self,
         identity: crate::consensus::SessionConsensusIdentity,
         admission: crate::fenced_mutation_roster::Admission,
-        original_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
+        current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
         wall_time_floor: opc_types::Timestamp,
     ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
@@ -1930,7 +1944,7 @@ impl SqliteSessionBackend {
                 conn,
                 identity,
                 &admission,
-                &original_authority,
+                &current_authority,
                 logical_time,
             )?;
             Ok((read, logical_time))
@@ -1978,6 +1992,7 @@ impl SqliteSessionBackend {
         registration_parts: ([u8; 32], crate::fenced_mutation_roster::RequestId, [u8; 32]),
         current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
         terminal_body_commitment: [u8; 32],
+        terminal_evidence: crate::fenced_mutation_roster::RosterCompactTerminalEvidenceV2,
         wall_time_floor: opc_types::Timestamp,
     ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
@@ -1995,9 +2010,39 @@ impl SqliteSessionBackend {
                 registration_parts,
                 &current_authority,
                 terminal_body_commitment,
+                &terminal_evidence,
                 logical_time,
             )?;
             Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Resolve one complete Established publication identity and current
+    /// authority under one SQLite read task after the caller's linearizable
+    /// barrier.  This is intentionally read-only: it neither proposes nor
+    /// retains a consumer receipt.
+    pub(crate) async fn consensus_protected_roster_current_publication_authority(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        request: crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<opc_types::Timestamp, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            consensus::read_protected_roster_current_publication_authority_sync(
+                conn,
+                identity,
+                &request,
+                logical_time,
+            )?;
+            Ok(logical_time)
         })
         .await
     }
@@ -3480,8 +3525,8 @@ mod operation_lifetime_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn file_backed_consensus_acceptance_reader_pool_admits_unrelated_probes_and_uses_fresh_snapshots(
-    ) {
+    async fn file_backed_consensus_acceptance_reader_pool_admits_unrelated_probes_and_uses_fresh_snapshots()
+     {
         let directory = tempfile::tempdir().expect("SQLite acceptance-reader directory");
         let path = directory.path().join("store.sqlite");
         let backend = SqliteSessionBackend::open(&path).expect("SQLite backend");
@@ -4186,7 +4231,7 @@ mod consensus_readiness_deadline_tests {
     use std::collections::BTreeMap;
 
     use opc_consensus::{
-        derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+        ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity, derive_configuration_id,
     };
 
     use super::*;

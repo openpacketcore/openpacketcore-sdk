@@ -9,22 +9,23 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 use crate::{
+    FenceToken, Generation, OwnerId, SessionKey, Timestamp,
     consumer::{
         SessionConsumerRosterAdmissionCapsule, SessionConsumerRosterRejection,
         SessionConsumerRosterTerminalCapsule, SessionConsumerScope,
     },
     fenced_mutation_roster::{
-        decode_frame, encode_frame, roster_ingress_capsule_commitment, Admission,
-        RequestBindingKey, RequestId, RosterExecutorProofBundleV1, RosterId, Scope,
-        TerminalConflictTombstone, TerminalRecord, MAX_ADMISSION_CODEC_BYTES,
-        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES,
-        MAX_TOMBSTONE_CODEC_BYTES,
+        Admission, MAX_ADMISSION_CODEC_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES,
+        MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
+        MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES, RequestBindingKey, RequestId,
+        RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceV2,
+        RosterExecutorProofBundleV1, RosterId, Scope, TerminalConflictTombstone, TerminalRecord,
+        decode_frame, encode_frame, roster_ingress_capsule_commitment,
     },
     fenced_mutation_roster_executor::{
         AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration, BackendRejection,
         CommittedTerminal, RecoveryRequest, RegistrationRequest, TerminalBody,
     },
-    FenceToken, Generation, OwnerId, SessionKey, Timestamp,
 };
 
 const ADMISSION_REQUEST_MAGIC: [u8; 8] = *b"OPCRPA1\0";
@@ -39,8 +40,6 @@ const TERMINAL_REQUEST_DOMAIN: &[u8] =
     b"openpacketcore/protected-roster/terminal-port/request/v1\0";
 const TERMINAL_RESPONSE_DOMAIN: &[u8] =
     b"openpacketcore/protected-roster/terminal-port/response/v1\0";
-const TOMBSTONE_FRAME_MAGIC: [u8; 8] = *b"OPCRTB1\0";
-const TOMBSTONE_FRAME_DOMAIN: &[u8] = b"opc/session-store/protected-roster/tombstone-frame/v1\0";
 const SCOPE_DOMAIN: &[u8] = b"openpacketcore/protected-roster/consumer-scope/v1\0";
 
 /// Reserved deterministic envelope allowance around canonical roster bodies.
@@ -53,12 +52,14 @@ pub(crate) const MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES: usize = 512;
 /// Maximum admission-family capsule, including a terminal recovery reply.
 pub(crate) const MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES: usize = MAX_ADMISSION_CODEC_BYTES
     + MAX_COMMITTED_TERMINAL_CODEC_BYTES
+    + MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES
     + MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES;
 
 /// Maximum terminal-family capsule, including the committed terminal reply.
 pub(crate) const MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES: usize =
     MAX_COMMITTED_TERMINAL_CODEC_BYTES
         + MAX_EXECUTOR_PROOF_BUNDLE_BYTES
+        + MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES
         + MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES;
 
 /// Fixed redaction-safe failure from the protected-roster client transport.
@@ -190,6 +191,8 @@ enum AdmissionRequestWire {
     Recover {
         scope: [u8; 32],
         roster_id: RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
         authority: AuthorityWire,
     },
 }
@@ -199,21 +202,22 @@ enum AdmissionResponseWire {
     Fresh {
         scope: [u8; 32],
         registration: RegistrationWire,
+        admission_provenance: Vec<u8>,
     },
-    // This producer does not emit the legacy replay response, but its
-    // revision-five discriminant is part of the persistent /3 wire ABI.
-    #[allow(dead_code)]
+    // Its revision-five discriminant is part of the persistent /3 wire ABI.
     Replayed { scope: [u8; 32] },
     PollAdmitted {
         scope: [u8; 32],
         registration: RegistrationWire,
         admission: Vec<u8>,
+        admission_provenance: Vec<u8>,
     },
     Terminal {
         scope: [u8; 32],
         registration: RegistrationWire,
         admission: Vec<u8>,
         committed: Vec<u8>,
+        admission_provenance: Vec<u8>,
     },
     Compacted {
         scope: [u8; 32],
@@ -237,6 +241,7 @@ struct TerminalRequestWire {
     authority: AuthorityWire,
     record: Vec<u8>,
     proof_bundle: Vec<u8>,
+    terminal_evidence: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -292,6 +297,7 @@ pub(crate) fn roster_terminal_ingress_capsule_commitment(
     terminal: &TerminalRecord,
     admission: &Admission,
     proof_bundle: &RosterExecutorProofBundleV1,
+    terminal_evidence: &RosterCompactTerminalEvidenceV2,
 ) -> Result<[u8; 32], ()> {
     let wire = TerminalRequestWire {
         scope: authority.scope().digest(),
@@ -300,6 +306,7 @@ pub(crate) fn roster_terminal_ingress_capsule_commitment(
         authority: authority.into(),
         record: terminal.to_canonical_bytes(admission).map_err(|_| ())?,
         proof_bundle: proof_bundle.canonical_bytes().map_err(|_| ())?,
+        terminal_evidence: terminal_evidence.canonical_bytes().map_err(|_| ())?,
     };
     roster_ingress_capsule_commitment(4, &encode_terminal_request(&wire)?).map_err(|_| ())
 }
@@ -378,6 +385,14 @@ fn admission_bytes_for_consumer_scope(
         .map_err(|_| ProtectedRosterTransportError)
 }
 
+fn admission_provenance_bytes(
+    provenance: &RosterCompactAdmissionProvenanceV2,
+) -> Result<Vec<u8>, ProtectedRosterTransportError> {
+    provenance
+        .canonical_bytes()
+        .map_err(|_| ProtectedRosterTransportError)
+}
+
 fn admission_response_capsule(
     wire: AdmissionResponseWire,
 ) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
@@ -403,10 +418,23 @@ fn terminal_response_capsule(
 pub(crate) fn encode_admission_fresh_response(
     consumer_scope: SessionConsumerScope,
     registration: BackendRegistration,
+    admission_provenance: &RosterCompactAdmissionProvenanceV2,
 ) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
     admission_response_capsule(AdmissionResponseWire::Fresh {
         scope: response_scope(consumer_scope),
         registration: RegistrationWire::from_registration(registration),
+        admission_provenance: admission_provenance_bytes(admission_provenance)?,
+    })
+}
+
+/// Encode an admitted stable-slot replay without issuing an execution
+/// capability. The consumer must use the authenticated recovery read path.
+#[doc(hidden)]
+pub(crate) fn encode_admission_replayed_response(
+    consumer_scope: SessionConsumerScope,
+) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
+    admission_response_capsule(AdmissionResponseWire::Replayed {
+        scope: response_scope(consumer_scope),
     })
 }
 
@@ -416,11 +444,13 @@ pub(crate) fn encode_admission_poll_admitted_response(
     consumer_scope: SessionConsumerScope,
     registration: BackendRegistration,
     admission: &Admission,
+    admission_provenance: &RosterCompactAdmissionProvenanceV2,
 ) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
     admission_response_capsule(AdmissionResponseWire::PollAdmitted {
         scope: response_scope(consumer_scope),
         registration: RegistrationWire::from_registration(registration),
         admission: admission_bytes_for_consumer_scope(consumer_scope, admission)?,
+        admission_provenance: admission_provenance_bytes(admission_provenance)?,
     })
 }
 
@@ -431,6 +461,7 @@ pub(crate) fn encode_admission_terminal_response(
     registration: BackendRegistration,
     admission: &Admission,
     committed: &CommittedTerminal,
+    admission_provenance: &RosterCompactAdmissionProvenanceV2,
 ) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
     admission_response_capsule(AdmissionResponseWire::Terminal {
         scope: response_scope(consumer_scope),
@@ -439,6 +470,7 @@ pub(crate) fn encode_admission_terminal_response(
         committed: committed
             .to_canonical_bytes(admission)
             .map_err(|_| ProtectedRosterTransportError)?,
+        admission_provenance: admission_provenance_bytes(admission_provenance)?,
     })
 }
 
@@ -593,6 +625,8 @@ pub(crate) fn decode_admission_request_for_scope(
         AdmissionRequestWire::Recover {
             scope: actual,
             roster_id,
+            original_owner,
+            original_admission_fence,
             authority,
         } => {
             expect_scope(actual, scope).map_err(|_| ProtectedRosterTransportError)?;
@@ -602,6 +636,8 @@ pub(crate) fn decode_admission_request_for_scope(
             let request = RecoveryRequest::new_with_lease_metadata(
                 scope,
                 roster_id,
+                original_owner,
+                original_admission_fence,
                 authority.key().clone(),
                 authority.owner().clone(),
                 authority.fence(),
@@ -682,6 +718,12 @@ pub(crate) fn decode_terminal_request_for_scope(
             .map_err(|_| ProtectedRosterTransportError)?
             .canonical_bytes()
             .map_err(|_| ProtectedRosterTransportError)?,
+        terminal_evidence: RosterCompactTerminalEvidenceV2::decode_canonical(
+            &wire.terminal_evidence,
+        )
+        .map_err(|_| ProtectedRosterTransportError)?
+        .canonical_bytes()
+        .map_err(|_| ProtectedRosterTransportError)?,
     })
 }
 
@@ -693,6 +735,7 @@ pub(crate) struct DecodedTerminalRequest {
     authority: AuthorityBinding,
     record: Vec<u8>,
     proof_bundle: Vec<u8>,
+    terminal_evidence: Vec<u8>,
 }
 
 impl DecodedTerminalRequest {
@@ -732,6 +775,15 @@ impl DecodedTerminalRequest {
         &self,
     ) -> Result<RosterExecutorProofBundleV1, ProtectedRosterTransportError> {
         RosterExecutorProofBundleV1::decode_canonical(&self.proof_bundle)
+            .map_err(|_| ProtectedRosterTransportError)
+    }
+
+    /// Decode the direct per-member compact terminal evidence.  The raw V1
+    /// bundle remains available only for the initial correspondence check.
+    pub(crate) fn terminal_evidence(
+        &self,
+    ) -> Result<RosterCompactTerminalEvidenceV2, ProtectedRosterTransportError> {
+        RosterCompactTerminalEvidenceV2::decode_canonical(&self.terminal_evidence)
             .map_err(|_| ProtectedRosterTransportError)
     }
 
@@ -776,53 +828,15 @@ impl DecodedTerminalRequest {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct TerminalConflictTombstoneWire {
-    binding_key: RequestBindingKey,
-    admission_body_commitment: [u8; 32],
-    terminal_body_commitment: [u8; 32],
-    admission_fence: u64,
-    expected_generation: u64,
-    phase_tag: u8,
-}
-
-/// Extract the immutable terminal-body commitment from a canonical compacted
-/// tombstone without exposing a tombstone constructor or raw server response.
-pub(crate) fn compacted_terminal_body_commitment(
-    tombstone: TerminalConflictTombstone,
-) -> Result<[u8; 32], ProtectedRosterTransportError> {
-    let bytes = tombstone
-        .to_canonical_bytes()
-        .map_err(|_| ProtectedRosterTransportError)?;
-    let wire: TerminalConflictTombstoneWire = decode_frame(
-        &bytes,
-        TOMBSTONE_FRAME_MAGIC,
-        TOMBSTONE_FRAME_DOMAIN,
-        MAX_TOMBSTONE_CODEC_BYTES,
-    )
-    .map_err(|_| ProtectedRosterTransportError)?;
-    if encode_frame(
-        TOMBSTONE_FRAME_MAGIC,
-        TOMBSTONE_FRAME_DOMAIN,
-        &wire,
-        MAX_TOMBSTONE_CODEC_BYTES,
-    )
-    .map_err(|_| ProtectedRosterTransportError)?
-        != bytes
-        || wire.terminal_body_commitment == [0; 32]
-    {
-        return Err(ProtectedRosterTransportError);
-    }
-    Ok(wire.terminal_body_commitment)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusIdentity,
+        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionKeyType, StableId,
     };
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId};
 
     fn consumer_scope(configuration: u8, epoch: u64) -> SessionConsumerScope {
         SessionConsumerScope::new(SessionConsensusIdentity::new(
@@ -840,11 +854,81 @@ mod tests {
     }
 
     #[test]
+    fn recovery_wire_keeps_original_tuple_distinct_from_current_successor() {
+        let consumer_scope = consumer_scope(0xB6, 10);
+        let scope = protected_roster_scope_from_consumer_scope(consumer_scope);
+        let original_owner = OwnerId::new("recovery-original-owner").expect("owner");
+        let original_fence = FenceToken::new(7);
+        let acquired_at = Timestamp::now_utc();
+        let expires_at = acquired_at.add_seconds(60).expect("lease expiry");
+        let key = SessionKey {
+            tenant: TenantId::from_static("recovery-wire-tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from_static(b"recovery-wire-key"))
+                .expect("stable ID"),
+        };
+        let authority = AuthorityWire {
+            key,
+            owner: OwnerId::new("recovery-successor-owner").expect("successor owner"),
+            fence: FenceToken::new(8),
+            credential_id: 11,
+            generation: Generation::new(3),
+            acquired_at,
+            expires_at,
+        };
+        let wire = AdmissionRequestWire::Recover {
+            scope: scope.digest(),
+            roster_id: RosterId::from_bytes([0xB7; 16]).expect("roster ID"),
+            original_owner: original_owner.clone(),
+            original_admission_fence: original_fence,
+            authority,
+        };
+        let capsule = SessionConsumerRosterAdmissionCapsule::new(
+            encode_admission_request(&wire).expect("canonical recovery request"),
+        )
+        .expect("recovery capsule");
+        let DecodedAdmissionRequest::Recover(decoded) =
+            decode_admission_request_for_scope(&capsule, consumer_scope)
+                .expect("strictly newer recovery request")
+        else {
+            panic!("recovery wire must remain a recovery request");
+        };
+        assert_eq!(decoded.original_owner(), &original_owner);
+        assert_eq!(decoded.original_admission_fence(), original_fence);
+        assert!(decoded.authority().fence() > decoded.original_admission_fence());
+
+        let non_successor = AdmissionRequestWire::Recover {
+            scope: scope.digest(),
+            roster_id: RosterId::from_bytes([0xB7; 16]).expect("roster ID"),
+            original_owner,
+            original_admission_fence: original_fence,
+            authority: AuthorityWire {
+                key: decoded.authority().key().clone(),
+                owner: decoded.authority().owner().clone(),
+                fence: original_fence,
+                credential_id: decoded.authority().credential_id(),
+                generation: decoded.authority().generation(),
+                acquired_at,
+                expires_at,
+            },
+        };
+        let capsule = SessionConsumerRosterAdmissionCapsule::new(
+            encode_admission_request(&non_successor).expect("canonical non-successor request"),
+        )
+        .expect("non-successor capsule");
+        assert!(
+            decode_admission_request_for_scope(&capsule, consumer_scope).is_err(),
+            "an equal current fence is rejected before any durable lookup"
+        );
+    }
+
+    #[test]
     fn revision_five_response_discriminants_remain_frozen() {
         let scope = [0xB2; 32];
 
-        // Replayed and Reject are intentionally producer-unused. Their
-        // reserved positions bracket the active recovery responses:
+        // Reject is intentionally producer-unused. The revision-five replay
+        // position remains between Fresh and the active recovery responses:
         // PollAdmitted=2, Terminal=3, and Compacted=4.
         assert_eq!(
             postcard_variant_tag(&AdmissionResponseWire::Replayed { scope }),
@@ -902,6 +986,33 @@ mod tests {
     }
 
     #[test]
+    fn admission_replayed_response_is_canonical_and_scope_bound() {
+        let scope = consumer_scope(0xB3, 8);
+        let capsule = encode_admission_replayed_response(scope).expect("bounded response");
+        let decoded: AdmissionResponseWire = decode_frame(
+            capsule.canonical_bytes(),
+            ADMISSION_RESPONSE_MAGIC,
+            ADMISSION_RESPONSE_DOMAIN,
+            MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+        )
+        .expect("canonical response decodes");
+        assert_eq!(
+            encode_admission_response(&decoded).expect("response reencodes"),
+            capsule.canonical_bytes(),
+        );
+        assert!(
+            expect_scope(
+                match decoded {
+                    AdmissionResponseWire::Replayed { scope } => scope,
+                    _ => unreachable!("encoded replay response"),
+                },
+                protected_roster_scope_from_consumer_scope(consumer_scope(0xB4, 8)),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn terminal_response_is_exactly_canonical_and_scope_bound() {
         let scope = consumer_scope(0xB3, 8);
         let capsule = encode_terminal_admitted_response(scope).expect("bounded response");
@@ -916,14 +1027,16 @@ mod tests {
             encode_terminal_response(&decoded).expect("response reencodes"),
             capsule.canonical_bytes(),
         );
-        assert!(expect_scope(
-            match decoded {
-                TerminalResponseWire::Admitted { scope } => scope,
-                _ => unreachable!("encoded admitted response"),
-            },
-            protected_roster_scope_from_consumer_scope(consumer_scope(0xB4, 8)),
-        )
-        .is_err());
+        assert!(
+            expect_scope(
+                match decoded {
+                    TerminalResponseWire::Admitted { scope } => scope,
+                    _ => unreachable!("encoded admitted response"),
+                },
+                protected_roster_scope_from_consumer_scope(consumer_scope(0xB4, 8)),
+            )
+            .is_err()
+        );
     }
 
     #[test]
