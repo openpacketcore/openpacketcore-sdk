@@ -2145,7 +2145,7 @@ fn collect_cache_changes(
                 if &expected_record.key != key {
                     return Err(FencedOwnershipError::InvalidRecord);
                 }
-                match successor {
+                match &**successor {
                     ProtectedRosterEstablishedSuccessor::Put { record } => {
                         if &record.key != key {
                             return Err(FencedOwnershipError::InvalidRecord);

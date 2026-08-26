@@ -3049,7 +3049,7 @@ pub(crate) fn session_consumer_change(
                 // authoritative row effect without exposing the guard or any
                 // roster proof material. Aborted terminals and retained
                 // replays never construct this replication operation.
-                let kind = match successor {
+                let kind = match &**successor {
                     ProtectedRosterEstablishedSuccessor::Put { .. }
                     | ProtectedRosterEstablishedSuccessor::NoOp => {
                         SessionConsumerChangeKind::RecordWritten

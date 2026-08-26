@@ -696,7 +696,7 @@ impl FakeSessionBackend {
                     return Err(StoreError::CasConflict);
                 }
 
-                match successor {
+                match *successor {
                     ProtectedRosterEstablishedSuccessor::Put { record } => {
                         if record.key != key
                             || record.expires_at.is_some()
@@ -706,7 +706,7 @@ impl FakeSessionBackend {
                         {
                             return Err(StoreError::CasConflict);
                         }
-                        state.records.insert(mk.clone(), record);
+                        state.records.insert(mk.clone(), *record);
                     }
                     ProtectedRosterEstablishedSuccessor::Delete => {
                         if state.records.remove(&mk).is_none() {

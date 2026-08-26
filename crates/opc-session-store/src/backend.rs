@@ -1016,7 +1016,7 @@ pub enum ReplicationOp {
         expected_record: StoredSessionRecord,
         /// Explicit Established-only materialization; an aborted terminal is
         /// never represented in the replication journal.
-        successor: ProtectedRosterEstablishedSuccessor,
+        successor: Box<ProtectedRosterEstablishedSuccessor>,
         /// Current authenticated execution owner, which may differ from the
         /// immutable `expected_record.owner` after a fenced takeover.
         owner: OwnerId,
@@ -1047,7 +1047,7 @@ pub enum ProtectedRosterEstablishedSuccessor {
     /// Install this exact authoritative successor.
     Put {
         /// Exact immutable-provenance successor to install after the CAS.
-        record: StoredSessionRecord,
+        record: Box<StoredSessionRecord>,
     },
     /// Delete the exact admitted row while retaining the execution fence.
     Delete,
@@ -1158,7 +1158,7 @@ impl ReplicationOp {
                     ..
                 } => {
                     validate_stored_record_expiry_at(expected_record, reference_timestamp)?;
-                    if let ProtectedRosterEstablishedSuccessor::Put { record } = successor {
+                    if let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor {
                         validate_stored_record_expiry_at(record, reference_timestamp)?;
                     }
                 }
