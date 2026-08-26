@@ -37,11 +37,6 @@ jobs:
   conformance:
     name: Kernel-independent conformance
     runs-on: ubuntu-latest
-    env:
-      # The protected-roster lane drives a real three-voter snapshot past the
-      # production compaction threshold. Preserve that threshold and every
-      # caller deadline while avoiding unoptimized test code as runner noise.
-      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -66,11 +61,17 @@ jobs:
       - name: Run conformance tests
         run: |
           set -euo pipefail
-          timing_contracts=(
+          ordinary_timing_contracts=(
             persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum
+            persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction
+            persistent_three_voter_first_transition_has_one_leader_activation_proof
+            persistent_three_voter_protected_roster_survives_real_os_process_loss
+          )
+          optimized_roster_contracts=(
             persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal
             persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart
           )
+          timing_contracts=("${ordinary_timing_contracts[@]}" "${optimized_roster_contracts[@]}")
           skips=()
           for timing_contract in "${timing_contracts[@]}"; do
             skips+=(--skip "$timing_contract")
@@ -85,8 +86,19 @@ jobs:
             --test-threads=4 \
             --exact \
             "${skips[@]}"
-          for timing_contract in "${timing_contracts[@]}"; do
+          for timing_contract in "${ordinary_timing_contracts[@]}"; do
             cargo test --locked \
+              -p opc-session-net \
+              --all-features \
+              --quiet \
+              --test stateless_quorum_consumer \
+              -- \
+              --test-threads=1 \
+              --exact \
+              "$timing_contract"
+          done
+          for timing_contract in "${optimized_roster_contracts[@]}"; do
+            env CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo test --locked \
               -p opc-session-net \
               --all-features \
               --quiet \
