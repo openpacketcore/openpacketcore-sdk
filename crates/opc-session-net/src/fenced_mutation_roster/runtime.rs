@@ -10,18 +10,19 @@
 
 use super::{
     canonical::{
-        Admission, COMMITTED_TERMINAL_FRAME_DOMAIN, COMMITTED_TERMINAL_FRAME_MAGIC,
-        EstablishedPublicationCall, MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_PLAN_BYTES,
-        MAX_STATUS_BYTES, Member, MemberCall, MemberProvider, PROOF_BINDING_DOMAIN,
-        PROOF_CREDENTIAL_DOMAIN, PROOF_DESCRIPTOR_DOMAIN, PROOF_DOMAIN, PROOF_OWNER_DOMAIN,
-        PROVIDER_OPERATION_ADOPT_TAG, PROVIDER_OPERATION_COMPENSATE_TAG,
-        PROVIDER_OPERATION_EXECUTE_TAG, PROVIDER_OPERATION_PREPARE_TAG,
-        PROVIDER_OPERATION_RECONCILE_TAG, PROVIDER_OPERATION_STATUS_TAG,
-        PROVIDER_SCHEDULING_DOMAIN, Phase, ProviderCallOutcome, ProviderCallOutcomeParts,
-        ProviderOutcome, ProviderReceipt, ProviderReceiptChallenge, RequestId, RosterId, Scope,
+        decode_frame, encode_frame, session_key_canonical_digest_input, Admission,
+        CompactedTerminalLookup, EstablishedPublicationCall, Member, MemberCall, MemberProvider,
+        Phase, ProviderCallOutcome, ProviderCallOutcomeParts, ProviderOutcome, ProviderReceipt,
+        ProviderReceiptChallenge, RequestId, RosterId, Scope, TerminalConflictTombstone,
+        TerminalRecord, TerminalSlotId, COMMITTED_TERMINAL_FRAME_DOMAIN,
+        COMMITTED_TERMINAL_FRAME_MAGIC, MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_PLAN_BYTES,
+        MAX_STATUS_BYTES, PROOF_BINDING_DOMAIN, PROOF_CREDENTIAL_DOMAIN, PROOF_DESCRIPTOR_DOMAIN,
+        PROOF_DOMAIN, PROOF_OWNER_DOMAIN, PROVIDER_OPERATION_ADOPT_TAG,
+        PROVIDER_OPERATION_COMPENSATE_TAG, PROVIDER_OPERATION_EXECUTE_TAG,
+        PROVIDER_OPERATION_PREPARE_TAG, PROVIDER_OPERATION_RECONCILE_TAG,
+        PROVIDER_OPERATION_STATUS_TAG, PROVIDER_SCHEDULING_DOMAIN,
         TERMINAL_COMMITTING_GUARD_DOMAIN, TERMINAL_RECEIPT_COMMITMENT_DOMAIN,
-        TERMINAL_RECORD_COMMITMENT_DOMAIN, TerminalConflictTombstone, TerminalRecord,
-        TerminalSlotId, decode_frame, encode_frame, session_key_canonical_digest_input,
+        TERMINAL_RECORD_COMMITMENT_DOMAIN,
     },
     diagnostics::{
         Counter as DiagnosticsCounter, Latency as DiagnosticsLatency, RosterDiagnostics,
@@ -31,14 +32,14 @@ use super::{
 };
 use async_trait::async_trait;
 use opc_session_store::fenced_mutation_roster::{
-    RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
-    RosterAttestationLeafCertificateV1, RosterAttestationTrustRootV1,
-    RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceBindingV2,
-    RosterCompactTerminalEvidenceV2, RosterCompactTerminalMemberProjectionV2,
-    RosterCompactTerminalMemberProofPartsV2, RosterCompactTerminalMemberSigningInputV2,
-    RosterExecutorMemberProofPartsV1, RosterExecutorProofBundleV1, RosterProviderOperationV1,
-    RosterProviderOutcomeV1, RosterProviderReceiptSigningInputV1,
-    RosterTerminalAttestationSigningInputV1, verify_roster_provider_receipt_v1,
+    verify_roster_provider_receipt_v1, RosterAttestationCertificateRoleV1,
+    RosterAttestationLeafCertificatePartsV1, RosterAttestationLeafCertificateV1,
+    RosterAttestationTrustRootV1, RosterCompactAdmissionProvenanceV2,
+    RosterCompactTerminalEvidenceBindingV2, RosterCompactTerminalEvidenceV2,
+    RosterCompactTerminalMemberProjectionV2, RosterCompactTerminalMemberProofPartsV2,
+    RosterCompactTerminalMemberSigningInputV2, RosterExecutorMemberProofPartsV1,
+    RosterExecutorProofBundleV1, RosterProviderOperationV1, RosterProviderOutcomeV1,
+    RosterProviderReceiptSigningInputV1, RosterTerminalAttestationSigningInputV1,
 };
 use opc_session_store::{Clock, FenceToken, Generation, OwnerId, SessionKey, SystemClock};
 use opc_types::Timestamp;
@@ -49,8 +50,8 @@ use std::{
     fmt,
     num::NonZeroUsize,
     sync::{
-        Arc, Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
 };
@@ -1114,69 +1115,109 @@ pub(crate) struct RecoveryRequest {
     authority: AuthorityBinding,
 }
 
-impl RecoveryRequest {
-    #[cfg(test)]
-    pub(crate) fn new(
-        scope: Scope,
-        roster_id: super::canonical::RosterId,
-        original_owner: OwnerId,
-        original_admission_fence: FenceToken,
-        key: SessionKey,
-        owner: OwnerId,
-        fence: FenceToken,
-        credential_id: u64,
-        generation: Generation,
-    ) -> Result<Self, ExecutorError> {
-        let issued_at = Timestamp::now_utc()
-            .add_seconds(-1)
-            .ok_or(ExecutorError::InvalidRegistration)?;
-        Self::new_with_lease_metadata(
-            RecoveryLookup::new(scope, roster_id),
-            original_owner,
-            original_admission_fence,
-            key,
-            owner,
-            fence,
-            credential_id,
-            generation,
-            LeaseMetadata::new(
-                issued_at,
-                issued_at
-                    .add_seconds(60)
-                    .ok_or(ExecutorError::InvalidRegistration)?,
-            ),
-        )
-    }
+/// Complete immutable provenance and current authority for one recovery.
+///
+/// Grouping these values makes the successor-takeover boundary explicit and
+/// prevents recovery construction from pairing a stable lookup with authority
+/// from a different scope, key, or lease.
+pub(crate) struct RecoveryRequestInput {
+    lookup: RecoveryLookup,
+    original_owner: OwnerId,
+    original_admission_fence: FenceToken,
+    authority: AuthorityBinding,
+}
 
-    pub(crate) fn new_with_lease_metadata(
+impl RecoveryRequestInput {
+    /// Assemble one recovery request from its immutable and current parts.
+    pub(crate) fn new(
         lookup: RecoveryLookup,
         original_owner: OwnerId,
         original_admission_fence: FenceToken,
+        authority: AuthorityBinding,
+    ) -> Self {
+        Self {
+            lookup,
+            original_owner,
+            original_admission_fence,
+            authority,
+        }
+    }
+}
+
+/// Current lease authority used to build a recovery request.
+pub(crate) struct RecoveryLeaseAuthority {
+    key: SessionKey,
+    owner: OwnerId,
+    fence: FenceToken,
+    credential_id: u64,
+    generation: Generation,
+    lease: LeaseMetadata,
+}
+
+impl RecoveryLeaseAuthority {
+    /// Assemble the current successor lease authority.
+    pub(crate) fn new(
         key: SessionKey,
         owner: OwnerId,
         fence: FenceToken,
         credential_id: u64,
         generation: Generation,
         lease: LeaseMetadata,
-    ) -> Result<Self, ExecutorError> {
-        let authority = AuthorityBinding::for_recovery(
-            lookup.scope(),
+    ) -> Self {
+        Self {
             key,
             owner,
             fence,
             credential_id,
             generation,
             lease,
-        )?;
-        if original_admission_fence.get() == 0 || authority.fence() <= original_admission_fence {
+        }
+    }
+
+    fn into_authority(self, scope: Scope) -> Result<AuthorityBinding, ExecutorError> {
+        AuthorityBinding::for_recovery(
+            scope,
+            self.key,
+            self.owner,
+            self.fence,
+            self.credential_id,
+            self.generation,
+            self.lease,
+        )
+    }
+}
+
+impl RecoveryRequest {
+    /// Validate one successor-takeover request before its durable lookup.
+    pub(crate) fn new(input: RecoveryRequestInput) -> Result<Self, ExecutorError> {
+        if input.authority.scope() != input.lookup.scope()
+            || input.original_admission_fence.get() == 0
+            || input.authority.fence() <= input.original_admission_fence
+        {
             return Err(ExecutorError::InvalidRegistration);
         }
         Ok(Self {
+            lookup: input.lookup,
+            original_owner: input.original_owner,
+            original_admission_fence: input.original_admission_fence,
+            authority: input.authority,
+        })
+    }
+
+    /// Bind immutable admission provenance to the complete successor lease.
+    pub(crate) fn new_with_lease_metadata(
+        lookup: RecoveryLookup,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
+        authority: RecoveryLeaseAuthority,
+    ) -> Result<Self, ExecutorError> {
+        let authority = authority.into_authority(lookup.scope())?;
+        Self::new(RecoveryRequestInput::new(
             lookup,
             original_owner,
             original_admission_fence,
             authority,
-        })
+        ))
     }
 
     /// Stable durable lookup key; no prior in-memory capability is required.
@@ -1197,6 +1238,23 @@ impl RecoveryRequest {
     /// Current successor authority the backend must validate exactly.
     pub(crate) fn authority(&self) -> &AuthorityBinding {
         &self.authority
+    }
+
+    /// Exact compacted-terminal claim derived from this validated recovery.
+    pub(crate) fn compacted_terminal_lookup(
+        &self,
+        history_epoch: u64,
+    ) -> CompactedTerminalLookup<'_> {
+        CompactedTerminalLookup {
+            history_epoch,
+            scope: self.lookup.scope(),
+            key: self.authority.key(),
+            roster_id: self.lookup.roster_id(),
+            original_owner: &self.original_owner,
+            original_admission_fence: self.original_admission_fence,
+            current_fence: self.authority.fence(),
+            current_generation: self.authority.generation(),
+        }
     }
 }
 
@@ -1675,7 +1733,7 @@ pub(crate) enum Observation {
     Pending,
     ReadyToPrepare,
     PreparedNotRun,
-    Conclusive { receipt: ProviderReceipt },
+    Conclusive { receipt: Box<ProviderReceipt> },
 }
 
 impl fmt::Debug for Observation {
@@ -3147,7 +3205,7 @@ pub(crate) trait RosterExecutorBackend: Send + Sync {
     /// `RecoveryLookup` and the full `Admission` must identify an already-
     /// registered exact body.
     async fn recover(&self, request: &RecoveryRequest)
-    -> Result<RegistrationDecision, Self::Error>;
+        -> Result<RegistrationDecision, Self::Error>;
 
     /// Read one exact terminal slot at a linearizable barrier without mutation.
     async fn terminal_status(
@@ -3358,16 +3416,7 @@ where
         } = decision
         {
             tombstone
-                .validate_lookup(
-                    history_epoch,
-                    request.lookup().scope(),
-                    request.authority().key(),
-                    request.lookup().roster_id(),
-                    request.original_owner(),
-                    request.original_admission_fence(),
-                    request.authority().fence(),
-                    request.authority().generation(),
-                )
+                .validate_lookup(request.compacted_terminal_lookup(history_epoch))
                 .map_err(|_| ExecutorError::AuthorityRejected)?;
             return Ok(RecoveryResult::Compacted);
         }
@@ -4670,7 +4719,12 @@ fn normalize_provider_result<E>(
                     provider_outcome_from_attested(receipt.outcome),
                 ) && receipt.operation == attested_operation(operation) =>
             {
-                (Observation::Conclusive { receipt }, None)
+                (
+                    Observation::Conclusive {
+                        receipt: Box::new(receipt),
+                    },
+                    None,
+                )
             }
             _ => (
                 Observation::OutcomeUnknown,
@@ -4979,12 +5033,12 @@ mod local_authority_registry_tests {
         AdmissionProposal, EstablishedMutation, MemberOperationId, Profile,
     };
     use bytes::Bytes;
-    use opc_consensus::{ConsensusClusterId, ConsensusConfigurationEpoch, derive_configuration_id};
+    use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
     use opc_session_store::{
-        SessionConsensusIdentity, SessionKeyType, StableId,
         fenced_mutation_roster::{
             RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
         },
+        SessionConsensusIdentity, SessionKeyType, StableId,
     };
     use opc_types::{NetworkFunctionKind, TenantId};
 
@@ -4993,16 +5047,14 @@ mod local_authority_registry_tests {
         let proposal = AdmissionProposal::new(
             Profile::v1(),
             RosterId::from_bytes([roster_byte; 16]).expect("nonzero roster ID"),
-            vec![
-                Member::new(
-                    0,
-                    MemberOperationId::from_bytes([roster_byte.wrapping_add(1); 16])
-                        .expect("nonzero member operation ID"),
-                    vec![roster_byte],
-                    1,
-                )
-                .expect("bounded member"),
-            ],
+            vec![Member::new(
+                0,
+                MemberOperationId::from_bytes([roster_byte.wrapping_add(1); 16])
+                    .expect("nonzero member operation ID"),
+                vec![roster_byte],
+                1,
+            )
+            .expect("bounded member")],
             EstablishedMutation::no_op(),
             vec![],
             vec![],
@@ -5261,18 +5313,18 @@ mod production_runtime_cut_matrix_tests {
     };
     use async_trait::async_trait;
     use bytes::Bytes;
-    use opc_consensus::{ConsensusClusterId, ConsensusConfigurationEpoch, derive_configuration_id};
+    use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
     use opc_session_store::{
-        SessionConsensusIdentity, SessionKeyType, StableId,
         fenced_mutation_roster::{
             RosterCompactAdmissionProvenanceSigningInputV2, RosterCompactAdmissionProvenanceV2,
             RosterIngressAttestationSigningInputV1, RosterIngressAttestationV1,
             RosterProviderOperationV1, RosterProviderOutcomeV1,
         },
+        SessionConsensusIdentity, SessionKeyType, StableId,
     };
     use opc_types::{NetworkFunctionKind, TenantId};
-    use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use p256::ecdsa::SigningKey;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn signed_provider_receipt(
@@ -6156,17 +6208,29 @@ mod production_runtime_cut_matrix_tests {
             .expect("registration request")
     }
 
+    fn test_recovery_lease() -> LeaseMetadata {
+        let acquired_at = Timestamp::now_utc()
+            .add_seconds(-1)
+            .expect("test lease acquisition time");
+        LeaseMetadata::new(
+            acquired_at,
+            acquired_at.add_seconds(60).expect("test lease expiry time"),
+        )
+    }
+
     fn successor(request: &RegistrationRequest, fence: u64) -> RecoveryRequest {
-        RecoveryRequest::new(
-            request.admission().scope(),
-            request.admission().roster_id(),
+        RecoveryRequest::new_with_lease_metadata(
+            RecoveryLookup::new(request.admission().scope(), request.admission().roster_id()),
             request.admission().logical_owner().clone(),
             request.admission().admission_fence(),
-            request.admission().key().clone(),
-            OwnerId::new("runtime-cut-successor").expect("successor owner"),
-            FenceToken::new(fence),
-            8,
-            Generation::new(1),
+            RecoveryLeaseAuthority::new(
+                request.admission().key().clone(),
+                OwnerId::new("runtime-cut-successor").expect("successor owner"),
+                FenceToken::new(fence),
+                8,
+                Generation::new(1),
+                test_recovery_lease(),
+            ),
         )
         .expect("successor recovery")
     }
@@ -6192,16 +6256,21 @@ mod production_runtime_cut_matrix_tests {
         ] {
             assert!(
                 matches!(
-                    RecoveryRequest::new(
-                        registration.admission().scope(),
-                        registration.admission().roster_id(),
+                    RecoveryRequest::new_with_lease_metadata(
+                        RecoveryLookup::new(
+                            registration.admission().scope(),
+                            registration.admission().roster_id(),
+                        ),
                         registration.admission().logical_owner().clone(),
                         claimed_original_fence,
-                        registration.admission().key().clone(),
-                        OwnerId::new("runtime-cut-non-successor").expect("owner"),
-                        registration.admission().admission_fence(),
-                        8,
-                        registration.admission().expected_generation(),
+                        RecoveryLeaseAuthority::new(
+                            registration.admission().key().clone(),
+                            OwnerId::new("runtime-cut-non-successor").expect("owner"),
+                            registration.admission().admission_fence(),
+                            8,
+                            registration.admission().expected_generation(),
+                            test_recovery_lease(),
+                        ),
                     ),
                     Err(ExecutorError::InvalidRegistration)
                 ),
@@ -6956,8 +7025,8 @@ mod production_runtime_cut_matrix_tests {
     }
 
     #[tokio::test]
-    async fn compensate_not_transmitted_restores_identical_compensation_retry_and_original_applied_proof()
-     {
+    async fn compensate_not_transmitted_restores_identical_compensation_retry_and_original_applied_proof(
+    ) {
         let request = request_with_members(2);
         let provider = Arc::new(CompensationProvider::new(
             CompensationMode::NotTransmittedThenConclusive,
@@ -7030,8 +7099,8 @@ mod production_runtime_cut_matrix_tests {
     }
 
     #[tokio::test]
-    async fn compensated_proof_supersedes_applied_and_stale_applied_status_cannot_prepare_established()
-     {
+    async fn compensated_proof_supersedes_applied_and_stale_applied_status_cannot_prepare_established(
+    ) {
         let request = request_with_members(2);
         let provider = Arc::new(CompensationProvider::new(
             CompensationMode::ConclusiveThenStaleAppliedStatus,
@@ -7203,8 +7272,8 @@ mod production_runtime_cut_matrix_tests {
     }
 
     #[tokio::test]
-    async fn successor_status_reconstructs_precrash_compensated_proof_and_aborts_without_recompensating()
-     {
+    async fn successor_status_reconstructs_precrash_compensated_proof_and_aborts_without_recompensating(
+    ) {
         let request = request_with_members(2);
         let provider = Arc::new(CompensationProvider::new(CompensationMode::Conclusive));
         let backend = Arc::new(CutBackend::default());
@@ -7285,8 +7354,8 @@ mod production_runtime_cut_matrix_tests {
     }
 
     #[tokio::test]
-    async fn successor_reconcile_reconstructs_precrash_compensated_proof_and_aborts_without_recompensating()
-     {
+    async fn successor_reconcile_reconstructs_precrash_compensated_proof_and_aborts_without_recompensating(
+    ) {
         let request = request_with_members(2);
         let provider = Arc::new(CompensationProvider::new(CompensationMode::Conclusive));
         let backend = Arc::new(CutBackend::default());

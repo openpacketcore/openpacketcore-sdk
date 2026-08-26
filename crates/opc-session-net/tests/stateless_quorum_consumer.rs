@@ -76,7 +76,6 @@ use opc_session_store::fenced_mutation_roster::{
 };
 #[cfg(feature = "test-control")]
 use opc_session_store::sqlite::test_support::{
-    protected_roster_terminal_apply_timing_test_guard,
     protected_roster_terminal_apply_timings_for_test,
     reset_protected_roster_terminal_apply_timings_for_test,
 };
@@ -109,6 +108,7 @@ use opc_session_store::{
     ValidatedQuorumTopology, FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES,
     FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES, FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES,
 };
+
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
 use p256::ecdsa::signature::hazmat::PrehashSigner;
@@ -116,6 +116,10 @@ use p256::ecdsa::SigningKey;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+#[cfg(feature = "test-control")]
+static PROTECTED_ROSTER_TERMINAL_APPLY_TIMING_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 opc_consensus::engine::declare_raft_types!(
     TestSessionRaftTypeConfig:
@@ -6357,7 +6361,9 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
         .await
         .expect("bind the six proofs to one exact terminal body");
     #[cfg(feature = "test-control")]
-    let _terminal_apply_timing_guard = protected_roster_terminal_apply_timing_test_guard();
+    let _terminal_apply_timing_guard = PROTECTED_ROSTER_TERMINAL_APPLY_TIMING_TEST_LOCK
+        .lock()
+        .await;
     #[cfg(feature = "test-control")]
     reset_protected_roster_terminal_apply_timings_for_test();
     let terminalize_started = Instant::now();

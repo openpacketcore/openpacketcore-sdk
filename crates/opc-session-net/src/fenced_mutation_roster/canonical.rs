@@ -5,17 +5,17 @@
 
 use async_trait::async_trait;
 use opc_session_store::{
-    FenceToken, Generation, OwnerId, SessionKey, StateType,
     consensus::SessionConsensusIdentity,
     fenced_mutation_roster::{
         RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
         RosterProviderOperationV1, RosterProviderOutcomeV1,
     },
+    FenceToken, Generation, OwnerId, SessionKey, StateType,
 };
 use opc_types::Timestamp;
 use serde::{
-    Deserialize, Deserializer, Serialize,
     de::{SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fmt, marker::PhantomData};
@@ -2280,6 +2280,30 @@ pub(crate) struct TerminalConflictTombstone {
     phase_tag: u8,
 }
 
+/// Complete caller claim for one compacted terminal lookup.
+///
+/// The immutable admission provenance and replaceable current authority are
+/// intentionally grouped so a recovery path cannot accidentally validate a
+/// mix of values from distinct lookups or leases.
+pub(crate) struct CompactedTerminalLookup<'a> {
+    /// Retained-history epoch bound into the original admission request ID.
+    pub(crate) history_epoch: u64,
+    /// Exact least-authority scope claimed by the caller.
+    pub(crate) scope: Scope,
+    /// Exact protected session key claimed by the caller.
+    pub(crate) key: &'a SessionKey,
+    /// Stable caller-owned roster identity.
+    pub(crate) roster_id: RosterId,
+    /// Immutable owner from the original admission.
+    pub(crate) original_owner: &'a OwnerId,
+    /// Immutable fence from the original admission.
+    pub(crate) original_admission_fence: FenceToken,
+    /// Current successor authority fence.
+    pub(crate) current_fence: FenceToken,
+    /// Current successor authority generation.
+    pub(crate) current_generation: Generation,
+}
+
 impl TerminalConflictTombstone {
     /// Construct the validated compact binding for an exact terminal record.
     #[cfg(test)]
@@ -2325,23 +2349,21 @@ impl TerminalConflictTombstone {
     /// Validate a compacted replay lookup without retaining an admission body.
     pub(crate) fn validate_lookup(
         &self,
-        history_epoch: u64,
-        scope: Scope,
-        key: &SessionKey,
-        roster_id: RosterId,
-        claimed_original_owner: &OwnerId,
-        claimed_original_admission_fence: FenceToken,
-        current_fence: FenceToken,
-        current_generation: Generation,
+        lookup: CompactedTerminalLookup<'_>,
     ) -> Result<CompactedTerminalStatus, Error> {
-        let binding_key = request_binding_key(history_epoch, scope, key, roster_id)?;
+        let binding_key = request_binding_key(
+            lookup.history_epoch,
+            lookup.scope,
+            lookup.key,
+            lookup.roster_id,
+        )?;
         if self.binding_key != binding_key {
             return Err(Error::InvalidAuthority);
         }
-        if self.admission_owner != *claimed_original_owner
-            || claimed_original_admission_fence.get() != self.admission_fence
-            || current_fence.get() <= self.admission_fence
-            || current_generation.get() != self.expected_generation
+        if self.admission_owner != *lookup.original_owner
+            || lookup.original_admission_fence.get() != self.admission_fence
+            || lookup.current_fence.get() <= self.admission_fence
+            || lookup.current_generation.get() != self.expected_generation
         {
             return Err(Error::InvalidAuthority);
         }
@@ -2678,14 +2700,14 @@ impl std::error::Error for Error {}
 mod frozen_cross_crate_goldens {
     use super::*;
     use bytes::Bytes;
-    use opc_consensus::{ConsensusClusterId, ConsensusConfigurationEpoch, derive_configuration_id};
+    use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
     use opc_session_store::{
-        FenceToken, Generation, OwnerId, SessionKey, SessionKeyType, StableId,
         consensus::SessionConsensusIdentity,
         fenced_mutation_roster::{
             RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
             RosterProviderOperationV1, RosterProviderOutcomeV1,
         },
+        FenceToken, Generation, OwnerId, SessionKey, SessionKeyType, StableId,
     };
     use opc_types::{NetworkFunctionKind, TenantId};
     use sha2::{Digest, Sha256};
@@ -2782,16 +2804,12 @@ mod frozen_cross_crate_goldens {
                 if expected_version != 0 {
                     assert_eq!(net_members.len(), width);
                     assert_eq!(store_members.len(), width);
-                    assert!(
-                        net_members
-                            .iter()
-                            .all(|member| member.expected_version() == expected_version)
-                    );
-                    assert!(
-                        store_members
-                            .iter()
-                            .all(|member| member.expected_version() == expected_version)
-                    );
+                    assert!(net_members
+                        .iter()
+                        .all(|member| member.expected_version() == expected_version));
+                    assert!(store_members
+                        .iter()
+                        .all(|member| member.expected_version() == expected_version));
                 }
             }
         }
