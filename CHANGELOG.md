@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Bounded protected atomic fenced-mutation roster — `opc-session-net`,
+  `opc-session-store`:** adds an opt-in revision-five persistent mTLS consumer
+  profile for one immutable roster of up to eight generic opaque provider
+  effects. One pre-effect `PollAdmitted` quorum transaction retains stable
+  caller IDs, ordered descriptors, exact protected plan/checkpoint/result, and
+  a future terminal-history reservation; provider prepare/execute/status/adopt
+  remains local and yields only SDK-issued conclusive proofs. One second
+  all-or-none quorum transaction binds every proof to the authoritative record
+  and returns durable `Established` or nonpublishing `Aborted` exact bytes.
+  Only `Established` can create publication authority. Same-body replay,
+  changed-body conflict, status-only recovery after ambiguity, higher-fence
+  takeover, restart/snapshot/key-rotation recovery, deterministic 24-hour
+  bounded reclaim, fixed diagnostics, and a real three-voter 13-cut mTLS
+  matrix preserve the two-remote-mutation hot path without exposing raw
+  consensus or creating per-subscriber resources.
 - **Durable grouped XFRM object roster transaction — `opc-ipsec-xfrm`:**
   `LinuxXfrmBackend::bind_current_network_namespace_with_object_roster_recovery`
   and the opt-in migration constructor

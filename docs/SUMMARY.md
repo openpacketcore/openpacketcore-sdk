@@ -58,6 +58,8 @@
 [Session-Store Legacy Fork Recovery](session-store-legacy-recovery.md)
 [Session-Store Stable-ID Migration](session-store-stable-id-migration.md)
 [Session-Store Replication Transaction-ID Migration](session-store-replication-tx-id-migration.md)
+[Session-Store Protected Atomic Roster](session-store-protected-atomic-roster.md)
+[Session-Store Protected Atomic Roster Evidence](session-store-protected-atomic-roster-evidence.md)
 [HA Design](ha-design.md)
 [Operator Readiness](operator-readiness.md)
 [GNSI Compatibility](gnsi-compatibility.md)
