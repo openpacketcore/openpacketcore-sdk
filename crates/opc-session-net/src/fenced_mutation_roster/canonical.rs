@@ -3048,7 +3048,7 @@ mod frozen_cross_crate_goldens {
             "mixed old/new tombstone frames fail closed"
         );
 
-        let mut rebound = tombstone;
+        let mut rebound = tombstone.clone();
         rebound.terminal_raft_log_index += 1;
         let rebound_frame = encode_frame(
             TOMBSTONE_FRAME_MAGIC,

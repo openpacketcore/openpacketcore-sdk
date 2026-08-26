@@ -7650,6 +7650,7 @@ fn validate_protected_roster_state_sync(
                 row.get(7).map_err(|_| ProtectedRosterApplyError::Corrupt)?,
             ),
         )?;
+        let record = hydrated.record();
         let terminal_raft_log_index = match hydrated.payload() {
             HydratedProductionReservationPayload::Live { .. } => None,
             HydratedProductionReservationPayload::Retained {
@@ -7659,9 +7660,25 @@ fn validate_protected_roster_state_sync(
                 Some(tombstone.terminal_raft_log_index())
             }
             #[cfg(test)]
-            HydratedProductionReservationPayload::Legacy => None,
+            HydratedProductionReservationPayload::Legacy => match record.state() {
+                ReservationState::Live => None,
+                ReservationState::Retained => Some(
+                    record
+                        .committed_terminal()
+                        .map_err(|_| ProtectedRosterApplyError::Corrupt)?
+                        .ok_or(ProtectedRosterApplyError::Corrupt)?
+                        .commit_metadata()
+                        .raft_log_index(),
+                ),
+                ReservationState::Tombstone => Some(
+                    record
+                        .tombstone()
+                        .map_err(|_| ProtectedRosterApplyError::Corrupt)?
+                        .ok_or(ProtectedRosterApplyError::Corrupt)?
+                        .terminal_raft_log_index(),
+                ),
+            },
         };
-        let record = hydrated.record();
         validator
             .add_record(
                 record,
@@ -28272,6 +28289,19 @@ mod tests {
         )
     }
 
+    fn set_applied_index_for_test(
+        conn: &Connection,
+        identity: SessionConsensusIdentity,
+        index: u64,
+    ) {
+        let tx = conn
+            .unchecked_transaction()
+            .expect("begin applied-index fixture transaction");
+        save_log_pointer(&tx, "consensus_applied", identity, &log_id(index))
+            .expect("write applied-index fixture");
+        tx.commit().expect("commit applied-index fixture");
+    }
+
     fn node_id() -> SessionConsensusNodeId {
         SessionConsensusNodeId::new(7).expect("node ID")
     }
@@ -30262,21 +30292,18 @@ mod tests {
             [],
         )
         .expect("anchor terminal history at its committed application sequence");
-        save_log_pointer(&conn, "consensus_applied", identity(), &log_id(2))
-            .expect("anchor the exact retained terminal Raft horizon");
+        set_applied_index_for_test(&conn, identity(), 2);
         assert!(
             validate_protected_roster_state_sync(&conn, identity()).is_ok(),
             "exact retained mapping survives restart validation"
         );
 
-        save_log_pointer(&conn, "consensus_applied", identity(), &log_id(1))
-            .expect("move the applied horizon before the terminal receipt");
+        set_applied_index_for_test(&conn, identity(), 1);
         assert!(
             validate_protected_roster_state_sync(&conn, identity()).is_err(),
             "restart validation must reject a terminal receipt beyond the applied Raft horizon"
         );
-        save_log_pointer(&conn, "consensus_applied", identity(), &log_id(2))
-            .expect("restore the exact retained terminal Raft horizon");
+        set_applied_index_for_test(&conn, identity(), 2);
 
         conn.execute(
             "UPDATE consensus_machine SET application_sequence=0 WHERE singleton=1",
@@ -32162,8 +32189,7 @@ mod tests {
                 [],
             )
             .expect("advance source roster sequence horizon");
-        save_log_pointer(&source_conn, "consensus_applied", identity(), &log_id(8))
-            .expect("advance source applied roster horizon");
+        set_applied_index_for_test(&source_conn, identity(), 8);
         let (last_log_id, last_membership) =
             build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
                 .expect("build protected-roster snapshot");
@@ -32190,8 +32216,7 @@ mod tests {
                 [],
             )
             .expect("advance target roster sequence horizon");
-        save_log_pointer(&target_conn, "consensus_applied", identity(), &log_id(8))
-            .expect("advance target applied roster horizon");
+        set_applied_index_for_test(&target_conn, identity(), 8);
         target_conn
             .execute_batch("PRAGMA foreign_keys = ON")
             .expect("enable foreign keys");
@@ -32349,8 +32374,7 @@ mod tests {
                 [],
             )
             .expect("set terminal sequence boundary");
-            save_log_pointer(&conn, "consensus_applied", storage_identity, &log_id(8))
-                .expect("set terminal Raft boundary");
+            set_applied_index_for_test(&conn, storage_identity, 8);
             let scope = read_membership_scope_sync(&conn, storage_identity)
                 .expect("read healthy successor scope");
             assert_eq!(scope.current_identity, successor_identity);
@@ -32468,35 +32492,32 @@ mod tests {
         drop(target_conn);
 
         let source_conn = Connection::open(&source_database).expect("open source for corruption");
-        save_log_pointer(
-            &source_conn,
-            "consensus_applied",
-            storage_identity,
-            &log_id(7),
-        )
-        .expect("move applied horizon before terminal receipt");
+        set_applied_index_for_test(&source_conn, storage_identity, 7);
         drop(source_conn);
         let horizon_reopen = SqliteSessionBackend::open(&source_database).expect("horizon backend");
+        let horizon_reopen_error = match SqliteConsensusCore::initialize(
+            &horizon_reopen,
+            directory.path().join("horizon-reopen-snapshots"),
+            successor_identity,
+            successor_members.clone(),
+            bindings.clone(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("reopen must reject terminal receipt beyond applied horizon"),
+            Err(error) => error,
+        };
         assert_eq!(
             SessionConsensusStorageError::CorruptState,
-            SqliteConsensusCore::initialize(
-                &horizon_reopen,
-                directory.path().join("horizon-reopen-snapshots"),
-                successor_identity,
-                successor_members.clone(),
-                bindings.clone(),
-                ConsensusAuthorityProfile::Dynamic,
-                None,
-            )
-            .await
-            .expect_err("reopen must reject terminal receipt beyond applied horizon")
+            horizon_reopen_error,
         );
         drop(horizon_reopen);
 
         std::fs::copy(&snapshot_path, &horizon_snapshot).expect("copy horizon snapshot fixture");
         let horizon = Connection::open(&horizon_snapshot).expect("open horizon snapshot");
-        save_log_pointer(&horizon, "consensus_applied", storage_identity, &log_id(7))
-            .expect("move incoming horizon before terminal receipt");
+        set_applied_index_for_test(&horizon, storage_identity, 7);
         drop(horizon);
         let horizon_meta = opc_consensus::engine::SnapshotMeta {
             last_log_id: Some(log_id(7)),
@@ -32530,13 +32551,7 @@ mod tests {
 
         let source_conn =
             Connection::open(&source_database).expect("open source for lineage corruption");
-        save_log_pointer(
-            &source_conn,
-            "consensus_applied",
-            storage_identity,
-            &log_id(8),
-        )
-        .expect("restore applied horizon");
+        set_applied_index_for_test(&source_conn, storage_identity, 8);
         source_conn
             .execute_batch(
                 "DELETE FROM consensus_membership_history; \
@@ -32550,19 +32565,23 @@ mod tests {
         drop(source_conn);
         let lineageless_reopen =
             SqliteSessionBackend::open(&source_database).expect("lineageless reopen backend");
+        let lineageless_reopen_error = match SqliteConsensusCore::initialize(
+            &lineageless_reopen,
+            directory.path().join("lineageless-reopen-snapshots"),
+            successor_identity,
+            successor_members,
+            bindings,
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("reopen must reject a lineageless non-genesis roster"),
+            Err(error) => error,
+        };
         assert_eq!(
             SessionConsensusStorageError::CorruptState,
-            SqliteConsensusCore::initialize(
-                &lineageless_reopen,
-                directory.path().join("lineageless-reopen-snapshots"),
-                successor_identity,
-                successor_members,
-                bindings,
-                ConsensusAuthorityProfile::Dynamic,
-                None,
-            )
-            .await
-            .expect_err("reopen must reject a lineageless non-genesis roster")
+            lineageless_reopen_error,
         );
     }
 
