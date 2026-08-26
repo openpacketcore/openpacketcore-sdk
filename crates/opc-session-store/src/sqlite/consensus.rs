@@ -11,11 +11,11 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Condvar;
 #[cfg(any(test, feature = "test-control"))]
 use std::sync::MutexGuard;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 #[cfg(any(test, feature = "test-control"))]
@@ -26,41 +26,42 @@ use opc_consensus::{AppendEntriesBatchAccumulator, AppendEntriesBatchDecision};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rusqlite::OpenFlags;
 use rusqlite::{
-    Connection, DropBehavior, InterruptHandle, OptionalExtension, Transaction, TransactionBehavior,
-    backup::StepResult, params,
+    backup::StepResult, params, Connection, DropBehavior, InterruptHandle, OptionalExtension,
+    Transaction, TransactionBehavior,
 };
 use sha2::{Digest, Sha256};
 
 use crate::backend::{
-    CompareAndSetResult, ProtectedRosterEstablishedSuccessor, REPLICATION_TX_ID_MAX_BYTES,
-    REPLICATION_TX_ID_MIN_BYTES, ReplicationEntry, ReplicationOp, ReplicationTxId,
+    CompareAndSetResult, ProtectedRosterEstablishedSuccessor, ReplicationEntry, ReplicationOp,
+    ReplicationTxId, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 use crate::capability::BackendCapabilities;
-use crate::consensus::SessionRaftTypeConfig;
 use crate::consensus::storage::{ConsensusAuthorityProfile, SessionConsensusStorageError};
 use crate::consensus::store::ConsensusStoreDiagnosticCounters;
 use crate::consensus::types::{
-    ConsensusRosterAdmissionCommand, ConsensusRosterAdmissionOutcome, ConsensusRosterRejection,
-    ConsensusRosterTerminalCommand, ConsensusRosterTerminalOutcome,
-    SESSION_CONSENSUS_SCHEMA_VERSION, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+    fenced_transition_v2_batch_outer_request_id, fenced_transition_voter_set_digest,
+    roster_registration_handle, validate_fenced_transition_v2_batch,
+    validate_fenced_transition_v2_batch_outcomes, ConsensusRosterAdmissionCommand,
+    ConsensusRosterAdmissionOutcome, ConsensusRosterRejection, ConsensusRosterTerminalCommand,
+    ConsensusRosterTerminalOutcome, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
     SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
     SessionConsensusNodeId, SessionConsensusRequestId, SessionConsensusResponse,
     SessionMutationIntent, SessionMutationOutcome, SessionTopologyMemberBinding,
-    fenced_transition_v2_batch_outer_request_id, fenced_transition_voter_set_digest,
-    roster_registration_handle, validate_fenced_transition_v2_batch,
-    validate_fenced_transition_v2_batch_outcomes,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
+use crate::consensus::SessionRaftTypeConfig;
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_mutation_roster::{
-    Admission, CompactAdmissionProvenanceVerificationV2, CompactTerminalEvidenceVerificationV2,
-    CompactedTombstoneHistoryVerificationV2, ExecutorTerminalProofVerification,
-    HistoricalCompactAdmissionProvenanceVerificationV2, IrreversibleHistoryFloor, RECLAIM_BATCH,
-    RequestBindingKey, RequestId as RosterRequestId, RosterAttestationTrustRootV1,
-    RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceV2, RosterId,
-    RosterIngressAttestationRosterCommandInputV1, Scope, TerminalConflictTombstone, TerminalRecord,
     session_key_commitment, verify_compact_admission_provenance_v2,
     verify_compact_terminal_evidence_v2, verify_compacted_tombstone_history_v2,
     verify_executor_terminal_proof_bundle, verify_historical_compact_admission_provenance_v2,
+    Admission, CompactAdmissionProvenanceVerificationV2, CompactTerminalEvidenceVerificationV2,
+    CompactedTombstoneHistoryVerificationV2, ExecutorTerminalProofVerification,
+    HistoricalCompactAdmissionProvenanceVerificationV2, IrreversibleHistoryFloor,
+    RequestBindingKey, RequestId as RosterRequestId, RosterAttestationTrustRootV1,
+    RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceV2, RosterId,
+    RosterIngressAttestationRosterCommandInputV1, Scope, TerminalConflictTombstone, TerminalRecord,
+    RECLAIM_BATCH,
 };
 use crate::fenced_mutation_roster_executor::{
     AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration, CommittedTerminal,
@@ -69,20 +70,26 @@ use crate::fenced_mutation_roster_executor::{
 #[cfg(test)]
 use crate::fenced_mutation_roster_storage::prepare_production_terminalization;
 use crate::fenced_mutation_roster_storage::{
-    ChargeProfile, ConsensusMaintenanceTimestamp, GlobalChargeBudget, GlobalChargeWitness,
-    HydratedProductionReservationPayload, HydratedProductionReservationRecord,
-    PreparedProductionTransaction, ProductionAdmissionBusinessReservation, ProductionBusinessState,
-    ProductionFloorKey, ProductionReservationRecord, ProductionReservationTransactionAdapter,
-    ProductionRetirementCursor, ProductionTerminalBusinessAction, ReservationError,
-    ReservationState, prepare_production_admission, prepare_production_global_terminal_retirement,
+    prepare_production_admission, prepare_production_global_terminal_retirement,
     prepare_production_reclaim,
     prepare_production_terminalization_hydrated_with_evidence_and_ingress,
-    validate_production_snapshot_with_floors,
+    validate_production_snapshot_with_floors, ChargeProfile, ConsensusMaintenanceTimestamp,
+    GlobalChargeBudget, GlobalChargeWitness, HydratedProductionReservationPayload,
+    HydratedProductionReservationRecord, PreparedProductionTransaction,
+    ProductionAdmissionBusinessReservation, ProductionBusinessState, ProductionFloorKey,
+    ProductionReservationRecord, ProductionReservationTransactionAdapter,
+    ProductionRetirementCursor, ProductionTerminalBusinessAction, ReservationError,
+    ReservationState,
 };
 use crate::fenced_mutation_roster_transport::{
     roster_poll_admit_ingress_capsule_commitment, roster_terminal_ingress_capsule_commitment,
 };
 use crate::fenced_transition::{
+    fenced_transition_v2_outer_request_id, fenced_transition_v2_profile_digest,
+    fenced_transition_v2_timestamp_is_in_range, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionMutationResult, FencedTransitionOutcome, FencedTransitionRequest,
+    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2HistoryEpoch,
+    FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2Status,
     FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_OUTCOME_BYTES,
     FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_REQUEST_ID_BYTES,
     FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_SCHEMA_V2,
@@ -94,23 +101,18 @@ use crate::fenced_transition::{
     FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_MAGIC,
     FENCED_TRANSITION_V2_RECEIPT_RESPONSE_CODEC_REVISION,
     FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES, FENCED_TRANSITION_V2_RECLAIM_BATCH,
-    FENCED_TRANSITION_V2_REQUEST_ID_BYTES, FencedTransitionLease, FencedTransitionMutation,
-    FencedTransitionMutationResult, FencedTransitionOutcome, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2HistoryEpoch,
-    FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2Status,
-    fenced_transition_v2_outer_request_id, fenced_transition_v2_profile_digest,
-    fenced_transition_v2_timestamp_is_in_range,
+    FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
 };
 use crate::readiness::PlacementResiliencePolicy;
 use crate::record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 use crate::{
-    LeaseGuard,
     model::{FenceToken, Generation, OwnerId, SessionKey, SessionKeyType, StableId, StateClass},
+    LeaseGuard,
 };
 
 #[cfg(test)]
 use super::RestoreScanValidationProfile;
-use super::{SqliteSessionBackend, apply_pragma_profile, lease, ops};
+use super::{apply_pragma_profile, lease, ops, SqliteSessionBackend};
 
 /// Exact maximum JSON command size accepted by the SQLite durable consensus
 /// log. V2's immutable transport profile requires this capacity, while V1
@@ -1863,8 +1865,8 @@ impl ConsensusLogPruneTurnGate {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-fn consensus_log_prune_turn_gates()
--> &'static Mutex<BTreeMap<PathBuf, Weak<ConsensusLogPruneTurnGate>>> {
+fn consensus_log_prune_turn_gates(
+) -> &'static Mutex<BTreeMap<PathBuf, Weak<ConsensusLogPruneTurnGate>>> {
     static GATES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<ConsensusLogPruneTurnGate>>>> =
         OnceLock::new();
     GATES.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -5077,14 +5079,13 @@ pub(crate) fn read_membership_scope_sync(
                             "session consensus aborted desired configuration ID is invalid",
                         )
                     })?;
-                    let epoch = SessionConsensusConfigurationEpoch::new(checked_positive_u64(
-                        epoch,
-                    )?)
-                    .map_err(|_| {
-                        invalid_data(
+                    let epoch =
+                        SessionConsensusConfigurationEpoch::new(checked_positive_u64(epoch)?)
+                            .map_err(|_| {
+                                invalid_data(
                             "session consensus aborted desired configuration epoch is invalid",
                         )
-                    })?;
+                            })?;
                     let desired_identity = SessionConsensusIdentity::new(
                         storage_identity.cluster_id(),
                         SessionConsensusConfigurationId::from_bytes(configuration),
@@ -25019,16 +25020,16 @@ fn validate_published_snapshot_file_name(file_name: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::Bytes;
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId};
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
-        AEAD_TAG_LEN, AES_256_GCM_SIV_NONCE_LEN, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad,
-        serialize_bound_aad,
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+        AES_256_GCM_SIV_NONCE_LEN,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
@@ -25283,7 +25284,7 @@ mod tests {
     #[test]
     fn consensus_log_prune_connection_commit_does_not_implicitly_checkpoint() {
         use opc_sqlite_file_control_sys::{
-            TEST_MAIN_SYNC_BLOCK_VFS_NAME, block_test_main_sync, install_test_main_sync_block_vfs,
+            block_test_main_sync, install_test_main_sync_block_vfs, TEST_MAIN_SYNC_BLOCK_VFS_NAME,
         };
 
         static VFS_GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -25488,7 +25489,7 @@ mod tests {
     #[test]
     fn proactive_passive_checkpoint_reports_held_checkpoint_lock_as_incomplete() {
         use opc_sqlite_file_control_sys::{
-            TEST_MAIN_SYNC_BLOCK_VFS_NAME, block_test_main_sync, install_test_main_sync_block_vfs,
+            block_test_main_sync, install_test_main_sync_block_vfs, TEST_MAIN_SYNC_BLOCK_VFS_NAME,
         };
 
         static VFS_GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -25697,18 +25698,16 @@ mod tests {
         ));
         let before = read_fenced_transition_v2_history_row_in_sync(&source_conn, identity(), false)
             .expect("read incomplete history");
-        assert!(
-            maintain_fenced_transition_v2_history_sync(
-                &source_conn,
-                identity(),
-                before.generation,
-                before.active_epoch,
-                before.retired_through,
-                0,
-                timestamp(1),
-            )
-            .is_err()
-        );
+        assert!(maintain_fenced_transition_v2_history_sync(
+            &source_conn,
+            identity(),
+            before.generation,
+            before.active_epoch,
+            before.retired_through,
+            0,
+            timestamp(1),
+        )
+        .is_err());
         assert_eq!(
             read_fenced_transition_v2_history_row_in_sync(&source_conn, identity(), false)
                 .expect("read history after rejected reclaim"),
@@ -25724,20 +25723,18 @@ mod tests {
             last_membership,
             snapshot_id: "truncated-v2".into(),
         };
-        assert!(
-            install_snapshot_database_sync(
-                &target_conn,
-                identity(),
-                &snapshot_path,
-                &meta,
-                "snapshot-00000000-0000-4000-8000-0000000000e1.opc",
-                [0xE1; 32],
-                std::fs::metadata(&snapshot_path)
-                    .expect("snapshot metadata")
-                    .len(),
-            )
-            .is_err()
-        );
+        assert!(install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-0000000000e1.opc",
+            [0xE1; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("snapshot metadata")
+                .len(),
+        )
+        .is_err());
     }
     #[cfg(target_os = "linux")]
     use crate::consensus::snapshot::PinnedSqliteFile;
@@ -25749,8 +25746,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn pinned_vacuum_into_finalization_survives_temp_path_failure_and_preserves_authority_and_receipts()
-     {
+    fn pinned_vacuum_into_finalization_survives_temp_path_failure_and_preserves_authority_and_receipts(
+    ) {
         const CHILD: &str = "OPC_SESSION_STORE_TEST_FAIL_TEMP_VFS";
         const TEST_NAME: &str = "sqlite::consensus::tests::pinned_vacuum_into_finalization_survives_temp_path_failure_and_preserves_authority_and_receipts";
 
@@ -26071,12 +26068,10 @@ mod tests {
     #[test]
     fn durable_current_snapshot_name_cannot_be_a_staging_artifact() {
         assert!(validate_published_snapshot_file_name("incoming-current.part").is_err());
-        assert!(
-            validate_published_snapshot_file_name(
-                "snapshot-00000000-0000-4000-8000-000000000000.opc"
-            )
-            .is_ok()
-        );
+        assert!(validate_published_snapshot_file_name(
+            "snapshot-00000000-0000-4000-8000-000000000000.opc"
+        )
+        .is_ok());
     }
 
     #[cfg(target_os = "linux")]
@@ -26519,16 +26514,14 @@ mod tests {
         let proposal = AdmissionProposal::new(
             Profile::v1(),
             RosterId::from_bytes(roster_id).expect("roster ID"),
-            vec![
-                Member::new(
-                    0,
-                    MemberOperationId::from_bytes([partition.wrapping_add(1); 16])
-                        .expect("member operation ID"),
-                    vec![partition.wrapping_add(2)],
-                    1,
-                )
-                .expect("member"),
-            ],
+            vec![Member::new(
+                0,
+                MemberOperationId::from_bytes([partition.wrapping_add(1); 16])
+                    .expect("member operation ID"),
+                vec![partition.wrapping_add(2)],
+                1,
+            )
+            .expect("member")],
             EstablishedMutation::no_op(),
             vec![partition.wrapping_add(3)],
             vec![partition.wrapping_add(4)],
@@ -26958,10 +26951,8 @@ mod tests {
         assert_eq!(0, initial.retired_terminal_sequence());
         maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at)
             .expect("compact sequence-one tombstone");
-        assert!(
-            retire_protected_rosters_sync(&conn, identity())
-                .expect("H=0 must select terminal sequence one")
-        );
+        assert!(retire_protected_rosters_sync(&conn, identity())
+            .expect("H=0 must select terminal sequence one"));
         let retired = protected_roster_read_witness_sync(&conn, identity())
             .expect("read retired witness")
             .expect("retired witness");
@@ -27055,9 +27046,7 @@ mod tests {
             .expect("first payload compaction");
         maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at)
             .expect("final payload compaction");
-        assert!(
-            retire_protected_rosters_sync(&conn, identity()).expect("maximum retirement batch")
-        );
+        assert!(retire_protected_rosters_sync(&conn, identity()).expect("maximum retirement batch"));
         assert!(
             protected_roster_read_retirement_cursor_sync(&conn, identity(), key)
                 .expect("read cursor")
@@ -27253,15 +27242,13 @@ mod tests {
             let proposal = AdmissionProposal::new(
                 Profile::v1(),
                 RosterId::from_bytes([0x91; 16]).expect("roster ID"),
-                vec![
-                    Member::new(
-                        0,
-                        MemberOperationId::from_bytes([0x92; 16]).expect("member operation ID"),
-                        vec![0x93],
-                        1,
-                    )
-                    .expect("member"),
-                ],
+                vec![Member::new(
+                    0,
+                    MemberOperationId::from_bytes([0x92; 16]).expect("member operation ID"),
+                    vec![0x93],
+                    1,
+                )
+                .expect("member")],
                 EstablishedMutation::no_op(),
                 vec![0x94],
                 vec![0x95],
@@ -27610,15 +27597,13 @@ mod tests {
             AdmissionProposal::new(
                 Profile::v1(),
                 RosterId::from_bytes([0xa1; 16]).expect("roster ID"),
-                vec![
-                    Member::new(
-                        0,
-                        MemberOperationId::from_bytes([0xa2; 16]).expect("member operation ID"),
-                        vec![0xa3],
-                        1,
-                    )
-                    .expect("member"),
-                ],
+                vec![Member::new(
+                    0,
+                    MemberOperationId::from_bytes([0xa2; 16]).expect("member operation ID"),
+                    vec![0xa3],
+                    1,
+                )
+                .expect("member")],
                 EstablishedMutation::no_op(),
                 vec![0xa4],
                 vec![0xa5],
@@ -27785,15 +27770,13 @@ mod tests {
         let proposal = AdmissionProposal::new(
             Profile::v1(),
             RosterId::from_bytes([0xa1; 16]).expect("roster ID"),
-            vec![
-                Member::new(
-                    0,
-                    MemberOperationId::from_bytes([0xa2; 16]).expect("member operation ID"),
-                    vec![0xa3],
-                    1,
-                )
-                .expect("member"),
-            ],
+            vec![Member::new(
+                0,
+                MemberOperationId::from_bytes([0xa2; 16]).expect("member operation ID"),
+                vec![0xa3],
+                1,
+            )
+            .expect("member")],
             EstablishedMutation::no_op(),
             vec![0xa4],
             vec![0xa5],
@@ -29834,12 +29817,10 @@ mod tests {
             .expect("count rejected dependent log"),
             0,
         );
-        assert!(
-            read_membership_scope_sync(&conn, identity())
-                .expect("unchanged scope")
-                .pending
-                .is_none()
-        );
+        assert!(read_membership_scope_sync(&conn, identity())
+            .expect("unchanged scope")
+            .pending
+            .is_none());
     }
 
     #[test]
@@ -29910,23 +29891,19 @@ mod tests {
                 &applied.responses[1].result,
                 Ok(SessionMutationOutcome::Unit)
             ));
-            assert!(
-                read_membership_scope_sync(&conn, identity())
-                    .expect("projected topology scope")
-                    .pending
-                    .is_some()
-            );
+            assert!(read_membership_scope_sync(&conn, identity())
+                .expect("projected topology scope")
+                .pending
+                .is_some());
             let request_id = SessionConsensusRequestId::from_bytes([request_byte; 16]);
             assert!(
                 read_fenced_transition_receipt_sync(&conn, identity(), request_id)
                     .expect("unbound fenced receipt read")
                     .is_none()
             );
-            assert!(
-                read_outcome_sync(&conn, identity(), request_id)
-                    .expect("topology outcome read")
-                    .is_some()
-            );
+            assert!(read_outcome_sync(&conn, identity(), request_id)
+                .expect("topology outcome read")
+                .is_some());
         }
     }
 
@@ -30002,17 +29979,13 @@ mod tests {
                         .expect("read fenced binding")
                         .is_some()
                 );
-                assert!(
-                    read_outcome_sync(&conn, identity(), request_id)
-                        .expect("read generic outcome")
-                        .is_none()
-                );
-                assert!(
-                    read_membership_scope_sync(&conn, identity())
-                        .expect("read unprojected topology scope")
-                        .pending
-                        .is_none()
-                );
+                assert!(read_outcome_sync(&conn, identity(), request_id)
+                    .expect("read generic outcome")
+                    .is_none());
+                assert!(read_membership_scope_sync(&conn, identity())
+                    .expect("read unprojected topology scope")
+                    .pending
+                    .is_none());
             } else {
                 assert!(matches!(
                     applied.responses.as_slice(),
@@ -30032,17 +30005,13 @@ mod tests {
                         .expect("read absent fenced binding")
                         .is_none()
                 );
-                assert!(
-                    read_outcome_sync(&conn, identity(), request_id)
-                        .expect("read topology outcome")
-                        .is_some()
-                );
-                assert!(
-                    read_membership_scope_sync(&conn, identity())
-                        .expect("read projected topology scope")
-                        .pending
-                        .is_some()
-                );
+                assert!(read_outcome_sync(&conn, identity(), request_id)
+                    .expect("read topology outcome")
+                    .is_some());
+                assert!(read_membership_scope_sync(&conn, identity())
+                    .expect("read projected topology scope")
+                    .pending
+                    .is_some());
             }
         }
     }
@@ -30342,15 +30311,13 @@ mod tests {
             fenced_transition_receipt_count_sync(&conn).expect("bounded receipt count"),
             FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
         );
-        assert!(
-            read_fenced_transition_receipt_sync(
-                &conn,
-                identity(),
-                SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes()),
-            )
-            .expect("read absent full request")
-            .is_none()
-        );
+        assert!(read_fenced_transition_receipt_sync(
+            &conn,
+            identity(),
+            SessionConsensusRequestId::from_bytes(*request.request_id().as_bytes()),
+        )
+        .expect("read absent full request")
+        .is_none());
 
         let different = fenced_transition_request(0xD4, "full-rejection-different-owner");
         let repeated = apply_entries_sync(
@@ -30524,11 +30491,9 @@ mod tests {
                     .expect("read permanently unbound V1 request")
                     .is_none()
             );
-            assert!(
-                read_outcome_sync(&conn, identity(), unbound_id)
-                    .expect("read absent generic binding")
-                    .is_none()
-            );
+            assert!(read_outcome_sync(&conn, identity(), unbound_id)
+                .expect("read absent generic binding")
+                .is_none());
             assert_eq!(
                 read_machine_sync(&conn, identity()).expect("machine after cap rejection"),
                 machine_before,
@@ -30700,14 +30665,12 @@ mod tests {
 
         assert!(validate_fenced_transition_receipts_sync(&conn, identity()).is_err());
         let directory = tempfile::tempdir().expect("snapshot directory");
-        assert!(
-            build_snapshot_database_sync(
-                &conn,
-                identity(),
-                &directory.path().join("oversized-fenced-history.sqlite"),
-            )
-            .is_err()
-        );
+        assert!(build_snapshot_database_sync(
+            &conn,
+            identity(),
+            &directory.path().join("oversized-fenced-history.sqlite"),
+        )
+        .is_err());
         assert!(matches!(
             initialize_schema(&conn, identity(), &expected_members()),
             Err(SessionConsensusStorageError::CorruptState)
@@ -31248,24 +31211,20 @@ mod tests {
         .expect("make successor authority eligible");
         fence_application_authority_sync(&conn, storage_identity, transition_id, transition_digest)
             .expect("roll application authority forward");
-        assert!(
-            validate_application_authority_sync(
-                &conn,
-                storage_identity,
-                member(10),
-                successor_identity,
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_application_authority_sync(
-                &conn,
-                storage_identity,
-                member(7),
-                storage_identity,
-            )
-            .is_err()
-        );
+        assert!(validate_application_authority_sync(
+            &conn,
+            storage_identity,
+            member(10),
+            successor_identity,
+        )
+        .is_ok());
+        assert!(validate_application_authority_sync(
+            &conn,
+            storage_identity,
+            member(7),
+            storage_identity,
+        )
+        .is_err());
 
         let sequence_before_revoked_replays = proposal_state_sync(&conn, storage_identity)
             .expect("state before revoked replay")
@@ -31581,16 +31540,14 @@ mod tests {
             ],
         )
         .expect("promote successor scope");
-        assert!(
-            !fenced_transition_v2_activation_matches_scope_sync(
-                &conn,
-                storage_identity,
-                successor_identity,
-                &successor_members,
-                fenced_transition_v2_profile_digest(),
-            )
-            .expect("promotion clears predecessor V2 certificate")
-        );
+        assert!(!fenced_transition_v2_activation_matches_scope_sync(
+            &conn,
+            storage_identity,
+            successor_identity,
+            &successor_members,
+            fenced_transition_v2_profile_digest(),
+        )
+        .expect("promotion clears predecessor V2 certificate"));
         let history_after_cutover =
             read_fenced_transition_v2_history_row_in_sync(&conn, storage_identity, false)
                 .expect("history after topology cutover");
@@ -31642,16 +31599,14 @@ mod tests {
             ))
         );
         assert!(recertified.notifications.is_empty());
-        assert!(
-            fenced_transition_v2_activation_matches_scope_sync(
-                &conn,
-                storage_identity,
-                successor_identity,
-                &successor_members,
-                fenced_transition_v2_profile_digest(),
-            )
-            .expect("successor V2 certificate is exact")
-        );
+        assert!(fenced_transition_v2_activation_matches_scope_sync(
+            &conn,
+            storage_identity,
+            successor_identity,
+            &successor_members,
+            fenced_transition_v2_profile_digest(),
+        )
+        .expect("successor V2 certificate is exact"));
         assert_eq!(
             read_fenced_transition_v2_history_row_in_sync(&conn, storage_identity, false)
                 .expect("history after retained recertification"),
@@ -31711,16 +31666,14 @@ mod tests {
             }]
         ));
         assert!(absent_result.notifications.is_empty());
-        assert!(
-            fenced_transition_v2_activation_matches_scope_sync(
-                &conn,
-                storage_identity,
-                successor_identity,
-                &successor_members,
-                fenced_transition_v2_profile_digest(),
-            )
-            .expect("absent retained request installs only the exact successor certificate")
-        );
+        assert!(fenced_transition_v2_activation_matches_scope_sync(
+            &conn,
+            storage_identity,
+            successor_identity,
+            &successor_members,
+            fenced_transition_v2_profile_digest(),
+        )
+        .expect("absent retained request installs only the exact successor certificate"));
         assert!(
             read_fenced_transition_v2_receipt_sync(&conn, storage_identity, &absent_retained)
                 .expect("read absent retained receipt")
@@ -31787,16 +31740,14 @@ mod tests {
                 [SessionConsensusResponse { result: Err(error), .. }] if error == &expected
             ));
             assert!(rejected.notifications.is_empty());
-            assert!(
-                !fenced_transition_v2_activation_matches_scope_sync(
-                    &conn,
-                    storage_identity,
-                    successor_identity,
-                    &successor_members,
-                    fenced_transition_v2_profile_digest(),
-                )
-                .expect("out-of-window request cannot install a certificate")
-            );
+            assert!(!fenced_transition_v2_activation_matches_scope_sync(
+                &conn,
+                storage_identity,
+                successor_identity,
+                &successor_members,
+                fenced_transition_v2_profile_digest(),
+            )
+            .expect("out-of-window request cannot install a certificate"));
         }
     }
 
@@ -31954,11 +31905,9 @@ mod tests {
                 ..
             }]
         ));
-        assert!(
-            ops::get_sync(&conn, &key(), expires_at)
-                .expect("record after expiry rejection")
-                .is_some()
-        );
+        assert!(ops::get_sync(&conn, &key(), expires_at)
+            .expect("record after expiry rejection")
+            .is_some());
 
         let new_owner = OwnerId::new("new-owner").expect("owner");
         let takeover_lease = FencedTransitionLease::acquire(
@@ -32508,17 +32457,15 @@ LIMIT 20000;
             Err(StoreError::BackendUnavailable(_))
         ));
         let scope = read_membership_scope_sync(&conn, identity()).expect("membership scope");
-        assert!(
-            activate_fenced_transition_v2_scope_sync(
-                &conn,
-                identity(),
-                scope.current_identity,
-                &scope.current_members,
-                fenced_transition_v2_profile_digest(),
-                FencedTransitionV2HistoryEpoch::new(2).expect("next epoch"),
-            )
-            .is_err()
-        );
+        assert!(activate_fenced_transition_v2_scope_sync(
+            &conn,
+            identity(),
+            scope.current_identity,
+            &scope.current_members,
+            fenced_transition_v2_profile_digest(),
+            FencedTransitionV2HistoryEpoch::new(2).expect("next epoch"),
+        )
+        .is_err());
 
         // Snapshot install performs the same history read through its pinned
         // incoming views before it can copy V3 tables or identity metadata.
@@ -33723,16 +33670,12 @@ LIMIT 20000;
             .project(&conn, &binding, identity())
             .expect("project authorized V2 bind after activation");
         assert!(projection.projected_v2_scope_activated);
-        assert!(
-            projection
-                .projected_v2_bound_requests
-                .contains(&activation_request.request_id().to_bytes())
-        );
-        assert!(
-            projection
-                .projected_v2_bound_requests
-                .contains(&bound_request.request_id().to_bytes())
-        );
+        assert!(projection
+            .projected_v2_bound_requests
+            .contains(&activation_request.request_id().to_bytes()));
+        assert!(projection
+            .projected_v2_bound_requests
+            .contains(&bound_request.request_id().to_bytes()));
         let projected_history = projection
             .projected_v2_history
             .expect("projection formed V2 history");
@@ -35352,15 +35295,13 @@ LIMIT 20000;
             ],
         )
         .expect("activate source scope");
-        assert!(
-            fenced_transition_activation_matches_scope_sync(
-                &source_conn,
-                storage_identity,
-                storage_identity,
-                &current,
-            )
-            .expect("source current certificate")
-        );
+        assert!(fenced_transition_activation_matches_scope_sync(
+            &source_conn,
+            storage_identity,
+            storage_identity,
+            &current,
+        )
+        .expect("source current certificate"));
 
         let target = SqliteSessionBackend::in_memory().expect("target backend");
         let target_conn = target.conn.blocking_lock();
@@ -35384,15 +35325,13 @@ LIMIT 20000;
             ],
         )
         .expect("activate target scope");
-        assert!(
-            fenced_transition_activation_matches_scope_sync(
-                &target_conn,
-                storage_identity,
-                storage_identity,
-                &current,
-            )
-            .expect("target current certificate")
-        );
+        assert!(fenced_transition_activation_matches_scope_sync(
+            &target_conn,
+            storage_identity,
+            storage_identity,
+            &current,
+        )
+        .expect("target current certificate"));
 
         let directory = tempfile::tempdir().expect("snapshot directory");
         let same_scope_path = directory.path().join("same-scope-zero-cert.sqlite");
@@ -35424,15 +35363,13 @@ LIMIT 20000;
         )
         .expect_err("same-scope snapshot must not erase the local certificate");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(
-            fenced_transition_activation_matches_scope_sync(
-                &target_conn,
-                storage_identity,
-                storage_identity,
-                &current,
-            )
-            .expect("failed snapshot preserves local certificate")
-        );
+        assert!(fenced_transition_activation_matches_scope_sync(
+            &target_conn,
+            storage_identity,
+            storage_identity,
+            &current,
+        )
+        .expect("failed snapshot preserves local certificate"));
 
         // A real membership promotion removes the predecessor certificate in
         // the promotion transaction.  Its V2 snapshot is valid, but the
@@ -35487,15 +35424,13 @@ LIMIT 20000;
             vec![joint, uniform],
         )
         .expect("promote successor scope");
-        assert!(
-            !fenced_transition_activation_matches_scope_sync(
-                &source_conn,
-                storage_identity,
-                successor_identity,
-                &successor_members,
-            )
-            .expect("promotion clears predecessor certificate")
-        );
+        assert!(!fenced_transition_activation_matches_scope_sync(
+            &source_conn,
+            storage_identity,
+            successor_identity,
+            &successor_members,
+        )
+        .expect("promotion clears predecessor certificate"));
 
         let successor_path = directory.path().join("successor-zero-cert.sqlite");
         let (successor_last_log, successor_membership) =
@@ -35527,15 +35462,13 @@ LIMIT 20000;
                 .expect("read installed V2 layout"),
             FencedTransitionReceiptLedgerLayout::Activated,
         );
-        assert!(
-            !fenced_transition_activation_matches_scope_sync(
-                &target_conn,
-                storage_identity,
-                successor_identity,
-                &successor_members,
-            )
-            .expect("successor remains deliberately unactivated")
-        );
+        assert!(!fenced_transition_activation_matches_scope_sync(
+            &target_conn,
+            storage_identity,
+            successor_identity,
+            &successor_members,
+        )
+        .expect("successor remains deliberately unactivated"));
     }
 
     #[test]
@@ -36208,11 +36141,9 @@ LIMIT 20000;
             .kind(),
             io::ErrorKind::InvalidData,
         );
-        assert!(
-            read_applied_sync(&target_conn, identity())
-                .expect("read unchanged target pointer")
-                .is_none()
-        );
+        assert!(read_applied_sync(&target_conn, identity())
+            .expect("read unchanged target pointer")
+            .is_none());
         assert_eq!(
             fenced_transition_receipt_count_sync(&target_conn).expect("read unchanged receipts"),
             0,
@@ -36831,13 +36762,11 @@ BEGIN IMMEDIATE;
             let record = sealed_record_for_key(key(), 1_048_576);
             persist_sealed_record_fixture(&conn, &record);
         }
-        assert!(
-            exact
-                .consensus_get_at(&key(), timestamp(1))
-                .await
-                .expect("exact-cap consensus read")
-                .is_some()
-        );
+        assert!(exact
+            .consensus_get_at(&key(), timestamp(1))
+            .await
+            .expect("exact-cap consensus read")
+            .is_some());
 
         let oversized = SqliteSessionBackend::in_memory().expect("oversized backend");
         {
@@ -38010,32 +37939,26 @@ BEGIN IMMEDIATE;
         validate_uniform_membership(&exact, &expected).expect("exact membership");
 
         let subset = BTreeSet::from([member(7), member(8)]);
-        assert!(
-            validate_uniform_membership(
-                &stored_membership(vec![subset.clone()], subset),
-                &expected
-            )
-            .is_err()
-        );
-        assert!(
-            validate_uniform_membership(
-                &stored_membership(
-                    vec![expected.clone(), BTreeSet::from([member(7), member(8)])],
-                    expected.clone(),
-                ),
-                &expected,
-            )
-            .is_err()
-        );
+        assert!(validate_uniform_membership(
+            &stored_membership(vec![subset.clone()], subset),
+            &expected
+        )
+        .is_err());
+        assert!(validate_uniform_membership(
+            &stored_membership(
+                vec![expected.clone(), BTreeSet::from([member(7), member(8)])],
+                expected.clone(),
+            ),
+            &expected,
+        )
+        .is_err());
         let mut nodes_with_learner = expected.clone();
         nodes_with_learner.insert(member(10));
-        assert!(
-            validate_uniform_membership(
-                &stored_membership(vec![expected.clone()], nodes_with_learner),
-                &expected,
-            )
-            .is_err()
-        );
+        assert!(validate_uniform_membership(
+            &stored_membership(vec![expected.clone()], nodes_with_learner),
+            &expected,
+        )
+        .is_err());
     }
 
     #[test]
@@ -38083,22 +38006,18 @@ BEGIN IMMEDIATE;
 
         let mut invented = union;
         invented.insert(member(12));
-        assert!(
-            classify_transition_membership(
-                &stored_membership(vec![current.clone()], invented),
-                &current,
-                &desired,
-            )
-            .is_err()
-        );
-        assert!(
-            classify_transition_membership(
-                &stored_membership(vec![current.clone(), members(&[7, 8, 10])], desired.clone(),),
-                &current,
-                &desired,
-            )
-            .is_err()
-        );
+        assert!(classify_transition_membership(
+            &stored_membership(vec![current.clone()], invented),
+            &current,
+            &desired,
+        )
+        .is_err());
+        assert!(classify_transition_membership(
+            &stored_membership(vec![current.clone(), members(&[7, 8, 10])], desired.clone(),),
+            &current,
+            &desired,
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -38189,15 +38108,13 @@ BEGIN IMMEDIATE;
             .expect("apply learner readiness");
         fence_application_authority_sync(&conn, storage_identity, first_id, first_digest)
             .expect("fence application authority");
-        assert!(
-            validate_application_authority_sync(
-                &conn,
-                storage_identity,
-                member(7),
-                storage_identity,
-            )
-            .is_err()
-        );
+        assert!(validate_application_authority_sync(
+            &conn,
+            storage_identity,
+            member(7),
+            storage_identity,
+        )
+        .is_err());
         validate_application_authority_sync(&conn, storage_identity, member(10), five_identity)
             .expect("new desired member is authoritative after fence");
 
@@ -38395,11 +38312,9 @@ BEGIN IMMEDIATE;
             read_membership_scope_sync(&conn, storage_identity).expect("compacted scope");
         assert!(compacted.predecessor.is_none());
         assert_eq!(2, compacted.history.len());
-        assert!(
-            read_current_snapshot_sync(&conn, storage_identity)
-                .expect("retained snapshot")
-                .is_some()
-        );
+        assert!(read_current_snapshot_sync(&conn, storage_identity)
+            .expect("retained snapshot")
+            .is_some());
 
         assert_eq!(
             MembershipScopeMutationError::ConflictingTransition,
@@ -38432,12 +38347,10 @@ BEGIN IMMEDIATE;
                 ..
             }] if code == "topology_transition_rejected"
         ));
-        assert!(
-            read_membership_scope_sync(&conn, storage_identity)
-                .expect("conflicting Prepare left scope intact")
-                .pending
-                .is_none()
-        );
+        assert!(read_membership_scope_sync(&conn, storage_identity)
+            .expect("conflicting Prepare left scope intact")
+            .pending
+            .is_none());
     }
 
     #[tokio::test]
@@ -38513,15 +38426,13 @@ BEGIN IMMEDIATE;
         );
         validate_application_authority_sync(&conn, storage_identity, member(7), storage_identity)
             .expect("current authority restored with abort");
-        assert!(
-            validate_application_authority_sync(
-                &conn,
-                storage_identity,
-                member(10),
-                desired_identity,
-            )
-            .is_err()
-        );
+        assert!(validate_application_authority_sync(
+            &conn,
+            storage_identity,
+            member(10),
+            desired_identity,
+        )
+        .is_err());
         let aborting_scope =
             read_membership_scope_sync(&conn, storage_identity).expect("aborting scope");
         assert!(aborting_scope.pending.is_none());
@@ -38559,12 +38470,10 @@ BEGIN IMMEDIATE;
             )
             .expect_err("an aborting transition must block its successor")
         );
-        assert!(
-            read_membership_scope_sync(&conn, storage_identity)
-                .expect("rejected successor left abort scope intact")
-                .pending
-                .is_none()
-        );
+        assert!(read_membership_scope_sync(&conn, storage_identity)
+            .expect("rejected successor left abort scope intact")
+            .pending
+            .is_none());
 
         let restored = membership_entry_at(4, vec![current.clone()], current.clone());
         let current_term_abort = topology_entry_at(
@@ -39119,12 +39028,10 @@ BEGIN IMMEDIATE;
                 )
                 .expect("retry candidate cancellation")
             );
-            assert!(
-                read_membership_scope_sync(&conn, storage_identity)
-                    .expect("cancelled candidate scope")
-                    .pending
-                    .is_none()
-            );
+            assert!(read_membership_scope_sync(&conn, storage_identity)
+                .expect("cancelled candidate scope")
+                .pending
+                .is_none());
             assert_eq!(
                 MembershipScopeMutationError::ConflictingTransition,
                 cancel_provisional_candidate_membership_scope_sync(
@@ -39688,16 +39595,14 @@ BEGIN IMMEDIATE;
             &desired,
         )
         .expect("fixed-width all-zero values are valid exact identifiers");
-        assert!(
-            read_membership_transition_evidence_sync(
-                &conn,
-                storage_identity,
-                [0; MEMBERSHIP_TRANSITION_ID_BYTES],
-                [0; 32],
-            )
-            .expect("read exact all-zero identifiers")
-            .is_some()
-        );
+        assert!(read_membership_transition_evidence_sync(
+            &conn,
+            storage_identity,
+            [0; MEMBERSHIP_TRANSITION_ID_BYTES],
+            [0; 32],
+        )
+        .expect("read exact all-zero identifiers")
+        .is_some());
         conn.execute_batch("PRAGMA ignore_check_constraints = ON")
             .expect("allow corrupt fixture");
         conn.execute(
@@ -39753,17 +39658,15 @@ BEGIN IMMEDIATE;
             last_membership: unexpected,
             snapshot_id: "mismatched-membership".into(),
         };
-        assert!(
-            save_current_snapshot_sync(
-                &conn,
-                identity,
-                &meta,
-                "snapshot-00000000-0000-4000-8000-000000000016.opc",
-                [0; 32],
-                1,
-            )
-            .is_err()
-        );
+        assert!(save_current_snapshot_sync(
+            &conn,
+            identity,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000016.opc",
+            [0; 32],
+            1,
+        )
+        .is_err());
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM consensus_snapshot", [], |row| {
                 row.get(0)
@@ -39964,15 +39867,13 @@ BEGIN IMMEDIATE;
             baseline_machine,
             proposal_state_sync(&conn, identity).expect("machine after fault")
         );
-        assert!(
-            read_outcome_sync(
-                &conn,
-                identity,
-                SessionConsensusRequestId::from_bytes(request_id)
-            )
-            .expect("outcome lookup")
-            .is_none()
-        );
+        assert!(read_outcome_sync(
+            &conn,
+            identity,
+            SessionConsensusRequestId::from_bytes(request_id)
+        )
+        .expect("outcome lookup")
+        .is_none());
         for table in ["leases", "key_fences", "session_replication_log"] {
             let count: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -40342,15 +40243,13 @@ BEGIN IMMEDIATE;
             [],
         )
         .expect("emulate promotion certificate invalidation");
-        assert!(
-            !fenced_transition_activation_matches_scope_sync(
-                &conn,
-                identity(),
-                identity(),
-                &voters,
-            )
-            .expect("certificate is absent after cutover")
-        );
+        assert!(!fenced_transition_activation_matches_scope_sync(
+            &conn,
+            identity(),
+            identity(),
+            &voters,
+        )
+        .expect("certificate is absent after cutover"));
 
         let request = fenced_transition_request(0xBB, "cutover-revoked-owner");
         let revoked = apply_entries_sync(
@@ -40375,15 +40274,13 @@ BEGIN IMMEDIATE;
                 ..
             }]
         ));
-        assert!(
-            !fenced_transition_activation_matches_scope_sync(
-                &conn,
-                identity(),
-                identity(),
-                &voters,
-            )
-            .expect("revoked wrapper cannot publish a certificate")
-        );
+        assert!(!fenced_transition_activation_matches_scope_sync(
+            &conn,
+            identity(),
+            identity(),
+            &voters,
+        )
+        .expect("revoked wrapper cannot publish a certificate"));
         assert_eq!(
             1_i64,
             conn.query_row("SELECT COUNT(*) FROM session_records", [], |row| row
@@ -40580,11 +40477,9 @@ BEGIN IMMEDIATE;
         )
         .expect_err("fixed raw vote must revalidate its durable authority");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
-        assert!(
-            read_vote_sync(&conn, identity)
-                .expect("read rejected vote")
-                .is_none()
-        );
+        assert!(read_vote_sync(&conn, identity)
+            .expect("read rejected vote")
+            .is_none());
     }
 
     #[tokio::test]
@@ -40613,11 +40508,9 @@ BEGIN IMMEDIATE;
         )
         .expect_err("fixed authority must reject a nonmember vote leader");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
-        assert!(
-            read_vote_sync(&conn, identity)
-                .expect("read rolled-back vote")
-                .is_none()
-        );
+        assert!(read_vote_sync(&conn, identity)
+            .expect("read rolled-back vote")
+            .is_none());
     }
 
     #[tokio::test]
@@ -40731,17 +40624,15 @@ BEGIN IMMEDIATE;
                 ConsensusAuthorityProfile::FixedImmutable,
             )
             .expect("reopen fixed authority");
-            assert!(
-                fixed_quorum_authority_is_exact_sync(
-                    &conn,
-                    identity,
-                    &members,
-                    &bindings,
-                    PlacementResiliencePolicy::RequireIndependentFailureDomains,
-                    false,
-                )
-                .expect("read reopened fixed authority")
-            );
+            assert!(fixed_quorum_authority_is_exact_sync(
+                &conn,
+                identity,
+                &members,
+                &bindings,
+                PlacementResiliencePolicy::RequireIndependentFailureDomains,
+                false,
+            )
+            .expect("read reopened fixed authority"));
         }
     }
 
@@ -40779,33 +40670,29 @@ BEGIN IMMEDIATE;
         .expect("form fixed quorum");
         drop(conn);
 
-        assert!(
-            backend
-                .fixed_quorum_application_traffic_authority_is_exact(
-                    identity,
-                    members.clone(),
-                    bindings.clone(),
-                    placement_policy,
-                )
-                .await
-                .expect("exact fixed authority snapshot")
-        );
+        assert!(backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            )
+            .await
+            .expect("exact fixed authority snapshot"));
 
         let conn = backend.conn.lock().await;
         mark_operator_recovery_pending_sync(&conn, identity, 1, [0x71; 32])
             .expect("mark recovery pending");
         drop(conn);
-        assert!(
-            !backend
-                .fixed_quorum_application_traffic_authority_is_exact(
-                    identity,
-                    members.clone(),
-                    bindings.clone(),
-                    placement_policy,
-                )
-                .await
-                .expect("pending recovery snapshot")
-        );
+        assert!(!backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            )
+            .await
+            .expect("pending recovery snapshot"));
 
         ensure_operator_recovery_latch_sync(
             &database,
@@ -40817,47 +40704,41 @@ BEGIN IMMEDIATE;
             },
         )
         .expect("write mismatched recovery latch");
-        assert!(
-            backend
-                .fixed_quorum_application_traffic_authority_is_exact(
-                    identity,
-                    members.clone(),
-                    bindings.clone(),
-                    placement_policy,
-                )
-                .await
-                .is_err()
-        );
+        assert!(backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            )
+            .await
+            .is_err());
 
         std::fs::write(
             operator_recovery_latch_path(&database).expect("recovery latch path"),
             b"corrupt",
         )
         .expect("corrupt recovery latch");
-        assert!(
-            backend
-                .fixed_quorum_application_traffic_authority_is_exact(
-                    identity,
-                    members.clone(),
-                    bindings.clone(),
-                    placement_policy,
-                )
-                .await
-                .is_err()
-        );
+        assert!(backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            )
+            .await
+            .is_err());
 
         backend.inject_consensus_operator_recovery_failure(true);
-        assert!(
-            backend
-                .fixed_quorum_application_traffic_authority_is_exact(
-                    identity,
-                    members,
-                    bindings,
-                    placement_policy,
-                )
-                .await
-                .is_err()
-        );
+        assert!(backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members,
+                bindings,
+                placement_policy,
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -40956,24 +40837,22 @@ BEGIN IMMEDIATE;
         mark_operator_recovery_pending_sync(&conn, identity, 1, [0x76; 32])
             .expect("mark recovery pending");
         drop(conn);
-        assert!(
-            backend
-                .fixed_quorum_fenced_transition_v2_status_at_scope(
-                    crate::sqlite::FixedQuorumFencedTransitionV2StatusReadRequest {
-                        storage_identity: identity,
-                        scope_identity: identity,
-                        voters: members.clone(),
-                        expected_members: members,
-                        expected_bindings: bindings,
-                        expected_placement_policy: placement_policy,
-                        profile_digest: fenced_transition_v2_profile_digest(),
-                        require_activation: false,
-                    },
-                    &request,
-                )
-                .await
-                .is_err()
-        );
+        assert!(backend
+            .fixed_quorum_fenced_transition_v2_status_at_scope(
+                crate::sqlite::FixedQuorumFencedTransitionV2StatusReadRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members,
+                    expected_bindings: bindings,
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                    require_activation: false,
+                },
+                &request,
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -41045,40 +40924,36 @@ BEGIN IMMEDIATE;
             } if observed == logical_time
         ));
 
-        assert!(
-            backend
-                .fixed_quorum_activated_v2_mutation_snapshot(
-                    crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
-                        storage_identity: identity,
-                        scope_identity: identity_at(2, 0x7A),
-                        voters: members.clone(),
-                        expected_members: members.clone(),
-                        expected_bindings: bindings.clone(),
-                        expected_placement_policy: placement_policy,
-                        profile_digest: fenced_transition_v2_profile_digest(),
-                    },
-                )
-                .await
-                .is_err()
-        );
+        assert!(backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity_at(2, 0x7A),
+                    voters: members.clone(),
+                    expected_members: members.clone(),
+                    expected_bindings: bindings.clone(),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .is_err());
 
         let wrong_members = BTreeSet::from([member(7), member(8), member(10)]);
-        assert!(
-            backend
-                .fixed_quorum_activated_v2_mutation_snapshot(
-                    crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
-                        storage_identity: identity,
-                        scope_identity: identity,
-                        voters: wrong_members.clone(),
-                        expected_members: wrong_members.clone(),
-                        expected_bindings: test_member_bindings(&wrong_members),
-                        expected_placement_policy: placement_policy,
-                        profile_digest: fenced_transition_v2_profile_digest(),
-                    },
-                )
-                .await
-                .is_err()
-        );
+        assert!(backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: wrong_members.clone(),
+                    expected_members: wrong_members.clone(),
+                    expected_bindings: test_member_bindings(&wrong_members),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .is_err());
 
         assert!(matches!(
             backend
@@ -41101,22 +40976,20 @@ BEGIN IMMEDIATE;
         // before logical time can be returned. No partial or stale snapshot
         // may cross that pre-proposal boundary.
         backend.inject_fixed_quorum_v2_mutation_snapshot_cut(true);
-        assert!(
-            backend
-                .fixed_quorum_activated_v2_mutation_snapshot(
-                    crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
-                        storage_identity: identity,
-                        scope_identity: identity,
-                        voters: members.clone(),
-                        expected_members: members.clone(),
-                        expected_bindings: bindings.clone(),
-                        expected_placement_policy: placement_policy,
-                        profile_digest: fenced_transition_v2_profile_digest(),
-                    },
-                )
-                .await
-                .is_err()
-        );
+        assert!(backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members.clone(),
+                    expected_bindings: bindings.clone(),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .is_err());
         backend.inject_fixed_quorum_v2_mutation_snapshot_cut(false);
 
         let conn = backend.conn.lock().await;
@@ -41147,22 +41020,20 @@ BEGIN IMMEDIATE;
         mark_operator_recovery_pending_sync(&conn, identity, 1, [0x7B; 32])
             .expect("mark recovery pending");
         drop(conn);
-        assert!(
-            backend
-                .fixed_quorum_activated_v2_mutation_snapshot(
-                    crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
-                        storage_identity: identity,
-                        scope_identity: identity,
-                        voters: members.clone(),
-                        expected_members: members,
-                        expected_bindings: bindings,
-                        expected_placement_policy: placement_policy,
-                        profile_digest: fenced_transition_v2_profile_digest(),
-                    },
-                )
-                .await
-                .is_err()
-        );
+        assert!(backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members,
+                    expected_bindings: bindings,
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -41219,22 +41090,20 @@ BEGIN IMMEDIATE;
         )
         .expect("write recovery latch");
 
-        assert!(
-            backend
-                .fixed_quorum_activated_v2_mutation_snapshot(
-                    crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
-                        storage_identity: identity,
-                        scope_identity: identity,
-                        voters: members.clone(),
-                        expected_members: members,
-                        expected_bindings: bindings,
-                        expected_placement_policy: placement_policy,
-                        profile_digest: fenced_transition_v2_profile_digest(),
-                    },
-                )
-                .await
-                .is_err()
-        );
+        assert!(backend
+            .fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members,
+                    expected_bindings: bindings,
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -41279,21 +41148,17 @@ BEGIN IMMEDIATE;
         )
         .expect_err("fixed authority must reject committed topology preparation");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
-        assert!(
-            read_applied_sync(&conn, identity)
-                .expect("read rolled-back applied pointer")
-                .is_none()
-        );
+        assert!(read_applied_sync(&conn, identity)
+            .expect("read rolled-back applied pointer")
+            .is_none());
         let scope = read_membership_scope_sync(&conn, identity).expect("read rolled-back scope");
         assert!(scope.pending.is_none());
         assert_eq!(identity, scope.current_identity);
         assert_eq!(fixed_members, scope.current_members);
-        assert!(
-            read_membership_sync(&conn, identity)
-                .expect("read rolled-back membership")
-                .log_id()
-                .is_none()
-        );
+        assert!(read_membership_sync(&conn, identity)
+            .expect("read rolled-back membership")
+            .log_id()
+            .is_none());
     }
 
     #[test]
@@ -41655,16 +41520,12 @@ BEGIN IMMEDIATE;
             })
             .expect("rejected log count")
         );
-        assert!(
-            read_committed_sync(&conn, identity)
-                .expect("read rejected committed pointer")
-                .is_none()
-        );
-        assert!(
-            read_current_snapshot_sync(&conn, identity)
-                .expect("read rejected snapshot metadata")
-                .is_none()
-        );
+        assert!(read_committed_sync(&conn, identity)
+            .expect("read rejected committed pointer")
+            .is_none());
+        assert!(read_current_snapshot_sync(&conn, identity)
+            .expect("read rejected snapshot metadata")
+            .is_none());
     }
 
     #[tokio::test]
@@ -41998,25 +41859,19 @@ BEGIN IMMEDIATE;
         )
         .expect_err("fixed snapshot install must reject local placement policy drift");
         assert_eq!(io::ErrorKind::InvalidData, install.kind());
-        assert!(
-            read_vote_sync(&target_conn, identity)
-                .expect("read rejected vote")
-                .is_none()
-        );
-        assert!(
-            read_committed_sync(&target_conn, identity)
-                .expect("read rejected committed pointer")
-                .is_none()
-        );
+        assert!(read_vote_sync(&target_conn, identity)
+            .expect("read rejected vote")
+            .is_none());
+        assert!(read_committed_sync(&target_conn, identity)
+            .expect("read rejected committed pointer")
+            .is_none());
         assert_eq!(
             Some(log_id(0)),
             read_applied_sync(&target_conn, identity).expect("read unchanged applied pointer")
         );
-        assert!(
-            read_current_snapshot_sync(&target_conn, identity)
-                .expect("read rejected snapshot metadata")
-                .is_none()
-        );
+        assert!(read_current_snapshot_sync(&target_conn, identity)
+            .expect("read rejected snapshot metadata")
+            .is_none());
         assert_eq!(
             Some(PlacementResiliencePolicy::AllowReducedResilience),
             read_fixed_placement_policy_sync(&target_conn)
@@ -42105,11 +41960,9 @@ BEGIN IMMEDIATE;
         )
         .expect_err("fixed snapshot install must not repair local authority drift");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
-        assert!(
-            read_applied_sync(&target_conn, identity)
-                .expect("read unchanged target applied pointer")
-                .is_none()
-        );
+        assert!(read_applied_sync(&target_conn, identity)
+            .expect("read unchanged target applied pointer")
+            .is_none());
         assert_eq!(
             BTreeMap::new(),
             read_membership_scope_sync(&target_conn, identity)
@@ -42206,11 +42059,9 @@ BEGIN IMMEDIATE;
                     .len(),
             )
             .expect_err("incoming snapshot helper must not follow a symlink");
-            assert!(
-                read_applied_sync(&target_conn, identity)
-                    .expect("read unchanged target after symlink rejection")
-                    .is_none()
-            );
+            assert!(read_applied_sync(&target_conn, identity)
+                .expect("read unchanged target after symlink rejection")
+                .is_none());
         }
         let replaced_error = install_snapshot_database_with_authority_sync(
             &target_conn,
@@ -42229,11 +42080,9 @@ BEGIN IMMEDIATE;
         )
         .expect_err("attached replacement source must be rejected before copy");
         assert_eq!(io::ErrorKind::InvalidData, replaced_error.kind());
-        assert!(
-            read_applied_sync(&target_conn, identity)
-                .expect("read unchanged target after replacement rejection")
-                .is_none()
-        );
+        assert!(read_applied_sync(&target_conn, identity)
+            .expect("read unchanged target after replacement rejection")
+            .is_none());
 
         install_snapshot_database_with_authority_sync(
             &target_conn,
@@ -42359,19 +42208,17 @@ BEGIN IMMEDIATE;
         let dynamic_target = SqliteSessionBackend::in_memory().expect("dynamic target");
         let dynamic_conn = dynamic_target.conn.lock().await;
         initialize_schema(&dynamic_conn, identity, &members).expect("initialize dynamic target");
-        assert!(
-            install_snapshot_database_with_profile_sync(
-                &dynamic_conn,
-                identity,
-                ConsensusAuthorityProfile::Dynamic,
-                &snapshot_path,
-                &meta,
-                "snapshot-00000000-0000-4000-8000-000000000021.opc",
-                [0x92; 32],
-                byte_length,
-            )
-            .is_err()
-        );
+        assert!(install_snapshot_database_with_profile_sync(
+            &dynamic_conn,
+            identity,
+            ConsensusAuthorityProfile::Dynamic,
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000021.opc",
+            [0x92; 32],
+            byte_length,
+        )
+        .is_err());
         assert_eq!(
             ConsensusAuthorityProfile::Dynamic,
             read_consensus_authority_profile_sync(&dynamic_conn)
@@ -42399,19 +42246,17 @@ BEGIN IMMEDIATE;
             ConsensusAuthorityProfile::FixedImmutable,
         )
         .expect("initialize fixed policy target");
-        assert!(
-            install_snapshot_database_with_profile_sync(
-                &policy_conn,
-                identity,
-                ConsensusAuthorityProfile::FixedImmutable,
-                &snapshot_path,
-                &meta,
-                "snapshot-00000000-0000-4000-8000-000000000022.opc",
-                [0x93; 32],
-                byte_length,
-            )
-            .is_err()
-        );
+        assert!(install_snapshot_database_with_profile_sync(
+            &policy_conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000022.opc",
+            [0x93; 32],
+            byte_length,
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -42618,12 +42463,10 @@ BEGIN IMMEDIATE;
                 .query_row("SELECT value FROM original_only", [], |row| row.get(0))
                 .expect("SQLite must consume A rather than B");
             assert_eq!(7, value);
-            assert!(
-                connection
-                    .query_row("SELECT value FROM replacement_only", [], |row| row
-                        .get::<_, i64>(0))
-                    .is_err()
-            );
+            assert!(connection
+                .query_row("SELECT value FROM replacement_only", [], |row| row
+                    .get::<_, i64>(0))
+                .is_err());
             verify_pinned_snapshot_descriptor(&pinned, &connection)
                 .expect("retained descriptor must still be A before pathname restoration");
         }
@@ -42950,11 +42793,9 @@ BEGIN IMMEDIATE;
             1,
             "only the first entry watches"
         );
-        assert!(
-            ops::get_sync(&conn, &second_key, timestamp(2))
-                .expect("read second key")
-                .is_none()
-        );
+        assert!(ops::get_sync(&conn, &second_key, timestamp(2))
+            .expect("read second key")
+            .is_none());
         assert_eq!(
             read_fenced_transition_status_sync(&conn, identity(), identity(), &second),
             Ok(FencedTransitionStatus::Recorded(Box::new(Err(

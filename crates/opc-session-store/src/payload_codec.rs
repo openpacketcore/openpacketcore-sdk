@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{BackendCapabilities, EncryptedSessionPayload};

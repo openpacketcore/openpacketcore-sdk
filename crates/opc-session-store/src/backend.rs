@@ -16,10 +16,6 @@ use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerScope, SessionConsumerStoreError,
-};
-use crate::{
     capability::BackendCapabilities,
     consensus::types::validate_fenced_transition_v2_batch,
     error::{LeaseError, StoreError},
@@ -44,6 +40,10 @@ use crate::{
         checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at,
         validate_stored_record_expiry_profile,
     },
+};
+use crate::{
+    SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerScope, SessionConsumerStoreError,
 };
 
 /// Per-watcher buffer size for replication watch streams.
@@ -4843,8 +4843,8 @@ mod protected_session_backend_tests {
     use opc_key::{KeyError, KeyHandle, KeyId, KeyPurpose};
 
     use crate::{
-        EncryptedSessionPayload, StateClass, StateType, fake::FakeSessionBackend,
-        model::SessionKeyType,
+        fake::FakeSessionBackend, model::SessionKeyType, EncryptedSessionPayload, StateClass,
+        StateType,
     };
 
     #[test]

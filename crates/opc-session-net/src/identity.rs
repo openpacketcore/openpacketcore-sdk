@@ -9,18 +9,17 @@ use opc_consensus::{
     derive_configuration_id, derive_node_id, ConsensusClusterId as SessionConsensusClusterId,
     ConsensusIdentity as SessionConsensusIdentity, ConsensusNodeId as SessionConsensusNodeId,
 };
+use opc_session_store::topology::derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root;
 #[cfg(any(
     all(feature = "insecure-test", feature = "legacy-session-net-compat"),
     test
 ))]
 use opc_session_store::ReplicaBackingIdentity;
-use opc_session_store::topology::derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root;
 #[cfg(any(feature = "legacy-session-net-compat", test))]
 use opc_session_store::{BackendPeerBinding, BackendPeerScopeIdentity};
 use opc_session_store::{
-    PlacementResiliencePolicy, QUORUM_TOPOLOGY_MAX_MEMBERS, QuorumReplicaDescriptor,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
-    RosterAttestationTrustRootV1,
+    PlacementResiliencePolicy, QuorumReplicaDescriptor, ReplicaEndpoint, ReplicaFailureDomain,
+    ReplicaId, ReplicaTlsIdentity, RosterAttestationTrustRootV1, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 use opc_types::SpiffeId;
 use sha2::{Digest, Sha256};

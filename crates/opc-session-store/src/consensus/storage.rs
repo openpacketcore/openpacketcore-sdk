@@ -8,15 +8,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES;
 use opc_consensus::engine::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use opc_consensus::engine::{
     Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState, RaftLogReader,
     RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StoredMembership, Vote,
 };
+use opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -24,10 +24,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use super::raft_adapter::{SessionRaftAdapterError, SessionRaftPeerDirectory};
 #[cfg(test)]
 use super::snapshot::{
-    FixedPrepublicationScanGateGuard, SnapshotArtifactGate, fixed_prepublication_scan_boundary,
+    fixed_prepublication_scan_boundary, FixedPrepublicationScanGateGuard, SnapshotArtifactGate,
 };
 use super::snapshot::{
-    PinnedSqliteFile, SNAPSHOT_MAX_BYTES, SessionSnapshotFile, UnpublishedSnapshotArtifact,
+    PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact, SNAPSHOT_MAX_BYTES,
 };
 use super::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
@@ -36,8 +36,8 @@ use super::{
 use crate::backend::ReplicationEntry;
 use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
 use crate::readiness::PlacementResiliencePolicy;
-use crate::sqlite::SqliteSessionBackend;
 use crate::sqlite::consensus::{self, SqliteConsensusCore};
+use crate::sqlite::SqliteSessionBackend;
 
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
 const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 8 + 32;
@@ -112,8 +112,8 @@ impl Drop for SnapshotArtifactState {
 }
 
 #[cfg(test)]
-fn promoted_verify_gates()
--> &'static std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<SnapshotArtifactGate>>> {
+fn promoted_verify_gates(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<SnapshotArtifactGate>>> {
     static GATES: std::sync::OnceLock<
         std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<SnapshotArtifactGate>>>,
     > = std::sync::OnceLock::new();
@@ -196,8 +196,8 @@ fn in_place_seal_test_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 #[cfg(test)]
-fn fixed_prepublication_verify_gates()
--> &'static std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<SnapshotArtifactGate>>> {
+fn fixed_prepublication_verify_gates(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<SnapshotArtifactGate>>> {
     static GATES: std::sync::OnceLock<
         std::sync::Mutex<BTreeMap<PathBuf, std::sync::Arc<SnapshotArtifactGate>>>,
     > = std::sync::OnceLock::new();
@@ -2579,8 +2579,8 @@ mod tests {
     use opc_consensus::engine::{CommittedLeaderId, EntryPayload, RaftSnapshotBuilder};
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
-        AEAD_TAG_LEN, AES_256_GCM_SIV_NONCE_LEN, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad,
-        serialize_bound_aad,
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+        AES_256_GCM_SIV_NONCE_LEN,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
     use sha2::Sha256;
@@ -2590,10 +2590,9 @@ mod tests {
     use super::*;
     use crate::backend::CompareAndSet;
     use crate::consensus::{
-        SESSION_CONSENSUS_SCHEMA_VERSION, SessionConsensusClusterId, SessionConsensusCommand,
-        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-        SessionConsensusEntryDigest, SessionConsensusRequestId, SessionMutationIntent,
-        SessionMutationOutcome,
+        SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+        SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusRequestId,
+        SessionMutationIntent, SessionMutationOutcome, SESSION_CONSENSUS_SCHEMA_VERSION,
     };
     use crate::lease::SessionLeaseManager;
     use crate::model::{Generation, OwnerId, SessionKey, SessionKeyType, StateClass, StateType};
@@ -3240,11 +3239,10 @@ mod tests {
         started_rx.await.expect("guarded output is armed");
         assert!(output_path.exists());
         task.abort();
-        assert!(
-            task.await
-                .expect_err("seal output task is cancelled")
-                .is_cancelled()
-        );
+        assert!(task
+            .await
+            .expect_err("seal output task is cancelled")
+            .is_cancelled());
         assert!(!output_path.exists());
     }
 
@@ -3782,8 +3780,8 @@ mod tests {
     }
 
     #[test]
-    fn fixed_prepublication_descriptor_scan_accepts_one_valid_bounded_envelope_and_rejects_tampering()
-     {
+    fn fixed_prepublication_descriptor_scan_accepts_one_valid_bounded_envelope_and_rejects_tampering(
+    ) {
         let directory = tempfile::tempdir().expect("fixed prepublication fixture directory");
         let payload = b"fixed prepublication envelope";
         let checksum = fixture_checksum(payload);
@@ -3905,18 +3903,16 @@ mod tests {
             checksum,
         );
         std::fs::rename(&replacement, &pathname_replacement).expect("replace pinned pathname");
-        assert!(
-            pinned
-                .verify_snapshot_envelope_and_bind_immutable_generation(
-                    &pathname_replacement,
-                    SNAPSHOT_FOOTER_MAGIC,
-                    SNAPSHOT_FOOTER_BYTES,
-                    1024,
-                    checksum,
-                    length,
-                )
-                .is_err()
-        );
+        assert!(pinned
+            .verify_snapshot_envelope_and_bind_immutable_generation(
+                &pathname_replacement,
+                SNAPSHOT_FOOTER_MAGIC,
+                SNAPSHOT_FOOTER_BYTES,
+                1024,
+                checksum,
+                length,
+            )
+            .is_err());
 
         let post_scan_replacement = directory.path().join("post-scan-replacement.opc");
         write_sealed_snapshot_fixture(
@@ -3950,11 +3946,9 @@ mod tests {
         );
         std::fs::rename(&replacement, &post_scan_replacement)
             .expect("replace bound post-scan pathname");
-        assert!(
-            pinned
-                .verify_bound_immutable_snapshot_envelope(&post_scan_replacement, length)
-                .is_err()
-        );
+        assert!(pinned
+            .verify_bound_immutable_snapshot_envelope(&post_scan_replacement, length)
+            .is_err());
 
         let post_scan_length_change = directory.path().join("post-scan-length-change.opc");
         write_sealed_snapshot_fixture(
@@ -3984,11 +3978,9 @@ mod tests {
             .expect("open bound post-scan length fixture")
             .set_len(length + 1)
             .expect("extend bound post-scan length fixture");
-        assert!(
-            pinned
-                .verify_bound_immutable_snapshot_envelope(&post_scan_length_change, length)
-                .is_err()
-        );
+        assert!(pinned
+            .verify_bound_immutable_snapshot_envelope(&post_scan_length_change, length)
+            .is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4660,11 +4652,9 @@ mod tests {
                 .expect("rows");
             for row in rows {
                 let bytes = row.expect("row");
-                assert!(
-                    !bytes
-                        .windows(PLAINTEXT_CANARY.len())
-                        .any(|window| window == PLAINTEXT_CANARY)
-                );
+                assert!(!bytes
+                    .windows(PLAINTEXT_CANARY.len())
+                    .any(|window| window == PLAINTEXT_CANARY));
             }
         }
     }
@@ -4857,11 +4847,9 @@ mod tests {
         let snapshot_bytes = tokio::fs::read(snapshot.snapshot.path())
             .await
             .expect("snapshot bytes");
-        assert!(
-            !snapshot_bytes
-                .windows(PLAINTEXT_CANARY.len())
-                .any(|window| window == PLAINTEXT_CANARY)
-        );
+        assert!(!snapshot_bytes
+            .windows(PLAINTEXT_CANARY.len())
+            .any(|window| window == PLAINTEXT_CANARY));
 
         let target_dir = tempfile::tempdir().expect("target tempdir");
         let target_backend =
@@ -4953,12 +4941,10 @@ mod tests {
             .await
             .expect("stream stale snapshot");
         stale_receiving.flush().await.expect("flush stale snapshot");
-        assert!(
-            target_sm
-                .install_snapshot(&snapshot.meta, stale_receiving)
-                .await
-                .is_err()
-        );
+        assert!(target_sm
+            .install_snapshot(&snapshot.meta, stale_receiving)
+            .await
+            .is_err());
         assert_eq!(
             (2, advanced_digest, Some(timestamp(2))),
             target_sm
@@ -4995,12 +4981,10 @@ mod tests {
             .flush()
             .await
             .expect("flush cross-identity snapshot");
-        assert!(
-            wrong_identity_sm
-                .install_snapshot(&snapshot.meta, wrong_identity_receiving)
-                .await
-                .is_err()
-        );
+        assert!(wrong_identity_sm
+            .install_snapshot(&snapshot.meta, wrong_identity_receiving)
+            .await
+            .is_err());
         assert_eq!(
             (0, SessionConsensusEntryDigest::GENESIS, None),
             wrong_identity_sm
@@ -5035,12 +5019,10 @@ mod tests {
             .flush()
             .await
             .expect("flush corrupt snapshot");
-        assert!(
-            corrupt_target_sm
-                .install_snapshot(&snapshot.meta, corrupt_receiving)
-                .await
-                .is_err()
-        );
+        assert!(corrupt_target_sm
+            .install_snapshot(&snapshot.meta, corrupt_receiving)
+            .await
+            .is_err());
         assert_eq!(
             (0, SessionConsensusEntryDigest::GENESIS, None),
             corrupt_target_sm
@@ -5191,12 +5173,10 @@ mod tests {
         .await
         .expect("final snapshot worker reaches its fixed source cut");
         cancelled.abort();
-        assert!(
-            cancelled
-                .await
-                .expect_err("final snapshot future is cancelled")
-                .is_cancelled()
-        );
+        assert!(cancelled
+            .await
+            .expect_err("final snapshot future is cancelled")
+            .is_cancelled());
 
         let shutdown_waiter = tokio::spawn({
             let observer = shutdown_observer.clone();

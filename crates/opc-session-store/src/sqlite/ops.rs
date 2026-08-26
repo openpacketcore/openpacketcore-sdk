@@ -1,10 +1,10 @@
 use opc_key::Zeroizing;
 use opc_types::Timestamp;
-use rand::{TryRng, rngs::SysRng};
-use rusqlite::{Connection, OptionalExtension, Row, named_params, params, types::ValueRef};
+use rand::{rngs::SysRng, TryRng};
+use rusqlite::{named_params, params, types::ValueRef, Connection, OptionalExtension, Row};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
@@ -13,15 +13,15 @@ use crate::{
     error::StoreError,
     lease::LeaseGuard,
     model::{
-        FenceToken, Generation, OWNER_ID_MAX_BYTES, OwnerId, SESSION_KEY_TYPE_MAX_BYTES,
-        STATE_TYPE_MAX_BYTES, SessionKey, SessionKeyType, StateClass, StateType,
+        FenceToken, Generation, OwnerId, SessionKey, SessionKeyType, StateClass, StateType,
+        OWNER_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES, STATE_TYPE_MAX_BYTES,
     },
     record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord},
     restore::{
-        RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES, RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE,
-        RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES, RESTORE_SCAN_MAX_SQLITE_VM_STEPS,
-        RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS, RestoreScanCursor, RestoreScanPage,
-        RestoreScanRequest, RestoreScanScope, restore_record_retained_bytes_from_lengths,
+        restore_record_retained_bytes_from_lengths, RestoreScanCursor, RestoreScanPage,
+        RestoreScanRequest, RestoreScanScope, RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES,
+        RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE, RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
+        RESTORE_SCAN_MAX_SQLITE_VM_STEPS, RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS,
     },
     ttl::{checked_session_deadline, validate_stored_record_expiry_at},
 };

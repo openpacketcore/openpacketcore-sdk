@@ -20,9 +20,9 @@ use crate::consumer::{SessionConsumerRoster, SessionConsumerRosterError, Session
 use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
 use crate::readiness::PlacementResiliencePolicy;
 use crate::topology_attestation::{
-    QuorumTopologyAttestor, TopologyAttestationAdmission, TopologyAttestationEvidence,
-    TopologyAttestationPolicy, TopologyAttestationSummary, TopologyAttestationTime,
-    VerifiedQuorumTopologyAttestation, verify_topology_attestations,
+    verify_topology_attestations, QuorumTopologyAttestor, TopologyAttestationAdmission,
+    TopologyAttestationEvidence, TopologyAttestationPolicy, TopologyAttestationSummary,
+    TopologyAttestationTime, VerifiedQuorumTopologyAttestation,
 };
 
 /// Maximum encoded length of a logical replica ID.
@@ -115,7 +115,9 @@ pub enum QuorumTopologyError {
         configured: usize,
     },
     /// A fixed durable quorum did not contain exactly three or five voters.
-    #[error("fixed durable quorum requires exactly three or five members; configured {configured}")]
+    #[error(
+        "fixed durable quorum requires exactly three or five members; configured {configured}"
+    )]
     FixedQuorumMemberCount {
         /// Number of configured members.
         configured: usize,
@@ -1328,11 +1330,9 @@ mod tests {
             ),
         )
         .expect("root-bound topology");
-        assert!(
-            topology
-                .roster_attestation_trust_root()
-                .is_some_and(|root| root.identity() == first_root.identity())
-        );
+        assert!(topology
+            .roster_attestation_trust_root()
+            .is_some_and(|root| root.identity() == first_root.identity()));
 
         assert!(matches!(
             ValidatedQuorumTopology::try_from(
