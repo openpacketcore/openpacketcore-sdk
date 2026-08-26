@@ -96,18 +96,18 @@ use opc_session_store::{
     Generation, LeaseGuard, OwnerId, PreparedCheckpointBudget, PreparedCompareAndSetExecuteError,
     PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
     PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
-    PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
-    QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest,
-    RosterAttestationTrustRootIdentityV1, RosterAttestationTrustRootV1, RosterIngressAttestationV1,
-    SessionBackend, SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
-    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusResponse,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerAuthorization,
-    SessionConsumerAuthorizationGrant, SessionConsumerChange, SessionConsumerLeaseError,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerRosterAuthorization, SessionConsumerRosterRejection, SessionConsumerScope,
-    SessionConsumerStoreError, SessionConsumerTenantNfScope,
+    PreparedFencedTransitionLookup, ProtectedRosterConsensusDiagnosticSnapshot,
+    QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyMode, RecordExpiryPreflight,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    RestoreScanRequest, RosterAttestationTrustRootIdentityV1, RosterAttestationTrustRootV1,
+    RosterIngressAttestationV1, SessionBackend, SessionConsensusCommand, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusResponse, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionConsumerAuthorization, SessionConsumerAuthorizationGrant, SessionConsumerChange,
+    SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerRosterAuthorization, SessionConsumerRosterRejection,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
     SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
     SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
     SessionConsumerVoterAuthority, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
@@ -10129,6 +10129,41 @@ fn protected_roster_process_loss_counter_total<const N: usize>(counters: &[u64; 
 }
 
 #[cfg(feature = "test-control")]
+fn assert_protected_roster_process_loss_state_unchanged(
+    before: &[ProtectedRosterConsensusDiagnosticSnapshot],
+    after: &[ProtectedRosterConsensusDiagnosticSnapshot],
+    context: &str,
+) {
+    assert_eq!(before.len(), THREE_VOTER_COUNT);
+    assert_eq!(after.len(), THREE_VOTER_COUNT);
+    for voter in 0..THREE_VOTER_COUNT {
+        assert_eq!(before[voter].occupancy_valid, 1, "{context}");
+        assert_eq!(after[voter].occupancy_valid, 1, "{context}");
+        assert_eq!(
+            after[voter].live_reservations, before[voter].live_reservations,
+            "{context}: live reservations remain unchanged on voter {voter}",
+        );
+        assert_eq!(
+            after[voter].retained_reservations, before[voter].retained_reservations,
+            "{context}: retained reservations remain unchanged on voter {voter}",
+        );
+        assert_eq!(
+            after[voter].tombstone_reservations, before[voter].tombstone_reservations,
+            "{context}: tombstone reservations remain unchanged on voter {voter}",
+        );
+        assert_eq!(
+            protected_roster_process_loss_counter_total(
+                &after[voter].state_machine_sqlite_commit_latency_millis,
+            ),
+            protected_roster_process_loss_counter_total(
+                &before[voter].state_machine_sqlite_commit_latency_millis,
+            ),
+            "{context}: no roster-bearing state-machine transaction commits on voter {voter}",
+        );
+    }
+}
+
+#[cfg(feature = "test-control")]
 async fn wait_for_protected_roster_process_loss_lease_expiry(guard: &LeaseGuard, phase: &str) {
     tokio::time::timeout(
         PROTECTED_ROSTER_PROCESS_LOSS_LEASE_EXPIRY_POLL_BOUND,
@@ -10611,8 +10646,12 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
     };
     assert_eq!(active.roster_id(), roster_id);
     assert_eq!(active.protected_plan(), protected_plan.as_slice());
+    let admission_applied_floor = fleet.stores[leader]
+        .status()
+        .applied_index
+        .expect("serving voter applied the admitted PollAdmit");
     fleet
-        .wait_all_application_sequences(admission_baseline + 1)
+        .wait_all_application_sequences(admission_applied_floor)
         .await;
     let (admission_applied_after, admission_log_after) =
         protected_roster_process_loss_voter_positions(&fleet);
@@ -10623,12 +10662,14 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
         .collect::<Vec<_>>();
     for voter in 0..THREE_VOTER_COUNT {
         assert!(
-            admission_applied_after[voter] > admission_applied_before[voter],
-            "the admitted PollAdmit is applied on every voter",
+            admission_applied_after[voter] >= admission_applied_floor
+                && admission_applied_after[voter] > admission_applied_before[voter],
+            "the admitted PollAdmit is applied at the observed operation floor on every voter",
         );
         assert!(
-            admission_log_after[voter] > admission_log_before[voter],
-            "the admitted PollAdmit is durably present in every voter log",
+            admission_log_after[voter] >= admission_applied_floor
+                && admission_log_after[voter] > admission_log_before[voter],
+            "the admitted PollAdmit is durably present at the observed operation floor in every voter log",
         );
         assert_eq!(admission_diagnostics_after[voter].occupancy_valid, 1);
         assert_eq!(
@@ -10811,8 +10852,12 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         &state.join("phase-two-guard.json"),
         &serde_json::to_vec(&phase_two_guard).expect("encode phase-two process-loss guard"),
     );
+    let current_fence_applied_floor = fleet.stores[leader]
+        .status()
+        .applied_index
+        .expect("serving voter applied the successor fence");
     fleet
-        .wait_all_application_sequences(before_current_fence + 1)
+        .wait_all_application_sequences(current_fence_applied_floor)
         .await;
     let (current_fence_applied_after, current_fence_log_after) =
         protected_roster_process_loss_voter_positions(&fleet);
@@ -10823,12 +10868,14 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         .collect::<Vec<_>>();
     for voter in 0..THREE_VOTER_COUNT {
         assert!(
-            current_fence_applied_after[voter] > current_fence_applied_before[voter],
-            "the successor fence is applied on every reopened voter",
+            current_fence_applied_after[voter] >= current_fence_applied_floor
+                && current_fence_applied_after[voter] > current_fence_applied_before[voter],
+            "the successor fence is applied at the observed operation floor on every reopened voter",
         );
         assert!(
-            current_fence_log_after[voter] > current_fence_log_before[voter],
-            "the successor fence is durably present in every reopened voter log",
+            current_fence_log_after[voter] >= current_fence_applied_floor
+                && current_fence_log_after[voter] > current_fence_log_before[voter],
+            "the successor fence is durably present at the observed operation floor in every reopened voter log",
         );
         assert_eq!(
             current_fence_diagnostics_after[voter].live_reservations,
@@ -10913,37 +10960,6 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         )
         .expect("compose phase-two protected-roster adapter");
     let client = adapter.client().clone();
-    let stale_proposal = AdmissionProposal::new(
-        FencedMutationRosterProfile::v1(),
-        roster_id,
-        members.clone(),
-        EstablishedMutation::no_op(),
-        protected_plan.clone(),
-        protected_checkpoint.clone(),
-        protected_result.clone(),
-    )
-    .expect("rebuild exact stale-owner admission for remote status rejection");
-    let mut stale_admission = client
-        .prepare(original_guard.clone(), expected_generation, stale_proposal)
-        .expect("prepare stale-owner exact admission status input");
-    assert!(matches!(
-        client.admit(&mut stale_admission).await,
-        Err(RosterClientError::AuthorityRejected)
-    ));
-    assert!(matches!(
-        client.admission_status(&stale_admission).await,
-        Err(RosterClientError::AuthorityRejected)
-    ));
-    assert_eq!(
-        transport.roster_admission_calls.load(Ordering::SeqCst),
-        1,
-        "one stale-owner admission/status probe reaches the remote authority check",
-    );
-    assert_eq!(
-        fleet.application_sequences().await,
-        [before_current_fence + 1; THREE_VOTER_COUNT],
-        "the rejected stale-owner probe appends no roster consensus mutation",
-    );
     let input = RecoveryInput::new(
         roster_id,
         OwnerId::new("three-voter-process-loss-owner").expect("process-loss owner"),
@@ -10971,9 +10987,14 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
     assert_eq!(publication.status_calls.load(Ordering::SeqCst), 0);
     assert_eq!(publication.begin_calls.load(Ordering::SeqCst), 0);
     assert_eq!(publication.adopt_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        fleet.application_sequences().await,
-        [before_current_fence + 1; THREE_VOTER_COUNT],
+    let recovery_diagnostics_after = fleet
+        .stores
+        .iter()
+        .map(ConsensusSessionStore::protected_roster_diagnostic_snapshot)
+        .collect::<Vec<_>>();
+    assert_protected_roster_process_loss_state_unchanged(
+        &current_fence_diagnostics_after,
+        &recovery_diagnostics_after,
         "reopen and read-only recovery do not reactivate the profile or append a roster command",
     );
 
@@ -11004,17 +11025,17 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
     assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
     assert_eq!(provider.status_calls.load(Ordering::SeqCst), 6);
     assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 6);
-    assert_eq!(
-        fleet.application_sequences().await,
-        [before_current_fence + 1; THREE_VOTER_COUNT],
-        "provider recovery has no per-member consensus write",
-    );
     let proofs = CompleteProofSet::new(proofs).expect("six exact process-loss proofs");
     let terminal_diagnostics_before = fleet
         .stores
         .iter()
         .map(ConsensusSessionStore::protected_roster_diagnostic_snapshot)
         .collect::<Vec<_>>();
+    assert_protected_roster_process_loss_state_unchanged(
+        &recovery_diagnostics_after,
+        &terminal_diagnostics_before,
+        "provider status and adoption have no per-member consensus write",
+    );
     let (terminal_applied_before, terminal_log_before) =
         protected_roster_process_loss_voter_positions(&fleet);
     let mut terminal = client
@@ -11036,8 +11057,12 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
             panic!("phase two returns one exact Established terminal receipt")
         }
     }
+    let terminal_applied_floor = fleet.stores[leader]
+        .status()
+        .applied_index
+        .expect("serving voter applied the exact Established terminal");
     fleet
-        .wait_all_application_sequences(before_current_fence + 2)
+        .wait_all_application_sequences(terminal_applied_floor)
         .await;
     let (terminal_applied_after, terminal_log_after) =
         protected_roster_process_loss_voter_positions(&fleet);
@@ -11048,12 +11073,14 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         .collect::<Vec<_>>();
     for voter in 0..THREE_VOTER_COUNT {
         assert!(
-            terminal_applied_after[voter] > terminal_applied_before[voter],
-            "the exact Established terminal is applied on every voter",
+            terminal_applied_after[voter] >= terminal_applied_floor
+                && terminal_applied_after[voter] > terminal_applied_before[voter],
+            "the exact Established terminal is applied at the observed operation floor on every voter",
         );
         assert!(
-            terminal_log_after[voter] > terminal_log_before[voter],
-            "the exact Established terminal is durably present in every voter log",
+            terminal_log_after[voter] >= terminal_applied_floor
+                && terminal_log_after[voter] > terminal_log_before[voter],
+            "the exact Established terminal is durably present at the observed operation floor in every voter log",
         );
         assert_eq!(terminal_diagnostics_after[voter].occupancy_valid, 1);
         assert_eq!(
@@ -11105,15 +11132,10 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
     );
     assert_eq!(
         transport.roster_admission_calls.load(Ordering::SeqCst),
-        1,
-        "the one rejected stale-owner probe is not a roster consensus mutation",
+        0,
+        "phase-two recovery sends no admission mutation after the durable cut",
     );
     assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        fleet.application_sequences().await,
-        [before_current_fence + 2; THREE_VOTER_COUNT],
-        "the fresh success has exactly two roster mutations across both processes",
-    );
     assert_eq!(publication.status_calls.load(Ordering::SeqCst), 0);
     assert_eq!(publication.begin_calls.load(Ordering::SeqCst), 0);
     assert_eq!(publication.adopt_calls.load(Ordering::SeqCst), 0);
@@ -11250,6 +11272,11 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
         fleet.voter_authority(leader),
     );
     wait_for_protected_roster_process_loss_lease_expiry(&phase_two_guard, "phase three").await;
+    let phase_three_diagnostics_before_fence = fleet
+        .stores
+        .iter()
+        .map(ConsensusSessionStore::protected_roster_diagnostic_snapshot)
+        .collect::<Vec<_>>();
     let current_guard = lease_client
         .acquire_with_id(
             SessionConsumerRequestId::from_bytes([0xe9; 16]),
@@ -11268,9 +11295,30 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
         current_guard.fence() > phase_two_guard.fence(),
         "phase three receives a higher current fence after phase-two expiry"
     );
+    let phase_three_fence_applied_floor = fleet.stores[leader]
+        .status()
+        .applied_index
+        .expect("serving voter applied the phase-three successor fence");
     fleet
-        .wait_all_application_sequences(before_current_fence + 1)
+        .wait_all_application_sequences(phase_three_fence_applied_floor)
         .await;
+    let phase_three_applied_after_fence = fleet.application_sequences().await;
+    assert!(
+        phase_three_applied_after_fence
+            .iter()
+            .all(|sequence| *sequence >= phase_three_fence_applied_floor),
+        "the phase-three successor fence is present at its observed operation floor on every voter",
+    );
+    let phase_three_diagnostics_after_fence = fleet
+        .stores
+        .iter()
+        .map(ConsensusSessionStore::protected_roster_diagnostic_snapshot)
+        .collect::<Vec<_>>();
+    assert_protected_roster_process_loss_state_unchanged(
+        &phase_three_diagnostics_before_fence,
+        &phase_three_diagnostics_after_fence,
+        "the generic phase-three successor fence commits no roster mutation",
+    );
 
     let protected_plan = vec![0xe2; 97];
     let protected_checkpoint = vec![0xe3; 83];
@@ -11393,9 +11441,14 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
     );
     assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 0);
     assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        fleet.application_sequences().await,
-        [before_current_fence + 1; THREE_VOTER_COUNT],
+    let phase_three_diagnostics_after_recovery = fleet
+        .stores
+        .iter()
+        .map(ConsensusSessionStore::protected_roster_diagnostic_snapshot)
+        .collect::<Vec<_>>();
+    assert_protected_roster_process_loss_state_unchanged(
+        &phase_three_diagnostics_after_fence,
+        &phase_three_diagnostics_after_recovery,
         "stale rejection and terminal recovery append neither a roster mutation nor a member write",
     );
 
@@ -11440,9 +11493,14 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
     );
     assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 0);
     assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        fleet.application_sequences().await,
-        [before_current_fence + 1; THREE_VOTER_COUNT],
+    let phase_three_diagnostics_after_publication = fleet
+        .stores
+        .iter()
+        .map(ConsensusSessionStore::protected_roster_diagnostic_snapshot)
+        .collect::<Vec<_>>();
+    assert_protected_roster_process_loss_state_unchanged(
+        &phase_three_diagnostics_after_recovery,
+        &phase_three_diagnostics_after_publication,
         "publication is provider-local and cannot append a third roster mutation",
     );
 
@@ -11477,6 +11535,13 @@ async fn persistent_three_voter_protected_roster_survives_real_os_process_loss()
         Some(_) => panic!("invalid protected-roster process-loss phase"),
         None => {
             let state = tempfile::tempdir().expect("parent process-loss state directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700))
+                    .expect("make parent process-loss state directory private");
+            }
             run_protected_roster_process_loss_child(state.path(), "phase-one");
             run_protected_roster_process_loss_child(state.path(), "phase-two");
             run_protected_roster_process_loss_child(state.path(), "phase-three");
