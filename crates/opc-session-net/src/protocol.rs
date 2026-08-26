@@ -509,8 +509,14 @@ const fn compact_roster_family(family: ConsensusRpcFamily) -> bool {
 /// base64 alphabet. This revision-five-only representation avoids expanding
 /// each opaque byte into a JSON number and is bounded before decoded
 /// allocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct CompactRosterPayload(Vec<u8>);
+
+impl fmt::Debug for CompactRosterPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompactRosterPayload(<redacted>)")
+    }
+}
 
 impl Serialize for CompactRosterPayload {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -602,7 +608,7 @@ impl<'de> Deserialize<'de> for CompactRosterPayload {
 }
 
 /// The compact protected-roster portion of the revision-five outer request.
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CompactRosterWireRequest {
     schema_version: u16,
@@ -610,6 +616,12 @@ pub(crate) struct CompactRosterWireRequest {
     sender: SessionConsensusNodeId,
     family: ConsensusRpcFamily,
     payload: CompactRosterPayload,
+}
+
+impl fmt::Debug for CompactRosterWireRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompactRosterWireRequest(<redacted>)")
+    }
 }
 
 impl CompactRosterWireRequest {
@@ -680,7 +692,7 @@ impl<'de> Deserialize<'de> for CompactRosterWireRequest {
 ///
 /// `Call` is byte-compatible with ordinary traffic. `RosterCall` is accepted
 /// only for the two protected-roster families.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum SessionConsensusTransportRequest {
     Call {
@@ -691,6 +703,19 @@ pub(crate) enum SessionConsensusTransportRequest {
         call_id: uuid::Uuid,
         request: CompactRosterWireRequest,
     },
+}
+
+impl fmt::Debug for SessionConsensusTransportRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Call { .. } => {
+                formatter.write_str("SessionConsensusTransportRequest::Call(<redacted>)")
+            }
+            Self::RosterCall { .. } => {
+                formatter.write_str("SessionConsensusTransportRequest::RosterCall(<redacted>)")
+            }
+        }
+    }
 }
 
 impl SessionConsensusTransportRequest {
@@ -4750,6 +4775,18 @@ mod tests {
 
     const OWNER_SENTINEL: &str = "peer-owner-sensitive-sentinel";
     const KEY_TYPE_SENTINEL: &str = "peer-key-type-sensitive-sentinel";
+
+    #[test]
+    fn compact_roster_payload_debug_is_fixed_and_redacted() {
+        let sentinel = b"protected-roster-sensitive-value";
+        let short = format!("{:?}", CompactRosterPayload(sentinel.to_vec()));
+        let long = format!("{:?}", CompactRosterPayload(vec![0xA5; 4_096]));
+
+        assert_eq!(short, "CompactRosterPayload(<redacted>)");
+        assert_eq!(short, long, "diagnostic width must not reveal payload size");
+        assert!(!short.contains("protected-roster-sensitive-value"));
+        assert!(!short.contains("165"), "byte values must remain redacted");
+    }
 
     fn replace_json_string(
         value: &mut serde_json::Value,

@@ -1555,6 +1555,7 @@ struct ConsumerHello {
     roster_commitment: [u8; 32],
     response_frame_size: u32,
     /// Present only on the dedicated protected-roster capability lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     roster_profile: Option<SessionConsumerRosterTransportProfile>,
 }
 
@@ -1568,6 +1569,7 @@ struct ConsumerHelloAck {
     roster_commitment: [u8; 32],
     request_frame_size: u32,
     /// Echoed only after exact protected-roster profile negotiation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     roster_profile: Option<SessionConsumerRosterTransportProfile>,
 }
 
@@ -6478,6 +6480,7 @@ impl StatelessSessionConsumerClient {
                 .map_err(
                     |cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause },
                 )?,
+            roster_profile: None,
         });
         write_frame_bounded_until(
             &mut writer,
@@ -9507,6 +9510,7 @@ impl PersistentSessionConsumerV2Pool {
                 roster_commitment: self.client.voter.roster_commitment(),
                 response_frame_size: consumer_wire_frame_size(MAX_NEGOTIATED_FRAME_SIZE)
                     .map_err(SessionConsumerClientError::from)?,
+                roster_profile: None,
             }),
             MAX_NEGOTIATED_FRAME_SIZE,
             deadline.min(lifecycle.retire_at()),
@@ -15454,6 +15458,7 @@ where
         voter_count: u16::try_from(voter_count).map_err(|_| ProtocolError::InvalidWireValue)?,
         roster_commitment,
         request_frame_size: consumer_wire_frame_size(max_frame_size)?,
+        roster_profile: None,
     });
     let hello_ack = write_frame_bounded_until(
         writer,
@@ -16496,11 +16501,12 @@ async fn handle_server_connection(
             return Ok(());
         }
         // This is the public listener's final tenant/NF grant boundary for
-        // ordinary operations. Roster operations retain no general-consumer
-        // grant: `/3` has already authenticated identity/scope and is routed
-        // below only after a root-certified ingress attestation. Keep the
-        // ordinary check before any service future is constructed so an
-        // external `SessionQuorumConsumer` cannot observe a rejected call.
+        // ordinary operations. Protected-roster operations retain a narrow
+        // nonconstructible derivative of this exact authorization; ingress
+        // checks its canonically decoded authority key before lookup or
+        // consensus. Keep the ordinary check before any service future is
+        // constructed so an external `SessionQuorumConsumer` cannot observe a
+        // rejected call.
         if !consumer_operation_requires_roster_capability(request.operation()) {
             if let Err(rejection) = authorization.authorize_operation(request.operation()) {
                 let _ = write_consumer_call_rejection_supervised(
@@ -16547,9 +16553,10 @@ async fn handle_server_connection(
                     Ok(binding) => binding,
                     Err(_) => return Ok(()),
                 };
-            // The signer receives a complete fixed statement after normal
-            // mTLS authorization, scope, operation grant, and current
-            // lifecycle checks. It never signs caller-selected bytes.
+            // The signer receives a complete fixed statement after mTLS
+            // authorization and current lifecycle checks. The narrow
+            // tenant/NF grant is retained for post-decode ingress validation;
+            // the signer never sees or signs unverified caller-selected bytes.
             let input = RosterIngressAttestationSigningInputV1 {
                 peer_identity_commitment: session_consumer_identity_commitment(
                     authorization.identity(),
@@ -16585,13 +16592,17 @@ async fn handle_server_connection(
         let mut peer_terminal = None;
         let mut response = {
             let execute_authorization = authorization.clone();
-            let execute_identity = authorization.identity().clone();
+            let execute_roster_authorization = authorization.roster_authorization();
             let execute_service = Arc::clone(&service);
             let execute = async move {
                 match roster_dispatch {
                     Some((ingress, attestation)) => {
                         ingress
-                            .execute_roster_ingress(&execute_identity, *request, attestation)
+                            .execute_roster_ingress(
+                                &execute_roster_authorization,
+                                *request,
+                                attestation,
+                            )
                             .await
                     }
                     None => {
@@ -17259,17 +17270,17 @@ mod tests {
         write_consumer_call_rejection_supervised, BorrowedConsumerCall,
         BorrowedConsumerCallResponse, BorrowedConsumerWireRequest, BorrowedConsumerWireResponse,
         BoxStream, ConsumerCall, ConsumerCallResponse, ConsumerConnection, ConsumerCorrelation,
-        ConsumerHello, ConsumerLeaseWireContext, ConsumerOperationKind, ConsumerServerCancellation,
-        ConsumerServerSetupTestHooks, ConsumerSessionLeaseMutationResultWire,
-        ConsumerSessionLeaseMutationStatusWire, ConsumerSessionResponseWire, ConsumerSetupPhase,
-        ConsumerSetupPhaseAttempt, ConsumerVoterBinding, ConsumerWatchTerminal,
-        ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
-        PersistentCapacityAdmission, PersistentCheckedOutConnection, PersistentConsumerCounters,
-        PersistentConsumerIoBarrier, PersistentConsumerReconnectControl,
-        PersistentConsumerShutdownIo, PersistentConsumerShutdownReader,
-        PersistentConsumerShutdownWriter, PersistentPreparedCompareAndSetToken,
-        PersistentPreparedLeaseAcquireToken, PersistentReconnectSetup,
-        PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+        ConsumerHello, ConsumerHelloAck, ConsumerLeaseWireContext, ConsumerOperationKind,
+        ConsumerServerCancellation, ConsumerServerSetupTestHooks,
+        ConsumerSessionLeaseMutationResultWire, ConsumerSessionLeaseMutationStatusWire,
+        ConsumerSessionResponseWire, ConsumerSetupPhase, ConsumerSetupPhaseAttempt,
+        ConsumerVoterBinding, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
+        ConsumerWireRequest, ConsumerWireResponse, PersistentCapacityAdmission,
+        PersistentCheckedOutConnection, PersistentConsumerCounters, PersistentConsumerIoBarrier,
+        PersistentConsumerReconnectControl, PersistentConsumerShutdownIo,
+        PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
+        PersistentPreparedCompareAndSetToken, PersistentPreparedLeaseAcquireToken,
+        PersistentReconnectSetup, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
         PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
         PersistentSessionConsumerV2ExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
         PersistentV2LaneActor, PersistentV2LaneCall, PersistentV2LaneLifetime,
@@ -17321,8 +17332,8 @@ mod tests {
         SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationRequest,
         SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
         SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRequest,
-        SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerScope,
-        SessionConsumerStoreError, SessionConsumerTenantNfScope,
+        SessionConsumerRequestId, SessionConsumerResponse, SessionConsumerRosterTransportProfile,
+        SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
         SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
         SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
         SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType,
@@ -22464,6 +22475,50 @@ mod tests {
         Response(Box<SessionConsumerResponse>),
     }
 
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FrozenGeneralRevisionSixHello {
+        transport_revision: u16,
+        scope: SessionConsumerScope,
+        expected_server_node_id: u64,
+        voter_count: u16,
+        roster_commitment: [u8; 32],
+        response_frame_size: u32,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FrozenGeneralRevisionSixHelloAck {
+        transport_revision: u16,
+        scope: SessionConsumerScope,
+        server_node_id: u64,
+        voter_count: u16,
+        roster_commitment: [u8; 32],
+        request_frame_size: u32,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(
+        tag = "kind",
+        content = "body",
+        rename_all = "snake_case",
+        deny_unknown_fields
+    )]
+    enum FrozenGeneralRevisionSixRequest {
+        Hello(FrozenGeneralRevisionSixHello),
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(
+        tag = "kind",
+        content = "body",
+        rename_all = "snake_case",
+        deny_unknown_fields
+    )]
+    enum FrozenGeneralRevisionSixResponse {
+        HelloAck(FrozenGeneralRevisionSixHelloAck),
+    }
+
     const REVISION_ONE_SCOPE_JSON: &str = concat!(
         "{\"cluster_id\":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],",
         "\"configuration_id\":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],",
@@ -22471,6 +22526,99 @@ mod tests {
     );
     const REVISION_ONE_RESPONSE_JSON: &str =
         "{\"kind\":\"response\",\"body\":{\"response\":\"watch_opened\"}}";
+
+    #[test]
+    fn general_revision_six_hello_frames_remain_byte_exact_without_roster_profile() {
+        let authority = test_consumer_voter_authority();
+        let frozen_request =
+            FrozenGeneralRevisionSixRequest::Hello(FrozenGeneralRevisionSixHello {
+                transport_revision: super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+                scope: scope(),
+                expected_server_node_id: authority.node_id().get(),
+                voter_count: u16::try_from(authority.voter_count()).expect("test voter count"),
+                roster_commitment: *authority.roster_commitment().as_bytes(),
+                response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                    .expect("consumer frame cap fits u32"),
+            });
+        let frozen_request_bytes =
+            serde_json::to_vec(&frozen_request).expect("frozen general Hello encodes");
+        assert!(!frozen_request_bytes
+            .windows(b"roster_profile".len())
+            .any(|window| window == b"roster_profile"));
+        let current_request: ConsumerWireRequest =
+            decode_consumer_frame_payload(&frozen_request_bytes)
+                .expect("current peer accepts the exact old general Hello");
+        assert_eq!(
+            serde_json::to_vec(&current_request).expect("current general Hello re-encodes"),
+            frozen_request_bytes
+        );
+        serde_json::from_slice::<FrozenGeneralRevisionSixRequest>(
+            &serde_json::to_vec(&ConsumerWireRequest::Hello(ConsumerHello {
+                transport_revision: super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+                scope: scope(),
+                expected_server_node_id: authority.node_id().get(),
+                voter_count: u16::try_from(authority.voter_count()).expect("test voter count"),
+                roster_commitment: *authority.roster_commitment().as_bytes(),
+                response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                    .expect("consumer frame cap fits u32"),
+                roster_profile: None,
+            }))
+            .expect("current general Hello encodes"),
+        )
+        .expect("old peer accepts the exact current general Hello");
+
+        let frozen_response =
+            FrozenGeneralRevisionSixResponse::HelloAck(FrozenGeneralRevisionSixHelloAck {
+                transport_revision: super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+                scope: scope(),
+                server_node_id: authority.node_id().get(),
+                voter_count: u16::try_from(authority.voter_count()).expect("test voter count"),
+                roster_commitment: *authority.roster_commitment().as_bytes(),
+                request_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                    .expect("consumer frame cap fits u32"),
+            });
+        let frozen_response_bytes =
+            serde_json::to_vec(&frozen_response).expect("frozen general HelloAck encodes");
+        assert!(!frozen_response_bytes
+            .windows(b"roster_profile".len())
+            .any(|window| window == b"roster_profile"));
+        let current_response: ConsumerWireResponse =
+            decode_consumer_frame_payload(&frozen_response_bytes)
+                .expect("current peer accepts the exact old general HelloAck");
+        assert_eq!(
+            serde_json::to_vec(&current_response).expect("current general HelloAck re-encodes"),
+            frozen_response_bytes
+        );
+        serde_json::from_slice::<FrozenGeneralRevisionSixResponse>(
+            &serde_json::to_vec(&ConsumerWireResponse::HelloAck(ConsumerHelloAck {
+                transport_revision: super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+                scope: scope(),
+                server_node_id: authority.node_id().get(),
+                voter_count: u16::try_from(authority.voter_count()).expect("test voter count"),
+                roster_commitment: *authority.roster_commitment().as_bytes(),
+                request_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                    .expect("consumer frame cap fits u32"),
+                roster_profile: None,
+            }))
+            .expect("current general HelloAck encodes"),
+        )
+        .expect("old peer accepts the exact current general HelloAck");
+
+        let protected = serde_json::to_vec(&ConsumerWireRequest::Hello(ConsumerHello {
+            transport_revision: super::SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
+            scope: scope(),
+            expected_server_node_id: authority.node_id().get(),
+            voter_count: u16::try_from(authority.voter_count()).expect("test voter count"),
+            roster_commitment: *authority.roster_commitment().as_bytes(),
+            response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                .expect("consumer frame cap fits u32"),
+            roster_profile: Some(SessionConsumerRosterTransportProfile::current()),
+        }))
+        .expect("protected-roster Hello encodes");
+        assert!(protected
+            .windows(b"roster_profile".len())
+            .any(|window| window == b"roster_profile"));
+    }
 
     #[test]
     fn frozen_revision_one_frames_never_cross_decode_as_revision_five() {
@@ -22512,6 +22660,7 @@ mod tests {
             roster_commitment: *test_consumer_voter_authority()
                 .roster_commitment()
                 .as_bytes(),
+            roster_profile: None,
             response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
                 .expect("consumer frame cap fits u32"),
         });
@@ -22956,6 +23105,7 @@ mod tests {
                 roster_commitment: *test_consumer_voter_authority()
                     .roster_commitment()
                     .as_bytes(),
+                roster_profile: None,
                 response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
                     .expect("test frame size fits u32"),
             }),
@@ -23208,6 +23358,7 @@ mod tests {
                     roster_commitment: *test_consumer_voter_authority()
                         .roster_commitment()
                         .as_bytes(),
+                    roster_profile: None,
                     request_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
                         .expect("consumer frame cap fits u32"),
                 }),

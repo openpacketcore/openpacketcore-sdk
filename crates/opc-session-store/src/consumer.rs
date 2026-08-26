@@ -912,6 +912,25 @@ impl fmt::Debug for SessionConsumerAuthorization {
     }
 }
 
+/// Non-constructible, roster-specific authority derived from an authenticated
+/// consumer authorization.
+///
+/// This token carries only the authenticated identity and opaque exact
+/// tenant/NF grant commitments required to admit the decoded authority key of
+/// a protected-roster request. It is neither a general store authority nor a
+/// serializable transport credential.
+#[derive(Clone)]
+pub struct SessionConsumerRosterAuthorization {
+    identity: SessionConsumerIdentity,
+    allowed_scopes: Arc<BTreeSet<[u8; 32]>>,
+}
+
+impl fmt::Debug for SessionConsumerRosterAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterAuthorization(<redacted>)")
+    }
+}
+
 /// Store-issued local-voter manifest containing one canonical roster and a
 /// bounded explicit authorization map. It is never serialized.
 #[derive(Clone)]
@@ -1588,6 +1607,19 @@ impl fmt::Debug for SessionConsumerLeaseMutationRequest {
 }
 
 impl SessionConsumerAuthorization {
+    /// Derive the least-authority token required by protected-roster ingress.
+    ///
+    /// Only a store-issued [`SessionConsumerAuthorization`] can mint this
+    /// token; an independently constructed [`SessionConsumerIdentity`] cannot
+    /// recover its grant commitments.
+    #[doc(hidden)]
+    pub fn roster_authorization(&self) -> SessionConsumerRosterAuthorization {
+        SessionConsumerRosterAuthorization {
+            identity: self.identity.clone(),
+            allowed_scopes: Arc::clone(&self.allowed_scopes),
+        }
+    }
+
     /// Return the authenticated peer identity bound to this authority token.
     ///
     /// The dedicated protected-roster ingress uses this only to bind its
@@ -1736,6 +1768,28 @@ impl SessionConsumerAuthorization {
                 .all(|request| self.permits_fenced_transition_v2(request)),
         };
         authorized
+            .then_some(())
+            .ok_or(SessionConsumerRejection::Unauthorized)
+    }
+}
+
+impl SessionConsumerRosterAuthorization {
+    /// Return the authenticated peer identity bound to this roster authority.
+    #[doc(hidden)]
+    pub fn identity(&self) -> &SessionConsumerIdentity {
+        &self.identity
+    }
+
+    /// Check whether the exact decoded roster authority key is granted.
+    ///
+    /// The token exposes only this membership decision and never its grant
+    /// commitments or an allowed-scope enumeration.
+    #[doc(hidden)]
+    pub fn authorize_session_key(&self, key: &SessionKey) -> Result<(), SessionConsumerRejection> {
+        let commitment =
+            session_consumer_tenant_nf_fields_commitment(key.tenant.as_str(), key.nf_kind.as_str());
+        self.allowed_scopes
+            .contains(&commitment)
             .then_some(())
             .ok_or(SessionConsumerRejection::Unauthorized)
     }
@@ -2972,11 +3026,16 @@ pub trait SessionQuorumRosterIngress: Send + Sync {
     }
 
     /// Dispatch one already-authenticated revision-five protected-roster
-    /// request. Implementations verify `attestation` before capsule decoding,
-    /// roster lookup, or consensus work.
+    /// request.
+    ///
+    /// Implementations must first verify the root-certified `attestation`,
+    /// then canonically decode the request capsule and call
+    /// [`SessionConsumerRosterAuthorization::authorize_session_key`] on its
+    /// exact decoded authority/admission key before any roster lookup or
+    /// consensus work. A cross-tenant or wrong-NF key must not be accepted.
     async fn execute_roster_ingress(
         &self,
-        identity: &SessionConsumerIdentity,
+        authorization: &SessionConsumerRosterAuthorization,
         request: SessionConsumerRequest,
         attestation: crate::fenced_mutation_roster::RosterIngressAttestationV1,
     ) -> SessionConsumerResponse;
@@ -3429,10 +3488,39 @@ mod tests {
     #[test]
     fn authorization_requires_exact_scope_and_denies_global_watch() {
         let (authorization, key) = authorization_fixture();
+        let roster_authorization = authorization.roster_authorization();
         let foreign = SessionKey {
             tenant: TenantId::from_static("tenant-z"),
             ..key.clone()
         };
+        let wrong_nf = SessionKey {
+            nf_kind: NetworkFunctionKind::amf(),
+            ..key.clone()
+        };
+        assert_eq!(
+            roster_authorization.authorize_session_key(&key),
+            Ok(()),
+            "the narrow roster token admits its exact tenant/NF grant"
+        );
+        assert_eq!(
+            roster_authorization.authorize_session_key(&foreign),
+            Err(SessionConsumerRejection::Unauthorized),
+            "the narrow roster token rejects a foreign tenant"
+        );
+        assert_eq!(
+            roster_authorization.authorize_session_key(&wrong_nf),
+            Err(SessionConsumerRejection::Unauthorized),
+            "the narrow roster token rejects an ungranted NF"
+        );
+        assert_eq!(
+            format!("{roster_authorization:?}"),
+            "SessionConsumerRosterAuthorization(<redacted>)"
+        );
+        assert_eq!(
+            roster_authorization.identity(),
+            authorization.identity(),
+            "roster ingress can bind the same authenticated identity without grant enumeration"
+        );
         assert_eq!(
             authorization.authorize_operation(&SessionConsumerOperation::Get {
                 key: foreign.clone()
