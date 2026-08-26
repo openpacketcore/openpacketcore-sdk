@@ -49,8 +49,7 @@ pub(crate) mod consensus;
 #[doc(hidden)]
 pub mod test_support {
     pub use super::consensus::{
-        ProtectedRosterTerminalApplyTimings,
-        protected_roster_terminal_apply_timing_test_guard,
+        ProtectedRosterTerminalApplyTimings, protected_roster_terminal_apply_timing_test_guard,
         protected_roster_terminal_apply_timings_for_test,
         reset_protected_roster_terminal_apply_timings_for_test,
     };
@@ -2007,11 +2006,13 @@ impl SqliteSessionBackend {
                 conn,
                 identity,
                 binding,
-                registration_parts,
-                &current_authority,
-                terminal_body_commitment,
-                &terminal_evidence,
-                logical_time,
+                consensus::ProtectedRosterTerminalStatusRequest {
+                    registration_parts,
+                    current_authority: &current_authority,
+                    terminal_body_commitment,
+                    terminal_evidence: &terminal_evidence,
+                    logical_time,
+                },
             )?;
             Ok((read, logical_time))
         })
