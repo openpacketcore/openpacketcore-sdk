@@ -2002,6 +2002,8 @@ pub enum SessionConsumerStoreError {
     PayloadTooLarge,
     /// The backend rejected protected data.
     ProtectedDataRejected,
+    /// A protected roster exclusively owns the exact session-record pre-state.
+    SessionRecordReserved,
 }
 
 impl From<StoreError> for SessionConsumerStoreError {
@@ -2044,6 +2046,7 @@ impl From<StoreError> for SessionConsumerStoreError {
             StoreError::LeaseHeld | StoreError::LeaseExpired => Self::LeaseUnavailable,
             StoreError::Crypto(_) | StoreError::Serialization(_) => Self::ProtectedDataRejected,
             StoreError::PayloadTooLarge { .. } => Self::PayloadTooLarge,
+            StoreError::SessionRecordReserved => Self::SessionRecordReserved,
             StoreError::InvalidRestoreScanRequest(_)
             | StoreError::InvalidRestoreScanResponse(_)
             | StoreError::RestoreScanPageTooLarge { .. } => Self::RestoreRejected,
@@ -2083,6 +2086,7 @@ impl SessionConsumerStoreError {
             Self::ProtectedDataRejected => {
                 StoreError::Crypto("consumer protected data rejected".into())
             }
+            Self::SessionRecordReserved => StoreError::SessionRecordReserved,
         }
     }
 }
@@ -3354,6 +3358,26 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
 
+    #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+    enum LegacySessionConsumerStoreError {
+        NotFound,
+        StaleFence,
+        CasConflict,
+        RequestConflict,
+        OutcomeUnavailable,
+        Unavailable,
+        InvalidInput,
+        CapabilityNotSupported,
+        WatchCatchUpRequired,
+        RestoreRejected,
+        RestoreCursorStale,
+        RestoreBudgetExceeded,
+        InvalidTtl,
+        LeaseUnavailable,
+        PayloadTooLarge,
+        ProtectedDataRejected,
+    }
+
     fn scope(configuration: u8, epoch: u64) -> SessionConsumerScope {
         SessionConsumerScope::new(SessionConsensusIdentity::new(
             SessionConsensusClusterId::from_bytes([1; 32]),
@@ -4301,6 +4325,110 @@ mod tests {
                 .expect("V1 storage exhausted postcard encodes"),
             vec![5],
             "the frozen V1 StorageExhausted discriminant remains ordinal five"
+        );
+    }
+
+    #[test]
+    fn session_record_reserved_store_error_is_append_only_and_round_trips() {
+        let legacy_pairs = [
+            (
+                SessionConsumerStoreError::NotFound,
+                LegacySessionConsumerStoreError::NotFound,
+            ),
+            (
+                SessionConsumerStoreError::StaleFence,
+                LegacySessionConsumerStoreError::StaleFence,
+            ),
+            (
+                SessionConsumerStoreError::CasConflict,
+                LegacySessionConsumerStoreError::CasConflict,
+            ),
+            (
+                SessionConsumerStoreError::RequestConflict,
+                LegacySessionConsumerStoreError::RequestConflict,
+            ),
+            (
+                SessionConsumerStoreError::OutcomeUnavailable,
+                LegacySessionConsumerStoreError::OutcomeUnavailable,
+            ),
+            (
+                SessionConsumerStoreError::Unavailable,
+                LegacySessionConsumerStoreError::Unavailable,
+            ),
+            (
+                SessionConsumerStoreError::InvalidInput,
+                LegacySessionConsumerStoreError::InvalidInput,
+            ),
+            (
+                SessionConsumerStoreError::CapabilityNotSupported,
+                LegacySessionConsumerStoreError::CapabilityNotSupported,
+            ),
+            (
+                SessionConsumerStoreError::WatchCatchUpRequired,
+                LegacySessionConsumerStoreError::WatchCatchUpRequired,
+            ),
+            (
+                SessionConsumerStoreError::RestoreRejected,
+                LegacySessionConsumerStoreError::RestoreRejected,
+            ),
+            (
+                SessionConsumerStoreError::RestoreCursorStale,
+                LegacySessionConsumerStoreError::RestoreCursorStale,
+            ),
+            (
+                SessionConsumerStoreError::RestoreBudgetExceeded,
+                LegacySessionConsumerStoreError::RestoreBudgetExceeded,
+            ),
+            (
+                SessionConsumerStoreError::InvalidTtl,
+                LegacySessionConsumerStoreError::InvalidTtl,
+            ),
+            (
+                SessionConsumerStoreError::LeaseUnavailable,
+                LegacySessionConsumerStoreError::LeaseUnavailable,
+            ),
+            (
+                SessionConsumerStoreError::PayloadTooLarge,
+                LegacySessionConsumerStoreError::PayloadTooLarge,
+            ),
+            (
+                SessionConsumerStoreError::ProtectedDataRejected,
+                LegacySessionConsumerStoreError::ProtectedDataRejected,
+            ),
+        ];
+        for (current, legacy) in legacy_pairs {
+            let current_bytes =
+                opc_consensus::encode_bounded(&current).expect("current consumer error encoding");
+            let legacy_bytes =
+                opc_consensus::encode_bounded(&legacy).expect("legacy consumer error encoding");
+            assert_eq!(current_bytes, legacy_bytes, "legacy ordinal changed");
+            opc_consensus::decode_bounded::<LegacySessionConsumerStoreError>(&current_bytes)
+                .expect("legacy decode of current consumer error");
+            assert_eq!(
+                opc_consensus::decode_bounded::<SessionConsumerStoreError>(&legacy_bytes)
+                    .expect("current decode of legacy consumer error"),
+                current
+            );
+        }
+
+        let current = SessionConsumerStoreError::SessionRecordReserved;
+        let encoded =
+            opc_consensus::encode_bounded(&current).expect("appended consumer error encoding");
+        assert!(
+            opc_consensus::decode_bounded::<LegacySessionConsumerStoreError>(&encoded).is_err()
+        );
+        assert_eq!(
+            opc_consensus::decode_bounded::<SessionConsumerStoreError>(&encoded)
+                .expect("current consumer error round trip"),
+            current
+        );
+        assert_eq!(
+            SessionConsumerStoreError::from(StoreError::SessionRecordReserved),
+            current
+        );
+        assert_eq!(
+            current.into_store_error(),
+            StoreError::SessionRecordReserved
         );
     }
 }
