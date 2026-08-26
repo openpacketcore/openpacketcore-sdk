@@ -7529,7 +7529,10 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
                     .max_replication_sequence()
                     .await
                 {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        wait_for_protected_roster_snapshot_workload_step(&fleet, workload_leader)
+                            .await;
+                    }
                     Err(StoreError::BackendUnavailable(_))
                         if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
                     {
@@ -8114,6 +8117,18 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
     fleet.shutdown().await;
 }
 
+#[cfg(feature = "test-control")]
+async fn wait_for_protected_roster_snapshot_workload_step(
+    fleet: &ThreeVoterConsumerFleet,
+    workload_leader: usize,
+) {
+    let applied_index = fleet.stores[workload_leader]
+        .status()
+        .applied_index
+        .expect("snapshot workload command is applied on its serving voter");
+    fleet.wait_all_application_sequences(applied_index).await;
+}
+
 async fn persistent_three_voter_protected_roster_terminal_reply_outcome_unknown() {
     persistent_three_voter_protected_roster_recovers_provider_crash_cut(
         DurableRosterCrashCut::TerminalCommittedReplyOutcomeUnknown,
@@ -8620,7 +8635,9 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
                 .max_replication_sequence()
                 .await
             {
-                Ok(_) => {}
+                Ok(_) => {
+                    wait_for_protected_roster_snapshot_workload_step(&fleet, workload_leader).await;
+                }
                 Err(StoreError::BackendUnavailable(_))
                     if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
                 {
@@ -10386,7 +10403,9 @@ async fn compact_protected_roster_process_loss_admission(
                 .max_replication_sequence()
                 .await
             {
-                Ok(_) => {}
+                Ok(_) => {
+                    wait_for_protected_roster_snapshot_workload_step(fleet, workload_leader).await;
+                }
                 Err(StoreError::BackendUnavailable(_))
                     if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
                 {
