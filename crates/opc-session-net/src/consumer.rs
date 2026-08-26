@@ -14,65 +14,65 @@ use std::io;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures_util::FutureExt;
 use futures_util::stream::{self, BoxStream, StreamExt};
+use futures_util::FutureExt;
 use opc_session_store::consumer::{
-    MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES,
-    MAX_SESSION_CONSUMER_ROSTER_TERMINAL_FRAME_BYTES, SessionConsumerRosterAdmissionCapsule,
+    session_consumer_identity_commitment, session_consumer_roster_ingress_operation,
+    session_consumer_roster_scope_commitment, SessionConsumerRosterAdmissionCapsule,
     SessionConsumerRosterAdmissionMutationResponse, SessionConsumerRosterAdmissionReadResponse,
     SessionConsumerRosterCurrentPublicationAuthorityCapsule,
     SessionConsumerRosterCurrentPublicationAuthorityReadResponse,
     SessionConsumerRosterTerminalCapsule, SessionConsumerRosterTerminalMutationResponse,
     SessionConsumerRosterTerminalReadResponse, SessionConsumerRosterTransportProfile,
-    SessionQuorumRosterIngress, session_consumer_identity_commitment,
-    session_consumer_roster_ingress_operation, session_consumer_roster_scope_commitment,
+    SessionQuorumRosterIngress, MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES,
+    MAX_SESSION_CONSUMER_ROSTER_TERMINAL_FRAME_BYTES,
 };
 use opc_session_store::{
-    AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-    FencedTransitionExecuteError, FencedTransitionObservation, FencedTransitionOutcome,
-    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
-    FencedTransitionV2RequestId, LeaseError, LeaseGuard, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
-    OwnerId, PreparedCheckpointBudget, PreparedCompareAndSetExecuteError,
-    PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetRequest,
+    checked_session_deadline, session_consumer_batch_result_into_store,
+    validate_stored_record_expiry_profile, AtomicFencedTransitionCapability, BackendCapabilities,
+    CompareAndSet, CompareAndSetResult, FencedTransitionExecuteError, FencedTransitionObservation,
+    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
+    FencedTransitionStatus, FencedTransitionV2RequestId, LeaseError, LeaseGuard, OwnerId,
+    PreparedCheckpointBudget, PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
+    PreparedCompareAndSetPrepareError, PreparedCompareAndSetRequest,
     PreparedCompareAndSetStatus as PreparedCasStatus, PreparedCompareAndSetStatusError,
     PreparedFencedTransition, PreparedLeaseAcquireExecuteError, PreparedLeaseAcquirePrepareError,
     PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError, ProtectedSessionBackend,
-    QUORUM_TOPOLOGY_MAX_MEMBERS, RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest,
-    SessionBackend, SessionConsensusNodeId, SessionConsumerAuthorization,
-    SessionConsumerAuthorizationManifest, SessionConsumerBatchResult, SessionConsumerChange,
-    SessionConsumerCompareAndSetReceiptOutcome, SessionConsumerCompareAndSetRequest,
-    SessionConsumerCompareAndSetStatus, SessionConsumerFencedTransitionError,
-    SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerLeaseError,
-    SessionConsumerLeaseMutationOperation, SessionConsumerLeaseMutationRequest,
-    SessionConsumerLeaseMutationResult, SessionConsumerLeaseMutationStatus,
-    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2Operation,
-    SessionConsumerV2Request, SessionConsumerV2Response, SessionConsumerVoterAuthority, SessionOp,
-    SessionOpResult, SessionPayloadEncoding, SessionQuorumConsumer, StatelessSessionConsumer,
-    StoreError, checked_session_deadline, session_consumer_batch_result_into_store,
-    validate_stored_record_expiry_profile,
+    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionBackend,
+    SessionConsensusNodeId, SessionConsumerAuthorization, SessionConsumerAuthorizationManifest,
+    SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerCompareAndSetReceiptOutcome,
+    SessionConsumerCompareAndSetRequest, SessionConsumerCompareAndSetStatus,
+    SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
+    SessionConsumerIdentity, SessionConsumerLeaseError, SessionConsumerLeaseMutationOperation,
+    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
+    SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+    SessionConsumerVoterAuthority, SessionOp, SessionOpResult, SessionPayloadEncoding,
+    SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 use opc_types::SpiffeId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::consensus::RemoteAddrResolver;
-use crate::error::{ProtocolError, classify_tls_io_error, tls_peer_credential_rejection};
+use crate::error::{classify_tls_io_error, tls_peer_credential_rejection, ProtocolError};
 use crate::fenced_mutation_roster::{
+    transport::{compose_client, compose_provider_adapter},
     FencedMutationRosterClient, FencedMutationRosterEstablishedPublicationProvider,
     FencedMutationRosterExecutorAttestor, FencedMutationRosterMemberProvider,
     FencedMutationRosterProviderAdapter, ProtectedRosterTransportError,
-    transport::{compose_client, compose_provider_adapter},
 };
 use crate::lifecycle::{
     CertificateExpiryEvidence, ConnectionLifecycle, ConnectionLifecyclePolicy, ReconnectAdmission,
@@ -81,13 +81,14 @@ use crate::lifecycle::{
 #[cfg(test)]
 use crate::protocol::read_frame_payload;
 use crate::protocol::{
-    FrameWriteError, FrameWritePollAttribution, FrameWriteProgress, MAX_NEGOTIATED_FRAME_SIZE,
-    WireBackendCapabilities, bounded_session_op_expectations, compare_and_set_result_matches_key,
+    bounded_session_op_expectations, compare_and_set_result_matches_key,
     conservative_payload_budget, get_result_matches_key, read_authenticated_frame_payload_until,
     read_authenticated_frame_payload_with_active_timeout_until,
     validate_restore_scan_wire_payload_bytes, write_frame_bounded_until,
     write_frame_bounded_until_classified_with_progress,
-    write_frame_bounded_until_two_phase_classified_with_progress,
+    write_frame_bounded_until_two_phase_classified_with_progress, FrameWriteError,
+    FrameWritePollAttribution, FrameWriteProgress, WireBackendCapabilities,
+    MAX_NEGOTIATED_FRAME_SIZE,
 };
 
 use opc_session_store::fenced_mutation_roster::{
@@ -1350,7 +1351,9 @@ pub enum SessionConsumerFencedTransitionMutationError {
     },
     /// The transition may have reached the quorum.  Do not automatically
     /// replay it; use only the retained identical request body and ID.
-    #[error("consumer fenced transition outcome is unconfirmed; recover only the retained request")]
+    #[error(
+        "consumer fenced transition outcome is unconfirmed; recover only the retained request"
+    )]
     OutcomeUnknown {
         /// Exact caller-retained transition identity.
         request_id: FencedTransitionRequestId,
@@ -17448,53 +17451,14 @@ mod tests {
     use std::net::SocketAddr;
     use std::num::NonZeroU32;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
     use super::test_consumer_voter_authority;
     use super::{
-        BorrowedConsumerCall, BorrowedConsumerCallResponse, BorrowedConsumerWireRequest,
-        BorrowedConsumerWireResponse, BoxStream, ConsumerCall, ConsumerCallResponse,
-        ConsumerConnection, ConsumerCorrelation, ConsumerHello, ConsumerHelloAck,
-        ConsumerLeaseWireContext, ConsumerOperationKind, ConsumerServerCancellation,
-        ConsumerServerSetupTestHooks, ConsumerSessionLeaseMutationResultWire,
-        ConsumerSessionLeaseMutationStatusWire, ConsumerSessionResponseWire, ConsumerSetupPhase,
-        ConsumerSetupPhaseAttempt, ConsumerVoterBinding, ConsumerWatchTerminal,
-        ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
-        DEFAULT_CONSUMER_IDLE_TIMEOUT, DEFAULT_CONSUMER_MAX_CONNECTIONS,
-        DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
-        MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
-        MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
-        MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
-        MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS, PREPARED_DISPATCHING,
-        PREPARED_PREPARING, PREPARED_READY, PREPARED_RECEIPT_ONLY, PREPARED_TERMINAL,
-        PersistentCapacityAdmission, PersistentCheckedOutConnection, PersistentConsumerCounters,
-        PersistentConsumerIoBarrier, PersistentConsumerReconnectControl,
-        PersistentConsumerShutdownIo, PersistentConsumerShutdownReader,
-        PersistentConsumerShutdownWriter, PersistentPreparedCompareAndSetToken,
-        PersistentPreparedLeaseAcquireToken, PersistentReconnectSetup,
-        PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-        PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
-        PersistentSessionConsumerV2ExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
-        PersistentV2LaneActor, PersistentV2LaneCall, PersistentV2LaneLifetime,
-        PersistentV2LaneState, PersistentV2PreCallTestHook, PersistentWatchRecovery,
-        PreparedConsumerRouter, PreparedLeaseAcquireDispatchResult, PreparedRequestState,
-        QueuedConsumerWatchItem, SessionConsumerAuthorization, SessionConsumerAuthorizationError,
-        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
-        SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
-        SessionConsumerFencedTransitionMutationError, SessionConsumerLeaseMutationError,
-        SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
-        SessionConsumerRejection, SessionQuorumConsumer, SessionQuorumConsumerServer,
-        StatelessSessionConsumerClient, authenticated_consumer_binding, classify_call_write_error,
+        authenticated_consumer_binding, classify_call_write_error,
         classify_prepared_lease_acquire_error, classify_prepared_lease_acquire_rejection,
         complete_before_deadline, consumer_connection_current,
         consumer_execute_into_fenced_transition, consumer_fresh_admission_is_current,
@@ -17513,22 +17477,61 @@ mod tests {
         response_retires_connection_authority, run_persistent_v2_lane, server_connection_current,
         store_error_matches_operation, v2_persistent_error, v2_request_commitment,
         valid_consumer_operation_timeout, wait_for_forced_shutdown,
-        write_consumer_call_rejection_supervised,
+        write_consumer_call_rejection_supervised, BorrowedConsumerCall,
+        BorrowedConsumerCallResponse, BorrowedConsumerWireRequest, BorrowedConsumerWireResponse,
+        BoxStream, ConsumerCall, ConsumerCallResponse, ConsumerConnection, ConsumerCorrelation,
+        ConsumerHello, ConsumerHelloAck, ConsumerLeaseWireContext, ConsumerOperationKind,
+        ConsumerServerCancellation, ConsumerServerSetupTestHooks,
+        ConsumerSessionLeaseMutationResultWire, ConsumerSessionLeaseMutationStatusWire,
+        ConsumerSessionResponseWire, ConsumerSetupPhase, ConsumerSetupPhaseAttempt,
+        ConsumerVoterBinding, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
+        ConsumerWireRequest, ConsumerWireResponse, PersistentCapacityAdmission,
+        PersistentCheckedOutConnection, PersistentConsumerCounters, PersistentConsumerIoBarrier,
+        PersistentConsumerReconnectControl, PersistentConsumerShutdownIo,
+        PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
+        PersistentPreparedCompareAndSetToken, PersistentPreparedLeaseAcquireToken,
+        PersistentReconnectSetup, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+        PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
+        PersistentSessionConsumerV2ExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
+        PersistentV2LaneActor, PersistentV2LaneCall, PersistentV2LaneLifetime,
+        PersistentV2LaneState, PersistentV2PreCallTestHook, PersistentWatchRecovery,
+        PreparedConsumerRouter, PreparedLeaseAcquireDispatchResult, PreparedRequestState,
+        QueuedConsumerWatchItem, SessionConsumerAuthorization, SessionConsumerAuthorizationError,
+        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
+        SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+        SessionConsumerFencedTransitionMutationError, SessionConsumerLeaseMutationError,
+        SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
+        SessionConsumerRejection, SessionQuorumConsumer, SessionQuorumConsumerServer,
+        StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+        DEFAULT_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+        MAX_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
+        MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+        MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
+        MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS, PREPARED_DISPATCHING,
+        PREPARED_PREPARING, PREPARED_READY, PREPARED_RECEIPT_ONLY, PREPARED_TERMINAL,
     };
     use bytes::Bytes;
     use futures_util::FutureExt as _;
     use futures_util::StreamExt;
-    use opc_key::{AES_256_GCM_SIV_KEY_LEN, KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
+    use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
     use opc_session_store::{
-        BackendCapabilities, CompareAndSet, CompareAndSetResult, EncryptedSessionPayload,
-        EncryptingSessionBackend, FakeSessionBackend, FenceToken, FencedTransitionExecuteError,
-        FencedTransitionLease, FencedTransitionMutation, FencedTransitionObservation,
-        FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-        FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
-        FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, Generation, LeaseGuard,
-        MAX_SESSION_TTL, OwnerId, PreparedCheckpointBudget, PreparedCompareAndSetExecuteError,
-        PreparedCompareAndSetOutcome, PreparedCompareAndSetStatus,
-        PreparedCompareAndSetStatusError, PreparedFencedTransition,
+        checked_session_deadline, BackendCapabilities, CompareAndSet, CompareAndSetResult,
+        EncryptedSessionPayload, EncryptingSessionBackend, FakeSessionBackend, FenceToken,
+        FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
+        FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
+        FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
+        FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
+        Generation, LeaseGuard, OwnerId, PreparedCheckpointBudget,
+        PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
+        PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError, PreparedFencedTransition,
         PreparedLeaseAcquireExecuteError, PreparedLeaseAcquireStatusError,
         RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionBackend,
         SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
@@ -17544,12 +17547,12 @@ mod tests {
         SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
         SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
         SessionKey, SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType,
-        StoreError, StoredSessionRecord, checked_session_deadline,
+        StoreError, StoredSessionRecord, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-    use tokio::sync::{Notify, Semaphore, mpsc, watch};
+    use tokio::sync::{mpsc, watch, Notify, Semaphore};
 
     use crate::consensus::RemoteAddrResolver;
     use crate::error::ProtocolError;
@@ -17820,46 +17823,40 @@ mod tests {
             PreparedConsumerRouter::persistent(authorities.iter().cloned().map(&persistent))
                 .is_ok()
         );
-        assert!(
-            PreparedConsumerRouter::persistent(authorities[..2].iter().cloned().map(&persistent))
-                .is_err()
-        );
-        assert!(
-            PreparedConsumerRouter::persistent(
-                [
-                    authorities[0].clone(),
-                    authorities[0].clone(),
-                    authorities[2].clone(),
-                ]
-                .into_iter()
+        assert!(PreparedConsumerRouter::persistent(
+            authorities[..2].iter().cloned().map(&persistent)
+        )
+        .is_err());
+        assert!(PreparedConsumerRouter::persistent(
+            [
+                authorities[0].clone(),
+                authorities[0].clone(),
+                authorities[2].clone(),
+            ]
+            .into_iter()
+            .map(&persistent),
+        )
+        .is_err());
+        assert!(PreparedConsumerRouter::persistent(
+            authorities
+                .iter()
+                .cloned()
+                .chain(std::iter::once(authorities[1].clone()))
                 .map(&persistent),
-            )
-            .is_err()
-        );
-        assert!(
-            PreparedConsumerRouter::persistent(
-                authorities
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(authorities[1].clone()))
-                    .map(&persistent),
-            )
-            .is_err()
-        );
+        )
+        .is_err());
 
         let other_identities = (0..3)
             .map(|index| material_spiffe(&format!("mixed-roster-voter-{index}")))
             .collect::<Vec<_>>();
         let other_roster = test_consumer_roster_for(&other_identities);
         let mixed = voter_authority_for_identity(&other_roster, &other_identities[1]);
-        assert!(
-            PreparedConsumerRouter::persistent(
-                [authorities[0].clone(), mixed, authorities[2].clone()]
-                    .into_iter()
-                    .map(&persistent),
-            )
-            .is_err()
-        );
+        assert!(PreparedConsumerRouter::persistent(
+            [authorities[0].clone(), mixed, authorities[2].clone()]
+                .into_iter()
+                .map(&persistent),
+        )
+        .is_err());
 
         let max_identities = (0..opc_session_store::QUORUM_TOPOLOGY_MAX_MEMBERS)
             .map(|index| material_spiffe(&format!("max-roster-voter-{index}")))
@@ -22232,11 +22229,9 @@ mod tests {
             .with_authenticated_consumer_binding(accepted)
             .expect("attach consumer marker");
 
-        assert!(
-            prepared
-                .request_for_authenticated_consumer(accepted)
-                .is_ok()
-        );
+        assert!(prepared
+            .request_for_authenticated_consumer(accepted)
+            .is_ok());
         assert!(prepared.request_for_authenticated_consumer(other).is_err());
     }
 
@@ -22341,22 +22336,16 @@ mod tests {
                 max: CONSENSUS_PHYSICAL_MAX_BYTES,
             })
         );
-        assert!(
-            backend
-                .prepare_fenced_transition(
-                    authenticated_consumer_record_free_request(0x87, false).await,
-                )
-                .await
-                .is_ok()
-        );
-        assert!(
-            backend
-                .prepare_fenced_transition(
-                    authenticated_consumer_record_free_request(0x88, true).await
-                )
-                .await
-                .is_ok()
-        );
+        assert!(backend
+            .prepare_fenced_transition(
+                authenticated_consumer_record_free_request(0x87, false).await,
+            )
+            .await
+            .is_ok());
+        assert!(backend
+            .prepare_fenced_transition(authenticated_consumer_record_free_request(0x88, true).await)
+            .await
+            .is_ok());
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -22763,11 +22752,9 @@ mod tests {
             });
         let frozen_request_bytes =
             serde_json::to_vec(&frozen_request).expect("frozen general Hello encodes");
-        assert!(
-            !frozen_request_bytes
-                .windows(b"roster_profile".len())
-                .any(|window| window == b"roster_profile")
-        );
+        assert!(!frozen_request_bytes
+            .windows(b"roster_profile".len())
+            .any(|window| window == b"roster_profile"));
         let current_request: ConsumerWireRequest =
             decode_consumer_frame_payload(&frozen_request_bytes)
                 .expect("current peer accepts the exact old general Hello");
@@ -22802,11 +22789,9 @@ mod tests {
             });
         let frozen_response_bytes =
             serde_json::to_vec(&frozen_response).expect("frozen general HelloAck encodes");
-        assert!(
-            !frozen_response_bytes
-                .windows(b"roster_profile".len())
-                .any(|window| window == b"roster_profile")
-        );
+        assert!(!frozen_response_bytes
+            .windows(b"roster_profile".len())
+            .any(|window| window == b"roster_profile"));
         let current_response: ConsumerWireResponse =
             decode_consumer_frame_payload(&frozen_response_bytes)
                 .expect("current peer accepts the exact old general HelloAck");
@@ -22840,11 +22825,9 @@ mod tests {
             roster_profile: Some(SessionConsumerRosterTransportProfile::current()),
         }))
         .expect("protected-roster Hello encodes");
-        assert!(
-            protected
-                .windows(b"roster_profile".len())
-                .any(|window| window == b"roster_profile")
-        );
+        assert!(protected
+            .windows(b"roster_profile".len())
+            .any(|window| window == b"roster_profile"));
     }
 
     #[test]
@@ -22873,12 +22856,10 @@ mod tests {
             serde_json::to_vec(&decoded).expect("re-encode frozen revision-one response"),
             REVISION_ONE_RESPONSE_JSON.as_bytes()
         );
-        assert!(
-            decode_consumer_frame_payload::<ConsumerWireResponse>(
-                REVISION_ONE_RESPONSE_JSON.as_bytes()
-            )
-            .is_err()
-        );
+        assert!(decode_consumer_frame_payload::<ConsumerWireResponse>(
+            REVISION_ONE_RESPONSE_JSON.as_bytes()
+        )
+        .is_err());
 
         let current_hello = ConsumerWireRequest::Hello(ConsumerHello {
             transport_revision: super::SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
@@ -22893,12 +22874,10 @@ mod tests {
             response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
                 .expect("consumer frame cap fits u32"),
         });
-        assert!(
-            serde_json::from_slice::<FrozenRevisionOneRequest>(
-                &serde_json::to_vec(&current_hello).expect("encode revision-two Hello")
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_slice::<FrozenRevisionOneRequest>(
+            &serde_json::to_vec(&current_hello).expect("encode revision-two Hello")
+        )
+        .is_err());
         let current_call = ConsumerWireRequest::Call(ConsumerCall {
             request: Box::new(SessionConsumerRequest::new(
                 scope(),
@@ -22907,22 +22886,18 @@ mod tests {
             )),
             correlation: correlation(1),
         });
-        assert!(
-            serde_json::from_slice::<FrozenRevisionOneRequest>(
-                &serde_json::to_vec(&current_call).expect("encode revision-two Call")
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_slice::<FrozenRevisionOneRequest>(
+            &serde_json::to_vec(&current_call).expect("encode revision-two Call")
+        )
+        .is_err());
         let current_response = ConsumerWireResponse::Response(ConsumerCallResponse {
             correlation: correlation(1),
             response: Box::new(ConsumerSessionResponseWire::WatchOpened),
         });
-        assert!(
-            serde_json::from_slice::<FrozenRevisionOneResponse>(
-                &serde_json::to_vec(&current_response).expect("encode revision-two Response")
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_slice::<FrozenRevisionOneResponse>(
+            &serde_json::to_vec(&current_response).expect("encode revision-two Response")
+        )
+        .is_err());
     }
 
     #[test]
@@ -23079,12 +23054,7 @@ mod tests {
             DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
             DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
         );
-        assert!(
-            config(
-                requests, pending, wait, watches, setup, attempts, jitter, drain
-            )
-            .is_ok()
-        );
+        assert!(config(requests, pending, wait, watches, setup, attempts, jitter, drain).is_ok());
         for (invalid_requests, invalid_pending, invalid_watches) in [
             (0, pending, watches),
             (
@@ -23181,15 +23151,13 @@ mod tests {
 
         let control = SessionReauthenticationControl::new();
         let (client, _material) = stateless_test_client(control);
-        assert!(
-            PersistentSessionConsumerClient::try_from_stateless(
-                client
-                    .clone()
-                    .with_operation_timeout(DEFAULT_CONSUMER_OPERATION_TIMEOUT),
-                PersistentSessionConsumerConfig::default(),
-            )
-            .is_ok()
-        );
+        assert!(PersistentSessionConsumerClient::try_from_stateless(
+            client
+                .clone()
+                .with_operation_timeout(DEFAULT_CONSUMER_OPERATION_TIMEOUT),
+            PersistentSessionConsumerConfig::default(),
+        )
+        .is_ok());
         assert!(matches!(
             PersistentSessionConsumerClient::try_from_stateless(
                 client.clone().with_operation_timeout(
@@ -23257,16 +23225,14 @@ mod tests {
             std::iter::empty(),
         )
         .expect("test authorizer");
-        assert!(
-            SessionQuorumConsumerServer::new(
-                Arc::new(RejectingTestConsumer),
-                server_material.config(),
-                authorizer.clone(),
-            )
-            .with_operation_timeout(DEFAULT_CONSUMER_OPERATION_TIMEOUT)
-            .validate()
-            .is_ok()
-        );
+        assert!(SessionQuorumConsumerServer::new(
+            Arc::new(RejectingTestConsumer),
+            server_material.config(),
+            authorizer.clone(),
+        )
+        .with_operation_timeout(DEFAULT_CONSUMER_OPERATION_TIMEOUT)
+        .validate()
+        .is_ok());
         let (handle, _) = SessionQuorumConsumerServer::new(
             Arc::new(RejectingTestConsumer),
             server_material.config(),
@@ -25380,14 +25346,12 @@ mod tests {
         to_b.resolved_address = address_b;
         to_b.warm_target_generation = generation_a;
         PersistentCheckedOutConnection::new(Arc::clone(&persistent.pool), to_b).return_idle();
-        assert!(
-            persistent
-                .pool
-                .checked_out
-                .lock()
-                .expect("checked out")
-                .is_empty()
-        );
+        assert!(persistent
+            .pool
+            .checked_out
+            .lock()
+            .expect("checked out")
+            .is_empty());
 
         let generation_b = persistent
             .pool
@@ -25403,14 +25367,12 @@ mod tests {
         to_a.resolved_address = address_a;
         to_a.warm_target_generation = generation_b;
         PersistentCheckedOutConnection::new(Arc::clone(&persistent.pool), to_a).return_idle();
-        assert!(
-            persistent
-                .pool
-                .checked_out
-                .lock()
-                .expect("checked out")
-                .is_empty()
-        );
+        assert!(persistent
+            .pool
+            .checked_out
+            .lock()
+            .expect("checked out")
+            .is_empty());
         assert_eq!(persistent.pool.current_warm_capacity(), 1);
         assert_eq!(
             persistent.pool.idle.lock().expect("idle").len(),

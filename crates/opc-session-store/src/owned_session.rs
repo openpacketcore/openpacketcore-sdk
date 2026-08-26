@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::error::LeaseError;

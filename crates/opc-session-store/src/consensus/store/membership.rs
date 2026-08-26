@@ -3546,18 +3546,18 @@ fn nonquiescent_prior_terminal(
 
 #[cfg(test)]
 mod scope_refresh_tests {
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use super::*;
     use crate::consensus::{SessionConsensusClusterId, SessionConsensusConfigurationId};
     use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
     use crate::model::{FenceToken, Generation, OwnerId, SessionKey, SessionKeyType};
-    use crate::sqlite::SqliteSessionBackend;
     use crate::sqlite::consensus::{
         AbortedMembershipCleanup, MembershipPredecessorScope, PendingMembershipScope,
         TerminalMembershipTransition,
     };
+    use crate::sqlite::SqliteSessionBackend;
     use crate::topology::{
         ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId,
         ReplicaTlsIdentity, ValidatedQuorumTopology,

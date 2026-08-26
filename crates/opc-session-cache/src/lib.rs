@@ -490,10 +490,7 @@ impl SessionCache {
                     debug!("Invalidating key from cache (ReleaseLease): {:?}", key);
                     lock.remove(&key);
                 }
-                ReplicationOp::ProtectedRosterEstablished {
-                    key,
-                    ..
-                } => {
+                ReplicationOp::ProtectedRosterEstablished { key, .. } => {
                     debug!(
                         "Invalidating cache entry from protected-roster Established replication"
                     );
@@ -694,10 +691,7 @@ fn collect_replication_op_keys(op: &ReplicationOp, keys: &mut Vec<SessionKey>) {
             | ReplicationOp::ReleaseLease { key, .. } => {
                 keys.push(key.clone());
             }
-            ReplicationOp::ProtectedRosterEstablished {
-                key,
-                ..
-            } => keys.push(key.clone()),
+            ReplicationOp::ProtectedRosterEstablished { key, .. } => keys.push(key.clone()),
             ReplicationOp::Batch { ops } => pending.extend(ops),
         }
     }

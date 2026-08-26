@@ -9,12 +9,11 @@
 
 use crate::{
     fenced_mutation_roster::{
-        Admission, COMMITTED_TERMINAL_FRAME_DOMAIN, COMMITTED_TERMINAL_FRAME_MAGIC,
-        CompactedTerminalLookup, MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_PLAN_BYTES, Phase,
-        RequestId, Scope,
+        decode_frame, encode_frame, Admission, CompactedTerminalLookup, Phase, RequestId, Scope,
+        TerminalRecord, TerminalSlotId, COMMITTED_TERMINAL_FRAME_DOMAIN,
+        COMMITTED_TERMINAL_FRAME_MAGIC, MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_PLAN_BYTES,
         TERMINAL_COMMITTING_GUARD_DOMAIN, TERMINAL_RECEIPT_COMMITMENT_DOMAIN,
-        TERMINAL_RECORD_COMMITMENT_DOMAIN, TerminalRecord, TerminalSlotId, decode_frame,
-        encode_frame,
+        TERMINAL_RECORD_COMMITMENT_DOMAIN,
     },
     model::{FenceToken, Generation, OwnerId, SessionKey},
 };

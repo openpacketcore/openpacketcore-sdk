@@ -505,11 +505,9 @@ async fn exhausted_direct_replication_sequence_rejects_before_lease_mutation() {
         LeaseError::Backend("backend unavailable: replication sequence exhausted".to_string())
     );
     let state = backend.inner.lock().await;
-    assert!(
-        !state
-            .leases
-            .contains_key(&FakeSessionBackend::map_key(&key))
-    );
+    assert!(!state
+        .leases
+        .contains_key(&FakeSessionBackend::map_key(&key)));
     assert!(state.replication_log.is_empty());
     assert_eq!(state.next_fence, 1);
     assert_eq!(state.next_credential_id, 1);

@@ -11,13 +11,12 @@ use sha2::{Digest, Sha256};
 use crate::backend::{CompareAndSet, CompareAndSetResult};
 use crate::error::StoreError;
 use crate::fenced_mutation_roster::{
-    Admission, MAX_ADMISSION_CODEC_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES,
-    MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
-    MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES, MAX_ROSTER_INGRESS_ATTESTATION_BYTES,
-    MAX_TERMINAL_CODEC_BYTES, MAX_TOMBSTONE_CODEC_BYTES, RequestBindingKey,
-    RequestId as RosterRequestId, RosterCompactAdmissionProvenanceV2,
+    Admission, RequestBindingKey, RequestId as RosterRequestId, RosterCompactAdmissionProvenanceV2,
     RosterCompactTerminalEvidenceV2, RosterExecutorProofBundleV1, RosterIngressAttestationV1,
-    TerminalConflictTombstone, TerminalRecord,
+    TerminalConflictTombstone, TerminalRecord, MAX_ADMISSION_CODEC_BYTES,
+    MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES,
+    MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES, MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES,
+    MAX_ROSTER_INGRESS_ATTESTATION_BYTES, MAX_TERMINAL_CODEC_BYTES, MAX_TOMBSTONE_CODEC_BYTES,
 };
 use crate::fenced_mutation_roster_executor::{
     AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration, CommittedTerminal,
@@ -2070,26 +2069,26 @@ mod tests {
 
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId};
-    use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use p256::ecdsa::SigningKey;
 
     use super::*;
     use crate::fenced_mutation_roster::{
-        AdmissionProposal, EstablishedMutation, FRESH_ROSTER_MEMBERS, Member, MemberOperationId,
-        Phase, Profile, RequestId, RosterAttestationCertificateRoleV1,
-        RosterAttestationLeafCertificatePartsV1, RosterAttestationLeafCertificateV1,
-        RosterAttestationTrustRootV1, RosterCompactAdmissionProvenanceSigningInputV2,
-        RosterCompactTerminalEvidenceBindingV2, RosterCompactTerminalEvidenceV2,
-        RosterCompactTerminalMemberProjectionV2, RosterCompactTerminalMemberProofPartsV2,
-        RosterCompactTerminalMemberSigningInputV2, RosterExecutorMemberProofPartsV1, RosterId,
-        RosterIngressAttestationSigningInputV1, RosterProviderOperationV1, RosterProviderOutcomeV1,
-        Scope, TerminalRecord,
+        AdmissionProposal, EstablishedMutation, Member, MemberOperationId, Phase, Profile,
+        RequestId, RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+        RosterAttestationLeafCertificateV1, RosterAttestationTrustRootV1,
+        RosterCompactAdmissionProvenanceSigningInputV2, RosterCompactTerminalEvidenceBindingV2,
+        RosterCompactTerminalEvidenceV2, RosterCompactTerminalMemberProjectionV2,
+        RosterCompactTerminalMemberProofPartsV2, RosterCompactTerminalMemberSigningInputV2,
+        RosterExecutorMemberProofPartsV1, RosterId, RosterIngressAttestationSigningInputV1,
+        RosterProviderOperationV1, RosterProviderOutcomeV1, Scope, TerminalRecord,
+        FRESH_ROSTER_MEMBERS,
     };
     use crate::fenced_mutation_roster_executor::{AuthorityBinding, BackendRegistration};
     use crate::{
         EncryptedSessionPayload, FenceToken, FencedTransitionLease, FencedTransitionMutation,
         FencedTransitionMutationResult, FencedTransitionRequestId, FencedTransitionV2CallerNonce,
-        Generation, OwnerId, STABLE_ID_MAX_BYTES, SessionKeyType, StableId, StateClass, StateType,
+        Generation, OwnerId, SessionKeyType, StableId, StateClass, StateType, STABLE_ID_MAX_BYTES,
     };
 
     #[derive(Clone, Serialize, Deserialize)]
@@ -3635,12 +3634,10 @@ mod tests {
                 .calculate_applied_digest(5, previous, legacy_time(42))
                 .expect("changed effective time roster digest")
         );
-        assert!(
-            command
-                .encode_roster_applied_digest_input(5, previous, effective)
-                .expect("roster digest encoding")
-                .starts_with(ROSTER_APPLIED_DIGEST_MAGIC)
-        );
+        assert!(command
+            .encode_roster_applied_digest_input(5, previous, effective)
+            .expect("roster digest encoding")
+            .starts_with(ROSTER_APPLIED_DIGEST_MAGIC));
 
         let changed_body = roster_digest_admission(0x77);
         let changed_body_command = roster_production_admission_command(
@@ -3968,13 +3965,11 @@ mod tests {
             original.exact_attempt_digest().expect("original attempt"),
             takeover.exact_attempt_digest().expect("takeover attempt")
         );
-        assert!(
-            !original
-                .outcome_binding()
-                .expect("old-guard response binding")
-                .matches_terminal(&takeover)
-                .expect("compare exact attempts")
-        );
+        assert!(!original
+            .outcome_binding()
+            .expect("old-guard response binding")
+            .matches_terminal(&takeover)
+            .expect("compare exact attempts"));
         assert_ne!(
             original.immutable_payload_digest(),
             conflicting.immutable_payload_digest()

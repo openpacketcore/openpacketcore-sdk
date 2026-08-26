@@ -12,8 +12,8 @@ use opc_types::Timestamp;
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use serde::{
-    Deserialize, Deserializer, Serialize,
     de::{SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fmt, marker::PhantomData, time::Duration};
@@ -5741,10 +5741,10 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SESSION_KEY_TYPE_MAX_BYTES, SessionKeyType, StableId};
+    use crate::{SessionKeyType, StableId, SESSION_KEY_TYPE_MAX_BYTES};
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId};
-    use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
+    use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
 
     fn roster_attestation_trust_root(
         root_id: [u8; 32],
@@ -6259,12 +6259,10 @@ mod tests {
             )
             .expect("supported roster width and version");
             assert_eq!(value.members().len(), width);
-            assert!(
-                value
-                    .members()
-                    .iter()
-                    .all(|member| member.expected_version() == expected_version)
-            );
+            assert!(value
+                .members()
+                .iter()
+                .all(|member| member.expected_version() == expected_version));
         }
 
         let invalid_member = Member {
@@ -6491,11 +6489,9 @@ mod tests {
             rehydrated.validate_new_binding(next_admission.binding_key(4).unwrap()),
             Err(Error::InvalidHistory)
         );
-        assert!(
-            rehydrated
-                .permits_binding(next_admission.binding_key(4).unwrap())
-                .is_ok()
-        );
+        assert!(rehydrated
+            .permits_binding(next_admission.binding_key(4).unwrap())
+            .is_ok());
         assert_eq!(
             rehydrated.permits_binding(next_admission.binding_key(5).unwrap()),
             Err(Error::InvalidHistory)
@@ -6538,12 +6534,10 @@ mod tests {
                 .and_then(|()| RequestId::bind(4, &next_admission).map(|_| ())),
             Err(Error::InvalidHistory)
         );
-        assert!(
-            rehydrated
-                .validate_new_binding(next_admission.binding_key(5).unwrap())
-                .and_then(|()| RequestId::bind(5, &next_admission).map(|_| ()))
-                .is_ok()
-        );
+        assert!(rehydrated
+            .validate_new_binding(next_admission.binding_key(5).unwrap())
+            .and_then(|()| RequestId::bind(5, &next_admission).map(|_| ()))
+            .is_ok());
         assert_eq!(
             initial.strictly_advances(rehydrated),
             Err(Error::InvalidHistory)
@@ -6683,17 +6677,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.roster_id(), p.roster_id());
-        assert!(
-            Admission::authenticate(
-                p,
-                key(),
-                Scope::from_digest([0; 32]),
-                OwnerId::new("owner").unwrap(),
-                FenceToken::new(1),
-                Generation::new(2)
-            )
-            .is_err()
-        );
+        assert!(Admission::authenticate(
+            p,
+            key(),
+            Scope::from_digest([0; 32]),
+            OwnerId::new("owner").unwrap(),
+            FenceToken::new(1),
+            Generation::new(2)
+        )
+        .is_err());
     }
     #[test]
     fn protected_plan_checkpoint_and_result_have_independent_exact_bounds() {
@@ -6980,18 +6972,16 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        assert!(
-            AdmissionProposal::new(
-                Profile::v1(),
-                RosterId::from_bytes([1; ROSTER_ID_BYTES]).unwrap(),
-                members,
-                EstablishedMutation::no_op(),
-                vec![],
-                vec![],
-                vec![],
-            )
-            .is_ok()
-        );
+        assert!(AdmissionProposal::new(
+            Profile::v1(),
+            RosterId::from_bytes([1; ROSTER_ID_BYTES]).unwrap(),
+            members,
+            EstablishedMutation::no_op(),
+            vec![],
+            vec![],
+            vec![],
+        )
+        .is_ok());
     }
     #[test]
     fn compacted_terminal_tombstone_never_reopens_changed_body() {
@@ -7014,18 +7004,16 @@ mod tests {
         let terminal_body_commitment =
             TerminalRecord::canonical_body_commitment(&terminal_bytes).unwrap();
         assert_eq!(terminal_body_commitment, terminal.body_commitment());
-        assert!(
-            tombstone
-                .validate_compacted_terminal(
-                    binding,
-                    request_id,
-                    terminal_slot,
-                    FenceToken::new(2),
-                    original_admission.expected_generation(),
-                    terminal_body_commitment,
-                )
-                .is_ok()
-        );
+        assert!(tombstone
+            .validate_compacted_terminal(
+                binding,
+                request_id,
+                terminal_slot,
+                FenceToken::new(2),
+                original_admission.expected_generation(),
+                terminal_body_commitment,
+            )
+            .is_ok());
         assert_eq!(
             tombstone.validate_compacted_terminal(
                 binding,
@@ -7090,11 +7078,8 @@ mod tests {
                 .unwrap(),
             status
         );
-        let mut wrong_scope = compacted_terminal_lookup(
-            &exact,
-            FenceToken::new(2),
-            exact.expected_generation(),
-        );
+        let mut wrong_scope =
+            compacted_terminal_lookup(&exact, FenceToken::new(2), exact.expected_generation());
         wrong_scope.scope = Scope::from_digest([8; 32]);
         assert_eq!(
             tombstone.validate_lookup(wrong_scope),
@@ -7102,11 +7087,8 @@ mod tests {
         );
         let mut other_key = exact.key().clone();
         other_key.stable_id = StableId::new(Bytes::from_static(b"other-key")).unwrap();
-        let mut wrong_key = compacted_terminal_lookup(
-            &exact,
-            FenceToken::new(2),
-            exact.expected_generation(),
-        );
+        let mut wrong_key =
+            compacted_terminal_lookup(&exact, FenceToken::new(2), exact.expected_generation());
         wrong_key.key = &other_key;
         assert_eq!(
             tombstone.validate_lookup(wrong_key),
@@ -7114,31 +7096,22 @@ mod tests {
         );
         let mut other_tenant = exact.key().clone();
         other_tenant.tenant = TenantId::from_static("other-tenant");
-        let mut wrong_tenant = compacted_terminal_lookup(
-            &exact,
-            FenceToken::new(2),
-            exact.expected_generation(),
-        );
+        let mut wrong_tenant =
+            compacted_terminal_lookup(&exact, FenceToken::new(2), exact.expected_generation());
         wrong_tenant.key = &other_tenant;
         assert_eq!(
             tombstone.validate_lookup(wrong_tenant),
             Err(Error::InvalidAuthority)
         );
-        let mut wrong_roster_id = compacted_terminal_lookup(
-            &exact,
-            FenceToken::new(2),
-            exact.expected_generation(),
-        );
+        let mut wrong_roster_id =
+            compacted_terminal_lookup(&exact, FenceToken::new(2), exact.expected_generation());
         wrong_roster_id.roster_id = RosterId::from_bytes([8; ROSTER_ID_BYTES]).unwrap();
         assert_eq!(
             tombstone.validate_lookup(wrong_roster_id),
             Err(Error::InvalidAuthority)
         );
-        let mut wrong_epoch = compacted_terminal_lookup(
-            &exact,
-            FenceToken::new(2),
-            exact.expected_generation(),
-        );
+        let mut wrong_epoch =
+            compacted_terminal_lookup(&exact, FenceToken::new(2), exact.expected_generation());
         wrong_epoch.history_epoch = 5;
         assert_eq!(
             tombstone.validate_lookup(wrong_epoch),
@@ -7153,21 +7126,15 @@ mod tests {
             Err(Error::InvalidAuthority)
         );
         let wrong_original_owner = OwnerId::new("wrong-original-owner").unwrap();
-        let mut wrong_owner = compacted_terminal_lookup(
-            &exact,
-            FenceToken::new(2),
-            exact.expected_generation(),
-        );
+        let mut wrong_owner =
+            compacted_terminal_lookup(&exact, FenceToken::new(2), exact.expected_generation());
         wrong_owner.original_owner = &wrong_original_owner;
         assert_eq!(
             tombstone.validate_lookup(wrong_owner),
             Err(Error::InvalidAuthority)
         );
-        let mut wrong_original_fence = compacted_terminal_lookup(
-            &exact,
-            FenceToken::new(3),
-            exact.expected_generation(),
-        );
+        let mut wrong_original_fence =
+            compacted_terminal_lookup(&exact, FenceToken::new(3), exact.expected_generation());
         wrong_original_fence.original_admission_fence =
             FenceToken::new(exact.admission_fence().get() + 1);
         assert_eq!(
@@ -7484,63 +7451,53 @@ mod tests {
         .expect("raw receipt verifies before compacting");
         let mut changed_outcome = raw.clone();
         changed_outcome.outcome = RosterProviderOutcomeV1::AppliedAdopted;
-        assert!(
-            verify_roster_provider_receipt_v1(
-                &_root,
-                compact_time(20),
-                certificate_parts(),
-                &changed_outcome,
-                &proof.provider_signature,
-            )
-            .is_err()
-        );
+        assert!(verify_roster_provider_receipt_v1(
+            &_root,
+            compact_time(20),
+            certificate_parts(),
+            &changed_outcome,
+            &proof.provider_signature,
+        )
+        .is_err());
         let mut changed_epoch = raw.clone();
         changed_epoch.proof_epoch += 1;
-        assert!(
-            verify_roster_provider_receipt_v1(
-                &_root,
-                compact_time(20),
-                certificate_parts(),
-                &changed_epoch,
-                &proof.provider_signature,
-            )
-            .is_err()
-        );
+        assert!(verify_roster_provider_receipt_v1(
+            &_root,
+            compact_time(20),
+            certificate_parts(),
+            &changed_epoch,
+            &proof.provider_signature,
+        )
+        .is_err());
         let mut changed_fence = raw.clone();
         changed_fence.authority_fence += 1;
-        assert!(
-            verify_roster_provider_receipt_v1(
-                &_root,
-                compact_time(20),
-                certificate_parts(),
-                &changed_fence,
-                &proof.provider_signature,
-            )
-            .is_err()
-        );
-        assert!(
-            verify_roster_provider_receipt_v1(
-                &_root,
-                compact_time(20),
-                certificate_parts(),
-                &raw,
-                &[0; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
-            )
-            .is_err()
-        );
-        assert!(
-            verify_roster_provider_receipt_v1(
-                &_root,
-                authority
-                    .acquired_at()
-                    .add_seconds(-1)
-                    .expect("before lease"),
-                certificate_parts(),
-                &raw,
-                &proof.provider_signature,
-            )
-            .is_err()
-        );
+        assert!(verify_roster_provider_receipt_v1(
+            &_root,
+            compact_time(20),
+            certificate_parts(),
+            &changed_fence,
+            &proof.provider_signature,
+        )
+        .is_err());
+        assert!(verify_roster_provider_receipt_v1(
+            &_root,
+            compact_time(20),
+            certificate_parts(),
+            &raw,
+            &[0; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
+        )
+        .is_err());
+        assert!(verify_roster_provider_receipt_v1(
+            &_root,
+            authority
+                .acquired_at()
+                .add_seconds(-1)
+                .expect("before lease"),
+            certificate_parts(),
+            &raw,
+            &proof.provider_signature,
+        )
+        .is_err());
         verify_compact_terminal_evidence_v2(CompactTerminalEvidenceVerificationV2 {
             root: &_root,
             configuration_identity: identity,
