@@ -121,6 +121,17 @@ pub(crate) const SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
 const PROTECTED_ROSTER_MAX_CANONICAL_RECORD_BYTES: usize = 4_368_617;
 const PROTECTED_ROSTER_MAX_CANONICAL_BUSINESS_BYTES: usize = 1_052_672;
 const PROTECTED_ROSTER_TERMINAL_RETENTION_NANOS: i128 = 24 * 60 * 60 * 1_000_000_000;
+const PROTECTED_ROSTER_RECOVERY_TRUST_ROOT_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/protected-roster/recovery-trust-root/v1\0";
+
+/// Return the immutable protected-roster canonical record and business value
+/// caps for recovery's bounded preflight, without duplicating protocol limits.
+pub(crate) fn protected_roster_recovery_value_caps() -> (usize, usize) {
+    (
+        PROTECTED_ROSTER_MAX_CANONICAL_RECORD_BYTES,
+        PROTECTED_ROSTER_MAX_CANONICAL_BUSINESS_BYTES,
+    )
+}
 
 // This is intentionally a unit-test-only counter rather than production
 // telemetry: it proves that the maintenance selector decodes no unselected
@@ -3647,13 +3658,6 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
         identity_table_exists,
     )
     .map_err(|_| SessionConsensusStorageError::IdentityMismatch)?;
-    ensure_protected_roster_schema_sync(&tx).map_err(|error| {
-        if error.kind() == io::ErrorKind::InvalidData {
-            SessionConsensusStorageError::CorruptState
-        } else {
-            SessionConsensusStorageError::BackendUnavailable
-        }
-    })?;
     if required_storage_identity.is_some_and(|required| required != storage_identity) {
         return Err(SessionConsensusStorageError::IdentityMismatch);
     }
@@ -3682,6 +3686,13 @@ fn initialize_schema_with_storage_anchor_and_pending_and_bindings(
             }
         },
     )?;
+    ensure_protected_roster_schema_sync(&tx).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            SessionConsensusStorageError::CorruptState
+        } else {
+            SessionConsensusStorageError::BackendUnavailable
+        }
+    })?;
     ensure_membership_scope_schema_sync(
         &tx,
         storage_identity,
@@ -6691,6 +6702,17 @@ enum ProtectedRosterLayout {
     Activated,
 }
 
+/// The recovery-facing roster state after exact SQLite DDL classification.
+/// `Legacy` deliberately includes rootless predecessor products accepted by
+/// the bounded receipt/history classifier; it does not permit a partial root
+/// or any partial roster namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProtectedRosterRecoveryLayout {
+    Legacy,
+    Prepared,
+    Activated,
+}
+
 const PROTECTED_ROSTER_TABLES: &[&str] = &[
     "consensus_protected_roster_rows",
     "consensus_protected_roster_floors",
@@ -6709,10 +6731,15 @@ fn protected_roster_layout_in_sync(
     attached: bool,
 ) -> io::Result<ProtectedRosterLayout> {
     let version = persisted_schema_version_in_sync(conn, attached)?;
-    let marker = fenced_transition_receipt_ledger_marker_in_sync(conn, attached)?
-        .ok_or_else(|| invalid_data("protected roster activation marker is missing"))?;
+    // The roster namespace is additive to the receipt/V2 lineage, but may
+    // never make a weakened predecessor authoritative. Reuse the complete
+    // receipt/history classifier so a marker name alone, a partial V2
+    // namespace, or weakened identity DDL cannot activate roster recovery.
+    let receipt_layout = fenced_transition_receipt_ledger_layout_in_sync(conn, attached)?;
     let objects_exact = protected_roster_schema_objects_are_exact_in_sync(conn, attached)?;
-    let predecessor_exact = protected_roster_predecessor_schema_is_exact_in_sync(conn, attached)?;
+    let namespace_absent = protected_roster_schema_namespace_is_absent_in_sync(conn, attached)?;
+    let root_columns_complete =
+        roster_attestation_root_columns_are_complete_in_sync(conn, attached)?;
     // A legacy predecessor has no roster tables to query.  Inspect row
     // emptiness only after the complete exact namespace is present; otherwise
     // a fresh database would turn the expected Legacy state into a backend
@@ -6721,39 +6748,149 @@ fn protected_roster_layout_in_sync(
 
     match (
         version,
-        marker,
+        receipt_layout,
         objects_exact,
-        predecessor_exact,
+        namespace_absent,
         tables_empty,
+        root_columns_complete,
     ) {
-        (version, false, false, true, _)
+        // #684 predates the receipt activation column. Its rootless and
+        // root-bearing exact products remain roster predecessors only when
+        // the receipt/history classifier has accepted the complete bounded
+        // markerless manifest; a partial root triplet cannot reach here.
+        (version, FencedTransitionReceiptLedgerLayout::Published684, false, true, _, _)
             if version == i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) =>
         {
             Ok(ProtectedRosterLayout::Legacy)
         }
-        (version, true, false, true, _)
-            if version == i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 1 =>
+        (version, FencedTransitionReceiptLedgerLayout::Prepared, false, true, _, _)
+            if version == i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) =>
         {
             Ok(ProtectedRosterLayout::Legacy)
         }
-        (version, false, true, false, true)
+        (version, FencedTransitionReceiptLedgerLayout::Activated, false, true, _, _)
+            if matches!(
+                version,
+                FENCED_TRANSITION_V1_DATABASE_FORMAT | FENCED_TRANSITION_V2_DATABASE_FORMAT
+            ) =>
+        {
+            Ok(ProtectedRosterLayout::Legacy)
+        }
+        (version, FencedTransitionReceiptLedgerLayout::Prepared, true, false, true, true)
             if version == i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) =>
         {
             Ok(ProtectedRosterLayout::Prepared)
         }
-        (version, true, true, false, true)
-            if version == FENCED_TRANSITION_V1_DATABASE_FORMAT
-                || version == FENCED_TRANSITION_V2_DATABASE_FORMAT =>
+        (version, FencedTransitionReceiptLedgerLayout::Activated, true, false, true, true)
+            if matches!(
+                version,
+                FENCED_TRANSITION_V1_DATABASE_FORMAT | FENCED_TRANSITION_V2_DATABASE_FORMAT
+            ) =>
         {
             Ok(ProtectedRosterLayout::Prepared)
         }
-        (version, marker, true, false, _) if version == PROTECTED_ROSTER_DATABASE_FORMAT => {
-            let _ = marker;
-            Ok(ProtectedRosterLayout::Activated)
-        }
+        (
+            PROTECTED_ROSTER_DATABASE_FORMAT,
+            FencedTransitionReceiptLedgerLayout::Prepared
+            | FencedTransitionReceiptLedgerLayout::Activated,
+            true,
+            false,
+            _,
+            true,
+        ) => Ok(ProtectedRosterLayout::Activated),
         _ => Err(invalid_data(
             "protected roster schema activation is invalid",
         )),
+    }
+}
+
+/// Rootless identity DDL is accepted only for an empty legacy roster
+/// predecessor.  Once any complete roster namespace exists, all three root
+/// columns are mandatory; the receipt identity classifier separately proves
+/// their exact emitted DDL.
+fn roster_attestation_root_columns_are_complete_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> io::Result<bool> {
+    let pragma = if attached {
+        "pragma_table_info('consensus_identity', 'consensus_incoming')"
+    } else {
+        "pragma_table_info('consensus_identity')"
+    };
+    let count: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {pragma} WHERE name IN \
+                 ('roster_attestation_root_id', 'roster_attestation_public_key', \
+                  'roster_attestation_algorithm_version')"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    match count {
+        0 => Ok(false),
+        3 => Ok(true),
+        _ => Err(invalid_data("roster attestation root columns are partial")),
+    }
+}
+
+/// Classify a locally opened roster namespace for recovery before any roster
+/// rows are decoded.  This preserves the full exact-DDL activation boundary
+/// while still recognizing bounded rootless pre-roster databases.
+pub(crate) fn protected_roster_recovery_layout_sync(
+    conn: &Connection,
+) -> Result<ProtectedRosterRecoveryLayout, SessionConsensusStorageError> {
+    let layout = protected_roster_layout_in_sync(conn, false).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            SessionConsensusStorageError::CorruptState
+        } else {
+            SessionConsensusStorageError::BackendUnavailable
+        }
+    })?;
+    // The DDL family is exact above; validate the nullable identity value
+    // shape as well so recovery never sees a half-configured verifier root.
+    read_roster_attestation_trust_root_sync(conn)?;
+    Ok(match layout {
+        ProtectedRosterLayout::Legacy => ProtectedRosterRecoveryLayout::Legacy,
+        ProtectedRosterLayout::Prepared => ProtectedRosterRecoveryLayout::Prepared,
+        ProtectedRosterLayout::Activated => ProtectedRosterRecoveryLayout::Activated,
+    })
+}
+
+/// Commit the immutable verifier root only after exact recovery
+/// classification has fenced the identity DDL. Recovery receives no raw key
+/// material or verifier authority; `None` is the valid rootless/all-null
+/// predecessor state and cannot authorize roster traffic.
+pub(crate) fn protected_roster_recovery_trust_root_commitment_sync(
+    conn: &Connection,
+) -> Result<Option<[u8; 32]>, SessionConsensusStorageError> {
+    let _ = protected_roster_recovery_layout_sync(conn)?;
+    let Some(root) = read_roster_attestation_trust_root_sync(conn)? else {
+        return Ok(None);
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(PROTECTED_ROSTER_RECOVERY_TRUST_ROOT_DOMAIN);
+    hasher.update(root.root_id());
+    hasher.update(root.compressed_public_key());
+    hasher.update([1]);
+    Ok(Some(hasher.finalize().into()))
+}
+
+/// Validate every persisted roster projection through the canonical decoders
+/// and domain invariants.  A prepared roster namespace is required to be
+/// empty and is therefore a valid recovery state.
+pub(crate) fn validate_protected_roster_recovery_state_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> Result<(), SessionConsensusStorageError> {
+    let layout = protected_roster_recovery_layout_sync(conn)?;
+    match layout {
+        ProtectedRosterRecoveryLayout::Legacy => Ok(()),
+        ProtectedRosterRecoveryLayout::Prepared | ProtectedRosterRecoveryLayout::Activated => {
+            validate_protected_roster_state_sync(conn, identity)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)
+        }
     }
 }
 
@@ -6777,38 +6914,29 @@ fn protected_roster_schema_objects_are_exact_in_sync(
     Ok(observed == expected)
 }
 
-/// The exact predecessor is synthesized from the current canonical manifest,
-/// dropping every member of the roster integrity boundary.  This prevents an
-/// arbitrary partial or weakened namespace from being "repaired" on open.
-fn protected_roster_predecessor_schema_is_exact_in_sync(
+/// A predecessor has no roster object of any kind.  Do not reuse the manifest
+/// sentinel here: an overlarge or SQL-less forged object intentionally maps to
+/// an empty manifest for exact-comparison failure, but is still a namespace
+/// occupant that must prevent legacy admission.
+fn protected_roster_schema_namespace_is_absent_in_sync(
     conn: &Connection,
     attached: bool,
 ) -> io::Result<bool> {
-    let canonical = SqliteSessionBackend::canonical_schema_connection()
-        .map_err(|_| invalid_data("protected roster canonical schema is unavailable"))?;
-    canonical
-        .execute_batch(CONSENSUS_SCHEMA)
-        .map_err(db_error)?;
-    canonical
-        .execute_batch(ROSTER_ATTESTATION_ROOT_COLUMNS_SCHEMA)
-        .map_err(db_error)?;
-    canonical
-        .execute_batch(PROTECTED_ROSTER_SCHEMA)
-        .map_err(db_error)?;
-    canonical
-        .execute_batch(
-            "DROP INDEX consensus_protected_roster_terminal_sequence; \
-             DROP INDEX consensus_protected_roster_reclaim_due; \
-             DROP INDEX consensus_protected_roster_partition_epoch; \
-             DROP TABLE consensus_protected_roster_admissions; \
-             DROP TABLE consensus_protected_roster_business; \
-             DROP TABLE consensus_protected_roster_witness; \
-             DROP TABLE consensus_protected_roster_retirement_cursors; \
-             DROP TABLE consensus_protected_roster_floors; \
-             DROP TABLE consensus_protected_roster_rows;",
-        )
-        .map_err(db_error)?;
-    Ok(schema_manifest_in_sync(conn, attached)? == schema_manifest_in_sync(&canonical, false)?)
+    let master = if attached {
+        "consensus_incoming.sqlite_master"
+    } else {
+        "main.sqlite_master"
+    };
+    conn.query_row(
+        &format!(
+            "SELECT NOT EXISTS(SELECT 1 FROM {master} \
+             WHERE name LIKE 'consensus_protected_roster%' \
+                OR tbl_name LIKE 'consensus_protected_roster%')"
+        ),
+        [],
+        |row| row.get(0),
+    )
+    .map_err(db_error)
 }
 
 fn protected_roster_schema_manifest(
@@ -10336,6 +10464,14 @@ fn validate_existing_schema(
     conn: &Connection,
     storage_identity: SessionConsensusIdentity,
 ) -> Result<(), SessionConsensusStorageError> {
+    validate_existing_schema_with_roster_requirement(conn, storage_identity, true)
+}
+
+fn validate_existing_schema_with_roster_requirement(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    require_protected_roster: bool,
+) -> Result<(), SessionConsensusStorageError> {
     for table in [
         "consensus_identity",
         "consensus_membership_scope",
@@ -10361,6 +10497,9 @@ fn validate_existing_schema(
         "consensus_snapshot",
         "consensus_operator_recovery",
     ] {
+        if !require_protected_roster && PROTECTED_ROSTER_TABLES.contains(&table) {
+            continue;
+        }
         if !table_exists(conn, table)
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
         {
@@ -10371,7 +10510,9 @@ fn validate_existing_schema(
     if read_storage_identity_sync(conn)? != storage_identity {
         return Err(SessionConsensusStorageError::IdentityMismatch);
     }
-    read_roster_attestation_trust_root_sync(conn)?;
+    if require_protected_roster {
+        read_roster_attestation_trust_root_sync(conn)?;
+    }
 
     let machine_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM consensus_machine", [], |row| {
@@ -10392,10 +10533,12 @@ fn validate_existing_schema(
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     validate_fenced_transition_v2_receipts_sync(conn, storage_identity)
         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-    protected_roster_layout_in_sync(conn, false)
-        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-    validate_protected_roster_state_sync(conn, storage_identity)
-        .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    if require_protected_roster {
+        protected_roster_layout_in_sync(conn, false)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        validate_protected_roster_state_sync(conn, storage_identity)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    }
     Ok(())
 }
 
@@ -11626,8 +11769,8 @@ fn fenced_transition_receipt_ledger_marker_in_sync(
 
 /// The activation bit is a one-way schema fence, so accepting its column name
 /// alone would let a weakened identity table authorize receipt-ledger repair.
-/// There are exactly two emitted forms: a fresh table and the table SQLite
-/// records after adding the marker to an exact published-#684 identity table.
+/// The exact forms span both released marker constructions and both identity
+/// families: without roster-root columns and with the complete root triplet.
 fn activated_consensus_identity_schema_is_exact_in_sync(
     conn: &Connection,
     attached: bool,
@@ -11666,33 +11809,39 @@ fn expected_activated_consensus_identity_schema_forms() -> io::Result<&'static B
 
     let mut expected = BTreeSet::new();
     for migrated in [false, true] {
-        let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
-            .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
-        canonical
-            .execute_batch(CONSENSUS_SCHEMA)
-            .map_err(db_error)?;
-        if migrated {
+        for roster_root_columns in [false, true] {
+            let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+                .map_err(|_| invalid_data("published session consensus schema is unavailable"))?;
             canonical
-                .execute_batch(
-                    "ALTER TABLE consensus_identity \
-                     DROP COLUMN fenced_transition_receipt_ledger_activated;",
+                .execute_batch(CONSENSUS_SCHEMA)
+                .map_err(db_error)?;
+            if migrated {
+                canonical
+                    .execute_batch(
+                        "ALTER TABLE consensus_identity \
+                         DROP COLUMN fenced_transition_receipt_ledger_activated;",
+                    )
+                    .map_err(db_error)?;
+            }
+            if roster_root_columns {
+                canonical
+                    .execute_batch(ROSTER_ATTESTATION_ROOT_COLUMNS_SCHEMA)
+                    .map_err(db_error)?;
+            }
+            if migrated {
+                canonical
+                    .execute_batch(FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_MIGRATION)
+                    .map_err(db_error)?;
+            }
+            let sql: String = canonical
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
+                    [],
+                    |row| row.get(0),
                 )
                 .map_err(db_error)?;
-            canonical
-                .execute_batch(FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_MIGRATION)
-                .map_err(db_error)?;
+            expected.insert(normalize_schema_sql(&sql));
         }
-        canonical
-            .execute_batch(ROSTER_ATTESTATION_ROOT_COLUMNS_SCHEMA)
-            .map_err(db_error)?;
-        let sql: String = canonical
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(db_error)?;
-        expected.insert(normalize_schema_sql(&sql));
     }
     // A concurrent first-use may have populated the same immutable forms
     // while this thread built them. Either form is equivalent and the stored
@@ -11739,41 +11888,46 @@ fn markerless_pre_fenced_schema_is_exact_in_sync(
                 Published684RestoreScanSchema::Direct,
                 Published684RestoreScanSchema::Migrated,
             ] {
-                let canonical = crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
-                    .map_err(|_| {
-                        invalid_data("published session consensus schema is unavailable")
-                    })?;
-                if pre_acquisition_timestamp {
+                for roster_root_columns in [false, true] {
+                    let canonical =
+                        crate::sqlite::SqliteSessionBackend::canonical_schema_connection()
+                            .map_err(|_| {
+                                invalid_data("published session consensus schema is unavailable")
+                            })?;
+                    if pre_acquisition_timestamp {
+                        canonical
+                            .execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
+                            .map_err(db_error)?;
+                    }
                     canonical
-                        .execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
+                        .execute_batch(CONSENSUS_SCHEMA)
                         .map_err(db_error)?;
-                }
-                canonical
-                    .execute_batch(CONSENSUS_SCHEMA)
-                    .map_err(db_error)?;
-                canonical
-                    .execute_batch(ROSTER_ATTESTATION_ROOT_COLUMNS_SCHEMA)
-                    .map_err(db_error)?;
-                canonical
-                    .execute_batch(
-                        "DROP TABLE consensus_fenced_transition_receipts; \
-                         DROP TABLE consensus_fenced_transition_activation; \
-                         ALTER TABLE consensus_identity \
-                         DROP COLUMN fenced_transition_receipt_ledger_activated;",
-                    )
-                    .map_err(db_error)?;
-                if pre_authority_dynamic {
+                    if roster_root_columns {
+                        canonical
+                            .execute_batch(ROSTER_ATTESTATION_ROOT_COLUMNS_SCHEMA)
+                            .map_err(db_error)?;
+                    }
                     canonical
                         .execute_batch(
-                            "ALTER TABLE consensus_identity DROP COLUMN authority_profile; \
-                             ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;",
+                            "DROP TABLE consensus_fenced_transition_receipts; \
+                             DROP TABLE consensus_fenced_transition_activation; \
+                             ALTER TABLE consensus_identity \
+                             DROP COLUMN fenced_transition_receipt_ledger_activated;",
                         )
                         .map_err(db_error)?;
-                }
-                install_published_684_operator_recovery_schema(&canonical, operator_recovery)?;
-                install_published_684_restore_scan_schema(&canonical, restore_scan)?;
-                if observed == schema_manifest_in_sync(&canonical, false)? {
-                    return Ok(true);
+                    if pre_authority_dynamic {
+                        canonical
+                            .execute_batch(
+                                "ALTER TABLE consensus_identity DROP COLUMN authority_profile; \
+                                 ALTER TABLE consensus_identity DROP COLUMN fixed_placement_policy;",
+                            )
+                            .map_err(db_error)?;
+                    }
+                    install_published_684_operator_recovery_schema(&canonical, operator_recovery)?;
+                    install_published_684_restore_scan_schema(&canonical, restore_scan)?;
+                    if observed == schema_manifest_in_sync(&canonical, false)? {
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -12548,8 +12702,13 @@ pub(crate) fn claim_legacy_checkpoint_sync(
         Timestamp::from_str(value)
             .map_err(|_| invalid_data("legacy checkpoint logical time is invalid"))?;
     }
-
+    // Keep claimed checkpoints on the same schema preparation path as a
+    // writable reopen: roots first, then operator recovery, receipt ledger,
+    // and finally the inert protected-roster namespace.  All DDL remains in
+    // this ownership transaction, before any later append/classifier use.
     tx.execute_batch(CONSENSUS_SCHEMA).map_err(db_error)?;
+    tx.execute_batch(ROSTER_ATTESTATION_ROOT_COLUMNS_SCHEMA)
+        .map_err(db_error)?;
     let epoch = epoch_i64(identity)?;
     tx.execute(
         "INSERT INTO consensus_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch, authority_profile) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
@@ -12581,17 +12740,25 @@ pub(crate) fn claim_legacy_checkpoint_sync(
         ],
     )
     .map_err(db_error)?;
-    tx.execute(
-        "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor) VALUES (1, ?1, 0, ?2, ?3, ?4, ?5)",
-        params![
-            epoch,
-            [0_u8; 32].as_slice(),
-            checked_positive_i64(pending_recovery_epoch)?,
-            plan_digest.as_slice(),
-            checked_i64(watch_cursor_invalidation_floor)?,
-        ],
-    )
-    .map_err(db_error)?;
+    ensure_operator_recovery_schema_sync(&tx, identity)?;
+    let changed = tx
+        .execute(
+            "UPDATE consensus_operator_recovery SET pending_epoch=?1, pending_plan_digest=?2, watch_cursor_invalidation_floor=?3 WHERE singleton=1 AND configuration_epoch=?4",
+            params![
+                checked_positive_i64(pending_recovery_epoch)?,
+                plan_digest.as_slice(),
+                checked_i64(watch_cursor_invalidation_floor)?,
+                epoch,
+            ],
+        )
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data(
+            "session recovery checkpoint operator state is invalid",
+        ));
+    }
+    ensure_fenced_transition_receipt_ledger_activation_sync(&tx, identity)?;
+    ensure_protected_roster_schema_sync(&tx)?;
     ensure_membership_scope_schema_sync(
         &tx,
         identity,
@@ -24038,6 +24205,7 @@ fn attached_snapshot_lease_schema(conn: &Connection) -> io::Result<AttachedSnaps
 fn create_attached_snapshot_validation_views(
     conn: &Connection,
     lease_schema: AttachedSnapshotLeaseSchema,
+    incoming_has_protected_roster: bool,
 ) -> io::Result<()> {
     for table in ATTACHED_SNAPSHOT_VALIDATION_TABLES {
         let source_exists = attached_snapshot_table_exists(conn, table)?;
@@ -24067,6 +24235,20 @@ fn create_attached_snapshot_validation_views(
             "CREATE TEMP VIEW consensus_fenced_transition_v2_activation AS SELECT CAST(NULL AS INTEGER) AS singleton, CAST(NULL AS INTEGER) AS storage_configuration_epoch, CAST(NULL AS BLOB) AS scope_configuration_id, CAST(NULL AS INTEGER) AS scope_configuration_epoch, CAST(NULL AS BLOB) AS voter_set_digest, CAST(NULL AS BLOB) AS profile_digest WHERE 0".to_owned()
         } else if *table == "consensus_fenced_transition_v2_history" && !source_exists {
             "CREATE TEMP VIEW consensus_fenced_transition_v2_history AS SELECT CAST(NULL AS INTEGER) AS singleton, CAST(NULL AS INTEGER) AS storage_configuration_epoch, CAST(NULL AS BLOB) AS profile_digest, CAST(NULL AS INTEGER) AS active_epoch, CAST(NULL AS INTEGER) AS retired_through_epoch, CAST(NULL AS INTEGER) AS generation, CAST(NULL AS INTEGER) AS current_bound_count, CAST(NULL AS INTEGER) AS reclaim_epoch, CAST(NULL AS INTEGER) AS reclaim_cursor_ordinal, CAST(NULL AS INTEGER) AS reclaim_remaining, CAST(NULL AS INTEGER) AS reclaimed_entries WHERE 0".to_owned()
+        } else if !incoming_has_protected_roster {
+            if let Some((_, columns)) = PROTECTED_ROSTER_SNAPSHOT_NAMESPACE_TABLES
+                .iter()
+                .find(|(roster_table, _)| roster_table == table)
+            {
+                // A completely absent protected-roster namespace is the exact
+                // pre-#707 empty predecessor. Project canonical empty views
+                // from the already-validated local Prepared schema so the
+                // shared incoming validators cannot mistake local rows for
+                // snapshot state or dereference a table the source never had.
+                format!("CREATE TEMP VIEW {table} AS SELECT {columns} FROM main.{table} WHERE 0")
+            } else {
+                format!("CREATE TEMP VIEW {table} AS SELECT * FROM consensus_incoming.{table}")
+            }
         } else {
             format!("CREATE TEMP VIEW {table} AS SELECT * FROM consensus_incoming.{table}")
         };
@@ -24140,6 +24322,7 @@ fn validate_attached_snapshot_database_sync(
     >,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     local_candidate_marker: Option<CandidateBootstrapMarker>,
+    incoming_has_protected_roster: bool,
     meta: &opc_consensus::engine::SnapshotMeta<
         SessionConsensusNodeId,
         opc_consensus::engine::EmptyNode,
@@ -24155,7 +24338,7 @@ fn validate_attached_snapshot_database_sync(
             "session consensus snapshot integrity check failed",
         ));
     }
-    validate_existing_schema(conn, identity)
+    validate_existing_schema_with_roster_requirement(conn, identity, incoming_has_protected_roster)
         .map_err(|_| invalid_data("session consensus snapshot identity is invalid"))?;
     match read_attached_snapshot_authority_profile_sync(conn)? {
         Some(incoming_profile) if incoming_profile == authority_profile => {}
@@ -24431,20 +24614,27 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         // activation fence independent of row count.
         let incoming_roster_layout = protected_roster_layout_in_sync(&tx, true)?;
         let local_roster_layout = protected_roster_layout_in_sync(&tx, false)?;
+        let incoming_has_roster_attestation_root_columns =
+            roster_attestation_root_columns_are_complete_in_sync(&tx, true)?;
         match (local_roster_layout, incoming_roster_layout) {
-            (_, ProtectedRosterLayout::Legacy) | (ProtectedRosterLayout::Legacy, _) => {
+            (ProtectedRosterLayout::Legacy, _) => {
                 return Err(invalid_data(
                     "session consensus snapshot protected roster schema is unsupported",
                 ));
             }
-            (ProtectedRosterLayout::Activated, ProtectedRosterLayout::Prepared) => {
+            (
+                ProtectedRosterLayout::Activated,
+                ProtectedRosterLayout::Legacy | ProtectedRosterLayout::Prepared,
+            ) => {
                 return Err(invalid_data(
                     "session consensus snapshot regresses protected roster activation",
                 ));
             }
             (
                 ProtectedRosterLayout::Prepared,
-                ProtectedRosterLayout::Prepared | ProtectedRosterLayout::Activated,
+                ProtectedRosterLayout::Legacy
+                | ProtectedRosterLayout::Prepared
+                | ProtectedRosterLayout::Activated,
             )
             | (ProtectedRosterLayout::Activated, ProtectedRosterLayout::Activated) => {}
         }
@@ -24470,11 +24660,16 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             incoming_fenced_layout == FencedTransitionReceiptLedgerLayout::Activated;
         let incoming_has_v2_receipts =
             incoming_v2_layout == FencedTransitionV2LedgerLayout::Activated;
+        let incoming_has_protected_roster = incoming_roster_layout != ProtectedRosterLayout::Legacy;
         if incoming_has_fenced_receipts {
             validate_attached_snapshot_fenced_receipt_schema_sync(&tx)?;
         }
         let incoming_lease_schema = attached_snapshot_lease_schema(&tx)?;
-        create_attached_snapshot_validation_views(&tx, incoming_lease_schema)?;
+        create_attached_snapshot_validation_views(
+            &tx,
+            incoming_lease_schema,
+            incoming_has_protected_roster,
+        )?;
         let validation: io::Result<()> = (|| {
             let incoming_scope = validate_attached_snapshot_database_sync(
                 &tx,
@@ -24485,23 +24680,30 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
                 expected_bindings,
                 fixed_placement_policy,
                 local_candidate_marker,
+                incoming_has_protected_roster,
                 meta,
             )?;
             let incoming_monotonic_state = snapshot_monotonic_state_sync(&tx, identity)?;
             validate_snapshot_monotonic_state(&local_monotonic_state, &incoming_monotonic_state)?;
-            if read_roster_attestation_trust_root_sync(&tx).map_err(|_| {
-                invalid_data("session consensus snapshot roster trust root is invalid")
-            })? != expected_roster_attestation_root
-            {
+            let incoming_roster_attestation_root = if incoming_has_roster_attestation_root_columns {
+                read_roster_attestation_trust_root_sync(&tx).map_err(|_| {
+                    invalid_data("session consensus snapshot roster trust root is invalid")
+                })?
+            } else {
+                None
+            };
+            if incoming_roster_attestation_root != expected_roster_attestation_root {
                 return Err(invalid_data(
                     "session consensus snapshot roster trust root is invalid",
                 ));
             }
-            validate_attached_snapshot_preserves_protected_roster_sync(
-                &tx,
-                &local_monotonic_state,
-                &incoming_monotonic_state,
-            )?;
+            if incoming_has_protected_roster {
+                validate_attached_snapshot_preserves_protected_roster_sync(
+                    &tx,
+                    &local_monotonic_state,
+                    &incoming_monotonic_state,
+                )?;
+            }
             validate_snapshot_preserves_current_fenced_transition_activation_sync(
                 &tx,
                 identity,
@@ -24676,6 +24878,8 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
                         | "consensus_fenced_transition_v2_activation"
                         | "consensus_fenced_transition_v2_history"
                 ) && !incoming_has_v2_receipts)
+                || (PROTECTED_ROSTER_TABLES.contains(&table)
+                    && !incoming_has_protected_roster)
             {
                 continue;
             }
@@ -28796,13 +29000,152 @@ mod tests {
 
         conn.execute(
             "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
-            [FENCED_TRANSITION_V2_DATABASE_FORMAT + 1],
+            [PROTECTED_ROSTER_DATABASE_FORMAT + 1],
         )
         .expect("inject unknown successor format");
         assert_eq!(
             read_storage_identity_sync(&conn),
             Err(SessionConsensusStorageError::SchemaVersionMismatch),
         );
+    }
+
+    #[test]
+    fn exact_pre_roster_v3_reopens_by_preparing_only_the_additive_namespace() {
+        let backend = SqliteSessionBackend::in_memory().expect("pre-roster V3 backend");
+        let conn = backend.conn.blocking_lock();
+        let identity = identity();
+        let members = expected_members();
+        initialize_schema(&conn, identity, &members).expect("initial consensus schema");
+        activate_v2_ledger_fixture(&conn);
+        let machine_before: (i64, Vec<u8>, Option<String>) = conn
+            .query_row(
+                "SELECT application_sequence, last_digest, logical_time FROM consensus_machine WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read pre-roster machine state");
+        let history_before: (Vec<u8>, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT profile_digest, active_epoch, retired_through_epoch, generation, current_bound_count FROM consensus_fenced_transition_v2_history WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read pre-roster V3 history");
+
+        drop_protected_roster_namespace_fixture(&conn);
+        drop_roster_attestation_root_columns_fixture(&conn);
+        assert_eq!(
+            protected_roster_layout_in_sync(&conn, false)
+                .expect("classify exact rootless pre-roster V3"),
+            ProtectedRosterLayout::Legacy,
+        );
+
+        initialize_schema(&conn, identity, &members)
+            .expect("transactionally prepare the additive roster namespace");
+        assert_eq!(
+            protected_roster_layout_in_sync(&conn, false).expect("classify prepared roster on V3"),
+            ProtectedRosterLayout::Prepared,
+        );
+        assert_eq!(
+            persisted_schema_version_in_sync(&conn, false).expect("read preserved V3 format"),
+            FENCED_TRANSITION_V2_DATABASE_FORMAT,
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT application_sequence, last_digest, logical_time FROM consensus_machine WHERE singleton=1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Option<String>>(2)?)),
+            )
+            .expect("read reopened machine state"),
+            machine_before,
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT profile_digest, active_epoch, retired_through_epoch, generation, current_bound_count FROM consensus_fenced_transition_v2_history WHERE singleton=1",
+                [],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?)),
+            )
+            .expect("read reopened V3 history"),
+            history_before,
+        );
+    }
+
+    #[test]
+    fn exact_pre_roster_v3_snapshot_installs_only_into_a_prepared_destination() {
+        let source = SqliteSessionBackend::in_memory().expect("pre-roster V3 source");
+        let source_conn = source.conn.blocking_lock();
+        initialize_schema(&source_conn, identity(), &expected_members())
+            .expect("initialize source schema");
+        apply_entries_sync(
+            &source_conn,
+            identity(),
+            &source.caps,
+            vec![membership_entry()],
+        )
+        .expect("apply source membership");
+        activate_v2_ledger_fixture(&source_conn);
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let snapshot_path = directory.path().join("exact-pre-roster-v3.sqlite");
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                .expect("build exact V3 source snapshot");
+        drop(source_conn);
+
+        let snapshot = Connection::open(&snapshot_path).expect("open exact V3 snapshot");
+        drop_protected_roster_namespace_fixture(&snapshot);
+        drop_roster_attestation_root_columns_fixture(&snapshot);
+        snapshot
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint exact pre-roster V3 snapshot");
+        drop(snapshot);
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "exact-pre-roster-v3".into(),
+        };
+
+        let target = SqliteSessionBackend::in_memory().expect("prepared target");
+        let target_conn = target.conn.blocking_lock();
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("initialize prepared target");
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000707.opc",
+            [0x70; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("exact V3 snapshot metadata")
+                .len(),
+        )
+        .expect("install exact pre-roster V3 into prepared target");
+        assert_eq!(
+            protected_roster_layout_in_sync(&target_conn, false)
+                .expect("classify installed prepared roster"),
+            ProtectedRosterLayout::Prepared,
+        );
+        assert_eq!(
+            fenced_transition_v2_ledger_layout_sync(&target_conn)
+                .expect("classify installed V3 ledger"),
+            FencedTransitionV2LedgerLayout::Activated,
+        );
+
+        activate_protected_roster_schema_sync(&target_conn)
+            .expect("activate destination roster fence");
+        let error = install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000708.opc",
+            [0x71; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("exact V3 snapshot metadata")
+                .len(),
+        )
+        .expect_err("an activated roster cannot install a pre-roster snapshot");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -28899,6 +29242,28 @@ mod tests {
             fenced_transition_receipt_ledger_layout_sync(&marker_false_hybrid_conn).is_err(),
             "format four with a prepared receipt marker cannot carry V2 tables"
         );
+        assert!(
+            protected_roster_layout_in_sync(&marker_false_hybrid_conn, false).is_err(),
+            "protected roster classification must reject a format-four V2 hybrid"
+        );
+
+        let missing_receipt_marker =
+            SqliteSessionBackend::in_memory().expect("missing receipt marker backend");
+        let missing_receipt_marker_conn = missing_receipt_marker.conn.blocking_lock();
+        initialize_schema(&missing_receipt_marker_conn, identity, &members)
+            .expect("initial schema");
+        activate_protected_roster_schema_sync(&missing_receipt_marker_conn)
+            .expect("activate protected roster");
+        missing_receipt_marker_conn
+            .execute_batch(
+                "ALTER TABLE consensus_identity \
+                 DROP COLUMN fenced_transition_receipt_ledger_activated;",
+            )
+            .expect("remove required receipt marker");
+        assert!(
+            protected_roster_layout_in_sync(&missing_receipt_marker_conn, false).is_err(),
+            "format four without its exact receipt marker must fail closed"
+        );
 
         let partial_hybrid = SqliteSessionBackend::in_memory().expect("partial hybrid backend");
         let partial_hybrid_conn = partial_hybrid.conn.blocking_lock();
@@ -28920,6 +29285,10 @@ mod tests {
         assert!(
             fenced_transition_receipt_ledger_layout_sync(&partial_hybrid_conn).is_err(),
             "format four with a partial V2 namespace must fail closed"
+        );
+        assert!(
+            protected_roster_layout_in_sync(&partial_hybrid_conn, false).is_err(),
+            "protected roster classification must reject a partial V2 namespace"
         );
     }
 
@@ -28967,6 +29336,18 @@ mod tests {
                 r#"
                 DROP TABLE consensus_fenced_transition_receipts;
                 DROP TABLE consensus_fenced_transition_activation;
+                DROP TABLE consensus_protected_roster_admissions;
+                DROP TABLE consensus_protected_roster_business;
+                DROP TABLE consensus_protected_roster_witness;
+                DROP TABLE consensus_protected_roster_retirement_cursors;
+                DROP TABLE consensus_protected_roster_floors;
+                DROP TABLE consensus_protected_roster_rows;
+                ALTER TABLE consensus_identity
+                DROP COLUMN roster_attestation_algorithm_version;
+                ALTER TABLE consensus_identity
+                DROP COLUMN roster_attestation_public_key;
+                ALTER TABLE consensus_identity
+                DROP COLUMN roster_attestation_root_id;
                 ALTER TABLE consensus_identity
                 DROP COLUMN fenced_transition_receipt_ledger_activated;
                 "#,
@@ -29005,6 +29386,16 @@ mod tests {
                 )
                 .expect("read activation marker"),
             0,
+        );
+        assert_eq!(
+            roster_attestation_root_columns_sync(&add_on_conn)
+                .expect("root columns installed before receipt preparation"),
+            [true; 3],
+        );
+        assert_eq!(
+            protected_roster_recovery_layout_sync(&add_on_conn)
+                .expect("markerless #684 migrates through receipt preparation before roster"),
+            ProtectedRosterRecoveryLayout::Prepared,
         );
     }
 
@@ -29522,6 +29913,33 @@ mod tests {
                 .expect("initial V2 epoch"),
         )
         .expect("activate V2 receipt fixture");
+    }
+
+    fn drop_protected_roster_namespace_fixture(conn: &Connection) {
+        conn.execute_batch(
+            "DROP INDEX consensus_protected_roster_terminal_sequence; \
+             DROP INDEX consensus_protected_roster_reclaim_due; \
+             DROP INDEX consensus_protected_roster_partition_epoch; \
+             DROP TABLE consensus_protected_roster_admissions; \
+             DROP TABLE consensus_protected_roster_business; \
+             DROP TABLE consensus_protected_roster_witness; \
+             DROP TABLE consensus_protected_roster_retirement_cursors; \
+             DROP TABLE consensus_protected_roster_floors; \
+             DROP TABLE consensus_protected_roster_rows;",
+        )
+        .expect("remove the complete protected-roster namespace fixture");
+    }
+
+    fn drop_roster_attestation_root_columns_fixture(conn: &Connection) {
+        conn.execute_batch(
+            "ALTER TABLE consensus_identity \
+             DROP COLUMN roster_attestation_algorithm_version; \
+             ALTER TABLE consensus_identity \
+             DROP COLUMN roster_attestation_public_key; \
+             ALTER TABLE consensus_identity \
+             DROP COLUMN roster_attestation_root_id;",
+        )
+        .expect("remove the complete roster-root identity fixture");
     }
 
     fn seed_v2_tombstones(conn: &Connection, count: usize, machine_time: Timestamp) {
@@ -31817,6 +32235,7 @@ mod tests {
         // renumber an existing SQLite image.
         assert_eq!(FENCED_TRANSITION_V1_DATABASE_FORMAT, 2);
         assert_eq!(FENCED_TRANSITION_V2_DATABASE_FORMAT, 3);
+        assert_eq!(PROTECTED_ROSTER_DATABASE_FORMAT, 4);
     }
 
     #[test]
@@ -35747,30 +36166,36 @@ LIMIT 20000;
                     Published684RestoreScanSchema::Direct,
                     Published684RestoreScanSchema::Migrated,
                 ] {
-                    let conn = SqliteSessionBackend::canonical_schema_connection()
-                        .expect("canonical published schema fixture");
-                    if pre_acquisition_timestamp {
-                        conn.execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
-                            .expect("pre-acquisition lease fixture");
+                    for roster_root_columns in [false, true] {
+                        let conn = SqliteSessionBackend::canonical_schema_connection()
+                            .expect("canonical published schema fixture");
+                        if pre_acquisition_timestamp {
+                            conn.execute_batch("ALTER TABLE leases DROP COLUMN acquired_at")
+                                .expect("pre-acquisition lease fixture");
+                        }
+                        conn.execute_batch(CONSENSUS_SCHEMA)
+                            .expect("current consensus fixture");
+                        if roster_root_columns {
+                            conn.execute_batch(ROSTER_ATTESTATION_ROOT_COLUMNS_SCHEMA)
+                                .expect("root-bearing #684 fixture");
+                        }
+                        conn.execute_batch(
+                            "DROP TABLE consensus_fenced_transition_receipts; \
+                             DROP TABLE consensus_fenced_transition_activation; \
+                             ALTER TABLE consensus_identity \
+                             DROP COLUMN fenced_transition_receipt_ledger_activated;",
+                        )
+                        .expect("markerless #684 fixture");
+                        install_published_684_operator_recovery_schema(&conn, operator_recovery)
+                            .expect("operator recovery fixture");
+                        install_published_684_restore_scan_schema(&conn, restore_scan)
+                            .expect("restore scan fixture");
+                        assert!(
+                            published_684_schema_is_exact_in_sync(&conn, false)
+                                .expect("classify published #684 schema"),
+                            "lease={pre_acquisition_timestamp}, operator={operator_recovery:?}, restore={restore_scan:?}, root={roster_root_columns}",
+                        );
                     }
-                    conn.execute_batch(CONSENSUS_SCHEMA)
-                        .expect("current consensus fixture");
-                    conn.execute_batch(
-                        "DROP TABLE consensus_fenced_transition_receipts; \
-                         DROP TABLE consensus_fenced_transition_activation; \
-                         ALTER TABLE consensus_identity \
-                         DROP COLUMN fenced_transition_receipt_ledger_activated;",
-                    )
-                    .expect("markerless #684 fixture");
-                    install_published_684_operator_recovery_schema(&conn, operator_recovery)
-                        .expect("operator recovery fixture");
-                    install_published_684_restore_scan_schema(&conn, restore_scan)
-                        .expect("restore scan fixture");
-                    assert!(
-                        published_684_schema_is_exact_in_sync(&conn, false)
-                            .expect("classify published #684 schema"),
-                        "lease={pre_acquisition_timestamp}, operator={operator_recovery:?}, restore={restore_scan:?}",
-                    );
                 }
             }
         }
@@ -35784,6 +36209,7 @@ LIMIT 20000;
         let source_conn = source.conn.blocking_lock();
         initialize_schema(&source_conn, identity(), &expected_members())
             .expect("initialize published schema source");
+        drop_protected_roster_namespace_fixture(&source_conn);
         source_conn
             .execute_batch(
                 "DROP TABLE consensus_fenced_transition_receipts; \
@@ -35855,6 +36281,7 @@ LIMIT 20000;
         let source_conn = source.conn.blocking_lock();
         initialize_schema(&source_conn, identity(), &expected_members())
             .expect("initialize legacy snapshot source");
+        drop_protected_roster_namespace_fixture(&source_conn);
         source_conn
             .execute_batch(
                 "DROP TABLE consensus_fenced_transition_receipts; \
@@ -35989,48 +36416,56 @@ LIMIT 20000;
     fn receipt_activation_marker_requires_exact_identity_ddl_and_integer_singleton() {
         let mut normalized_identity_forms = BTreeSet::new();
         for migrated in [false, true] {
-            let conn = SqliteSessionBackend::canonical_schema_connection()
-                .expect("canonical activated schema fixture");
-            conn.execute_batch(CONSENSUS_SCHEMA)
-                .expect("current consensus fixture");
-            let storage_identity = identity();
-            conn.execute(
-                "INSERT INTO consensus_identity \
-                 (singleton, schema_version, cluster_id, configuration_id, \
-                  configuration_epoch, authority_profile) \
-                 VALUES (1, ?1, ?2, ?3, ?4, ?5)",
-                params![
-                    i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
-                    storage_identity.cluster_id().as_bytes().as_slice(),
-                    storage_identity.configuration_id().as_bytes().as_slice(),
-                    epoch_i64(storage_identity).expect("valid fixture epoch"),
-                    authority_profile_i64(ConsensusAuthorityProfile::Dynamic),
-                ],
-            )
-            .expect("insert activated identity singleton");
-            if migrated {
-                conn.execute_batch(
-                    "ALTER TABLE consensus_identity \
-                     DROP COLUMN fenced_transition_receipt_ledger_activated;",
+            for roster_root_columns in [false, true] {
+                let conn = SqliteSessionBackend::canonical_schema_connection()
+                    .expect("canonical activated schema fixture");
+                conn.execute_batch(CONSENSUS_SCHEMA)
+                    .expect("current consensus fixture");
+                let storage_identity = identity();
+                conn.execute(
+                    "INSERT INTO consensus_identity \
+                     (singleton, schema_version, cluster_id, configuration_id, \
+                      configuration_epoch, authority_profile) \
+                     VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        i64::from(SESSION_CONSENSUS_SCHEMA_VERSION),
+                        storage_identity.cluster_id().as_bytes().as_slice(),
+                        storage_identity.configuration_id().as_bytes().as_slice(),
+                        epoch_i64(storage_identity).expect("valid fixture epoch"),
+                        authority_profile_i64(ConsensusAuthorityProfile::Dynamic),
+                    ],
                 )
-                .expect("published #684 identity fixture");
-                conn.execute_batch(FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_MIGRATION)
-                    .expect("activation migration fixture");
+                .expect("insert activated identity singleton");
+                if migrated {
+                    conn.execute_batch(
+                        "ALTER TABLE consensus_identity \
+                         DROP COLUMN fenced_transition_receipt_ledger_activated;",
+                    )
+                    .expect("published #684 identity fixture");
+                }
+                if roster_root_columns {
+                    conn.execute_batch(ROSTER_ATTESTATION_ROOT_COLUMNS_SCHEMA)
+                        .expect("root-bearing identity fixture");
+                }
+                if migrated {
+                    conn.execute_batch(FENCED_TRANSITION_RECEIPT_LEDGER_ACTIVATION_MIGRATION)
+                        .expect("activation migration fixture");
+                }
+                assert_eq!(
+                    fenced_transition_receipt_ledger_marker_in_sync(&conn, false)
+                        .expect("inspect exact activation marker"),
+                    Some(false),
+                    "migrated={migrated}, root={roster_root_columns}",
+                );
+                let sql: String = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read identity DDL");
+                normalized_identity_forms.insert(normalize_schema_sql(&sql));
             }
-            assert_eq!(
-                fenced_transition_receipt_ledger_marker_in_sync(&conn, false)
-                    .expect("inspect exact activation marker"),
-                Some(false),
-                "migrated={migrated}",
-            );
-            let sql: String = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("read identity DDL");
-            normalized_identity_forms.insert(normalize_schema_sql(&sql));
         }
         assert!(!normalized_identity_forms.is_empty());
 
@@ -36067,6 +36502,39 @@ LIMIT 20000;
                 "{name}",
             );
         }
+    }
+
+    #[test]
+    fn protected_roster_recovery_classifier_rejects_partial_root_and_namespace() {
+        let partial_root = SqliteSessionBackend::in_memory().expect("partial root backend");
+        let partial_root_conn = partial_root.conn.blocking_lock();
+        initialize_schema(&partial_root_conn, identity(), &expected_members())
+            .expect("initial protected roster schema");
+        partial_root_conn
+            .execute_batch(
+                "ALTER TABLE consensus_identity \
+                 DROP COLUMN roster_attestation_algorithm_version;",
+            )
+            .expect("form partial trust-root identity");
+        assert_eq!(
+            protected_roster_recovery_layout_sync(&partial_root_conn),
+            Err(SessionConsensusStorageError::CorruptState),
+            "a root column triplet is an exact identity boundary",
+        );
+
+        let partial_namespace =
+            SqliteSessionBackend::in_memory().expect("partial roster namespace backend");
+        let partial_namespace_conn = partial_namespace.conn.blocking_lock();
+        initialize_schema(&partial_namespace_conn, identity(), &expected_members())
+            .expect("initial protected roster schema");
+        partial_namespace_conn
+            .execute_batch("DROP TABLE consensus_protected_roster_admissions;")
+            .expect("form partial protected roster namespace");
+        assert_eq!(
+            protected_roster_recovery_layout_sync(&partial_namespace_conn),
+            Err(SessionConsensusStorageError::CorruptState),
+            "one missing roster object must not be repaired or accepted",
+        );
     }
 
     #[test]
@@ -36200,6 +36668,7 @@ LIMIT 20000;
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let legacy = Connection::open(&snapshot_path).expect("open snapshot fixture");
+        drop_protected_roster_namespace_fixture(&legacy);
         legacy
             .execute_batch(
                 r#"
@@ -37341,6 +37810,13 @@ BEGIN IMMEDIATE;
             record_count, 0,
             "the fenced writer must not mutate the claim"
         );
+        assert_eq!(
+            protected_roster_recovery_layout_sync(&conn)
+                .expect("claimed checkpoint has an exact prepared roster namespace"),
+            ProtectedRosterRecoveryLayout::Prepared,
+        );
+        validate_protected_roster_recovery_state_sync(&conn, identity())
+            .expect("claimed checkpoint has an empty valid protected roster state");
         validate_sealed_state_sync(&conn).expect("claimed state remains valid");
     }
 
@@ -42286,6 +42762,7 @@ BEGIN IMMEDIATE;
         drop(source_conn);
 
         let legacy_snapshot = Connection::open(&snapshot_path).expect("open snapshot fixture");
+        drop_protected_roster_namespace_fixture(&legacy_snapshot);
         legacy_snapshot
             .execute_batch(
                 "DROP TABLE consensus_fenced_transition_receipts;\

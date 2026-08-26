@@ -44,9 +44,9 @@ use crate::{
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpcHandler,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
     SessionLeaseManager, SqliteSessionBackend, StateClass, StateType, StoredSessionRecord,
-    SystemClock, FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_SCHEMA_V1,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, REPLICATION_TX_ID_MAX_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SystemClock, FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS, FENCED_TRANSITION_OUTCOME_RETENTION,
+    FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    REPLICATION_TX_ID_MAX_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 
 const RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
@@ -752,7 +752,7 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
             crate::sqlite::ops::read_restore_scan_state_sync(&target)
                 .expect("read recovered restore incarnation");
         restore_incarnations.insert((restore_epoch, *restore_key));
-        assert_eq!(objects.len(), 24);
+        assert_eq!(objects.len(), 33);
         assert!(objects.iter().any(|(kind, name)| {
             kind == "table" && name == "consensus_fenced_transition_receipts"
         }));
@@ -762,9 +762,31 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
         assert!(objects.iter().any(|(kind, name)| {
             kind == "index" && name == "consensus_fenced_transition_receipts_due"
         }));
+        for (kind, name) in [
+            ("table", "consensus_protected_roster_rows"),
+            ("table", "consensus_protected_roster_floors"),
+            ("table", "consensus_protected_roster_retirement_cursors"),
+            ("table", "consensus_protected_roster_witness"),
+            ("table", "consensus_protected_roster_business"),
+            ("table", "consensus_protected_roster_admissions"),
+            ("index", "consensus_protected_roster_reclaim_due"),
+            ("index", "consensus_protected_roster_partition_epoch"),
+            ("index", "consensus_protected_roster_terminal_sequence"),
+        ] {
+            assert!(objects.iter().any(
+                |(observed_kind, observed_name)| observed_kind == kind && observed_name == name
+            ));
+        }
         assert!(objects.iter().all(|(kind, name)| {
             kind == "table"
-                || (kind == "index" && name == "consensus_fenced_transition_receipts_due")
+                || (kind == "index"
+                    && matches!(
+                        name.as_str(),
+                        "consensus_fenced_transition_receipts_due"
+                            | "consensus_protected_roster_reclaim_due"
+                            | "consensus_protected_roster_partition_epoch"
+                            | "consensus_protected_roster_terminal_sequence"
+                    ))
         }));
     }
     assert_eq!(restore_incarnations.len(), replicas.len());
@@ -2506,7 +2528,16 @@ fn current_recovery_inspection_accepts_pre_ledger_replica() {
     let (replica, members) = current_receipt_inspection_fixture(temp.path());
     let conn = Connection::open(&replica.database_path).expect("open current replica");
     conn.execute_batch(
-        "DROP TABLE consensus_fenced_transition_receipts;
+        "DROP INDEX consensus_protected_roster_terminal_sequence;
+         DROP INDEX consensus_protected_roster_reclaim_due;
+         DROP INDEX consensus_protected_roster_partition_epoch;
+         DROP TABLE consensus_protected_roster_admissions;
+         DROP TABLE consensus_protected_roster_business;
+         DROP TABLE consensus_protected_roster_witness;
+         DROP TABLE consensus_protected_roster_retirement_cursors;
+         DROP TABLE consensus_protected_roster_floors;
+         DROP TABLE consensus_protected_roster_rows;
+         DROP TABLE consensus_fenced_transition_receipts;
          DROP TABLE consensus_fenced_transition_activation;
          ALTER TABLE consensus_identity
          DROP COLUMN fenced_transition_receipt_ledger_activated;
@@ -2523,6 +2554,295 @@ fn current_recovery_inspection_accepts_pre_ledger_replica() {
         limits: RecoveryLimits::default(),
     })
     .expect("read-only inspection accepts a pre-ledger replica");
+}
+
+fn activate_protected_roster_recovery_fixture(replica: &RecoveryReplica) {
+    let conn = Connection::open(&replica.database_path).expect("open protected roster fixture");
+    conn.execute(
+        "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
+        [i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 3],
+    )
+    .expect("activate protected roster format");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint protected roster activation");
+}
+
+#[test]
+fn current_recovery_roster_prepared_layout_is_rootless_predecessor_compatible() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (prepared, prepared_members) =
+        current_receipt_inspection_fixture(&temp.path().join("prepared"));
+    let prepared_before = inspect_current_fixture(&prepared, &prepared_members)
+        .expect("inspect empty prepared roster layout");
+
+    // This is the exact rootless predecessor: removing any one roster object
+    // or only one root column is intentionally not a compatibility form.
+    let (rootless, rootless_members) =
+        current_receipt_inspection_fixture(&temp.path().join("rootless"));
+    let conn = Connection::open(&rootless.database_path).expect("open rootless predecessor");
+    conn.execute_batch(
+        "DROP INDEX consensus_protected_roster_terminal_sequence;
+         DROP INDEX consensus_protected_roster_reclaim_due;
+         DROP INDEX consensus_protected_roster_partition_epoch;
+         DROP TABLE consensus_protected_roster_admissions;
+         DROP TABLE consensus_protected_roster_business;
+         DROP TABLE consensus_protected_roster_witness;
+         DROP TABLE consensus_protected_roster_retirement_cursors;
+         DROP TABLE consensus_protected_roster_floors;
+         DROP TABLE consensus_protected_roster_rows;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_algorithm_version;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_public_key;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_root_id;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("form exact rootless predecessor");
+    drop(conn);
+    let rootless_before = inspect_current_fixture(&rootless, &rootless_members)
+        .expect("inspect exact rootless predecessor");
+    assert_eq!(
+        prepared_before.branch_digest(),
+        rootless_before.branch_digest(),
+        "empty prepared and exact rootless roster layouts retain identical authority",
+    );
+
+    drop(SqliteSessionBackend::open(&prepared.database_path).expect("reopen prepared roster"));
+    let prepared_after =
+        inspect_current_fixture(&prepared, &prepared_members).expect("reinspect prepared roster");
+    assert_eq!(
+        prepared_before.branch_digest(),
+        prepared_after.branch_digest()
+    );
+
+    let (v3, v3_members) = current_receipt_inspection_fixture(&temp.path().join("v3-rootless"));
+    activate_v3_history_fixture(&v3, 1, 0, 0);
+    let conn = Connection::open(&v3.database_path).expect("open exact V3 predecessor");
+    conn.execute_batch(
+        "DROP INDEX consensus_protected_roster_terminal_sequence;
+         DROP INDEX consensus_protected_roster_reclaim_due;
+         DROP INDEX consensus_protected_roster_partition_epoch;
+         DROP TABLE consensus_protected_roster_admissions;
+         DROP TABLE consensus_protected_roster_business;
+         DROP TABLE consensus_protected_roster_witness;
+         DROP TABLE consensus_protected_roster_retirement_cursors;
+         DROP TABLE consensus_protected_roster_floors;
+         DROP TABLE consensus_protected_roster_rows;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_algorithm_version;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_public_key;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_root_id;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("form exact rootless pre-roster V3 fixture");
+    drop(conn);
+    inspect_current_fixture(&v3, &v3_members)
+        .expect("read-only recovery accepts the exact pre-roster V3 product");
+}
+
+#[test]
+fn current_recovery_accepts_exact_root_then_marker_pre_roster_upgrade() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(temp.path());
+    let expected = inspect_current_fixture(&replica, &members)
+        .expect("inspect equivalent empty prepared roster");
+    let conn = Connection::open(&replica.database_path).expect("open R2 upgrade fixture");
+    conn.execute_batch(
+        "DROP INDEX consensus_protected_roster_terminal_sequence;
+         DROP INDEX consensus_protected_roster_reclaim_due;
+         DROP INDEX consensus_protected_roster_partition_epoch;
+         DROP TABLE consensus_protected_roster_admissions;
+         DROP TABLE consensus_protected_roster_business;
+         DROP TABLE consensus_protected_roster_witness;
+         DROP TABLE consensus_protected_roster_retirement_cursors;
+         DROP TABLE consensus_protected_roster_floors;
+         DROP TABLE consensus_protected_roster_rows;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_algorithm_version;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_public_key;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_root_id;
+         ALTER TABLE consensus_identity DROP COLUMN fenced_transition_receipt_ledger_activated;
+         ALTER TABLE consensus_identity ADD COLUMN roster_attestation_root_id BLOB CHECK (
+             roster_attestation_root_id IS NULL OR length(roster_attestation_root_id) = 32
+         );
+         ALTER TABLE consensus_identity ADD COLUMN roster_attestation_public_key BLOB CHECK (
+             roster_attestation_public_key IS NULL OR length(roster_attestation_public_key) = 33
+         );
+         ALTER TABLE consensus_identity ADD COLUMN roster_attestation_algorithm_version INTEGER CHECK (
+             roster_attestation_algorithm_version IS NULL OR roster_attestation_algorithm_version = 1
+         );
+         ALTER TABLE consensus_identity ADD COLUMN fenced_transition_receipt_ledger_activated INTEGER NOT NULL DEFAULT 0 CHECK (
+             fenced_transition_receipt_ledger_activated IN (0, 1)
+         );
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("form exact roots-then-marker pre-roster upgrade");
+    drop(conn);
+
+    let observed = inspect_current_fixture(&replica, &members)
+        .expect("offline recovery accepts exact roots-then-marker upgrade");
+    assert_eq!(expected.branch_digest(), observed.branch_digest());
+    assert_eq!(
+        expected.logical_state_digest(),
+        observed.logical_state_digest()
+    );
+}
+
+#[test]
+fn current_recovery_accepts_only_the_activated_protected_roster_format() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (valid, valid_members) = current_receipt_inspection_fixture(&temp.path().join("valid"));
+    activate_protected_roster_recovery_fixture(&valid);
+    inspect_current_fixture(&valid, &valid_members).expect("format-four roster is recoverable");
+
+    let (missing_marker, missing_marker_members) =
+        current_receipt_inspection_fixture(&temp.path().join("missing-marker"));
+    activate_protected_roster_recovery_fixture(&missing_marker);
+    let conn =
+        Connection::open(&missing_marker.database_path).expect("open missing marker fixture");
+    conn.execute_batch(
+        "ALTER TABLE consensus_identity
+         DROP COLUMN fenced_transition_receipt_ledger_activated;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("remove required receipt marker");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&missing_marker, &missing_marker_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (partial_v2, partial_v2_members) =
+        current_receipt_inspection_fixture(&temp.path().join("partial-v2"));
+    activate_protected_roster_recovery_fixture(&partial_v2);
+    let conn = Connection::open(&partial_v2.database_path).expect("open partial V2 fixture");
+    conn.execute_batch(
+        "CREATE TABLE consensus_fenced_transition_v2_receipts (singleton INTEGER);
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("install partial V2 namespace");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&partial_v2, &partial_v2_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (future, future_members) = current_receipt_inspection_fixture(&temp.path().join("future"));
+    activate_protected_roster_recovery_fixture(&future);
+    let conn = Connection::open(&future.database_path).expect("open future format fixture");
+    conn.execute(
+        "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
+        [i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 4],
+    )
+    .expect("write unknown roster format");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint unknown roster format");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&future, &future_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+}
+
+#[test]
+fn current_recovery_roster_namespace_and_preflight_fail_closed() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+
+    let (partial, partial_members) =
+        current_receipt_inspection_fixture(&temp.path().join("partial"));
+    let conn = Connection::open(&partial.database_path).expect("open partial roster fixture");
+    conn.execute_batch(
+        "DROP TABLE consensus_protected_roster_witness; PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("form partial roster namespace");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&partial, &partial_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (partial_root, partial_root_members) =
+        current_receipt_inspection_fixture(&temp.path().join("partial-root"));
+    let conn = Connection::open(&partial_root.database_path).expect("open partial root fixture");
+    conn.execute_batch(
+        "ALTER TABLE consensus_identity DROP COLUMN roster_attestation_algorithm_version;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("form partial roster trust-root identity");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&partial_root, &partial_root_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (corrupt, corrupt_members) =
+        current_receipt_inspection_fixture(&temp.path().join("corrupt"));
+    activate_protected_roster_recovery_fixture(&corrupt);
+    let conn = Connection::open(&corrupt.database_path).expect("open corrupt roster fixture");
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .expect("allow corrupt protected row");
+    conn.execute(
+        "INSERT INTO consensus_protected_roster_rows (binding, configuration_epoch, partition, history_epoch, state, terminalized_at, terminal_sequence, canonical_record) VALUES (zeroblob(120), (SELECT configuration_epoch FROM consensus_identity WHERE singleton=1), zeroblob(64), 1, 1, NULL, NULL, X'00')",
+        [],
+    )
+    .expect("insert corrupt protected row");
+    conn.execute_batch("PRAGMA ignore_check_constraints = OFF; PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint corrupt protected row");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&corrupt, &corrupt_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (oversized, oversized_members) =
+        current_receipt_inspection_fixture(&temp.path().join("oversized"));
+    activate_protected_roster_recovery_fixture(&oversized);
+    let conn = Connection::open(&oversized.database_path).expect("open oversized roster fixture");
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .expect("allow oversized protected value");
+    let (record_cap, _) = consensus::protected_roster_recovery_value_caps();
+    let oversized_record = record_cap
+        .checked_add(1)
+        .expect("canonical protected record cap has a successor");
+    conn.execute(
+        "INSERT INTO consensus_protected_roster_rows (binding, configuration_epoch, partition, history_epoch, state, terminalized_at, terminal_sequence, canonical_record) VALUES (zeroblob(120), (SELECT configuration_epoch FROM consensus_identity WHERE singleton=1), zeroblob(64), 1, 1, NULL, NULL, zeroblob(?1))",
+        [i64::try_from(oversized_record).expect("record cap fits SQLite integer")],
+    )
+    .expect("insert oversized protected record");
+    conn.execute_batch("PRAGMA ignore_check_constraints = OFF; PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint oversized protected record");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&oversized, &oversized_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (over_count, over_count_members) =
+        current_receipt_inspection_fixture(&temp.path().join("over-count"));
+    activate_protected_roster_recovery_fixture(&over_count);
+    let conn = Connection::open(&over_count.database_path).expect("open over-count roster fixture");
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")
+        .expect("disable fixture-only foreign keys");
+    let too_many_business_rows = FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS
+        .checked_add(1)
+        .expect("live protected business cap has a successor");
+    conn.execute_batch(&format!(
+        "WITH RECURSIVE sequence(value) AS (
+             VALUES(1)
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < {too_many_business_rows}
+         )
+         INSERT INTO consensus_protected_roster_business (business_key, binding, configuration_epoch, generation, canonical_business)
+         SELECT CAST(printf('%032d', value) AS BLOB),
+                CAST(printf('%0120d', value) AS BLOB),
+                1,
+                1,
+                X'00'
+         FROM sequence;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    ))
+    .expect("insert one row over live protected business cap");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&over_count, &over_count_members),
+        Err(RecoveryError::CorruptReplica),
+    );
 }
 
 #[test]

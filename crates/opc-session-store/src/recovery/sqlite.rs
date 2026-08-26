@@ -25,7 +25,8 @@ use crate::consensus::{
 };
 use crate::sqlite::{consensus, ops};
 use crate::{
-    ReplicationEntry, ReplicationTxId, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+    ReplicationEntry, ReplicationTxId, FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS,
+    FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS,
     FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES, FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
@@ -45,10 +46,15 @@ const PATH_BINDING_DOMAIN: &[u8] = b"openpacketcore/session-recovery/path-bindin
 const FILE_IDENTITY_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file-identity/v1\0";
 const LOGICAL_STATE_DOMAIN: &[u8] = b"openpacketcore/session-recovery/logical-state/v1\0";
 const FILE_DIGEST_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file/v1\0";
+const PROTECTED_ROSTER_LAYOUT_DOMAIN: &[u8] =
+    b"openpacketcore/session-recovery/protected-roster-layout/v1\0";
+const PROTECTED_ROSTER_TRUST_ROOT_DOMAIN: &[u8] =
+    b"openpacketcore/session-recovery/protected-roster-trust-root/v1\0";
 const WORKFLOW_VERSION: u16 = 2;
 // Six base SQLite objects plus bounded consensus/recovery tables. V3 adds
-// three ledger objects and two required indexes.
-const MAX_CURRENT_SCHEMA_OBJECTS: usize = 28;
+// three ledger objects and two required indexes. The protected roster adds
+// six tables and three required indexes.
+const MAX_CURRENT_SCHEMA_OBJECTS: usize = 37;
 const MAX_SCHEMA_SQL_BYTES: usize = 16_384;
 
 type FencedTransitionV2HistorySqlRow = (
@@ -404,6 +410,8 @@ fn inspect_current(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let receipt_ledger_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
+    let protected_roster_layout = consensus::protected_roster_recovery_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     let (schema_version, cluster, configuration, epoch): (i64, Vec<u8>, Vec<u8>, i64) = conn
         .query_row(
             "SELECT schema_version, cluster_id, configuration_id, configuration_epoch FROM consensus_identity WHERE singleton = 1",
@@ -411,18 +419,24 @@ fn inspect_current(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(|_| RecoveryError::CorruptReplica)?;
-    let expected_schema_version = match v2_ledger_layout {
-        consensus::FencedTransitionV2LedgerLayout::Activated => {
-            i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 2
+    let expected_schema_version = match protected_roster_layout {
+        consensus::ProtectedRosterRecoveryLayout::Activated => {
+            i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 3
         }
-        consensus::FencedTransitionV2LedgerLayout::Absent => match receipt_ledger_layout {
-            consensus::FencedTransitionReceiptLedgerLayout::Published684
-            | consensus::FencedTransitionReceiptLedgerLayout::Prepared => {
-                i64::from(SESSION_CONSENSUS_SCHEMA_VERSION)
+        consensus::ProtectedRosterRecoveryLayout::Legacy
+        | consensus::ProtectedRosterRecoveryLayout::Prepared => match v2_ledger_layout {
+            consensus::FencedTransitionV2LedgerLayout::Activated => {
+                i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 2
             }
-            consensus::FencedTransitionReceiptLedgerLayout::Activated => {
-                i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 1
-            }
+            consensus::FencedTransitionV2LedgerLayout::Absent => match receipt_ledger_layout {
+                consensus::FencedTransitionReceiptLedgerLayout::Published684
+                | consensus::FencedTransitionReceiptLedgerLayout::Prepared => {
+                    i64::from(SESSION_CONSENSUS_SCHEMA_VERSION)
+                }
+                consensus::FencedTransitionReceiptLedgerLayout::Activated => {
+                    i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 1
+                }
+            },
         },
     };
     if schema_version != expected_schema_version {
@@ -459,6 +473,8 @@ fn inspect_current(
         validate_fenced_transition_v2_recovery_state(conn, storage_identity)?;
     }
     validate_consensus_sealed_records(conn, budget)?;
+    consensus::validate_protected_roster_recovery_state_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     validate_legacy_lease_state(conn, budget)?;
     if receipt_ledger_layout != consensus::FencedTransitionReceiptLedgerLayout::Published684 {
         consensus::validate_fenced_transition_receipts_sync(conn, storage_identity)
@@ -677,6 +693,7 @@ fn preflight_current_tables(
             return Err(RecoveryError::CorruptReplica);
         }
     }
+    preflight_protected_roster_tables(conn, budget, &mut total_bytes)?;
     if table_exists(conn, "consensus_operator_recovery")? {
         let (count, maximum, total): (i64, i64, i64) = conn
             .query_row(
@@ -846,6 +863,157 @@ fn preflight_fenced_transition_v2_receipt_count(conn: &Connection) -> Result<usi
         return Err(RecoveryError::CorruptReplica);
     }
     Ok(count)
+}
+
+#[derive(Clone, Copy)]
+struct ProtectedRosterPreflightTable {
+    count_query: &'static str,
+    values_query: &'static str,
+    protocol_cap: usize,
+    protocol_max_value: ProtectedRosterValueCap,
+}
+
+#[derive(Clone, Copy)]
+enum ProtectedRosterValueCap {
+    Fixed(usize),
+    CanonicalRecord,
+    CanonicalBusiness,
+}
+
+/// Check the protocol-owned roster cardinalities before any aggregate or
+/// canonical decoder can inspect the complete table. Every count query sees
+/// at most one row beyond its immutable format cap; every width query sees at
+/// most that cap. Recovery limits remain an additional caller-owned bound.
+fn preflight_protected_roster_tables(
+    conn: &Connection,
+    budget: &InspectionBudget,
+    total_bytes: &mut u64,
+) -> Result<(), RecoveryError> {
+    let layout = consensus::protected_roster_recovery_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if layout == consensus::ProtectedRosterRecoveryLayout::Legacy {
+        return Ok(());
+    }
+
+    const ROOT: ProtectedRosterPreflightTable = ProtectedRosterPreflightTable {
+        count_query: "SELECT COUNT(*) FROM (SELECT singleton FROM consensus_identity LIMIT ?1)",
+        values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(COALESCE(length(roster_attestation_root_id), 0), COALESCE(length(roster_attestation_public_key), 0), COALESCE(length(roster_attestation_algorithm_version), 0))), 0), COALESCE(SUM(COALESCE(length(roster_attestation_root_id), 0) + COALESCE(length(roster_attestation_public_key), 0) + COALESCE(length(roster_attestation_algorithm_version), 0)), 0) FROM (SELECT roster_attestation_root_id, roster_attestation_public_key, roster_attestation_algorithm_version FROM consensus_identity LIMIT ?1)",
+        protocol_cap: 1,
+        protocol_max_value: ProtectedRosterValueCap::Fixed(33),
+    };
+    const TABLES: &[ProtectedRosterPreflightTable] = &[
+        ProtectedRosterPreflightTable {
+            count_query: "SELECT COUNT(*) FROM (SELECT binding FROM consensus_protected_roster_rows LIMIT ?1)",
+            values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(binding), length(partition), COALESCE(length(terminalized_at), 0), length(canonical_record))), 0), COALESCE(SUM(length(binding) + length(partition) + COALESCE(length(terminalized_at), 0) + length(canonical_record)), 0) FROM (SELECT binding, partition, terminalized_at, canonical_record FROM consensus_protected_roster_rows LIMIT ?1)",
+            protocol_cap: FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+            protocol_max_value: ProtectedRosterValueCap::CanonicalRecord,
+        },
+        ProtectedRosterPreflightTable {
+            count_query: "SELECT COUNT(*) FROM (SELECT partition FROM consensus_protected_roster_floors LIMIT ?1)",
+            values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(partition), length(canonical_floor))), 0), COALESCE(SUM(length(partition) + length(canonical_floor)), 0) FROM (SELECT partition, canonical_floor FROM consensus_protected_roster_floors LIMIT ?1)",
+            protocol_cap: FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+            protocol_max_value: ProtectedRosterValueCap::Fixed(128),
+        },
+        ProtectedRosterPreflightTable {
+            count_query: "SELECT COUNT(*) FROM (SELECT partition FROM consensus_protected_roster_retirement_cursors LIMIT ?1)",
+            values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(partition), length(canonical_cursor))), 0), COALESCE(SUM(length(partition) + length(canonical_cursor)), 0) FROM (SELECT partition, canonical_cursor FROM consensus_protected_roster_retirement_cursors LIMIT ?1)",
+            protocol_cap: FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+            protocol_max_value: ProtectedRosterValueCap::Fixed(256),
+        },
+        ProtectedRosterPreflightTable {
+            count_query: "SELECT COUNT(*) FROM (SELECT singleton FROM consensus_protected_roster_witness LIMIT ?1)",
+            values_query: "SELECT COUNT(*), COALESCE(MAX(length(canonical_witness)), 0), COALESCE(SUM(length(canonical_witness)), 0) FROM (SELECT canonical_witness FROM consensus_protected_roster_witness LIMIT ?1)",
+            protocol_cap: 1,
+            protocol_max_value: ProtectedRosterValueCap::Fixed(1_024),
+        },
+        ProtectedRosterPreflightTable {
+            count_query: "SELECT COUNT(*) FROM (SELECT business_key FROM consensus_protected_roster_business LIMIT ?1)",
+            values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(business_key), length(binding), length(canonical_business))), 0), COALESCE(SUM(length(business_key) + length(binding) + length(canonical_business)), 0) FROM (SELECT business_key, binding, canonical_business FROM consensus_protected_roster_business LIMIT ?1)",
+            protocol_cap: FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS,
+            protocol_max_value: ProtectedRosterValueCap::CanonicalBusiness,
+        },
+        ProtectedRosterPreflightTable {
+            count_query: "SELECT COUNT(*) FROM (SELECT binding FROM consensus_protected_roster_admissions LIMIT ?1)",
+            values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(binding), length(stable_slot), length(admission_request_id), length(terminal_request_id), length(original_owner), length(original_acquired_at), length(original_expires_at))), 0), COALESCE(SUM(length(binding) + length(stable_slot) + length(admission_request_id) + length(terminal_request_id) + length(original_owner) + length(original_acquired_at) + length(original_expires_at)), 0) FROM (SELECT binding, stable_slot, admission_request_id, terminal_request_id, original_owner, original_acquired_at, original_expires_at FROM consensus_protected_roster_admissions LIMIT ?1)",
+            protocol_cap: FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+            protocol_max_value: ProtectedRosterValueCap::Fixed(128),
+        },
+    ];
+
+    let (canonical_record, canonical_business) = consensus::protected_roster_recovery_value_caps();
+    preflight_protected_roster_table(
+        conn,
+        budget,
+        total_bytes,
+        ROOT,
+        canonical_record,
+        canonical_business,
+    )?;
+    for table in TABLES {
+        preflight_protected_roster_table(
+            conn,
+            budget,
+            total_bytes,
+            *table,
+            canonical_record,
+            canonical_business,
+        )?;
+    }
+    Ok(())
+}
+
+fn preflight_protected_roster_table(
+    conn: &Connection,
+    budget: &InspectionBudget,
+    total_bytes: &mut u64,
+    table: ProtectedRosterPreflightTable,
+    canonical_record: usize,
+    canonical_business: usize,
+) -> Result<(), RecoveryError> {
+    let probe_limit = i64::try_from(
+        table
+            .protocol_cap
+            .checked_add(1)
+            .ok_or(RecoveryError::CorruptReplica)?,
+    )
+    .map_err(|_| RecoveryError::CorruptReplica)?;
+    let observed_count: i64 = conn
+        .query_row(table.count_query, [probe_limit], |row| row.get(0))
+        .map_err(|error| inspection_sql_error(error, budget))?;
+    let observed_count =
+        usize::try_from(observed_count).map_err(|_| RecoveryError::CorruptReplica)?;
+    if observed_count > table.protocol_cap {
+        return Err(RecoveryError::CorruptReplica);
+    }
+
+    let aggregate_limit =
+        i64::try_from(table.protocol_cap).map_err(|_| RecoveryError::CorruptReplica)?;
+    let (count, maximum, total): (i64, i64, i64) = conn
+        .query_row(table.values_query, [aggregate_limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|error| inspection_sql_error(error, budget))?;
+    let count = u64::try_from(count).map_err(|_| RecoveryError::CorruptReplica)?;
+    let maximum = u64::try_from(maximum).map_err(|_| RecoveryError::CorruptReplica)?;
+    let total = u64::try_from(total).map_err(|_| RecoveryError::CorruptReplica)?;
+    *total_bytes = total_bytes
+        .checked_add(total)
+        .ok_or(RecoveryError::WorkLimitExceeded)?;
+    let protocol_max_value = match table.protocol_max_value {
+        ProtectedRosterValueCap::Fixed(value) => value,
+        ProtectedRosterValueCap::CanonicalRecord => canonical_record,
+        ProtectedRosterValueCap::CanonicalBusiness => canonical_business,
+    };
+    if maximum > u64::try_from(protocol_max_value).map_err(|_| RecoveryError::CorruptReplica)? {
+        return Err(RecoveryError::CorruptReplica);
+    }
+    if count > budget.limits.max_rows()
+        || maximum > budget.limits.max_value_bytes()
+        || *total_bytes > budget.limits.max_total_value_bytes()
+    {
+        return Err(RecoveryError::WorkLimitExceeded);
+    }
+    Ok(())
 }
 
 /// Validate the complete V3 non-absorbing history state without repairing or
@@ -1275,33 +1443,37 @@ fn hash_current_checkpoint(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let v2_ledger_layout = consensus::fenced_transition_v2_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
+    let protected_roster_layout = consensus::protected_roster_recovery_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let (cluster, configuration, epoch): (Vec<u8>, Vec<u8>, i64) = conn
+        .query_row(
+            "SELECT cluster_id, configuration_id, configuration_epoch FROM consensus_identity WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let cluster: [u8; 32] = cluster
+        .try_into()
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let configuration: [u8; 32] = configuration
+        .try_into()
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let epoch = u64::try_from(epoch)
+        .ok()
+        .and_then(|value| SessionConsensusConfigurationEpoch::new(value).ok())
+        .ok_or(RecoveryError::CorruptReplica)?;
+    let storage_identity = SessionConsensusIdentity::new(
+        crate::consensus::SessionConsensusClusterId::from_bytes(cluster),
+        SessionConsensusConfigurationId::from_bytes(configuration),
+        epoch,
+    );
     if v2_ledger_layout == consensus::FencedTransitionV2LedgerLayout::Activated {
-        let (cluster, configuration, epoch): (Vec<u8>, Vec<u8>, i64) = conn
-            .query_row(
-                "SELECT cluster_id, configuration_id, configuration_epoch FROM consensus_identity WHERE singleton = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|_| RecoveryError::CorruptReplica)?;
-        let cluster: [u8; 32] = cluster
-            .try_into()
-            .map_err(|_| RecoveryError::CorruptReplica)?;
-        let configuration: [u8; 32] = configuration
-            .try_into()
-            .map_err(|_| RecoveryError::CorruptReplica)?;
-        let epoch = u64::try_from(epoch)
-            .ok()
-            .and_then(|value| SessionConsensusConfigurationEpoch::new(value).ok())
-            .ok_or(RecoveryError::CorruptReplica)?;
-        validate_fenced_transition_v2_recovery_state(
-            conn,
-            SessionConsensusIdentity::new(
-                crate::consensus::SessionConsensusClusterId::from_bytes(cluster),
-                SessionConsensusConfigurationId::from_bytes(configuration),
-                epoch,
-            ),
-        )?;
+        validate_fenced_transition_v2_recovery_state(conn, storage_identity)?;
     }
+    let mut protected_roster_bytes = 0;
+    preflight_protected_roster_tables(conn, budget, &mut protected_roster_bytes)?;
+    consensus::validate_protected_roster_recovery_state_sync(conn, storage_identity)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     hasher.update(b"openpacketcore/session-recovery/fenced-transition-layout/v1\0");
     // An exact #684 predecessor and an empty Prepared layout carry the same
     // state-machine semantics: neither can serve V1 and a writable reopen
@@ -1319,6 +1491,25 @@ fn hash_current_checkpoint(
         consensus::FencedTransitionV2LedgerLayout::Absent => [0],
         consensus::FencedTransitionV2LedgerLayout::Activated => [1],
     });
+    // A prepared empty roster is intentionally equivalent to its rootless
+    // predecessor. An activated roster is a durable consensus fence, even if
+    // its first command was a typed rejection and therefore left no rows.
+    hasher.update(PROTECTED_ROSTER_LAYOUT_DOMAIN);
+    hasher.update(match protected_roster_layout {
+        consensus::ProtectedRosterRecoveryLayout::Legacy
+        | consensus::ProtectedRosterRecoveryLayout::Prepared => [0],
+        consensus::ProtectedRosterRecoveryLayout::Activated => [1],
+    });
+    hasher.update(PROTECTED_ROSTER_TRUST_ROOT_DOMAIN);
+    match consensus::protected_roster_recovery_trust_root_commitment_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?
+    {
+        None => hasher.update([0]),
+        Some(commitment) => {
+            hasher.update([1]);
+            hasher.update(commitment);
+        }
+    }
     let schema_version: i64 = conn
         .query_row(
             "SELECT schema_version FROM consensus_identity WHERE singleton = 1",
@@ -1338,6 +1529,18 @@ fn hash_current_checkpoint(
             "SELECT * FROM consensus_fenced_transition_v2_history ORDER BY singleton",
             "SELECT * FROM consensus_fenced_transition_v2_activation ORDER BY singleton",
             "SELECT * FROM consensus_fenced_transition_v2_receipts ORDER BY history_epoch, ordinal, request_id",
+        ] {
+            hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
+        }
+    }
+    if protected_roster_layout == consensus::ProtectedRosterRecoveryLayout::Activated {
+        for query in [
+            "SELECT * FROM consensus_protected_roster_rows ORDER BY binding",
+            "SELECT * FROM consensus_protected_roster_floors ORDER BY partition",
+            "SELECT * FROM consensus_protected_roster_retirement_cursors ORDER BY partition",
+            "SELECT * FROM consensus_protected_roster_witness ORDER BY singleton",
+            "SELECT * FROM consensus_protected_roster_business ORDER BY business_key",
+            "SELECT * FROM consensus_protected_roster_admissions ORDER BY binding",
         ] {
             hash_query_rows_with_identity(conn, query, query, budget, hasher)?;
         }
@@ -1662,10 +1865,17 @@ fn validate_exact_recovery_schema(
         .map_err(|_| RecoveryError::CorruptReplica)?;
     let receipt_ledger_layout = consensus::fenced_transition_receipt_ledger_layout_sync(conn)
         .map_err(|_| RecoveryError::CorruptReplica)?;
+    let protected_roster_layout = consensus::protected_roster_recovery_layout_sync(conn)
+        .map_err(|_| RecoveryError::CorruptReplica)?;
     if receipt_ledger_layout == consensus::FencedTransitionReceiptLedgerLayout::Published684 {
         // The classifier compared the complete released manifest.  Its absent
-        // ledger is canonically an empty ledger for recovery hashing, while a
-        // marker-bearing database can never take this path.
+        // ledger is canonically an empty ledger for recovery hashing. A
+        // roster namespace or root identity cannot be silently appended to
+        // this released format: the roster classifier must prove the exact
+        // rootless predecessor before this compatibility return.
+        if protected_roster_layout != consensus::ProtectedRosterRecoveryLayout::Legacy {
+            return Err(RecoveryError::CorruptReplica);
+        }
         return Ok(());
     }
     let has_restore_scan_state = validate_restore_scan_schema_if_present(conn)?;
@@ -1674,6 +1884,31 @@ fn validate_exact_recovery_schema(
     consensus::install_recovery_validation_schema_sync(&canonical, false)
         .map_err(|_| RecoveryError::DatabaseUnavailable)?;
     let mut expected = recovery_schema_manifest(&canonical)?;
+    // Identity DDL and every protected-roster object have already passed the
+    // bounded exact classifiers above. Excluding those objects here avoids
+    // synthesizing one preferred ALTER-column order and accidentally rejecting
+    // another exact emitted form; no persisted database is mutated for
+    // recovery validation.
+    expected
+        .remove("consensus_identity")
+        .ok_or(RecoveryError::DatabaseUnavailable)?;
+    // `recovery_schema_manifest` validates every allowed index in place and
+    // retains only table DDL in the returned map. The three roster indexes
+    // therefore must not be removed a second time here.
+    const PROTECTED_ROSTER_SCHEMA_TABLES: &[&str] = &[
+        "consensus_protected_roster_rows",
+        "consensus_protected_roster_floors",
+        "consensus_protected_roster_retirement_cursors",
+        "consensus_protected_roster_witness",
+        "consensus_protected_roster_business",
+        "consensus_protected_roster_admissions",
+    ];
+    for table in PROTECTED_ROSTER_SCHEMA_TABLES {
+        // The canonical helper currently emits the pre-roster base and may
+        // gain the additive namespace later. Its exact roster DDL is owned by
+        // the classifier either way, so exclude it when present.
+        expected.remove(*table);
+    }
     let canonical_lease = expected
         .remove("leases")
         .ok_or(RecoveryError::DatabaseUnavailable)?;
@@ -1726,6 +1961,20 @@ fn validate_exact_recovery_schema(
         .ok_or(RecoveryError::DatabaseUnavailable)?;
 
     let mut observed = recovery_schema_manifest(conn)?;
+    observed
+        .remove("consensus_identity")
+        .ok_or(RecoveryError::CorruptReplica)?;
+    if matches!(
+        protected_roster_layout,
+        consensus::ProtectedRosterRecoveryLayout::Prepared
+            | consensus::ProtectedRosterRecoveryLayout::Activated
+    ) {
+        for table in PROTECTED_ROSTER_SCHEMA_TABLES {
+            observed
+                .remove(*table)
+                .ok_or(RecoveryError::CorruptReplica)?;
+        }
+    }
     if v2_ledger_layout == consensus::FencedTransitionV2LedgerLayout::Activated {
         for table in [
             "consensus_fenced_transition_v2_receipts",
@@ -1888,6 +2137,15 @@ fn recovery_schema_manifest(conn: &Connection) -> Result<BTreeMap<String, String
                 ),
                 "consensus_fenced_transition_v2_receipts_due" => normalize_schema_sql(
                     "CREATE INDEX consensus_fenced_transition_v2_receipts_due ON consensus_fenced_transition_v2_receipts (retained_until, request_id) WHERE response_json IS NOT NULL",
+                ),
+                "consensus_protected_roster_reclaim_due" => normalize_schema_sql(
+                    "CREATE INDEX consensus_protected_roster_reclaim_due ON consensus_protected_roster_rows(terminalized_at,binding) WHERE state=2",
+                ),
+                "consensus_protected_roster_partition_epoch" => normalize_schema_sql(
+                    "CREATE INDEX consensus_protected_roster_partition_epoch ON consensus_protected_roster_rows(partition,history_epoch,binding)",
+                ),
+                "consensus_protected_roster_terminal_sequence" => normalize_schema_sql(
+                    "CREATE UNIQUE INDEX consensus_protected_roster_terminal_sequence ON consensus_protected_roster_rows(terminal_sequence) WHERE terminal_sequence IS NOT NULL",
                 ),
                 _ => return Err(RecoveryError::CorruptReplica),
             };
