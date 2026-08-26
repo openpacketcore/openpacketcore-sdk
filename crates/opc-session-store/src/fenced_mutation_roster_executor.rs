@@ -906,6 +906,11 @@ impl ConsensusCommitMetadata {
         self.committed_at
     }
 
+    /// Return the exact Raft position at which the terminal linearized.
+    pub(crate) const fn raft_log_index(self) -> u64 {
+        self.raft_log_index
+    }
+
     fn update_commitment(self, hasher: &mut Sha256) {
         hasher.update(self.sequence.to_be_bytes());
         hasher.update(self.raft_log_index.to_be_bytes());

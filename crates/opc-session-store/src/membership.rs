@@ -281,6 +281,7 @@ impl SessionTopologyTransitionRequest {
     /// the existing desired configuration ID and its already-bound request
     /// digest. Candidate opening and route staging independently derive that
     /// ID from their current validated topology root before acceptance.
+    #[cfg(feature = "test-control")]
     pub(crate) fn try_new_with_roster_attestation_trust_root(
         transition_id: SessionTopologyTransitionId,
         cluster_id: SessionConsensusClusterId,

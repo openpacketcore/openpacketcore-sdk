@@ -18,11 +18,12 @@ certificate; they do not infer support from the listener or from a generic
 capability marker.
 
 The real three-voter fixtures perform this activation before exposing protected
-traffic. Their full-process restart path deliberately does not reactivate it,
-so every restart/crash test proves that the original certificate survived and
-still matches the current exact voter scope. The fresh roster itself therefore
-retains exactly two state-changing quorum transactions: PollAdmitted before any
-provider effect and one all-or-none Established or Aborted terminal mutation.
+traffic. Their full-fleet durable-reopen path drops every process-local fleet
+handle and deliberately does not reactivate the profile, so every reopen/crash
+test proves that the original certificate survived and still matches the
+current exact voter scope. The fresh roster itself therefore retains exactly
+two state-changing quorum transactions: PollAdmitted before any provider effect
+and one all-or-none Established or Aborted terminal mutation.
 
 ## Candidate lineage
 
@@ -106,7 +107,7 @@ env CARGO_PROFILE_TEST_OPT_LEVEL=1 \
   persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart \
   -- --exact --nocapture
 
-result: PASS (all three full-process restart cases)
+result: PASS (all three full-fleet durable-reopen cases)
 assertions: higher-fence cross-node recovery; old/expired fence rejection;
             exact checkpoint/result after restart/leader change; Established
             before publication; published-before-ACK and Attempted ambiguity
@@ -116,6 +117,22 @@ assertions: higher-fence cross-node recovery; old/expired fence rejection;
 The three full-fleet restart cases are serialized with a test-only semaphore;
 the production timeout is unchanged. This avoids unrelated simultaneous
 election fleets competing on the qualification host.
+
+The focused conclusive-Aborted production-path case is:
+
+```text
+env CARGO_PROFILE_TEST_OPT_LEVEL=1 \
+  cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-features \
+  persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart \
+  -- --exact --nocapture
+
+result: PASS
+assertions: six SDK-issued NotApplied + Reconciled member proofs commit
+            Aborted; a different voter recovers the exact protected
+            checkpoint/result before physical snapshot compaction; a full
+            three-voter durable reopen returns byte-identical Aborted bytes and
+            has no publication authority or publication path
+```
 
 ## Retention and snapshot evidence
 

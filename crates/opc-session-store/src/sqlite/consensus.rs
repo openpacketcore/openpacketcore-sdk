@@ -7236,23 +7236,94 @@ fn protected_roster_hydrate_record_projection_sync(
     Ok(hydrated)
 }
 
-/// Return whether an immutable roster proof was issued by an identity in the
-/// fully validated durable membership lineage. A current command must still be
-/// authenticated by the current scope; this admits historical evidence only so
-/// an honest predecessor-issued row survives its N -> N+1 rollover.
-fn membership_scope_contains_historical_roster_identity(
+/// Return whether an identity owns this exact durable Raft-log interval.
+///
+/// The cutover entry itself belongs to neither roster authority interval, so
+/// historical intervals end strictly before it and the current interval begins
+/// strictly after the last retained cutover. This keeps recovery and snapshot
+/// proof checks aligned with applied-log validation.
+fn membership_scope_identity_owns_roster_log_index(
     scope: &MembershipValidationScope,
     identity: SessionConsensusIdentity,
+    log_index: u64,
 ) -> bool {
-    identity == scope.current_identity
-        || scope
-            .predecessor
-            .as_ref()
-            .is_some_and(|predecessor| predecessor.identity == identity)
-        || scope
-            .history
-            .iter()
-            .any(|predecessor| predecessor.identity == identity)
+    let mut prior_cutover = None;
+    for predecessor in scope.history.iter().chain(scope.predecessor.iter()) {
+        let starts_after_prior = prior_cutover.is_none_or(|cutover| log_index > cutover);
+        if identity == predecessor.identity
+            && starts_after_prior
+            && log_index < predecessor.cutover_log_index
+        {
+            return true;
+        }
+        prior_cutover = Some(predecessor.cutover_log_index);
+    }
+    identity == scope.current_identity && prior_cutover.is_none_or(|cutover| log_index > cutover)
+}
+
+/// Return whether roster authority has durable interval evidence.
+///
+/// The immutable SQL identity anchors the genesis interval. A successor must
+/// retain either its immediate predecessor or bounded history before a roster
+/// command can use its current interval.
+fn protected_roster_authority_interval_is_anchored(
+    scope: &MembershipValidationScope,
+    storage_identity: SessionConsensusIdentity,
+) -> bool {
+    scope.current_identity == storage_identity
+        || scope.predecessor.is_some()
+        || !scope.history.is_empty()
+}
+
+/// Validate the exact historical interval of a signed admission envelope.
+///
+/// This is intentionally the first recovery and attached-snapshot admission
+/// gate, before reconstructing the signed envelope's remaining commitments.
+fn validate_roster_admission_attestation_identity_interval(
+    membership_scope: &MembershipValidationScope,
+    binding: RequestBindingKey,
+    admission_identity: SessionConsensusIdentity,
+) -> Result<(), ProtectedRosterApplyError> {
+    membership_scope_identity_owns_roster_log_index(
+        membership_scope,
+        admission_identity,
+        binding.history_epoch(),
+    )
+    .then_some(())
+    .ok_or(ProtectedRosterApplyError::Corrupt)
+}
+
+/// Validate the exact historical interval of a signed retained-terminal
+/// envelope before its remaining authenticated commitments are reconstructed.
+fn validate_roster_terminal_attestation_identity_interval(
+    membership_scope: &MembershipValidationScope,
+    terminal_identity: SessionConsensusIdentity,
+    terminal_metadata: ConsensusCommitMetadata,
+) -> Result<(), ProtectedRosterApplyError> {
+    membership_scope_identity_owns_roster_log_index(
+        membership_scope,
+        terminal_identity,
+        terminal_metadata.raft_log_index(),
+    )
+    .then_some(())
+    .ok_or(ProtectedRosterApplyError::Corrupt)
+}
+
+/// Validate compact terminal evidence against the exact applied-log interval
+/// retained in its canonical tombstone after the full terminal receipt has
+/// been reclaimed.
+fn validate_roster_tombstone_terminal_attestation_identity_interval(
+    membership_scope: &MembershipValidationScope,
+    terminal_identity: SessionConsensusIdentity,
+    tombstone: &TerminalConflictTombstone,
+) -> Result<(), ProtectedRosterApplyError> {
+    membership_scope_identity_owns_roster_log_index(
+        membership_scope,
+        terminal_identity,
+        tombstone.terminal_raft_log_index(),
+    )
+    .then_some(())
+    .ok_or(ProtectedRosterApplyError::Corrupt)
 }
 
 /// Recheck every root-signed envelope retained by a non-compacted roster row.
@@ -7275,12 +7346,11 @@ fn validate_hydrated_protected_roster_attestations_sync(
          admission_ingress: &crate::fenced_mutation_roster::RosterIngressAttestationV1,
          admission_provenance: &RosterCompactAdmissionProvenanceV2| {
             let admission_identity = admission_provenance.configuration_identity();
-            if !membership_scope_contains_historical_roster_identity(
+            validate_roster_admission_attestation_identity_interval(
                 membership_scope,
+                binding,
                 admission_identity,
-            ) {
-                return Err(ProtectedRosterApplyError::Corrupt);
-            }
+            )?;
             let admission_capsule =
                 roster_poll_admit_ingress_capsule_commitment(admission, original_authority)
                     .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
@@ -7332,13 +7402,15 @@ fn validate_hydrated_protected_roster_attestations_sync(
             let terminal_registration = committed_terminal.committing_registration();
             let terminal_authority = committed_terminal.committing_authority();
             let terminal = committed_terminal.record();
-            let terminal_time = committed_terminal.commit_metadata().committed_at();
+            let terminal_metadata = committed_terminal.commit_metadata();
+            let terminal_time = terminal_metadata.committed_at();
             let terminal_identity = terminal_evidence.configuration_identity();
+            validate_roster_terminal_attestation_identity_interval(
+                membership_scope,
+                terminal_identity,
+                terminal_metadata,
+            )?;
             if registration != terminal_registration
-                || !membership_scope_contains_historical_roster_identity(
-                    membership_scope,
-                    terminal_identity,
-                )
                 || terminal_authority.scope() != admission.scope()
                 || terminal_authority.key() != admission.key()
                 || terminal_authority.generation() != admission.expected_generation()
@@ -7504,13 +7576,38 @@ fn validate_protected_roster_state_sync(
     // predecessor retry.
     let membership_scope = read_membership_scope_sync(conn, identity)
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
+    let has_roster_rows = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
+    if has_roster_rows
+        && !protected_roster_authority_interval_is_anchored(&membership_scope, identity)
+    {
+        return Err(ProtectedRosterApplyError::Corrupt);
+    }
     let roster_attestation_root = read_roster_attestation_trust_root_sync(conn)
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
     let (application_sequence, _, _, _) =
         read_machine_sync(conn, identity).map_err(|_| ProtectedRosterApplyError::Corrupt)?;
+    // Read this pointer exactly once for the whole ordered pass. The binding
+    // epoch and a retained/compacted terminal's receipt index are consensus
+    // coordinates, not application-sequence counters; an otherwise valid
+    // row must never point beyond the durable applied horizon.
+    let applied_raft_log_index = read_applied_sync(conn, identity)
+        .map_err(|_| ProtectedRosterApplyError::Corrupt)?
+        .map(|log_id| log_id.index);
+    if has_roster_rows
+        && applied_raft_log_index.is_none_or(|applied_raft_log_index| applied_raft_log_index == 0)
+    {
+        return Err(ProtectedRosterApplyError::Corrupt);
+    }
     let witness = protected_roster_read_witness_sync(conn, identity)?;
     let accounting_witness = witness.unwrap_or_else(GlobalChargeWitness::empty);
-    let mut validator = ProductionSnapshotStreamValidator::new(application_sequence);
+    let mut validator =
+        ProductionSnapshotStreamValidator::new(application_sequence, applied_raft_log_index);
     let mut statement = conn
         .prepare(
             "SELECT r.binding, r.configuration_epoch, r.partition, r.history_epoch, r.state, \
@@ -7553,9 +7650,25 @@ fn validate_protected_roster_state_sync(
                 row.get(7).map_err(|_| ProtectedRosterApplyError::Corrupt)?,
             ),
         )?;
+        let terminal_raft_log_index = match hydrated.payload() {
+            HydratedProductionReservationPayload::Live { .. } => None,
+            HydratedProductionReservationPayload::Retained {
+                committed_terminal, ..
+            } => Some(committed_terminal.commit_metadata().raft_log_index()),
+            HydratedProductionReservationPayload::Tombstone { tombstone, .. } => {
+                Some(tombstone.terminal_raft_log_index())
+            }
+            #[cfg(test)]
+            HydratedProductionReservationPayload::Legacy => None,
+        };
         let record = hydrated.record();
         validator
-            .add_record(record, accounting_witness, ChargeProfile::v1())
+            .add_record(
+                record,
+                terminal_raft_log_index,
+                accounting_witness,
+                ChargeProfile::v1(),
+            )
             .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
 
         let floor_epoch: Option<i64> =
@@ -7732,13 +7845,19 @@ fn validate_protected_roster_state_sync(
                     .ok_or(ProtectedRosterApplyError::Corrupt)?
                     .to_consensus_timestamp()
                     .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
-                if !membership_scope_contains_historical_roster_identity(
+                if validate_roster_admission_attestation_identity_interval(
                     &membership_scope,
+                    binding,
                     admission_identity,
-                ) || !membership_scope_contains_historical_roster_identity(
-                    &membership_scope,
-                    terminal_identity,
-                ) {
+                )
+                .is_err()
+                    || validate_roster_tombstone_terminal_attestation_identity_interval(
+                        &membership_scope,
+                        terminal_identity,
+                        tombstone,
+                    )
+                    .is_err()
+                {
                     return Err(ProtectedRosterApplyError::Corrupt);
                 }
                 let slots = verify_compacted_tombstone_history_v2(
@@ -13693,6 +13812,7 @@ fn validate_entry_for_membership_scope_with_roster_authority(
             protected_roster_command_for_scope(
                 &command.intent,
                 scope,
+                storage_identity,
                 entry.log_id.index,
                 roster_authority,
             )?;
@@ -16327,6 +16447,7 @@ fn roster_command(intent: &SessionMutationIntent) -> Option<RosterCommandRef<'_>
 fn protected_roster_command_for_scope<'a>(
     intent: &'a SessionMutationIntent,
     scope: &MembershipValidationScope,
+    storage_identity: SessionConsensusIdentity,
     log_index: u64,
     validation: ProtectedRosterCommandAuthorityValidation,
 ) -> io::Result<Option<ProtectedRosterCommandRef<'a>>> {
@@ -16354,29 +16475,28 @@ fn protected_roster_command_for_scope<'a>(
         }
         _ => return Ok(None),
     };
-    let mut prior_cutover = None;
-    let log_position_authority_is_exact =
+    if !protected_roster_authority_interval_is_anchored(scope, storage_identity) {
+        return Err(invalid_data(
+            "session consensus protected roster authority interval is unanchored",
+        ));
+    }
+    let authority_has_exact_member = if *authority_identity == scope.current_identity {
+        scope.current_members.contains(origin)
+    } else {
         scope
             .history
             .iter()
             .chain(scope.predecessor.iter())
-            .any(|predecessor| {
-                let starts_after_prior = prior_cutover.is_none_or(|cutover| log_index > cutover);
-                let is_exact = *authority_identity == predecessor.identity
-                    && predecessor.members.contains(origin)
-                    && starts_after_prior
-                    && log_index < predecessor.cutover_log_index;
-                prior_cutover = Some(predecessor.cutover_log_index);
-                is_exact
-            });
-    let current_authority_is_exact = *authority_identity == scope.current_identity
-        && scope.current_members.contains(origin)
-        && prior_cutover.is_none_or(|cutover| log_index > cutover);
+            .find(|predecessor| predecessor.identity == *authority_identity)
+            .is_some_and(|predecessor| predecessor.members.contains(origin))
+    };
+    let authority_is_exact = authority_has_exact_member
+        && membership_scope_identity_owns_roster_log_index(scope, *authority_identity, log_index);
     let authority_is_exact = match validation {
-        ProtectedRosterCommandAuthorityValidation::CurrentOnly => current_authority_is_exact,
-        ProtectedRosterCommandAuthorityValidation::AppliedHistory => {
-            log_position_authority_is_exact || current_authority_is_exact
+        ProtectedRosterCommandAuthorityValidation::CurrentOnly => {
+            authority_is_exact && *authority_identity == scope.current_identity
         }
+        ProtectedRosterCommandAuthorityValidation::AppliedHistory => authority_is_exact,
     };
     if !authority_is_exact {
         return Err(invalid_data(
@@ -20878,6 +20998,7 @@ fn apply_protected_roster_command_sync(
     } = protected_roster_command_for_scope(
         &command.intent,
         &scope,
+        identity,
         raft_log_index,
         ProtectedRosterCommandAuthorityValidation::CurrentOnly,
     )?
@@ -24986,7 +25107,7 @@ fn protected_roster_snapshot_tombstone_matches_retained(
         .committed_terminal()
         .map_err(|_| protected_roster_snapshot_monotonicity_error())?
         .ok_or_else(protected_roster_snapshot_monotonicity_error)?;
-    let expected = TerminalConflictTombstone::new(&admission, committed.record())
+    let expected = TerminalConflictTombstone::from_committed_terminal(&admission, &committed)
         .map_err(|_| protected_roster_snapshot_monotonicity_error())?;
     Ok(incoming
         .tombstone()
@@ -30074,7 +30195,7 @@ mod tests {
             &admission,
             &authority,
             terminal,
-            ConsensusCommitMetadata::issue(1, 1, committed_at).expect("commit metadata"),
+            ConsensusCommitMetadata::issue(1, 2, committed_at).expect("commit metadata"),
         )
         .expect("committed terminal");
         let admitted = prepare_production_admission(
@@ -30141,10 +30262,21 @@ mod tests {
             [],
         )
         .expect("anchor terminal history at its committed application sequence");
+        save_log_pointer(&conn, "consensus_applied", identity(), &log_id(2))
+            .expect("anchor the exact retained terminal Raft horizon");
         assert!(
             validate_protected_roster_state_sync(&conn, identity()).is_ok(),
             "exact retained mapping survives restart validation"
         );
+
+        save_log_pointer(&conn, "consensus_applied", identity(), &log_id(1))
+            .expect("move the applied horizon before the terminal receipt");
+        assert!(
+            validate_protected_roster_state_sync(&conn, identity()).is_err(),
+            "restart validation must reject a terminal receipt beyond the applied Raft horizon"
+        );
+        save_log_pointer(&conn, "consensus_applied", identity(), &log_id(2))
+            .expect("restore the exact retained terminal Raft horizon");
 
         conn.execute(
             "UPDATE consensus_machine SET application_sequence=0 WHERE singleton=1",
@@ -30571,6 +30703,7 @@ mod tests {
         assert!(protected_roster_command_for_scope(
             &predecessor,
             &successor_scope,
+            identity(),
             19,
             ProtectedRosterCommandAuthorityValidation::AppliedHistory,
         )
@@ -30579,6 +30712,7 @@ mod tests {
         assert!(protected_roster_command_for_scope(
             &predecessor,
             &successor_scope,
+            identity(),
             19,
             ProtectedRosterCommandAuthorityValidation::CurrentOnly,
         )
@@ -30587,6 +30721,7 @@ mod tests {
             let error = match protected_roster_command_for_scope(
                 &predecessor,
                 &successor_scope,
+                identity(),
                 index,
                 ProtectedRosterCommandAuthorityValidation::AppliedHistory,
             ) {
@@ -30609,6 +30744,7 @@ mod tests {
         assert!(protected_roster_command_for_scope(
             &wrong_predecessor_origin,
             &successor_scope,
+            identity(),
             19,
             ProtectedRosterCommandAuthorityValidation::AppliedHistory,
         )
@@ -30624,6 +30760,7 @@ mod tests {
         assert!(protected_roster_command_for_scope(
             &successor,
             &successor_scope,
+            identity(),
             21,
             ProtectedRosterCommandAuthorityValidation::AppliedHistory,
         )
@@ -30632,6 +30769,7 @@ mod tests {
         assert!(protected_roster_command_for_scope(
             &successor,
             &successor_scope,
+            identity(),
             21,
             ProtectedRosterCommandAuthorityValidation::CurrentOnly,
         )
@@ -30642,11 +30780,149 @@ mod tests {
                 protected_roster_command_for_scope(
                     &successor,
                     &successor_scope,
+                    identity(),
                     index,
                     ProtectedRosterCommandAuthorityValidation::AppliedHistory,
                 )
                 .is_err(),
                 "successor authority rewrote predecessor history at index {index}"
+            );
+        }
+
+        let mut lineageless_scope =
+            read_membership_scope_sync(&conn, identity()).expect("genesis membership scope");
+        let arbitrary_genesis = identity_at(41, 0xcc);
+        lineageless_scope.current_identity = arbitrary_genesis;
+        lineageless_scope.application_authority_epoch = arbitrary_genesis.configuration_epoch();
+        assert!(protected_roster_authority_interval_is_anchored(
+            &lineageless_scope,
+            arbitrary_genesis,
+        ));
+
+        let lineageless_successor = identity_at(42, 0xcd);
+        lineageless_scope.current_identity = lineageless_successor;
+        lineageless_scope.application_authority_epoch = lineageless_successor.configuration_epoch();
+        assert!(!protected_roster_authority_interval_is_anchored(
+            &lineageless_scope,
+            identity(),
+        ));
+        let lineageless_command = SessionMutationIntent::Authorized {
+            origin: node_id(),
+            authority_identity: lineageless_successor,
+            mutation: Box::new(SessionMutationIntent::RosterAdmission(Box::new(
+                roster_command(),
+            ))),
+        };
+        let error = match protected_roster_command_for_scope(
+            &lineageless_command,
+            &lineageless_scope,
+            identity(),
+            21,
+            ProtectedRosterCommandAuthorityValidation::CurrentOnly,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("lineageless successor created a protected roster row"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "session consensus protected roster authority interval is unanchored"
+        );
+    }
+
+    #[test]
+    fn protected_roster_recovery_and_snapshot_attestations_require_exact_identity_intervals() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let mut scope = read_membership_scope_sync(&conn, identity()).expect("membership scope");
+        let predecessor_identity = scope.current_identity;
+        let predecessor_members = scope.current_members.clone();
+        let successor_identity = identity_at(2, 0xce);
+        let successor_members = members(&[7, 8]);
+        scope.current_identity = successor_identity;
+        scope.current_members = successor_members.clone();
+        scope.application_authority_epoch = successor_identity.configuration_epoch();
+        scope.application_authority_members = successor_members;
+        scope.predecessor = Some(MembershipPredecessorScope {
+            transition_id: [0xcf; MEMBERSHIP_TRANSITION_ID_BYTES],
+            transition_digest: [0xd0; 32],
+            identity: predecessor_identity,
+            members: predecessor_members,
+            transition_start_log_index: 10,
+            cutover_log_index: 20,
+        });
+        let future_identity = identity_at(3, 0xd1);
+
+        // The fully signed envelopes are exercised by their own cryptographic
+        // tests. These production-shaped binding and commit-metadata fixtures
+        // reach the recovery/attached-snapshot interval gates immediately
+        // before those envelope verifiers run.
+        for (path, case, signed_identity, signed_index, expected) in [
+            ("reopen", "before cutover", predecessor_identity, 19, true),
+            (
+                "InstallSnapshot",
+                "at cutover",
+                predecessor_identity,
+                20,
+                false,
+            ),
+            ("reopen", "after cutover", predecessor_identity, 21, false),
+            (
+                "InstallSnapshot",
+                "successor after cutover",
+                successor_identity,
+                21,
+                true,
+            ),
+            (
+                "InstallSnapshot",
+                "future identity at future index",
+                future_identity,
+                21,
+                false,
+            ),
+        ] {
+            let admission = retirement_fixture_admission(0xd2, 1);
+            let binding = admission
+                .binding_key(signed_index)
+                .expect("production-shaped admission binding");
+            assert_eq!(
+                validate_roster_admission_attestation_identity_interval(
+                    &scope,
+                    binding,
+                    signed_identity,
+                )
+                .is_ok(),
+                expected,
+                "{path} live admission {case} identity/index validation",
+            );
+            let terminal_metadata = ConsensusCommitMetadata::issue(1, signed_index, timestamp(1))
+                .expect("production-shaped terminal commit metadata");
+            assert_eq!(
+                validate_roster_terminal_attestation_identity_interval(
+                    &scope,
+                    signed_identity,
+                    terminal_metadata,
+                )
+                .is_ok(),
+                expected,
+                "{path} retained terminal {case} identity/index validation",
+            );
+            let committed =
+                retirement_fixture_terminal(&admission, signed_index, timestamp(1), signed_index);
+            let tombstone =
+                TerminalConflictTombstone::from_committed_terminal(&admission, &committed)
+                    .expect("production-shaped compact tombstone");
+            assert_eq!(tombstone.terminal_raft_log_index(), signed_index);
+            assert_eq!(
+                validate_roster_tombstone_terminal_attestation_identity_interval(
+                    &scope,
+                    signed_identity,
+                    &tombstone,
+                )
+                .is_ok(),
+                expected,
+                "{path} compact tombstone {case} identity/index validation",
             );
         }
     }
@@ -31863,7 +32139,7 @@ mod tests {
         let snapshot_path = directory.path().join("protected-roster.sqlite");
         let retained_at = Timestamp::from_str("2026-01-01T00:00:00Z").expect("retained time");
         let retained =
-            retirement_fixture_retained_with_terminal_sequence(0x71, 1, 7, retained_at, 1);
+            retirement_fixture_retained_with_terminal_sequence(0x71, 1, 7, retained_at, 8);
 
         let source = SqliteSessionBackend::in_memory().expect("source backend");
         let source_conn = source.conn.blocking_lock();
@@ -31882,10 +32158,12 @@ mod tests {
         write_retirement_fixture_witness(&source_conn, std::slice::from_ref(&retained));
         source_conn
             .execute(
-                "UPDATE consensus_machine SET application_sequence = 1 WHERE singleton = 1",
+                "UPDATE consensus_machine SET application_sequence = 8 WHERE singleton = 1",
                 [],
             )
             .expect("advance source roster sequence horizon");
+        save_log_pointer(&source_conn, "consensus_applied", identity(), &log_id(8))
+            .expect("advance source applied roster horizon");
         let (last_log_id, last_membership) =
             build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
                 .expect("build protected-roster snapshot");
@@ -31908,10 +32186,12 @@ mod tests {
         write_retirement_fixture_witness(&target_conn, std::slice::from_ref(&retained));
         target_conn
             .execute(
-                "UPDATE consensus_machine SET application_sequence = 1 WHERE singleton = 1",
+                "UPDATE consensus_machine SET application_sequence = 8 WHERE singleton = 1",
                 [],
             )
             .expect("advance target roster sequence horizon");
+        save_log_pointer(&target_conn, "consensus_applied", identity(), &log_id(8))
+            .expect("advance target applied roster horizon");
         target_conn
             .execute_batch("PRAGMA foreign_keys = ON")
             .expect("enable foreign keys");
@@ -31961,6 +32241,328 @@ mod tests {
         assert!(
             rows.next().expect("read foreign key check").is_none(),
             "installed protected-roster namespace has no foreign-key violations"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_roster_successor_lineage_and_horizon_reopen_and_snapshot_lifecycle() {
+        let directory = tempfile::tempdir().expect("lifecycle directory");
+        let source_database = directory.path().join("successor.sqlite");
+        let snapshot_path = directory.path().join("successor-snapshot.sqlite");
+        let lineageless_snapshot = directory.path().join("lineageless-snapshot.sqlite");
+        let horizon_snapshot = directory.path().join("horizon-snapshot.sqlite");
+        let storage_identity = identity();
+        let predecessor_members = members(&[7, 8, 9]);
+        let successor_members = members(&[7, 8, 9, 10, 11]);
+        let successor_identity = identity_at(2, 0x71);
+        let transition_id = [0x72; MEMBERSHIP_TRANSITION_ID_BYTES];
+        let transition_digest = [0x73; 32];
+        let retained_at = Timestamp::from_str("2026-01-01T00:00:00Z").expect("retained timestamp");
+
+        let source = SqliteSessionBackend::open(&source_database).expect("source backend");
+        let (last_log_id, last_membership) = {
+            let conn = source.conn.lock().await;
+            initialize_schema(&conn, storage_identity, &predecessor_members)
+                .expect("initialize predecessor scope");
+            let initial = membership_entry_at(
+                0,
+                vec![predecessor_members.clone()],
+                predecessor_members.clone(),
+            );
+            append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
+                .expect("append predecessor membership");
+            apply_entries_sync(&conn, storage_identity, &source.caps, vec![initial])
+                .expect("apply predecessor membership");
+            stage_membership_scope_sync(
+                &conn,
+                storage_identity,
+                transition_id,
+                transition_digest,
+                successor_identity,
+                &successor_members,
+            )
+            .expect("stage successor scope");
+            let learners = membership_entry_at(
+                1,
+                vec![predecessor_members.clone()],
+                successor_members.clone(),
+            );
+            let ready = topology_entry_at(
+                2,
+                0x74,
+                SessionMutationIntent::MarkTopologyLearnersReady {
+                    transition_id,
+                    request_digest: transition_digest,
+                },
+            );
+            append_logs_sync(&conn, storage_identity, &[learners.clone(), ready.clone()])
+                .expect("append successor readiness");
+            apply_entries_sync(&conn, storage_identity, &source.caps, vec![learners, ready])
+                .expect("apply successor readiness");
+            fence_application_authority_sync(
+                &conn,
+                storage_identity,
+                transition_id,
+                transition_digest,
+            )
+            .expect("fence successor authority");
+            let joint = membership_entry_at(
+                3,
+                vec![predecessor_members.clone(), successor_members.clone()],
+                successor_members.clone(),
+            );
+            let uniform = membership_entry_at(
+                4,
+                vec![successor_members.clone()],
+                successor_members.clone(),
+            );
+            let finalize = topology_entry_at(
+                5,
+                0x75,
+                SessionMutationIntent::FinalizeTopologyTransition {
+                    transition_id,
+                    request_digest: transition_digest,
+                },
+            );
+            append_logs_sync(
+                &conn,
+                storage_identity,
+                &[joint.clone(), uniform.clone(), finalize.clone()],
+            )
+            .expect("append successor cutover");
+            apply_entries_sync(
+                &conn,
+                storage_identity,
+                &source.caps,
+                vec![joint, uniform, finalize],
+            )
+            .expect("apply successor cutover");
+
+            let retained =
+                retirement_fixture_retained_with_terminal_sequence(0x76, 1, 1, retained_at, 8);
+            activate_protected_roster_schema_sync(&conn).expect("activate protected roster");
+            write_retirement_fixture_record(&conn, &retained, retained_at);
+            write_retirement_fixture_floor(&conn, retained.binding());
+            write_retirement_fixture_witness(&conn, std::slice::from_ref(&retained));
+            conn.execute(
+                "UPDATE consensus_machine SET application_sequence = 8 WHERE singleton = 1",
+                [],
+            )
+            .expect("set terminal sequence boundary");
+            save_log_pointer(&conn, "consensus_applied", storage_identity, &log_id(8))
+                .expect("set terminal Raft boundary");
+            let scope = read_membership_scope_sync(&conn, storage_identity)
+                .expect("read healthy successor scope");
+            assert_eq!(scope.current_identity, successor_identity);
+            assert!(scope.predecessor.is_some());
+            build_snapshot_database_sync(&conn, storage_identity, &snapshot_path)
+                .expect("build healthy successor snapshot")
+        };
+        drop(source);
+
+        let bindings = test_member_bindings(&successor_members);
+        let reopened = SqliteSessionBackend::open(&source_database).expect("reopen backend");
+        SqliteConsensusCore::initialize(
+            &reopened,
+            directory.path().join("reopen-snapshots"),
+            successor_identity,
+            successor_members.clone(),
+            bindings.clone(),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("reopen accepts the exact successor and terminal boundary");
+        drop(reopened);
+
+        let meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id: "protected-roster-successor-lifecycle".into(),
+        };
+        let target = SqliteSessionBackend::in_memory().expect("snapshot target");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, storage_identity, &predecessor_members)
+            .expect("initialize predecessor target");
+        let target_initial = membership_entry_at(
+            0,
+            vec![predecessor_members.clone()],
+            predecessor_members.clone(),
+        );
+        apply_entries_sync(
+            &target_conn,
+            storage_identity,
+            &target.caps,
+            vec![target_initial],
+        )
+        .expect("apply target predecessor membership");
+        install_snapshot_database_sync(
+            &target_conn,
+            storage_identity,
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000707.opc",
+            [0x71; 32],
+            std::fs::metadata(&snapshot_path)
+                .expect("healthy snapshot metadata")
+                .len(),
+        )
+        .expect("install healthy successor snapshot");
+        assert_eq!(
+            successor_identity,
+            read_membership_scope_sync(&target_conn, storage_identity)
+                .expect("installed successor scope")
+                .current_identity
+        );
+
+        std::fs::copy(&snapshot_path, &lineageless_snapshot)
+            .expect("copy lineageless snapshot fixture");
+        let lineageless =
+            Connection::open(&lineageless_snapshot).expect("open lineageless snapshot");
+        lineageless
+            .execute_batch(
+                "DELETE FROM consensus_membership_history; \
+                 UPDATE consensus_membership_scope \
+                 SET predecessor_configuration_id = NULL, predecessor_transition_id = NULL, \
+                     predecessor_transition_digest = NULL, predecessor_configuration_epoch = NULL, \
+                     predecessor_members_json = NULL, predecessor_transition_start_index = NULL, \
+                     predecessor_cutover_index = NULL;",
+            )
+            .expect("clear successor lineage");
+        drop(lineageless);
+
+        let before_scope = read_membership_scope_sync(&target_conn, storage_identity)
+            .expect("target scope before rejected snapshot");
+        let before_applied = read_applied_sync(&target_conn, storage_identity)
+            .expect("target applied before rejected snapshot");
+        let before_restore = ops::read_restore_scan_state_sync(&target_conn)
+            .expect("target restore state before rejected snapshot");
+        let error = install_snapshot_database_sync(
+            &target_conn,
+            storage_identity,
+            &lineageless_snapshot,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000708.opc",
+            [0x72; 32],
+            std::fs::metadata(&lineageless_snapshot)
+                .expect("lineageless snapshot metadata")
+                .len(),
+        )
+        .expect_err("lineageless successor snapshot must reject");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert_eq!(
+            before_scope,
+            read_membership_scope_sync(&target_conn, storage_identity)
+                .expect("rejected snapshot preserves target scope")
+        );
+        assert_eq!(
+            before_applied,
+            read_applied_sync(&target_conn, storage_identity)
+                .expect("rejected snapshot preserves target applied horizon")
+        );
+        assert_eq!(
+            before_restore,
+            ops::read_restore_scan_state_sync(&target_conn)
+                .expect("rejected snapshot preserves target restore state")
+        );
+        drop(target_conn);
+
+        let source_conn = Connection::open(&source_database).expect("open source for corruption");
+        save_log_pointer(
+            &source_conn,
+            "consensus_applied",
+            storage_identity,
+            &log_id(7),
+        )
+        .expect("move applied horizon before terminal receipt");
+        drop(source_conn);
+        let horizon_reopen = SqliteSessionBackend::open(&source_database).expect("horizon backend");
+        assert_eq!(
+            SessionConsensusStorageError::CorruptState,
+            SqliteConsensusCore::initialize(
+                &horizon_reopen,
+                directory.path().join("horizon-reopen-snapshots"),
+                successor_identity,
+                successor_members.clone(),
+                bindings.clone(),
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            .expect_err("reopen must reject terminal receipt beyond applied horizon")
+        );
+        drop(horizon_reopen);
+
+        std::fs::copy(&snapshot_path, &horizon_snapshot).expect("copy horizon snapshot fixture");
+        let horizon = Connection::open(&horizon_snapshot).expect("open horizon snapshot");
+        save_log_pointer(&horizon, "consensus_applied", storage_identity, &log_id(7))
+            .expect("move incoming horizon before terminal receipt");
+        drop(horizon);
+        let horizon_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(7)),
+            last_membership: meta.last_membership.clone(),
+            snapshot_id: "protected-roster-horizon-rejected".into(),
+        };
+        let horizon_target = SqliteSessionBackend::in_memory().expect("horizon target");
+        let horizon_target_conn = horizon_target.conn.lock().await;
+        initialize_schema(&horizon_target_conn, storage_identity, &predecessor_members)
+            .expect("initialize horizon target");
+        let before_horizon_target = read_applied_sync(&horizon_target_conn, storage_identity)
+            .expect("horizon target applied before rejection");
+        let error = install_snapshot_database_sync(
+            &horizon_target_conn,
+            storage_identity,
+            &horizon_snapshot,
+            &horizon_meta,
+            "snapshot-00000000-0000-4000-8000-000000000709.opc",
+            [0x73; 32],
+            std::fs::metadata(&horizon_snapshot)
+                .expect("horizon snapshot metadata")
+                .len(),
+        )
+        .expect_err("incoming terminal receipt beyond applied horizon must reject");
+        assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert_eq!(
+            before_horizon_target,
+            read_applied_sync(&horizon_target_conn, storage_identity)
+                .expect("rejected horizon snapshot preserves target")
+        );
+
+        let source_conn =
+            Connection::open(&source_database).expect("open source for lineage corruption");
+        save_log_pointer(
+            &source_conn,
+            "consensus_applied",
+            storage_identity,
+            &log_id(8),
+        )
+        .expect("restore applied horizon");
+        source_conn
+            .execute_batch(
+                "DELETE FROM consensus_membership_history; \
+                 UPDATE consensus_membership_scope \
+                 SET predecessor_configuration_id = NULL, predecessor_transition_id = NULL, \
+                     predecessor_transition_digest = NULL, predecessor_configuration_epoch = NULL, \
+                     predecessor_members_json = NULL, predecessor_transition_start_index = NULL, \
+                     predecessor_cutover_index = NULL;",
+            )
+            .expect("clear reopened successor lineage");
+        drop(source_conn);
+        let lineageless_reopen =
+            SqliteSessionBackend::open(&source_database).expect("lineageless reopen backend");
+        assert_eq!(
+            SessionConsensusStorageError::CorruptState,
+            SqliteConsensusCore::initialize(
+                &lineageless_reopen,
+                directory.path().join("lineageless-reopen-snapshots"),
+                successor_identity,
+                successor_members,
+                bindings,
+                ConsensusAuthorityProfile::Dynamic,
+                None,
+            )
+            .await
+            .expect_err("reopen must reject a lineageless non-genesis roster")
         );
     }
 

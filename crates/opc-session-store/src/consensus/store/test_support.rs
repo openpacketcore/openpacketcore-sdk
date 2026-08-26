@@ -41,7 +41,7 @@ use crate::fenced_mutation_roster::{
     RosterTerminalAttestationSigningInputV1, Scope, TerminalRecord, FRESH_ROSTER_MEMBERS,
 };
 use crate::fenced_mutation_roster_executor::{
-    AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration,
+    AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration, CommittedTerminal,
 };
 use crate::lease::SessionLeaseManager;
 use crate::model::{FenceToken, Generation, SessionKeyType, StateClass, StateType};
@@ -717,6 +717,10 @@ pub struct SignedRosterTerminalForTest {
     authority: AuthorityBinding,
     successor_lease: Option<crate::lease::LeaseGuard>,
     terminal: TerminalRecord,
+    /// Exact authenticated production composite captured before reclaim.
+    /// Compacted-status assertions must retain its Raft index rather than
+    /// deriving one from the admission history epoch.
+    committed: CommittedTerminal,
     proof_bundle: RosterExecutorProofBundleV1,
     terminal_evidence: RosterCompactTerminalEvidenceV2,
 }
@@ -959,11 +963,25 @@ pub async fn assert_mixed_compacted_roster_status_and_terminal_conflict_for_test
     if authority.fence() <= admission.authority.fence() {
         return Err("compacted-roster successor did not advance the fence".to_owned());
     }
-    let expected_tombstone = crate::fenced_mutation_roster::TerminalConflictTombstone::new(
-        &admission.admission,
-        &committed_terminal.terminal,
-    )
-    .map_err(|_| "expected compacted roster tombstone was invalid".to_owned())?;
+    if committed_terminal.committed.record() != &committed_terminal.terminal {
+        return Err("test compacted roster retained composite changed terminal body".to_owned());
+    }
+    let expected_tombstone =
+        crate::fenced_mutation_roster::TerminalConflictTombstone::from_committed_terminal(
+            &admission.admission,
+            &committed_terminal.committed,
+        )
+        .map_err(|_| "expected compacted roster tombstone was invalid".to_owned())?;
+    if expected_tombstone.terminal_raft_log_index()
+        != committed_terminal
+            .committed
+            .commit_metadata()
+            .raft_log_index()
+    {
+        return Err(
+            "compacted-roster tombstone did not retain the committed Raft index".to_owned(),
+        );
+    }
     let expected_tombstone_bytes = expected_tombstone
         .to_canonical_bytes()
         .map_err(|_| "expected compacted roster tombstone encoding failed".to_owned())?;
@@ -1693,9 +1711,9 @@ async fn submit_signed_roster_terminal_for_test(
         .await
         .map_err(|_| "test successor terminal status rejected".to_owned())?
         .0;
-    let receipt_commitment = match terminal_status {
+    let (receipt_commitment, committed) = match terminal_status {
         crate::sqlite::consensus::ProtectedRosterReadResult::Terminalized(read) => {
-            read.committed.receipt_commitment()
+            (read.committed.receipt_commitment(), read.committed)
         }
         _ => return Err("test successor terminal status was not retained".to_owned()),
     };
@@ -1754,6 +1772,7 @@ async fn submit_signed_roster_terminal_for_test(
             authority: authority.clone(),
             successor_lease: None,
             terminal,
+            committed,
             proof_bundle,
             terminal_evidence,
         }),

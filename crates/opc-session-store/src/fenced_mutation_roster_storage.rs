@@ -572,6 +572,22 @@ mod production_tests {
     }
 
     fn admission_for(tenant: &'static str, identity: u16) -> Admission {
+        admission_for_authority(
+            tenant,
+            identity,
+            OwnerId::new("owner").unwrap(),
+            FenceToken::new(1),
+            Generation::new(1),
+        )
+    }
+
+    fn admission_for_authority(
+        tenant: &'static str,
+        identity: u16,
+        owner: OwnerId,
+        fence: FenceToken,
+        generation: Generation,
+    ) -> Admission {
         let proposal = AdmissionProposal::new(
             Profile::v1(),
             RosterId::from_bytes([7; ROSTER_ID_BYTES]).unwrap(),
@@ -598,11 +614,21 @@ mod production_tests {
             proposal,
             key,
             Scope::from_digest([9; 32]),
-            OwnerId::new("owner").unwrap(),
-            FenceToken::new(1),
-            Generation::new(1),
+            owner,
+            fence,
+            generation,
         )
         .unwrap()
+    }
+
+    fn maximum_authority_admission(identity: u16) -> Admission {
+        admission_for_authority(
+            "tenant",
+            identity,
+            OwnerId::new("o".repeat(OwnerId::MAX_BYTES)).expect("maximum owner"),
+            FenceToken::new(u64::MAX),
+            Generation::new(u64::MAX),
+        )
     }
 
     fn terminal(admission: &Admission) -> CommittedTerminal {
@@ -614,6 +640,21 @@ mod production_tests {
         // the synthetic commit sequence globally unique so snapshot/restart
         // validation exercises the production total-order invariant. Identity
         // zero intentionally yields sequence one for the H=0 boundary.
+        let terminal_sequence = admission
+            .key()
+            .stable_id
+            .as_ref()
+            .iter()
+            .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte))
+            + 1;
+        terminal_at_with_raft_log_index(admission, epoch, terminal_sequence)
+    }
+
+    fn terminal_at_with_raft_log_index(
+        admission: &Admission,
+        epoch: u64,
+        raft_log_index: u64,
+    ) -> CommittedTerminal {
         let terminal_sequence = admission
             .key()
             .stable_id
@@ -633,11 +674,11 @@ mod production_tests {
         let committed_at = Timestamp::now_utc();
         let authority = AuthorityBinding::for_admission(
             admission,
-            OwnerId::new("owner").unwrap(),
-            FenceToken::new(1),
+            admission.logical_owner().clone(),
+            admission.admission_fence(),
             AuthorityLeaseMetadata::new(
                 1,
-                Generation::new(1),
+                admission.expected_generation(),
                 committed_at,
                 committed_at.add_seconds(1).unwrap(),
             ),
@@ -648,7 +689,7 @@ mod production_tests {
             admission,
             &authority,
             record,
-            ConsensusCommitMetadata::issue(terminal_sequence, terminal_sequence, committed_at)
+            ConsensusCommitMetadata::issue(terminal_sequence, raft_log_index, committed_at)
                 .unwrap(),
         )
         .unwrap()
@@ -1405,6 +1446,156 @@ mod production_tests {
         assert_eq!(store.rows[&binding].state, ReservationState::Tombstone);
         assert_eq!(store.witness.roster.floor_count(), 1);
         assert_eq!(store.witness.roster.durable_epoch_bindings(), 1);
+    }
+
+    #[test]
+    fn reclaim_preserves_the_committed_terminal_raft_log_index_in_the_tombstone() {
+        let profile = profile();
+        let admitted = admission(77);
+        let committed = terminal_at(&admitted, 7);
+        let commit_metadata = committed.commit_metadata();
+        let expected_raft_log_index = commit_metadata.raft_log_index();
+        let exact_reclaim_time = ConsensusMaintenanceTimestamp::from_consensus_timestamp(
+            commit_metadata
+                .committed_at()
+                .add_seconds(24 * 60 * 60)
+                .expect("exact retention boundary"),
+        )
+        .expect("bounded maintenance timestamp");
+        let mut record = live(&admitted, 7, profile);
+        record
+            .terminalize(&committed, profile)
+            .expect("retain committed terminal");
+        record
+            .reclaim_at(exact_reclaim_time, profile)
+            .expect("reclaim at the retention boundary");
+
+        let tombstone = record
+            .tombstone()
+            .expect("decode compact tombstone")
+            .expect("compact tombstone present");
+        assert_eq!(
+            tombstone.terminal_raft_log_index(),
+            expected_raft_log_index,
+            "reclaim must preserve the exact authenticated commit interval"
+        );
+        assert!(
+            tombstone
+                .to_canonical_bytes()
+                .expect("canonical tombstone")
+                .len()
+                <= MAX_TOMBSTONE_CODEC_BYTES
+        );
+    }
+
+    #[test]
+    fn reclaim_maximum_owner_and_scalars_fit_the_fixed_tombstone_ceiling() {
+        let profile = profile();
+        let admitted = maximum_authority_admission(78);
+        let committed = terminal_at_with_raft_log_index(&admitted, 7, u64::MAX);
+        let commit_metadata = committed.commit_metadata();
+        let exact_reclaim_time = ConsensusMaintenanceTimestamp::from_consensus_timestamp(
+            commit_metadata
+                .committed_at()
+                .add_seconds(24 * 60 * 60)
+                .expect("exact retention boundary"),
+        )
+        .expect("bounded maintenance timestamp");
+        let mut record = live(&admitted, 7, profile);
+        record
+            .terminalize(&committed, profile)
+            .expect("retain committed terminal");
+        record
+            .reclaim_at(exact_reclaim_time, profile)
+            .expect("reclaim maximum compact terminal");
+
+        let tombstone = record
+            .tombstone()
+            .expect("decode compact tombstone")
+            .expect("compact tombstone present");
+        let canonical = tombstone
+            .to_canonical_bytes()
+            .expect("canonical maximum tombstone");
+        assert_eq!(canonical.len(), 237);
+        assert!(canonical.len() <= MAX_TOMBSTONE_CODEC_BYTES);
+        assert_eq!(tombstone.terminal_raft_log_index(), u64::MAX);
+    }
+
+    #[test]
+    fn production_snapshot_validator_bounds_admission_and_terminal_indices_by_applied_horizon() {
+        let profile = profile();
+        let horizon = 10;
+        let witness = GlobalChargeWitness::empty();
+        let live_within_horizon = live(&admission(79), 7, profile);
+        let live_future = live(&admission(80), 11, profile);
+
+        assert!(
+            ProductionSnapshotStreamValidator::new(u64::MAX, Some(horizon))
+                .add_record(&live_within_horizon, None, witness, profile)
+                .is_ok()
+        );
+        for applied in [None, Some(0)] {
+            assert_eq!(
+                ProductionSnapshotStreamValidator::new(u64::MAX, applied).add_record(
+                    &live_within_horizon,
+                    None,
+                    witness,
+                    profile,
+                ),
+                Err(ReservationError::SnapshotMismatch),
+                "a roster admission needs a nonzero applied Raft horizon",
+            );
+        }
+        assert_eq!(
+            ProductionSnapshotStreamValidator::new(u64::MAX, Some(horizon)).add_record(
+                &live_future,
+                None,
+                witness,
+                profile,
+            ),
+            Err(ReservationError::SnapshotMismatch),
+            "a live admission cannot point beyond the applied Raft horizon",
+        );
+
+        let admitted = admission(81);
+        let committed = terminal_at_with_raft_log_index(&admitted, 7, 8);
+        let mut retained = live(&admitted, 7, profile);
+        retained
+            .terminalize(&committed, profile)
+            .expect("retain terminal for applied-horizon validation");
+        let exact_reclaim_time = ConsensusMaintenanceTimestamp::from_consensus_timestamp(
+            committed
+                .commit_metadata()
+                .committed_at()
+                .add_seconds(24 * 60 * 60)
+                .expect("exact retention boundary"),
+        )
+        .expect("bounded maintenance timestamp");
+        let mut tombstone = retained.clone();
+        tombstone
+            .reclaim_at(exact_reclaim_time, profile)
+            .expect("compact terminal for applied-horizon validation");
+
+        for (label, record) in [("retained", &retained), ("tombstone", &tombstone)] {
+            assert!(
+                ProductionSnapshotStreamValidator::new(u64::MAX, Some(horizon))
+                    .add_record(record, Some(8), witness, profile)
+                    .is_ok(),
+                "{label} terminal index inside its interval is valid"
+            );
+            for terminal_raft_log_index in [None, Some(6), Some(7), Some(11)] {
+                assert_eq!(
+                    ProductionSnapshotStreamValidator::new(u64::MAX, Some(horizon)).add_record(
+                        record,
+                        terminal_raft_log_index,
+                        witness,
+                        profile,
+                    ),
+                    Err(ReservationError::SnapshotMismatch),
+                    "{label} terminal index must satisfy admission < terminal <= applied",
+                );
+            }
+        }
     }
 
     #[test]
@@ -2735,7 +2926,7 @@ impl ProductionReservationRecord {
             .ok_or(ReservationError::StateShape)?;
         let tombstone = TerminalConflictTombstone::from_canonical_bytes(bytes)
             .map_err(|_| ReservationError::CanonicalEncoding)?;
-        if tombstone.binding_key() != self.binding {
+        if tombstone.validate_binding(self.binding).is_err() {
             return Err(ReservationError::SnapshotMismatch);
         }
         Ok(Some(tombstone))
@@ -2967,7 +3158,7 @@ impl ProductionReservationRecord {
                 .ok_or(ReservationError::StateShape)?;
             let decoded = TerminalConflictTombstone::from_canonical_bytes(tombstone)
                 .map_err(|_| ReservationError::CanonicalEncoding)?;
-            if decoded.binding_key() != self.binding {
+            if decoded.validate_binding(self.binding).is_err() {
                 return Err(ReservationError::SnapshotMismatch);
             }
             #[cfg(test)]
@@ -3236,9 +3427,9 @@ impl ProductionReservationRecord {
             .ok_or(ReservationError::StateShape)?;
         let terminal = CommittedTerminal::from_canonical_bytes(terminal_bytes, &admission)
             .map_err(|_| ReservationError::CanonicalEncoding)?;
-        let tombstone = TerminalConflictTombstone::new(&admission, terminal.record())
+        let tombstone = TerminalConflictTombstone::from_committed_terminal(&admission, &terminal)
             .map_err(|_| ReservationError::CanonicalEncoding)?;
-        if tombstone.binding_key() != self.binding {
+        if tombstone.validate_binding(self.binding).is_err() {
             return Err(ReservationError::SnapshotMismatch);
         }
         let tombstone_bytes = tombstone
@@ -3610,6 +3801,10 @@ pub(crate) fn validate_production_snapshot_witness(
 /// those SQLite-enforced keys.
 pub(crate) struct ProductionSnapshotStreamValidator {
     application_sequence: u64,
+    /// Exact consensus Raft horizon from the database's durable applied
+    /// pointer. Unlike the application sequence, this bounds the coordinates
+    /// embedded in roster admissions and terminal receipts.
+    applied_raft_log_index: Option<u64>,
     counters: AggregateCounters,
     record_count: usize,
     floor_count: usize,
@@ -3618,9 +3813,13 @@ pub(crate) struct ProductionSnapshotStreamValidator {
 
 impl ProductionSnapshotStreamValidator {
     /// Start an empty SQL-stream validation pass.
-    pub(crate) const fn new(application_sequence: u64) -> Self {
+    pub(crate) const fn new(
+        application_sequence: u64,
+        applied_raft_log_index: Option<u64>,
+    ) -> Self {
         Self {
             application_sequence,
+            applied_raft_log_index,
             counters: zero_counters(),
             record_count: 0,
             floor_count: 0,
@@ -3633,10 +3832,33 @@ impl ProductionSnapshotStreamValidator {
     pub(crate) fn add_record(
         &mut self,
         record: &ProductionReservationRecord,
+        terminal_raft_log_index: Option<u64>,
         witness: GlobalChargeWitness,
         profile: ChargeProfile,
     ) -> Result<(), ReservationError> {
         record.validate(profile)?;
+        let applied_raft_log_index = self
+            .applied_raft_log_index
+            .filter(|index| *index != 0)
+            .ok_or(ReservationError::SnapshotMismatch)?;
+        let admission_raft_log_index = record.binding().history_epoch();
+        if admission_raft_log_index == 0 || admission_raft_log_index > applied_raft_log_index {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        match record.state() {
+            ReservationState::Live if terminal_raft_log_index.is_none() => {}
+            ReservationState::Retained | ReservationState::Tombstone => {
+                let terminal_raft_log_index = terminal_raft_log_index
+                    .filter(|index| *index != 0)
+                    .ok_or(ReservationError::SnapshotMismatch)?;
+                if terminal_raft_log_index <= admission_raft_log_index
+                    || terminal_raft_log_index > applied_raft_log_index
+                {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+            }
+            ReservationState::Live => return Err(ReservationError::SnapshotMismatch),
+        }
         if record
             .terminal_sequence()
             .is_some_and(|sequence| sequence <= witness.retired_terminal_sequence())

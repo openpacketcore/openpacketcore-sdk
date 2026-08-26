@@ -69,7 +69,15 @@ const PUBLICATION_PAYLOAD_DOMAIN: &[u8] =
     b"opc/session-store/protected-roster/publication-payload/v1\0";
 const PUBLICATION_EVIDENCE_DOMAIN: &[u8] =
     b"opc/session-store/protected-roster/publication-evidence/v1\0";
-const TOMBSTONE_FRAME_DOMAIN: &[u8] = b"opc/session-store/protected-roster/tombstone-frame/v1\0";
+const TOMBSTONE_FRAME_DOMAIN: &[u8] = b"opc/session-store/protected-roster/tombstone-frame/v3\0";
+/// Binds the compact terminal's exact Raft position to the immutable roster
+/// admission and terminal body after their full retained copies are reclaimed.
+const TOMBSTONE_TERMINAL_INDEX_BINDING_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/tombstone-terminal-index-binding/v1\0";
+/// Commits the immutable admission owner without retaining its plaintext
+/// identity in the compact tombstone.
+const TOMBSTONE_ADMISSION_OWNER_COMMITMENT_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/tombstone-admission-owner-commitment/v1\0";
 const HISTORY_FLOOR_FRAME_DOMAIN: &[u8] =
     b"opc/session-store/protected-roster/history-floor-frame/v1\0";
 const ADMISSION_FRAME_DOMAIN: &[u8] = b"opc/session-store/protected-roster/admission-frame/v1\0";
@@ -81,7 +89,7 @@ const ADMISSION_FRAME_MAGIC: [u8; 8] = *b"OPCRAD2\0";
 const TERMINAL_FRAME_MAGIC: [u8; 8] = *b"OPCRTM2\0";
 /// Magic for the durable atomic terminal record/receipt composite frame.
 pub(crate) const COMMITTED_TERMINAL_FRAME_MAGIC: [u8; 8] = *b"OPCRCT1\0";
-const TOMBSTONE_FRAME_MAGIC: [u8; 8] = *b"OPCRTB1\0";
+const TOMBSTONE_FRAME_MAGIC: [u8; 8] = *b"OPCRTB3\0";
 const HISTORY_FLOOR_FRAME_MAGIC: [u8; 8] = *b"OPCRHF1\0";
 /// Domain separating executor-owned proof commitments from roster commitments.
 pub(crate) const PROOF_DOMAIN: &[u8] = b"opc/session-store/protected-roster/executor-proof/v1\0";
@@ -251,9 +259,9 @@ const PROFILE_DESCRIPTOR: &[u8] = concat!(
     "consumer-revision=5\n",
     "alpn=opc-session-consumer/3\n",
     "codec=postcard-canonical,frame-digest=sha256\n",
-    "domains=profile,admission,descriptor,terminal,terminal-slot,session-key-binding,tenant-scope-partition,provider-fence-binding,publication-id,publication-payload,publication-evidence,admission-frame,terminal-frame,committed-terminal-frame,tombstone-frame,history-floor-frame,executor-proof,executor-evidence,terminal-committing-guard,terminal-session-record,terminal-receipt,provider-scheduling,binding,descriptor,owner,credential,roster-attestation-root,roster-attestation-certificate,roster-attestation-proof,roster-attestation-provider-receipt,roster-attestation-stable-proof,roster-attestation-evidence,roster-attestation-bundle,roster-ingress-attestation,roster-ingress-capsule,roster-compact-admission-provenance,roster-compact-admission-commitment,roster-compact-admission-field,roster-compact-admission-slot,roster-compact-terminal-evidence,roster-compact-terminal-commitment\n",
-    "magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB1\\0,OPCRHF1\\0,OPCPRC1\\0\n",
-    "field-order=profile,roster,members,established-mutation,plan,checkpoint,result;key,scope,owner,fence,generation;binding:epoch,scope,tenant-scope-partition,session-key-commitment,roster-id;tombstone:binding,admission-commitment,terminal-commitment,admission-owner,admission-fence,generation,phase;history-floor:scope,tenant-scope-partition,retired-through\n",
+    "domains=profile,admission,descriptor,terminal,terminal-slot,session-key-binding,tenant-scope-partition,provider-fence-binding,publication-id,publication-payload,publication-evidence,admission-frame,terminal-frame,committed-terminal-frame,tombstone-frame,tombstone-terminal-index-binding,tombstone-admission-owner-commitment,history-floor-frame,executor-proof,executor-evidence,terminal-committing-guard,terminal-session-record,terminal-receipt,provider-scheduling,binding,descriptor,owner,credential,roster-attestation-root,roster-attestation-certificate,roster-attestation-proof,roster-attestation-provider-receipt,roster-attestation-stable-proof,roster-attestation-evidence,roster-attestation-bundle,roster-ingress-attestation,roster-ingress-capsule,roster-compact-admission-provenance,roster-compact-admission-commitment,roster-compact-admission-field,roster-compact-admission-slot,roster-compact-terminal-evidence,roster-compact-terminal-commitment\n",
+    "magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB3\\0,OPCRHF1\\0,OPCPRC1\\0\n",
+    "field-order=profile,roster,members,established-mutation,plan,checkpoint,result;key,scope,owner,fence,generation;binding:epoch,scope,tenant-scope-partition,session-key-commitment,roster-id;tombstone:scope,admission-commitment,terminal-commitment,admission-owner-commitment,admission-fence,generation,phase,terminal-raft-log-index,terminal-index-binding;history-floor:scope,tenant-scope-partition,retired-through\n",
     "executor-field-order=proof-binding:roster-attestation-proof,profile,configuration-identity,certificate-subject,certificate-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,terminal-phase,terminal-body-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,immutable-authority-scope,current-ingress-scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;provider-receipt=roster-attestation-provider-receipt,profile,configuration-identity,provider-certificate-subject,provider-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,immutable-authority-scope,current-ingress-scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;proof-commitment:roster-attestation-stable-proof,binding,registration-request-id,terminal-slot,roster-id,admission-commitment,phase,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,outcome,evidence-commitment;certificate=roster-attestation-certificate,version,root-id,role,configuration-identity,scope,subject,leaf-epoch,key-id[32],not-before,not-after,compressed-p256-key;attestation=p256-sha256,compressed-sec1:33,low-s-p1363:64,roles:executor|provider|transport-ingress;ingress=roster-ingress-attestation,profile-alpn,peer,scope,request,operation,capsule,authenticated-at,peer-cert-expires,material-generation,handshake-epoch;provider-operations=local-prepare-execute-status-adopt-compensate-reconcile\n",
     "committed-terminal-frame-field-order=record,commit-metadata(sequence,raft-log-index,committed-at),committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,committing-authority-scope,committing-authority-ingress-scope,committing-authority-key,committing-authority-owner,committing-authority-fence,committing-authority-credential,committing-authority-generation,committing-authority-acquired-at,committing-authority-expires-at,committing-guard-commitment,materialization,receipt-commitment;materialization-postcard-tags=updated:0,deleted:1,no-op:2,aborted:3\n",
     "terminal-guard-field-order=profile,committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,admission-commitment,immutable-authority-scope,current-ingress-scope,key,owner,fence,credential,generation,acquired-at,expires-at\n",
@@ -274,7 +282,7 @@ const PROFILE_DESCRIPTOR: &[u8] = concat!(
     "conclusive-matrix=prepare:none;execute:applied-executed;status:applied-executed|applied-adopted|not-applied-reconciled|compensated-reconciled;adopt:applied-adopted|not-applied-reconciled|compensated-reconciled;compensate:compensated-reconciled;reconcile:not-applied-reconciled|compensated-reconciled\n",
     "limits=max-members:8,accepted-members:1..8,fresh-target-members:6,plan:1048576,checkpoint:1048576,result:16384,roster-id:16,member-operation-id:16,descriptor:16384,status:4096,attestation-evidence:4096,attestation-bundle:40960,compact-terminal-evidence:8192,ingress-attestation:1024,admission-codec:2245658,terminal-codec:1065423,committed-terminal-codec:1069519,tombstone-codec:256,history-floor-codec:128,history-epoch-max:9223372036854775807,live:1024,live-plus-retained:131072,epoch-bindings:131072,operational-target:100000,reclaim:1024,retention-seconds:86400,quorum-mutations:fresh-success=2(admission,terminalization);remote-reads=admission-status,recover,terminal-status,current-publication-authority;local-authority-checks=provider-pre-post,publication-pre-post\n",
     "maintenance=bounded-deterministic-reclaim-and-retirement,payload-compaction,irreversible-floor-retirement;never-on-fresh-success;local-provider-journal-only\n",
-    "history=stable-slot-binds-epoch-scope-session-key-roster-id,new-v2-admission-atomically-selects-binds-current-epoch-greater-than-durable-exact-scope-floor-before-reserve,admit-reserves-one-terminal-slot,terminal-retention-starts-at-terminalization,reclaim-oldest-min-1024-eligible-to-v2-conflict-tombstone,never-reclaim-live,durable-canonical-scope-bound-irreversible-floor,never-reopen-before-scope-bound-irreversible-epoch-retirement\n",
+    "history=stable-slot-binds-epoch-scope-session-key-roster-id,new-v2-admission-atomically-selects-binds-current-epoch-greater-than-durable-exact-scope-floor-before-reserve,admit-reserves-one-terminal-slot,terminal-retention-starts-at-terminalization,reclaim-oldest-min-1024-eligible-to-v3-conflict-tombstone,compact-tombstone-retains-profile-bound-owner-commitment-and-committed-terminal-raft-log-index-bound-to-request-binding-admission-and-terminal-body,never-reclaim-live,durable-canonical-scope-bound-irreversible-floor,never-reopen-before-scope-bound-irreversible-epoch-retirement\n",
     "retry=any-provider-operation-only-after-its-direct-identical-retained-call-not-transmitted,outcome-unknown-status-adopt-only,not-found-non-exclusionary\n",
     "provider-fence=atomically-track-monotonic-current-execution-fence-per-exact-member-binding(roster-id,admission-commitment,scope,tenant,ordinal,stable-member-operation-id,descriptor,expected-version),reject-delayed-lower-fence-execute-after-higher-fence-status-or-adopt-conclusive-not-applied-or-compensated\n",
     "terminal=phase-inferred-from-complete-local-provider-proofs,prepared-body-local,first-conclusive-member-outcome-and-evidence-commitment-immutable-across-successors,established-alone-mints-publication-authority,aborted-nonpublishing,checkpoint-and-result-retained-exactly-through-terminal-retention,then-full-copies-atomically-deleted-and-payload-compacted-to-nonpublishing-conflict-status\n",
@@ -304,6 +312,8 @@ pub fn profile_digest() -> [u8; 32] {
         TERMINAL_FRAME_DOMAIN,
         COMMITTED_TERMINAL_FRAME_DOMAIN,
         TOMBSTONE_FRAME_DOMAIN,
+        TOMBSTONE_TERMINAL_INDEX_BINDING_DOMAIN,
+        TOMBSTONE_ADMISSION_OWNER_COMMITMENT_DOMAIN,
         HISTORY_FLOOR_FRAME_DOMAIN,
         PROOF_DOMAIN,
         EXECUTOR_EVIDENCE_DOMAIN,
@@ -2315,13 +2325,54 @@ pub trait MemberProvider: Send + Sync + 'static {
 /// alone therefore never reopens a stable roster ID for a different body.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TerminalConflictTombstone {
-    binding_key: RequestBindingKey,
+    scope: Scope,
     admission_body_commitment: [u8; 32],
     terminal_body_commitment: [u8; 32],
-    admission_owner: OwnerId,
+    admission_owner_commitment: [u8; 32],
     admission_fence: u64,
     expected_generation: u64,
     phase_tag: u8,
+    /// Exact applied-log coordinate from the authenticated retained terminal.
+    terminal_raft_log_index: u64,
+    /// Domain-separated binding of this coordinate to the exact immutable
+    /// admission and terminal identities.
+    terminal_index_binding: [u8; 32],
+}
+
+fn tombstone_terminal_index_binding(
+    profile: Profile,
+    binding: RequestBindingKey,
+    admission_body_commitment: [u8; 32],
+    terminal_body_commitment: [u8; 32],
+    admission_owner_commitment: [u8; 32],
+    phase_tag: u8,
+    terminal_raft_log_index: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(TOMBSTONE_TERMINAL_INDEX_BINDING_DOMAIN);
+    hasher.update(profile.schema().to_be_bytes());
+    hasher.update(profile.consumer_revision().to_be_bytes());
+    hasher.update(profile.digest());
+    hasher.update(binding.to_bytes());
+    hasher.update(admission_body_commitment);
+    hasher.update(terminal_body_commitment);
+    hasher.update(admission_owner_commitment);
+    hasher.update([phase_tag]);
+    hasher.update(terminal_raft_log_index.to_be_bytes());
+    hasher.finalize().into()
+}
+
+fn tombstone_admission_owner_commitment(profile: Profile, owner: &OwnerId) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(TOMBSTONE_ADMISSION_OWNER_COMMITMENT_DOMAIN);
+    hasher.update(profile.schema().to_be_bytes());
+    hasher.update(profile.consumer_revision().to_be_bytes());
+    hasher.update(profile.digest());
+    let owner = owner.as_str().as_bytes();
+    let owner_length = u64::try_from(owner.len()).expect("owner identifier length is bounded");
+    hasher.update(owner_length.to_be_bytes());
+    hasher.update(owner);
+    hasher.finalize().into()
 }
 
 /// Complete caller claim for one compacted terminal lookup.
@@ -2347,18 +2398,48 @@ pub(crate) struct CompactedTerminalLookup<'a> {
 }
 
 impl TerminalConflictTombstone {
-    /// Construct the validated compact binding for an exact terminal record.
+    /// Test-only fixture constructor. Production compaction must retain the
+    /// index minted by a committed terminal, never one derived from a request.
     #[cfg(test)]
     pub(crate) fn new(admission: &Admission, record: &TerminalRecord) -> Result<Self, Error> {
+        Self::from_record_with_raft_log_index(
+            admission,
+            record,
+            record.request_id().history_epoch(),
+        )
+    }
+
+    #[cfg(test)]
+    fn from_record_with_raft_log_index(
+        admission: &Admission,
+        record: &TerminalRecord,
+        terminal_raft_log_index: u64,
+    ) -> Result<Self, Error> {
         record.validate_for(admission)?;
+        if terminal_raft_log_index == 0 {
+            return Err(Error::InvalidHistory);
+        }
+        let binding_key = admission.binding_key(record.request_id().history_epoch())?;
+        let admission_owner_commitment =
+            tombstone_admission_owner_commitment(admission.profile(), admission.logical_owner());
         let value = Self {
-            binding_key: admission.binding_key(record.request_id().history_epoch())?,
+            scope: binding_key.scope,
             admission_body_commitment: admission.body_commitment(),
             terminal_body_commitment: record.body_commitment(),
-            admission_owner: admission.logical_owner().clone(),
+            admission_owner_commitment,
             admission_fence: admission.admission_fence().get(),
             expected_generation: admission.expected_generation().get(),
             phase_tag: record.phase()?.tag(),
+            terminal_raft_log_index,
+            terminal_index_binding: tombstone_terminal_index_binding(
+                admission.profile(),
+                binding_key,
+                admission.body_commitment(),
+                record.body_commitment(),
+                admission_owner_commitment,
+                record.phase()?.tag(),
+                terminal_raft_log_index,
+            ),
         };
         value.validate()?;
         Ok(value)
@@ -2370,13 +2451,12 @@ impl TerminalConflictTombstone {
         admission: &Admission,
     ) -> Result<CompactedTerminalStatus, Error> {
         let binding_key = admission.binding_key(history_epoch)?;
-        if self.binding_key != binding_key {
-            return Err(Error::InvalidAuthority);
-        }
+        self.validate_binding(binding_key)?;
         if self.admission_body_commitment != admission.body_commitment() {
             return Err(Error::RequestConflict);
         }
-        if self.admission_owner != *admission.logical_owner()
+        if self.admission_owner_commitment
+            != tombstone_admission_owner_commitment(admission.profile(), admission.logical_owner())
             || self.admission_fence != admission.admission_fence().get()
             || self.expected_generation != admission.expected_generation().get()
         {
@@ -2386,6 +2466,27 @@ impl TerminalConflictTombstone {
             phase: Phase::from_tag(self.phase_tag)?,
             terminal_body_commitment: self.terminal_body_commitment,
         })
+    }
+
+    /// Recompute the exact request binding from the row/index key without
+    /// reconstructing the reclaimed admission body.
+    pub(crate) fn validate_binding(&self, binding: RequestBindingKey) -> Result<(), Error> {
+        self.validate()?;
+        if self.scope != binding.scope
+            || self.terminal_index_binding
+                != tombstone_terminal_index_binding(
+                    Profile::v1(),
+                    binding,
+                    self.admission_body_commitment,
+                    self.terminal_body_commitment,
+                    self.admission_owner_commitment,
+                    self.phase_tag,
+                    self.terminal_raft_log_index,
+                )
+        {
+            return Err(Error::InvalidAuthority);
+        }
+        Ok(())
     }
 
     /// Validate a compacted replay lookup without retaining an admission body.
@@ -2398,14 +2499,13 @@ impl TerminalConflictTombstone {
         // tombstone, while the exact caller key and roster remain bound to it.
         let binding_key = request_binding_key(
             lookup.history_epoch,
-            self.binding_key.scope,
+            self.scope,
             lookup.key,
             lookup.roster_id,
         )?;
-        if self.binding_key != binding_key {
-            return Err(Error::InvalidAuthority);
-        }
-        if self.admission_owner != *lookup.original_owner
+        self.validate_binding(binding_key)?;
+        if self.admission_owner_commitment
+            != tombstone_admission_owner_commitment(Profile::v1(), lookup.original_owner)
             || lookup.original_admission_fence.get() != self.admission_fence
             || lookup.current_fence.get() <= self.admission_fence
             || lookup.current_generation.get() != self.expected_generation
@@ -2442,8 +2542,13 @@ impl TerminalConflictTombstone {
     }
 
     fn validate(&self) -> Result<(), Error> {
-        self.binding_key.validate()?;
-        if self.admission_body_commitment == [0; 32] || self.terminal_body_commitment == [0; 32] {
+        self.scope.validate()?;
+        if self.admission_body_commitment == [0; 32]
+            || self.terminal_body_commitment == [0; 32]
+            || self.admission_owner_commitment == [0; 32]
+            || self.terminal_raft_log_index == 0
+            || self.terminal_index_binding == [0; 32]
+        {
             return Err(Error::InvalidHistory);
         }
         if self.admission_fence == 0 {
@@ -2462,26 +2567,30 @@ impl fmt::Debug for TerminalConflictTombstone {
 
 #[derive(Deserialize)]
 struct TerminalConflictTombstoneWire {
-    binding_key: RequestBindingKey,
+    scope: [u8; 32],
     admission_body_commitment: [u8; 32],
     terminal_body_commitment: [u8; 32],
-    admission_owner: OwnerId,
+    admission_owner_commitment: [u8; 32],
     admission_fence: u64,
     expected_generation: u64,
     phase_tag: u8,
+    terminal_raft_log_index: u64,
+    terminal_index_binding: [u8; 32],
 }
 
 impl<'de> Deserialize<'de> for TerminalConflictTombstone {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = TerminalConflictTombstoneWire::deserialize(deserializer)?;
         let value = Self {
-            binding_key: wire.binding_key,
+            scope: Scope::from_digest(wire.scope),
             admission_body_commitment: wire.admission_body_commitment,
             terminal_body_commitment: wire.terminal_body_commitment,
-            admission_owner: wire.admission_owner,
+            admission_owner_commitment: wire.admission_owner_commitment,
             admission_fence: wire.admission_fence,
             expected_generation: wire.expected_generation,
             phase_tag: wire.phase_tag,
+            terminal_raft_log_index: wire.terminal_raft_log_index,
+            terminal_index_binding: wire.terminal_index_binding,
         };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
@@ -2867,9 +2976,9 @@ mod frozen_cross_crate_goldens {
         assert_eq!(
             profile_digest(),
             [
-                0xb9, 0xb1, 0xe7, 0xce, 0xbb, 0x01, 0x58, 0xb2, 0x75, 0xf6, 0xfc, 0x5d, 0x17, 0x70,
-                0x97, 0xe3, 0xab, 0xa5, 0x09, 0x22, 0x24, 0x07, 0x98, 0x23, 0xeb, 0x7a, 0x41, 0x8f,
-                0xae, 0x53, 0x07, 0x6c,
+                0x7c, 0x49, 0x24, 0x64, 0xa0, 0x8d, 0xb0, 0x8f, 0xde, 0x85, 0x21, 0x0b, 0xc8, 0xdb,
+                0x00, 0x15, 0x68, 0x82, 0xef, 0x24, 0x50, 0x3b, 0x99, 0x77, 0x34, 0x28, 0xce, 0x24,
+                0x1f, 0x87, 0x12, 0x6a,
             ]
         );
         assert_eq!(
@@ -2905,6 +3014,73 @@ mod frozen_cross_crate_goldens {
                 0xc4, 0x91, 0xef, 0x25, 0x54, 0xa4, 0x49, 0xf0, 0xa3, 0x19, 0x14, 0xb8, 0xf3, 0x5f,
                 0xef, 0x53, 0xf0, 0x11,
             ]
+        );
+    }
+
+    #[test]
+    fn tombstone_v3_rejects_old_frames_and_tampered_commitments() {
+        let admission = admission();
+        let terminal = TerminalRecord::new(
+            &admission,
+            RequestId::bind(4, &admission).expect("terminal request ID"),
+            Phase::Established,
+            vec![[1; 32]; FRESH_ROSTER_MEMBERS],
+        )
+        .expect("terminal");
+        let tombstone =
+            TerminalConflictTombstone::new(&admission, &terminal).expect("v3 tombstone");
+        let canonical = tombstone.to_canonical_bytes().expect("v3 frame");
+        assert_eq!(
+            TerminalConflictTombstone::from_canonical_bytes(&canonical),
+            Ok(tombstone.clone())
+        );
+
+        let old_frame = encode_frame(
+            *b"OPCRTB2\0",
+            b"opc/session-store/protected-roster/tombstone-frame/v2\0",
+            &tombstone,
+            MAX_TOMBSTONE_CODEC_BYTES,
+        )
+        .expect("old-version frame");
+        assert_eq!(
+            TerminalConflictTombstone::from_canonical_bytes(&old_frame),
+            Err(Error::InvalidEncoding),
+            "mixed old/new tombstone frames fail closed"
+        );
+
+        let mut rebound = tombstone;
+        rebound.terminal_raft_log_index += 1;
+        let rebound_frame = encode_frame(
+            TOMBSTONE_FRAME_MAGIC,
+            TOMBSTONE_FRAME_DOMAIN,
+            &rebound,
+            MAX_TOMBSTONE_CODEC_BYTES,
+        )
+        .expect("rebound v3 frame");
+        let rebound = TerminalConflictTombstone::from_canonical_bytes(&rebound_frame)
+            .expect("structural decoder accepts a framed tombstone");
+        assert_eq!(
+            rebound.validate_binding(admission.binding_key(4).expect("binding")),
+            Err(Error::InvalidAuthority),
+            "the terminal index binding rejects a reframed changed index"
+        );
+
+        let mut changed_owner_commitment = tombstone;
+        changed_owner_commitment.admission_owner_commitment[0] ^= 1;
+        let changed_owner_commitment = encode_frame(
+            TOMBSTONE_FRAME_MAGIC,
+            TOMBSTONE_FRAME_DOMAIN,
+            &changed_owner_commitment,
+            MAX_TOMBSTONE_CODEC_BYTES,
+        )
+        .expect("owner-commitment tamper frame");
+        let changed_owner_commitment =
+            TerminalConflictTombstone::from_canonical_bytes(&changed_owner_commitment)
+                .expect("structural decoder accepts owner-commitment tamper");
+        assert_eq!(
+            changed_owner_commitment.validate_admission(4, &admission),
+            Err(Error::InvalidAuthority),
+            "the owner commitment is bound into the terminal index binding"
         );
     }
 

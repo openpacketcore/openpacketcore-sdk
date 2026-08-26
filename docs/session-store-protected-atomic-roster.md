@@ -32,9 +32,15 @@ FencedMutationRosterAdmissionProposal::new(
     terminal_result,
 )
 
+FencedMutationRosterExecutorAttestorAdapter::new(
+    topology_trust_root,
+    executor_certificate,
+    Arc<dyn FencedMutationRosterExecutorTerminalSigner>,
+)
+
 FencedMutationRosterClient::{prepare, admit, admission_status, recover}
 FencedMutationRosterClient::{prepare_member, execute, status, adopt,
-                              compensate_member}
+                              reconcile, compensate_member}
 FencedMutationRosterClient::{prepare_terminal, terminalize, terminal_status}
 FencedMutationRosterProviderAdapter::publish
 ```
@@ -42,6 +48,14 @@ FencedMutationRosterProviderAdapter::publish
 `prepare`, member-provider operations, terminal preparation, and publication
 provider operations are local. Admission and terminalization are the only
 state-changing remote roster calls.
+
+The attestor adapter accepts only topology-provisioned public trust material
+and an HSM/KMS signer for SDK-constructed terminal preimages. The signer has no
+tenant selector, proof constructor, consensus handle, or administrative
+capability. The executor validates the certificate, current authority, exact
+scope/body, and complete provider proof set before and after signing. The
+public `fenced_mutation_roster_*_signing_digest_*` helpers expose only the exact
+prehash for those typed SDK inputs.
 
 ## Immutable admission
 
@@ -122,12 +136,12 @@ state value, or a mixed Established/Aborted proof set cannot terminalize.
 ## Provider proof boundary
 
 `FencedMutationRosterMemberProvider` is generic over opaque descriptors. Its
-`prepare`, `execute`, `status`, `adopt`, and optional `compensate_member`
-methods receive an SDK-created `FencedMutationRosterMemberCall`. The call binds
-the roster and admission commitment, ordinal, stable member operation ID,
-descriptor and descriptor commitment, expected version and generation,
-authenticated scope/key/owner, current fence and credential, and half-open
-lease window.
+`prepare`, `execute`, `status`, `adopt`, `reconcile_member`, and optional
+`compensate_member` methods receive an SDK-created
+`FencedMutationRosterMemberCall`. The call binds the roster and admission
+commitment, ordinal, stable member operation ID, descriptor and descriptor
+commitment, expected version and generation, authenticated scope/key/owner,
+current fence and credential, and half-open lease window.
 
 A provider response is only an observation.
 `FencedMutationRosterProviderCallOutcome::conclusive` accepts exactly four
@@ -139,6 +153,14 @@ truth-table rows:
 | Applied | Adopted | Established |
 | NotApplied | Reconciled | Aborted |
 | Compensated | Reconciled | Aborted |
+
+The operation/outcome matrix is also fixed: `prepare` is never conclusive;
+`execute` can conclude only `Applied + Executed`; `status` can reproduce an
+applied outcome or report a reconciled non-applied/compensated outcome;
+`adopt` can conclude `Applied + Adopted` or a reconciled
+non-applied/compensated outcome; `compensate_member` can conclude only
+`Compensated + Reconciled`; and `reconcile_member` can conclude only
+`NotApplied + Reconciled` or `Compensated + Reconciled`.
 
 The startup-fixed SDK executor validates the provider result, checks current
 authority before and after the call, and signs the exact member/body binding.
@@ -198,6 +220,16 @@ least 24 hours old. Each operation selects the oldest deterministic
 `min(1024, eligible)` rows, including a smaller final batch, and never selects
 a live or ambiguous roster. Irreversible conflict/history floors preserve
 same-ID replay/conflict behavior after protected payload compaction.
+
+The fixed V3 compact terminal tombstone is at most 256 bytes (237 bytes at
+maximum owner, fence, generation, and Raft-index widths). It binds the exact
+scope and request identity, admission and terminal body commitments, a
+profile-bound commitment to the immutable admission owner, terminal phase, and
+the terminal transaction's actual Raft log index. Reopen and snapshot install
+authenticate the admission and terminal signers against their respective
+membership intervals and require `0 < admission_index < terminal_index <=
+applied_index` for terminal records. A non-genesis roster cannot survive after
+its predecessor/history anchor is removed.
 
 ## Diagnostics and isolation
 

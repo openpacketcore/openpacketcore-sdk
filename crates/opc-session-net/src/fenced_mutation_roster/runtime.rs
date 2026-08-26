@@ -1222,13 +1222,22 @@ pub(crate) struct RecoveryLookup {
 }
 
 impl RecoveryLookup {
-    pub(crate) fn new(scope: Scope, roster_id: super::canonical::RosterId) -> Self {
-        Self { scope, roster_id }
+    pub(crate) fn new(ingress_scope: Scope, roster_id: super::canonical::RosterId) -> Self {
+        Self {
+            scope: ingress_scope,
+            roster_id,
+        }
     }
 
-    /// Exact current least-authority ingress scope for this lookup.
-    pub(crate) const fn scope(&self) -> Scope {
+    /// Exact current authenticated ingress scope for this lookup.
+    pub(crate) const fn ingress_scope(&self) -> Scope {
         self.scope
+    }
+
+    /// Compatibility alias for the current ingress scope. This is never the
+    /// durable historical admission scope, which is resolved from the row.
+    pub(crate) const fn scope(&self) -> Scope {
+        self.ingress_scope()
     }
 
     /// Stable caller-owned roster identity.
@@ -1328,7 +1337,7 @@ impl RecoveryLeaseAuthority {
 impl RecoveryRequest {
     /// Validate one successor-takeover request before its durable lookup.
     pub(crate) fn new(input: RecoveryRequestInput) -> Result<Self, ExecutorError> {
-        if input.authority.scope() != input.lookup.scope()
+        if input.authority.ingress_scope() != input.lookup.ingress_scope()
             || input.original_admission_fence.get() == 0
             || input.authority.fence() <= input.original_admission_fence
         {
@@ -1349,7 +1358,7 @@ impl RecoveryRequest {
         original_admission_fence: FenceToken,
         authority: RecoveryLeaseAuthority,
     ) -> Result<Self, ExecutorError> {
-        let authority = authority.into_authority(lookup.scope())?;
+        let authority = authority.into_authority(lookup.ingress_scope())?;
         Self::new(RecoveryRequestInput::new(
             lookup,
             original_owner,
@@ -1384,7 +1393,7 @@ impl RecoveryRequest {
     /// can provide historical authority or scope.
     fn resolve_for_admission(mut self, admission: &Admission) -> Result<Self, ExecutorError> {
         if self.lookup.roster_id() != admission.roster_id()
-            || self.authority.ingress_scope() != self.lookup.scope()
+            || self.authority.ingress_scope() != self.lookup.ingress_scope()
         {
             return Err(ExecutorError::InvalidRegistration);
         }
