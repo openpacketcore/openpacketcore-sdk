@@ -1175,6 +1175,7 @@ impl ConsensusStoreDiagnosticCounters {
 
 struct ConsensusSessionStoreInner {
     raft: SessionRaft,
+    storage_shutdown: storage::ConsensusStorageShutdownObserver,
     raft_handler: SessionRaftRpcHandler,
     backend: SqliteSessionBackend,
     proactive_checkpoint_lane: Option<Arc<crate::sqlite::consensus::ProactiveCheckpointLane>>,
@@ -1269,7 +1270,9 @@ async fn shutdown_consensus_session_store(
         .raft
         .shutdown()
         .await
-        .map_err(|_| consensus_unavailable())
+        .map_err(|_| consensus_unavailable())?;
+    inner.storage_shutdown.wait().await;
+    Ok(())
 }
 
 async fn await_consensus_session_store_shutdown(
@@ -2400,6 +2403,9 @@ impl ConsensusSessionStore {
             .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
+        let storage_shutdown = state_machine
+            .shutdown_observer()
+            .ok_or(ConsensusSessionStoreOpenError::StorageUnavailable)?;
         let (membership_scope, _) = backend
             .consensus_membership_scope_snapshot(storage_identity)
             .await
@@ -2465,6 +2471,7 @@ impl ConsensusSessionStore {
 
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            storage_shutdown,
             raft_handler,
             backend,
             proactive_checkpoint_lane,
@@ -2614,6 +2621,9 @@ impl ConsensusSessionStore {
         .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
+        let storage_shutdown = state_machine
+            .shutdown_observer()
+            .ok_or(ConsensusSessionStoreOpenError::StorageUnavailable)?;
         let (membership_scope, _) = backend
             .consensus_membership_scope_snapshot(storage_identity)
             .await
@@ -2665,6 +2675,7 @@ impl ConsensusSessionStore {
 
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            storage_shutdown,
             raft_handler,
             backend,
             proactive_checkpoint_lane,
@@ -9192,7 +9203,12 @@ impl ConsensusSessionConsumerService {
             | SessionConsumerOperation::ObserveFencedTransition { .. }
             | SessionConsumerOperation::LeaseMutationStatus { .. }
             | SessionConsumerOperation::CompareAndSetStatus { .. }
-            | SessionConsumerOperation::FencedTransitionStatus { .. } => {
+            | SessionConsumerOperation::FencedTransitionStatus { .. }
+            | SessionConsumerOperation::FencedMutationRosterPollAdmit { .. }
+            | SessionConsumerOperation::FencedMutationRosterAdmissionStatus { .. }
+            | SessionConsumerOperation::FencedMutationRosterRecover { .. }
+            | SessionConsumerOperation::FencedMutationRosterTerminalize { .. }
+            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. } => {
                 SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
             }
             SessionConsumerOperation::FencedTransition { .. } => {
@@ -9244,7 +9260,16 @@ impl ConsensusSessionConsumerService {
             | SessionConsumerOperation::ObserveFencedTransition { .. }
             | SessionConsumerOperation::LeaseMutationStatus { .. }
             | SessionConsumerOperation::CompareAndSetStatus { .. }
-            | SessionConsumerOperation::FencedTransitionStatus { .. } => false,
+            | SessionConsumerOperation::FencedTransitionStatus { .. }
+            // Protected-roster operations are deliberately outside this
+            // ordinary consumer mutation classifier. The dedicated `/3`
+            // ingress authenticates and dispatches them through its closed
+            // roster service instead of this general authorization path.
+            | SessionConsumerOperation::FencedMutationRosterPollAdmit { .. }
+            | SessionConsumerOperation::FencedMutationRosterAdmissionStatus { .. }
+            | SessionConsumerOperation::FencedMutationRosterRecover { .. }
+            | SessionConsumerOperation::FencedMutationRosterTerminalize { .. }
+            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. } => false,
             SessionConsumerOperation::Batch { ops } => ops
                 .iter()
                 .any(|operation| !matches!(operation, SessionOp::Get { .. })),
@@ -9888,6 +9913,13 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                 )
             }
             SessionConsumerOperation::Watch { .. } => SessionConsumerResponse::WatchOpened,
+            SessionConsumerOperation::FencedMutationRosterPollAdmit { .. }
+            | SessionConsumerOperation::FencedMutationRosterAdmissionStatus { .. }
+            | SessionConsumerOperation::FencedMutationRosterRecover { .. }
+            | SessionConsumerOperation::FencedMutationRosterTerminalize { .. }
+            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. } => {
+                SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized)
+            }
         }
     }
 
@@ -14600,6 +14632,84 @@ mod membership_tests {
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_retry_after_cancellation_waits_for_detached_snapshot_capture() {
+        let directory = tempfile::tempdir().expect("shutdown retry directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("shutdown retry SQLite backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open shutdown retry store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize shutdown retry store");
+
+        let capture_gate = store.inner.backend.snapshot_capture_gate();
+        capture_gate.arm();
+        store
+            .inner
+            .raft
+            .trigger()
+            .snapshot()
+            .await
+            .expect("start engine-owned snapshot capture");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !capture_gate.started() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("detached snapshot capture reaches its fixed gate");
+
+        let cancelled_shutdown = tokio::spawn({
+            let store = store.clone();
+            async move { store.shutdown().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.inner.raft.metrics().borrow().running_state.is_ok() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("shutdown reaches the engine termination edge");
+        tokio::task::yield_now().await;
+        assert!(
+            !cancelled_shutdown.is_finished(),
+            "shutdown must remain pending while the detached snapshot worker owns SQLite"
+        );
+        cancelled_shutdown.abort();
+        assert!(
+            cancelled_shutdown
+                .await
+                .expect_err("public shutdown future is cancelled")
+                .is_cancelled(),
+            "the fixture must cancel only the public shutdown caller"
+        );
+
+        let retry = tokio::spawn({
+            let store = store.clone();
+            async move { store.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !retry.is_finished(),
+            "a retry cannot authorize reopening while the detached snapshot worker owns SQLite"
+        );
+
+        capture_gate.release();
+        tokio::time::timeout(Duration::from_secs(5), retry)
+            .await
+            .expect("released detached snapshot worker completes the retry barrier")
+            .expect("retry task remains available")
+            .expect("retry authorizes reopening only after all tracked owners exit");
     }
 
     #[tokio::test]
