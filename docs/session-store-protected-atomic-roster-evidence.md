@@ -42,7 +42,8 @@ The following locked tests run through the production revision-five roster
 transport. Commands are shown without private paths or credentials.
 
 ```text
-cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
+env CARGO_PROFILE_TEST_OPT_LEVEL=1 \
+  cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
   persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal \
   -- --exact --nocapture
 
@@ -100,7 +101,8 @@ cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-fe
   persistent_three_voter_protected_roster_publication_published_before_acknowledgement_survives_full_restart \
   -- --exact --nocapture
 
-cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-features \
+env CARGO_PROFILE_TEST_OPT_LEVEL=1 \
+  cargo test --locked -p opc-session-net --test stateless_quorum_consumer --all-features \
   persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart \
   -- --exact --nocapture
 
@@ -180,7 +182,7 @@ result: PASS
 cargo test --locked -p opc-session-store --lib 'recovery::tests::' -- --nocapture
 result: PASS; 44 passed, 0 failed
 
-cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
+cargo test --locked -p opc-session-net --all-features --test stateless_quorum_consumer \
   -- --nocapture
 result: PASS; 40 passed, 0 failed, 2 release-only latency tests ignored
 ```
