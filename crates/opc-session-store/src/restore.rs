@@ -9,19 +9,19 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aes_gcm_siv::{
-    aead::{generic_array::GenericArray, AeadInPlace, KeyInit},
     Aes256GcmSiv,
+    aead::{AeadInPlace, KeyInit, generic_array::GenericArray},
 };
 use hmac::{Hmac, Mac};
 use opc_key::Zeroizing;
-use opc_redaction::{redact_text, RedactionSummary};
+use opc_redaction::{RedactionSummary, redact_text};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    hex::encode_lower, OwnerId, SessionKey, SessionKeyType, StateClass, StateType, StoreError,
-    StoredSessionRecord,
+    OwnerId, SessionKey, SessionKeyType, StateClass, StateType, StoreError, StoredSessionRecord,
+    hex::encode_lower,
 };
 
 /// Default maximum restore scan page size.

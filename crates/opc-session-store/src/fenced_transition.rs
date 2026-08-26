@@ -2636,8 +2636,8 @@ mod tests {
     use bytes::Bytes;
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
-        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
-        AES_256_GCM_SIV_NONCE_LEN,
+        AEAD_TAG_LEN, AES_256_GCM_SIV_NONCE_LEN, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad,
+        serialize_bound_aad,
     };
     use opc_types::{NetworkFunctionKind, TenantId};
 
@@ -3139,9 +3139,11 @@ mod tests {
                 .request_id(),
             request_id,
         );
-        assert!(prepared
-            .request_for_authenticated_consumer([0x62; 32])
-            .is_err());
+        assert!(
+            prepared
+                .request_for_authenticated_consumer([0x62; 32])
+                .is_err()
+        );
         assert_eq!(
             format!("{prepared:?}"),
             "PreparedFencedTransition(<redacted>)"
@@ -3380,11 +3382,13 @@ mod tests {
             Err(StoreError::InvalidSessionTtl)
         ));
 
-        assert!(FencedTransitionLease::renew(
-            lease_guard(key(), owner.clone(), FenceToken::new(8)),
-            maximum,
-        )
-        .is_ok());
+        assert!(
+            FencedTransitionLease::renew(
+                lease_guard(key(), owner.clone(), FenceToken::new(8)),
+                maximum,
+            )
+            .is_ok()
+        );
         assert!(matches!(
             FencedTransitionLease::renew(
                 lease_guard(key(), owner.clone(), FenceToken::new(8)),
@@ -3741,9 +3745,11 @@ mod tests {
                 Err(StoreError::LeaseExpired)
             );
         }
-        assert!(request_with_expiry(0x14, timestamp(21))
-            .validate_at(admission)
-            .is_ok());
+        assert!(
+            request_with_expiry(0x14, timestamp(21))
+                .validate_at(admission)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3945,15 +3951,17 @@ mod tests {
             retained_until,
         };
 
-        assert!(make_outcome(
-            recorded_at,
-            exact_maximum,
-            FencedTransitionMutationResult::TtlRefreshed {
-                expires_at: exact_maximum,
-            },
-        )
-        .validate()
-        .is_ok());
+        assert!(
+            make_outcome(
+                recorded_at,
+                exact_maximum,
+                FencedTransitionMutationResult::TtlRefreshed {
+                    expires_at: exact_maximum,
+                },
+            )
+            .validate()
+            .is_ok()
+        );
         for invalid in [
             make_outcome(
                 recorded_at,
@@ -4358,11 +4366,13 @@ mod tests {
             *decoded.request_id().body_commitment()
         );
         assert!(decoded.validate().is_ok());
-        assert!(serde_json::from_str::<FencedTransitionV2Request>(&format!(
-            "{{\"unexpected\":true,{}}}",
-            &encoded[1..]
-        ))
-        .is_err());
+        assert!(
+            serde_json::from_str::<FencedTransitionV2Request>(&format!(
+                "{{\"unexpected\":true,{}}}",
+                &encoded[1..]
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -4518,25 +4528,37 @@ mod tests {
         assert_eq!(FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_REVISION, 2);
         assert_eq!(FENCED_TRANSITION_V2_ERROR_STATUS_REVISION, 2);
         assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR.contains("body=version:u8=1"));
-        assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR
-            .contains("ingress=validate-commitment-before-semantic-validation"));
+        assert!(
+            FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR
+                .contains("ingress=validate-commitment-before-semantic-validation")
+        );
         assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR.contains("outer-id="));
         assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR.contains("validation=see:"));
         assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR.contains("command-transport=see:"));
         assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR.contains("record-envelope=see:"));
-        assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR
-            .contains("outcome-retention=secs-u64be+nanos-u64be"));
+        assert!(
+            FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR
+                .contains("outcome-retention=secs-u64be+nanos-u64be")
+        );
         assert!(
             FENCED_TRANSITION_V2_COMMAND_TRANSPORT_SCHEMA_DESCRIPTOR.contains("rpc=postcard-1.1.3")
         );
-        assert!(FENCED_TRANSITION_V2_RECORD_ENVELOPE_SCHEMA_DESCRIPTOR
-            .contains("envelope=magic:OPCE:bytes4,version:u16be=1"));
-        assert!(FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR
-            .contains("payload-capacity=exact-max-record-payload-bytes"));
-        assert!(FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR
-            .contains("derived-deadlines=lease-and-refresh"));
-        assert!(FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR
-            .contains("timestamp-wire=canonical-rfc3339-year[0000,9999]"));
+        assert!(
+            FENCED_TRANSITION_V2_RECORD_ENVELOPE_SCHEMA_DESCRIPTOR
+                .contains("envelope=magic:OPCE:bytes4,version:u16be=1")
+        );
+        assert!(
+            FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR
+                .contains("payload-capacity=exact-max-record-payload-bytes")
+        );
+        assert!(
+            FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR
+                .contains("derived-deadlines=lease-and-refresh")
+        );
+        assert!(
+            FENCED_TRANSITION_V2_VALIDATION_SCHEMA_DESCRIPTOR
+                .contains("timestamp-wire=canonical-rfc3339-year[0000,9999]")
+        );
         assert_eq!(FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, 1_048_576);
         assert_eq!(
             FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
@@ -4556,9 +4578,13 @@ mod tests {
         assert!(
             FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR.contains("replay-epochs<=7")
         );
-        assert!(FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR
-            .contains("generation:u64be<=durable-counter-max"));
-        assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR.contains("replicated-command-wire="));
+        assert!(
+            FENCED_TRANSITION_V2_PERSISTED_HISTORY_SCHEMA_DESCRIPTOR
+                .contains("generation:u64be<=durable-counter-max")
+        );
+        assert!(
+            FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR.contains("replicated-command-wire=")
+        );
         assert!(FENCED_TRANSITION_V2_PROFILE_SCHEMA_DESCRIPTOR.contains(
             "lease-postcard[acquire:0,renew:1],mutation-postcard[create:0,update:1,delete:2,refresh-ttl:3]"
         ));
@@ -4722,16 +4748,18 @@ mod tests {
             at_max.generation(),
             FENCED_TRANSITION_V2_MAX_DURABLE_GENERATION
         );
-        assert!(FencedTransitionV2HistoryState::new(
-            active,
-            None,
-            None,
-            0,
-            FENCED_TRANSITION_V2_MAX_DURABLE_GENERATION + 1,
-            0,
-            0,
-        )
-        .is_err());
+        assert!(
+            FencedTransitionV2HistoryState::new(
+                active,
+                None,
+                None,
+                0,
+                FENCED_TRANSITION_V2_MAX_DURABLE_GENERATION + 1,
+                0,
+                0,
+            )
+            .is_err()
+        );
 
         let encoded = serde_json::to_value(at_max).expect("fixed-width state wire");
         assert_eq!(

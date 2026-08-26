@@ -397,18 +397,22 @@ mod tests {
     #[test]
     fn test_all_enabled_capabilities() {
         let caps = BackendCapabilities::all_enabled();
-        assert!(caps
-            .validate_for(SessionStateProfile::AuthoritativeSession)
-            .is_ok());
-        assert!(caps
-            .validate_for(SessionStateProfile::EphemeralProcedure)
-            .is_ok());
-        assert!(caps
-            .validate_for(SessionStateProfile::ReadThroughCache)
-            .is_ok());
-        assert!(caps
-            .validate_for(SessionStateProfile::ReplicatedDisasterRecovery)
-            .is_ok());
+        assert!(
+            caps.validate_for(SessionStateProfile::AuthoritativeSession)
+                .is_ok()
+        );
+        assert!(
+            caps.validate_for(SessionStateProfile::EphemeralProcedure)
+                .is_ok()
+        );
+        assert!(
+            caps.validate_for(SessionStateProfile::ReadThroughCache)
+                .is_ok()
+        );
+        assert!(
+            caps.validate_for(SessionStateProfile::ReplicatedDisasterRecovery)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -467,18 +471,24 @@ mod tests {
 
         // SQLite has CAS, monotonic fence, per-key TTL, and server-side lease expiry
         // So it is suitable for AuthoritativeSession, EphemeralProcedure, and ReadThroughCache.
-        assert!(backend
-            .assert_suitable_for(SessionStateProfile::AuthoritativeSession)
-            .await
-            .is_ok());
-        assert!(backend
-            .assert_suitable_for(SessionStateProfile::EphemeralProcedure)
-            .await
-            .is_ok());
-        assert!(backend
-            .assert_suitable_for(SessionStateProfile::ReadThroughCache)
-            .await
-            .is_ok());
+        assert!(
+            backend
+                .assert_suitable_for(SessionStateProfile::AuthoritativeSession)
+                .await
+                .is_ok()
+        );
+        assert!(
+            backend
+                .assert_suitable_for(SessionStateProfile::EphemeralProcedure)
+                .await
+                .is_ok()
+        );
+        assert!(
+            backend
+                .assert_suitable_for(SessionStateProfile::ReadThroughCache)
+                .await
+                .is_ok()
+        );
 
         // SQLite does not advertise ordered_replication_log on its own, so it
         // is NOT suitable for ReplicatedDisasterRecovery.
@@ -494,16 +504,20 @@ mod tests {
         }
 
         // Test with model::StateClass mappings
-        assert!(assert_suitable_for(
-            StateClass::AuthoritativeSession,
-            &backend.capabilities().await
-        )
-        .is_ok());
-        assert!(assert_suitable_for(
-            StateClass::EphemeralProcedure,
-            &backend.capabilities().await
-        )
-        .is_ok());
+        assert!(
+            assert_suitable_for(
+                StateClass::AuthoritativeSession,
+                &backend.capabilities().await
+            )
+            .is_ok()
+        );
+        assert!(
+            assert_suitable_for(
+                StateClass::EphemeralProcedure,
+                &backend.capabilities().await
+            )
+            .is_ok()
+        );
         assert!(
             assert_suitable_for(StateClass::DataplaneLookup, &backend.capabilities().await).is_ok()
         );
@@ -518,12 +532,14 @@ mod tests {
         );
 
         // Test assert_backend_suitable_for_profile helper
-        assert!(assert_backend_suitable_for_profile(
-            &backend,
-            SessionStateProfile::AuthoritativeSession
-        )
-        .await
-        .is_ok());
+        assert!(
+            assert_backend_suitable_for_profile(
+                &backend,
+                SessionStateProfile::AuthoritativeSession
+            )
+            .await
+            .is_ok()
+        );
     }
 
     #[test]

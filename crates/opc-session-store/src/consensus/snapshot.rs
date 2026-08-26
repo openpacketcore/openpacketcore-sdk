@@ -9,8 +9,8 @@ use std::io;
 use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use sha2::Digest as _;
@@ -354,8 +354,8 @@ impl Drop for FixedPrepublicationScanGateGuard {
 }
 
 #[cfg(test)]
-fn fixed_prepublication_scan_gates(
-) -> &'static std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>> {
+fn fixed_prepublication_scan_gates()
+-> &'static std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>> {
     static GATES: std::sync::OnceLock<
         std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>>,
     > = std::sync::OnceLock::new();
@@ -1789,8 +1789,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn unpublished_sqlite_cleanup_removes_only_its_created_identity(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn unpublished_sqlite_cleanup_removes_only_its_created_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("build.sqlite");
         let created = std::fs::OpenOptions::new()
@@ -1818,8 +1818,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn unpublished_sqlite_cleanup_fences_each_created_sidecar_identity(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn unpublished_sqlite_cleanup_fences_each_created_sidecar_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("build.sqlite");
         let created = std::fs::OpenOptions::new()
@@ -1847,8 +1847,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn unpublished_snapshot_cleanup_tracks_atomic_promotion_and_publication(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn unpublished_snapshot_cleanup_tracks_atomic_promotion_and_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let temporary = directory.path().join("seal.part");
         let published = directory.path().join("snapshot.opc");
@@ -1894,8 +1894,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiving_snapshot_rewind_rejects_changed_overlapping_bytes(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn receiving_snapshot_rewind_rejects_changed_overlapping_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming.part");
         let original = b"original snapshot";
@@ -1917,8 +1917,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiving_snapshot_cancelled_seek_rejects_changed_overlapping_bytes(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn receiving_snapshot_cancelled_seek_rejects_changed_overlapping_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming.part");
         let original = b"original snapshot";
@@ -1940,8 +1940,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiving_snapshot_exact_rewind_retry_keeps_bytes_and_length(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn receiving_snapshot_exact_rewind_retry_keeps_bytes_and_length()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming.part");
         let original = b"exact snapshot retry";
@@ -1966,8 +1966,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiving_snapshot_partial_exact_overlap_appends_only_missing_suffix(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn receiving_snapshot_partial_exact_overlap_appends_only_missing_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming.part");
         let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
@@ -1983,8 +1983,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiving_snapshot_is_readable_only_after_exact_shutdown(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn receiving_snapshot_is_readable_only_after_exact_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming.part");
         let original = b"authenticated snapshot stream";
@@ -2007,8 +2007,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_replay_and_submitted_seek_preserve_receiver_exactness(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn cancelled_replay_and_submitted_seek_preserve_receiver_exactness()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming.part");
         let original = b"abcdef";
@@ -2032,8 +2032,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_immediately_after_receive_create_cleans_the_exact_artifact(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn cancellation_immediately_after_receive_create_cleans_the_exact_artifact()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming-cancelled.part");
         let gate = Arc::new(SnapshotArtifactGate::new());
@@ -2055,10 +2055,11 @@ mod tests {
         gate.wait_started().await;
         assert!(path.is_file(), "the created receive artifact is observable");
         task.abort();
-        assert!(task
-            .await
-            .expect_err("receive task is cancelled")
-            .is_cancelled());
+        assert!(
+            task.await
+                .expect_err("receive task is cancelled")
+                .is_cancelled()
+        );
         assert!(
             !path.exists(),
             "cancellation after create must clean the exact receive artifact"
@@ -2068,8 +2069,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn abandoned_receive_cleanup_never_unlinks_a_same_name_replacement(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn abandoned_receive_cleanup_never_unlinks_a_same_name_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming.part");
         let receiving = SessionSnapshotFile::create(path.clone()).await?;
@@ -2161,8 +2162,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bound_envelope_rejects_same_inode_same_length_mutation_after_scan(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn bound_envelope_rejects_same_inode_same_length_mutation_after_scan()
+    -> Result<(), Box<dyn std::error::Error>> {
         const FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
         const FOOTER_BYTES: u64 = 48;
 
@@ -2207,8 +2208,8 @@ mod tests {
 
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn linked_identity_fails_closed_without_linux_descriptor_authority(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn linked_identity_fails_closed_without_linux_descriptor_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("snapshot");
         std::fs::write(&path, b"snapshot")?;
@@ -2237,8 +2238,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_receiver_rejects_writes_before_file_growth(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn bounded_receiver_rejects_writes_before_file_growth()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming");
         let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
@@ -2260,8 +2261,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiving_handle_cannot_bypass_the_stream_ceiling(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn receiving_handle_cannot_bypass_the_stream_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("incoming");
         let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1)).try_acquire_owned()?;

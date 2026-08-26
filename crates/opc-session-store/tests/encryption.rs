@@ -265,7 +265,8 @@ fn replication_cas_records(op: &ReplicationOp) -> Vec<&StoredSessionRecord> {
             | ReplicationOp::RefreshTtl { .. }
             | ReplicationOp::AcquireLease { .. }
             | ReplicationOp::RenewLease { .. }
-            | ReplicationOp::ReleaseLease { .. } => {}
+            | ReplicationOp::ReleaseLease { .. }
+            | ReplicationOp::ProtectedRosterEstablished { .. } => {}
         }
     }
     records
@@ -559,7 +560,8 @@ fn corrupt_nth_nested_cas(op: &mut ReplicationOp, target: usize, canary: &'stati
             | ReplicationOp::RefreshTtl { .. }
             | ReplicationOp::AcquireLease { .. }
             | ReplicationOp::RenewLease { .. }
-            | ReplicationOp::ReleaseLease { .. } => {}
+            | ReplicationOp::ReleaseLease { .. }
+            | ReplicationOp::ProtectedRosterEstablished { .. } => {}
         }
     }
     panic!("test fixture did not contain requested nested CAS");

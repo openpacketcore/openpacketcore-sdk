@@ -12,26 +12,26 @@ pub(crate) mod store;
 pub mod types;
 
 pub use network::{
-    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
-    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse,
 };
 pub(crate) use store::OperatorRecoveryCommitError;
 pub use store::{
-    validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
-    ConsensusSessionStore, ConsensusSessionStoreOpenError, ConsensusStoreDiagnosticSnapshot,
+    ConsensusSessionConsumerService, ConsensusSessionStore, ConsensusSessionStoreOpenError,
+    ConsensusStoreDiagnosticSnapshot, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
     SessionConsensusStatus, SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
-    SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    SessionTopologyTransportAdmissionError, validate_consensus_physical_fenced_transition_request,
 };
 
 pub use types::{
+    SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
     SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
     SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusIdentity,
     SessionConsensusIdentityError, SessionConsensusNodeId, SessionConsensusRequestId,
     SessionConsensusResponse, SessionConsensusRpc, SessionMutationIntent, SessionMutationOutcome,
-    SessionTopologyMemberBinding, SESSION_CONSENSUS_CLUSTER_ID_MAX_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionTopologyMemberBinding,
 };
 
 opc_consensus::engine::declare_raft_types!(

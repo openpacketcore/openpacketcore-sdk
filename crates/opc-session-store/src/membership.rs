@@ -18,8 +18,8 @@ use crate::consensus::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionTopologyMemberBinding,
 };
 use crate::topology::{
-    QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyError, ReplicaId,
-    ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
+    QUORUM_TOPOLOGY_MAX_MEMBERS, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    QuorumTopologyError, ReplicaId, ValidatedQuorumTopology,
 };
 
 const TRANSITION_REQUEST_DIGEST_DOMAIN: &[u8] =

@@ -1,5 +1,5 @@
 use opc_types::Timestamp;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::time::Duration;
 
 use super::ops::{
@@ -154,15 +154,19 @@ fn acquire_with_fence_sync(
     // Update globals
     conn.execute(
         "UPDATE lease_globals SET val = ?1 WHERE key = 'next_fence'",
-        params![sqlite_u64(next_fence_global)
-            .map_err(|error| LeaseError::Backend(error.to_string()))?],
+        params![
+            sqlite_u64(next_fence_global)
+                .map_err(|error| LeaseError::Backend(error.to_string()))?
+        ],
     )
     .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
     conn.execute(
         "UPDATE lease_globals SET val = ?1 WHERE key = 'next_credential_id'",
-        params![sqlite_u64(next_credential_id_global)
-            .map_err(|error| LeaseError::Backend(error.to_string()))?],
+        params![
+            sqlite_u64(next_credential_id_global)
+                .map_err(|error| LeaseError::Backend(error.to_string()))?
+        ],
     )
     .map_err(|e| LeaseError::Backend(e.to_string()))?;
 
@@ -454,7 +458,7 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
-    use crate::sqlite::{ops, SqliteSessionBackend};
+    use crate::sqlite::{SqliteSessionBackend, ops};
 
     fn key() -> SessionKey {
         SessionKey {

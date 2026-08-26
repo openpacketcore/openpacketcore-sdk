@@ -1,8 +1,8 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -10,29 +10,29 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use opc_key::{
-    EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose,
-    MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider, Zeroizing,
-    AES_256_GCM_SIV_KEY_LEN,
+    AES_256_GCM_SIV_KEY_LEN, EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId,
+    KeyProvider, KeyPurpose, MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider,
+    Zeroizing,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
 use crate::fenced_transition::FencedTransitionV2Effect;
 use crate::{
-    checked_session_deadline, validate_consensus_physical_fenced_transition_request,
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-    EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
-    FencedTransitionLease, FencedTransitionMutation, FencedTransitionMutationResult,
-    FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
-    FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2HistoryState,
-    FencedTransitionV2JournalScope, FencedTransitionV2PreparedJournal,
-    FencedTransitionV2PreparedJournalKey, FencedTransitionV2Request, FencedTransitionV2Status,
-    Generation, LeaseError, LeaseGuard, OwnerId, PreparedFencedTransition,
-    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
-    PreparedFencedTransitionLookup, RemoteSealingSessionBackend, SessionBackend, SessionKey,
-    SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, SessionPayloadEncoding,
-    SessionStore, StateClass, StateType, StoreError, StoredSessionRecord,
-    FENCED_TRANSITION_MAX_PREPARED_BYTES,
+    EncryptedSessionPayload, EncryptingSessionBackend, FENCED_TRANSITION_MAX_PREPARED_BYTES,
+    FenceToken, FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionMutationResult, FencedTransitionObservation, FencedTransitionOutcome,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
+    FencedTransitionV2CallerNonce, FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch,
+    FencedTransitionV2HistoryState, FencedTransitionV2JournalScope,
+    FencedTransitionV2PreparedJournal, FencedTransitionV2PreparedJournalKey,
+    FencedTransitionV2Request, FencedTransitionV2Status, Generation, LeaseError, LeaseGuard,
+    OwnerId, PreparedFencedTransition, PreparedFencedTransitionJournal,
+    PreparedFencedTransitionJournalKey, PreparedFencedTransitionLookup,
+    RemoteSealingSessionBackend, SessionBackend, SessionKey, SessionKeyType, SessionLeaseManager,
+    SessionOp, SessionOpResult, SessionPayloadEncoding, SessionStore, StateClass, StateType,
+    StoreError, StoredSessionRecord, checked_session_deadline,
+    validate_consensus_physical_fenced_transition_request,
 };
 
 const NAMESPACE: &str = "protected-fenced-transition";
@@ -1075,15 +1075,19 @@ async fn protected_v2_batches_reuse_existing_mappings_and_seal_only_missing_item
         create_v2_request(0x42, epoch),
         create_v2_request(0x43, epoch),
     ];
-    assert!(local
-        .fenced_transition_v2(local_batch[0].clone())
-        .await
-        .is_ok());
+    assert!(
+        local
+            .fenced_transition_v2(local_batch[0].clone())
+            .await
+            .is_ok()
+    );
     assert_eq!(local_provider.calls(), 1);
-    assert!(local
-        .fenced_transition_v2_batch(local_batch.clone())
-        .await
-        .is_ok());
+    assert!(
+        local
+            .fenced_transition_v2_batch(local_batch.clone())
+            .await
+            .is_ok()
+    );
     assert_eq!(local_provider.calls(), 3, "only the two missing items seal");
     assert!(local.fenced_transition_v2_batch(local_batch).await.is_ok());
     assert_eq!(local_provider.calls(), 3, "exact replay does not reseal");
@@ -1110,24 +1114,30 @@ async fn protected_v2_batches_reuse_existing_mappings_and_seal_only_missing_item
         create_v2_request(0x45, epoch),
         create_v2_request(0x46, epoch),
     ];
-    assert!(remote
-        .fenced_transition_v2(remote_batch[0].clone())
-        .await
-        .is_ok());
+    assert!(
+        remote
+            .fenced_transition_v2(remote_batch[0].clone())
+            .await
+            .is_ok()
+    );
     assert_eq!(remote_provider.calls(), 1);
-    assert!(remote
-        .fenced_transition_v2_batch(remote_batch.clone())
-        .await
-        .is_ok());
+    assert!(
+        remote
+            .fenced_transition_v2_batch(remote_batch.clone())
+            .await
+            .is_ok()
+    );
     assert_eq!(
         remote_provider.calls(),
         3,
         "only the two missing items seal"
     );
-    assert!(remote
-        .fenced_transition_v2_batch(remote_batch)
-        .await
-        .is_ok());
+    assert!(
+        remote
+            .fenced_transition_v2_batch(remote_batch)
+            .await
+            .is_ok()
+    );
     assert_eq!(remote_provider.calls(), 3, "exact replay does not reseal");
     let remote_physical = remote_spy.v2_executed();
     assert_eq!(remote_physical.len(), 7);
@@ -1233,21 +1243,27 @@ async fn protected_v2_batch_conflicts_are_synthetic_and_never_dispatched() {
         NAMESPACE,
         crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
     );
-    assert!(local_journal
-        .lookup(local_scope, local_missing_conflict.request_id())
-        .await
-        .expect("local conflict lookup")
-        .is_none());
-    assert!(local_journal
-        .lookup(local_scope, local_seed.request_id())
-        .await
-        .expect("local seed lookup")
-        .is_some());
-    assert!(local_journal
-        .lookup(local_scope, local_valid.request_id())
-        .await
-        .expect("local valid lookup")
-        .is_some());
+    assert!(
+        local_journal
+            .lookup(local_scope, local_missing_conflict.request_id())
+            .await
+            .expect("local conflict lookup")
+            .is_none()
+    );
+    assert!(
+        local_journal
+            .lookup(local_scope, local_seed.request_id())
+            .await
+            .expect("local seed lookup")
+            .is_some()
+    );
+    assert!(
+        local_journal
+            .lookup(local_scope, local_valid.request_id())
+            .await
+            .expect("local valid lookup")
+            .is_some()
+    );
 
     let remote_spy = Arc::new(AtomicSpy::new());
     remote_spy.enable_v2();
@@ -1301,21 +1317,27 @@ async fn protected_v2_batch_conflicts_are_synthetic_and_never_dispatched() {
         NAMESPACE,
         crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
     );
-    assert!(remote_journal
-        .lookup(remote_scope, remote_missing_conflict.request_id())
-        .await
-        .expect("remote conflict lookup")
-        .is_none());
-    assert!(remote_journal
-        .lookup(remote_scope, remote_seed.request_id())
-        .await
-        .expect("remote seed lookup")
-        .is_some());
-    assert!(remote_journal
-        .lookup(remote_scope, remote_valid.request_id())
-        .await
-        .expect("remote valid lookup")
-        .is_some());
+    assert!(
+        remote_journal
+            .lookup(remote_scope, remote_missing_conflict.request_id())
+            .await
+            .expect("remote conflict lookup")
+            .is_none()
+    );
+    assert!(
+        remote_journal
+            .lookup(remote_scope, remote_seed.request_id())
+            .await
+            .expect("remote seed lookup")
+            .is_some()
+    );
+    assert!(
+        remote_journal
+            .lookup(remote_scope, remote_valid.request_id())
+            .await
+            .expect("remote valid lookup")
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -1346,15 +1368,19 @@ async fn protected_v2_proven_not_transmitted_and_preproposal_rejection_recover_c
         NAMESPACE,
         crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
     );
-    assert!(local_journal
-        .lookup(local_scope, local_request.request_id())
-        .await
-        .expect("local not-transmitted journal lookup")
-        .is_none());
-    assert!(local
-        .fenced_transition_v2(local_request.clone())
-        .await
-        .is_ok());
+    assert!(
+        local_journal
+            .lookup(local_scope, local_request.request_id())
+            .await
+            .expect("local not-transmitted journal lookup")
+            .is_none()
+    );
+    assert!(
+        local
+            .fenced_transition_v2(local_request.clone())
+            .await
+            .is_ok()
+    );
     assert_eq!(
         local_provider.calls(),
         2,
@@ -1385,15 +1411,19 @@ async fn protected_v2_proven_not_transmitted_and_preproposal_rejection_recover_c
         NAMESPACE,
         crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
     );
-    assert!(remote_journal
-        .lookup(remote_scope, remote_request.request_id())
-        .await
-        .expect("remote not-transmitted journal lookup")
-        .is_none());
-    assert!(remote
-        .fenced_transition_v2(remote_request.clone())
-        .await
-        .is_ok());
+    assert!(
+        remote_journal
+            .lookup(remote_scope, remote_request.request_id())
+            .await
+            .expect("remote not-transmitted journal lookup")
+            .is_none()
+    );
+    assert!(
+        remote
+            .fenced_transition_v2(remote_request.clone())
+            .await
+            .is_ok()
+    );
     assert_eq!(
         remote_provider.calls(),
         2,
@@ -1431,16 +1461,20 @@ async fn protected_v2_proven_not_transmitted_and_preproposal_rejection_recover_c
         crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
     );
     for request in &local_batch {
-        assert!(local_batch_journal
-            .lookup(local_batch_scope, request.request_id())
-            .await
-            .expect("local batch not-transmitted journal lookup")
-            .is_none());
+        assert!(
+            local_batch_journal
+                .lookup(local_batch_scope, request.request_id())
+                .await
+                .expect("local batch not-transmitted journal lookup")
+                .is_none()
+        );
     }
-    assert!(local_batch_backend
-        .fenced_transition_v2_batch(local_batch)
-        .await
-        .is_ok());
+    assert!(
+        local_batch_backend
+            .fenced_transition_v2_batch(local_batch)
+            .await
+            .is_ok()
+    );
     assert_eq!(
         local_batch_provider.calls(),
         4,
@@ -1478,16 +1512,20 @@ async fn protected_v2_proven_not_transmitted_and_preproposal_rejection_recover_c
         crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
     );
     for request in &remote_batch {
-        assert!(remote_batch_journal
-            .lookup(remote_batch_scope, request.request_id())
-            .await
-            .expect("remote batch not-transmitted journal lookup")
-            .is_none());
+        assert!(
+            remote_batch_journal
+                .lookup(remote_batch_scope, request.request_id())
+                .await
+                .expect("remote batch not-transmitted journal lookup")
+                .is_none()
+        );
     }
-    assert!(remote_batch_backend
-        .fenced_transition_v2_batch(remote_batch)
-        .await
-        .is_ok());
+    assert!(
+        remote_batch_backend
+            .fenced_transition_v2_batch(remote_batch)
+            .await
+            .is_ok()
+    );
     assert_eq!(
         remote_batch_provider.calls(),
         4,
@@ -1535,11 +1573,13 @@ async fn protected_v2_not_transmitted_cleanup_cannot_remove_a_same_id_retry_mapp
         NAMESPACE,
         crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
     );
-    assert!(journal
-        .lookup(scope, request.request_id())
-        .await
-        .expect("same-ID journal lookup")
-        .is_some());
+    assert!(
+        journal
+            .lookup(scope, request.request_id())
+            .await
+            .expect("same-ID journal lookup")
+            .is_some()
+    );
     assert_eq!(spy.v2_executed().len(), 1);
 }
 
@@ -1567,10 +1607,12 @@ async fn protected_v2_cancellation_retains_a_recoverable_mapping_without_backgro
     });
     entered_wait.await;
     cancelled.abort();
-    assert!(cancelled
-        .await
-        .expect_err("cancelled task must not join")
-        .is_cancelled());
+    assert!(
+        cancelled
+            .await
+            .expect_err("cancelled task must not join")
+            .is_cancelled()
+    );
 
     let scope = protected_v2_journal_scope_for(
         spy.as_ref(),
@@ -1578,11 +1620,13 @@ async fn protected_v2_cancellation_retains_a_recoverable_mapping_without_backgro
         NAMESPACE,
         crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
     );
-    assert!(journal
-        .lookup(scope, request.request_id())
-        .await
-        .expect("cancelled journal lookup")
-        .is_some());
+    assert!(
+        journal
+            .lookup(scope, request.request_id())
+            .await
+            .expect("cancelled journal lookup")
+            .is_some()
+    );
     assert!(backend.fenced_transition_v2(request).await.is_ok());
     assert_eq!(
         provider.calls(),
@@ -1642,15 +1686,19 @@ async fn protected_v2_local_not_transmitted_cleanup_finalizes_without_a_cancella
         NAMESPACE,
         crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
     );
-    assert!(singleton_journal
-        .lookup(singleton_scope, singleton_request.request_id())
-        .await
-        .expect("completed singleton cleanup lookup")
-        .is_none());
-    assert!(singleton_backend
-        .fenced_transition_v2(singleton_request)
-        .await
-        .is_ok());
+    assert!(
+        singleton_journal
+            .lookup(singleton_scope, singleton_request.request_id())
+            .await
+            .expect("completed singleton cleanup lookup")
+            .is_none()
+    );
+    assert!(
+        singleton_backend
+            .fenced_transition_v2(singleton_request)
+            .await
+            .is_ok()
+    );
     assert_eq!(singleton_provider.calls(), 2);
 
     let batch_spy = Arc::new(AtomicSpy::new());
@@ -1691,16 +1739,20 @@ async fn protected_v2_local_not_transmitted_cleanup_finalizes_without_a_cancella
         crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
     );
     for request in &batch_requests {
-        assert!(batch_journal
-            .lookup(batch_scope, request.request_id())
-            .await
-            .expect("completed batch cleanup lookup")
-            .is_none());
+        assert!(
+            batch_journal
+                .lookup(batch_scope, request.request_id())
+                .await
+                .expect("completed batch cleanup lookup")
+                .is_none()
+        );
     }
-    assert!(batch_backend
-        .fenced_transition_v2_batch(batch_requests)
-        .await
-        .is_ok());
+    assert!(
+        batch_backend
+            .fenced_transition_v2_batch(batch_requests)
+            .await
+            .is_ok()
+    );
     assert_eq!(batch_provider.calls(), 4);
 }
 
@@ -1741,15 +1793,19 @@ async fn protected_v2_remote_not_transmitted_cleanup_finalizes_without_a_cancell
         NAMESPACE,
         crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
     );
-    assert!(singleton_journal
-        .lookup(singleton_scope, singleton_request.request_id())
-        .await
-        .expect("completed singleton cleanup lookup")
-        .is_none());
-    assert!(singleton_backend
-        .fenced_transition_v2(singleton_request)
-        .await
-        .is_ok());
+    assert!(
+        singleton_journal
+            .lookup(singleton_scope, singleton_request.request_id())
+            .await
+            .expect("completed singleton cleanup lookup")
+            .is_none()
+    );
+    assert!(
+        singleton_backend
+            .fenced_transition_v2(singleton_request)
+            .await
+            .is_ok()
+    );
     assert_eq!(singleton_provider.calls(), 2);
 
     let batch_spy = Arc::new(AtomicSpy::new());
@@ -1790,16 +1846,20 @@ async fn protected_v2_remote_not_transmitted_cleanup_finalizes_without_a_cancell
         crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
     );
     for request in &batch_requests {
-        assert!(batch_journal
-            .lookup(batch_scope, request.request_id())
-            .await
-            .expect("completed batch cleanup lookup")
-            .is_none());
+        assert!(
+            batch_journal
+                .lookup(batch_scope, request.request_id())
+                .await
+                .expect("completed batch cleanup lookup")
+                .is_none()
+        );
     }
-    assert!(batch_backend
-        .fenced_transition_v2_batch(batch_requests)
-        .await
-        .is_ok());
+    assert!(
+        batch_backend
+            .fenced_transition_v2_batch(batch_requests)
+            .await
+            .is_ok()
+    );
     assert_eq!(batch_provider.calls(), 4);
 }
 
@@ -1857,10 +1917,12 @@ async fn protected_wrappers_preserve_v2_exact_replay_across_successor_restart_an
     )
     .with_fenced_transition_v2_journal(local_fixture.open_v2())
     .with_fenced_transition_v2_journal_scope(local_fixture.v2_scope());
-    assert!(local_reopened
-        .fenced_transition_v2(local_request.clone())
-        .await
-        .is_ok());
+    assert!(
+        local_reopened
+            .fenced_transition_v2(local_request.clone())
+            .await
+            .is_ok()
+    );
     assert_eq!(
         local_rotated_provider.calls(),
         0,
@@ -1935,10 +1997,12 @@ async fn protected_wrappers_preserve_v2_exact_replay_across_successor_restart_an
     )
     .with_fenced_transition_v2_journal(remote_fixture.open_v2())
     .with_fenced_transition_v2_journal_scope(remote_fixture.v2_scope());
-    assert!(remote_reopened
-        .fenced_transition_v2(remote_request.clone())
-        .await
-        .is_ok());
+    assert!(
+        remote_reopened
+            .fenced_transition_v2(remote_request.clone())
+            .await
+            .is_ok()
+    );
     assert_eq!(
         remote_rotated_provider.calls(),
         0,
@@ -1996,19 +2060,21 @@ async fn protected_wrappers_reclaim_v2_mappings_only_after_consensus_retires_the
         local.fenced_transition_v2(local_request.clone()).await,
         Err(StoreError::FencedTransitionOutcomeUnknown)
     ));
-    assert!(local_journal
-        .lookup(
-            protected_v2_journal_scope_for(
-                local_spy.as_ref(),
-                local_fixture.v2_scope(),
-                NAMESPACE,
-                crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
-            ),
-            local_request.request_id(),
-        )
-        .await
-        .expect("local V2 journal lookup before retirement")
-        .is_some());
+    assert!(
+        local_journal
+            .lookup(
+                protected_v2_journal_scope_for(
+                    local_spy.as_ref(),
+                    local_fixture.v2_scope(),
+                    NAMESPACE,
+                    crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+                ),
+                local_request.request_id(),
+            )
+            .await
+            .expect("local V2 journal lookup before retirement")
+            .is_some()
+    );
     local_spy.set_v2_history(retired);
     assert_eq!(
         local
@@ -2017,19 +2083,21 @@ async fn protected_wrappers_reclaim_v2_mappings_only_after_consensus_retires_the
             .expect("local retired V2 status"),
         FencedTransitionV2Status::Retired
     );
-    assert!(local_journal
-        .lookup(
-            protected_v2_journal_scope_for(
-                local_spy.as_ref(),
-                local_fixture.v2_scope(),
-                NAMESPACE,
-                crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
-            ),
-            local_request.request_id(),
-        )
-        .await
-        .expect("local V2 journal lookup after retirement")
-        .is_none());
+    assert!(
+        local_journal
+            .lookup(
+                protected_v2_journal_scope_for(
+                    local_spy.as_ref(),
+                    local_fixture.v2_scope(),
+                    NAMESPACE,
+                    crate::backend::ProtectedFencedTransitionV2JournalMode::LocalAead,
+                ),
+                local_request.request_id(),
+            )
+            .await
+            .expect("local V2 journal lookup after retirement")
+            .is_none()
+    );
     assert!(matches!(
         local.fenced_transition_v2(local_request).await,
         Err(StoreError::FencedTransitionHistoryEpochRetired)
@@ -2055,19 +2123,21 @@ async fn protected_wrappers_reclaim_v2_mappings_only_after_consensus_retires_the
         remote.fenced_transition_v2(remote_request.clone()).await,
         Err(StoreError::FencedTransitionOutcomeUnknown)
     ));
-    assert!(remote_journal
-        .lookup(
-            protected_v2_journal_scope_for(
-                remote_spy.as_ref(),
-                remote_fixture.v2_scope(),
-                NAMESPACE,
-                crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
-            ),
-            remote_request.request_id(),
-        )
-        .await
-        .expect("remote V2 journal lookup before retirement")
-        .is_some());
+    assert!(
+        remote_journal
+            .lookup(
+                protected_v2_journal_scope_for(
+                    remote_spy.as_ref(),
+                    remote_fixture.v2_scope(),
+                    NAMESPACE,
+                    crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+                ),
+                remote_request.request_id(),
+            )
+            .await
+            .expect("remote V2 journal lookup before retirement")
+            .is_some()
+    );
     remote_spy.set_v2_history(retired);
     assert_eq!(
         remote
@@ -2076,19 +2146,21 @@ async fn protected_wrappers_reclaim_v2_mappings_only_after_consensus_retires_the
             .expect("remote retired V2 status"),
         FencedTransitionV2Status::Retired
     );
-    assert!(remote_journal
-        .lookup(
-            protected_v2_journal_scope_for(
-                remote_spy.as_ref(),
-                remote_fixture.v2_scope(),
-                NAMESPACE,
-                crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
-            ),
-            remote_request.request_id(),
-        )
-        .await
-        .expect("remote V2 journal lookup after retirement")
-        .is_none());
+    assert!(
+        remote_journal
+            .lookup(
+                protected_v2_journal_scope_for(
+                    remote_spy.as_ref(),
+                    remote_fixture.v2_scope(),
+                    NAMESPACE,
+                    crate::backend::ProtectedFencedTransitionV2JournalMode::RemoteSeal,
+                ),
+                remote_request.request_id(),
+            )
+            .await
+            .expect("remote V2 journal lookup after retirement")
+            .is_none()
+    );
     assert!(matches!(
         remote.fenced_transition_v2(remote_request).await,
         Err(StoreError::FencedTransitionHistoryEpochRetired)
@@ -2101,27 +2173,33 @@ async fn protected_wrappers_reclaim_v2_mappings_only_after_consensus_retires_the
 async fn protected_v2_journal_rejects_mixed_formats_and_corrupted_bindings() {
     let legacy_fixture = JournalFixture::new(0xb5);
     drop(legacy_fixture.open());
-    assert!(FencedTransitionV2PreparedJournal::open_existing(
-        &legacy_fixture.path,
-        FencedTransitionV2PreparedJournalKey::from_bytes(legacy_fixture.key),
-    )
-    .is_err());
+    assert!(
+        FencedTransitionV2PreparedJournal::open_existing(
+            &legacy_fixture.path,
+            FencedTransitionV2PreparedJournalKey::from_bytes(legacy_fixture.key),
+        )
+        .is_err()
+    );
 
     let v2_fixture = JournalFixture::new(0xb6);
     drop(v2_fixture.open_v2());
-    assert!(PreparedFencedTransitionJournal::open_existing(
-        &v2_fixture.v2_path,
-        PreparedFencedTransitionJournalKey::from_bytes(v2_fixture.key),
-    )
-    .is_err());
+    assert!(
+        PreparedFencedTransitionJournal::open_existing(
+            &v2_fixture.v2_path,
+            PreparedFencedTransitionJournalKey::from_bytes(v2_fixture.key),
+        )
+        .is_err()
+    );
 
     let wrong_key_fixture = JournalFixture::new(0xbe);
     drop(wrong_key_fixture.open_v2());
-    assert!(FencedTransitionV2PreparedJournal::open_existing(
-        &wrong_key_fixture.v2_path,
-        FencedTransitionV2PreparedJournalKey::from_bytes([0xbf; 32]),
-    )
-    .is_err());
+    assert!(
+        FencedTransitionV2PreparedJournal::open_existing(
+            &wrong_key_fixture.v2_path,
+            FencedTransitionV2PreparedJournalKey::from_bytes([0xbf; 32]),
+        )
+        .is_err()
+    );
 
     let spy = Arc::new(AtomicSpy::new());
     spy.enable_v2();
@@ -2289,11 +2367,13 @@ async fn protected_v2_primary_index_corruption_fails_closed_on_direct_journal_re
         &fixture.v2_path,
         "sqlite_autoindex_protected_fenced_transition_v2_journal_1",
     );
-    assert!(FencedTransitionV2PreparedJournal::open_existing(
-        &fixture.v2_path,
-        FencedTransitionV2PreparedJournalKey::from_bytes(fixture.key),
-    )
-    .is_err());
+    assert!(
+        FencedTransitionV2PreparedJournal::open_existing(
+            &fixture.v2_path,
+            FencedTransitionV2PreparedJournalKey::from_bytes(fixture.key),
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -2314,10 +2394,12 @@ async fn protected_v2_index_divergence_fails_closed_before_reseal_or_dispatch() 
     )
     .with_fenced_transition_v2_journal(Arc::clone(&local_journal))
     .with_fenced_transition_v2_journal_scope(local_scope);
-    assert!(local_initial
-        .fenced_transition_v2(local_request.clone())
-        .await
-        .is_ok());
+    assert!(
+        local_initial
+            .fenced_transition_v2(local_request.clone())
+            .await
+            .is_ok()
+    );
     drop(local_initial);
     let local_dispatched = local_spy.v2_executed().len();
     remove_v2_index(
@@ -2367,10 +2449,12 @@ async fn protected_v2_index_divergence_fails_closed_before_reseal_or_dispatch() 
     )
     .with_fenced_transition_v2_journal(Arc::clone(&remote_journal))
     .with_fenced_transition_v2_journal_scope(remote_scope);
-    assert!(remote_initial
-        .fenced_transition_v2(remote_request.clone())
-        .await
-        .is_ok());
+    assert!(
+        remote_initial
+            .fenced_transition_v2(remote_request.clone())
+            .await
+            .is_ok()
+    );
     drop(remote_initial);
     let remote_dispatched = remote_spy.v2_executed().len();
     remove_v2_index(
@@ -2758,8 +2842,10 @@ async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_phys
         serde_json::from_slice(&serialized).expect("deserialize opaque token");
     assert_eq!(restored, prepared);
     assert!(format!("{prepared:?}").contains("redacted"));
-    assert!(!format!("{prepared:?}")
-        .contains(std::str::from_utf8(SYNTHETIC_PAYLOAD).expect("synthetic payload is UTF-8")));
+    assert!(
+        !format!("{prepared:?}")
+            .contains(std::str::from_utf8(SYNTHETIC_PAYLOAD).expect("synthetic payload is UTF-8"))
+    );
 
     assert!(matches!(
         backend.fenced_transition(&restored).await,
@@ -2840,8 +2926,8 @@ async fn protected_fenced_transition_local_prepares_once_and_recovers_exact_phys
 }
 
 #[tokio::test]
-async fn protected_fenced_transition_remote_prepares_create_and_update_once_with_dynamic_composition(
-) {
+async fn protected_fenced_transition_remote_prepares_create_and_update_once_with_dynamic_composition()
+ {
     let spy = Arc::new(AtomicSpy::new());
     spy.delay_ambiguous_commit();
     let provider = CountingRemoteProvider::with_key("remote-before-rotation", 0x31);
@@ -2920,11 +3006,13 @@ async fn protected_fenced_transition_remote_prepares_create_and_update_once_with
         PreparedFencedTransitionLookup::Absent => panic!("remote prepared request was lost"),
     };
     spy.commit_delayed();
-    assert!(reconstructed
-        .fenced_transition(&recovered)
-        .await
-        .expect("exact remote replay")
-        .matches_request(&physical[0]));
+    assert!(
+        reconstructed
+            .fenced_transition(&recovered)
+            .await
+            .expect("exact remote replay")
+            .matches_request(&physical[0])
+    );
     assert!(matches!(
         reconstructed.fenced_transition_status(&recovered).await,
         Ok(FencedTransitionStatus::Recorded(_))
@@ -3001,8 +3089,10 @@ async fn protected_fenced_transition_observation_unprotects_once_preserves_fence
         "exactly one unprotect"
     );
     assert!(format!("{observation:?}").contains("redacted"));
-    assert!(!format!("{observation:?}")
-        .contains(std::str::from_utf8(SYNTHETIC_PAYLOAD).expect("synthetic payload is UTF-8")));
+    assert!(
+        !format!("{observation:?}")
+            .contains(std::str::from_utf8(SYNTHETIC_PAYLOAD).expect("synthetic payload is UTF-8"))
+    );
     spy.set_observed(None);
     let calls_before_none = provider.calls();
     let none = backend
@@ -3054,12 +3144,14 @@ async fn protected_fenced_transition_observation_unprotects_once_preserves_fence
     assert_eq!(remote_provider.calls(), calls_before_remote_observation + 1);
     remote_spy.set_observed(None);
     let calls_before_remote_none = remote_provider.calls();
-    assert!(remote
-        .observe_fenced_transition(&key())
-        .await
-        .expect("remote observe absent")
-        .record()
-        .is_none());
+    assert!(
+        remote
+            .observe_fenced_transition(&key())
+            .await
+            .expect("remote observe absent")
+            .record()
+            .is_none()
+    );
     assert_eq!(remote_provider.calls(), calls_before_remote_none);
 }
 
@@ -3544,10 +3636,12 @@ async fn protected_fenced_transition_delete_and_refresh_are_provider_free_throug
         local.fenced_transition_status(&local_refresh).await,
         Ok(FencedTransitionStatus::Recorded(_))
     ));
-    assert!(local_spy
-        .prepared()
-        .iter()
-        .all(|request| request.mutation().record().is_none()));
+    assert!(
+        local_spy
+            .prepared()
+            .iter()
+            .all(|request| request.mutation().record().is_none())
+    );
     assert_eq!(
         local_provider.calls(),
         0,
@@ -3672,8 +3766,8 @@ async fn protected_fenced_transition_rejects_both_nested_protection_orders() {
 }
 
 #[tokio::test]
-async fn protected_fenced_transition_capability_preflight_and_token_binding_fail_closed_before_effects(
-) {
+async fn protected_fenced_transition_capability_preflight_and_token_binding_fail_closed_before_effects()
+ {
     let spy = Arc::new(AtomicSpy::new());
     let provider = CountingKeyProvider::with_key("local-validation", 0x61);
     let unjournaled =

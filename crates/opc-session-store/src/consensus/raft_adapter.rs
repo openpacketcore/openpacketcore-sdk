@@ -17,17 +17,20 @@ use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use opc_consensus::engine::{EmptyNode, Membership, StoredMembership, Vote};
-use opc_consensus::{decode_bounded, encode_bounded, ConsensusCodecError};
-use serde::de::DeserializeOwned;
+use opc_consensus::engine::{EmptyNode, EntryPayload, Membership, StoredMembership, Vote};
+use opc_consensus::{
+    ConsensusCodecError, decode_bounded, decode_roster_bounded, encode_bounded,
+    encode_roster_bounded,
+};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use super::{
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionRaft, SessionRaftTypeConfig,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SESSION_CONSENSUS_SCHEMA_VERSION, SessionConsensusCommand, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionMutationIntent, SessionRaft, SessionRaftTypeConfig,
 };
 use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
 use crate::readiness::PlacementResiliencePolicy;
@@ -1002,13 +1005,20 @@ impl SessionRaftNetwork {
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<SessionConsensusNodeId>, EngineRpcError> {
         let entry_count = request.entries.len();
-        let payload = match encode_bounded(request) {
+        let roster_append = is_singleton_roster_append(request);
+        let payload = match if roster_append {
+            encode_roster_bounded(request)
+        } else {
+            encode_bounded(request)
+        } {
             Ok(payload) => payload,
             Err(ConsensusCodecError::TooLarge) => {
-                if let Some(entries_hint) = append_entries_split_hint(entry_count) {
-                    return Err(EngineRpcError::PayloadTooLarge(
-                        PayloadTooLarge::new_entries_hint(entries_hint),
-                    ));
+                if !roster_append {
+                    if let Some(entries_hint) = append_entries_split_hint(entry_count) {
+                        return Err(EngineRpcError::PayloadTooLarge(
+                            PayloadTooLarge::new_entries_hint(entries_hint),
+                        ));
+                    }
                 }
                 return Err(EngineRpcError::Unreachable(Unreachable::new(
                     &CodecTransportError(ConsensusCodecError::TooLarge),
@@ -1021,12 +1031,41 @@ impl SessionRaftNetwork {
             }
         };
         self.call(
-            SessionConsensusRpcFamily::AppendEntries,
+            if roster_append {
+                SessionConsensusRpcFamily::AppendEntriesRoster
+            } else {
+                SessionConsensusRpcFamily::AppendEntries
+            },
             opc_consensus::engine::RPCTypes::AppendEntries,
             payload,
             option,
         )
         .await
+    }
+}
+
+/// A roster-sized append envelope may carry exactly one normal protected-
+/// roster application command. Heartbeats and every other batching shape stay
+/// on ordinary AppendEntries so the relaxed payload ceiling is never generic.
+pub(crate) fn is_singleton_roster_append(
+    request: &AppendEntriesRequest<SessionRaftTypeConfig>,
+) -> bool {
+    match request.entries.as_slice() {
+        [entry] => match &entry.payload {
+            EntryPayload::Normal(SessionConsensusCommand { intent, .. }) => {
+                let intent = match intent {
+                    SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+                    intent => intent,
+                };
+                matches!(
+                    intent,
+                    SessionMutationIntent::RosterAdmission(_)
+                        | SessionMutationIntent::RosterTerminal(_)
+                )
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -1201,6 +1240,17 @@ impl SessionRaftRpcHandler {
                 };
                 encode_engine_result(&self.raft.append_entries(rpc).await)
             }
+            SessionConsensusRpcFamily::AppendEntriesRoster => {
+                let rpc = match decode_roster_and_bind_sender::<
+                    AppendEntriesRequest<SessionRaftTypeConfig>,
+                >(&request.payload, request.sender)
+                {
+                    Ok(rpc) if is_singleton_roster_append(&rpc) => rpc,
+                    Ok(_) => return rejected_response(SessionConsensusPeerError::Protocol),
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.append_entries(rpc).await)
+            }
             SessionConsensusRpcFamily::Vote => {
                 let rpc = match decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(
                     &request.payload,
@@ -1234,7 +1284,9 @@ impl SessionRaftRpcHandler {
                 }
                 encode_engine_result(&self.raft.install_snapshot(rpc).await)
             }
-            SessionConsensusRpcFamily::ForwardMutation | SessionConsensusRpcFamily::ReadBarrier => {
+            SessionConsensusRpcFamily::ForwardMutation
+            | SessionConsensusRpcFamily::ForwardRosterMutation
+            | SessionConsensusRpcFamily::ReadBarrier => {
                 return rejected_response(SessionConsensusPeerError::Rejected);
             }
             SessionConsensusRpcFamily::TopologyAdmissionBarrier => {
@@ -1298,6 +1350,7 @@ fn is_engine_rpc_family(family: SessionConsensusRpcFamily) -> bool {
         family,
         SessionConsensusRpcFamily::Vote
             | SessionConsensusRpcFamily::AppendEntries
+            | SessionConsensusRpcFamily::AppendEntriesRoster
             | SessionConsensusRpcFamily::InstallSnapshot
     )
 }
@@ -1332,6 +1385,21 @@ where
     T: DeserializeOwned + EngineRequestSender,
 {
     let request: T = decode_bounded(payload).map_err(|_| SessionConsensusPeerError::Protocol)?;
+    if request.vote().leader_id.voted_for() != Some(sender) {
+        return Err(SessionConsensusPeerError::ScopeMismatch);
+    }
+    Ok(request)
+}
+
+fn decode_roster_and_bind_sender<T>(
+    payload: &[u8],
+    sender: SessionConsensusNodeId,
+) -> Result<T, SessionConsensusPeerError>
+where
+    T: DeserializeOwned + EngineRequestSender,
+{
+    let request: T =
+        decode_roster_bounded(payload).map_err(|_| SessionConsensusPeerError::Protocol)?;
     if request.vote().leader_id.voted_for() != Some(sender) {
         return Err(SessionConsensusPeerError::ScopeMismatch);
     }
@@ -1375,16 +1443,15 @@ mod tests {
     use bytes::Bytes;
     use opc_consensus::engine::storage::{RaftSnapshotBuilder, RaftStateMachine};
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
-    use opc_consensus::{durable_openraft_config, DurableOpenraftDomain};
+    use opc_consensus::{DurableOpenraftDomain, durable_openraft_config};
     use opc_types::Timestamp;
     use tokio::sync::Notify;
 
     use super::*;
     use crate::consensus::{
-        storage, SessionConsensusClusterId, SessionConsensusCommand,
+        SESSION_CONSENSUS_SCHEMA_VERSION, SessionConsensusClusterId, SessionConsensusCommand,
         SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-        SessionConsensusRequestId, SessionMutationIntent, SessionTopologyMemberBinding,
-        SESSION_CONSENSUS_SCHEMA_VERSION,
+        SessionConsensusRequestId, SessionMutationIntent, SessionTopologyMemberBinding, storage,
     };
     use crate::sqlite::SqliteSessionBackend;
 
@@ -2764,10 +2831,12 @@ mod tests {
             directory.abort_staged(transition_id(0xc3), transition_digest(0xc3), expected_epoch,),
             Err(SessionRaftAdapterError::PeerTransitionConflict)
         );
-        assert!(directory
-            .resolve_engine(target)
-            .expect("directory remains available")
-            .is_some());
+        assert!(
+            directory
+                .resolve_engine(target)
+                .expect("directory remains available")
+                .is_some()
+        );
         directory
             .abort_staged(transition_b, digest_b, expected_epoch)
             .expect("matching successor abort still succeeds");
@@ -2815,18 +2884,24 @@ mod tests {
             )
             .expect("stage added learner");
 
-        assert!(directory
-            .resolve_engine_for(added, SessionConsensusRpcFamily::AppendEntries)
-            .expect("append route lookup")
-            .is_some());
-        assert!(directory
-            .resolve_engine_for(added, SessionConsensusRpcFamily::InstallSnapshot)
-            .expect("snapshot route lookup")
-            .is_some());
-        assert!(directory
-            .resolve_engine_for(added, SessionConsensusRpcFamily::Vote)
-            .expect("vote route lookup")
-            .is_none());
+        assert!(
+            directory
+                .resolve_engine_for(added, SessionConsensusRpcFamily::AppendEntries)
+                .expect("append route lookup")
+                .is_some()
+        );
+        assert!(
+            directory
+                .resolve_engine_for(added, SessionConsensusRpcFamily::InstallSnapshot)
+                .expect("snapshot route lookup")
+                .is_some()
+        );
+        assert!(
+            directory
+                .resolve_engine_for(added, SessionConsensusRpcFamily::Vote)
+                .expect("vote route lookup")
+                .is_none()
+        );
         assert!(directory.authorizes_engine(
             added,
             desired,
@@ -2853,10 +2928,12 @@ mod tests {
         directory
             .admit_staged_voting(transition, digest, current.configuration_epoch())
             .expect("exact voting admission retry is idempotent");
-        assert!(directory
-            .resolve_engine_for(added, SessionConsensusRpcFamily::Vote)
-            .expect("vote route lookup after admission")
-            .is_some());
+        assert!(
+            directory
+                .resolve_engine_for(added, SessionConsensusRpcFamily::Vote)
+                .expect("vote route lookup after admission")
+                .is_some()
+        );
         assert!(directory.authorizes_engine(added, desired, SessionConsensusRpcFamily::Vote));
     }
 
@@ -2910,10 +2987,12 @@ mod tests {
             ),
             Err(SessionRaftAdapterError::PeerCapacityExceeded)
         );
-        assert!(empty_directory
-            .resolve_engine(extra_id)
-            .expect("directory remains available")
-            .is_none());
+        assert!(
+            empty_directory
+                .resolve_engine(extra_id)
+                .expect("directory remains available")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2972,10 +3051,12 @@ mod tests {
         ];
         for family in cached_predecessor_families {
             assert!(directory.authorizes_engine(removed, current, family));
-            assert!(directory
-                .resolve_engine_for(removed, family)
-                .expect("predecessor route remains available before joint")
-                .is_some());
+            assert!(
+                directory
+                    .resolve_engine_for(removed, family)
+                    .expect("predecessor route remains available before joint")
+                    .is_some()
+            );
         }
 
         let joint_nodes = current_members
@@ -2993,10 +3074,12 @@ mod tests {
             current,
             "joint consensus must not retire the predecessor scope"
         );
-        assert!(directory
-            .resolve_engine(removed)
-            .expect("old route remains")
-            .is_some());
+        assert!(
+            directory
+                .resolve_engine(removed)
+                .expect("old route remains")
+                .is_some()
+        );
         for family in cached_predecessor_families {
             assert!(
                 directory.authorizes_engine(removed, current, family),
@@ -3014,10 +3097,12 @@ mod tests {
             cached_calls.push(tokio::spawn(async move {
                 let _full_rpc_lifetime = cached_directory.begin_engine_rpc().await;
                 assert!(cached_directory.authorizes_engine(removed, current, family));
-                assert!(cached_directory
-                    .resolve_engine_for(removed, family)
-                    .expect("cached directory remains available")
-                    .is_some());
+                assert!(
+                    cached_directory
+                        .resolve_engine_for(removed, family)
+                        .expect("cached directory remains available")
+                        .is_some()
+                );
                 entered.send(family).await.expect("report entered RPC");
                 release
                     .acquire()
@@ -3057,10 +3142,12 @@ mod tests {
             directory.current_scope().expect("desired scope"),
             (desired, desired_members.clone())
         );
-        assert!(directory
-            .resolve_engine(removed)
-            .expect("directory remains available")
-            .is_none());
+        assert!(
+            directory
+                .resolve_engine(removed)
+                .expect("directory remains available")
+                .is_none()
+        );
         for family in cached_predecessor_families {
             assert!(
                 !directory.authorizes_engine(removed, current, family),
@@ -3159,10 +3246,12 @@ mod tests {
             SessionConsensusRpcFamily::InstallSnapshot,
         ] {
             assert!(!directory.authorizes_engine(removed, current, family));
-            assert!(directory
-                .resolve_engine_for(removed, family)
-                .expect("suspended directory remains available")
-                .is_none());
+            assert!(
+                directory
+                    .resolve_engine_for(removed, family)
+                    .expect("suspended directory remains available")
+                    .is_none()
+            );
         }
         assert_eq!(
             directory.current_scope().expect("staging scope retained"),
@@ -3574,10 +3663,16 @@ mod tests {
             SessionConsensusRpcFamily::AppendEntries
         ));
         assert!(is_engine_rpc_family(
+            SessionConsensusRpcFamily::AppendEntriesRoster
+        ));
+        assert!(is_engine_rpc_family(
             SessionConsensusRpcFamily::InstallSnapshot
         ));
         assert!(!is_engine_rpc_family(
             SessionConsensusRpcFamily::ForwardMutation
+        ));
+        assert!(!is_engine_rpc_family(
+            SessionConsensusRpcFamily::ForwardRosterMutation
         ));
         assert!(!is_engine_rpc_family(
             SessionConsensusRpcFamily::ReadBarrier

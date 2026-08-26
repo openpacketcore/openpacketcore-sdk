@@ -22,7 +22,7 @@ use super::{
     },
 };
 use async_trait::async_trait;
-use opc_session_store::{Generation, LeaseGuard};
+use opc_session_store::{FenceToken, Generation, LeaseGuard, OwnerId};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{fmt, sync::Arc};
 
@@ -225,7 +225,13 @@ impl AdmissionInput {
         lease: LeaseGuard,
         expected_generation: Generation,
     ) -> Result<RecoveryInput, ClientError> {
-        RecoveryInput::new(self.roster_id(), lease, expected_generation)
+        RecoveryInput::new(
+            self.roster_id(),
+            self.lease.owner().clone(),
+            self.lease.fence(),
+            lease,
+            expected_generation,
+        )
     }
 
     fn registration_request(&self, scope: Scope) -> Result<RegistrationRequest, ClientError> {
@@ -260,10 +266,15 @@ impl fmt::Debug for AdmissionInput {
 ///
 /// The current guard is authenticated by the durable backend.  The immutable
 /// admission body is deliberately not accepted here: recovery reads its exact
-/// retained canonical form by the client-fixed scope and this roster ID.
+/// retained canonical form only after qualifying the client-fixed scope,
+/// roster ID, original owner, and original admission fence.
 #[derive(Serialize)]
 pub struct RecoveryInput {
     roster_id: RosterId,
+    // These values are immutable provenance from the original admission. They
+    // are deliberately distinct from the replaceable current lease below.
+    original_owner: OwnerId,
+    original_admission_fence: FenceToken,
     lease: LeaseGuard,
     expected_generation: Generation,
 }
@@ -272,14 +283,21 @@ impl RecoveryInput {
     /// Construct a recovery request under a current, higher lease guard.
     pub fn new(
         roster_id: RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
         lease: LeaseGuard,
         expected_generation: Generation,
     ) -> Result<Self, ClientError> {
-        if !lease_has_valid_profile(&lease) {
+        if !lease_has_valid_profile(&lease) || original_admission_fence.get() == 0 {
             return Err(ClientError::InvalidInput);
+        }
+        if lease.fence() <= original_admission_fence {
+            return Err(ClientError::AuthorityRejected);
         }
         Ok(Self {
             roster_id,
+            original_owner,
+            original_admission_fence,
             lease,
             expected_generation,
         })
@@ -293,6 +311,8 @@ impl RecoveryInput {
     fn request(&self, scope: Scope) -> Result<RecoveryRequest, ClientError> {
         RecoveryRequest::new_with_lease_metadata(
             RecoveryLookup::new(scope, self.roster_id),
+            self.original_owner.clone(),
+            self.original_admission_fence,
             self.lease.key().clone(),
             self.lease.owner().clone(),
             self.lease.fence(),
@@ -319,6 +339,8 @@ fn lease_has_valid_profile(lease: &LeaseGuard) -> bool {
 #[derive(Deserialize)]
 struct RecoveryInputWire {
     roster_id: RosterId,
+    original_owner: OwnerId,
+    original_admission_fence: FenceToken,
     lease: LeaseGuard,
     expected_generation: Generation,
 }
@@ -326,7 +348,13 @@ struct RecoveryInputWire {
 impl<'de> Deserialize<'de> for RecoveryInput {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = RecoveryInputWire::deserialize(deserializer)?;
-        Self::new(wire.roster_id, wire.lease, wire.expected_generation)
+        Self::new(
+            wire.roster_id,
+            wire.original_owner,
+            wire.original_admission_fence,
+            wire.lease,
+            wire.expected_generation,
+        )
             .map_err(serde::de::Error::custom)
     }
 }
@@ -347,9 +375,12 @@ impl fmt::Debug for AdmissionOutcome {
     }
 }
 
-/// Admission ambiguity represented only by its durable stable identity.
+/// Admission ambiguity represented by its stable identity and sealed original
+/// admission provenance; it never retains protected admission payload bytes.
 pub struct AdmissionUnknown {
     roster_id: RosterId,
+    original_owner: OwnerId,
+    original_admission_fence: FenceToken,
 }
 
 impl AdmissionUnknown {
@@ -364,7 +395,13 @@ impl AdmissionUnknown {
         lease: LeaseGuard,
         expected_generation: Generation,
     ) -> Result<RecoveryInput, ClientError> {
-        RecoveryInput::new(self.roster_id, lease, expected_generation)
+        RecoveryInput::new(
+            self.roster_id,
+            self.original_owner,
+            self.original_admission_fence,
+            lease,
+            expected_generation,
+        )
     }
 }
 
@@ -1021,6 +1058,11 @@ trait ExecutorClient: Send + Sync {
         registration: &Registration,
         ordinal: u8,
     ) -> Result<CallResult, ExecutorError>;
+    async fn reconcile_member(
+        &self,
+        registration: &Registration,
+        ordinal: u8,
+    ) -> Result<CallResult, ExecutorError>;
     async fn compensate_member(
         &self,
         registration: &Registration,
@@ -1098,6 +1140,14 @@ where
         ordinal: u8,
     ) -> Result<CallResult, ExecutorError> {
         self.executor.adopt(registration, ordinal).await
+    }
+
+    async fn reconcile_member(
+        &self,
+        registration: &Registration,
+        ordinal: u8,
+    ) -> Result<CallResult, ExecutorError> {
+        self.executor.reconcile_member(registration, ordinal).await
     }
 
     async fn compensate_member(
@@ -1211,6 +1261,8 @@ impl FencedMutationRosterClient {
             Err(ExecutorError::AdmissionOutcomeUnknown) => {
                 Ok(AdmissionOutcome::OutcomeUnknown(AdmissionUnknown {
                     roster_id: input.roster_id(),
+                    original_owner: input.lease.owner().clone(),
+                    original_admission_fence: input.lease.fence(),
                 }))
             }
             Err(error) => Err(error.into()),
@@ -1365,6 +1417,23 @@ impl FencedMutationRosterClient {
         let result = self
             .executor
             .adopt(member.registration.as_ref(), member.ordinal.get())
+            .await;
+        recovery_member_outcome(result)
+    }
+
+    /// Reconcile one ambiguous member under the same stable identity and
+    /// current guard without replaying its external effect.
+    ///
+    /// Only a provider-signed conclusive reconciliation receipt can produce
+    /// a terminal proof. `NotFound`, pending, and ambiguous observations stay
+    /// non-exclusionary and cannot authorize Aborted.
+    pub async fn reconcile(
+        &self,
+        member: &mut RecoverableMember,
+    ) -> Result<MemberRecoveryOutcome, ClientError> {
+        let result = self
+            .executor
+            .reconcile_member(member.registration.as_ref(), member.ordinal.get())
             .await;
         recovery_member_outcome(result)
     }

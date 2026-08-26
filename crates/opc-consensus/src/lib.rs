@@ -50,7 +50,8 @@ pub use profile::{
     DURABLE_OPENRAFT_PROFILE, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 pub use transport::{
-    ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler,
-    ConsensusWireRequest, ConsensusWireResponse, CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+    decode_roster_bounded, encode_roster_bounded, ConsensusPeer, ConsensusPeerError,
+    ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
+    CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES, CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
     CONSENSUS_SCHEMA_VERSION,
 };

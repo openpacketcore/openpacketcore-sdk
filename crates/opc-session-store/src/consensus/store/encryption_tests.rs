@@ -1,20 +1,20 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use opc_consensus::{
-    derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
-    DURABLE_CONSENSUS_TIMING_PROFILE,
+    ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+    DURABLE_CONSENSUS_TIMING_PROFILE, derive_configuration_id,
 };
 use opc_key::{
-    EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose,
-    MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider, Zeroizing,
-    AES_256_GCM_SIV_KEY_LEN,
+    AES_256_GCM_SIV_KEY_LEN, EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId,
+    KeyProvider, KeyPurpose, MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider,
+    Zeroizing,
 };
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
@@ -1411,12 +1411,16 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
         .raft
         .metrics();
     let recovered_metrics = recovered_metrics.borrow();
-    assert!(recovered_metrics
-        .snapshot
-        .is_some_and(|log_id| log_id.index > lagging_applied));
-    assert!(recovered_metrics
-        .last_applied
-        .is_some_and(|log_id| log_id.index > lagging_applied));
+    assert!(
+        recovered_metrics
+            .snapshot
+            .is_some_and(|log_id| log_id.index > lagging_applied)
+    );
+    assert!(
+        recovered_metrics
+            .last_applied
+            .is_some_and(|log_id| log_id.index > lagging_applied)
+    );
     drop(recovered_metrics);
     for (session_key, expected_key_id, plaintext) in [
         (&before_key, &old_key_id, PLAINTEXT_BEFORE_ROTATION),

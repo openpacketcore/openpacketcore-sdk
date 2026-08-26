@@ -21,11 +21,11 @@ use futures_util::stream::{BoxStream, StreamExt};
 use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError};
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
-    decode_bounded, durable_openraft_config, encode_bounded, DurableOpenraftDomain,
-    EnsureLinearizableOutcome, EnsureLinearizableSupervisor, LinearizableReadAdmit,
-    LinearizableReadBarrier, LinearizableReadBarrierError, LinearizableReadLease,
     DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY,
-    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS, DurableOpenraftDomain, EnsureLinearizableOutcome,
+    EnsureLinearizableSupervisor, LinearizableReadAdmit, LinearizableReadBarrier,
+    LinearizableReadBarrierError, LinearizableReadLease, decode_bounded, decode_roster_bounded,
+    durable_openraft_config, encode_bounded, encode_roster_bounded,
 };
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
@@ -39,35 +39,31 @@ use super::raft_adapter::{
 };
 use super::storage::{self, SessionConsensusStorageError};
 use super::types::{
+    ConsensusRosterAdmissionCommand, ConsensusRosterAdmissionOutcome, ConsensusRosterRejection,
+    ConsensusRosterTerminalCommand, ConsensusRosterTerminalOutcome,
     fenced_transition_v2_batch_outer_request_id, fenced_transition_voter_set_digest,
-    validate_fenced_transition_v2_batch, ConsensusRosterAdmissionCommand,
-    ConsensusRosterAdmissionOutcome, ConsensusRosterRejection, ConsensusRosterTerminalCommand,
-    ConsensusRosterTerminalOutcome,
+    validate_fenced_transition_v2_batch,
 };
 use super::{
+    SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
     SessionConsensusCommand, SessionConsensusConfigurationEpoch, SessionConsensusIdentity,
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpcFamily,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SessionMutationIntent, SessionMutationOutcome, SessionRaft, SessionRaftTypeConfig,
-    SessionTopologyMemberBinding, SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionTopologyMemberBinding,
 };
 use crate::backend::{
-    record_expiry_preflights, validate_record_expiry_preflights_at,
-    validate_record_expiry_preflights_profile, validate_replication_log_page_owned,
-    validate_replication_prefix_owned, BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+    BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
     RecordExpiryPreflight, ReplicationEntry, ReplicationLogRange, SessionBackend, SessionOp,
-    SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
+    SessionOpResult, record_expiry_preflights, validate_record_expiry_preflights_at,
+    validate_record_expiry_preflights_profile, validate_replication_log_page_owned,
+    validate_replication_prefix_owned,
 };
 use crate::capability::{BackendCapabilities, SessionStorePlatformProfile};
 use crate::clock::{Clock, SystemClock};
 use crate::consumer::{
-    consumer_request_commitment, derive_consumer_consensus_request_id,
-    derive_consumer_consensus_request_id_from_commitment,
-    derive_consumer_fenced_transition_request, derive_consumer_request_binding_id,
-    session_consumer_identity_commitment, session_consumer_roster_ingress_operation,
-    session_consumer_roster_scope_commitment, SessionConsumerAuthorization,
+    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, SessionConsumerAuthorization,
     SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationManifest,
     SessionConsumerBatchResult, SessionConsumerChange, SessionConsumerCompareAndSetRequest,
     SessionConsumerCompareAndSetStatus, SessionConsumerFencedTransitionError,
@@ -76,36 +72,44 @@ use crate::consumer::{
     SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
     SessionConsumerRoster, SessionConsumerRosterAdmissionMutationResponse,
     SessionConsumerRosterAdmissionReadResponse, SessionConsumerRosterAuthorization,
-    SessionConsumerRosterRejection, SessionConsumerRosterTerminalMutationResponse,
-    SessionConsumerRosterTerminalReadResponse, SessionConsumerScope, SessionConsumerStoreError,
-    SessionConsumerV2FencedTransitionBatchError, SessionConsumerV2FencedTransitionBatchResult,
-    SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
-    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
-    SessionQuorumConsumer, SessionQuorumRosterIngress, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    SessionConsumerRosterCurrentPublicationAuthorityReadResponse, SessionConsumerRosterRejection,
+    SessionConsumerRosterTerminalMutationResponse, SessionConsumerRosterTerminalReadResponse,
+    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionBatchError,
+    SessionConsumerV2FencedTransitionBatchResult, SessionConsumerV2FencedTransitionError,
+    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionQuorumConsumer, SessionQuorumRosterIngress,
+    consumer_request_commitment, derive_consumer_consensus_request_id,
+    derive_consumer_consensus_request_id_from_commitment,
+    derive_consumer_fenced_transition_request, derive_consumer_request_binding_id,
+    session_consumer_identity_commitment, session_consumer_roster_ingress_operation,
+    session_consumer_roster_scope_commitment,
 };
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_mutation_roster::{
-    RosterAttestationTrustRootV1, RosterIngressAttestationV1,
-    RosterIngressAttestationVerificationInputV1,
+    CompactAdmissionProvenanceVerificationV2, RosterAttestationTrustRootV1,
+    RosterCompactAdmissionProvenanceSigningInputV2, RosterCompactAdmissionProvenanceV2,
+    RosterIngressAttestationV1, RosterIngressAttestationVerificationInputV1,
+    verify_compact_admission_provenance_v2,
 };
 use crate::fenced_mutation_roster_transport::{
     decode_admission_request_for_scope, decode_terminal_request_for_scope,
     encode_admission_compacted_response, encode_admission_fresh_response,
-    encode_admission_poll_admitted_response, encode_admission_terminal_response,
-    encode_terminal_admitted_response, encode_terminal_compacted_response,
-    encode_terminal_replayed_bytes_response, encode_terminal_terminalized_bytes_response,
+    encode_admission_poll_admitted_response, encode_admission_replayed_response,
+    encode_admission_terminal_response, encode_terminal_admitted_response,
+    encode_terminal_compacted_response, encode_terminal_replayed_bytes_response,
+    encode_terminal_terminalized_bytes_response,
     encode_terminal_terminalized_validated_bytes_response,
 };
 use crate::fenced_transition::{
-    AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
-    FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionStatus,
-    FencedTransitionV2Capability, FencedTransitionV2Effect, FencedTransitionV2HistoryEpoch,
-    FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2Status,
-    PreparedFencedTransition, PreparedFencedTransitionProtection, FENCED_TRANSITION_SCHEMA_V1,
-    FENCED_TRANSITION_SCHEMA_V2, FENCED_TRANSITION_V2_CONSENSUS_SCHEMA_VERSION,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES,
+    AtomicFencedTransitionCapability, FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_SCHEMA_V2,
+    FENCED_TRANSITION_V2_CONSENSUS_SCHEMA_VERSION, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES,
     FENCED_TRANSITION_V2_MIN_CONSENSUS_RPC_PAYLOAD_BYTES,
-    FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES,
+    FENCED_TRANSITION_V2_MIN_DURABLE_LOG_ENTRY_BYTES, FencedTransitionExecuteError,
+    FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
+    FencedTransitionStatus, FencedTransitionV2Capability, FencedTransitionV2Effect,
+    FencedTransitionV2HistoryEpoch, FencedTransitionV2HistoryState, FencedTransitionV2Request,
+    FencedTransitionV2Status, PreparedFencedTransition, PreparedFencedTransitionProtection,
 };
 use crate::lease::{LeaseGuard, SessionLeaseManager};
 use crate::model::{OwnerId, SessionKey};
@@ -5630,6 +5634,7 @@ impl ConsensusSessionStore {
             intent,
             required_consumer_scope: ForwardConsumerScope::from_optional(required_consumer_scope),
         };
+        let roster_mutation = is_roster_mutation_intent(&request.intent);
         let mut preferred = None;
         let mut outcome_may_be_unavailable = false;
 
@@ -5648,15 +5653,18 @@ impl ConsensusSessionStore {
                 self.apply_on_local_leader(request.clone(), self.inner.local_node_id, deadline)
                     .await
             } else {
-                match self
-                    .call_peer::<_, ForwardMutationReply>(
+                match if roster_mutation {
+                    self.call_roster_mutation_peer(leader, &request, deadline)
+                        .await
+                } else {
+                    self.call_peer::<_, ForwardMutationReply>(
                         leader,
                         SessionConsensusRpcFamily::ForwardMutation,
                         &BorrowedForwardRequest::Mutation(&request),
                         deadline,
                     )
                     .await
-                {
+                } {
                     Ok(reply) => reply,
                     Err(ConsensusPeerCallFailure::AfterTransmission) => {
                         // The peer abstraction cannot prove that a failed call
@@ -6580,6 +6588,7 @@ impl ConsensusSessionStore {
         let required_consumer_scope = request.required_consumer_scope.clone();
         let reroute_receiver_forward_to_leader =
             !mutation_requires_exact_status_resolution(&request);
+        let roster_mutation = is_roster_mutation_intent(&request.intent);
         let intent = match request.intent {
             intent @ SessionMutationIntent::FinalizeOperatorRecovery { .. }
             | intent @ SessionMutationIntent::MaintainFencedTransitionV2History { .. }
@@ -6605,7 +6614,11 @@ impl ConsensusSessionStore {
                 error,
             )));
         }
-        let encoded_command = match encode_bounded(&command) {
+        let encoded_command = match if roster_mutation {
+            encode_roster_bounded(&command)
+        } else {
+            encode_bounded(&command)
+        } {
             Ok(encoded) => encoded,
             Err(_) => {
                 let max = self.inner.backend.consensus_capabilities().max_value_bytes;
@@ -7094,6 +7107,16 @@ impl ConsensusSessionStore {
         Req: Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
     {
+        // Roster-sized envelopes require a structural proof supplied by the
+        // dedicated forwarding path below. Generic callers must never widen
+        // an arbitrary application request to the roster payload ceiling.
+        if matches!(
+            family,
+            SessionConsensusRpcFamily::ForwardRosterMutation
+                | SessionConsensusRpcFamily::AppendEntriesRoster
+        ) {
+            return Err(ConsensusPeerCallFailure::BeforeTransmission);
+        }
         let (identity, peer) = self
             .inner
             .peer_directory
@@ -7119,6 +7142,45 @@ impl ConsensusSessionStore {
             .result
             .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
         decode_bounded(&payload).map_err(|_| ConsensusPeerCallFailure::AfterTransmission)
+    }
+
+    /// Forward exactly one protected-roster mutation through the distinct,
+    /// roster-bounded RPC family. The predicate is checked before selecting
+    /// the family and checked again by the leader before it proposes.
+    async fn call_roster_mutation_peer(
+        &self,
+        target: SessionConsensusNodeId,
+        request: &ForwardMutationRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<ForwardMutationReply, ConsensusPeerCallFailure> {
+        if !is_roster_mutation_intent(&request.intent) {
+            return Err(ConsensusPeerCallFailure::BeforeTransmission);
+        }
+        let (identity, peer) = self
+            .inner
+            .peer_directory
+            .resolve_application(target)
+            .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
+        let payload = encode_roster_bounded(&BorrowedForwardRequest::Mutation(request))
+            .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
+        let wire = SessionConsensusWireRequest::try_new(
+            identity,
+            self.inner.local_node_id,
+            SessionConsensusRpcFamily::ForwardRosterMutation,
+            payload,
+        )
+        .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
+        let response = tokio::time::timeout_at(deadline, peer.call(wire))
+            .await
+            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?
+            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
+        response
+            .validate()
+            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
+        let payload = response
+            .result
+            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
+        decode_roster_bounded(&payload).map_err(|_| ConsensusPeerCallFailure::AfterTransmission)
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
@@ -8162,6 +8224,8 @@ fn mutation_requires_exact_status_resolution(request: &ForwardMutationRequest) -
                 | SessionMutationIntent::FencedTransitionV2(_)
                 | SessionMutationIntent::FencedTransitionV2Batch(_)
                 | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
+                | SessionMutationIntent::RosterAdmission(_)
+                | SessionMutationIntent::RosterTerminal(_)
         )
 }
 
@@ -8393,6 +8457,32 @@ fn roster_admission_outcome_matches_command(
             outcome_binding.matches_admission(command) == Ok(true)
                 && roster_rejection_is_typed(*rejection)
         }
+        ConsensusRosterAdmissionOutcome::Replayed { outcome_binding } => {
+            outcome_binding.matches_admission(command) == Ok(true)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RosterAdmissionIngressDisposition {
+    Fresh,
+    Replayed,
+}
+
+/// The registration history epoch is minted exactly at the first admitted
+/// Raft entry. A later committed admission result can therefore never issue a
+/// second execution capability for that registration.
+fn roster_admission_ingress_disposition(
+    registration_history_epoch: u64,
+    response_raft_log_index: u64,
+) -> Result<RosterAdmissionIngressDisposition, ()> {
+    if registration_history_epoch == 0 || response_raft_log_index == 0 {
+        return Err(());
+    }
+    match registration_history_epoch.cmp(&response_raft_log_index) {
+        std::cmp::Ordering::Equal => Ok(RosterAdmissionIngressDisposition::Fresh),
+        std::cmp::Ordering::Less => Ok(RosterAdmissionIngressDisposition::Replayed),
+        std::cmp::Ordering::Greater => Err(()),
     }
 }
 
@@ -8968,9 +9058,10 @@ fn validate_roster_admission_command(
     }
     let _slot = command.admission_slot()?;
     let _payload_digest = command.immutable_payload_digest()?;
-    ConsensusRosterAdmissionCommand::new(command.admission().clone(), command.authority().clone())?;
-    if command.ingress_request_id() != [0; 16]
-        && command.ingress_attestation()?.request_id() != command.ingress_request_id()
+    let ingress = command.ingress_attestation()?;
+    let _provenance = command.admission_provenance()?;
+    if command.ingress_request_id() == [0; 16]
+        || ingress.request_id() != command.ingress_request_id()
     {
         return Err(StoreError::InvalidKey(
             "roster_admission_ingress_request_id_mismatch".into(),
@@ -9005,8 +9096,10 @@ fn validate_roster_terminal_command(
     )
     .map_err(|_| StoreError::InvalidKey("roster_terminal_record_invalid".into()))?;
     command.proof_bundle()?;
-    if command.ingress_request_id() != [0; 16]
-        && command.ingress_attestation()?.request_id() != command.ingress_request_id()
+    command.terminal_evidence()?;
+    let ingress = command.ingress_attestation()?;
+    if command.ingress_request_id() == [0; 16]
+        || ingress.request_id() != command.ingress_request_id()
     {
         return Err(StoreError::InvalidKey(
             "roster_terminal_ingress_request_id_mismatch".into(),
@@ -9077,6 +9170,7 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
         match request.family {
             SessionConsensusRpcFamily::Vote
             | SessionConsensusRpcFamily::AppendEntries
+            | SessionConsensusRpcFamily::AppendEntriesRoster
             | SessionConsensusRpcFamily::InstallSnapshot => {
                 let deadline = tokio::time::Instant::now()
                     .checked_add(self.store.inner.operation_timeout)
@@ -9137,6 +9231,35 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                     }
                 };
                 encode_service_reply(&reply)
+            }
+            SessionConsensusRpcFamily::ForwardRosterMutation => {
+                if !self
+                    .store
+                    .current_application_scope_matches(authenticated_sender, request.identity)
+                {
+                    return SessionConsensusWireResponse {
+                        result: Err(SessionConsensusPeerError::ScopeMismatch),
+                    };
+                }
+                let forwarded: ForwardRequest = match decode_roster_bounded(&request.payload) {
+                    Ok(forwarded) => forwarded,
+                    Err(_) => return protocol_rejection(),
+                };
+                let ForwardRequest::Mutation(forwarded) = forwarded else {
+                    return protocol_rejection();
+                };
+                if !is_roster_mutation_intent(&forwarded.intent) {
+                    return protocol_rejection();
+                }
+                let deadline = tokio::time::Instant::now()
+                    .checked_add(self.store.inner.operation_timeout)
+                    .unwrap_or_else(tokio::time::Instant::now);
+                encode_service_reply(
+                    &self
+                        .store
+                        .apply_on_local_leader(forwarded, authenticated_sender, deadline)
+                        .await,
+                )
             }
             SessionConsensusRpcFamily::ReadBarrier => {
                 if !self
@@ -9229,6 +9352,13 @@ fn protocol_rejection() -> SessionConsensusWireResponse {
     SessionConsensusWireResponse {
         result: Err(SessionConsensusPeerError::Protocol),
     }
+}
+
+fn is_roster_mutation_intent(intent: &SessionMutationIntent) -> bool {
+    matches!(
+        intent,
+        SessionMutationIntent::RosterAdmission(_) | SessionMutationIntent::RosterTerminal(_)
+    )
 }
 
 impl ConsensusSessionConsumerService {
@@ -9342,7 +9472,7 @@ impl ConsensusSessionConsumerService {
             _ => {
                 return SessionConsumerResponse::Rejected(
                     SessionConsumerRejection::MalformedRequest,
-                )
+                );
             }
         };
         let lookup = match crate::sqlite::consensus::consumer_compare_and_set_receipt_lookup(
@@ -9355,7 +9485,7 @@ impl ConsensusSessionConsumerService {
         ) {
             Ok(lookup) => lookup,
             Err(_) => {
-                return SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+                return SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable);
             }
         };
         match self
@@ -9520,9 +9650,10 @@ impl ConsensusSessionConsumerService {
             | SessionConsumerOperation::FencedMutationRosterAdmissionStatus { .. }
             | SessionConsumerOperation::FencedMutationRosterRecover { .. }
             | SessionConsumerOperation::FencedMutationRosterTerminalize { .. }
-            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. } => {
-                SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest)
-            }
+            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. }
+            | SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
+                ..
+            } => SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest),
             SessionConsumerOperation::FencedTransition { .. } => {
                 SessionConsumerResponse::FencedTransition(Err(
                     SessionConsumerFencedTransitionError::RequestConflict,
@@ -9581,7 +9712,10 @@ impl ConsensusSessionConsumerService {
             | SessionConsumerOperation::FencedMutationRosterAdmissionStatus { .. }
             | SessionConsumerOperation::FencedMutationRosterRecover { .. }
             | SessionConsumerOperation::FencedMutationRosterTerminalize { .. }
-            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. } => false,
+            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. }
+            | SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority { .. } => {
+                false
+            }
             SessionConsumerOperation::Batch { ops } => ops
                 .iter()
                 .any(|operation| !matches!(operation, SessionOp::Get { .. })),
@@ -9924,6 +10058,15 @@ fn roster_terminal_read_rejected(
     )
 }
 
+/// Do not distinguish malformed, stale, expired, foreign, or unavailable
+/// current-publication-authority reads. This private capability is only a
+/// Boolean eligibility check to the consumed publication adapter.
+fn roster_current_publication_authority_rejected() -> SessionConsumerResponse {
+    SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
+        SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Rejected,
+    )
+}
+
 enum RosterAdmissionRead {
     Status(
         crate::fenced_mutation_roster::Admission,
@@ -9969,17 +10112,21 @@ impl ConsensusSessionConsumerService {
                 return roster_admission_read_rejected(
                     recovery,
                     SessionConsumerRosterRejection::RecoveryRequired,
-                )
+                );
             }
-            ProtectedRosterReadResult::Admitted(live) => {
-                encode_admission_poll_admitted_response(scope, live.registration, &live.admission)
-            }
+            ProtectedRosterReadResult::Admitted(live) => encode_admission_poll_admitted_response(
+                scope,
+                live.registration,
+                &live.admission,
+                &live.admission_provenance,
+            ),
             ProtectedRosterReadResult::Terminalized(terminal) => {
                 encode_admission_terminal_response(
                     scope,
                     terminal.registration,
                     &terminal.admission,
                     &terminal.committed,
+                    &terminal.admission_provenance,
                 )
             }
             ProtectedRosterReadResult::Compacted {
@@ -10092,11 +10239,20 @@ impl ConsensusSessionConsumerService {
         let proof_bundle = match decoded.proof_bundle() {
             Ok(proof_bundle) => proof_bundle,
             Err(_) => {
-                return roster_terminal_mutation_rejected(SessionConsumerRosterRejection::Malformed)
+                return roster_terminal_mutation_rejected(
+                    SessionConsumerRosterRejection::Malformed,
+                );
             }
         };
-        let command =
-            match ConsensusRosterTerminalCommand::new_with_proof_bundle_and_ingress_request_id(
+        let terminal_evidence = match decoded.terminal_evidence() {
+            Ok(terminal_evidence) => terminal_evidence,
+            Err(_) => {
+                return roster_terminal_mutation_rejected(
+                    SessionConsumerRosterRejection::Malformed,
+                );
+            }
+        };
+        let command = match ConsensusRosterTerminalCommand::new_with_proof_bundle_evidence_and_ingress_request_id(
                 super::types::ConsensusRosterTerminalCommandInput {
                     binding,
                     registration_handle,
@@ -10106,6 +10262,7 @@ impl ConsensusSessionConsumerService {
                     record,
                 },
                 proof_bundle,
+                terminal_evidence,
                 *ingress_request_id.as_bytes(),
                 attestation,
             ) {
@@ -10119,7 +10276,9 @@ impl ConsensusSessionConsumerService {
         let request_id = match command.request_id() {
             Ok(request_id) => request_id,
             Err(_) => {
-                return roster_terminal_mutation_rejected(SessionConsumerRosterRejection::Malformed)
+                return roster_terminal_mutation_rejected(
+                    SessionConsumerRosterRejection::Malformed,
+                );
             }
         };
         // The leader path re-admits the exact scope. Release the local guard
@@ -10257,7 +10416,7 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                 Err(_) => {
                     return SessionConsumerResponse::Rejected(
                         SessionConsumerRejection::MalformedRequest,
-                    )
+                    );
                 }
             };
             if let Err(error) = self
@@ -10325,7 +10484,7 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                 Err(_) => {
                     return SessionConsumerResponse::Rejected(
                         SessionConsumerRejection::MalformedRequest,
-                    )
+                    );
                 }
             };
             if let Err(error) = self
@@ -10569,7 +10728,7 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                     Err(_) => {
                         return SessionConsumerResponse::Rejected(
                             SessionConsumerRejection::MalformedRequest,
-                        )
+                        );
                     }
                 };
                 self.execute_batch(identity, &request, request_commitment, deadline, ops)
@@ -10598,9 +10757,10 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
             | SessionConsumerOperation::FencedMutationRosterAdmissionStatus { .. }
             | SessionConsumerOperation::FencedMutationRosterRecover { .. }
             | SessionConsumerOperation::FencedMutationRosterTerminalize { .. }
-            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. } => {
-                SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized)
-            }
+            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. }
+            | SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
+                ..
+            } => SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized),
         }
     }
 
@@ -10788,11 +10948,66 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
         self.roster_expected_root().map(|root| root.identity())
     }
 
+    fn prepare_compact_admission_provenance_input(
+        &self,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: &SessionConsumerRequest,
+        attestation: &RosterIngressAttestationV1,
+        certificate_subject_identity_commitment: [u8; 32],
+    ) -> Result<RosterCompactAdmissionProvenanceSigningInputV2, SessionConsumerRosterRejection>
+    {
+        let operation = request.operation();
+        let SessionConsumerOperation::FencedMutationRosterPollAdmit { request: capsule } =
+            operation
+        else {
+            return Err(SessionConsumerRosterRejection::Capability);
+        };
+        if request.validate().is_err() || validate_consumer_operation(operation).is_err() {
+            return Err(SessionConsumerRosterRejection::Malformed);
+        }
+        let (operation_tag, capsule_digest) = session_consumer_roster_ingress_operation(operation)?;
+        let root = self
+            .roster_expected_root()
+            .ok_or(SessionConsumerRosterRejection::Capability)?;
+        let (configuration_identity, _) = self
+            .store
+            .current_scope()
+            .map_err(|_| SessionConsumerRosterRejection::Unavailable)?;
+        let expected = RosterIngressAttestationVerificationInputV1 {
+            configuration_identity: &configuration_identity,
+            expected_peer_identity_commitment: session_consumer_identity_commitment(
+                authorization.identity(),
+            ),
+            expected_scope: session_consumer_roster_scope_commitment(request.scope()),
+            expected_request_id: *request.request_id().as_bytes(),
+            expected_operation_tag: operation_tag,
+            expected_capsule_digest: capsule_digest,
+        };
+        attestation
+            .verify_connection_binding(&root, &expected)
+            .map_err(|_| SessionConsumerRosterRejection::Authority)?;
+        let (admission, authority) = decode_admission_request_for_scope(capsule, request.scope())
+            .and_then(|decoded| decoded.into_register_parts())
+            .map_err(|_| SessionConsumerRosterRejection::Malformed)?;
+        authorization
+            .authorize_session_key(admission.key())
+            .map_err(|_| SessionConsumerRosterRejection::Authority)?;
+        RosterCompactAdmissionProvenanceSigningInputV2::for_admission(
+            configuration_identity,
+            &admission,
+            &authority,
+            attestation.signing_input(),
+            certificate_subject_identity_commitment,
+        )
+        .map_err(|_| SessionConsumerRosterRejection::Malformed)
+    }
+
     async fn execute_roster_ingress(
         &self,
         authorization: &SessionConsumerRosterAuthorization,
         request: SessionConsumerRequest,
         attestation: RosterIngressAttestationV1,
+        admission_provenance: Option<RosterCompactAdmissionProvenanceV2>,
     ) -> SessionConsumerResponse {
         let operation = request.operation().clone();
         let ingress_kind = match &operation {
@@ -10801,6 +11016,9 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
             SessionConsumerOperation::FencedMutationRosterRecover { .. } => 3,
             SessionConsumerOperation::FencedMutationRosterTerminalize { .. } => 4,
             SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. } => 5,
+            SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
+                ..
+            } => 6,
             _ => 0,
         };
         let admission_response = |rejection| roster_admission_mutation_rejected(rejection);
@@ -10808,6 +11026,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
             |recovery, rejection| roster_admission_read_rejected(recovery, rejection);
         let terminal_response = |rejection| roster_terminal_mutation_rejected(rejection);
         let terminal_read_response = |rejection| roster_terminal_read_rejected(rejection);
+        let current_authority_response = || roster_current_publication_authority_rejected();
 
         let rejection_response = |rejection| match ingress_kind {
             1 => admission_response(rejection),
@@ -10815,8 +11034,13 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
             3 => admission_read_response(true, rejection),
             4 => terminal_response(rejection),
             5 => terminal_read_response(rejection),
+            6 => current_authority_response(),
             _ => SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized),
         };
+
+        if (ingress_kind == 1) != admission_provenance.is_some() {
+            return rejection_response(SessionConsumerRosterRejection::Malformed);
+        }
 
         let deadline = match self.operation_deadline() {
             Ok(deadline) => deadline,
@@ -10864,12 +11088,34 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     {
                         Ok(parts) => parts,
                         Err(_) => {
-                            return admission_response(SessionConsumerRosterRejection::Malformed)
+                            return admission_response(SessionConsumerRosterRejection::Malformed);
                         }
                     };
+                let admission_provenance = admission_provenance
+                    .as_ref()
+                    .expect("admission provenance presence checked before dispatch");
                 if authorization
                     .authorize_session_key(admission.key())
                     .is_err()
+                {
+                    return admission_response(SessionConsumerRosterRejection::Authority);
+                }
+                let binding = match admission.binding_key(1) {
+                    Ok(binding) => binding,
+                    Err(_) => return admission_response(SessionConsumerRosterRejection::Malformed),
+                };
+                if verify_compact_admission_provenance_v2(
+                    CompactAdmissionProvenanceVerificationV2 {
+                        root: &root,
+                        configuration_identity,
+                        binding,
+                        admission: &admission,
+                        original_authority: &authority,
+                        ingress: attestation.signing_input(),
+                        provenance: admission_provenance,
+                    },
+                )
+                .is_err()
                 {
                     return admission_response(SessionConsumerRosterRejection::Authority);
                 }
@@ -10885,11 +11131,12 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                 // forwarding; a queued topology writer would otherwise be
                 // able to self-block this request.
                 drop(admission_guard);
-                let command = match ConsensusRosterAdmissionCommand::new_with_ingress_request_id(
+                let command = match ConsensusRosterAdmissionCommand::new_with_provenance_and_ingress_request_id(
                     admission.clone(),
                     authority,
                     *request.request_id().as_bytes(),
                     attestation,
+                    admission_provenance.clone(),
                 ) {
                     Ok(command) => command,
                     Err(_) => return admission_response(SessionConsumerRosterRejection::Malformed),
@@ -10911,6 +11158,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     .await
                 {
                     Ok(response) => {
+                        let response_raft_log_index = response.raft_log_index;
                         match response.result {
                             Ok(SessionMutationOutcome::RosterAdmission(
                                 ConsensusRosterAdmissionOutcome::Admitted {
@@ -10919,25 +11167,55 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                                     ..
                                 },
                             )) => {
-                                let result = crate::fenced_mutation_roster_executor::BackendRegistration::from_consensus_parts(
-                                registration_handle,
-                                registration_request_id,
-                                &admission,
-                            )
-                            .map_err(|_| ())
-                            .and_then(|registration| {
-                                encode_admission_fresh_response(request.scope(), registration)
-                                    .map_err(|_| ())
-                            });
+                                let result = match roster_admission_ingress_disposition(
+                                    registration_request_id.history_epoch(),
+                                    response_raft_log_index,
+                                ) {
+                                    Ok(RosterAdmissionIngressDisposition::Fresh) => {
+                                        crate::fenced_mutation_roster_executor::BackendRegistration::from_consensus_parts(
+                                            registration_handle,
+                                            registration_request_id,
+                                            &admission,
+                                        )
+                                        .map_err(|_| ())
+                                        .and_then(|registration| {
+                                            encode_admission_fresh_response(
+                                                request.scope(),
+                                                registration,
+                                                admission_provenance,
+                                            )
+                                            .map_err(|_| ())
+                                        })
+                                    }
+                                    Ok(RosterAdmissionIngressDisposition::Replayed) => {
+                                        encode_admission_replayed_response(request.scope())
+                                            .map_err(|_| ())
+                                    }
+                                    Err(()) => Err(()),
+                                };
                                 match result {
-                                Ok(capsule) => SessionConsumerResponse::FencedMutationRosterPollAdmit(
-                                    SessionConsumerRosterAdmissionMutationResponse::Recorded(capsule),
-                                ),
+                                    Ok(capsule) => SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                                        SessionConsumerRosterAdmissionMutationResponse::Recorded(capsule),
+                                    ),
+                                    Err(_) => SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                                        SessionConsumerRosterAdmissionMutationResponse::OutcomeUnknown,
+                                    ),
+                                }
+                            }
+                            Ok(SessionMutationOutcome::RosterAdmission(
+                                ConsensusRosterAdmissionOutcome::Replayed { .. },
+                            )) => match encode_admission_replayed_response(request.scope()) {
+                                Ok(capsule) => {
+                                    SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                                        SessionConsumerRosterAdmissionMutationResponse::Recorded(
+                                            capsule,
+                                        ),
+                                    )
+                                }
                                 Err(_) => SessionConsumerResponse::FencedMutationRosterPollAdmit(
                                     SessionConsumerRosterAdmissionMutationResponse::OutcomeUnknown,
                                 ),
-                            }
-                            }
+                            },
                             Ok(SessionMutationOutcome::RosterAdmission(
                                 ConsensusRosterAdmissionOutcome::Rejected { rejection, .. },
                             )) => admission_response(session_consumer_roster_rejection(rejection)),
@@ -10967,7 +11245,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                         return admission_read_response(
                             recovery,
                             SessionConsumerRosterRejection::Malformed,
-                        )
+                        );
                     }
                 };
                 let read = if recovery {
@@ -10988,7 +11266,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                             return admission_read_response(
                                 true,
                                 SessionConsumerRosterRejection::Malformed,
-                            )
+                            );
                         }
                     }
                 } else {
@@ -11009,7 +11287,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                             return admission_read_response(
                                 false,
                                 SessionConsumerRosterRejection::Malformed,
-                            )
+                            );
                         }
                     }
                 };
@@ -11023,7 +11301,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                         return admission_read_response(
                             recovery,
                             SessionConsumerRosterRejection::Authority,
-                        )
+                        );
                     }
                 };
                 drop(initial_guard);
@@ -11048,7 +11326,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                         return admission_read_response(
                             recovery,
                             SessionConsumerRosterRejection::Authority,
-                        )
+                        );
                     }
                 };
                 let wall_time_floor = self.store.inner.clock.now_utc();
@@ -11080,7 +11358,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                 let (read, authority_time) = match result {
                     Ok(read) => read,
                     Err(error) => {
-                        return admission_read_response(recovery, roster_store_rejection(&error))
+                        return admission_read_response(recovery, roster_store_rejection(&error));
                     }
                 };
                 // The backend selected both this state image and its current
@@ -11185,6 +11463,10 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     Ok(commitment) => commitment,
                     Err(_) => return rejection_response(SessionConsumerRosterRejection::Malformed),
                 };
+                let terminal_evidence = match decoded.terminal_evidence() {
+                    Ok(terminal_evidence) => terminal_evidence,
+                    Err(_) => return rejection_response(SessionConsumerRosterRejection::Malformed),
+                };
                 #[cfg(test)]
                 ROSTER_INGRESS_TERMINAL_STATUS_READ_COUNT.fetch_add(1, Ordering::Relaxed);
                 let read = match self
@@ -11197,6 +11479,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                         registration,
                         authority,
                         terminal_body_commitment,
+                        terminal_evidence,
                         wall_time_floor,
                     )
                     .await
@@ -11220,6 +11503,77 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     return rejection_response(SessionConsumerRosterRejection::Authority);
                 }
                 self.roster_terminal_read(request.scope(), decoded, read, post_barrier_guard)
+            }
+            SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
+                request: capsule,
+            } => {
+                // A publication adapter submits only this narrow query.  The
+                // client-owned fields are authenticated by the ingress first,
+                // then all are compared under a fresh ReadIndex/SQLite read;
+                // no existing admission/recovery/status operation is reused.
+                if capsule.scope() != session_consumer_roster_scope_commitment(request.scope())
+                    || authorization.authorize_session_key(capsule.key()).is_err()
+                {
+                    return current_authority_response();
+                }
+                let initial_guard = match self
+                    .store
+                    .admit_consumer_scope(request.scope(), deadline)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => return current_authority_response(),
+                };
+                drop(initial_guard);
+                if self
+                    .store
+                    .linearizable_barrier_before(deadline)
+                    .await
+                    .is_err()
+                {
+                    return current_authority_response();
+                }
+                let _post_barrier_guard = match self
+                    .store
+                    .admit_consumer_scope(request.scope(), deadline)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => return current_authority_response(),
+                };
+                let wall_time_floor = self.store.inner.clock.now_utc();
+                let authority_time = match self
+                    .store
+                    .inner
+                    .backend
+                    .consensus_protected_roster_current_publication_authority(
+                        self.store.inner.storage_identity,
+                        *capsule,
+                        wall_time_floor,
+                    )
+                    .await
+                {
+                    Ok(time) => time,
+                    Err(_) => return current_authority_response(),
+                };
+                // The barrier can wait through an ingress certificate or
+                // traffic-authority change. Re-check both at the exact time
+                // selected with the durable authority row before returning
+                // an eligibility ACK to provider-local publication work.
+                if attestation
+                    .verify(&root, &expected, authority_time)
+                    .is_err()
+                    || self
+                        .store
+                        .require_application_traffic_authority_before(deadline)
+                        .await
+                        .is_err()
+                {
+                    return current_authority_response();
+                }
+                SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
+                    SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current,
+                )
             }
             _ => SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized),
         }
@@ -11746,35 +12100,41 @@ impl SessionLeaseManager for ConsensusSessionStore {
 #[cfg(test)]
 mod membership_tests {
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use futures_util::{FutureExt, StreamExt};
-    use opc_consensus::engine::{CommittedLeaderId, Membership};
+    use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, Membership, Vote};
     use opc_consensus::{
-        derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
+        ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity, derive_configuration_id,
     };
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
-        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider,
-        SessionAad, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN,
+        AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN, AeadAlgorithm,
+        EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider, SessionAad, Zeroizing,
+        serialize_bound_aad,
     };
-    use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+    use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
     use serde::{Deserialize, Serialize};
 
     use super::*;
     use crate::backend::ReplicationOp;
     use crate::consumer::SessionConsumerTenantNfScope;
     use crate::fenced_mutation_roster::{
-        roster_executor_evidence_commitment, stable_terminal_proof_commitment, Admission,
-        AdmissionProposal, EstablishedMutation, Member, MemberOperationId, Phase, Profile,
-        RequestId as RosterRequestId, RosterAttestationCertificateRoleV1,
+        Admission, AdmissionProposal, CompactTerminalEvidenceVerificationV2, EstablishedMutation,
+        ExecutorTerminalProofVerification, FRESH_ROSTER_MEMBERS, Member, MemberOperationId, Phase,
+        Profile, RequestId as RosterRequestId, RosterAttestationCertificateRoleV1,
         RosterAttestationLeafCertificatePartsV1, RosterAttestationLeafCertificateV1,
-        RosterAttestationTrustRootV1, RosterExecutorMemberProofPartsV1,
+        RosterAttestationTrustRootV1, RosterCompactAdmissionProvenanceV2,
+        RosterCompactTerminalEvidenceBindingV2, RosterCompactTerminalEvidenceV2,
+        RosterCompactTerminalMemberProjectionV2, RosterCompactTerminalMemberProofPartsV2,
+        RosterCompactTerminalMemberSigningInputV2, RosterExecutorMemberProofPartsV1,
         RosterExecutorProofBundleV1, RosterId, RosterIngressAttestationSigningInputV1,
-        RosterProviderOperationV1, RosterProviderOutcomeV1,
-        RosterTerminalAttestationSigningInputV1, Scope, TerminalRecord, FRESH_ROSTER_MEMBERS,
+        RosterProviderOperationV1, RosterProviderOutcomeV1, RosterProviderReceiptSigningInputV1,
+        RosterTerminalAttestationSigningInputV1, Scope, TerminalRecord,
+        roster_executor_evidence_commitment, stable_terminal_proof_commitment,
+        verify_compact_terminal_evidence_v2, verify_executor_terminal_proof_bundle,
     };
     use crate::fenced_mutation_roster_executor::{
         AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration,
@@ -11936,7 +12296,7 @@ mod membership_tests {
         FencedTransitionOutcome, FencedTransitionRequestId, FencedTransitionV2CallerNonce,
         FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2Status,
         OwnerId, SessionConsensusClusterId, SessionConsensusConfigurationId,
-        SessionConsumerAuthorizationGrant, SessionConsumerRequestId, SessionConsumerTenantNfScope,
+        SessionConsumerAuthorizationGrant, SessionConsumerRequestId,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 
@@ -12054,6 +12414,8 @@ mod membership_tests {
         Recover {
             scope: [u8; 32],
             roster_id: RosterId,
+            original_owner: OwnerId,
+            original_admission_fence: FenceToken,
             authority: RosterIngressAuthorityWire,
         },
     }
@@ -12067,18 +12429,23 @@ mod membership_tests {
         Fresh {
             scope: [u8; 32],
             registration: RosterIngressRegistrationWire,
+            admission_provenance: Vec<u8>,
         },
-        Replayed {},
+        Replayed {
+            scope: [u8; 32],
+        },
         PollAdmitted {
             scope: [u8; 32],
             registration: RosterIngressRegistrationWire,
             admission: Vec<u8>,
+            admission_provenance: Vec<u8>,
         },
         Terminal {
             scope: [u8; 32],
             registration: RosterIngressRegistrationWire,
             admission: Vec<u8>,
             committed: Vec<u8>,
+            admission_provenance: Vec<u8>,
         },
         Compacted {
             scope: [u8; 32],
@@ -12099,6 +12466,7 @@ mod membership_tests {
         authority: RosterIngressAuthorityWire,
         record: Vec<u8>,
         proof_bundle: Vec<u8>,
+        terminal_evidence: Vec<u8>,
     }
 
     fn admission_capsule(
@@ -12126,11 +12494,15 @@ mod membership_tests {
     fn recovery_capsule(
         scope: Scope,
         roster_id: RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
         authority: &AuthorityBinding,
     ) -> crate::consumer::SessionConsumerRosterAdmissionCapsule {
         let wire = RosterIngressAdmissionRequestWire::Recover {
             scope: scope.digest(),
             roster_id,
+            original_owner,
+            original_admission_fence,
             authority: authority.into(),
         };
         crate::consumer::SessionConsumerRosterAdmissionCapsule::new(
@@ -12153,6 +12525,7 @@ mod membership_tests {
         terminal: &TerminalRecord,
         admission: &Admission,
         proof_bundle: &RosterExecutorProofBundleV1,
+        terminal_evidence: &RosterCompactTerminalEvidenceV2,
     ) -> crate::consumer::SessionConsumerRosterTerminalCapsule {
         let wire = RosterIngressTerminalRequestWire {
             scope: scope.digest(),
@@ -12163,6 +12536,9 @@ mod membership_tests {
                 .to_canonical_bytes(admission)
                 .expect("terminal bytes"),
             proof_bundle: proof_bundle.canonical_bytes().expect("proof bundle bytes"),
+            terminal_evidence: terminal_evidence
+                .canonical_bytes()
+                .expect("compact terminal evidence bytes"),
         };
         crate::consumer::SessionConsumerRosterTerminalCapsule::new(
             crate::fenced_mutation_roster::encode_frame(
@@ -12250,16 +12626,39 @@ mod membership_tests {
             operation_tag: u8,
             capsule: [u8; 32],
         ) -> RosterIngressAttestationV1 {
+            self.ingress_with_metadata(
+                peer_identity_commitment,
+                scope,
+                request_id,
+                operation_tag,
+                capsule,
+                self.valid_from,
+                1,
+                1,
+            )
+        }
+
+        fn ingress_with_metadata(
+            &self,
+            peer_identity_commitment: [u8; 32],
+            scope: [u8; 32],
+            request_id: SessionConsumerRequestId,
+            operation_tag: u8,
+            capsule: [u8; 32],
+            authenticated_at: Timestamp,
+            material_generation: u64,
+            handshake_epoch: u64,
+        ) -> RosterIngressAttestationV1 {
             let input = RosterIngressAttestationSigningInputV1 {
                 peer_identity_commitment,
                 consumer_scope: scope,
                 request_id: *request_id.as_bytes(),
                 operation_tag,
                 canonical_capsule_digest: capsule,
-                authenticated_at: self.valid_from,
+                authenticated_at,
                 peer_certificate_expires_at: self.valid_until,
-                material_generation: 1,
-                handshake_epoch: 1,
+                material_generation,
+                handshake_epoch,
             };
             RosterIngressAttestationV1::issue_from_signed_parts(
                 &self.root,
@@ -12276,13 +12675,42 @@ mod membership_tests {
             .expect("ingress attestation")
         }
 
+        fn compact_admission(
+            &self,
+            scope: [u8; 32],
+            subject_identity_commitment: [u8; 32],
+            input: &RosterCompactAdmissionProvenanceSigningInputV2,
+        ) -> RosterCompactAdmissionProvenanceV2 {
+            RosterCompactAdmissionProvenanceV2::issue_from_signed_parts(
+                &self.root,
+                self.certificate(
+                    RosterAttestationCertificateRoleV1::TransportIngress,
+                    scope,
+                    subject_identity_commitment,
+                    [0x49; 32],
+                    self.ingress_key.verifying_key(),
+                ),
+                input,
+                sign_roster_test_digest(
+                    &self.ingress_key,
+                    input.digest().expect("compact admission digest"),
+                ),
+            )
+            .expect("compact admission provenance")
+        }
+
         fn terminal(
             &self,
             admission: &Admission,
             binding: crate::fenced_mutation_roster::RequestBindingKey,
             registration: BackendRegistration,
             authority: &AuthorityBinding,
-        ) -> (TerminalRecord, RosterExecutorProofBundleV1) {
+            admission_provenance: &RosterCompactAdmissionProvenanceV2,
+        ) -> (
+            TerminalRecord,
+            RosterExecutorProofBundleV1,
+            RosterCompactTerminalEvidenceV2,
+        ) {
             let (registration_handle, registration_request_id, registration_terminal_slot) =
                 registration.consensus_parts();
             let evidence = admission
@@ -12317,7 +12745,7 @@ mod membership_tests {
             let proofs = admission
                 .members()
                 .iter()
-                .zip(evidence)
+                .zip(&evidence)
                 .map(|(member, evidence)| {
                     let input = RosterTerminalAttestationSigningInputV1 {
                         profile: admission.profile(),
@@ -12349,14 +12777,29 @@ mod membership_tests {
                         proof_epoch: 1,
                         provider_operation: RosterProviderOperationV1::Execute,
                         outcome: RosterProviderOutcomeV1::AppliedExecuted,
-                        evidence,
+                        evidence: evidence.clone(),
                     };
+                    let provider_input = RosterProviderReceiptSigningInputV1::from_terminal_input(
+                        &input, [0x4a; 32],
+                    )
+                    .expect("provider receipt input");
                     RosterExecutorMemberProofPartsV1 {
                         ordinal: member.ordinal(),
                         provider_operation: RosterProviderOperationV1::Execute,
                         outcome: RosterProviderOutcomeV1::AppliedExecuted,
                         proof_epoch: 1,
                         evidence: input.evidence.clone(),
+                        provider_certificate: self.certificate(
+                            RosterAttestationCertificateRoleV1::Provider,
+                            authority.scope().digest(),
+                            [0x4a; 32],
+                            [0x4b; 32],
+                            self.executor_key.verifying_key(),
+                        ),
+                        provider_signature: sign_roster_test_digest(
+                            &self.executor_key,
+                            provider_input.digest().expect("provider receipt digest"),
+                        ),
                         signature: sign_roster_test_digest(
                             &self.executor_key,
                             input.digest().expect("executor proof digest"),
@@ -12376,7 +12819,87 @@ mod membership_tests {
                 proofs,
             )
             .expect("executor proof bundle");
-            (terminal, proof_bundle)
+            let compact_binding = RosterCompactTerminalEvidenceBindingV2::for_terminal(
+                self.identity,
+                binding,
+                registration,
+                admission_provenance,
+                admission,
+                authority,
+                &terminal,
+                [0x47; 32],
+            )
+            .expect("compact terminal binding");
+            let compact_proofs = admission
+                .members()
+                .iter()
+                .zip(terminal.proof_commitments())
+                .zip(&evidence)
+                .map(|((member, stable_proof_commitment), evidence)| {
+                    let member = RosterCompactTerminalMemberProjectionV2 {
+                        ordinal: member.ordinal(),
+                        member_operation_id: *member.operation_id().as_bytes(),
+                        descriptor_length: member.descriptor().len() as u16,
+                        descriptor_commitment: member.descriptor_commitment(),
+                        expected_member_version: member.expected_version(),
+                        admission_generation: admission.expected_generation().get(),
+                        proof_epoch: 1,
+                        provider_operation: RosterProviderOperationV1::Execute,
+                        outcome: RosterProviderOutcomeV1::AppliedExecuted,
+                        evidence_length: evidence.len() as u16,
+                        evidence_commitment: roster_executor_evidence_commitment(evidence),
+                        stable_proof_commitment: *stable_proof_commitment,
+                    };
+                    let provider_certificate = self.certificate(
+                        RosterAttestationCertificateRoleV1::Provider,
+                        authority.scope().digest(),
+                        [0x4a; 32],
+                        [0x4b; 32],
+                        self.executor_key.verifying_key(),
+                    );
+                    let provider = RosterAttestationLeafCertificateV1::issue_from_signed_parts(
+                        &self.root,
+                        provider_certificate.clone(),
+                    )
+                    .expect("provider certificate");
+                    RosterCompactTerminalMemberProofPartsV2 {
+                        provider_certificate,
+                        provider_signature: sign_roster_test_digest(
+                            &self.executor_key,
+                            crate::fenced_mutation_roster::provider_receipt_compact_digest(
+                                &compact_binding,
+                                &member,
+                                &provider,
+                            )
+                            .expect("provider receipt digest"),
+                        ),
+                        signature: sign_roster_test_digest(
+                            &self.executor_key,
+                            RosterCompactTerminalMemberSigningInputV2 {
+                                binding: compact_binding.clone(),
+                                member: member.clone(),
+                            }
+                            .digest()
+                            .expect("compact terminal member digest"),
+                        ),
+                        member,
+                    }
+                })
+                .collect();
+            let terminal_evidence = RosterCompactTerminalEvidenceV2::issue_from_signed_parts(
+                &self.root,
+                self.certificate(
+                    RosterAttestationCertificateRoleV1::Executor,
+                    authority.scope().digest(),
+                    [0x47; 32],
+                    [0x48; 32],
+                    self.executor_key.verifying_key(),
+                ),
+                &compact_binding,
+                compact_proofs,
+            )
+            .expect("compact terminal evidence");
+            (terminal, proof_bundle, terminal_evidence)
         }
     }
 
@@ -12564,12 +13087,14 @@ mod membership_tests {
             store.inner.consensus_log_prune_lane.is_some(),
             "fixed durable storage constructs the owned physical-prune lane"
         );
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            checkpoint_workers.wait_for_worker_count(1),
-        )
-        .await
-        .expect("checkpoint worker starts"));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                checkpoint_workers.wait_for_worker_count(1),
+            )
+            .await
+            .expect("checkpoint worker starts")
+        );
 
         let hold = store.hold_raft_shutdown_before_core_for_test();
         let gate = Arc::clone(&hold.gate);
@@ -12581,12 +13106,14 @@ mod membership_tests {
                 .expect("join Raft shutdown gate observer"),
             "the public shutdown reaches the held core phase only after both maintenance joins"
         );
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            checkpoint_workers.wait_for_worker_count(0),
-        )
-        .await
-        .expect("checkpoint worker exits before core shutdown"));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                checkpoint_workers.wait_for_worker_count(0),
+            )
+            .await
+            .expect("checkpoint worker exits before core shutdown")
+        );
         assert_eq!(
             store
                 .inner
@@ -12640,12 +13167,14 @@ mod membership_tests {
         )
         .await
         .expect("open fixed store with bounded shutdown deadline");
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            checkpoint_workers.wait_for_worker_count(1),
-        )
-        .await
-        .expect("checkpoint worker starts"));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                checkpoint_workers.wait_for_worker_count(1),
+            )
+            .await
+            .expect("checkpoint worker starts")
+        );
 
         let hold = store.hold_raft_shutdown_before_core_for_test();
         let gate = Arc::clone(&hold.gate);
@@ -12659,12 +13188,14 @@ mod membership_tests {
                 .expect("join Raft shutdown gate observer"),
             "the shared shutdown reaches the deliberately stalled core"
         );
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            checkpoint_workers.wait_for_worker_count(0),
-        )
-        .await
-        .expect("checkpoint worker exits before either caller times out"));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                checkpoint_workers.wait_for_worker_count(0),
+            )
+            .await
+            .expect("checkpoint worker exits before either caller times out")
+        );
 
         let first = tokio::time::timeout(Duration::from_secs(1), first)
             .await
@@ -13334,6 +13865,47 @@ mod membership_tests {
         .expect("authority")
     }
 
+    fn roster_response_production_admission_command(
+        admission: Admission,
+        authority: AuthorityBinding,
+    ) -> ConsensusRosterAdmissionCommand {
+        let identity = singleton_topology()
+            .consensus_identity()
+            .expect("roster response identity");
+        let issuer = RosterIngressTestIssuer::new(
+            identity,
+            Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH),
+            Timestamp::from_offset_datetime(
+                time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60),
+            ),
+        );
+        let ingress = issuer.ingress(
+            [0x94; 32],
+            admission.scope().digest(),
+            SessionConsumerRequestId::from_bytes([0x95; 16]),
+            1,
+            [0x96; 32],
+        );
+        let provenance_input = RosterCompactAdmissionProvenanceSigningInputV2::for_admission(
+            identity,
+            &admission,
+            &authority,
+            ingress.signing_input(),
+            [0x97; 32],
+        )
+        .expect("roster response provenance input");
+        let provenance =
+            issuer.compact_admission(admission.scope().digest(), [0x97; 32], &provenance_input);
+        ConsensusRosterAdmissionCommand::new_with_provenance_and_ingress_request_id(
+            admission,
+            authority,
+            ingress.request_id(),
+            ingress,
+            provenance,
+        )
+        .expect("production roster response command")
+    }
+
     fn roster_response_authority_at_fence(admission: &Admission, fence: u64) -> AuthorityBinding {
         AuthorityBinding::from_consensus_parts(
             admission.scope().digest(),
@@ -13397,6 +13969,26 @@ mod membership_tests {
             RosterExecutorProofBundleV1::certificate_signing_digest(&certificate)
                 .expect("certificate digest"),
         );
+        let mut provider_certificate = RosterAttestationLeafCertificatePartsV1 {
+            root_id: root.root_id(),
+            role: RosterAttestationCertificateRoleV1::Provider,
+            configuration_identity: identity,
+            scope: admission.scope().digest(),
+            subject_identity_commitment: [0x84; 32],
+            leaf_epoch: 1,
+            key_id: [0x85; 32],
+            not_before: Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH),
+            not_after: Timestamp::from_offset_datetime(
+                time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60),
+            ),
+            public_key: compressed_roster_test_key(leaf_key.verifying_key()),
+            root_signature: [0; 64],
+        };
+        provider_certificate.root_signature = sign_roster_test_digest(
+            &root_key,
+            RosterExecutorProofBundleV1::certificate_signing_digest(&provider_certificate)
+                .expect("provider certificate digest"),
+        );
         let proofs = admission
             .members()
             .iter()
@@ -13406,6 +13998,11 @@ mod membership_tests {
                 outcome: RosterProviderOutcomeV1::AppliedExecuted,
                 proof_epoch: 1,
                 evidence: vec![0x84, member.ordinal()],
+                provider_certificate: provider_certificate.clone(),
+                provider_signature: sign_roster_test_digest(
+                    &leaf_key,
+                    [member.ordinal().saturating_add(2); 32],
+                ),
                 signature: sign_roster_test_digest(
                     &leaf_key,
                     [member.ordinal().saturating_add(1); 32],
@@ -13452,13 +14049,92 @@ mod membership_tests {
     }
 
     #[test]
+    fn roster_append_predicate_requires_exactly_one_normal_roster_command() {
+        let identity = singleton_topology()
+            .consensus_identity()
+            .expect("singleton consensus identity");
+        let leader = node(1);
+        let entry = |index, intent| Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, leader), index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity,
+                request_id: SessionConsensusRequestId::from_bytes([index as u8; 16]),
+                logical_time: Timestamp::from_offset_datetime(time::OffsetDateTime::UNIX_EPOCH),
+                intent,
+            }),
+        };
+        let append = |entries| opc_consensus::engine::raft::AppendEntriesRequest {
+            vote: Vote::new_committed(1, leader),
+            prev_log_id: None,
+            leader_commit: None,
+            entries,
+        };
+
+        let admission = roster_response_admission();
+        let admission_intent = SessionMutationIntent::RosterAdmission(Box::new(
+            ConsensusRosterAdmissionCommand::new(
+                admission.clone(),
+                roster_response_authority(&admission),
+            )
+            .expect("admission command"),
+        ));
+        assert!(crate::consensus::raft_adapter::is_singleton_roster_append(
+            &append(vec![entry(1, admission_intent),])
+        ));
+
+        let terminal_intent = SessionMutationIntent::RosterTerminal(Box::new(
+            roster_response_terminal_command(&admission, roster_response_authority(&admission)),
+        ));
+        assert!(crate::consensus::raft_adapter::is_singleton_roster_append(
+            &append(vec![entry(2, terminal_intent),])
+        ));
+
+        assert!(!crate::consensus::raft_adapter::is_singleton_roster_append(
+            &append(vec![])
+        ));
+        assert!(!crate::consensus::raft_adapter::is_singleton_roster_append(
+            &append(vec![entry(3, SessionMutationIntent::AdvanceLogicalTime),])
+        ));
+        let second_admission = SessionMutationIntent::RosterAdmission(Box::new(
+            ConsensusRosterAdmissionCommand::new(
+                admission.clone(),
+                roster_response_authority(&admission),
+            )
+            .expect("second admission command"),
+        ));
+        let third_admission = SessionMutationIntent::RosterAdmission(Box::new(
+            ConsensusRosterAdmissionCommand::new(
+                admission.clone(),
+                roster_response_authority(&admission),
+            )
+            .expect("third admission command"),
+        ));
+        assert!(!crate::consensus::raft_adapter::is_singleton_roster_append(
+            &append(vec![entry(4, second_admission), entry(5, third_admission)])
+        ));
+        let mixed_admission = SessionMutationIntent::RosterAdmission(Box::new(
+            ConsensusRosterAdmissionCommand::new(
+                admission.clone(),
+                roster_response_authority(&admission),
+            )
+            .expect("mixed admission command"),
+        ));
+        assert!(!crate::consensus::raft_adapter::is_singleton_roster_append(
+            &append(vec![
+                entry(6, mixed_admission),
+                entry(7, SessionMutationIntent::AdvanceLogicalTime),
+            ])
+        ));
+    }
+
+    #[test]
     fn roster_admission_committed_responses_require_exact_typed_binding() {
         let admission = roster_response_admission();
-        let command = ConsensusRosterAdmissionCommand::new(
+        let command = roster_response_production_admission_command(
             admission.clone(),
             roster_response_authority(&admission),
-        )
-        .expect("admission command");
+        );
         let request_id = RosterRequestId::bind(9, &admission).expect("request ID");
         let registration =
             BackendRegistration::from_consensus_parts([0x81; 32], request_id, &admission)
@@ -13496,6 +14172,12 @@ mod membership_tests {
         assert!(committed_response_matches_intent(
             &intent,
             &committed(Ok(admitted()))
+        ));
+        assert!(committed_response_matches_intent(
+            &intent,
+            &committed(Ok(SessionMutationOutcome::RosterAdmission(
+                ConsensusRosterAdmissionOutcome::Replayed { outcome_binding },
+            ))),
         ));
 
         let mut wrong_slot = slot;
@@ -13542,8 +14224,7 @@ mod membership_tests {
         )
         .expect("other authority");
         let other_outcome_binding =
-            ConsensusRosterAdmissionCommand::new(admission.clone(), other_authority)
-                .expect("other command")
+            roster_response_production_admission_command(admission.clone(), other_authority)
                 .outcome_binding()
                 .expect("other outcome binding");
         assert!(!committed_response_matches_intent(
@@ -13565,6 +14246,21 @@ mod membership_tests {
             consensus_outcome_unavailable(&intent),
             StoreError::BackendOperationOutcomeUnavailable
         );
+    }
+
+    #[test]
+    fn admission_response_epoch_classification_rejects_future_registration() {
+        assert_eq!(
+            roster_admission_ingress_disposition(9, 9),
+            Ok(RosterAdmissionIngressDisposition::Fresh),
+        );
+        assert_eq!(
+            roster_admission_ingress_disposition(9, 10),
+            Ok(RosterAdmissionIngressDisposition::Replayed),
+        );
+        assert_eq!(roster_admission_ingress_disposition(10, 9), Err(()));
+        assert_eq!(roster_admission_ingress_disposition(0, 9), Err(()));
+        assert_eq!(roster_admission_ingress_disposition(9, 0), Err(()));
     }
 
     #[test]
@@ -13809,6 +14505,32 @@ mod membership_tests {
         serde_json::from_value(encoded).expect("structural V2 body conflict decodes")
     }
 
+    #[test]
+    fn roster_mutations_require_exact_status_resolution_without_consumer_scope() {
+        let admission = roster_response_admission();
+        let authority = roster_response_authority(&admission);
+        let mutations = [
+            SessionMutationIntent::RosterAdmission(Box::new(
+                roster_response_production_admission_command(admission.clone(), authority.clone()),
+            )),
+            SessionMutationIntent::RosterTerminal(Box::new(roster_response_terminal_command(
+                &admission, authority,
+            ))),
+        ];
+
+        for intent in mutations {
+            let request = ForwardMutationRequest {
+                request_id: SessionConsensusRequestId::new(),
+                intent,
+                required_consumer_scope: ForwardConsumerScope::Internal,
+            };
+            assert!(
+                mutation_requires_exact_status_resolution(&request),
+                "protected roster mutations must not reroute after transport ambiguity"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn generic_receiver_forward_to_leader_is_rerouted_with_same_request_id() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
@@ -13880,8 +14602,8 @@ mod membership_tests {
     }
 
     #[tokio::test]
-    async fn accepted_receiver_forward_to_leader_is_terminal_unknown_for_singleton_and_batch_effects(
-    ) {
+    async fn accepted_receiver_forward_to_leader_is_terminal_unknown_for_singleton_and_batch_effects()
+     {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let open = |label: &'static str| async move {
             let directory = tempfile::tempdir().expect("accepted receiver effect directory");
@@ -14419,21 +15141,24 @@ mod membership_tests {
             },
         );
 
-        assert!(fixed_durable_v2_status_for_batch_dispatch(
-            QuorumTopologyMode::FixedDurableQuorum,
-            &status,
-        )
-        .is_some());
-        assert!(fixed_durable_v2_status_for_batch_dispatch(
-            QuorumTopologyMode::LabSingleton,
-            &status,
-        )
-        .is_none());
-        assert!(fixed_durable_v2_status_for_batch_dispatch(
-            QuorumTopologyMode::FixedDurableQuorum,
-            &non_status,
-        )
-        .is_none());
+        assert!(
+            fixed_durable_v2_status_for_batch_dispatch(
+                QuorumTopologyMode::FixedDurableQuorum,
+                &status,
+            )
+            .is_some()
+        );
+        assert!(
+            fixed_durable_v2_status_for_batch_dispatch(QuorumTopologyMode::LabSingleton, &status,)
+                .is_none()
+        );
+        assert!(
+            fixed_durable_v2_status_for_batch_dispatch(
+                QuorumTopologyMode::FixedDurableQuorum,
+                &non_status,
+            )
+            .is_none()
+        );
         let batch = SessionConsumerV2Request::new(
             scope,
             SessionConsumerV2Operation::FencedTransitionV2Batch {
@@ -16147,13 +16872,13 @@ mod membership_tests {
         let peer_identity_commitment =
             session_consumer_identity_commitment(authorization.identity());
         let service = store.consumer_service();
-        let admission_capsule = admission_capsule(roster_scope, &admission, &authority);
+        let original_admission_capsule = admission_capsule(roster_scope, &admission, &authority);
         let admission_request_id = SessionConsumerRequestId::from_bytes([0x55; 16]);
         let admission_request = SessionConsumerRequest::new(
             scope,
             admission_request_id,
             SessionConsumerOperation::FencedMutationRosterPollAdmit {
-                request: Box::new(admission_capsule.clone()),
+                request: Box::new(original_admission_capsule.clone()),
             },
         );
         let (admission_tag, admission_digest) =
@@ -16169,23 +16894,48 @@ mod membership_tests {
             .borrow()
             .last_log_index
             .expect("first log index");
+        let admission_attestation = issuer.ingress(
+            peer_identity_commitment,
+            roster_scope.digest(),
+            admission_request_id,
+            admission_tag,
+            admission_digest,
+        );
+        let admission_subject_identity_commitment = [0x4a; 32];
+        let admission_provenance_input = service
+            .prepare_compact_admission_provenance_input(
+                &roster_authorization,
+                &admission_request,
+                &admission_attestation,
+                admission_subject_identity_commitment,
+            )
+            .expect("compact admission provenance input");
+        let admission_provenance = issuer.compact_admission(
+            roster_scope.digest(),
+            admission_subject_identity_commitment,
+            &admission_provenance_input,
+        );
         let admission_response = service
             .execute_roster_ingress(
                 &roster_authorization,
                 admission_request,
-                issuer.ingress(
-                    peer_identity_commitment,
-                    roster_scope.digest(),
-                    admission_request_id,
-                    admission_tag,
-                    admission_digest,
-                ),
+                admission_attestation.clone(),
+                Some(admission_provenance.clone()),
             )
             .await;
         let admission_response_capsule = match admission_response {
             SessionConsumerResponse::FencedMutationRosterPollAdmit(
                 SessionConsumerRosterAdmissionMutationResponse::Recorded(capsule),
             ) => capsule,
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::OutcomeUnknown,
+            ) => panic!("expected recorded fresh roster admission, got OutcomeUnknown"),
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::NotTransmitted,
+            ) => panic!("expected recorded fresh roster admission, got NotTransmitted"),
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::Rejected(rejection),
+            ) => panic!("expected recorded fresh roster admission, got {rejection:?}"),
             response => panic!("expected fresh roster admission, got {response:?}"),
         };
         let admission_wire: RosterIngressAdmissionResponseWire =
@@ -16200,6 +16950,7 @@ mod membership_tests {
             RosterIngressAdmissionResponseWire::Fresh {
                 scope: response_scope,
                 registration,
+                ..
             } => {
                 assert_eq!(response_scope, roster_scope.digest());
                 let request_id = registration.request_id;
@@ -16207,11 +16958,334 @@ mod membership_tests {
             }
             _ => panic!("expected fresh admission response wire"),
         };
+        assert_eq!(
+            registration_request_id.history_epoch(),
+            first_log + 1,
+            "the first admission Raft entry mints the registration epoch"
+        );
+
+        // An independent authenticated ingress for the same canonical body
+        // must be recorded as a stable-slot replay. It has a fresh consumer
+        // request ID, authenticated-at instant, material generation, and
+        // handshake epoch, so equality cannot depend on its compact proof.
+        clock.set(start.add_seconds(1).expect("replay logical time"));
+        let replay_request_id = SessionConsumerRequestId::from_bytes([0x5b; 16]);
+        let replay_request = SessionConsumerRequest::new(
+            scope,
+            replay_request_id,
+            SessionConsumerOperation::FencedMutationRosterPollAdmit {
+                request: Box::new(original_admission_capsule.clone()),
+            },
+        );
+        let (replay_tag, replay_digest) =
+            session_consumer_roster_ingress_operation(replay_request.operation())
+                .expect("replay ingress operation");
+        let replay_attestation = issuer.ingress_with_metadata(
+            peer_identity_commitment,
+            roster_scope.digest(),
+            replay_request_id,
+            replay_tag,
+            replay_digest,
+            start.add_seconds(1).expect("replay authentication time"),
+            2,
+            2,
+        );
+        let replay_provenance_input = service
+            .prepare_compact_admission_provenance_input(
+                &roster_authorization,
+                &replay_request,
+                &replay_attestation,
+                admission_subject_identity_commitment,
+            )
+            .expect("replay compact admission provenance input");
+        let replay_provenance = issuer.compact_admission(
+            roster_scope.digest(),
+            admission_subject_identity_commitment,
+            &replay_provenance_input,
+        );
+        assert_ne!(
+            admission_provenance
+                .canonical_bytes()
+                .expect("fresh provenance bytes"),
+            replay_provenance
+                .canonical_bytes()
+                .expect("replay provenance bytes"),
+            "independently signed ingress provenance differs from the stored proof"
+        );
+        let replay_response = service
+            .execute_roster_ingress(
+                &roster_authorization,
+                replay_request,
+                replay_attestation,
+                Some(replay_provenance),
+            )
+            .await;
+        let replay_capsule = match replay_response {
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::Recorded(capsule),
+            ) => capsule,
+            response => panic!("expected replayed roster admission, got {response:?}"),
+        };
+        let replay_wire: RosterIngressAdmissionResponseWire =
+            crate::fenced_mutation_roster::decode_frame(
+                replay_capsule.canonical_bytes(),
+                TEST_ADMISSION_RESPONSE_MAGIC,
+                TEST_ADMISSION_RESPONSE_DOMAIN,
+                crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+            )
+            .expect("decode capability-free replay response");
+        assert!(matches!(
+            replay_wire,
+            RosterIngressAdmissionResponseWire::Replayed { scope: response_scope }
+                if response_scope == roster_scope.digest()
+        ));
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(first_log + 2),
+            "same-body replay applies at a new Raft position without another registration"
+        );
+        assert_eq!(
+            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
+            2,
+            "fresh admission and the no-effect replay are the only submitted admission commands"
+        );
+        assert_eq!(
+            ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.load(Ordering::Relaxed),
+            2
+        );
+
+        // The protected-roster namespace deliberately bypasses the generic
+        // request ledger. Replaying the original byte-for-byte command still
+        // reaches the stable-slot classifier at a later Raft index and must
+        // therefore be capability-free as well.
+        let exact_duplicate_request = SessionConsumerRequest::new(
+            scope,
+            admission_request_id,
+            SessionConsumerOperation::FencedMutationRosterPollAdmit {
+                request: Box::new(original_admission_capsule.clone()),
+            },
+        );
+        let exact_duplicate_response = service
+            .execute_roster_ingress(
+                &roster_authorization,
+                exact_duplicate_request,
+                admission_attestation,
+                Some(admission_provenance.clone()),
+            )
+            .await;
+        let exact_duplicate_capsule = match exact_duplicate_response {
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::Recorded(capsule),
+            ) => capsule,
+            response => panic!("expected exact replayed roster admission, got {response:?}"),
+        };
+        let exact_duplicate_wire: RosterIngressAdmissionResponseWire =
+            crate::fenced_mutation_roster::decode_frame(
+                exact_duplicate_capsule.canonical_bytes(),
+                TEST_ADMISSION_RESPONSE_MAGIC,
+                TEST_ADMISSION_RESPONSE_DOMAIN,
+                crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+            )
+            .expect("decode exact capability-free replay response");
+        assert!(matches!(
+            exact_duplicate_wire,
+            RosterIngressAdmissionResponseWire::Replayed { scope: response_scope }
+                if response_scope == roster_scope.digest()
+        ));
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(first_log + 3),
+            "an exact replay reaches the roster classifier instead of the generic ledger"
+        );
+        assert_eq!(
+            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
+            3,
+            "the exact replay is a no-effect roster command, not a cached capability response"
+        );
+        assert_eq!(
+            ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.load(Ordering::Relaxed),
+            3
+        );
+
+        // A status projection reads the original durable registration and
+        // compact proof after the independent retry. This is causal evidence
+        // that the replay did not replace stored provenance or mint a new
+        // epoch/capability.
+        let replay_status_request_id = SessionConsumerRequestId::from_bytes([0x5c; 16]);
+        let replay_status_request = SessionConsumerRequest::new(
+            scope,
+            replay_status_request_id,
+            SessionConsumerOperation::FencedMutationRosterAdmissionStatus {
+                request: Box::new(original_admission_capsule.clone()),
+            },
+        );
+        let (replay_status_tag, replay_status_digest) =
+            session_consumer_roster_ingress_operation(replay_status_request.operation())
+                .expect("replay status operation");
+        let replay_status_response = service
+            .execute_roster_ingress(
+                &roster_authorization,
+                replay_status_request,
+                issuer.ingress(
+                    peer_identity_commitment,
+                    roster_scope.digest(),
+                    replay_status_request_id,
+                    replay_status_tag,
+                    replay_status_digest,
+                ),
+                None,
+            )
+            .await;
+        let replay_status_capsule = match replay_status_response {
+            SessionConsumerResponse::FencedMutationRosterAdmissionStatus(
+                SessionConsumerRosterAdmissionReadResponse::Recorded(capsule),
+            ) => capsule,
+            response => panic!("expected post-replay admission status, got {response:?}"),
+        };
+        let replay_status_wire: RosterIngressAdmissionResponseWire =
+            crate::fenced_mutation_roster::decode_frame(
+                replay_status_capsule.canonical_bytes(),
+                TEST_ADMISSION_RESPONSE_MAGIC,
+                TEST_ADMISSION_RESPONSE_DOMAIN,
+                crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+            )
+            .expect("decode post-replay admission status");
+        match replay_status_wire {
+            RosterIngressAdmissionResponseWire::PollAdmitted {
+                registration: stored_registration,
+                admission_provenance: stored_provenance,
+                ..
+            } => {
+                assert_eq!(stored_registration.request_id, registration_request_id);
+                assert_eq!(
+                    stored_provenance,
+                    admission_provenance
+                        .canonical_bytes()
+                        .expect("stored provenance bytes"),
+                    "the retry must not replace durable provenance"
+                );
+            }
+            _ => panic!("expected nonterminal stored admission after replay"),
+        }
+
+        let conflicting_admission = Admission::authenticate(
+            AdmissionProposal::new(
+                Profile::v1(),
+                RosterId::from_bytes([0x51; 16]).expect("same roster ID"),
+                (0..FRESH_ROSTER_MEMBERS)
+                    .map(|ordinal| {
+                        Member::new(
+                            ordinal as u8,
+                            MemberOperationId::from_bytes([ordinal as u8 + 1; 16])
+                                .expect("member operation ID"),
+                            vec![ordinal as u8 + 0x61],
+                            1,
+                        )
+                        .expect("conflicting member")
+                    })
+                    .collect(),
+                EstablishedMutation::no_op(),
+                vec![0x52],
+                vec![0x53],
+                vec![0x54],
+            )
+            .expect("conflicting admission proposal"),
+            key.clone(),
+            roster_scope,
+            authority.owner().clone(),
+            authority.fence(),
+            admission.expected_generation(),
+        )
+        .expect("same-slot conflicting admission");
+        let conflicting_capsule =
+            admission_capsule(roster_scope, &conflicting_admission, &authority);
+        let conflicting_request_id = SessionConsumerRequestId::from_bytes([0x5d; 16]);
+        let conflicting_request = SessionConsumerRequest::new(
+            scope,
+            conflicting_request_id,
+            SessionConsumerOperation::FencedMutationRosterPollAdmit {
+                request: Box::new(conflicting_capsule),
+            },
+        );
+        let (conflicting_tag, conflicting_digest) =
+            session_consumer_roster_ingress_operation(conflicting_request.operation())
+                .expect("conflicting admission operation");
+        let conflicting_attestation = issuer.ingress_with_metadata(
+            peer_identity_commitment,
+            roster_scope.digest(),
+            conflicting_request_id,
+            conflicting_tag,
+            conflicting_digest,
+            start.add_seconds(1).expect("conflict authentication time"),
+            3,
+            3,
+        );
+        let conflicting_provenance_input = service
+            .prepare_compact_admission_provenance_input(
+                &roster_authorization,
+                &conflicting_request,
+                &conflicting_attestation,
+                admission_subject_identity_commitment,
+            )
+            .expect("conflicting compact admission provenance input");
+        let conflicting_provenance = issuer.compact_admission(
+            roster_scope.digest(),
+            admission_subject_identity_commitment,
+            &conflicting_provenance_input,
+        );
+        assert!(matches!(
+            service
+                .execute_roster_ingress(
+                    &roster_authorization,
+                    conflicting_request,
+                    conflicting_attestation,
+                    Some(conflicting_provenance),
+                )
+                .await,
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::Rejected(
+                    SessionConsumerRosterRejection::Conflict
+                )
+            )
+        ));
+
+        // Keep the existing fresh-terminal accounting isolated from the
+        // replay/read assertions above.
+        reset_roster_ingress_test_counters();
+        reset_consumer_consensus_proposal_count();
         let binding = admission
             .binding_key(registration_request_id.history_epoch())
             .expect("admission binding");
-        let (terminal, proof_bundle) =
-            issuer.terminal(&admission, binding, registration, &authority);
+        let (terminal, proof_bundle, terminal_evidence) = issuer.terminal(
+            &admission,
+            binding,
+            registration,
+            &authority,
+            &admission_provenance,
+        );
+        verify_compact_terminal_evidence_v2(CompactTerminalEvidenceVerificationV2 {
+            root: &root,
+            configuration_identity: identity,
+            logical_time: start,
+            binding,
+            registration,
+            admission_provenance: &admission_provenance,
+            committing_authority: &authority,
+            evidence: &terminal_evidence,
+        })
+        .expect("terminal evidence verifies before ingress");
+        verify_executor_terminal_proof_bundle(ExecutorTerminalProofVerification {
+            root: Some(&root),
+            configuration_identity: identity,
+            logical_time: start,
+            binding,
+            registration,
+            admission: &admission,
+            authority: &authority,
+            terminal: &terminal,
+            bundle: &proof_bundle,
+        })
+        .expect("terminal proof bundle verifies before ingress");
         let terminal_capsule = terminal_capsule(
             roster_scope,
             binding,
@@ -16220,6 +17294,7 @@ mod membership_tests {
             &terminal,
             &admission,
             &proof_bundle,
+            &terminal_evidence,
         );
         let terminal_request_id = SessionConsumerRequestId::from_bytes([0x56; 16]);
         let terminal_request = SessionConsumerRequest::new(
@@ -16232,6 +17307,20 @@ mod membership_tests {
         let (terminal_tag, terminal_digest) =
             session_consumer_roster_ingress_operation(terminal_request.operation())
                 .expect("terminal ingress operation");
+        assert_eq!(
+            crate::fenced_mutation_roster_transport::roster_terminal_ingress_capsule_commitment(
+                binding,
+                registration,
+                &authority,
+                &terminal,
+                &admission,
+                &proof_bundle,
+                &terminal_evidence,
+            )
+            .expect("reconstruct terminal ingress capsule"),
+            terminal_digest,
+            "test terminal request must match the durable command reconstruction"
+        );
         let terminal_response = service
             .execute_roster_ingress(
                 &roster_authorization,
@@ -16243,6 +17332,7 @@ mod membership_tests {
                     terminal_tag,
                     terminal_digest,
                 ),
+                None,
             )
             .await;
         assert!(matches!(
@@ -16253,17 +17343,17 @@ mod membership_tests {
         ));
         assert_eq!(
             store.inner.raft.metrics().borrow().last_log_index,
-            Some(first_log + 2),
-            "fresh admission and terminalization append only their two roster mutations"
+            Some(first_log + 5),
+            "fresh admission, independent and exact replays, body conflict, and terminalization each append once"
         );
         assert_eq!(
             CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
-            2,
-            "the fresh roster flow submits exactly one admission and one terminal command"
+            1,
+            "after replay accounting resets, terminalization is the only fresh-effect command"
         );
         assert_eq!(
             ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.load(Ordering::Relaxed),
-            1
+            0
         );
         assert_eq!(
             ROSTER_INGRESS_TERMINAL_SUBMISSION_COUNT.load(Ordering::Relaxed),
@@ -16292,21 +17382,11 @@ mod membership_tests {
             (
                 SessionConsumerRequestId::from_bytes([0x57; 16]),
                 SessionConsumerOperation::FencedMutationRosterAdmissionStatus {
-                    request: Box::new(admission_capsule.clone()),
+                    request: Box::new(original_admission_capsule.clone()),
                 },
             ),
             (
                 SessionConsumerRequestId::from_bytes([0x58; 16]),
-                SessionConsumerOperation::FencedMutationRosterRecover {
-                    request: Box::new(recovery_capsule(
-                        roster_scope,
-                        admission.roster_id(),
-                        &authority,
-                    )),
-                },
-            ),
-            (
-                SessionConsumerRequestId::from_bytes([0x59; 16]),
                 SessionConsumerOperation::FencedMutationRosterTerminalStatus {
                     request: Box::new(terminal_capsule.clone()),
                 },
@@ -16326,6 +17406,7 @@ mod membership_tests {
                         tag,
                         digest,
                     ),
+                    None,
                 )
                 .await;
             assert!(!matches!(
@@ -16348,7 +17429,7 @@ mod membership_tests {
         );
         assert_eq!(
             ROSTER_INGRESS_LINEARIZABLE_BARRIER_COUNT.load(Ordering::Relaxed),
-            3,
+            2,
             "each protected-roster read path has one quorum barrier"
         );
         assert_eq!(
@@ -16388,6 +17469,7 @@ mod membership_tests {
                     expired_tag,
                     expired_digest,
                 ),
+                None,
             )
             .await;
         assert_eq!(
@@ -16421,6 +17503,635 @@ mod membership_tests {
             ROSTER_INGRESS_TERMINAL_STATUS_READ_COUNT.load(Ordering::Relaxed),
             1,
             "expiry is rechecked from the post-barrier terminal projection time"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_roster_sqlite_successor_authority_preserves_the_immutable_admission() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("successor roster directory");
+        let start = Timestamp::from_str("2025-02-01T00:00:00Z").expect("test start");
+        let clock = Arc::new(MutableClock::new(start));
+        let root = roster_ingress_test_root();
+        let topology = roster_ingress_singleton_topology(root.clone());
+        let identity = topology.consensus_identity().expect("consensus identity");
+        let store = ConsensusSessionStore::open_with_clock(
+            topology,
+            SqliteSessionBackend::open(directory.path().join("successor.sqlite"))
+                .expect("successor SQLite backend"),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            clock.clone(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open successor store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize successor store");
+
+        let key = SessionKey {
+            tenant: TenantId::new("roster-successor").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"same-session")
+                .try_into()
+                .expect("stable ID"),
+        };
+        // Start the original owner at fence two so both equal- and lower-
+        // fence successor attempts can be represented by valid wire values.
+        let seed = store
+            .acquire(
+                &key,
+                OwnerId::new("successor-seed").expect("seed owner"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("seed lease");
+        store.release(seed).await.expect("release seed lease");
+        let original_owner = OwnerId::new("successor-owner-a").expect("original owner");
+        let original_lease = store
+            .acquire(&key, original_owner.clone(), Duration::from_secs(60))
+            .await
+            .expect("original lease");
+        assert_eq!(original_lease.fence().get(), 2);
+        let initial = consumer_record_with_payload_len(&key, &original_lease, 1024);
+        assert!(matches!(
+            store
+                .compare_and_set(CompareAndSet {
+                    key: key.clone(),
+                    lease: original_lease.clone(),
+                    expected_generation: None,
+                    new_record: initial,
+                })
+                .await
+                .expect("write protected business record"),
+            CompareAndSetResult::Success
+        ));
+
+        let scope = store.consumer_scope().expect("consumer scope");
+        let consumer_identity = SessionConsumerIdentity::new(
+            "spiffe://test.example/tenant/roster-successor/ns/default/sa/store/nf/smf/instance/one",
+        )
+        .expect("consumer identity");
+        let manifest = store
+            .consumer_authorization_manifest([SessionConsumerAuthorizationGrant::try_new(
+                SpiffeId::new(consumer_identity.as_str()).expect("consumer SPIFFE ID"),
+                [SessionConsumerTenantNfScope::new(
+                    key.tenant.clone(),
+                    key.nf_kind.clone(),
+                )],
+            )
+            .expect("consumer grant")])
+            .await
+            .expect("consumer authorization manifest");
+        let authorization = manifest
+            .authorize(&consumer_identity)
+            .expect("consumer authorization");
+        let roster_authorization = authorization.roster_authorization();
+        let roster_scope = Scope::from_digest(session_consumer_roster_scope_commitment(scope));
+        let admission = Admission::authenticate(
+            AdmissionProposal::new(
+                Profile::v1(),
+                RosterId::from_bytes([0x61; 16]).expect("roster ID"),
+                (0..FRESH_ROSTER_MEMBERS)
+                    .map(|ordinal| {
+                        Member::new(
+                            ordinal as u8,
+                            MemberOperationId::from_bytes([ordinal as u8 + 1; 16])
+                                .expect("member operation ID"),
+                            vec![ordinal as u8 + 1],
+                            1,
+                        )
+                        .expect("member")
+                    })
+                    .collect(),
+                EstablishedMutation::no_op(),
+                vec![0x62],
+                vec![0x63],
+                vec![0x64],
+            )
+            .expect("admission proposal"),
+            key.clone(),
+            roster_scope,
+            original_owner.clone(),
+            original_lease.fence(),
+            Generation::new(1),
+        )
+        .expect("admission");
+        let original_authority = AuthorityBinding::for_admission(
+            &admission,
+            original_owner.clone(),
+            original_lease.fence(),
+            AuthorityLeaseMetadata::new(
+                original_lease.credential_id(),
+                Generation::new(1),
+                original_lease.acquired_at(),
+                original_lease.expires_at(),
+            ),
+        )
+        .expect("original authority");
+        let issuer = RosterIngressTestIssuer::new(
+            identity,
+            Timestamp::from_str("2025-01-31T23:59:59Z").expect("certificate start"),
+            start.add_seconds(50).expect("certificate expiry"),
+        );
+        let peer_identity_commitment =
+            session_consumer_identity_commitment(authorization.identity());
+        let service = store.consumer_service();
+        let admission_request_id = SessionConsumerRequestId::from_bytes([0x65; 16]);
+        let admission_request = SessionConsumerRequest::new(
+            scope,
+            admission_request_id,
+            SessionConsumerOperation::FencedMutationRosterPollAdmit {
+                request: Box::new(admission_capsule(
+                    roster_scope,
+                    &admission,
+                    &original_authority,
+                )),
+            },
+        );
+        let (admission_tag, admission_digest) =
+            session_consumer_roster_ingress_operation(admission_request.operation())
+                .expect("admission operation");
+        let admission_attestation = issuer.ingress(
+            peer_identity_commitment,
+            roster_scope.digest(),
+            admission_request_id,
+            admission_tag,
+            admission_digest,
+        );
+        let admission_provenance_input = service
+            .prepare_compact_admission_provenance_input(
+                &roster_authorization,
+                &admission_request,
+                &admission_attestation,
+                [0x66; 32],
+            )
+            .expect("admission provenance input");
+        let admission_provenance = issuer.compact_admission(
+            roster_scope.digest(),
+            [0x66; 32],
+            &admission_provenance_input,
+        );
+        let registration = match service
+            .execute_roster_ingress(
+                &roster_authorization,
+                admission_request,
+                admission_attestation,
+                Some(admission_provenance.clone()),
+            )
+            .await
+        {
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::Recorded(capsule),
+            ) => match crate::fenced_mutation_roster::decode_frame(
+                capsule.canonical_bytes(),
+                TEST_ADMISSION_RESPONSE_MAGIC,
+                TEST_ADMISSION_RESPONSE_DOMAIN,
+                crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+            )
+            .expect("decode fresh admission") {
+                RosterIngressAdmissionResponseWire::Fresh { registration, .. } => {
+                    registration.registration(&admission)
+                }
+                _ => panic!("expected fresh admission registration"),
+            },
+            response => panic!("expected admitted roster, got {response:?}"),
+        };
+
+        // This is an actual lease handoff in the same SQLite backend, not a
+        // caller-authored authority. The reservation prevents any third
+        // business mutation while the successor recovers and terminalizes.
+        store
+            .release(original_lease.clone())
+            .await
+            .expect("release original lease");
+        let successor_owner = OwnerId::new("successor-owner-b").expect("successor owner");
+        let successor_lease = store
+            .acquire(&key, successor_owner.clone(), Duration::from_secs(60))
+            .await
+            .expect("successor lease");
+        assert_eq!(
+            successor_lease.fence().get(),
+            original_lease.fence().get() + 1
+        );
+        let successor_authority = AuthorityBinding::from_consensus_parts(
+            roster_scope.digest(),
+            key.clone(),
+            successor_owner.clone(),
+            successor_lease.fence(),
+            AuthorityLeaseMetadata::new(
+                successor_lease.credential_id(),
+                Generation::new(1),
+                successor_lease.acquired_at(),
+                successor_lease.expires_at(),
+            ),
+        )
+        .expect("successor authority");
+
+        let admission_status = store
+            .inner
+            .backend
+            .consensus_protected_roster_admission_status(
+                identity,
+                admission.clone(),
+                successor_authority.clone(),
+                start,
+            )
+            .await
+            .expect("successor exact admission status")
+            .0;
+        assert!(matches!(
+            admission_status,
+            crate::sqlite::consensus::ProtectedRosterReadResult::Admitted(_)
+        ));
+        let recovery =
+            crate::fenced_mutation_roster_executor::RecoveryRequest::new_with_lease_metadata(
+                roster_scope,
+                admission.roster_id(),
+                admission.logical_owner().clone(),
+                admission.admission_fence(),
+                key.clone(),
+                successor_owner.clone(),
+                successor_lease.fence(),
+                AuthorityLeaseMetadata::new(
+                    successor_lease.credential_id(),
+                    Generation::new(1),
+                    successor_lease.acquired_at(),
+                    successor_lease.expires_at(),
+                ),
+            )
+            .expect("successor recovery request");
+        assert!(matches!(
+            store
+                .inner
+                .backend
+                .consensus_protected_roster_recovery(identity, recovery, start)
+                .await
+                .expect("successor recovery")
+                .0,
+            crate::sqlite::consensus::ProtectedRosterReadResult::Admitted(_)
+        ));
+
+        let binding = admission
+            .binding_key(registration.consensus_parts().1.history_epoch())
+            .expect("admission binding");
+        let (terminal, proof_bundle, terminal_evidence) = issuer.terminal(
+            &admission,
+            binding,
+            registration,
+            &successor_authority,
+            &admission_provenance,
+        );
+        let terminal_capsule = terminal_capsule(
+            roster_scope,
+            binding,
+            registration,
+            &successor_authority,
+            &terminal,
+            &admission,
+            &proof_bundle,
+            &terminal_evidence,
+        );
+        let terminal_request_id = SessionConsumerRequestId::from_bytes([0x67; 16]);
+        let terminal_request = SessionConsumerRequest::new(
+            scope,
+            terminal_request_id,
+            SessionConsumerOperation::FencedMutationRosterTerminalize {
+                request: Box::new(terminal_capsule.clone()),
+            },
+        );
+        let (terminal_tag, terminal_digest) =
+            session_consumer_roster_ingress_operation(terminal_request.operation())
+                .expect("terminal operation");
+        let terminalized_bytes = match service
+            .execute_roster_ingress(
+                &roster_authorization,
+                terminal_request,
+                issuer.ingress(
+                    peer_identity_commitment,
+                    roster_scope.digest(),
+                    terminal_request_id,
+                    terminal_tag,
+                    terminal_digest,
+                ),
+                None,
+            )
+            .await
+        {
+            SessionConsumerResponse::FencedMutationRosterTerminalize(
+                SessionConsumerRosterTerminalMutationResponse::Recorded(capsule),
+            ) => capsule.canonical_bytes().to_vec(),
+            response => panic!("expected successor terminalization, got {response:?}"),
+        };
+        let (registration_handle, registration_request_id, registration_terminal_slot) =
+            registration.consensus_parts();
+        let terminal_status = store
+            .inner
+            .backend
+            .consensus_protected_roster_terminal_status(
+                identity,
+                binding,
+                (
+                    registration_handle,
+                    registration_request_id,
+                    *registration_terminal_slot.as_bytes(),
+                ),
+                successor_authority.clone(),
+                terminal.body_commitment(),
+                terminal_evidence.clone(),
+                start,
+            )
+            .await
+            .expect("successor exact terminal status")
+            .0;
+        let receipt_commitment = match &terminal_status {
+            crate::sqlite::consensus::ProtectedRosterReadResult::Terminalized(read) => {
+                read.committed.receipt_commitment()
+            }
+            _ => panic!("successor terminal status must retain Established"),
+        };
+        let terminal_status_request_id = SessionConsumerRequestId::from_bytes([0x68; 16]);
+        let terminal_status_request = SessionConsumerRequest::new(
+            scope,
+            terminal_status_request_id,
+            SessionConsumerOperation::FencedMutationRosterTerminalStatus {
+                request: Box::new(terminal_capsule.clone()),
+            },
+        );
+        let (terminal_status_tag, terminal_status_digest) =
+            session_consumer_roster_ingress_operation(terminal_status_request.operation())
+                .expect("terminal status operation");
+        let status_bytes = match service
+            .execute_roster_ingress(
+                &roster_authorization,
+                terminal_status_request,
+                issuer.ingress(
+                    peer_identity_commitment,
+                    roster_scope.digest(),
+                    terminal_status_request_id,
+                    terminal_status_tag,
+                    terminal_status_digest,
+                ),
+                None,
+            )
+            .await
+        {
+            SessionConsumerResponse::FencedMutationRosterTerminalStatus(
+                SessionConsumerRosterTerminalReadResponse::Recorded(capsule),
+            ) => capsule.canonical_bytes().to_vec(),
+            response => panic!("expected successor terminal status, got {response:?}"),
+        };
+        assert_eq!(
+            status_bytes, terminalized_bytes,
+            "status returns exact retained bytes"
+        );
+
+        let publication =
+            crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule::new(
+                roster_scope.digest(),
+                key.clone(),
+                *admission.roster_id().as_bytes(),
+                admission.body_commitment(),
+                terminal.body_commitment(),
+                receipt_commitment,
+                original_owner,
+                original_lease.fence(),
+                registration_handle,
+                registration_request_id.to_bytes(),
+                *registration_terminal_slot.as_bytes(),
+                successor_owner,
+                successor_lease.fence(),
+                successor_lease.credential_id(),
+                Generation::new(1),
+                successor_lease.acquired_at(),
+                successor_lease.expires_at(),
+            )
+            .expect("Established publication query");
+        let publication_request_id = SessionConsumerRequestId::from_bytes([0x69; 16]);
+        let publication_request = SessionConsumerRequest::new(
+            scope,
+            publication_request_id,
+            SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
+                request: Box::new(publication),
+            },
+        );
+        let (publication_tag, publication_digest) =
+            session_consumer_roster_ingress_operation(publication_request.operation())
+                .expect("publication operation");
+        assert!(matches!(
+            service
+                .execute_roster_ingress(
+                    &roster_authorization,
+                    publication_request,
+                    issuer.ingress(
+                        peer_identity_commitment,
+                        roster_scope.digest(),
+                        publication_request_id,
+                        publication_tag,
+                        publication_digest,
+                    ),
+                    None,
+                )
+                .await,
+            SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
+                SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current
+            )
+        ));
+
+        let equal_fence = AuthorityBinding::from_consensus_parts(
+            roster_scope.digest(),
+            key.clone(),
+            OwnerId::new("successor-owner-b-equal").expect("equal owner"),
+            original_lease.fence(),
+            AuthorityLeaseMetadata::new(
+                successor_lease.credential_id(),
+                Generation::new(1),
+                successor_lease.acquired_at(),
+                successor_lease.expires_at(),
+            ),
+        )
+        .expect("equal-fence authority");
+        let lower_fence = AuthorityBinding::from_consensus_parts(
+            roster_scope.digest(),
+            key.clone(),
+            OwnerId::new("successor-owner-b-lower").expect("lower owner"),
+            FenceToken::new(original_lease.fence().get() - 1),
+            AuthorityLeaseMetadata::new(
+                successor_lease.credential_id(),
+                Generation::new(1),
+                successor_lease.acquired_at(),
+                successor_lease.expires_at(),
+            ),
+        )
+        .expect("lower-fence authority");
+        let old_owner = AuthorityBinding::from_consensus_parts(
+            roster_scope.digest(),
+            key.clone(),
+            original_authority.owner().clone(),
+            original_lease.fence(),
+            AuthorityLeaseMetadata::new(
+                original_lease.credential_id(),
+                Generation::new(1),
+                original_lease.acquired_at(),
+                original_lease.expires_at(),
+            ),
+        )
+        .expect("old owner authority");
+        let wrong_scope = AuthorityBinding::from_consensus_parts(
+            [0x70; 32],
+            key.clone(),
+            successor_authority.owner().clone(),
+            successor_lease.fence(),
+            AuthorityLeaseMetadata::new(
+                successor_lease.credential_id(),
+                Generation::new(1),
+                successor_lease.acquired_at(),
+                successor_lease.expires_at(),
+            ),
+        )
+        .expect("wrong scope authority");
+        let wrong_tenant = AuthorityBinding::from_consensus_parts(
+            roster_scope.digest(),
+            SessionKey {
+                tenant: TenantId::new("other-tenant").expect("other tenant"),
+                nf_kind: NetworkFunctionKind::smf(),
+                key_type: SessionKeyType::PduSession,
+                stable_id: key.stable_id.clone(),
+            },
+            successor_authority.owner().clone(),
+            successor_lease.fence(),
+            AuthorityLeaseMetadata::new(
+                successor_lease.credential_id(),
+                Generation::new(1),
+                successor_lease.acquired_at(),
+                successor_lease.expires_at(),
+            ),
+        )
+        .expect("wrong tenant authority");
+        let wrong_key = AuthorityBinding::from_consensus_parts(
+            roster_scope.digest(),
+            SessionKey {
+                tenant: key.tenant.clone(),
+                nf_kind: NetworkFunctionKind::smf(),
+                key_type: SessionKeyType::PduSession,
+                stable_id: Bytes::from_static(b"other-session")
+                    .try_into()
+                    .expect("other stable ID"),
+            },
+            successor_authority.owner().clone(),
+            successor_lease.fence(),
+            AuthorityLeaseMetadata::new(
+                successor_lease.credential_id(),
+                Generation::new(1),
+                successor_lease.acquired_at(),
+                successor_lease.expires_at(),
+            ),
+        )
+        .expect("wrong key authority");
+        let wrong_generation = AuthorityBinding::from_consensus_parts(
+            roster_scope.digest(),
+            key.clone(),
+            successor_authority.owner().clone(),
+            successor_lease.fence(),
+            AuthorityLeaseMetadata::new(
+                successor_lease.credential_id(),
+                Generation::new(2),
+                successor_lease.acquired_at(),
+                successor_lease.expires_at(),
+            ),
+        )
+        .expect("wrong generation authority");
+        let wrong_credential = AuthorityBinding::from_consensus_parts(
+            roster_scope.digest(),
+            key.clone(),
+            successor_authority.owner().clone(),
+            successor_lease.fence(),
+            AuthorityLeaseMetadata::new(
+                successor_lease.credential_id() + 1,
+                Generation::new(1),
+                successor_lease.acquired_at(),
+                successor_lease.expires_at(),
+            ),
+        )
+        .expect("wrong credential authority");
+        let wrong_window = AuthorityBinding::from_consensus_parts(
+            roster_scope.digest(),
+            key.clone(),
+            successor_authority.owner().clone(),
+            successor_lease.fence(),
+            AuthorityLeaseMetadata::new(
+                successor_lease.credential_id(),
+                Generation::new(1),
+                successor_lease
+                    .acquired_at()
+                    .add_seconds(1)
+                    .expect("shifted acquisition"),
+                successor_lease.expires_at(),
+            ),
+        )
+        .expect("wrong lease window authority");
+        let last_log = store.inner.raft.metrics().borrow().last_log_index;
+        for authority in [
+            equal_fence,
+            lower_fence,
+            old_owner,
+            wrong_scope,
+            wrong_tenant,
+            wrong_key,
+            wrong_generation,
+            wrong_credential,
+            wrong_window,
+        ] {
+            assert!(
+                store
+                    .inner
+                    .backend
+                    .consensus_protected_roster_terminal_status(
+                        identity,
+                        binding,
+                        (
+                            registration_handle,
+                            registration_request_id,
+                            *registration_terminal_slot.as_bytes(),
+                        ),
+                        authority,
+                        terminal.body_commitment(),
+                        terminal_evidence.clone(),
+                        start,
+                    )
+                    .await
+                    .is_err(),
+                "stale, foreign, or malformed successor authority must fail closed"
+            );
+        }
+        assert!(
+            store
+                .inner
+                .backend
+                .consensus_protected_roster_terminal_status(
+                    identity,
+                    binding,
+                    (
+                        registration_handle,
+                        registration_request_id,
+                        *registration_terminal_slot.as_bytes(),
+                    ),
+                    successor_authority,
+                    terminal.body_commitment(),
+                    terminal_evidence,
+                    successor_lease.expires_at(),
+                )
+                .await
+                .is_err(),
+            "an expired successor lease cannot read the retained terminal"
+        );
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            last_log,
+            "all successor validation failures are read-only and cannot create a third mutation"
         );
     }
 
@@ -16674,15 +18385,15 @@ mod membership_tests {
                 visit_bytes_copied_bytes: 0,
                 visit_byte_buf_owners: 0,
                 sequence_chunk_allocations: (crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES
-                    / crate::record::PAYLOAD_DESERIALIZE_CHUNK_BYTES) as u64,
+                    / crate::record::PAYLOAD_DESERIALIZE_CHUNK_BYTES)
+                    as u64,
                 sequence_chunk_capacity_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES
                     as u64,
                 sequence_staged_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES as u64,
                 sequence_final_allocations: 1,
                 sequence_final_allocation_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES
                     as u64,
-                sequence_final_copied_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES
-                    as u64,
+                sequence_final_copied_bytes: crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES as u64,
             },
             "a proven-before-transmission remote reroute shares the canonical body; decoding the durable JSON sequence has one measured staged-to-final copy"
         );
@@ -17749,6 +19460,49 @@ mod membership_tests {
             durable_recovery_epoch(&database, store.inner.storage_identity),
             0,
             "rejected forwarded recovery forgery advanced the durable epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_forwarding_rejects_a_generic_mutation_smuggled_into_its_family() {
+        let directory = tempfile::tempdir().expect("roster forwarding directory");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+                .expect("roster forwarding backend"),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open roster forwarding store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize roster forwarding store");
+
+        let before_log = store.inner.raft.metrics().borrow().last_log_index;
+        let payload = encode_roster_bounded(&ForwardRequest::Mutation(ForwardMutationRequest {
+            request_id: SessionConsensusRequestId::new(),
+            intent: SessionMutationIntent::AdvanceLogicalTime,
+            required_consumer_scope: ForwardConsumerScope::Internal,
+        }))
+        .expect("encode smuggled generic forwarding request");
+        let request = SessionConsensusWireRequest::try_new(
+            store.inner.storage_identity,
+            store.inner.local_node_id,
+            SessionConsensusRpcFamily::ForwardRosterMutation,
+            payload,
+        )
+        .expect("bind smuggled forwarding request to the local member");
+        let response = store
+            .rpc_handler()
+            .handle(store.inner.local_node_id, request)
+            .await;
+        assert_eq!(response.result, Err(SessionConsensusPeerError::Protocol));
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            before_log,
+            "a generic request smuggled through roster forwarding reached the Raft log"
         );
     }
 

@@ -13,10 +13,10 @@ use opc_consensus::{
     ConsensusRpcFamily, CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES, CONSENSUS_SCHEMA_VERSION,
 };
 use opc_session_store::backend::{
-    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationLogRange, ReplicationOp,
-    ReplicationTxId, SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
-    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
-    MAX_REPLICATION_OPERATION_DEPTH,
+    CompareAndSet, CompareAndSetResult, ProtectedRosterEstablishedSuccessor, ReplicationEntry,
+    ReplicationLogRange, ReplicationOp, ReplicationTxId, SessionOp, SessionOpResult,
+    MAX_RECORD_EXPIRY_PREFLIGHTS, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -1046,6 +1046,16 @@ fn validate_replication_payload_limit(
             Some(ReplicationOp::CompareAndSet { new_record, .. }) => {
                 validate_record_payload_limit(new_record, max)?;
             }
+            Some(ReplicationOp::ProtectedRosterEstablished {
+                expected_record,
+                successor,
+                ..
+            }) => {
+                validate_record_payload_limit(expected_record, max)?;
+                if let ProtectedRosterEstablishedSuccessor::Put { record } = successor {
+                    validate_record_payload_limit(record, max)?;
+                }
+            }
             Some(ReplicationOp::Batch { ops }) => pending.push(ops.iter()),
             Some(
                 ReplicationOp::DeleteFenced { .. }
@@ -1234,6 +1244,18 @@ fn validate_replication_retained_profile(
             | ReplicationOp::AcquireLease { key, .. }
             | ReplicationOp::RenewLease { key, .. }
             | ReplicationOp::ReleaseLease { key, .. } => validate_session_key_profile(key)?,
+            ReplicationOp::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                ..
+            } => {
+                validate_session_key_profile(key)?;
+                validate_record_profile(expected_record)?;
+                if let ProtectedRosterEstablishedSuccessor::Put { record } = successor {
+                    validate_record_profile(record)?;
+                }
+            }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
         }
     }
@@ -1830,6 +1852,10 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             | StoreError::FencedTransitionStorageExhausted => {
                 Self::CapabilityNotSupported("unknown_capability")
             }
+            // Legacy protocol v5 has no protected-roster reservation error.
+            // Preserve the no-effect conflict semantics without revealing
+            // whether a protected roster exists for the named key.
+            StoreError::SessionRecordReserved => Self::CasConflict,
             StoreError::BackendOperationOutcomeUnavailable => {
                 Self::BackendOperationOutcomeUnavailable
             }
@@ -2108,6 +2134,16 @@ enum WireReplicationNodeRef<'a> {
         fence: &'a FenceToken,
         credential_id: u64,
     },
+    ProtectedRosterEstablished {
+        key: &'a SessionKey,
+        expected_record: &'a StoredSessionRecord,
+        successor: &'a ProtectedRosterEstablishedSuccessor,
+        owner: &'a OwnerId,
+        fence: &'a FenceToken,
+        credential_id: u64,
+        guard_acquired_at: &'a Timestamp,
+        guard_expires_at: &'a Timestamp,
+    },
     Batch {
         child_count: u16,
     },
@@ -2156,6 +2192,16 @@ enum WireReplicationNode {
         owner: OwnerId,
         fence: FenceToken,
         credential_id: u64,
+    },
+    ProtectedRosterEstablished {
+        key: SessionKey,
+        expected_record: StoredSessionRecord,
+        successor: ProtectedRosterEstablishedSuccessor,
+        owner: OwnerId,
+        fence: FenceToken,
+        credential_id: u64,
+        guard_acquired_at: Timestamp,
+        guard_expires_at: Timestamp,
     },
     Batch {
         child_count: u16,
@@ -2241,6 +2287,25 @@ impl WireReplicationNode {
                 owner,
                 fence,
                 credential_id,
+            },
+            Self::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
+            } => ReplicationOp::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
             },
             Self::Batch { .. } => {
                 return Err(WireConversionError(
@@ -2411,6 +2476,25 @@ impl<'a> TryFrom<&'a ReplicationEntry> for WireReplicationEntryRef<'a> {
                     owner,
                     fence,
                     credential_id: *credential_id,
+                },
+                ReplicationOp::ProtectedRosterEstablished {
+                    key,
+                    expected_record,
+                    successor,
+                    owner,
+                    fence,
+                    credential_id,
+                    guard_acquired_at,
+                    guard_expires_at,
+                } => WireReplicationNodeRef::ProtectedRosterEstablished {
+                    key,
+                    expected_record,
+                    successor,
+                    owner,
+                    fence,
+                    credential_id: *credential_id,
+                    guard_acquired_at,
+                    guard_expires_at,
                 },
                 ReplicationOp::Batch { ops } => {
                     let child_count = u16::try_from(ops.len()).map_err(|_| {
@@ -4788,6 +4872,94 @@ mod tests {
         assert!(!short.contains("165"), "byte values must remain redacted");
     }
 
+    #[test]
+    fn compact_roster_outer_request_is_canonical_bounded_and_round_trips() {
+        let cluster = opc_consensus::ConsensusClusterId::new("compact-roster").expect("cluster");
+        let epoch = opc_consensus::ConsensusConfigurationEpoch::new(1).expect("epoch");
+        let identity = opc_consensus::ConsensusIdentity::new(
+            cluster,
+            opc_consensus::derive_configuration_id(cluster, epoch, &[[9; 32]]),
+            epoch,
+        );
+        let sender = opc_consensus::derive_node_id(cluster, b"replica-a").expect("node ID");
+        let request = SessionConsensusWireRequest::try_new(
+            identity,
+            sender,
+            ConsensusRpcFamily::ForwardRosterMutation,
+            vec![0x4d],
+        )
+        .expect("bounded roster request");
+        let mut invalid_outbound = request.clone();
+        invalid_outbound.schema_version = 0;
+        assert!(matches!(
+            SessionConsensusTransportRequest::from_wire_call(uuid::Uuid::nil(), invalid_outbound),
+            Err(SessionConsensusPeerError::Protocol)
+        ));
+        let frame =
+            SessionConsensusTransportRequest::from_wire_call(uuid::Uuid::nil(), request.clone())
+                .expect("compact roster call");
+        let encoded = serde_json::to_vec(&frame).expect("serialize compact roster call");
+        let encoded_value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("inspect compact roster call");
+        assert_eq!(
+            encoded_value["RosterCall"]["request"]["payload"],
+            serde_json::json!("TQ==")
+        );
+        let decoded: SessionConsensusTransportRequest =
+            serde_json::from_slice(&encoded).expect("decode compact roster call");
+        let (_, decoded_request) = decoded.into_wire_call().expect("validated roster request");
+        assert_eq!(decoded_request, request);
+
+        let mut malformed = encoded_value.clone();
+        malformed["RosterCall"]["request"]["payload"] = serde_json::json!("!Q==");
+        assert!(serde_json::from_value::<SessionConsensusTransportRequest>(malformed).is_err());
+
+        let mut noncanonical = encoded_value.clone();
+        noncanonical["RosterCall"]["request"]["payload"] = serde_json::json!("TR==");
+        assert!(serde_json::from_value::<SessionConsensusTransportRequest>(noncanonical).is_err());
+
+        let mut oversized = encoded_value.clone();
+        oversized["RosterCall"]["request"]["payload"] =
+            serde_json::json!("A".repeat(MAX_COMPACT_ROSTER_PAYLOAD_ENCODED_BYTES + 4));
+        assert!(serde_json::from_value::<SessionConsensusTransportRequest>(oversized).is_err());
+
+        let mut non_roster_family = encoded_value;
+        non_roster_family["RosterCall"]["request"]["family"] = serde_json::json!("Vote");
+        assert!(
+            serde_json::from_value::<SessionConsensusTransportRequest>(non_roster_family).is_err()
+        );
+
+        let legacy_roster_call = SessionConsensusTransportRequest::Call {
+            call_id: uuid::Uuid::nil(),
+            request,
+        };
+        assert!(matches!(
+            legacy_roster_call.into_wire_call(),
+            Err(SessionConsensusPeerError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn compact_roster_payload_enforces_exact_and_one_over_limits() {
+        assert_eq!(CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES, 2_253_338);
+        let exact = base64::engine::general_purpose::STANDARD
+            .encode(vec![u8::MAX; CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES]);
+        assert_eq!(exact.len(), MAX_COMPACT_ROSTER_PAYLOAD_ENCODED_BYTES);
+        assert_eq!(
+            decode_compact_roster_payload(&exact)
+                .expect("exact compact roster payload")
+                .len(),
+            CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES
+        );
+
+        let one_over = base64::engine::general_purpose::STANDARD.encode(vec![
+            u8::MAX;
+            CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES
+                + 1
+        ]);
+        assert!(decode_compact_roster_payload(&one_over).is_err());
+    }
+
     fn replace_json_string(
         value: &mut serde_json::Value,
         needle: &str,
@@ -5125,6 +5297,23 @@ mod tests {
         ensure_frame_fits(&request, MIN_SESSION_CONSENSUS_FRAME_SIZE)
             .expect("consensus minimum must fit the worst byte request");
 
+        let roster_request = SessionConsensusWireRequest::try_new(
+            identity,
+            sender,
+            opc_consensus::ConsensusRpcFamily::AppendEntriesRoster,
+            vec![u8::MAX; CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES],
+        )
+        .expect("maximum bounded roster request");
+        let roster_request =
+            SessionConsensusTransportRequest::from_wire_call(uuid::Uuid::nil(), roster_request)
+                .expect("maximum bounded roster outer request");
+        assert!(matches!(
+            roster_request,
+            SessionConsensusTransportRequest::RosterCall { .. }
+        ));
+        ensure_frame_fits(&roster_request, MIN_SESSION_CONSENSUS_FRAME_SIZE)
+            .expect("consensus minimum must fit the maximum roster outer request");
+
         let response = SessionConsensusTransportResponse::Call {
             call_id: uuid::Uuid::nil(),
             response: SessionConsensusWireResponse {
@@ -5134,6 +5323,10 @@ mod tests {
         ensure_frame_fits(&response, MIN_SESSION_CONSENSUS_FRAME_SIZE)
             .expect("consensus minimum must fit the worst byte response");
         assert!(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.is_current());
+        assert_eq!(
+            CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.max_roster_rpc_payload_bytes,
+            2_253_338
+        );
         assert_eq!(
             CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision,
             6
@@ -5149,6 +5342,7 @@ mod tests {
                 "application_revision": 2,
                 "error_set_revision": 6,
                 "max_rpc_payload_bytes": SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+                "max_roster_rpc_payload_bytes": CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES,
                 "min_frame_size": MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 "max_frame_size": MAX_NEGOTIATED_FRAME_SIZE,
             }),

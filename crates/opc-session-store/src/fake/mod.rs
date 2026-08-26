@@ -20,11 +20,12 @@ use tokio::sync::Mutex;
 
 use crate::{
     backend::{
+        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult,
+        MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, ProtectedRosterEstablishedSuccessor,
+        ReplicationEntry, ReplicationLogRange, ReplicationOp, ReplicationTxId,
+        ReplicationWatchCursor, SessionBackend, SessionOp, SessionOpResult,
         next_replication_sequence, validate_replication_log_page_owned,
         validate_replication_prefix, validate_replication_prefix_owned, validate_session_ops_at,
-        BackendInstanceIdentity, CompareAndSet, CompareAndSetResult, ReplicationEntry,
-        ReplicationLogRange, ReplicationOp, ReplicationTxId, ReplicationWatchCursor,
-        SessionBackend, SessionOp, SessionOpResult, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
     },
     capability::BackendCapabilities,
     clock::{Clock, TokioVirtualClock},
@@ -32,11 +33,11 @@ use crate::{
     lease::{LeaseGuard, SessionLeaseManager},
     model::{FenceToken, OwnerId, SessionKey, SessionKeyType, StableId},
     record::StoredSessionRecord,
-    replication_watch::{prepare_watch_registration, ReplicationWatcher},
+    replication_watch::{ReplicationWatcher, prepare_watch_registration},
     restore::{
-        compare_restore_records, restore_record_retained_bytes, RestoreScanCursor, RestoreScanPage,
-        RestoreScanRequest, RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
-        RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
+        RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES, RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES,
+        RestoreScanCursor, RestoreScanPage, RestoreScanRequest, compare_restore_records,
+        restore_record_retained_bytes,
     },
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
 };
@@ -117,6 +118,9 @@ struct LeaseEntry {
     credential_id: u64,
     owner: OwnerId,
     fence: FenceToken,
+    /// The lease issuance time is distinct from its renewable expiry. The
+    /// protected-roster replication command authenticates both fields.
+    acquired_at: Timestamp,
     expires_at: Timestamp,
     guard_expires_at: Timestamp,
 }
@@ -580,6 +584,7 @@ impl FakeSessionBackend {
                         credential_id,
                         owner,
                         fence,
+                        acquired_at: now,
                         expires_at,
                         guard_expires_at: expires_at,
                     },
@@ -603,6 +608,11 @@ impl FakeSessionBackend {
                     return Err(StoreError::StaleFence);
                 }
                 Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                let acquired_at = state
+                    .leases
+                    .get(&mk)
+                    .map(|entry| entry.acquired_at)
+                    .ok_or(StoreError::StaleFence)?;
                 state.leases.insert(
                     mk.clone(),
                     LeaseEntry {
@@ -610,6 +620,7 @@ impl FakeSessionBackend {
                         credential_id,
                         owner,
                         fence,
+                        acquired_at,
                         expires_at,
                         guard_expires_at: expires_at,
                     },
@@ -637,6 +648,75 @@ impl FakeSessionBackend {
                     }
                 }
                 state.key_fences.insert(mk, fence);
+                Ok(())
+            }
+            ReplicationOp::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
+            } => {
+                // This cannot reuse generic CAS: recovery can establish the
+                // terminal under a higher current guard while the immutable
+                // admitted row deliberately retains its original provenance.
+                if expected_record.key != key
+                    || expected_record.expires_at.is_some()
+                    || credential_id == 0
+                    || guard_expires_at <= guard_acquired_at
+                    || fence < expected_record.fence
+                {
+                    return Err(StoreError::StaleFence);
+                }
+                let mk = Self::map_key(&key);
+                let current_fence = Self::current_fence(state, &mk);
+                if current_fence > fence {
+                    return Err(StoreError::StaleFence);
+                }
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                let Some(lease_entry) = state.leases.get(&mk) else {
+                    return Err(StoreError::StaleFence);
+                };
+                if !lease_entry.active
+                    || lease_entry.credential_id != credential_id
+                    || lease_entry.owner != owner
+                    || lease_entry.fence != fence
+                    || lease_entry.acquired_at != guard_acquired_at
+                    || lease_entry.guard_expires_at != guard_expires_at
+                {
+                    return Err(StoreError::StaleFence);
+                }
+                if guard_expires_at <= now || lease_entry.expires_at <= now {
+                    return Err(StoreError::LeaseExpired);
+                }
+                if state.records.get(&mk) != Some(&expected_record) {
+                    return Err(StoreError::CasConflict);
+                }
+
+                match successor {
+                    ProtectedRosterEstablishedSuccessor::Put { record } => {
+                        if record.key != key
+                            || record.expires_at.is_some()
+                            || record.owner != expected_record.owner
+                            || record.fence != expected_record.fence
+                            || record.generation <= expected_record.generation
+                        {
+                            return Err(StoreError::CasConflict);
+                        }
+                        state.records.insert(mk.clone(), record);
+                    }
+                    ProtectedRosterEstablishedSuccessor::Delete => {
+                        if state.records.remove(&mk).is_none() {
+                            return Err(StoreError::CasConflict);
+                        }
+                    }
+                    ProtectedRosterEstablishedSuccessor::NoOp => {}
+                }
+                state.key_fences.insert(mk, fence);
+                state.next_fence = state.next_fence.max(fence.get().saturating_add(1));
                 Ok(())
             }
             ReplicationOp::Batch { ops } => {
@@ -1114,6 +1194,7 @@ impl SessionLeaseManager for FakeSessionBackend {
                 credential_id,
                 owner: owner.clone(),
                 fence,
+                acquired_at: now,
                 expires_at,
                 guard_expires_at: expires_at,
             },

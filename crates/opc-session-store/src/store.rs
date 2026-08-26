@@ -11,12 +11,12 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 
 use crate::backend::{
+    BackendInstanceIdentity, BackendPeerBinding, CompareAndSet, CompareAndSetResult,
+    ProtectedSelectorLedgerBase, ProtectedSessionBackend, RecordExpiryPreflight, ReplicationEntry,
+    ReplicationLogRange, SelectorLedgerStorageScope, SessionBackend, SessionOp, SessionOpResult,
     enforce_replication_watch_cursor, protected_payload_scope_commitment_for,
     record_expiry_preflights, validate_replication_log_page_owned,
-    validate_replication_prefix_owned, BackendInstanceIdentity, BackendPeerBinding, CompareAndSet,
-    CompareAndSetResult, ProtectedSelectorLedgerBase, ProtectedSessionBackend,
-    RecordExpiryPreflight, ReplicationEntry, ReplicationLogRange, SelectorLedgerStorageScope,
-    SessionBackend, SessionOp, SessionOpResult,
+    validate_replication_prefix_owned,
 };
 use crate::capability::BackendCapabilities;
 use crate::error::{LeaseError, StoreError};
@@ -365,9 +365,9 @@ impl<B: SessionBackend + SessionLeaseManager> SessionLeaseManager for SessionSto
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FakeSessionBackend;
     use crate::model::{Generation, SessionKeyType, StateClass, StateType};
     use crate::record::EncryptedSessionPayload;
-    use crate::FakeSessionBackend;
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId};
 

@@ -9,10 +9,11 @@
 
 use crate::{
     fenced_mutation_roster::{
-        decode_frame, encode_frame, Admission, Phase, RequestId, Scope, TerminalRecord,
-        TerminalSlotId, COMMITTED_TERMINAL_FRAME_DOMAIN, COMMITTED_TERMINAL_FRAME_MAGIC,
-        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_PLAN_BYTES, TERMINAL_COMMITTING_GUARD_DOMAIN,
-        TERMINAL_RECEIPT_COMMITMENT_DOMAIN, TERMINAL_RECORD_COMMITMENT_DOMAIN,
+        Admission, COMMITTED_TERMINAL_FRAME_DOMAIN, COMMITTED_TERMINAL_FRAME_MAGIC,
+        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_PLAN_BYTES, Phase, RequestId, Scope,
+        TERMINAL_COMMITTING_GUARD_DOMAIN, TERMINAL_RECEIPT_COMMITMENT_DOMAIN,
+        TERMINAL_RECORD_COMMITMENT_DOMAIN, TerminalRecord, TerminalSlotId, decode_frame,
+        encode_frame,
     },
     model::{FenceToken, Generation, OwnerId, SessionKey},
 };
@@ -322,6 +323,8 @@ impl fmt::Debug for RecoveryLookup {
 #[derive(Clone)]
 pub(crate) struct RecoveryRequest {
     lookup: RecoveryLookup,
+    original_owner: OwnerId,
+    original_admission_fence: FenceToken,
     authority: AuthorityBinding,
 }
 
@@ -329,20 +332,38 @@ impl RecoveryRequest {
     pub(crate) fn new_with_lease_metadata(
         scope: Scope,
         roster_id: crate::fenced_mutation_roster::RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
         key: SessionKey,
         owner: OwnerId,
         fence: FenceToken,
         lease: AuthorityLeaseMetadata,
     ) -> Result<Self, ExecutorError> {
+        let authority = AuthorityBinding::for_recovery(scope, key, owner, fence, lease)?;
+        if original_admission_fence.get() == 0 || authority.fence() <= original_admission_fence {
+            return Err(ExecutorError::InvalidRegistration);
+        }
         Ok(Self {
             lookup: RecoveryLookup::new(scope, roster_id),
-            authority: AuthorityBinding::for_recovery(scope, key, owner, fence, lease)?,
+            original_owner,
+            original_admission_fence,
+            authority,
         })
     }
 
     /// Stable durable lookup key; no prior in-memory capability is required.
     pub(crate) const fn lookup(&self) -> RecoveryLookup {
         self.lookup
+    }
+
+    /// Immutable admission provenance the backend must bind before lookup.
+    pub(crate) fn original_owner(&self) -> &OwnerId {
+        &self.original_owner
+    }
+
+    /// Immutable admission fence the current lease must strictly succeed.
+    pub(crate) const fn original_admission_fence(&self) -> FenceToken {
+        self.original_admission_fence
     }
 
     /// Current successor authority the backend must validate exactly.
@@ -903,6 +924,14 @@ impl CommittedTerminal {
         Self::issue(registration, admission, authority, &body, commit_metadata)
     }
 
+    /// Return the globally monotonic consensus sequence at which this
+    /// terminal result linearized.  Roster storage persists this exact value
+    /// with compacted terminal history so a fixed-size closure witness can
+    /// prove an omitted tombstone was retired rather than rolled back.
+    pub(crate) const fn terminal_sequence(&self) -> u64 {
+        self.commit_metadata.sequence
+    }
+
     /// Encode the exact historical terminal composite for consensus storage,
     /// snapshots, and cross-node replay. Protected bytes are copied verbatim
     /// from the committed terminal record; this path never reseals them.
@@ -1133,21 +1162,11 @@ impl CommittedTerminal {
         &self.record
     }
 
-    /// Exact registration that bound the historical terminal proof set.
-    ///
-    /// Storage uses this only to re-verify retained terminal evidence after a
-    /// restart or snapshot install. It is deliberately crate-private so a
-    /// caller cannot manufacture a terminal publication capability from it.
-    pub(crate) const fn committing_registration(&self) -> BackendRegistration {
-        self.committing_registration
-    }
-
-    /// Exact authority that committed the historical terminal proof set.
-    ///
-    /// This is provenance, not a current-leader authority grant. A later
-    /// same-body replay may carry proofs issued for a newer authority.
-    pub(crate) fn committing_authority(&self) -> &AuthorityBinding {
-        &self.committing_authority
+    /// Return the immutable receipt commitment retained with this exact
+    /// terminal composite.  The current-publication-authority reader compares
+    /// it under its backend read lock; it never constructs a receipt.
+    pub(crate) const fn receipt_commitment(&self) -> [u8; 32] {
+        self.receipt_commitment
     }
 
     pub(crate) const fn commit_metadata(&self) -> ConsensusCommitMetadata {

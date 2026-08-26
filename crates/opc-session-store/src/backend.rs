@@ -16,6 +16,10 @@ use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerScope, SessionConsumerStoreError,
+};
+use crate::{
     capability::BackendCapabilities,
     consensus::types::validate_fenced_transition_v2_batch,
     error::{LeaseError, StoreError},
@@ -40,10 +44,6 @@ use crate::{
         checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at,
         validate_stored_record_expiry_profile,
     },
-};
-use crate::{
-    SessionConsumerOperation, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerScope, SessionConsumerStoreError,
 };
 
 /// Per-watcher buffer size for replication watch streams.
@@ -999,12 +999,67 @@ pub enum ReplicationOp {
         /// is deactivated.
         credential_id: u64,
     },
+    /// Replay of the one protected-roster `Established` materialization.
+    ///
+    /// The protected roster preserves immutable admission provenance at the
+    /// original fence while a recovery successor can commit the terminal at a
+    /// higher live fence.  Generic CAS replay cannot represent that split:
+    /// its replacement record intentionally retains the original owner/fence.
+    /// This operation therefore carries the exact admitted raw row and the
+    /// current lease authority separately.  It deliberately contains no
+    /// roster identifier, registration, terminal body, or proof material.
+    ProtectedRosterEstablished {
+        /// Exact key whose admission-reserved authoritative row is consumed.
+        key: SessionKey,
+        /// Complete authoritative row observed at admission.  Replay requires
+        /// byte-for-byte equality, including its original provenance.
+        expected_record: StoredSessionRecord,
+        /// Explicit Established-only materialization; an aborted terminal is
+        /// never represented in the replication journal.
+        successor: ProtectedRosterEstablishedSuccessor,
+        /// Current authenticated execution owner, which may differ from the
+        /// immutable `expected_record.owner` after a fenced takeover.
+        owner: OwnerId,
+        /// Current authenticated execution fence and persistent floor.
+        fence: FenceToken,
+        /// Credential of the active execution lease.
+        credential_id: u64,
+        /// Exact issuance time of the execution lease.
+        guard_acquired_at: Timestamp,
+        /// Exact expiry of the execution lease.
+        guard_expires_at: Timestamp,
+    },
     /// Replay of a batch: the nested ops are applied sequentially and the
     /// first failure aborts the rest of the batch replay.
     Batch {
         /// Mutations in original submission order.
         ops: Vec<ReplicationOp>,
     },
+}
+
+/// The only legal session-record effects of a protected-roster Established
+/// terminal.  This is intentionally separate from a generic optional record:
+/// a terminal `NoOp` must compare the exact admitted record without violating
+/// the ordinary monotonic-generation rule, while `Delete` must retain the
+/// authenticated fence floor.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ProtectedRosterEstablishedSuccessor {
+    /// Install this exact authoritative successor.
+    Put {
+        /// Exact immutable-provenance successor to install after the CAS.
+        record: StoredSessionRecord,
+    },
+    /// Delete the exact admitted row while retaining the execution fence.
+    Delete,
+    /// Retain the exact admitted row; this is an Established terminal whose
+    /// materialization deliberately does not advance its generation.
+    NoOp,
+}
+
+impl fmt::Debug for ProtectedRosterEstablishedSuccessor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProtectedRosterEstablishedSuccessor(<redacted>)")
+    }
 }
 
 impl fmt::Debug for ReplicationOp {
@@ -1097,6 +1152,16 @@ impl ReplicationOp {
                 Self::CompareAndSet { new_record, .. } => {
                     validate_stored_record_expiry_at(new_record, reference_timestamp)?;
                 }
+                Self::ProtectedRosterEstablished {
+                    expected_record,
+                    successor,
+                    ..
+                } => {
+                    validate_stored_record_expiry_at(expected_record, reference_timestamp)?;
+                    if let ProtectedRosterEstablishedSuccessor::Put { record } = successor {
+                        validate_stored_record_expiry_at(record, reference_timestamp)?;
+                    }
+                }
                 Self::Batch { ops } => pending.extend(ops),
                 Self::DeleteFenced { .. } | Self::ReleaseLease { .. } => {}
             }
@@ -1142,6 +1207,33 @@ where
                     credential_id,
                     guard_expires_at,
                     new_record: transform_record(new_record).await?,
+                });
+            }
+            ReplicationTransformWork::Visit(ReplicationOp::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
+            }) => {
+                // This is an exact durable CAS, not a public payload
+                // projection. Encryption and remote sealing are generally
+                // randomized, so independently re-wrapping its expected
+                // record (or successor) would make the exact replica row
+                // impossible to match. Preserve the opaque protected pair
+                // byte-for-byte through all generic wrapper transforms.
+                transformed.push(ReplicationOp::ProtectedRosterEstablished {
+                    key,
+                    expected_record,
+                    successor,
+                    owner,
+                    fence,
+                    credential_id,
+                    guard_acquired_at,
+                    guard_expires_at,
                 });
             }
             ReplicationTransformWork::Visit(ReplicationOp::Batch { ops }) => {
@@ -4751,8 +4843,8 @@ mod protected_session_backend_tests {
     use opc_key::{KeyError, KeyHandle, KeyId, KeyPurpose};
 
     use crate::{
-        fake::FakeSessionBackend, model::SessionKeyType, EncryptedSessionPayload, StateClass,
-        StateType,
+        EncryptedSessionPayload, StateClass, StateType, fake::FakeSessionBackend,
+        model::SessionKeyType,
     };
 
     #[test]
@@ -4877,6 +4969,41 @@ mod protected_session_backend_tests {
                 payload: EncryptedSessionPayload::new([0x51]),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn protected_roster_replication_cas_is_opaque_to_randomized_wrappers() {
+        let operation = prepared_test_operation().await;
+        let lease = operation.lease.clone();
+        let expected_record = operation.new_record;
+        let op = ReplicationOp::ProtectedRosterEstablished {
+            key: expected_record.key.clone(),
+            expected_record,
+            successor: ProtectedRosterEstablishedSuccessor::NoOp,
+            owner: lease.owner().clone(),
+            fence: lease.fence(),
+            credential_id: lease.credential_id(),
+            guard_acquired_at: lease.acquired_at(),
+            guard_expires_at: lease.expires_at(),
+        };
+        let original = op.clone();
+        let transforms = Arc::new(AtomicUsize::new(0));
+        let observed = transforms.clone();
+        let transformed = transform_replication_op(op, move |record| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                // A randomized encrypt/seal wrapper would produce a different
+                // envelope here. The protected exact-CAS operation must never
+                // call this transform for either immutable record.
+                Ok(record)
+            }
+        })
+        .await
+        .expect("protected roster transform succeeds");
+
+        assert_eq!(transformed, original);
+        assert_eq!(transforms.load(Ordering::SeqCst), 0);
     }
 
     fn prepared_scope() -> SessionConsumerScope {

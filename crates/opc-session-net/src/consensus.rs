@@ -2417,10 +2417,11 @@ impl RemoteSessionConsensusPeer {
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
         let call_id = uuid::Uuid::new_v4();
+        let request = SessionConsensusTransportRequest::from_wire_call(call_id, request)?;
         let call = async {
             write_frame_bounded_until(
                 &mut connection.writer,
-                &SessionConsensusTransportRequest::Call { call_id, request },
+                &request,
                 connection.request_frame_size,
                 deadline,
             )
@@ -3623,87 +3624,88 @@ where
             }
             Err(error) => return Err(error),
         };
-        let SessionConsensusTransportRequest::Call { call_id, request } = inbound;
-        let response = if request.validate().is_err() {
-            SessionConsensusWireResponse {
+        let call_id = inbound.call_id();
+        let response = match inbound.into_wire_call() {
+            Err(_) => SessionConsensusWireResponse {
                 result: Err(SessionConsensusPeerError::Protocol),
-            }
-        } else {
-            let handler_deadline = tokio::time::Instant::now()
-                .checked_add(rpc_timeout)
-                .ok_or(ProtocolError::InvalidWireValue)?;
-            let execution_permit = tokio::select! {
-                biased;
-                _ = hard_rx.changed() => return Ok(()),
-                permit = tokio::time::timeout_at(
-                    handler_deadline,
-                    Arc::clone(&handler_executions).acquire_owned(),
-                ) => match permit {
-                    Ok(Ok(permit)) => Some(permit),
-                    Ok(Err(_)) | Err(_) => None,
-                },
-            };
-            let Some(execution_permit) = execution_permit else {
-                return write_consensus_call_response(
-                    writer,
-                    call_id,
-                    SessionConsensusWireResponse {
-                        result: Err(SessionConsensusPeerError::Timeout),
+            },
+            Ok((_, request)) => {
+                let handler_deadline = tokio::time::Instant::now()
+                    .checked_add(rpc_timeout)
+                    .ok_or(ProtocolError::InvalidWireValue)?;
+                let execution_permit = tokio::select! {
+                    biased;
+                    _ = hard_rx.changed() => return Ok(()),
+                    permit = tokio::time::timeout_at(
+                        handler_deadline,
+                        Arc::clone(&handler_executions).acquire_owned(),
+                    ) => match permit {
+                        Ok(Ok(permit)) => Some(permit),
+                        Ok(Err(_)) | Err(_) => None,
                     },
-                    effective_response_frame_size,
-                    idle_timeout,
-                    connection_cancellation,
-                    &mut hard_rx,
+                };
+                let Some(execution_permit) = execution_permit else {
+                    return write_consensus_call_response(
+                        writer,
+                        call_id,
+                        SessionConsensusWireResponse {
+                            result: Err(SessionConsensusPeerError::Timeout),
+                        },
+                        effective_response_frame_size,
+                        idle_timeout,
+                        connection_cancellation,
+                        &mut hard_rx,
+                    )
+                    .await;
+                };
+                let scope_admission = tokio::time::timeout_at(
+                    handler_deadline,
+                    membership.revalidate_engine_scope(
+                        &membership_scope,
+                        request.identity,
+                        request.sender,
+                        request.family,
+                    ),
                 )
                 .await;
-            };
-            let scope_admission = tokio::time::timeout_at(
-                handler_deadline,
-                membership.revalidate_engine_scope(
-                    &membership_scope,
-                    request.identity,
-                    request.sender,
-                    request.family,
-                ),
-            )
-            .await;
-            match scope_admission {
-                Ok(Err(error)) => SessionConsensusWireResponse { result: Err(error) },
-                Err(_) => SessionConsensusWireResponse {
-                    result: Err(SessionConsensusPeerError::Timeout),
-                },
-                Ok(Ok(membership_lease)) => {
-                    let handler = Arc::clone(&handler);
-                    let authenticated_sender = hello.sender_node_id;
-                    let mut handler_task = tokio::spawn(async move {
-                        let _membership_lease = membership_lease;
-                        let _execution_permit = execution_permit;
-                        handler.handle(authenticated_sender, request).await
-                    });
-                    let handled = tokio::select! {
-                        biased;
-                        _ = hard_rx.changed() => None,
-                        handled = tokio::time::timeout_at(handler_deadline, &mut handler_task) => {
-                            Some(handled)
-                        },
-                    };
-                    match handled {
-                        None => {
-                            drop(handler_task);
-                            return Ok(());
-                        }
-                        Some(Ok(Ok(response))) if response.validate().is_ok() => response,
-                        Some(Ok(Ok(_))) | Some(Ok(Err(_))) => SessionConsensusWireResponse {
-                            result: Err(SessionConsensusPeerError::Protocol),
-                        },
-                        Some(Err(_)) => {
-                            // Dropping a JoinHandle detaches rather than cancels the task.
-                            // The bounded execution permit and owned membership lease remain
-                            // held until the handler (and any queued RaftCore call it awaits)
-                            // reaches an actual terminal result.
-                            drop(handler_task);
-                            SessionConsensusWireResponse {
-                                result: Err(SessionConsensusPeerError::Timeout),
+                match scope_admission {
+                    Ok(Err(error)) => SessionConsensusWireResponse { result: Err(error) },
+                    Err(_) => SessionConsensusWireResponse {
+                        result: Err(SessionConsensusPeerError::Timeout),
+                    },
+                    Ok(Ok(membership_lease)) => {
+                        let handler = Arc::clone(&handler);
+                        let authenticated_sender = hello.sender_node_id;
+                        let mut handler_task = tokio::spawn(async move {
+                            let _membership_lease = membership_lease;
+                            let _execution_permit = execution_permit;
+                            handler.handle(authenticated_sender, request).await
+                        });
+                        let handled = tokio::select! {
+                            biased;
+                            _ = hard_rx.changed() => None,
+                            handled = tokio::time::timeout_at(handler_deadline, &mut handler_task) => {
+                                Some(handled)
+                            },
+                        };
+                        match handled {
+                            None => {
+                                drop(handler_task);
+                                return Ok(());
+                            }
+                            Some(Ok(Ok(response))) if response.validate().is_ok() => response,
+                            Some(Ok(Ok(_))) | Some(Ok(Err(_))) => SessionConsensusWireResponse {
+                                result: Err(SessionConsensusPeerError::Protocol),
+                            },
+                            Some(Err(_)) => {
+                                // Dropping a JoinHandle detaches rather than cancels the task.
+                                // The bounded execution permit and owned membership lease remain
+                                // held until the handler (and any queued RaftCore call it awaits)
+                                // reaches an actual terminal result.
+                                drop(handler_task);
+                                SessionConsensusWireResponse {
+                                    result: Err(SessionConsensusPeerError::Timeout),
+                                }
                             }
                         }
                     }
@@ -5808,7 +5810,9 @@ mod tests {
                     read_frame(&mut stream, MAX_NEGOTIATED_FRAME_SIZE)
                         .await
                         .expect("read fresh consensus call");
-                let SessionConsensusTransportRequest::Call { call_id, request } = call;
+                let SessionConsensusTransportRequest::Call { call_id, request } = call else {
+                    panic!("expected ordinary consensus call");
+                };
                 application_calls += 1;
                 write_frame(
                     &mut stream,
@@ -5891,7 +5895,9 @@ mod tests {
                     read_frame(&mut stream, MAX_NEGOTIATED_FRAME_SIZE)
                         .await
                         .expect("read post-epoch consensus call");
-                let SessionConsensusTransportRequest::Call { call_id, request } = call;
+                let SessionConsensusTransportRequest::Call { call_id, request } = call else {
+                    panic!("expected ordinary consensus call");
+                };
                 application_calls += 1;
                 write_frame(
                     &mut stream,
@@ -6225,7 +6231,9 @@ mod tests {
                     read_frame(&mut stream, MAX_NEGOTIATED_FRAME_SIZE)
                         .await
                         .expect("read consensus call");
-                let SessionConsensusTransportRequest::Call { call_id, request } = call;
+                let SessionConsensusTransportRequest::Call { call_id, request } = call else {
+                    panic!("expected ordinary consensus call");
+                };
                 if attempt == 1 {
                     // EOF after a complete request leaves the response position
                     // unknown and must make this stream permanently unusable.

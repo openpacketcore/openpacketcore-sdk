@@ -11,20 +11,20 @@ use bytes::Bytes;
 use opc_config_model::{
     AuthStrength, RequestId, TransportType, TrustedPrincipal, WorkloadIdentity,
 };
-use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
 use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
+use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
-    serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider,
-    SessionAad, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN,
+    AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN, AeadAlgorithm, EnvelopeAad,
+    KeyId, KeyPurpose, MemoryKeyProvider, SessionAad, Zeroizing, serialize_bound_aad,
 };
 use opc_mgmt_audit::{AuditError, AuditEvent, AuditOutcome, AuditSink};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
-use rusqlite::{params, types::Value, Connection};
+use rusqlite::{Connection, params, types::Value};
 use sha2::{Digest, Sha256};
 
 use super::sqlite::{
-    backup_and_reset_replica, prepare_test_workflow, seal_plan, RecoveryFailpoint, ResetInput,
+    RecoveryFailpoint, ResetInput, backup_and_reset_replica, prepare_test_workflow, seal_plan,
 };
 use super::*;
 use crate::capability::BackendCapabilities;
@@ -39,14 +39,14 @@ use crate::topology::{
 };
 use crate::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend,
-    Generation, OwnerId, ReplicationEntry, ReplicationOp, SessionBackend,
+    FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_SCHEMA_V1,
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, Generation, OwnerId, REPLICATION_TX_ID_MAX_BYTES,
+    ReplicationEntry, ReplicationOp, SESSION_CONSENSUS_SCHEMA_VERSION, SessionBackend,
     SessionConsensusEntryDigest, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpcHandler,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
     SessionLeaseManager, SqliteSessionBackend, StateClass, StateType, StoredSessionRecord,
-    SystemClock, FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_SCHEMA_V1,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, REPLICATION_TX_ID_MAX_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SystemClock,
 };
 
 const RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
@@ -3116,10 +3116,12 @@ async fn three_way_current_fork_requires_and_uses_majority_committed_checkpoint(
     assert_eq!(repaired.fence_high_water(), 7);
     let recovered_backend =
         SqliteSessionBackend::open(&replicas[2].database_path).expect("open recovered target");
-    assert!(recovered_backend
-        .consensus_operator_recovery_pending(identity())
-        .await
-        .expect("read target recovery gate"));
+    assert!(
+        recovered_backend
+            .consensus_operator_recovery_pending(identity())
+            .await
+            .expect("read target recovery gate")
+    );
 }
 
 #[tokio::test]
@@ -3320,7 +3322,7 @@ fn backup_and_snapshot_failpoints_resume_without_losing_quarantine() {
 #[cfg(unix)]
 #[test]
 fn recovery_artifacts_reject_insecure_roots_symlinks_and_unsealed_staging_files() {
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     let temp = tempfile::tempdir().expect("temporary directory");
     let ids = [
@@ -3676,9 +3678,11 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
     let plaintext_canary = b"legacy-recovery-plaintext-canary";
     for replica in &replicas {
         let database = std::fs::read(&replica.database_path).expect("read recovered database");
-        assert!(!database
-            .windows(plaintext_canary.len())
-            .any(|window| window == plaintext_canary));
+        assert!(
+            !database
+                .windows(plaintext_canary.len())
+                .any(|window| window == plaintext_canary)
+        );
     }
     assert_tree_does_not_contain(backup.path(), plaintext_canary);
 

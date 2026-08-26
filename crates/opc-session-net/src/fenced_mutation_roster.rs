@@ -45,6 +45,8 @@ pub use canonical::{
     EstablishedPublicationProvider as FencedMutationRosterEstablishedPublicationProvider,
     MemberProvider as FencedMutationRosterMemberProvider,
     ProviderCallOutcome as FencedMutationRosterProviderCallOutcome,
+    ProviderReceiptCapsule as FencedMutationRosterProviderReceiptCapsule,
+    ProviderReceiptChallenge as FencedMutationRosterProviderReceiptChallenge,
 };
 pub use canonical::{
     CONSUMER_ALPN as FENCED_MUTATION_ROSTER_CONSUMER_ALPN,

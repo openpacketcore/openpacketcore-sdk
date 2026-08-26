@@ -15,21 +15,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    plan_mac, RecoveryDecisionBasis, RecoveryDigest, RecoveryError, RecoveryExecutionState,
+    RecoveryDecisionBasis, RecoveryDigest, RecoveryError, RecoveryExecutionState,
     RecoveryIntegrityKey, RecoveryLimits, RecoveryPlan, RecoveryReplica, RecoveryReplicaEvidence,
-    RecoveryReplicaFormat,
+    RecoveryReplicaFormat, plan_mac,
 };
 use crate::consensus::{
-    SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId, SessionConsensusIdentity,
-    SessionConsensusNodeId, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SESSION_CONSENSUS_SCHEMA_VERSION, SessionConsensusConfigurationEpoch,
+    SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsensusNodeId,
 };
 use crate::sqlite::{consensus, ops};
 use crate::{
-    ReplicationEntry, ReplicationTxId, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS,
-    FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
+    FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS, FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES, FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
-    REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
+    REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES, ReplicationEntry, ReplicationTxId,
 };
 
 const PATH_MAX_BYTES: usize = 4_096;

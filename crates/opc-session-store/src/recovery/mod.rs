@@ -26,19 +26,19 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::ConsensusSessionStore;
 use crate::consensus::{
     OperatorRecoveryCommitError, SessionConsensusIdentity, SessionConsensusNodeId,
     SessionConsensusRequestId,
 };
 use crate::topology::{
-    ReplicaBackingIdentity, ReplicaId, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
+    QUORUM_TOPOLOGY_MAX_MEMBERS, ReplicaBackingIdentity, ReplicaId, ValidatedQuorumTopology,
 };
-use crate::ConsensusSessionStore;
 
 use self::sqlite::{
-    backup_and_reset_replica, clear_fleet_latches, inspect_replica, replica_has_recovery_latch,
-    resume_audit_state, resume_execution_state, seal_plan, set_fleet_latches_audit_pending,
-    verify_plan_seal, InspectionInput, ResetInput,
+    InspectionInput, ResetInput, backup_and_reset_replica, clear_fleet_latches, inspect_replica,
+    replica_has_recovery_latch, resume_audit_state, resume_execution_state, seal_plan,
+    set_fleet_latches_audit_pending, verify_plan_seal,
 };
 
 const RECOVERY_PLAN_VERSION: u16 = 1;

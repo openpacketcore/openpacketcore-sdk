@@ -6,8 +6,8 @@ use futures_util::Stream;
 use tokio::sync::mpsc;
 
 use crate::backend::{
-    validate_replication_log_page_owned, ReplicationEntry, ReplicationWatchCursor,
-    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, WATCH_CHANNEL_CAPACITY,
+    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, ReplicationEntry, ReplicationWatchCursor,
+    WATCH_CHANNEL_CAPACITY, validate_replication_log_page_owned,
 };
 use crate::error::StoreError;
 

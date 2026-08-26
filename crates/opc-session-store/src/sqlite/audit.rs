@@ -9,14 +9,14 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use opc_types::Timestamp;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    validate_record_expiry_at, OwnerId, ReplicationEntry, ReplicationTxId, SessionKeyType,
-    StateClass, OWNER_ID_MAX_BYTES, REPLICATION_TX_ID_MAX_BYTES, SESSION_KEY_TYPE_MAX_BYTES,
-    STABLE_ID_MAX_BYTES, STABLE_ID_MIN_BYTES,
+    OWNER_ID_MAX_BYTES, OwnerId, REPLICATION_TX_ID_MAX_BYTES, ReplicationEntry, ReplicationTxId,
+    SESSION_KEY_TYPE_MAX_BYTES, STABLE_ID_MAX_BYTES, STABLE_ID_MIN_BYTES, SessionKeyType,
+    StateClass, validate_record_expiry_at,
 };
 
 /// Version of the count-only SQLite identity-audit report.

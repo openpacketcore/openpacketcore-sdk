@@ -8,17 +8,17 @@
 //! version, tenant, or backend fails to decrypt instead of silently decoding.
 
 use opc_crypto::{
-    decrypt_decoded_envelope_with_handle, encrypt_envelope_with_handle, CryptoEnvelopeV1,
+    CryptoEnvelopeV1, decrypt_decoded_envelope_with_handle, encrypt_envelope_with_handle,
 };
 use opc_key::{
-    decode_bound_aad, key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, EnvelopeAad,
-    EnvelopeMetadata, KeyHandle, KeyProvider, KeyPurpose, RemoteSealProvider, SessionAad,
-    Zeroizing, AEAD_TAG_LEN,
+    AEAD_TAG_LEN, AeadAlgorithm, EnvelopeAad, EnvelopeMetadata, KeyHandle, KeyProvider, KeyPurpose,
+    RemoteSealProvider, SessionAad, Zeroizing, decode_bound_aad, key_id_from_bound_aad,
+    serialize_bound_aad,
 };
 use opc_types::Timestamp;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use crate::{
     error::StoreError,
@@ -909,10 +909,10 @@ fn build_session_aad_with_digest(
 #[cfg(test)]
 mod tests {
     use super::{
-        EncryptedSessionPayloadOwnershipTestCounters, WipingPayloadBytes,
         ENCRYPTED_SESSION_PAYLOAD_OWNERSHIP_TEST_COUNTERS,
+        EncryptedSessionPayloadOwnershipTestCounters, WipingPayloadBytes,
     };
-    use serde::{de, Deserialize};
+    use serde::{Deserialize, de};
     use std::sync::Arc;
 
     struct BytesOnlyDeserializer<'a>(&'a [u8]);

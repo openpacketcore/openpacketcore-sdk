@@ -4,14 +4,16 @@
 //! immutable proposal, its authenticated admission, and terminal persistence.
 
 use crate::consensus::SessionConsensusIdentity;
-use crate::fenced_mutation_roster_executor::{AuthorityBinding, BackendRegistration};
+use crate::fenced_mutation_roster_executor::{
+    AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration,
+};
 use crate::model::{FenceToken, Generation, OwnerId, SessionKey, StateType};
 use opc_types::Timestamp;
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use serde::{
-    de::{SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
+    de::{SeqAccess, Visitor},
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fmt, marker::PhantomData, time::Duration};
@@ -53,7 +55,7 @@ pub const ROSTER_ATTESTATION_P256_SIGNATURE_BYTES: usize = 64;
 /// Eight 4096-byte evidence payloads plus fixed certificate/proof framing fit
 /// below this ceiling; it remains independent of the 1 MiB checkpoint and
 /// 16 KiB result limits.
-pub const MAX_EXECUTOR_PROOF_BUNDLE_BYTES: usize = 36 * 1024;
+pub const MAX_EXECUTOR_PROOF_BUNDLE_BYTES: usize = 40 * 1024;
 /// Maximum canonical bytes of one ingress attestation statement.
 pub const MAX_ROSTER_INGRESS_ATTESTATION_BYTES: usize = 1024;
 /// Maximum canonical bytes retained for a root-verifiable compact admission.
@@ -67,7 +69,7 @@ pub const MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES: usize = 2048;
 /// Eight fixed-width signed member summaries, one root-certified leaf
 /// certificate, and the common terminal binding fit below this limit. Raw
 /// provider evidence is never carried here.
-pub const MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES: usize = 4096;
+pub const MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES: usize = 8 * 1024;
 /// Maximum number of live admitted rosters.
 pub const MAX_LIVE_ROSTERS: usize = 1_024;
 /// Maximum combined number of live and retained terminal rosters.
@@ -138,6 +140,11 @@ const ROSTER_ATTESTATION_CERTIFICATE_DOMAIN: &[u8] =
     b"openpacketcore/session-store/roster-attestation-certificate/v1\0";
 const ROSTER_ATTESTATION_PROOF_DOMAIN: &[u8] =
     b"openpacketcore/session-store/roster-attestation-proof/v1\0";
+/// Dedicated provider-receipt domain.  This is deliberately distinct from
+/// executor aggregation and never commits a selected terminal phase/body.
+const ROSTER_ATTESTATION_PROVIDER_RECEIPT_DOMAIN: &[u8] =
+    b"openpacketcore/session-store/roster-attestation-provider-receipt/v1\0";
+const ROSTER_ATTESTATION_PROVIDER_RECEIPT_MAGIC: [u8; 8] = *b"OPCPRC1\0";
 const ROSTER_ATTESTATION_STABLE_PROOF_DOMAIN: &[u8] =
     b"openpacketcore/session-store/roster-attestation-stable-proof/v1\0";
 const ROSTER_ATTESTATION_EVIDENCE_DOMAIN: &[u8] =
@@ -255,6 +262,7 @@ pub(crate) const PROVIDER_OPERATION_STATUS_TAG: u8 = 2;
 pub(crate) const PROVIDER_OPERATION_ADOPT_TAG: u8 = 3;
 pub(crate) const PROVIDER_OPERATION_COMPENSATE_TAG: u8 = 4;
 pub(crate) const PROVIDER_OPERATION_PREPARE_TAG: u8 = 5;
+pub(crate) const PROVIDER_OPERATION_RECONCILE_TAG: u8 = 6;
 const PUBLICATION_OPERATION_STATUS_TAG: u8 = 1;
 const PUBLICATION_OPERATION_BEGIN_INTENT_TAG: u8 = 2;
 const PUBLICATION_OPERATION_ADOPT_TAG: u8 = 3;
@@ -384,14 +392,14 @@ const PROFILE_DESCRIPTOR: &[u8] = concat!(
     "consumer-revision=5\n",
     "alpn=opc-session-consumer/3\n",
     "codec=postcard-canonical,frame-digest=sha256\n",
-    "domains=profile,admission,descriptor,terminal,terminal-slot,session-key-binding,tenant-scope-partition,provider-fence-binding,publication-id,publication-payload,publication-evidence,admission-frame,terminal-frame,committed-terminal-frame,tombstone-frame,history-floor-frame,executor-proof,executor-evidence,terminal-committing-guard,terminal-session-record,terminal-receipt,provider-scheduling,binding,descriptor,owner,credential,roster-attestation-root,roster-attestation-certificate,roster-attestation-proof,roster-attestation-stable-proof,roster-attestation-evidence,roster-attestation-bundle,roster-ingress-attestation,roster-ingress-capsule\n",
-    "magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB1\\0,OPCRHF1\\0\n",
-    "field-order=profile,roster,members,established-mutation,plan,checkpoint,result;key,scope,owner,fence,generation;binding:epoch,scope,tenant-scope-partition,session-key-commitment,roster-id;tombstone:binding,admission-commitment,terminal-commitment,admission-fence,generation,phase;history-floor:scope,tenant-scope-partition,retired-through\n",
-    "executor-field-order=proof-binding:roster-attestation-proof,profile,configuration-identity,certificate-subject,certificate-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,terminal-phase,terminal-body-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;proof-commitment:roster-attestation-stable-proof,binding,registration-request-id,terminal-slot,roster-id,admission-commitment,phase,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,outcome,evidence-commitment;certificate=roster-attestation-certificate,version,root-id,role,configuration-identity,scope,subject,leaf-epoch,key-id[32],not-before,not-after,compressed-p256-key;attestation=p256-sha256,compressed-sec1:33,low-s-p1363:64,roles:executor|transport-ingress;ingress=roster-ingress-attestation,profile-alpn,peer,scope,request,operation,capsule,authenticated-at,peer-cert-expires,material-generation,handshake-epoch;provider-operations=local-prepare-execute-status-adopt-compensate\n",
+    "domains=profile,admission,descriptor,terminal,terminal-slot,session-key-binding,tenant-scope-partition,provider-fence-binding,publication-id,publication-payload,publication-evidence,admission-frame,terminal-frame,committed-terminal-frame,tombstone-frame,history-floor-frame,executor-proof,executor-evidence,terminal-committing-guard,terminal-session-record,terminal-receipt,provider-scheduling,binding,descriptor,owner,credential,roster-attestation-root,roster-attestation-certificate,roster-attestation-proof,roster-attestation-provider-receipt,roster-attestation-stable-proof,roster-attestation-evidence,roster-attestation-bundle,roster-ingress-attestation,roster-ingress-capsule\n",
+    "magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB1\\0,OPCRHF1\\0,OPCPRC1\\0\n",
+    "field-order=profile,roster,members,established-mutation,plan,checkpoint,result;key,scope,owner,fence,generation;binding:epoch,scope,tenant-scope-partition,session-key-commitment,roster-id;tombstone:binding,admission-commitment,terminal-commitment,admission-owner,admission-fence,generation,phase;history-floor:scope,tenant-scope-partition,retired-through\n",
+    "executor-field-order=proof-binding:roster-attestation-proof,profile,configuration-identity,certificate-subject,certificate-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,terminal-phase,terminal-body-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;provider-receipt=roster-attestation-provider-receipt,profile,configuration-identity,provider-certificate-subject,provider-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;proof-commitment:roster-attestation-stable-proof,binding,registration-request-id,terminal-slot,roster-id,admission-commitment,phase,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,outcome,evidence-commitment;certificate=roster-attestation-certificate,version,root-id,role,configuration-identity,scope,subject,leaf-epoch,key-id[32],not-before,not-after,compressed-p256-key;attestation=p256-sha256,compressed-sec1:33,low-s-p1363:64,roles:executor|provider|transport-ingress;ingress=roster-ingress-attestation,profile-alpn,peer,scope,request,operation,capsule,authenticated-at,peer-cert-expires,material-generation,handshake-epoch;provider-operations=local-prepare-execute-status-adopt-compensate-reconcile\n",
     "committed-terminal-frame-field-order=record,commit-metadata(sequence,raft-log-index,committed-at),committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,committing-authority-scope,committing-authority-key,committing-authority-owner,committing-authority-fence,committing-authority-credential,committing-authority-generation,committing-authority-acquired-at,committing-authority-expires-at,committing-guard-commitment,materialization,receipt-commitment;materialization-postcard-tags=updated:0,deleted:1,no-op:2,aborted:3\n",
     "terminal-guard-field-order=profile,committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,admission-commitment,scope,key,owner,fence,credential,generation,acquired-at,expires-at\n",
     "terminal-receipt-field-order=profile,registration-request-id,terminal-slot-id,admission-commitment,terminal-body-commitment,phase,committing-fence,committing-guard-commitment,commit-metadata,materialization;materialization=updated-from-to-record-commitment|deleted-generation|no-op-generation|aborted\n",
-    "executor-operation-tags=execute:1,status:2,adopt:3,compensate:4,prepare:5\n",
+    "executor-operation-tags=execute:1,status:2,adopt:3,compensate:4,prepare:5,reconcile:6\n",
     "publication-operation-tags=status:1,begin-inert-intent:2,adopt:3;publication-outcome-tags=absent:1,not-transmitted:2,outcome-unknown:3,pending:4,published:5,conflict:6\n",
     "phase-tags=established:1,aborted:2\n",
     "established-mutation-tags=put-checkpoint:1,delete:2,no-op:3\n",
@@ -402,7 +410,7 @@ const PROFILE_DESCRIPTOR: &[u8] = concat!(
     "provider-scheduling=fail-fast,global-max:1024,exact-tenant-scope-cap:ceil(global/2),fixed-shards:16,no-wait-queue,no-per-subscriber-resource\n",
     "provider-tags=not-transmitted:1,outcome-unknown:2,not-found:3,pending:4,conclusive:5,prepared-not-run:6,ready-to-prepare:7\n",
     "outcome-tags=applied-executed:1,applied-adopted:2,not-applied-reconciled:3,compensated-reconciled:4\n",
-    "limits=max-members:8,accepted-members:1..8,fresh-target-members:6,plan:1048576,checkpoint:1048576,result:16384,roster-id:16,member-operation-id:16,descriptor:16384,status:4096,attestation-evidence:4096,attestation-bundle:36864,ingress-attestation:1024,admission-codec:2245658,terminal-codec:1065423,committed-terminal-codec:1069519,tombstone-codec:256,history-floor-codec:128,history-epoch-max:9223372036854775807,live:1024,live-plus-retained:131072,epoch-bindings:131072,operational-target:100000,reclaim:1024,retention-seconds:86400,quorum-mutations:fresh-success=2(admission,terminalization);remote-reads=admission-status,recover,terminal-status;local-authority-checks=provider-pre-post,publication-pre-post\n",
+    "limits=max-members:8,accepted-members:1..8,fresh-target-members:6,plan:1048576,checkpoint:1048576,result:16384,roster-id:16,member-operation-id:16,descriptor:16384,status:4096,attestation-evidence:4096,attestation-bundle:40960,compact-terminal-evidence:8192,ingress-attestation:1024,admission-codec:2245658,terminal-codec:1065423,committed-terminal-codec:1069519,tombstone-codec:256,history-floor-codec:128,history-epoch-max:9223372036854775807,live:1024,live-plus-retained:131072,epoch-bindings:131072,operational-target:100000,reclaim:1024,retention-seconds:86400,quorum-mutations:fresh-success=2(admission,terminalization);remote-reads=admission-status,recover,terminal-status,current-publication-authority;local-authority-checks=provider-pre-post,publication-pre-post\n",
     "maintenance=bounded-deterministic-reclaim-and-retirement,payload-compaction,irreversible-floor-retirement;never-on-fresh-success;local-provider-journal-only\n",
     "history=stable-slot-binds-epoch-scope-session-key-roster-id,new-v2-admission-atomically-selects-binds-current-epoch-greater-than-durable-exact-scope-floor-before-reserve,admit-reserves-one-terminal-slot,terminal-retention-starts-at-terminalization,reclaim-oldest-min-1024-eligible-to-v2-conflict-tombstone,never-reclaim-live,durable-canonical-scope-bound-irreversible-floor,never-reopen-before-scope-bound-irreversible-epoch-retirement\n",
     "retry=prepare-or-execute-only-after-same-call-not-transmitted,outcome-unknown-status-adopt-only,not-found-non-exclusionary\n",
@@ -448,6 +456,7 @@ pub fn profile_digest() -> [u8; 32] {
         ROSTER_ATTESTATION_ROOT_DOMAIN,
         ROSTER_ATTESTATION_CERTIFICATE_DOMAIN,
         ROSTER_ATTESTATION_PROOF_DOMAIN,
+        ROSTER_ATTESTATION_PROVIDER_RECEIPT_DOMAIN,
         ROSTER_ATTESTATION_STABLE_PROOF_DOMAIN,
         ROSTER_ATTESTATION_EVIDENCE_DOMAIN,
         ROSTER_ATTESTATION_BUNDLE_DOMAIN,
@@ -461,18 +470,21 @@ pub fn profile_digest() -> [u8; 32] {
     h.update(COMMITTED_TERMINAL_FRAME_MAGIC);
     h.update(TOMBSTONE_FRAME_MAGIC);
     h.update(HISTORY_FLOOR_FRAME_MAGIC);
+    h.update(ROSTER_ATTESTATION_PROVIDER_RECEIPT_MAGIC);
     h.update([
         PROVIDER_OPERATION_EXECUTE_TAG,
         PROVIDER_OPERATION_STATUS_TAG,
         PROVIDER_OPERATION_ADOPT_TAG,
         PROVIDER_OPERATION_COMPENSATE_TAG,
         PROVIDER_OPERATION_PREPARE_TAG,
+        PROVIDER_OPERATION_RECONCILE_TAG,
     ]);
     h.update([PHASE_ESTABLISHED, PHASE_ABORTED]);
     h.update((ROSTER_ATTESTATION_P256_COMPRESSED_PUBLIC_KEY_BYTES as u64).to_be_bytes());
     h.update((ROSTER_ATTESTATION_P256_SIGNATURE_BYTES as u64).to_be_bytes());
     h.update((MAX_EXECUTOR_PROOF_EVIDENCE_BYTES as u64).to_be_bytes());
     h.update((MAX_EXECUTOR_PROOF_BUNDLE_BYTES as u64).to_be_bytes());
+    h.update((MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES as u64).to_be_bytes());
     h.update([
         ESTABLISHED_MUTATION_PUT_CHECKPOINT,
         ESTABLISHED_MUTATION_DELETE,
@@ -919,6 +931,14 @@ pub(crate) struct Admission {
     logical_owner: OwnerId,
     admission_fence: FenceToken,
     expected_generation: Generation,
+    /// Derived from the immutable wire fields during authenticated
+    /// construction/deserialization. This is deliberately absent from the
+    /// canonical wire shape: terminal proof verification calls this once per
+    /// member, and re-hashing the bounded 1 MiB plan and checkpoint on every
+    /// call would make maximum-body consensus application scale with proof
+    /// count instead of body count.
+    #[serde(skip_serializing)]
+    body_commitment: [u8; 32],
 }
 impl Admission {
     pub(crate) fn authenticate(
@@ -946,6 +966,14 @@ impl Admission {
         {
             return Err(Error::InvalidEstablishedMutation);
         }
+        let body_commitment = admission_body_commitment(
+            &proposal,
+            &key,
+            scope,
+            &logical_owner,
+            admission_fence,
+            expected_generation,
+        );
         Ok(Self {
             proposal,
             key,
@@ -953,37 +981,11 @@ impl Admission {
             logical_owner,
             admission_fence,
             expected_generation,
+            body_commitment,
         })
     }
-    pub(crate) fn body_commitment(&self) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(ADMISSION_DOMAIN);
-        h.update(self.proposal.profile.digest());
-        h.update(self.proposal.roster_id.as_bytes());
-        update_len_prefixed(&mut h, &self.key.canonical_digest_input());
-        h.update(self.scope.digest());
-        update_len_prefixed(&mut h, self.logical_owner.as_str().as_bytes());
-        h.update(self.admission_fence.get().to_be_bytes());
-        h.update(self.expected_generation.get().to_be_bytes());
-        h.update((self.proposal.members.len() as u64).to_be_bytes());
-        for member in &self.proposal.members {
-            h.update([member.ordinal]);
-            h.update(member.operation_id.as_bytes());
-            h.update(member.descriptor_commitment());
-            h.update(member.expected_version.to_be_bytes());
-        }
-        h.update([self.proposal.established_mutation.tag()]);
-        match self.proposal.established_mutation.state_type() {
-            Some(state_type) => {
-                h.update([1]);
-                update_len_prefixed(&mut h, state_type.as_str().as_bytes());
-            }
-            None => h.update([0]),
-        }
-        update_len_prefixed(&mut h, &self.proposal.protected_plan);
-        update_len_prefixed(&mut h, &self.proposal.terminal_checkpoint);
-        update_len_prefixed(&mut h, &self.proposal.terminal_result);
-        h.finalize().into()
+    pub(crate) const fn body_commitment(&self) -> [u8; 32] {
+        self.body_commitment
     }
     pub(crate) const fn profile(&self) -> Profile {
         self.proposal.profile
@@ -1049,6 +1051,44 @@ impl Admission {
         }
         Ok(admission)
     }
+}
+
+fn admission_body_commitment(
+    proposal: &AdmissionProposal,
+    key: &SessionKey,
+    scope: Scope,
+    logical_owner: &OwnerId,
+    admission_fence: FenceToken,
+    expected_generation: Generation,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(ADMISSION_DOMAIN);
+    h.update(proposal.profile.digest());
+    h.update(proposal.roster_id.as_bytes());
+    update_len_prefixed(&mut h, &key.canonical_digest_input());
+    h.update(scope.digest());
+    update_len_prefixed(&mut h, logical_owner.as_str().as_bytes());
+    h.update(admission_fence.get().to_be_bytes());
+    h.update(expected_generation.get().to_be_bytes());
+    h.update((proposal.members.len() as u64).to_be_bytes());
+    for member in &proposal.members {
+        h.update([member.ordinal]);
+        h.update(member.operation_id.as_bytes());
+        h.update(member.descriptor_commitment());
+        h.update(member.expected_version.to_be_bytes());
+    }
+    h.update([proposal.established_mutation.tag()]);
+    match proposal.established_mutation.state_type() {
+        Some(state_type) => {
+            h.update([1]);
+            update_len_prefixed(&mut h, state_type.as_str().as_bytes());
+        }
+        None => h.update([0]),
+    }
+    update_len_prefixed(&mut h, &proposal.protected_plan);
+    update_len_prefixed(&mut h, &proposal.terminal_checkpoint);
+    update_len_prefixed(&mut h, &proposal.terminal_result);
+    h.finalize().into()
 }
 impl fmt::Debug for Admission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1284,6 +1324,20 @@ pub(crate) fn session_key_commitment(key: &SessionKey) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Compute the exact authenticated tenant/scope partition committed by a
+/// durable protected-roster binding.
+///
+/// SQLite authorization and compact-evidence validation share this internal
+/// helper so neither persistence path can silently drift from the immutable
+/// request identity.
+pub(crate) fn tenant_scope_partition_commitment(scope: Scope, key: &SessionKey) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(TENANT_SCOPE_PARTITION_DOMAIN);
+    hasher.update(scope.digest());
+    update_len_prefixed(&mut hasher, key.tenant.as_str().as_bytes());
+    hasher.finalize().into()
+}
+
 fn request_binding_key(
     history_epoch: u64,
     scope: Scope,
@@ -1292,14 +1346,10 @@ fn request_binding_key(
 ) -> Result<RequestBindingKey, Error> {
     validate_history_epoch(history_epoch)?;
     scope.validate()?;
-    let mut partition_hasher = Sha256::new();
-    partition_hasher.update(TENANT_SCOPE_PARTITION_DOMAIN);
-    partition_hasher.update(scope.digest());
-    update_len_prefixed(&mut partition_hasher, key.tenant.as_str().as_bytes());
     let binding = RequestBindingKey {
         history_epoch,
         scope,
-        tenant_scope_partition: partition_hasher.finalize().into(),
+        tenant_scope_partition: tenant_scope_partition_commitment(scope, key),
         session_key_commitment: session_key_commitment(key),
         roster_id,
     };
@@ -1420,14 +1470,6 @@ impl TerminalRecord {
     }
     pub(crate) fn proof_commitments(&self) -> &[[u8; 32]] {
         &self.proof_commitments
-    }
-    #[cfg(test)]
-    pub(crate) fn protected_checkpoint(&self) -> &[u8] {
-        &self.protected_checkpoint
-    }
-    #[cfg(test)]
-    pub(crate) fn protected_result(&self) -> &[u8] {
-        &self.protected_result
     }
     pub(crate) const fn body_commitment(&self) -> [u8; 32] {
         self.body_commitment
@@ -1562,6 +1604,9 @@ impl<'de> Deserialize<'de> for TerminalRecord {
 pub enum RosterAttestationCertificateRoleV1 {
     /// A leaf authorized to attest local provider execution observations.
     Executor,
+    /// A leaf controlled by the product provider that performed the member
+    /// operation. Provider receipts are independently required at Q2.
+    Provider,
     /// A leaf reserved for authenticated transport-ingress assertions.
     TransportIngress,
 }
@@ -1571,7 +1616,8 @@ impl RosterAttestationCertificateRoleV1 {
     pub const fn tag(self) -> u8 {
         match self {
             Self::Executor => 1,
-            Self::TransportIngress => 2,
+            Self::Provider => 2,
+            Self::TransportIngress => 3,
         }
     }
 
@@ -1579,7 +1625,8 @@ impl RosterAttestationCertificateRoleV1 {
     pub fn from_tag(tag: u8) -> Result<Self, RosterAttestationError> {
         match tag {
             1 => Ok(Self::Executor),
-            2 => Ok(Self::TransportIngress),
+            2 => Ok(Self::Provider),
+            3 => Ok(Self::TransportIngress),
             _ => Err(RosterAttestationError),
         }
     }
@@ -1751,6 +1798,10 @@ pub struct RosterExecutorMemberProofPartsV1 {
     pub proof_epoch: u64,
     /// Opaque nonempty provider evidence, bounded to 4096 bytes.
     pub evidence: Vec<u8>,
+    /// Root-signed Provider leaf certificate for this exact member receipt.
+    pub provider_certificate: RosterAttestationLeafCertificatePartsV1,
+    /// Fixed low-S P-256 `r || s` Provider receipt signature.
+    pub provider_signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
     /// Fixed low-S P-256 `r || s` leaf signature.
     pub signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
 }
@@ -1765,6 +1816,7 @@ pub enum RosterProviderOperationV1 {
     Adopt,
     Compensate,
     Prepare,
+    Reconcile,
 }
 
 impl RosterProviderOperationV1 {
@@ -1776,6 +1828,7 @@ impl RosterProviderOperationV1 {
             Self::Adopt => PROVIDER_OPERATION_ADOPT_TAG,
             Self::Compensate => PROVIDER_OPERATION_COMPENSATE_TAG,
             Self::Prepare => PROVIDER_OPERATION_PREPARE_TAG,
+            Self::Reconcile => PROVIDER_OPERATION_RECONCILE_TAG,
         }
     }
 
@@ -1787,6 +1840,7 @@ impl RosterProviderOperationV1 {
             PROVIDER_OPERATION_ADOPT_TAG => Ok(Self::Adopt),
             PROVIDER_OPERATION_COMPENSATE_TAG => Ok(Self::Compensate),
             PROVIDER_OPERATION_PREPARE_TAG => Ok(Self::Prepare),
+            PROVIDER_OPERATION_RECONCILE_TAG => Ok(Self::Reconcile),
             _ => Err(RosterAttestationError),
         }
     }
@@ -2038,6 +2092,9 @@ struct RosterExecutorMemberProofV1 {
     outcome_tag: u8,
     proof_epoch: u64,
     evidence: Vec<u8>,
+    provider_certificate: RosterAttestationLeafCertificateV1,
+    #[serde(with = "fixed_array_64")]
+    provider_signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
     #[serde(with = "fixed_array_64")]
     signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
 }
@@ -2050,6 +2107,10 @@ impl RosterExecutorMemberProofV1 {
             outcome_tag: parts.outcome.tag(),
             proof_epoch: parts.proof_epoch,
             evidence: parts.evidence,
+            provider_certificate: RosterAttestationLeafCertificateV1::from_parts(
+                parts.provider_certificate,
+            )?,
+            provider_signature: parts.provider_signature,
             signature: parts.signature,
         };
         value.validate_structure()?;
@@ -2063,6 +2124,9 @@ impl RosterExecutorMemberProofV1 {
             || self.evidence.len() > MAX_EXECUTOR_PROOF_EVIDENCE_BYTES
             || RosterProviderOperationV1::from_tag(self.operation_tag).is_err()
             || RosterProviderOutcomeV1::from_tag(self.outcome_tag).is_err()
+            || self.provider_certificate.validate_structure().is_err()
+            || self.provider_certificate.role()? != RosterAttestationCertificateRoleV1::Provider
+            || canonical_signature(&self.provider_signature).is_err()
             || canonical_signature(&self.signature).is_err()
         {
             return Err(RosterAttestationError);
@@ -2095,6 +2159,9 @@ impl<'de> Deserialize<'de> for RosterExecutorMemberProofV1 {
             outcome_tag: u8,
             proof_epoch: u64,
             evidence: BoundedBytes<MAX_EXECUTOR_PROOF_EVIDENCE_BYTES>,
+            provider_certificate: RosterAttestationLeafCertificateV1,
+            #[serde(with = "fixed_array_64")]
+            provider_signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
             #[serde(with = "fixed_array_64")]
             signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
         }
@@ -2105,6 +2172,8 @@ impl<'de> Deserialize<'de> for RosterExecutorMemberProofV1 {
             outcome_tag: wire.outcome_tag,
             proof_epoch: wire.proof_epoch,
             evidence: wire.evidence.0,
+            provider_certificate: wire.provider_certificate,
+            provider_signature: wire.provider_signature,
             signature: wire.signature,
         };
         value
@@ -2142,7 +2211,11 @@ impl RosterExecutorProofBundleV1 {
         certificate.verify_root(root)?;
         let proofs = proofs
             .into_iter()
-            .map(RosterExecutorMemberProofV1::from_parts)
+            .map(|parts| {
+                let proof = RosterExecutorMemberProofV1::from_parts(parts)?;
+                proof.provider_certificate.verify_root(root)?;
+                Ok(proof)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let value = Self {
             certificate,
@@ -2348,6 +2421,304 @@ impl RosterTerminalAttestationSigningInputV1 {
         hasher.update(evidence_commitment);
         Ok(hasher.finalize().into())
     }
+}
+
+/// Exact, redaction-safe Provider leaf-signature preimage for a single
+/// conclusive member receipt.
+///
+/// This is intentionally separate from [`RosterTerminalAttestationSigningInputV1`]:
+/// a receipt is minted before Q2 and therefore commits neither an
+/// Established/Aborted choice nor a terminal record body. It does bind the
+/// complete frozen admission/current-authority tuple that makes a provider
+/// assertion meaningful to deterministic consensus.
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct RosterProviderReceiptSigningInputV1 {
+    pub profile: Profile,
+    pub configuration_identity: SessionConsensusIdentity,
+    pub certificate_subject_identity_commitment: [u8; 32],
+    pub certificate_role: RosterAttestationCertificateRoleV1,
+    pub binding: [u8; 120],
+    pub registration_handle: [u8; 32],
+    pub registration_request_id: [u8; 56],
+    pub registration_terminal_slot: [u8; 32],
+    pub roster_id: [u8; ROSTER_ID_BYTES],
+    pub admission_commitment: [u8; 32],
+    pub ordinal: u8,
+    pub member_operation_id: [u8; MEMBER_OPERATION_ID_BYTES],
+    pub descriptor: Vec<u8>,
+    pub descriptor_commitment: [u8; 32],
+    pub expected_member_version: u64,
+    pub admission_generation: u64,
+    pub authority_scope: [u8; 32],
+    pub authority_key_canonical: Vec<u8>,
+    pub authority_owner: Vec<u8>,
+    pub authority_fence: u64,
+    pub authority_credential_id: u64,
+    pub authority_generation: u64,
+    pub authority_acquired_at: Timestamp,
+    pub authority_expires_at: Timestamp,
+    pub proof_epoch: u64,
+    pub provider_operation: RosterProviderOperationV1,
+    pub outcome: RosterProviderOutcomeV1,
+    pub evidence: Vec<u8>,
+}
+
+impl RosterProviderReceiptSigningInputV1 {
+    /// Derive the Provider receipt input from the same immutable/current
+    /// member facts used for executor aggregation. The Provider identity is
+    /// supplied separately so certificate roles cannot be confused.
+    #[doc(hidden)]
+    pub fn from_terminal_input(
+        input: &RosterTerminalAttestationSigningInputV1,
+        provider_subject_identity_commitment: [u8; 32],
+    ) -> Result<Self, RosterAttestationError> {
+        input.digest()?;
+        Ok(Self {
+            profile: input.profile,
+            configuration_identity: input.configuration_identity,
+            certificate_subject_identity_commitment: provider_subject_identity_commitment,
+            certificate_role: RosterAttestationCertificateRoleV1::Provider,
+            binding: input.binding,
+            registration_handle: input.registration_handle,
+            registration_request_id: input.registration_request_id,
+            registration_terminal_slot: input.registration_terminal_slot,
+            roster_id: input.roster_id,
+            admission_commitment: input.admission_commitment,
+            ordinal: input.ordinal,
+            member_operation_id: input.member_operation_id,
+            descriptor: input.descriptor.clone(),
+            descriptor_commitment: input.descriptor_commitment,
+            expected_member_version: input.expected_member_version,
+            admission_generation: input.admission_generation,
+            authority_scope: input.authority_scope,
+            authority_key_canonical: input.authority_key_canonical.clone(),
+            authority_owner: input.authority_owner.clone(),
+            authority_fence: input.authority_fence,
+            authority_credential_id: input.authority_credential_id,
+            authority_generation: input.authority_generation,
+            authority_acquired_at: input.authority_acquired_at,
+            authority_expires_at: input.authority_expires_at,
+            proof_epoch: input.proof_epoch,
+            provider_operation: input.provider_operation,
+            outcome: input.outcome,
+            evidence: input.evidence.clone(),
+        })
+    }
+
+    /// Return the exact Provider receipt digest. This domain deliberately has
+    /// no terminal phase or terminal body fields.
+    #[doc(hidden)]
+    pub fn digest(&self) -> Result<[u8; 32], RosterAttestationError> {
+        if self.profile.validate().is_err()
+            || self.certificate_subject_identity_commitment == [0; 32]
+            || self.certificate_role != RosterAttestationCertificateRoleV1::Provider
+            || self.registration_handle == [0; 32]
+            || self.registration_terminal_slot == [0; 32]
+            || self.admission_commitment == [0; 32]
+            || self.member_operation_id == [0; MEMBER_OPERATION_ID_BYTES]
+            || self.descriptor.is_empty()
+            || self.descriptor.len() > MAX_DESCRIPTOR_BYTES
+            || self.expected_member_version == 0
+            || self.admission_generation == 0
+            || self.authority_scope == [0; 32]
+            || self.authority_key_canonical.is_empty()
+            || self.authority_owner.is_empty()
+            || self.authority_fence == 0
+            || self.authority_credential_id == 0
+            || self.authority_generation == 0
+            || self.authority_expires_at <= self.authority_acquired_at
+            || self.proof_epoch == 0
+            || self.evidence.is_empty()
+            || self.evidence.len() > MAX_EXECUTOR_PROOF_EVIDENCE_BYTES
+            || !attested_provider_outcome_allowed(self.provider_operation, self.outcome)
+        {
+            return Err(RosterAttestationError);
+        }
+        if RequestBindingKey::from_bytes(self.binding).is_err()
+            || descriptor_commitment_from_bytes(&self.descriptor) != self.descriptor_commitment
+        {
+            return Err(RosterAttestationError);
+        }
+        provider_receipt_digest_from_challenge_v1(
+            self.challenge_digest()?,
+            self.certificate_subject_identity_commitment,
+            self.proof_epoch,
+            self.provider_operation,
+            self.outcome,
+            &self.evidence,
+        )
+    }
+
+    /// Return the opaque fixed-call challenge used by the protected Provider
+    /// host.  It deliberately excludes Provider identity and the conclusive
+    /// outcome/evidence, while binding every immutable registration/member and
+    /// current-authority fact reconstructed by consensus.
+    #[doc(hidden)]
+    pub fn challenge_digest(&self) -> Result<[u8; 32], RosterAttestationError> {
+        if self.profile.validate().is_err()
+            || self.registration_handle == [0; 32]
+            || self.registration_terminal_slot == [0; 32]
+            || self.admission_commitment == [0; 32]
+            || self.member_operation_id == [0; MEMBER_OPERATION_ID_BYTES]
+            || self.descriptor.is_empty()
+            || self.descriptor.len() > MAX_DESCRIPTOR_BYTES
+            || self.expected_member_version == 0
+            || self.admission_generation == 0
+            || self.authority_scope == [0; 32]
+            || self.authority_key_canonical.is_empty()
+            || self.authority_owner.is_empty()
+            || self.authority_fence == 0
+            || self.authority_credential_id == 0
+            || self.authority_generation == 0
+            || self.authority_expires_at <= self.authority_acquired_at
+            || self.proof_epoch == 0
+        {
+            return Err(RosterAttestationError);
+        }
+        if RequestBindingKey::from_bytes(self.binding).is_err()
+            || descriptor_commitment_from_bytes(&self.descriptor) != self.descriptor_commitment
+        {
+            return Err(RosterAttestationError);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(ROSTER_ATTESTATION_PROVIDER_RECEIPT_DOMAIN);
+        hasher.update(ROSTER_ATTESTATION_PROVIDER_RECEIPT_MAGIC);
+        hasher.update([2]);
+        hasher.update(self.profile.schema().to_be_bytes());
+        hasher.update(self.profile.consumer_revision().to_be_bytes());
+        hasher.update(self.profile.digest());
+        update_consensus_identity_attestation(&mut hasher, self.configuration_identity);
+        hasher.update(self.binding);
+        hasher.update(self.registration_handle);
+        hasher.update(self.registration_request_id);
+        hasher.update(self.registration_terminal_slot);
+        hasher.update(self.roster_id);
+        hasher.update(self.admission_commitment);
+        hasher.update([self.ordinal]);
+        hasher.update(self.member_operation_id);
+        hasher.update((self.descriptor.len() as u64).to_be_bytes());
+        hasher.update(self.descriptor_commitment);
+        hasher.update(self.expected_member_version.to_be_bytes());
+        hasher.update(self.admission_generation.to_be_bytes());
+        hasher.update(self.authority_scope);
+        hasher.update(compact_session_key_commitment_from_canonical(
+            &self.authority_key_canonical,
+        ));
+        hasher.update(compact_owner_commitment_from_canonical(
+            &self.authority_owner,
+        ));
+        hasher.update(self.authority_fence.to_be_bytes());
+        hasher.update(self.authority_credential_id.to_be_bytes());
+        hasher.update(self.authority_generation.to_be_bytes());
+        update_timestamp_attestation(&mut hasher, self.authority_acquired_at);
+        update_timestamp_attestation(&mut hasher, self.authority_expires_at);
+        hasher.update(self.proof_epoch.to_be_bytes());
+        hasher.update([self.provider_operation.tag()]);
+        Ok(hasher.finalize().into())
+    }
+}
+
+/// Return the exact Provider-leaf digest for an opaque fixed-call challenge.
+///
+/// This is the only public signing preimage helper.  It cannot select the
+/// immutable call binding; that binding was frozen by the SDK into `challenge`.
+#[doc(hidden)]
+pub fn provider_receipt_digest_from_challenge_v1(
+    challenge: [u8; 32],
+    provider_subject_identity_commitment: [u8; 32],
+    proof_epoch: u64,
+    operation: RosterProviderOperationV1,
+    outcome: RosterProviderOutcomeV1,
+    evidence: &[u8],
+) -> Result<[u8; 32], RosterAttestationError> {
+    if challenge == [0; 32]
+        || provider_subject_identity_commitment == [0; 32]
+        || proof_epoch == 0
+        || evidence.is_empty()
+        || evidence.len() > MAX_EXECUTOR_PROOF_EVIDENCE_BYTES
+        || !attested_provider_outcome_allowed(operation, outcome)
+    {
+        return Err(RosterAttestationError);
+    }
+    provider_receipt_digest_from_challenge_commitment_v1(
+        challenge,
+        provider_subject_identity_commitment,
+        proof_epoch,
+        operation,
+        outcome,
+        evidence.len(),
+        evidence_commitment_from_bytes(evidence),
+    )
+}
+
+/// Shared final Provider-leaf digest over an exact fixed-call challenge and
+/// an evidence commitment. Compact Q2 verification retains that same bounded
+/// length/commitment pair but not raw evidence bytes, so it must use this
+/// exact preimage rather than a second receipt domain.
+fn provider_receipt_digest_from_challenge_commitment_v1(
+    challenge: [u8; 32],
+    provider_subject_identity_commitment: [u8; 32],
+    proof_epoch: u64,
+    operation: RosterProviderOperationV1,
+    outcome: RosterProviderOutcomeV1,
+    evidence_length: usize,
+    evidence_commitment: [u8; 32],
+) -> Result<[u8; 32], RosterAttestationError> {
+    if challenge == [0; 32]
+        || provider_subject_identity_commitment == [0; 32]
+        || proof_epoch == 0
+        || evidence_length == 0
+        || evidence_length > MAX_EXECUTOR_PROOF_EVIDENCE_BYTES
+        || evidence_commitment == [0; 32]
+        || !attested_provider_outcome_allowed(operation, outcome)
+    {
+        return Err(RosterAttestationError);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(ROSTER_ATTESTATION_PROVIDER_RECEIPT_DOMAIN);
+    hasher.update(ROSTER_ATTESTATION_PROVIDER_RECEIPT_MAGIC);
+    hasher.update([3]);
+    hasher.update(challenge);
+    hasher.update(provider_subject_identity_commitment);
+    hasher.update([RosterAttestationCertificateRoleV1::Provider.tag()]);
+    hasher.update(proof_epoch.to_be_bytes());
+    hasher.update([operation.tag(), outcome.tag()]);
+    hasher.update((evidence_length as u64).to_be_bytes());
+    hasher.update(evidence_commitment);
+    Ok(hasher.finalize().into())
+}
+
+/// Verify one provider receipt before an executor promotes it into an
+/// SDK-issued conclusive member proof.
+///
+/// Consensus independently repeats the same root, certificate, authority,
+/// and signature checks when Q2 is applied.  This preflight helper exists so
+/// an untrusted consumer cannot turn arbitrary caller-authored disposition
+/// bytes into an [`Applied`](RosterProviderOutcomeV1::AppliedExecuted) proof
+/// between Q1 and Q2.
+#[doc(hidden)]
+pub fn verify_roster_provider_receipt_v1(
+    root: &RosterAttestationTrustRootV1,
+    logical_time: Timestamp,
+    certificate_parts: RosterAttestationLeafCertificatePartsV1,
+    input: &RosterProviderReceiptSigningInputV1,
+    signature: &[u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
+) -> Result<(), RosterAttestationError> {
+    let certificate =
+        RosterAttestationLeafCertificateV1::issue_from_signed_parts(root, certificate_parts)?;
+    if certificate.role()? != RosterAttestationCertificateRoleV1::Provider
+        || certificate.configuration_identity != input.configuration_identity
+        || certificate.scope != input.authority_scope
+        || certificate.subject_identity_commitment != input.certificate_subject_identity_commitment
+        || logical_time < certificate.not_before
+        || logical_time >= certificate.not_after
+        || logical_time < input.authority_acquired_at
+        || logical_time >= input.authority_expires_at
+    {
+        return Err(RosterAttestationError);
+    }
+    verify_digest_signature(&certificate.public_key, input.digest()?, signature)
 }
 
 /// Commit one exact canonical opaque consumer capsule for a fixed roster
@@ -2562,11 +2933,12 @@ impl RosterIngressAttestationV1 {
         self.input.request_id
     }
 
-    /// Return the root-signed ingress authentication time for the
-    /// state-machine's delayed-terminal admission gate.
-    #[doc(hidden)]
-    pub(crate) const fn authenticated_at(&self) -> Timestamp {
-        self.input.authenticated_at
+    /// Return the exact typed statement retained by this verified ingress
+    /// envelope. The consensus ingress uses it to construct the separate V2
+    /// admission provenance without re-creating any authenticated transport
+    /// fields or introducing a self-referential capsule commitment.
+    pub(crate) const fn signing_input(&self) -> &RosterIngressAttestationSigningInputV1 {
+        &self.input
     }
 
     /// Exact bounded canonical command envelope.
@@ -2649,12 +3021,19 @@ fn compact_owner_commitment(owner: &OwnerId) -> [u8; 32] {
     compact_admission_field_commitment(COMPACT_ADMISSION_FIELD_OWNER, owner.as_str().as_bytes())
 }
 
-fn compact_tenant_scope_partition(scope: Scope, key: &SessionKey) -> [u8; 32] {
+fn compact_owner_commitment_from_canonical(owner: &[u8]) -> [u8; 32] {
+    compact_admission_field_commitment(COMPACT_ADMISSION_FIELD_OWNER, owner)
+}
+
+fn compact_session_key_commitment_from_canonical(key: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(TENANT_SCOPE_PARTITION_DOMAIN);
-    hasher.update(scope.digest());
-    update_len_prefixed(&mut hasher, key.tenant.as_str().as_bytes());
+    hasher.update(SESSION_KEY_BINDING_DOMAIN);
+    update_len_prefixed(&mut hasher, key);
     hasher.finalize().into()
+}
+
+fn compact_tenant_scope_partition(scope: Scope, key: &SessionKey) -> [u8; 32] {
+    tenant_scope_partition_commitment(scope, key)
 }
 
 fn compact_admission_slot(admission: &Admission) -> [u8; 32] {
@@ -2904,6 +3283,12 @@ impl RosterCompactAdmissionProvenanceSigningInputV2 {
         Ok(())
     }
 
+    /// Construct the exact compact admission statement from an already
+    /// authenticated V1 ingress input. This is exported only for the SDK's
+    /// separate transport-signing crate; every caller field is recomputed
+    /// from typed admission and authority values before the statement can be
+    /// signed or accepted by consensus.
+    #[doc(hidden)]
     pub(crate) fn for_admission(
         configuration_identity: SessionConsensusIdentity,
         admission: &Admission,
@@ -2981,6 +3366,53 @@ impl RosterCompactAdmissionProvenanceSigningInputV2 {
         };
         input.validate()?;
         Ok(input)
+    }
+
+    /// Reconstruct the exact compact signer input from the canonical SDK
+    /// admission and its authenticated lease fields. This is the narrow
+    /// cross-crate seam used by the SDK transport layer; it never accepts a
+    /// caller-authored disposition or emits consensus/store authority.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_canonical_admission(
+        configuration_identity: SessionConsensusIdentity,
+        canonical_admission: &[u8],
+        authority_scope: [u8; 32],
+        authority_key: SessionKey,
+        authority_owner: OwnerId,
+        authority_fence: FenceToken,
+        authority_credential_id: u64,
+        authority_generation: Generation,
+        authority_acquired_at: Timestamp,
+        authority_expires_at: Timestamp,
+        ingress: &RosterIngressAttestationSigningInputV1,
+        certificate_subject_identity_commitment: [u8; 32],
+    ) -> Result<Self, RosterAttestationError> {
+        let admission = Admission::from_canonical_bytes(canonical_admission)
+            .map_err(|_| RosterAttestationError)?;
+        if admission.scope().digest() != authority_scope {
+            return Err(RosterAttestationError);
+        }
+        let authority = AuthorityBinding::from_consensus_parts(
+            authority_scope,
+            authority_key,
+            authority_owner,
+            authority_fence,
+            AuthorityLeaseMetadata::new(
+                authority_credential_id,
+                authority_generation,
+                authority_acquired_at,
+                authority_expires_at,
+            ),
+        )
+        .map_err(|_| RosterAttestationError)?;
+        Self::for_admission(
+            configuration_identity,
+            &admission,
+            &authority,
+            ingress,
+            certificate_subject_identity_commitment,
+        )
     }
 }
 
@@ -3173,6 +3605,18 @@ pub(crate) struct CompactAdmissionProvenanceVerificationV2<'a> {
     pub(crate) provenance: &'a RosterCompactAdmissionProvenanceV2,
 }
 
+/// Crate-private inputs for rechecking compact admission evidence retained by
+/// durable roster history. The ingress projection intentionally comes only
+/// from the signed compact provenance, never from a retrying caller.
+pub(crate) struct HistoricalCompactAdmissionProvenanceVerificationV2<'a> {
+    pub(crate) root: &'a RosterAttestationTrustRootV1,
+    pub(crate) configuration_identity: SessionConsensusIdentity,
+    pub(crate) binding: RequestBindingKey,
+    pub(crate) admission: &'a Admission,
+    pub(crate) original_authority: &'a AuthorityBinding,
+    pub(crate) provenance: &'a RosterCompactAdmissionProvenanceV2,
+}
+
 /// Verify compact admission evidence against the exact original typed values.
 pub(crate) fn verify_compact_admission_provenance_v2(
     verification: CompactAdmissionProvenanceVerificationV2<'_>,
@@ -3185,6 +3629,167 @@ pub(crate) fn verify_compact_admission_provenance_v2(
         verification.original_authority,
         verification.ingress,
     )
+}
+
+/// Revalidate immutable compact admission evidence from durable history.
+///
+/// The stored statement embeds the ingress projection that was signed with
+/// the original authority. Retries can authenticate a different ingress and
+/// provenance statement, but they must never select the projection used to
+/// validate retained history.
+pub(crate) fn verify_historical_compact_admission_provenance_v2(
+    verification: HistoricalCompactAdmissionProvenanceVerificationV2<'_>,
+) -> Result<(), RosterAttestationError> {
+    let ingress = &verification.provenance.input().ingress;
+    verification.provenance.verify_for(
+        verification.root,
+        verification.configuration_identity,
+        verification.binding,
+        verification.admission,
+        verification.original_authority,
+        ingress,
+    )
+}
+
+/// Crate-private verifier inputs for a tombstone whose full admission bytes
+/// have been reclaimed.  The signed compact provenance is the only durable
+/// source for its stable slot and immutable original-authority projection.
+pub(crate) struct CompactedTombstoneHistoryVerificationV2<'a> {
+    pub(crate) root: &'a RosterAttestationTrustRootV1,
+    pub(crate) configuration_identity: SessionConsensusIdentity,
+    pub(crate) binding: RequestBindingKey,
+    pub(crate) tombstone: &'a TerminalConflictTombstone,
+    pub(crate) admission_provenance: &'a RosterCompactAdmissionProvenanceV2,
+    pub(crate) terminal_evidence: &'a RosterCompactTerminalEvidenceV2,
+    pub(crate) original_owner: &'a OwnerId,
+    pub(crate) original_fence: u64,
+    pub(crate) original_credential_id: u64,
+    pub(crate) original_generation: u64,
+    pub(crate) original_acquired_at: Timestamp,
+    pub(crate) original_expires_at: Timestamp,
+}
+
+/// Authenticated stable slots reconstructed from reclaimed tombstone history.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactedTombstoneHistorySlots {
+    stable_slot: [u8; 32],
+    terminal_slot: [u8; 32],
+}
+
+impl CompactedTombstoneHistorySlots {
+    pub(crate) const fn stable_slot(self) -> [u8; 32] {
+        self.stable_slot
+    }
+
+    pub(crate) const fn terminal_slot(self) -> [u8; 32] {
+        self.terminal_slot
+    }
+}
+
+/// Re-authenticate the compact history retained after admission bytes age out.
+///
+/// This deliberately reconstructs no `Admission`: it proves the binding,
+/// stable slot, original-authority projection, compact terminal signatures,
+/// and tombstone commitments from the signed compact frames themselves.
+pub(crate) fn verify_compacted_tombstone_history_v2(
+    verification: CompactedTombstoneHistoryVerificationV2<'_>,
+) -> Result<CompactedTombstoneHistorySlots, RosterAttestationError> {
+    let CompactedTombstoneHistoryVerificationV2 {
+        root,
+        configuration_identity,
+        binding,
+        tombstone,
+        admission_provenance,
+        terminal_evidence,
+        original_owner,
+        original_fence,
+        original_credential_id,
+        original_generation,
+        original_acquired_at,
+        original_expires_at,
+    } = verification;
+    tombstone.validate().map_err(|_| RosterAttestationError)?;
+    admission_provenance.verify_historical_signature(root, configuration_identity)?;
+    let admission = admission_provenance.input();
+    if admission.scope != binding.scope.digest()
+        || admission.tenant_scope_partition != binding.tenant_scope_partition
+        || admission.session_key_commitment != binding.session_key_commitment
+        || admission.roster_id != *binding.roster_id.as_bytes()
+        || admission.admission_commitment != tombstone.admission_body_commitment
+        || admission.admission_fence != tombstone.admission_fence
+        || admission.expected_generation != tombstone.expected_generation
+        || admission.authority_scope != binding.scope.digest()
+        || admission.authority_key_commitment != binding.session_key_commitment
+        || admission.authority_owner_commitment != compact_owner_commitment(original_owner)
+        || admission.authority_fence != original_fence
+        || admission.authority_credential_id != original_credential_id
+        || admission.authority_generation != original_generation
+        || admission.authority_acquired_at != original_acquired_at
+        || admission.authority_expires_at != original_expires_at
+    {
+        return Err(RosterAttestationError);
+    }
+    let request = RequestId {
+        history_epoch: binding.history_epoch,
+        roster_id: binding.roster_id,
+        body_commitment: admission.admission_commitment,
+    };
+    let terminal_slot = command_id(TERMINAL_SLOT_DOMAIN, binding);
+    terminal_evidence.validate_structure()?;
+    terminal_evidence.certificate.verify_root(root)?;
+    let terminal = &terminal_evidence.binding;
+    if terminal_evidence.certificate.role()? != RosterAttestationCertificateRoleV1::Executor
+        || terminal_evidence.certificate.configuration_identity != configuration_identity
+        || terminal_evidence.certificate.scope != terminal.authority_scope
+        || terminal_evidence.certificate.subject_identity_commitment
+            != terminal.certificate_subject_identity_commitment
+        || terminal.profile != admission.profile
+        || terminal.configuration_identity != configuration_identity
+        || terminal.admission_provenance_commitment != admission_provenance.commitment()?
+        || terminal.binding != binding.to_bytes()
+        || terminal.registration_handle == [0; 32]
+        || terminal.registration_request_id != request.to_bytes()
+        || terminal.registration_terminal_slot != terminal_slot
+        || terminal.roster_id != admission.roster_id
+        || terminal.admission_commitment != admission.admission_commitment
+        || terminal.terminal_phase_tag != tombstone.phase_tag
+        || terminal.terminal_body_commitment != tombstone.terminal_body_commitment
+        || terminal.terminal_checkpoint != admission.protected_checkpoint
+        || terminal.terminal_result != admission.protected_result
+        || terminal.authority_scope != binding.scope.digest()
+        || terminal.authority_key_commitment != binding.session_key_commitment
+        || terminal.authority_owner_commitment != compact_owner_commitment(original_owner)
+        || terminal.authority_generation != original_generation
+        || terminal.authority_fence < original_fence
+        || terminal.authority_credential_id == 0
+        || terminal.authority_expires_at <= terminal.authority_acquired_at
+        || terminal_evidence.proofs.len() != admission.members.len()
+    {
+        return Err(RosterAttestationError);
+    }
+    for (proof, admitted) in terminal_evidence.proofs.iter().zip(&admission.members) {
+        if proof.member.ordinal != admitted.ordinal
+            || proof.member.member_operation_id != admitted.member_operation_id
+            || proof.member.descriptor_length != admitted.descriptor_length
+            || proof.member.descriptor_commitment != admitted.descriptor_commitment
+            || proof.member.expected_member_version != admitted.expected_member_version
+        {
+            return Err(RosterAttestationError);
+        }
+        let signed = RosterCompactTerminalMemberSigningInputV2 {
+            binding: terminal.clone(),
+            member: proof.member.clone(),
+        };
+        verify_digest_signature(
+            &terminal_evidence.certificate.public_key,
+            signed.digest()?,
+            &proof.signature,
+        )?;
+    }
+    Ok(CompactedTombstoneHistorySlots {
+        stable_slot: admission.admission_slot,
+        terminal_slot,
+    })
 }
 
 fn update_ingress_attestation_input(
@@ -3272,6 +3877,8 @@ impl RosterCompactTerminalEvidenceBindingV2 {
         Ok(())
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_terminal(
         configuration_identity: SessionConsensusIdentity,
         binding: RequestBindingKey,
@@ -3334,6 +3941,65 @@ impl RosterCompactTerminalEvidenceBindingV2 {
         value.validate()?;
         Ok(value)
     }
+
+    /// Construct the compact common binding from the exact V1 terminal input
+    /// that the SDK already produced, plus the immutable admission provenance
+    /// and protected bytes retained by the admission. This narrow bridge lets
+    /// a separate SDK crate issue V2 member signatures without reproducing
+    /// private commitment domains or gaining a generic signing capability.
+    #[doc(hidden)]
+    pub fn from_terminal_v1_input(
+        admission_provenance: &RosterCompactAdmissionProvenanceV2,
+        protected_checkpoint: &[u8],
+        protected_result: &[u8],
+        input: &RosterTerminalAttestationSigningInputV1,
+    ) -> Result<Self, RosterAttestationError> {
+        input.digest()?;
+        if input.certificate_role != RosterAttestationCertificateRoleV1::Executor
+            || protected_checkpoint.len() > MAX_CHECKPOINT_BYTES
+            || protected_result.len() > MAX_RESULT_BYTES
+        {
+            return Err(RosterAttestationError);
+        }
+        let field =
+            |tag, bytes: &[u8]| -> Result<RosterCompactFieldCommitmentV2, RosterAttestationError> {
+                Ok(RosterCompactFieldCommitmentV2 {
+                    length: u32::try_from(bytes.len()).map_err(|_| RosterAttestationError)?,
+                    commitment: compact_admission_field_commitment(tag, bytes),
+                })
+            };
+        let value = Self {
+            profile: input.profile,
+            configuration_identity: input.configuration_identity,
+            certificate_subject_identity_commitment: input.certificate_subject_identity_commitment,
+            certificate_role: RosterAttestationCertificateRoleV1::Executor,
+            admission_provenance_commitment: admission_provenance.commitment()?,
+            binding: input.binding,
+            registration_handle: input.registration_handle,
+            registration_request_id: input.registration_request_id,
+            registration_terminal_slot: input.registration_terminal_slot,
+            roster_id: input.roster_id,
+            admission_commitment: input.admission_commitment,
+            terminal_phase_tag: input.terminal_phase.tag(),
+            terminal_body_commitment: input.terminal_body_commitment,
+            terminal_checkpoint: field(COMPACT_ADMISSION_FIELD_CHECKPOINT, protected_checkpoint)?,
+            terminal_result: field(COMPACT_ADMISSION_FIELD_RESULT, protected_result)?,
+            authority_scope: input.authority_scope,
+            authority_key_commitment: compact_session_key_commitment_from_canonical(
+                &input.authority_key_canonical,
+            ),
+            authority_owner_commitment: compact_owner_commitment_from_canonical(
+                &input.authority_owner,
+            ),
+            authority_fence: input.authority_fence,
+            authority_credential_id: input.authority_credential_id,
+            authority_generation: input.authority_generation,
+            authority_acquired_at: input.authority_acquired_at,
+            authority_expires_at: input.authority_expires_at,
+        };
+        value.validate()?;
+        Ok(value)
+    }
 }
 
 impl fmt::Debug for RosterCompactTerminalEvidenceBindingV2 {
@@ -3353,6 +4019,7 @@ pub struct RosterCompactTerminalMemberProjectionV2 {
     pub descriptor_length: u16,
     pub descriptor_commitment: [u8; 32],
     pub expected_member_version: u64,
+    pub admission_generation: u64,
     pub proof_epoch: u64,
     pub provider_operation: RosterProviderOperationV1,
     pub outcome: RosterProviderOutcomeV1,
@@ -3362,6 +4029,36 @@ pub struct RosterCompactTerminalMemberProjectionV2 {
 }
 
 impl RosterCompactTerminalMemberProjectionV2 {
+    /// Project one exact raw V1 executor proof input into its independently
+    /// signed compact V2 form. The caller supplies the immutable terminal
+    /// proof commitment already bound into the prepared terminal body; raw
+    /// descriptor and provider evidence bytes never enter the compact row.
+    #[doc(hidden)]
+    pub fn from_terminal_v1_input(
+        input: &RosterTerminalAttestationSigningInputV1,
+        stable_proof_commitment: [u8; 32],
+    ) -> Result<Self, RosterAttestationError> {
+        input.digest()?;
+        let value = Self {
+            ordinal: input.ordinal,
+            member_operation_id: input.member_operation_id,
+            descriptor_length: u16::try_from(input.descriptor.len())
+                .map_err(|_| RosterAttestationError)?,
+            descriptor_commitment: input.descriptor_commitment,
+            expected_member_version: input.expected_member_version,
+            admission_generation: input.admission_generation,
+            proof_epoch: input.proof_epoch,
+            provider_operation: input.provider_operation,
+            outcome: input.outcome,
+            evidence_length: u16::try_from(input.evidence.len())
+                .map_err(|_| RosterAttestationError)?,
+            evidence_commitment: roster_executor_evidence_commitment(&input.evidence),
+            stable_proof_commitment,
+        };
+        value.validate(input.ordinal as usize, input.terminal_phase)?;
+        Ok(value)
+    }
+
     fn validate(
         &self,
         expected_ordinal: usize,
@@ -3374,6 +4071,7 @@ impl RosterCompactTerminalMemberProjectionV2 {
             || self.descriptor_length as usize > MAX_DESCRIPTOR_BYTES
             || self.descriptor_commitment == [0; 32]
             || self.expected_member_version == 0
+            || self.admission_generation == 0
             || self.proof_epoch == 0
             || self.evidence_length == 0
             || self.evidence_length as usize > MAX_EXECUTOR_PROOF_EVIDENCE_BYTES
@@ -3432,12 +4130,21 @@ impl fmt::Debug for RosterCompactTerminalMemberSigningInputV2 {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RosterCompactTerminalMemberProofPartsV2 {
     pub member: RosterCompactTerminalMemberProjectionV2,
+    /// Root-signed Provider leaf certificate retained after raw evidence is
+    /// compacted so followers can independently reverify the receipt.
+    pub provider_certificate: RosterAttestationLeafCertificatePartsV1,
+    /// Provider signature over the receipt domain and the compact evidence
+    /// commitment (not the selected terminal phase/body).
+    pub provider_signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
     pub signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 struct RosterCompactTerminalMemberProofV2 {
     member: RosterCompactTerminalMemberProjectionV2,
+    provider_certificate: RosterAttestationLeafCertificateV1,
+    #[serde(with = "fixed_array_64")]
+    provider_signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
     #[serde(with = "fixed_array_64")]
     signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
 }
@@ -3446,9 +4153,17 @@ impl RosterCompactTerminalMemberProofV2 {
     fn from_parts(
         parts: RosterCompactTerminalMemberProofPartsV2,
     ) -> Result<Self, RosterAttestationError> {
+        let provider_certificate =
+            RosterAttestationLeafCertificateV1::from_parts(parts.provider_certificate)?;
+        if provider_certificate.role()? != RosterAttestationCertificateRoleV1::Provider {
+            return Err(RosterAttestationError);
+        }
+        canonical_signature(&parts.provider_signature)?;
         canonical_signature(&parts.signature)?;
         Ok(Self {
             member: parts.member,
+            provider_certificate,
+            provider_signature: parts.provider_signature,
             signature: parts.signature,
         })
     }
@@ -3462,15 +4177,34 @@ impl<'de> Deserialize<'de> for RosterCompactTerminalMemberProofV2 {
         #[derive(Deserialize)]
         struct Wire {
             member: RosterCompactTerminalMemberProjectionV2,
+            provider_certificate: RosterAttestationLeafCertificateV1,
+            #[serde(with = "fixed_array_64")]
+            provider_signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
             #[serde(with = "fixed_array_64")]
             signature: [u8; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
         }
         let wire = Wire::deserialize(deserializer)?;
-        canonical_signature(&wire.signature).map_err(serde::de::Error::custom)?;
-        Ok(Self {
+        let value = Self {
             member: wire.member,
+            provider_certificate: wire.provider_certificate,
+            provider_signature: wire.provider_signature,
             signature: wire.signature,
-        })
+        };
+        value
+            .validate_structure()
+            .map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+impl RosterCompactTerminalMemberProofV2 {
+    fn validate_structure(&self) -> Result<(), RosterAttestationError> {
+        self.provider_certificate.validate_structure()?;
+        if self.provider_certificate.role()? != RosterAttestationCertificateRoleV1::Provider {
+            return Err(RosterAttestationError);
+        }
+        canonical_signature(&self.provider_signature)?;
+        canonical_signature(&self.signature).map(|_| ())
     }
 }
 
@@ -3520,6 +4254,15 @@ impl RosterCompactTerminalEvidenceV2 {
                     ordinal,
                     Phase::from_tag(binding.terminal_phase_tag)
                         .map_err(|_| RosterAttestationError)?,
+                )?;
+                let provider = RosterAttestationLeafCertificateV1::from_parts(
+                    proof.provider_certificate.clone(),
+                )?;
+                provider.verify_root(root)?;
+                verify_digest_signature(
+                    &provider.public_key,
+                    provider_receipt_compact_digest(binding, &proof.member, &provider)?,
+                    &proof.provider_signature,
                 )?;
                 verify_digest_signature(
                     &certificate.public_key,
@@ -3582,7 +4325,7 @@ impl RosterCompactTerminalEvidenceV2 {
         let mut ids = BTreeSet::new();
         for (ordinal, proof) in self.proofs.iter().enumerate() {
             proof.member.validate(ordinal, phase)?;
-            canonical_signature(&proof.signature)?;
+            proof.validate_structure()?;
             if !ids.insert(proof.member.member_operation_id) {
                 return Err(RosterAttestationError);
             }
@@ -3590,6 +4333,7 @@ impl RosterCompactTerminalEvidenceV2 {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn verify_compact_for(
         &self,
         root: &RosterAttestationTrustRootV1,
@@ -3633,10 +4377,29 @@ impl RosterCompactTerminalEvidenceV2 {
             || committing_authority.generation().get() != self.binding.authority_generation
             || committing_authority.acquired_at() != self.binding.authority_acquired_at
             || committing_authority.expires_at() != self.binding.authority_expires_at
+            || logical_time < committing_authority.acquired_at()
+            || logical_time >= committing_authority.expires_at()
         {
             return Err(RosterAttestationError);
         }
         for proof in &self.proofs {
+            proof.provider_certificate.verify_root(root)?;
+            if proof.provider_certificate.configuration_identity != configuration_identity
+                || proof.provider_certificate.scope != self.binding.authority_scope
+                || logical_time < proof.provider_certificate.not_before
+                || logical_time >= proof.provider_certificate.not_after
+            {
+                return Err(RosterAttestationError);
+            }
+            verify_digest_signature(
+                &proof.provider_certificate.public_key,
+                provider_receipt_compact_digest(
+                    &self.binding,
+                    &proof.member,
+                    &proof.provider_certificate,
+                )?,
+                &proof.provider_signature,
+            )?;
             let input = RosterCompactTerminalMemberSigningInputV2 {
                 binding: self.binding.clone(),
                 member: proof.member.clone(),
@@ -3686,6 +4449,7 @@ impl RosterCompactTerminalEvidenceV2 {
                 || proof.member.descriptor_length as usize != member.descriptor().len()
                 || proof.member.descriptor_commitment != member.descriptor_commitment()
                 || proof.member.expected_member_version != member.expected_version()
+                || proof.member.admission_generation != admission.expected_generation().get()
                 || proof.member.stable_proof_commitment != *stable
             {
                 return Err(RosterAttestationError);
@@ -3707,11 +4471,15 @@ impl<'de> Deserialize<'de> for RosterCompactTerminalEvidenceV2 {
             proofs: BoundedVec<RosterCompactTerminalMemberProofV2, MAX_MEMBERS>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        Ok(Self {
+        let value = Self {
             certificate: wire.certificate,
             binding: wire.binding,
             proofs: wire.proofs.0,
-        })
+        };
+        value
+            .validate_structure()
+            .map_err(serde::de::Error::custom)?;
+        Ok(value)
     }
 }
 
@@ -3810,6 +4578,7 @@ fn verify_compact_terminal_chain(
             || member.member.descriptor_length != admission_member.descriptor_length
             || member.member.descriptor_commitment != admission_member.descriptor_commitment
             || member.member.expected_member_version != admission_member.expected_member_version
+            || member.member.admission_generation != provenance.expected_generation
         {
             return Err(RosterAttestationError);
         }
@@ -3859,11 +4628,77 @@ fn update_compact_terminal_member(
     hasher.update(member.descriptor_length.to_be_bytes());
     hasher.update(member.descriptor_commitment);
     hasher.update(member.expected_member_version.to_be_bytes());
+    hasher.update(member.admission_generation.to_be_bytes());
     hasher.update(member.proof_epoch.to_be_bytes());
     hasher.update([member.provider_operation.tag(), member.outcome.tag()]);
     hasher.update(member.evidence_length.to_be_bytes());
     hasher.update(member.evidence_commitment);
     hasher.update(member.stable_proof_commitment);
+}
+
+/// Reconstruct the Provider receipt digest from durable compact evidence.
+/// Unlike executor aggregation, the provider receipt has no terminal phase,
+/// terminal body, raw descriptor, raw evidence, certificate rotation, or
+/// signature material in its signed body. The descriptor/evidence commitments
+/// are sufficient to preserve the original raw bindings after compaction.
+pub(crate) fn provider_receipt_compact_digest(
+    binding: &RosterCompactTerminalEvidenceBindingV2,
+    member: &RosterCompactTerminalMemberProjectionV2,
+    certificate: &RosterAttestationLeafCertificateV1,
+) -> Result<[u8; 32], RosterAttestationError> {
+    binding.validate()?;
+    let phase = Phase::from_tag(binding.terminal_phase_tag).map_err(|_| RosterAttestationError)?;
+    member.validate(member.ordinal as usize, phase)?;
+    certificate.validate_structure()?;
+    if certificate.role()? != RosterAttestationCertificateRoleV1::Provider
+        || certificate.configuration_identity != binding.configuration_identity
+        || certificate.scope != binding.authority_scope
+    {
+        return Err(RosterAttestationError);
+    }
+    // Byte-for-byte the fixed portion of
+    // `RosterProviderReceiptSigningInputV1::challenge_digest()`, expressed
+    // from retained compact commitments. This preserves the Provider
+    // signature across raw-to-compact conversion.
+    let mut hasher = Sha256::new();
+    hasher.update(ROSTER_ATTESTATION_PROVIDER_RECEIPT_DOMAIN);
+    hasher.update(ROSTER_ATTESTATION_PROVIDER_RECEIPT_MAGIC);
+    hasher.update([2]);
+    hasher.update(binding.profile.schema().to_be_bytes());
+    hasher.update(binding.profile.consumer_revision().to_be_bytes());
+    hasher.update(binding.profile.digest());
+    update_consensus_identity_attestation(&mut hasher, binding.configuration_identity);
+    hasher.update(binding.binding);
+    hasher.update(binding.registration_handle);
+    hasher.update(binding.registration_request_id);
+    hasher.update(binding.registration_terminal_slot);
+    hasher.update(binding.roster_id);
+    hasher.update(binding.admission_commitment);
+    hasher.update([member.ordinal]);
+    hasher.update(member.member_operation_id);
+    hasher.update((member.descriptor_length as u64).to_be_bytes());
+    hasher.update(member.descriptor_commitment);
+    hasher.update(member.expected_member_version.to_be_bytes());
+    hasher.update(member.admission_generation.to_be_bytes());
+    hasher.update(binding.authority_scope);
+    hasher.update(binding.authority_key_commitment);
+    hasher.update(binding.authority_owner_commitment);
+    hasher.update(binding.authority_fence.to_be_bytes());
+    hasher.update(binding.authority_credential_id.to_be_bytes());
+    hasher.update(binding.authority_generation.to_be_bytes());
+    update_timestamp_attestation(&mut hasher, binding.authority_acquired_at);
+    update_timestamp_attestation(&mut hasher, binding.authority_expires_at);
+    hasher.update(member.proof_epoch.to_be_bytes());
+    hasher.update([member.provider_operation.tag()]);
+    provider_receipt_digest_from_challenge_commitment_v1(
+        hasher.finalize().into(),
+        certificate.subject_identity_commitment,
+        member.proof_epoch,
+        member.provider_operation,
+        member.outcome,
+        member.evidence_length as usize,
+        member.evidence_commitment,
+    )
 }
 
 /// Crate-private inputs for deterministic executor-proof verification.
@@ -3924,6 +4759,8 @@ pub(crate) fn verify_executor_terminal_proof_bundle(
         || authority.fence().get() == 0
         || authority.credential_id() == 0
         || authority.expires_at() <= authority.acquired_at()
+        || logical_time < authority.acquired_at()
+        || logical_time >= authority.expires_at()
     {
         return Err(RosterAttestationError);
     }
@@ -3952,6 +4789,17 @@ pub(crate) fn verify_executor_terminal_proof_bundle(
         {
             return Err(RosterAttestationError);
         }
+        verify_provider_receipt(
+            root,
+            configuration_identity,
+            logical_time,
+            binding,
+            registration,
+            admission,
+            authority,
+            member,
+            proof,
+        )?;
         let digest = terminal_proof_signing_digest(TerminalProofSigningInput {
             certificate,
             configuration_identity,
@@ -3978,6 +4826,41 @@ pub(crate) fn verify_executor_terminal_proof_bundle(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_provider_receipt(
+    root: &RosterAttestationTrustRootV1,
+    configuration_identity: SessionConsensusIdentity,
+    logical_time: Timestamp,
+    binding: RequestBindingKey,
+    registration: BackendRegistration,
+    admission: &Admission,
+    authority: &AuthorityBinding,
+    member: &Member,
+    proof: &RosterExecutorMemberProofV1,
+) -> Result<(), RosterAttestationError> {
+    let certificate = &proof.provider_certificate;
+    certificate.verify_root(root)?;
+    if certificate.role()? != RosterAttestationCertificateRoleV1::Provider
+        || certificate.configuration_identity != configuration_identity
+        || certificate.scope != admission.scope().digest()
+        || logical_time < certificate.not_before
+        || logical_time >= certificate.not_after
+    {
+        return Err(RosterAttestationError);
+    }
+    let digest = provider_receipt_signing_digest(
+        certificate,
+        configuration_identity,
+        binding,
+        registration,
+        admission,
+        authority,
+        member,
+        proof,
+    )?;
+    verify_digest_signature(&certificate.public_key, digest, &proof.provider_signature)
 }
 
 /// Stable terminal contribution for one member proof.
@@ -4099,6 +4982,59 @@ fn terminal_proof_signing_digest(
     input.digest()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn provider_receipt_signing_digest(
+    certificate: &RosterAttestationLeafCertificateV1,
+    configuration_identity: SessionConsensusIdentity,
+    binding: RequestBindingKey,
+    registration: BackendRegistration,
+    admission: &Admission,
+    authority: &AuthorityBinding,
+    member: &Member,
+    proof: &RosterExecutorMemberProofV1,
+) -> Result<[u8; 32], RosterAttestationError> {
+    let operation = proof.operation()?;
+    let outcome = proof.outcome()?;
+    let (handle, request_id, terminal_slot) = registration.consensus_parts();
+    if binding.scope != admission.scope()
+        || binding.roster_id != admission.roster_id()
+        || proof.ordinal != member.ordinal()
+    {
+        return Err(RosterAttestationError);
+    }
+    RosterProviderReceiptSigningInputV1 {
+        profile: admission.profile(),
+        configuration_identity,
+        certificate_subject_identity_commitment: certificate.subject_identity_commitment,
+        certificate_role: certificate.role()?,
+        binding: binding.to_bytes(),
+        registration_handle: handle,
+        registration_request_id: request_id.to_bytes(),
+        registration_terminal_slot: *terminal_slot.as_bytes(),
+        roster_id: *admission.roster_id().as_bytes(),
+        admission_commitment: admission.body_commitment(),
+        ordinal: member.ordinal(),
+        member_operation_id: *member.operation_id().as_bytes(),
+        descriptor: member.descriptor().to_vec(),
+        descriptor_commitment: member.descriptor_commitment(),
+        expected_member_version: member.expected_version(),
+        admission_generation: admission.expected_generation().get(),
+        authority_scope: authority.scope().digest(),
+        authority_key_canonical: authority.key().canonical_digest_input(),
+        authority_owner: authority.owner().as_str().as_bytes().to_vec(),
+        authority_fence: authority.fence().get(),
+        authority_credential_id: authority.credential_id(),
+        authority_generation: authority.generation().get(),
+        authority_acquired_at: authority.acquired_at(),
+        authority_expires_at: authority.expires_at(),
+        proof_epoch: proof.proof_epoch,
+        provider_operation: operation,
+        outcome,
+        evidence: proof.evidence.clone(),
+    }
+    .digest()
+}
+
 fn descriptor_commitment_from_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(DESCRIPTOR_DOMAIN);
@@ -4127,15 +5063,23 @@ fn attested_provider_outcome_allowed(
     outcome: RosterProviderOutcomeV1,
 ) -> bool {
     match operation {
-        RosterProviderOperationV1::Execute => matches!(
+        // Execution can establish only its own positive terminal fact. In
+        // particular a product provider cannot turn an execute failure into a
+        // NotApplied/Reconciled assertion without the dedicated reconciliation
+        // operation and Provider receipt.
+        RosterProviderOperationV1::Execute => outcome == RosterProviderOutcomeV1::AppliedExecuted,
+        RosterProviderOperationV1::Status => matches!(
             outcome,
-            RosterProviderOutcomeV1::AppliedExecuted
-                | RosterProviderOutcomeV1::NotAppliedReconciled
+            RosterProviderOutcomeV1::AppliedExecuted | RosterProviderOutcomeV1::AppliedAdopted
         ),
-        RosterProviderOperationV1::Status | RosterProviderOperationV1::Adopt => true,
-        RosterProviderOperationV1::Compensate => {
-            outcome == RosterProviderOutcomeV1::CompensatedReconciled
-        }
+        RosterProviderOperationV1::Adopt => outcome == RosterProviderOutcomeV1::AppliedAdopted,
+        // Only Reconcile may make a negative or compensation conclusion.
+        RosterProviderOperationV1::Reconcile => matches!(
+            outcome,
+            RosterProviderOutcomeV1::NotAppliedReconciled
+                | RosterProviderOutcomeV1::CompensatedReconciled
+        ),
+        RosterProviderOperationV1::Compensate => false,
         // Preparation is intentionally not a terminal observation. It may
         // establish a local retry state, never a conclusive remote outcome.
         RosterProviderOperationV1::Prepare => false,
@@ -4242,6 +5186,7 @@ impl IrreversibleHistoryFloor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn advance_to(self, retired_through: u64) -> Result<Self, Error> {
         validate_history_epoch(retired_through)?;
         let next = Self {
@@ -4345,11 +5290,12 @@ impl fmt::Debug for IrreversibleHistoryFloor {
 ///
 /// This tombstone is retired only with the enclosing V2 history epoch. Age
 /// alone therefore never reopens a stable roster ID for a different body.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TerminalConflictTombstone {
     binding_key: RequestBindingKey,
     admission_body_commitment: [u8; 32],
     terminal_body_commitment: [u8; 32],
+    admission_owner: OwnerId,
     admission_fence: u64,
     expected_generation: u64,
     phase_tag: u8,
@@ -4363,6 +5309,7 @@ impl TerminalConflictTombstone {
             binding_key: admission.binding_key(record.request_id().history_epoch())?,
             admission_body_commitment: admission.body_commitment(),
             terminal_body_commitment: record.body_commitment(),
+            admission_owner: admission.logical_owner().clone(),
             admission_fence: admission.admission_fence().get(),
             expected_generation: admission.expected_generation().get(),
             phase_tag: record.phase()?.tag(),
@@ -4372,7 +5319,7 @@ impl TerminalConflictTombstone {
     }
 
     pub(crate) fn validate_admission(
-        self,
+        &self,
         history_epoch: u64,
         admission: &Admission,
     ) -> Result<CompactedTerminalStatus, Error> {
@@ -4383,7 +5330,8 @@ impl TerminalConflictTombstone {
         if self.admission_body_commitment != admission.body_commitment() {
             return Err(Error::RequestConflict);
         }
-        if self.admission_fence != admission.admission_fence().get()
+        if self.admission_owner != *admission.logical_owner()
+            || self.admission_fence != admission.admission_fence().get()
             || self.expected_generation != admission.expected_generation().get()
         {
             return Err(Error::RequestConflict);
@@ -4401,7 +5349,7 @@ impl TerminalConflictTombstone {
     /// replaceable guard: it must be a valid strictly higher fence for the
     /// same generation, while the terminal body and slot remain byte-exact.
     pub(crate) fn validate_compacted_terminal(
-        self,
+        &self,
         binding: RequestBindingKey,
         request_id: RequestId,
         terminal_slot: [u8; 32],
@@ -4438,11 +5386,13 @@ impl TerminalConflictTombstone {
 
     /// Validate a compacted replay lookup without retaining an admission body.
     pub(crate) fn validate_lookup(
-        self,
+        &self,
         history_epoch: u64,
         scope: Scope,
         key: &SessionKey,
         roster_id: RosterId,
+        claimed_original_owner: &OwnerId,
+        claimed_original_admission_fence: FenceToken,
         current_fence: FenceToken,
         current_generation: Generation,
     ) -> Result<CompactedTerminalStatus, Error> {
@@ -4450,7 +5400,9 @@ impl TerminalConflictTombstone {
         if self.binding_key != binding_key {
             return Err(Error::InvalidAuthority);
         }
-        if current_fence.get() <= self.admission_fence
+        if self.admission_owner != *claimed_original_owner
+            || claimed_original_admission_fence.get() != self.admission_fence
+            || current_fence.get() <= self.admission_fence
             || current_generation.get() != self.expected_generation
         {
             return Err(Error::InvalidAuthority);
@@ -4461,11 +5413,11 @@ impl TerminalConflictTombstone {
         })
     }
 
-    pub(crate) const fn binding_key(self) -> RequestBindingKey {
+    pub(crate) const fn binding_key(&self) -> RequestBindingKey {
         self.binding_key
     }
 
-    pub(crate) fn to_canonical_bytes(self) -> Result<Vec<u8>, Error> {
+    pub(crate) fn to_canonical_bytes(&self) -> Result<Vec<u8>, Error> {
         encode_frame(
             TOMBSTONE_FRAME_MAGIC,
             TOMBSTONE_FRAME_DOMAIN,
@@ -4488,7 +5440,7 @@ impl TerminalConflictTombstone {
         Ok(value)
     }
 
-    fn validate(self) -> Result<(), Error> {
+    fn validate(&self) -> Result<(), Error> {
         self.binding_key.validate()?;
         if self.admission_body_commitment == [0; 32] || self.terminal_body_commitment == [0; 32] {
             return Err(Error::InvalidHistory);
@@ -4512,6 +5464,7 @@ struct TerminalConflictTombstoneWire {
     binding_key: RequestBindingKey,
     admission_body_commitment: [u8; 32],
     terminal_body_commitment: [u8; 32],
+    admission_owner: OwnerId,
     admission_fence: u64,
     expected_generation: u64,
     phase_tag: u8,
@@ -4524,6 +5477,7 @@ impl<'de> Deserialize<'de> for TerminalConflictTombstone {
             binding_key: wire.binding_key,
             admission_body_commitment: wire.admission_body_commitment,
             terminal_body_commitment: wire.terminal_body_commitment,
+            admission_owner: wire.admission_owner,
             admission_fence: wire.admission_fence,
             expected_generation: wire.expected_generation,
             phase_tag: wire.phase_tag,
@@ -4754,10 +5708,10 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SessionKeyType, StableId, SESSION_KEY_TYPE_MAX_BYTES};
+    use crate::{SESSION_KEY_TYPE_MAX_BYTES, SessionKeyType, StableId};
     use bytes::Bytes;
     use opc_types::{NetworkFunctionKind, TenantId};
-    use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+    use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
 
     fn roster_attestation_trust_root(
         root_id: [u8; 32],
@@ -5058,6 +6012,7 @@ mod tests {
                     descriptor_length: member.descriptor().len() as u16,
                     descriptor_commitment: member.descriptor_commitment(),
                     expected_member_version: member.expected_version(),
+                    admission_generation: admission.expected_generation().get(),
                     proof_epoch: 19,
                     provider_operation: RosterProviderOperationV1::Execute,
                     outcome: RosterProviderOutcomeV1::AppliedExecuted,
@@ -5074,7 +6029,30 @@ mod tests {
                     .digest()
                     .expect("terminal member digest"),
                 );
-                RosterCompactTerminalMemberProofPartsV2 { member, signature }
+                let provider_certificate = compact_certificate(
+                    &root,
+                    &root_key,
+                    &executor_leaf,
+                    RosterAttestationCertificateRoleV1::Provider,
+                    identity,
+                    admission.scope().digest(),
+                    [0x4e; 32],
+                );
+                let provider = RosterAttestationLeafCertificateV1::issue_from_signed_parts(
+                    &root,
+                    provider_certificate.clone(),
+                )
+                .expect("provider certificate");
+                RosterCompactTerminalMemberProofPartsV2 {
+                    provider_signature: sign_digest(
+                        &executor_leaf,
+                        provider_receipt_compact_digest(&terminal_binding, &member, &provider)
+                            .expect("provider digest"),
+                    ),
+                    provider_certificate,
+                    member,
+                    signature,
+                }
             })
             .collect();
         let executor_certificate = compact_certificate(
@@ -5231,10 +6209,12 @@ mod tests {
             )
             .expect("supported roster width and version");
             assert_eq!(value.members().len(), width);
-            assert!(value
-                .members()
-                .iter()
-                .all(|member| member.expected_version() == expected_version));
+            assert!(
+                value
+                    .members()
+                    .iter()
+                    .all(|member| member.expected_version() == expected_version)
+            );
         }
 
         let invalid_member = Member {
@@ -5270,14 +6250,24 @@ mod tests {
         assert_eq!(MAX_COMMITTED_TERMINAL_CODEC_BYTES, 1_069_519);
         let profile_lines: BTreeSet<&[u8]> =
             PROFILE_DESCRIPTOR.split(|byte| *byte == b'\n').collect();
+        assert!(profile_lines.iter().any(|line| {
+            line.starts_with(b"domains=")
+                && line
+                    .windows(b"roster-attestation-provider-receipt".len())
+                    .any(|part| part == b"roster-attestation-provider-receipt")
+        }));
         assert!(profile_lines.contains(
-            b"domains=profile,admission,descriptor,terminal,terminal-slot,session-key-binding,tenant-scope-partition,provider-fence-binding,publication-id,publication-payload,publication-evidence,admission-frame,terminal-frame,committed-terminal-frame,tombstone-frame,history-floor-frame,executor-proof,executor-evidence,terminal-committing-guard,terminal-session-record,terminal-receipt,provider-scheduling,binding,descriptor,owner,credential,roster-attestation-root,roster-attestation-certificate,roster-attestation-proof,roster-attestation-stable-proof,roster-attestation-evidence,roster-attestation-bundle,roster-ingress-attestation,roster-ingress-capsule".as_slice()
+            b"magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB1\\0,OPCRHF1\\0,OPCPRC1\\0".as_slice()
         ));
-        assert!(profile_lines
-            .contains(b"magics=OPCRAD2\\0,OPCRTM2\\0,OPCRCT1\\0,OPCRTB1\\0,OPCRHF1\\0".as_slice()));
-        assert!(profile_lines.contains(
-            b"limits=max-members:8,accepted-members:1..8,fresh-target-members:6,plan:1048576,checkpoint:1048576,result:16384,roster-id:16,member-operation-id:16,descriptor:16384,status:4096,attestation-evidence:4096,attestation-bundle:36864,ingress-attestation:1024,admission-codec:2245658,terminal-codec:1065423,committed-terminal-codec:1069519,tombstone-codec:256,history-floor-codec:128,history-epoch-max:9223372036854775807,live:1024,live-plus-retained:131072,epoch-bindings:131072,operational-target:100000,reclaim:1024,retention-seconds:86400,quorum-mutations:fresh-success=2(admission,terminalization);remote-reads=admission-status,recover,terminal-status;local-authority-checks=provider-pre-post,publication-pre-post".as_slice()
-        ));
+        assert!(profile_lines.iter().any(|line| {
+            line.starts_with(b"limits=")
+                && line
+                    .windows(b"attestation-bundle:40960".len())
+                    .any(|part| part == b"attestation-bundle:40960")
+                && line
+                    .windows(b"compact-terminal-evidence:8192".len())
+                    .any(|part| part == b"compact-terminal-evidence:8192")
+        }));
         assert!(profile_lines.contains(
             b"committed-terminal-frame-field-order=record,commit-metadata(sequence,raft-log-index,committed-at),committing-registration-handle,committing-registration-request-id,committing-registration-terminal-slot-id,committing-authority-scope,committing-authority-key,committing-authority-owner,committing-authority-fence,committing-authority-credential,committing-authority-generation,committing-authority-acquired-at,committing-authority-expires-at,committing-guard-commitment,materialization,receipt-commitment;materialization-postcard-tags=updated:0,deleted:1,no-op:2,aborted:3".as_slice()
         ));
@@ -5316,7 +6306,10 @@ mod tests {
             .any(|line| line == b"history=stable-slot-binds-epoch-scope-session-key-roster-id,new-v2-admission-atomically-selects-binds-current-epoch-greater-than-durable-exact-scope-floor-before-reserve,admit-reserves-one-terminal-slot,terminal-retention-starts-at-terminalization,reclaim-oldest-min-1024-eligible-to-v2-conflict-tombstone,never-reclaim-live,durable-canonical-scope-bound-irreversible-floor,never-reopen-before-scope-bound-irreversible-epoch-retirement"));
         assert!(PROFILE_DESCRIPTOR
             .split(|byte| *byte == b'\n')
-            .any(|line| line == b"executor-field-order=proof-binding:roster-attestation-proof,profile,configuration-identity,certificate-subject,certificate-role,binding,registration-handle,registration-request-id,terminal-slot,roster-id,admission-commitment,terminal-phase,terminal-body-commitment,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,scope,key,owner-commitment,fence,credential-commitment,generation,acquired-at-nanos,expires-at-nanos,proof-epoch,operation,outcome,evidence-length,evidence,evidence-commitment;proof-commitment:roster-attestation-stable-proof,binding,registration-request-id,terminal-slot,roster-id,admission-commitment,phase,ordinal,stable-member-operation-id,descriptor-length,descriptor,descriptor-commitment,expected-version,expected-generation,outcome,evidence-commitment;certificate=roster-attestation-certificate,version,root-id,role,configuration-identity,scope,subject,leaf-epoch,key-id[32],not-before,not-after,compressed-p256-key;attestation=p256-sha256,compressed-sec1:33,low-s-p1363:64,roles:executor|transport-ingress;ingress=roster-ingress-attestation,profile-alpn,peer,scope,request,operation,capsule,authenticated-at,peer-cert-expires,material-generation,handshake-epoch;provider-operations=local-prepare-execute-status-adopt-compensate"));
+            .any(|line| line.starts_with(b"executor-field-order=")
+                && line.windows(b"provider-receipt=".len()).any(|part| part == b"provider-receipt=")
+                && line.windows(b"roles:executor|provider|transport-ingress".len()).any(|part| part == b"roles:executor|provider|transport-ingress")
+                && line.windows(b"provider-operations=local-prepare-execute-status-adopt-compensate-reconcile".len()).any(|part| part == b"provider-operations=local-prepare-execute-status-adopt-compensate-reconcile")));
         assert_eq!(
             PROOF_DOMAIN,
             b"opc/session-store/protected-roster/executor-proof/v1\0"
@@ -5332,8 +6325,9 @@ mod tests {
                 PROVIDER_OPERATION_ADOPT_TAG,
                 PROVIDER_OPERATION_COMPENSATE_TAG,
                 PROVIDER_OPERATION_PREPARE_TAG,
+                PROVIDER_OPERATION_RECONCILE_TAG,
             ],
-            [1, 2, 3, 4, 5]
+            [1, 2, 3, 4, 5, 6]
         );
         assert_eq!([PHASE_ESTABLISHED, PHASE_ABORTED], [1, 2]);
         assert_eq!(
@@ -5379,11 +6373,45 @@ mod tests {
         assert_eq!(
             profile_digest(),
             [
-                0xfc, 0xdc, 0xfc, 0x0c, 0xe3, 0x25, 0xfc, 0xd0, 0xb4, 0xee, 0x7e, 0xa3, 0xbb, 0xdc,
-                0x3f, 0xd6, 0xd8, 0x41, 0xf1, 0x39, 0x8e, 0x9e, 0x27, 0x03, 0x33, 0xef, 0xba, 0x02,
-                0xe0, 0xde, 0x77, 0x66,
+                0x1f, 0xc9, 0xe4, 0xbd, 0xaf, 0xfd, 0x17, 0x46, 0xf1, 0xaf, 0x8d, 0x21, 0xc7, 0xb7,
+                0x34, 0x37, 0xc5, 0xba, 0x14, 0x22, 0x8e, 0xc4, 0x3b, 0xe4, 0xe2, 0xcf, 0x18, 0x2c,
+                0x6a, 0x3d, 0xda, 0x35,
             ]
         );
+    }
+
+    #[test]
+    fn reconcile_is_the_only_negative_or_compensation_terminal_operation() {
+        use RosterProviderOperationV1::{Adopt, Compensate, Execute, Prepare, Reconcile, Status};
+        use RosterProviderOutcomeV1::{
+            AppliedAdopted, AppliedExecuted, CompensatedReconciled, NotAppliedReconciled,
+        };
+
+        assert!(attested_provider_outcome_allowed(Execute, AppliedExecuted));
+        assert!(!attested_provider_outcome_allowed(
+            Execute,
+            NotAppliedReconciled
+        ));
+        assert!(!attested_provider_outcome_allowed(
+            Execute,
+            CompensatedReconciled
+        ));
+        assert!(attested_provider_outcome_allowed(Adopt, AppliedAdopted));
+        assert!(attested_provider_outcome_allowed(Status, AppliedExecuted));
+        assert!(attested_provider_outcome_allowed(Status, AppliedAdopted));
+        assert!(attested_provider_outcome_allowed(
+            Reconcile,
+            NotAppliedReconciled
+        ));
+        assert!(attested_provider_outcome_allowed(
+            Reconcile,
+            CompensatedReconciled
+        ));
+        assert!(!attested_provider_outcome_allowed(
+            Compensate,
+            CompensatedReconciled
+        ));
+        assert!(!attested_provider_outcome_allowed(Prepare, AppliedExecuted));
     }
 
     #[test]
@@ -5413,21 +6441,39 @@ mod tests {
             rehydrated.validate_new_binding(next_admission.binding_key(4).unwrap()),
             Err(Error::InvalidHistory)
         );
-        assert!(rehydrated
-            .permits_binding(next_admission.binding_key(4).unwrap())
-            .is_ok());
+        assert!(
+            rehydrated
+                .permits_binding(next_admission.binding_key(4).unwrap())
+                .is_ok()
+        );
         assert_eq!(
             rehydrated.permits_binding(next_admission.binding_key(5).unwrap()),
             Err(Error::InvalidHistory)
         );
-        let mut other_scope_admission = next_admission.clone();
-        other_scope_admission.scope = Scope::from_digest([8; 32]);
+        let other_scope_admission = Admission::authenticate(
+            next_admission.proposal.clone(),
+            next_admission.key.clone(),
+            Scope::from_digest([8; 32]),
+            next_admission.logical_owner.clone(),
+            next_admission.admission_fence,
+            next_admission.expected_generation,
+        )
+        .unwrap();
         assert_eq!(
             rehydrated.permits_binding(other_scope_admission.binding_key(4).unwrap()),
             Err(Error::InvalidAuthority)
         );
-        let mut other_tenant_admission = next_admission.clone();
-        other_tenant_admission.key.tenant = TenantId::from_static("other-tenant");
+        let mut other_tenant_key = next_admission.key.clone();
+        other_tenant_key.tenant = TenantId::from_static("other-tenant");
+        let other_tenant_admission = Admission::authenticate(
+            next_admission.proposal.clone(),
+            other_tenant_key,
+            next_admission.scope,
+            next_admission.logical_owner.clone(),
+            next_admission.admission_fence,
+            next_admission.expected_generation,
+        )
+        .unwrap();
         assert_eq!(
             rehydrated.validate_new_binding(other_tenant_admission.binding_key(5).unwrap()),
             Err(Error::InvalidAuthority)
@@ -5442,10 +6488,12 @@ mod tests {
                 .and_then(|()| RequestId::bind(4, &next_admission).map(|_| ())),
             Err(Error::InvalidHistory)
         );
-        assert!(rehydrated
-            .validate_new_binding(next_admission.binding_key(5).unwrap())
-            .and_then(|()| RequestId::bind(5, &next_admission).map(|_| ()))
-            .is_ok());
+        assert!(
+            rehydrated
+                .validate_new_binding(next_admission.binding_key(5).unwrap())
+                .and_then(|()| RequestId::bind(5, &next_admission).map(|_| ()))
+                .is_ok()
+        );
         assert_eq!(
             initial.strictly_advances(rehydrated),
             Err(Error::InvalidHistory)
@@ -5453,8 +6501,15 @@ mod tests {
         assert_eq!(rehydrated.advance_to(4), Err(Error::InvalidHistory));
         assert_eq!(rehydrated.advance_to(3), Err(Error::InvalidHistory));
 
-        let mut other_scope_admission = next_admission.clone();
-        other_scope_admission.scope = Scope::from_digest([8; 32]);
+        let other_scope_admission = Admission::authenticate(
+            next_admission.proposal.clone(),
+            next_admission.key.clone(),
+            Scope::from_digest([8; 32]),
+            next_admission.logical_owner.clone(),
+            next_admission.admission_fence,
+            next_admission.expected_generation,
+        )
+        .unwrap();
         let other_scope =
             IrreversibleHistoryFloor::initial(other_scope_admission.binding_key(1).unwrap())
                 .unwrap()
@@ -5503,10 +6558,16 @@ mod tests {
         assert_eq!(
             frame_sha256(&admission_frame),
             [
-                0x33, 0x03, 0x3e, 0xc3, 0x17, 0x3c, 0xf1, 0x79, 0xfd, 0xb0, 0x8b, 0x16, 0x54, 0xc7,
-                0xcb, 0x15, 0x46, 0x9e, 0xaf, 0xd0, 0xef, 0x89, 0xb4, 0x51, 0x02, 0x34, 0x8f, 0x77,
-                0xcc, 0x52, 0x8a, 0x7c,
+                0x54, 0xdb, 0x6e, 0x9f, 0x73, 0x4e, 0xc7, 0xa2, 0xa4, 0xe8, 0xe0, 0x44, 0xb9, 0x12,
+                0x86, 0x1d, 0xd2, 0x8c, 0xe8, 0x6e, 0x94, 0x68, 0x96, 0x06, 0x43, 0x54, 0x8c, 0x1d,
+                0x82, 0x22, 0x8f, 0x7a,
             ]
+        );
+        let decoded_admission = Admission::from_canonical_bytes(&admission_frame).unwrap();
+        assert_eq!(decoded_admission, admission);
+        assert_eq!(
+            decoded_admission.body_commitment(),
+            admission.body_commitment()
         );
         let mut admission_trailing = admission_frame.clone();
         admission_trailing.push(0);
@@ -5527,9 +6588,9 @@ mod tests {
         assert_eq!(
             frame_sha256(&terminal_frame),
             [
-                0xa3, 0xfa, 0x58, 0x9d, 0x92, 0x19, 0x04, 0x94, 0x4f, 0x63, 0xdf, 0xa8, 0x74, 0x5f,
-                0x83, 0x2a, 0x3c, 0x05, 0xa0, 0xd4, 0x38, 0x17, 0x34, 0xda, 0x30, 0x54, 0xb8, 0xc9,
-                0x70, 0xbd, 0xdf, 0xcc,
+                0xa1, 0xcd, 0xa1, 0x64, 0x2c, 0x6a, 0x50, 0x4d, 0x26, 0x9c, 0x5a, 0x69, 0x9f, 0x5a,
+                0x32, 0x5a, 0x33, 0x90, 0x51, 0xc6, 0x53, 0x7c, 0x9c, 0x9a, 0x99, 0x4f, 0xe5, 0x95,
+                0x69, 0xdb, 0x02, 0x7e,
             ]
         );
         let mut terminal_trailing = terminal_frame.clone();
@@ -5572,15 +6633,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.roster_id(), p.roster_id());
-        assert!(Admission::authenticate(
-            p,
-            key(),
-            Scope::from_digest([0; 32]),
-            OwnerId::new("owner").unwrap(),
-            FenceToken::new(1),
-            Generation::new(2)
-        )
-        .is_err());
+        assert!(
+            Admission::authenticate(
+                p,
+                key(),
+                Scope::from_digest([0; 32]),
+                OwnerId::new("owner").unwrap(),
+                FenceToken::new(1),
+                Generation::new(2)
+            )
+            .is_err()
+        );
     }
     #[test]
     fn protected_plan_checkpoint_and_result_have_independent_exact_bounds() {
@@ -5721,16 +6784,29 @@ mod tests {
     #[test]
     fn admission_commitment_binds_every_established_mutation_field() {
         let original = admission();
-        let mut changed = original.clone();
-        changed.proposal.established_mutation = EstablishedMutation::delete();
-        assert_ne!(original.body_commitment(), changed.body_commitment());
+        let reauthenticate = |mutation| {
+            let mut proposal = original.proposal.clone();
+            proposal.established_mutation = mutation;
+            Admission::authenticate(
+                proposal,
+                original.key.clone(),
+                original.scope,
+                original.logical_owner.clone(),
+                original.admission_fence,
+                original.expected_generation,
+            )
+            .unwrap()
+        };
+        let deleted = reauthenticate(EstablishedMutation::delete());
+        assert_ne!(original.body_commitment(), deleted.body_commitment());
 
-        changed.proposal.established_mutation =
-            EstablishedMutation::put_checkpoint(StateType::from_static("final-a"));
-        let first_put = changed.body_commitment();
-        changed.proposal.established_mutation =
-            EstablishedMutation::put_checkpoint(StateType::from_static("final-b"));
-        assert_ne!(first_put, changed.body_commitment());
+        let first_put = reauthenticate(EstablishedMutation::put_checkpoint(
+            StateType::from_static("final-a"),
+        ));
+        let second_put = reauthenticate(EstablishedMutation::put_checkpoint(
+            StateType::from_static("final-b"),
+        ));
+        assert_ne!(first_put.body_commitment(), second_put.body_commitment());
     }
     #[test]
     fn terminal_binds_order_tamper_and_restart_bytes() {
@@ -5765,8 +6841,17 @@ mod tests {
         let request_id = RequestId::bind(4, &admission).unwrap();
         let terminal_slot = request_id.terminal_slot_id(&admission).unwrap();
 
-        let mut changed_body = admission.clone();
-        changed_body.proposal.protected_plan.push(4);
+        let mut changed_proposal = admission.proposal.clone();
+        changed_proposal.protected_plan.push(4);
+        let changed_body = Admission::authenticate(
+            changed_proposal,
+            admission.key.clone(),
+            admission.scope,
+            admission.logical_owner.clone(),
+            admission.admission_fence,
+            admission.expected_generation,
+        )
+        .unwrap();
         let changed_request_id = RequestId::bind(4, &changed_body).unwrap();
         assert_ne!(request_id, changed_request_id);
         assert_eq!(
@@ -5845,16 +6930,18 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        assert!(AdmissionProposal::new(
-            Profile::v1(),
-            RosterId::from_bytes([1; ROSTER_ID_BYTES]).unwrap(),
-            members,
-            EstablishedMutation::no_op(),
-            vec![],
-            vec![],
-            vec![],
-        )
-        .is_ok());
+        assert!(
+            AdmissionProposal::new(
+                Profile::v1(),
+                RosterId::from_bytes([1; ROSTER_ID_BYTES]).unwrap(),
+                members,
+                EstablishedMutation::no_op(),
+                vec![],
+                vec![],
+                vec![],
+            )
+            .is_ok()
+        );
     }
     #[test]
     fn compacted_terminal_tombstone_never_reopens_changed_body() {
@@ -5877,16 +6964,18 @@ mod tests {
         let terminal_body_commitment =
             TerminalRecord::canonical_body_commitment(&terminal_bytes).unwrap();
         assert_eq!(terminal_body_commitment, terminal.body_commitment());
-        assert!(tombstone
-            .validate_compacted_terminal(
-                binding,
-                request_id,
-                terminal_slot,
-                FenceToken::new(2),
-                original_admission.expected_generation(),
-                terminal_body_commitment,
-            )
-            .is_ok());
+        assert!(
+            tombstone
+                .validate_compacted_terminal(
+                    binding,
+                    request_id,
+                    terminal_slot,
+                    FenceToken::new(2),
+                    original_admission.expected_generation(),
+                    terminal_body_commitment,
+                )
+                .is_ok()
+        );
         assert_eq!(
             tombstone.validate_compacted_terminal(
                 binding,
@@ -5939,6 +7028,8 @@ mod tests {
                 exact.scope(),
                 exact.key(),
                 exact.roster_id(),
+                exact.logical_owner(),
+                exact.admission_fence(),
                 exact.admission_fence(),
                 exact.expected_generation(),
             ),
@@ -5951,6 +7042,8 @@ mod tests {
                     exact.scope(),
                     exact.key(),
                     exact.roster_id(),
+                    exact.logical_owner(),
+                    exact.admission_fence(),
                     FenceToken::new(2),
                     exact.expected_generation(),
                 )
@@ -5963,6 +7056,8 @@ mod tests {
                 Scope::from_digest([8; 32]),
                 exact.key(),
                 exact.roster_id(),
+                exact.logical_owner(),
+                exact.admission_fence(),
                 FenceToken::new(2),
                 exact.expected_generation(),
             ),
@@ -5976,6 +7071,8 @@ mod tests {
                 exact.scope(),
                 &other_key,
                 exact.roster_id(),
+                exact.logical_owner(),
+                exact.admission_fence(),
                 FenceToken::new(2),
                 exact.expected_generation(),
             ),
@@ -5989,6 +7086,8 @@ mod tests {
                 exact.scope(),
                 &other_tenant,
                 exact.roster_id(),
+                exact.logical_owner(),
+                exact.admission_fence(),
                 FenceToken::new(2),
                 exact.expected_generation(),
             ),
@@ -6000,6 +7099,8 @@ mod tests {
                 exact.scope(),
                 exact.key(),
                 RosterId::from_bytes([8; ROSTER_ID_BYTES]).unwrap(),
+                exact.logical_owner(),
+                exact.admission_fence(),
                 FenceToken::new(2),
                 exact.expected_generation(),
             ),
@@ -6011,6 +7112,8 @@ mod tests {
                 exact.scope(),
                 exact.key(),
                 exact.roster_id(),
+                exact.logical_owner(),
+                exact.admission_fence(),
                 FenceToken::new(2),
                 exact.expected_generation(),
             ),
@@ -6022,10 +7125,40 @@ mod tests {
                 exact.scope(),
                 exact.key(),
                 exact.roster_id(),
+                exact.logical_owner(),
+                exact.admission_fence(),
                 FenceToken::new(2),
                 Generation::new(exact.expected_generation().get() + 1),
             ),
             Err(Error::InvalidAuthority)
+        );
+        let wrong_original_owner = OwnerId::new("wrong-original-owner").unwrap();
+        assert_eq!(
+            tombstone.validate_lookup(
+                4,
+                exact.scope(),
+                exact.key(),
+                exact.roster_id(),
+                &wrong_original_owner,
+                exact.admission_fence(),
+                FenceToken::new(2),
+                exact.expected_generation(),
+            ),
+            Err(Error::InvalidAuthority)
+        );
+        assert_eq!(
+            tombstone.validate_lookup(
+                4,
+                exact.scope(),
+                exact.key(),
+                exact.roster_id(),
+                exact.logical_owner(),
+                FenceToken::new(exact.admission_fence().get() + 1),
+                FenceToken::new(3),
+                exact.expected_generation(),
+            ),
+            Err(Error::InvalidAuthority),
+            "the compact lookup must bind the claimed original admission fence"
         );
 
         let mut changed_bodies = Vec::new();
@@ -6170,6 +7303,17 @@ mod tests {
                 provenance: &provenance,
             })
             .expect("exact compact admission provenance");
+            verify_historical_compact_admission_provenance_v2(
+                HistoricalCompactAdmissionProvenanceVerificationV2 {
+                    root: &root,
+                    configuration_identity: identity,
+                    binding,
+                    admission: &admission,
+                    original_authority: &authority,
+                    provenance: &provenance,
+                },
+            )
+            .expect("stored compact admission provenance uses its own ingress projection");
             evidence
                 .verify_raw_terminal(&admission, &terminal)
                 .expect("raw terminal correspondence");
@@ -6205,6 +7349,217 @@ mod tests {
                 evidence.commitment().expect("terminal commitment")
             );
         }
+    }
+
+    #[test]
+    fn raw_provider_receipt_digest_survives_compact_q2_projection() {
+        let (
+            _root,
+            identity,
+            admission,
+            binding,
+            authority,
+            registration,
+            _ingress,
+            _provenance,
+            _terminal,
+            compact,
+        ) = compact_v2_fixture(1);
+        let proof = compact.proofs.first().expect("one compact member");
+        let member = admission.members().first().expect("one admitted member");
+        let certificate_parts = || RosterAttestationLeafCertificatePartsV1 {
+            root_id: proof.provider_certificate.root_id,
+            role: RosterAttestationCertificateRoleV1::Provider,
+            configuration_identity: proof.provider_certificate.configuration_identity,
+            scope: proof.provider_certificate.scope,
+            subject_identity_commitment: proof.provider_certificate.subject_identity_commitment,
+            leaf_epoch: proof.provider_certificate.leaf_epoch,
+            key_id: proof.provider_certificate.key_id,
+            not_before: proof.provider_certificate.not_before,
+            not_after: proof.provider_certificate.not_after,
+            public_key: proof.provider_certificate.public_key,
+            root_signature: proof.provider_certificate.root_signature,
+        };
+        let (handle, request_id, terminal_slot) = registration.consensus_parts();
+        let raw = RosterProviderReceiptSigningInputV1 {
+            profile: admission.profile(),
+            configuration_identity: identity,
+            certificate_subject_identity_commitment: proof
+                .provider_certificate
+                .subject_identity_commitment,
+            certificate_role: RosterAttestationCertificateRoleV1::Provider,
+            binding: binding.to_bytes(),
+            registration_handle: handle,
+            registration_request_id: request_id.to_bytes(),
+            registration_terminal_slot: *terminal_slot.as_bytes(),
+            roster_id: *admission.roster_id().as_bytes(),
+            admission_commitment: admission.body_commitment(),
+            ordinal: member.ordinal(),
+            member_operation_id: *member.operation_id().as_bytes(),
+            descriptor: member.descriptor().to_vec(),
+            descriptor_commitment: member.descriptor_commitment(),
+            expected_member_version: member.expected_version(),
+            admission_generation: admission.expected_generation().get(),
+            authority_scope: authority.scope().digest(),
+            authority_key_canonical: authority.key().canonical_digest_input(),
+            authority_owner: authority.owner().as_str().as_bytes().to_vec(),
+            authority_fence: authority.fence().get(),
+            authority_credential_id: authority.credential_id(),
+            authority_generation: authority.generation().get(),
+            authority_acquired_at: authority.acquired_at(),
+            authority_expires_at: authority.expires_at(),
+            proof_epoch: proof.member.proof_epoch,
+            provider_operation: proof.member.provider_operation,
+            outcome: proof.member.outcome,
+            evidence: vec![0x4c; MAX_EXECUTOR_PROOF_EVIDENCE_BYTES],
+        };
+        assert_eq!(
+            raw.digest().expect("raw receipt digest"),
+            provider_receipt_compact_digest(
+                &compact.binding,
+                &proof.member,
+                &proof.provider_certificate,
+            )
+            .expect("same receipt digest from compact projection"),
+            "Q2 must verify the Provider signature over the identical raw receipt preimage"
+        );
+        verify_roster_provider_receipt_v1(
+            &_root,
+            compact_time(20),
+            certificate_parts(),
+            &raw,
+            &proof.provider_signature,
+        )
+        .expect("raw receipt verifies before compacting");
+        let mut changed_outcome = raw.clone();
+        changed_outcome.outcome = RosterProviderOutcomeV1::AppliedAdopted;
+        assert!(
+            verify_roster_provider_receipt_v1(
+                &_root,
+                compact_time(20),
+                certificate_parts(),
+                &changed_outcome,
+                &proof.provider_signature,
+            )
+            .is_err()
+        );
+        let mut changed_epoch = raw.clone();
+        changed_epoch.proof_epoch += 1;
+        assert!(
+            verify_roster_provider_receipt_v1(
+                &_root,
+                compact_time(20),
+                certificate_parts(),
+                &changed_epoch,
+                &proof.provider_signature,
+            )
+            .is_err()
+        );
+        let mut changed_fence = raw.clone();
+        changed_fence.authority_fence += 1;
+        assert!(
+            verify_roster_provider_receipt_v1(
+                &_root,
+                compact_time(20),
+                certificate_parts(),
+                &changed_fence,
+                &proof.provider_signature,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_roster_provider_receipt_v1(
+                &_root,
+                compact_time(20),
+                certificate_parts(),
+                &raw,
+                &[0; ROSTER_ATTESTATION_P256_SIGNATURE_BYTES],
+            )
+            .is_err()
+        );
+        assert!(
+            verify_roster_provider_receipt_v1(
+                &_root,
+                authority
+                    .acquired_at()
+                    .add_seconds(-1)
+                    .expect("before lease"),
+                certificate_parts(),
+                &raw,
+                &proof.provider_signature,
+            )
+            .is_err()
+        );
+        verify_compact_terminal_evidence_v2(CompactTerminalEvidenceVerificationV2 {
+            root: &_root,
+            configuration_identity: identity,
+            logical_time: compact_time(20),
+            binding,
+            registration,
+            admission_provenance: &_provenance,
+            committing_authority: &authority,
+            evidence: &compact,
+        })
+        .expect("Q2 compact verification accepts the raw Provider signature");
+    }
+
+    #[test]
+    fn compacted_tombstone_history_reauthenticates_slots_and_original_authority() {
+        let (
+            root,
+            identity,
+            admission,
+            binding,
+            authority,
+            _registration,
+            _ingress,
+            provenance,
+            terminal,
+            evidence,
+        ) = compact_v2_fixture(1);
+        let tombstone = TerminalConflictTombstone::new(&admission, &terminal)
+            .expect("compact terminal tombstone");
+        let verified =
+            verify_compacted_tombstone_history_v2(CompactedTombstoneHistoryVerificationV2 {
+                root: &root,
+                configuration_identity: identity,
+                binding,
+                tombstone: &tombstone,
+                admission_provenance: &provenance,
+                terminal_evidence: &evidence,
+                original_owner: authority.owner(),
+                original_fence: authority.fence().get(),
+                original_credential_id: authority.credential_id(),
+                original_generation: authority.generation().get(),
+                original_acquired_at: authority.acquired_at(),
+                original_expires_at: authority.expires_at(),
+            })
+            .expect("signed compact history verifies without admission bytes");
+        assert_eq!(verified.stable_slot(), compact_admission_slot(&admission));
+        assert_eq!(
+            verified.terminal_slot(),
+            command_id(TERMINAL_SLOT_DOMAIN, binding)
+        );
+
+        let substituted_owner = OwnerId::new("compacted-history-forged-owner").expect("owner");
+        assert!(
+            verify_compacted_tombstone_history_v2(CompactedTombstoneHistoryVerificationV2 {
+                root: &root,
+                configuration_identity: identity,
+                binding,
+                tombstone: &tombstone,
+                admission_provenance: &provenance,
+                terminal_evidence: &evidence,
+                original_owner: &substituted_owner,
+                original_fence: authority.fence().get(),
+                original_credential_id: authority.credential_id(),
+                original_generation: authority.generation().get(),
+                original_acquired_at: authority.acquired_at(),
+                original_expires_at: authority.expires_at(),
+            })
+            .is_err(),
+            "a side-table owner substitution must not change a tombstone's stable identity"
+        );
     }
 
     #[test]
@@ -6455,6 +7810,7 @@ mod tests {
                     descriptor_length: member.descriptor().len() as u16,
                     descriptor_commitment: member.descriptor_commitment(),
                     expected_member_version: member.expected_version(),
+                    admission_generation: admission.expected_generation().get(),
                     proof_epoch: 23,
                     provider_operation: RosterProviderOperationV1::Execute,
                     outcome: RosterProviderOutcomeV1::AppliedExecuted,
@@ -6471,7 +7827,30 @@ mod tests {
                     .digest()
                     .expect("successor member digest"),
                 );
-                RosterCompactTerminalMemberProofPartsV2 { member, signature }
+                let provider_certificate = compact_certificate(
+                    &root,
+                    &root_key,
+                    &executor_leaf,
+                    RosterAttestationCertificateRoleV1::Provider,
+                    identity,
+                    admission.scope().digest(),
+                    [0x4e; 32],
+                );
+                let provider = RosterAttestationLeafCertificateV1::issue_from_signed_parts(
+                    &root,
+                    provider_certificate.clone(),
+                )
+                .expect("provider certificate");
+                RosterCompactTerminalMemberProofPartsV2 {
+                    provider_signature: sign_digest(
+                        &executor_leaf,
+                        provider_receipt_compact_digest(&terminal_binding, &member, &provider)
+                            .expect("provider digest"),
+                    ),
+                    provider_certificate,
+                    member,
+                    signature,
+                }
             })
             .collect();
         let certificate = compact_certificate(

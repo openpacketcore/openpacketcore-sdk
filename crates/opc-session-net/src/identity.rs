@@ -14,13 +14,14 @@ use opc_consensus::{
     test
 ))]
 use opc_session_store::ReplicaBackingIdentity;
-use opc_session_store::{
-    derive_fixed_durable_quorum_consensus_identity, PlacementResiliencePolicy,
-    QuorumReplicaDescriptor, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
-    QUORUM_TOPOLOGY_MAX_MEMBERS,
-};
+use opc_session_store::topology::derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root;
 #[cfg(any(feature = "legacy-session-net-compat", test))]
 use opc_session_store::{BackendPeerBinding, BackendPeerScopeIdentity};
+use opc_session_store::{
+    PlacementResiliencePolicy, QUORUM_TOPOLOGY_MAX_MEMBERS, QuorumReplicaDescriptor,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    RosterAttestationTrustRootV1,
+};
 use opc_types::SpiffeId;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -187,6 +188,7 @@ pub struct SessionReplicationManifest {
     placement_disposition: SessionPlacementDisposition,
     consensus_identity: SessionConsensusIdentity,
     fixed_quorum_consensus_identity: SessionConsensusIdentity,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
     members: BTreeMap<ReplicaId, ManifestMember>,
     node_ids: BTreeMap<ReplicaId, SessionConsensusNodeId>,
 }
@@ -221,12 +223,35 @@ impl SessionReplicationManifest {
         configuration_epoch: SessionConfigurationEpoch,
         descriptors: Vec<QuorumReplicaDescriptor>,
     ) -> Result<Self, SessionManifestError> {
-        Self::try_new_with_epoch_and_placement_policy(
+        Self::try_new_with_epoch_and_roster_attestation_root(
+            cluster_id,
+            generation,
+            configuration_epoch,
+            descriptors,
+            None,
+        )
+    }
+
+    /// Validate a complete descriptor set and bind an optional immutable
+    /// protected-roster trust root into the fixed durable-quorum identity.
+    ///
+    /// A missing root preserves the ordinary consumer profile. Root rotation
+    /// changes the derived fixed identity rather than reusing durable state.
+    #[doc(hidden)]
+    pub fn try_new_with_epoch_and_roster_attestation_root(
+        cluster_id: SessionClusterId,
+        generation: SessionConfigurationGeneration,
+        configuration_epoch: SessionConfigurationEpoch,
+        descriptors: Vec<QuorumReplicaDescriptor>,
+        roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+    ) -> Result<Self, SessionManifestError> {
+        Self::try_new_with_epoch_and_placement_policy_and_roster_attestation_root(
             cluster_id,
             generation,
             configuration_epoch,
             descriptors,
             SessionPlacementPolicy::RequireIndependentFailureDomains,
+            roster_attestation_trust_root,
         )
     }
 
@@ -241,6 +266,28 @@ impl SessionReplicationManifest {
         configuration_epoch: SessionConfigurationEpoch,
         descriptors: Vec<QuorumReplicaDescriptor>,
         placement_policy: SessionPlacementPolicy,
+    ) -> Result<Self, SessionManifestError> {
+        Self::try_new_with_epoch_and_placement_policy_and_roster_attestation_root(
+            cluster_id,
+            generation,
+            configuration_epoch,
+            descriptors,
+            placement_policy,
+            None,
+        )
+    }
+
+    /// Root-aware fixed-placement constructor used by protected-roster
+    /// composition. The root is incorporated only in the fixed durable
+    /// identity, preserving dynamic-consensus compatibility.
+    #[doc(hidden)]
+    pub fn try_new_with_epoch_and_placement_policy_and_roster_attestation_root(
+        cluster_id: SessionClusterId,
+        generation: SessionConfigurationGeneration,
+        configuration_epoch: SessionConfigurationEpoch,
+        descriptors: Vec<QuorumReplicaDescriptor>,
+        placement_policy: SessionPlacementPolicy,
+        roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
     ) -> Result<Self, SessionManifestError> {
         if descriptors.is_empty() {
             return Err(SessionManifestError::EmptyMembership);
@@ -321,12 +368,14 @@ impl SessionReplicationManifest {
             consensus_configuration_id,
             consensus_epoch,
         );
-        let fixed_quorum_consensus_identity = derive_fixed_durable_quorum_consensus_identity(
-            consensus_cluster_id,
-            consensus_epoch,
-            &component_fingerprints,
-            placement_policy,
-        );
+        let fixed_quorum_consensus_identity =
+            derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
+                consensus_cluster_id,
+                consensus_epoch,
+                &component_fingerprints,
+                placement_policy,
+                roster_attestation_trust_root.as_ref(),
+            );
         let mut node_ids = BTreeMap::new();
         let mut admitted_node_ids = HashSet::with_capacity(members.len());
         for replica_id in members.keys() {
@@ -352,6 +401,7 @@ impl SessionReplicationManifest {
             placement_disposition,
             consensus_identity,
             fixed_quorum_consensus_identity,
+            roster_attestation_trust_root,
             members,
             node_ids,
         })
@@ -391,6 +441,12 @@ impl SessionReplicationManifest {
     /// retains the established dynamic-profile identity and behavior.
     pub const fn fixed_durable_quorum_consensus_identity(&self) -> SessionConsensusIdentity {
         self.fixed_quorum_consensus_identity
+    }
+
+    /// Return the immutable root bound to this fixed durable-quorum manifest.
+    #[doc(hidden)]
+    pub fn roster_attestation_trust_root(&self) -> Option<&RosterAttestationTrustRootV1> {
+        self.roster_attestation_trust_root.as_ref()
     }
 
     /// Return the canonical consensus node ordinal for one admitted replica.
@@ -791,6 +847,22 @@ mod tests {
         .expect("manifest")
     }
 
+    fn roster_attestation_root(
+        root_id: [u8; 32],
+        signing_key: [u8; 32],
+    ) -> RosterAttestationTrustRootV1 {
+        let signing_key = p256::ecdsa::SigningKey::from_bytes((&signing_key).into())
+            .expect("fixed P-256 roster root signing key");
+        let public_key = signing_key
+            .verifying_key()
+            .to_sec1_point(true)
+            .as_bytes()
+            .try_into()
+            .expect("compressed P-256 roster root public key");
+        RosterAttestationTrustRootV1::new(root_id, public_key)
+            .expect("fixed roster attestation trust root")
+    }
+
     #[test]
     fn manifest_identity_is_order_independent_and_scope_sensitive() {
         let descriptors = vec![descriptor(1), descriptor(2), descriptor(3)];
@@ -868,6 +940,58 @@ mod tests {
         assert_ne!(
             original.consensus_identity(),
             changed_descriptor.consensus_identity()
+        );
+    }
+
+    #[test]
+    fn fixed_durable_binding_commits_the_optional_roster_attestation_root() {
+        let descriptors = vec![descriptor(1), descriptor(2), descriptor(3)];
+        let first_root = roster_attestation_root([0x61; 32], [0x31; 32]);
+        let second_root = roster_attestation_root([0x62; 32], [0x32; 32]);
+        let rootless = manifest_with_epoch("cluster-a", "legacy-a", 7, descriptors.clone());
+        let root_bound =
+            SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
+                SessionClusterId::new("cluster-a").expect("cluster ID"),
+                SessionConfigurationGeneration::new("legacy-a").expect("generation"),
+                SessionConfigurationEpoch::new(7).expect("configuration epoch"),
+                descriptors.clone(),
+                Some(first_root.clone()),
+            )
+            .expect("root-bound manifest");
+        let rotated_root =
+            SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
+                SessionClusterId::new("cluster-a").expect("cluster ID"),
+                SessionConfigurationGeneration::new("legacy-a").expect("generation"),
+                SessionConfigurationEpoch::new(7).expect("configuration epoch"),
+                descriptors,
+                Some(second_root),
+            )
+            .expect("rotated-root manifest");
+
+        assert_eq!(
+            rootless.consensus_identity(),
+            root_bound.consensus_identity()
+        );
+        assert_ne!(
+            rootless.fixed_durable_quorum_consensus_identity(),
+            root_bound.fixed_durable_quorum_consensus_identity()
+        );
+        assert_ne!(
+            root_bound.fixed_durable_quorum_consensus_identity(),
+            rotated_root.fixed_durable_quorum_consensus_identity()
+        );
+        assert_eq!(
+            root_bound.roster_attestation_trust_root(),
+            Some(&first_root)
+        );
+
+        let root_bound = Arc::new(root_bound);
+        let binding = root_bound
+            .bind_fixed_durable_quorum_local(ReplicaId::new("replica-1").expect("replica ID"))
+            .expect("root-bound fixed durable binding");
+        assert_eq!(
+            binding.consensus_identity(),
+            root_bound.fixed_durable_quorum_consensus_identity()
         );
     }
 

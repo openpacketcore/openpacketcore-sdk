@@ -11,8 +11,8 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -20,23 +20,23 @@ use std::{
 #[cfg(test)]
 use std::sync::Condvar;
 
-use rand::{rngs::SysRng, TryRng};
+use rand::{TryRng, rngs::SysRng};
 use rusqlite::{
-    limits::Limit, params, types::ValueRef, Connection, OpenFlags, OptionalExtension,
-    TransactionBehavior,
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior, limits::Limit, params,
+    types::ValueRef,
 };
 use sha2_zeroize::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
-    FencedTransitionRequestId, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
-    FencedTransitionV2RequestId, PreparedFencedTransition, PreparedFencedTransitionLookup,
-    StoreError, FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_PREPARED_BYTES,
+    FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_PREPARED_BYTES,
     FENCED_TRANSITION_PREPARED_SCHEMA_V1, FENCED_TRANSITION_REQUEST_ID_BYTES,
     FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS, FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
-    FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_V2_REQUEST_ID_BYTES, FencedTransitionRequestId,
+    FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2RequestId,
+    PreparedFencedTransition, PreparedFencedTransitionLookup, StoreError,
 };
 
 /// Width of the independent integrity key protecting one prepared journal.
@@ -3277,8 +3277,8 @@ fn v2_journal_primary_and_epoch_indexes_match(
 ) -> Result<bool, StoreError> {
     let query = |index: &str| {
         format!(
-        "SELECT outer_request_id, history_epoch, bucket, integrity_tag, rowid FROM protected_fenced_transition_v2_journal INDEXED BY {index} ORDER BY history_epoch ASC, outer_request_id ASC LIMIT {V2_JOURNAL_MEMBERSHIP_SCAN_LIMIT}"
-    )
+            "SELECT outer_request_id, history_epoch, bucket, integrity_tag, rowid FROM protected_fenced_transition_v2_journal INDEXED BY {index} ORDER BY history_epoch ASC, outer_request_id ASC LIMIT {V2_JOURNAL_MEMBERSHIP_SCAN_LIMIT}"
+        )
     };
     let mut primary_statement = conn
         .prepare(&query(
@@ -5097,8 +5097,8 @@ fn prepare_secure_journal_path_unix(
     use std::os::unix::ffi::OsStrExt;
 
     use nix::{
-        fcntl::{open, openat, AtFlags, OFlag},
-        sys::stat::{fstat, fstatat, Mode},
+        fcntl::{AtFlags, OFlag, open, openat},
+        sys::stat::{Mode, fstat, fstatat},
     };
 
     let absolute = if path.is_absolute() {
@@ -5256,8 +5256,8 @@ fn validate_existing_sqlite_header(
     use std::os::unix::fs::FileExt;
 
     use nix::{
-        fcntl::{openat, AtFlags, OFlag},
-        sys::stat::{fstat, fstatat, Mode},
+        fcntl::{AtFlags, OFlag, openat},
+        sys::stat::{Mode, fstat, fstatat},
     };
 
     // The process-local inode lease proves that no other SDK journal
@@ -5907,11 +5907,13 @@ mod tests {
                 .expect("unbound lookup"),
             PreparedFencedTransitionLookup::Absent
         );
-        assert!(reopened
-            .require_exact(&retained)
-            .await
-            .expect("exact binding")
-            .is_some());
+        assert!(
+            reopened
+                .require_exact(&retained)
+                .await
+                .expect("exact binding")
+                .is_some()
+        );
         reopened
             .health_check()
             .await
@@ -6660,7 +6662,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepared_journal_rejects_public_directories_and_symlink_files() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let public_directory = tempfile::tempdir().expect("public fixture directory");
         std::fs::set_permissions(
@@ -6688,7 +6690,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepared_journal_rejects_symlinked_parent_and_hardlinked_leaf() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let symlink_fixture = JournalFixture::new(0x4b);
         let real_parent = symlink_fixture._directory.path().join("real");
@@ -6716,7 +6718,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepared_journal_rejects_unowned_parent_when_testable() {
-        use nix::unistd::{chown, geteuid, Uid};
+        use nix::unistd::{Uid, chown, geteuid};
 
         if geteuid().is_root() {
             let fixture = JournalFixture::new(0x4d);
@@ -7069,8 +7071,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protected_v2_journal_fails_closed_for_catalog_table_bucket_epoch_and_metadata_corruption(
-    ) {
+    async fn protected_v2_journal_fails_closed_for_catalog_table_bucket_epoch_and_metadata_corruption()
+     {
         let cases: [(&str, &str); 6] = [
             (
                 "catalog",

@@ -15,9 +15,9 @@ use thiserror::Error;
 
 use crate::consensus::SessionConsensusIdentity;
 use crate::topology::{
-    QuorumTopologyError, QuorumTopologyMode, ReplicaBackingIdentity, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, ValidatedQuorumTopology, QUORUM_TOPOLOGY_MAX_MEMBERS,
-    REPLICA_IDENTITY_MAX_BYTES,
+    QUORUM_TOPOLOGY_MAX_MEMBERS, QuorumTopologyError, QuorumTopologyMode,
+    REPLICA_IDENTITY_MAX_BYTES, ReplicaBackingIdentity, ReplicaFailureDomain, ReplicaId,
+    ReplicaTlsIdentity, ValidatedQuorumTopology,
 };
 
 /// Maximum opaque proof size accepted for one replica observation.
