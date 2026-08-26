@@ -2363,16 +2363,28 @@ mod tests {
             .expect("structurally valid proof bundle")
     }
 
-    fn roster_test_certificate(
-        root: &RosterAttestationTrustRootV1,
-        root_key: &SigningKey,
+    struct RosterTestCertificateInput<'a> {
         role: RosterAttestationCertificateRoleV1,
         identity: SessionConsensusIdentity,
         scope: [u8; 32],
         subject_identity_commitment: [u8; 32],
         key_id: [u8; 32],
-        public_key: &p256::ecdsa::VerifyingKey,
+        public_key: &'a p256::ecdsa::VerifyingKey,
+    }
+
+    fn roster_test_certificate(
+        root: &RosterAttestationTrustRootV1,
+        root_key: &SigningKey,
+        input: RosterTestCertificateInput<'_>,
     ) -> RosterAttestationLeafCertificatePartsV1 {
+        let RosterTestCertificateInput {
+            role,
+            identity,
+            scope,
+            subject_identity_commitment,
+            key_id,
+            public_key,
+        } = input;
         let mut certificate = RosterAttestationLeafCertificatePartsV1 {
             root_id: root.root_id(),
             role,
@@ -2429,12 +2441,14 @@ mod tests {
             roster_test_certificate(
                 &root,
                 &root_key,
-                RosterAttestationCertificateRoleV1::TransportIngress,
-                legacy_identity(),
-                admission.scope().digest(),
-                ingress_input.peer_identity_commitment,
-                [0x47; 32],
-                ingress_key.verifying_key(),
+                RosterTestCertificateInput {
+                    role: RosterAttestationCertificateRoleV1::TransportIngress,
+                    identity: legacy_identity(),
+                    scope: admission.scope().digest(),
+                    subject_identity_commitment: ingress_input.peer_identity_commitment,
+                    key_id: [0x47; 32],
+                    public_key: ingress_key.verifying_key(),
+                },
             ),
             &ingress_input,
             sign_digest(
@@ -2456,12 +2470,14 @@ mod tests {
             roster_test_certificate(
                 &root,
                 &root_key,
-                RosterAttestationCertificateRoleV1::TransportIngress,
-                legacy_identity(),
-                admission.scope().digest(),
-                [0x48; 32],
-                [0x49; 32],
-                ingress_key.verifying_key(),
+                RosterTestCertificateInput {
+                    role: RosterAttestationCertificateRoleV1::TransportIngress,
+                    identity: legacy_identity(),
+                    scope: admission.scope().digest(),
+                    subject_identity_commitment: [0x48; 32],
+                    key_id: [0x49; 32],
+                    public_key: ingress_key.verifying_key(),
+                },
             ),
             &provenance_input,
             sign_digest(
@@ -2516,12 +2532,14 @@ mod tests {
             roster_test_certificate(
                 &root,
                 &root_key,
-                RosterAttestationCertificateRoleV1::TransportIngress,
-                legacy_identity(),
-                admission.scope().digest(),
-                ingress_input.peer_identity_commitment,
-                [0x58; 32],
-                ingress_key.verifying_key(),
+                RosterTestCertificateInput {
+                    role: RosterAttestationCertificateRoleV1::TransportIngress,
+                    identity: legacy_identity(),
+                    scope: admission.scope().digest(),
+                    subject_identity_commitment: ingress_input.peer_identity_commitment,
+                    key_id: [0x58; 32],
+                    public_key: ingress_key.verifying_key(),
+                },
             ),
             &ingress_input,
             sign_digest(
@@ -2543,12 +2561,14 @@ mod tests {
             roster_test_certificate(
                 &root,
                 &root_key,
-                RosterAttestationCertificateRoleV1::TransportIngress,
-                legacy_identity(),
-                admission.scope().digest(),
-                [0x59; 32],
-                [0x5a; 32],
-                ingress_key.verifying_key(),
+                RosterTestCertificateInput {
+                    role: RosterAttestationCertificateRoleV1::TransportIngress,
+                    identity: legacy_identity(),
+                    scope: admission.scope().digest(),
+                    subject_identity_commitment: [0x59; 32],
+                    key_id: [0x5a; 32],
+                    public_key: ingress_key.verifying_key(),
+                },
             ),
             &provenance_input,
             sign_digest(
@@ -2624,12 +2644,14 @@ mod tests {
                 let provider_certificate = roster_test_certificate(
                     &root,
                     &root_key,
-                    RosterAttestationCertificateRoleV1::Provider,
-                    legacy_identity(),
-                    admission.scope().digest(),
-                    [0x5e; 32],
-                    [0x60; 32],
-                    executor_key.verifying_key(),
+                    RosterTestCertificateInput {
+                        role: RosterAttestationCertificateRoleV1::Provider,
+                        identity: legacy_identity(),
+                        scope: admission.scope().digest(),
+                        subject_identity_commitment: [0x5e; 32],
+                        key_id: [0x60; 32],
+                        public_key: executor_key.verifying_key(),
+                    },
                 );
                 let provider = RosterAttestationLeafCertificateV1::issue_from_signed_parts(
                     &root,
@@ -2665,12 +2687,14 @@ mod tests {
             roster_test_certificate(
                 &root,
                 &root_key,
-                RosterAttestationCertificateRoleV1::Executor,
-                legacy_identity(),
-                admission.scope().digest(),
-                [0x5d; 32],
-                terminal_evidence_key_id,
-                executor_key.verifying_key(),
+                RosterTestCertificateInput {
+                    role: RosterAttestationCertificateRoleV1::Executor,
+                    identity: legacy_identity(),
+                    scope: admission.scope().digest(),
+                    subject_identity_commitment: [0x5d; 32],
+                    key_id: terminal_evidence_key_id,
+                    public_key: executor_key.verifying_key(),
+                },
             ),
             &terminal_binding,
             compact_proofs,
