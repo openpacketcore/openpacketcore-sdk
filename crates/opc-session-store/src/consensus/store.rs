@@ -10069,10 +10069,12 @@ fn roster_current_publication_authority_rejected() -> SessionConsumerResponse {
 
 enum RosterAdmissionRead {
     Status(
-        crate::fenced_mutation_roster::Admission,
-        crate::fenced_mutation_roster_executor::AuthorityBinding,
+        Box<(
+            crate::fenced_mutation_roster::Admission,
+            crate::fenced_mutation_roster_executor::AuthorityBinding,
+        )>,
     ),
-    Recovery(crate::fenced_mutation_roster_executor::RecoveryRequest),
+    Recovery(Box<crate::fenced_mutation_roster_executor::RecoveryRequest>),
 }
 
 impl ConsensusSessionConsumerService {
@@ -11260,7 +11262,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                                     SessionConsumerRosterRejection::Authority,
                                 );
                             }
-                            RosterAdmissionRead::Recovery(recovery_request)
+                            RosterAdmissionRead::Recovery(Box::new(recovery_request))
                         }
                         Err(_) => {
                             return admission_read_response(
@@ -11281,7 +11283,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                                     SessionConsumerRosterRejection::Authority,
                                 );
                             }
-                            RosterAdmissionRead::Status(admission, authority)
+                            RosterAdmissionRead::Status(Box::new((admission, authority)))
                         }
                         Err(_) => {
                             return admission_read_response(
@@ -11331,7 +11333,8 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                 };
                 let wall_time_floor = self.store.inner.clock.now_utc();
                 let result = match read {
-                    RosterAdmissionRead::Status(admission, authority) => {
+                    RosterAdmissionRead::Status(admission) => {
+                        let (admission, authority) = *admission;
                         self.store
                             .inner
                             .backend
@@ -11349,7 +11352,7 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                             .backend
                             .consensus_protected_roster_recovery(
                                 self.store.inner.storage_identity,
-                                recovery_request,
+                                *recovery_request,
                                 wall_time_floor,
                             )
                             .await
@@ -12411,13 +12414,6 @@ mod membership_tests {
             admission: Vec<u8>,
             authority: RosterIngressAuthorityWire,
         },
-        Recover {
-            scope: [u8; 32],
-            roster_id: RosterId,
-            original_owner: OwnerId,
-            original_admission_fence: FenceToken,
-            authority: RosterIngressAuthorityWire,
-        },
     }
 
     #[allow(
@@ -12489,32 +12485,6 @@ mod membership_tests {
             .expect("admission frame"),
         )
         .expect("admission capsule")
-    }
-
-    fn recovery_capsule(
-        scope: Scope,
-        roster_id: RosterId,
-        original_owner: OwnerId,
-        original_admission_fence: FenceToken,
-        authority: &AuthorityBinding,
-    ) -> crate::consumer::SessionConsumerRosterAdmissionCapsule {
-        let wire = RosterIngressAdmissionRequestWire::Recover {
-            scope: scope.digest(),
-            roster_id,
-            original_owner,
-            original_admission_fence,
-            authority: authority.into(),
-        };
-        crate::consumer::SessionConsumerRosterAdmissionCapsule::new(
-            crate::fenced_mutation_roster::encode_frame(
-                TEST_ADMISSION_REQUEST_MAGIC,
-                TEST_ADMISSION_REQUEST_DOMAIN,
-                &wire,
-                crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
-            )
-            .expect("recovery frame"),
-        )
-        .expect("recovery capsule")
     }
 
     fn terminal_capsule(

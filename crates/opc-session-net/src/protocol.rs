@@ -1052,7 +1052,7 @@ fn validate_replication_payload_limit(
                 ..
             }) => {
                 validate_record_payload_limit(expected_record, max)?;
-                if let ProtectedRosterEstablishedSuccessor::Put { record } = successor {
+                if let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor {
                     validate_record_payload_limit(record, max)?;
                 }
             }
@@ -1252,7 +1252,7 @@ fn validate_replication_retained_profile(
             } => {
                 validate_session_key_profile(key)?;
                 validate_record_profile(expected_record)?;
-                if let ProtectedRosterEstablishedSuccessor::Put { record } = successor {
+                if let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor {
                     validate_record_profile(record)?;
                 }
             }
@@ -2300,7 +2300,7 @@ impl WireReplicationNode {
             } => ReplicationOp::ProtectedRosterEstablished {
                 key,
                 expected_record,
-                successor,
+                successor: Box::new(successor),
                 owner,
                 fence,
                 credential_id,

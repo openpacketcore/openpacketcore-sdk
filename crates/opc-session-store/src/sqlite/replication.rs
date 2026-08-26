@@ -424,7 +424,7 @@ fn apply_validated_replicated_op_sync(
             conn,
             &key,
             &expected_record,
-            successor,
+            *successor,
             &owner,
             fence,
             credential_id,
@@ -650,7 +650,7 @@ pub(crate) fn validate_replication_payloads(
                     ));
                 }
                 validate_replication_payload_len(expected_record, max_value_bytes)?;
-                if let ProtectedRosterEstablishedSuccessor::Put { record } = successor {
+                if let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor {
                     if record.key != *key {
                         return Err(StoreError::InvalidKey(
                             "protected roster replication key does not match record key".into(),
