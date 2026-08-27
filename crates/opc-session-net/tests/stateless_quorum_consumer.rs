@@ -23,6 +23,10 @@ use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
 };
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
+#[cfg(feature = "test-control")]
+use opc_key::{
+    EncryptedPayload, EnvelopeAad, KeyError, MemoryRemoteSealProvider, RemoteSealProvider,
+};
 use opc_key::{
     KeyHandle, KeyId, KeyProvider, KeyPurpose, MemoryKeyProvider, Zeroizing,
     AES_256_GCM_SIV_KEY_LEN,
@@ -2319,6 +2323,54 @@ impl KeyProvider for CountingKeyProvider {
         tenant: &TenantId,
     ) -> Result<KeyId, opc_key::KeyError> {
         self.inner.rotate_key(purpose, tenant).await
+    }
+}
+
+#[cfg(feature = "test-control")]
+struct CountingRemoteSealProvider {
+    inner: Arc<MemoryRemoteSealProvider>,
+    seal_calls: AtomicUsize,
+    unseal_calls: AtomicUsize,
+}
+
+#[cfg(feature = "test-control")]
+impl CountingRemoteSealProvider {
+    fn new(inner: Arc<MemoryRemoteSealProvider>) -> Self {
+        Self {
+            inner,
+            seal_calls: AtomicUsize::new(0),
+            unseal_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn call_counts(&self) -> (usize, usize) {
+        (
+            self.seal_calls.load(Ordering::SeqCst),
+            self.unseal_calls.load(Ordering::SeqCst),
+        )
+    }
+}
+
+#[cfg(feature = "test-control")]
+#[async_trait]
+impl RemoteSealProvider for CountingRemoteSealProvider {
+    async fn seal(
+        &self,
+        aad: &EnvelopeAad,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, KeyError> {
+        self.seal_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.seal(aad, plaintext).await
+    }
+
+    async fn unseal(
+        &self,
+        key_id: &KeyId,
+        aad: &EnvelopeAad,
+        ciphertext_and_tag: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+        self.unseal_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.unseal(key_id, aad, ciphertext_and_tag).await
     }
 }
 
@@ -7200,9 +7252,65 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
             .expect("durable crash-cut member")
         })
         .collect::<Vec<_>>();
-    let protected_plan = format!("durable-crash-cut-plan-{}", cut.name()).into_bytes();
-    let protected_checkpoint = vec![0xc7, 0x01];
-    let protected_result = vec![0xc8, 0x02];
+    let (protected_plan, protected_checkpoint, protected_result) =
+        if force_snapshot_before_full_restart {
+            let canary = |state_type: &'static str, plaintext: &'static [u8]| StoredSessionRecord {
+                key: key.clone(),
+                generation: expected_generation,
+                owner: owner.clone(),
+                fence: original_guard.fence(),
+                state_class: StateClass::AuthoritativeSession,
+                state_type: StateType::from_static(state_type),
+                expires_at: None,
+                payload: EncryptedSessionPayload::new(plaintext),
+            };
+            let plan = EncryptedSessionPayload::encrypt(
+                setup_provider.as_ref(),
+                &canary(
+                    "durable-roster-rotation-plan",
+                    b"durable-roster-rotation-protected-plan",
+                ),
+                "three-voter-durable-roster-rotation",
+            )
+            .await
+            .expect("seal durable roster plan before rotation")
+            .as_bytes()
+            .to_vec();
+            let checkpoint = EncryptedSessionPayload::encrypt(
+                setup_provider.as_ref(),
+                &canary(
+                    "durable-roster-rotation-checkpoint",
+                    b"durable-roster-rotation-protected-checkpoint",
+                ),
+                "three-voter-durable-roster-rotation",
+            )
+            .await
+            .expect("seal durable roster checkpoint before rotation")
+            .as_bytes()
+            .to_vec();
+            let result = EncryptedSessionPayload::encrypt(
+                setup_provider.as_ref(),
+                &canary(
+                    "durable-roster-rotation-result",
+                    b"durable-roster-rotation-protected-result",
+                ),
+                "three-voter-durable-roster-rotation",
+            )
+            .await
+            .expect("seal durable roster exact result before rotation")
+            .as_bytes()
+            .to_vec();
+            assert!(plan.len() <= FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES);
+            assert!(checkpoint.len() <= FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES);
+            assert!(result.len() <= FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES);
+            (plan, checkpoint, result)
+        } else {
+            (
+                format!("durable-crash-cut-plan-{}", cut.name()).into_bytes(),
+                vec![0xc7, 0x01],
+                vec![0xc8, 0x02],
+            )
+        };
     let proposal = AdmissionProposal::new(
         FencedMutationRosterProfile::v1(),
         RosterId::from_bytes([0x92; 16]).expect("durable crash-cut roster ID"),
@@ -7331,6 +7439,22 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
     };
     assert_eq!(initial_provider.prepare_calls.load(Ordering::SeqCst), 0);
     assert_eq!(initial_provider.execute_calls.load(Ordering::SeqCst), 0);
+    if force_snapshot_before_full_restart {
+        let provider_calls_before_rotation = setup_provider.calls();
+        let rotated_key_id = setup_provider
+            .rotate_key(KeyPurpose::Session, &key.tenant)
+            .await
+            .expect("rotate local roster protection key after admission");
+        assert_ne!(
+            rotated_key_id,
+            KeyId::new("consumer-v2-test-key").expect("original local roster protection key ID")
+        );
+        assert_eq!(
+            setup_provider.calls(),
+            provider_calls_before_rotation,
+            "rotation changes future sealing authority without reading or rebuilding admitted bytes"
+        );
+    }
 
     let mut initial_proofs = Vec::with_capacity(6);
     for ordinal in 0..cut.initial_member_count() {
@@ -8110,6 +8234,13 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
         [terminal_baseline + 1; THREE_VOTER_COUNT],
         "publication is provider-local and cannot add a third roster proposal",
     );
+    if force_snapshot_before_full_restart {
+        assert_eq!(
+            setup_provider.calls(),
+            protected_payload_key_calls_before_restart,
+            "snapshot, full restart, cross-voter recovery, terminalization, and publication reuse the exact pre-rotation envelopes without key lookup, reseal, or IV draw"
+        );
+    }
 
     recovery_shutdown.shutdown().await;
     recovery_server.abort_and_wait().await;
@@ -8516,9 +8647,65 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
             .expect("Aborted snapshot member")
         })
         .collect::<Vec<_>>();
-    let protected_plan = b"aborted-snapshot-plan".to_vec();
-    let protected_checkpoint = vec![0xaf, 0x01, 0x00, 0xff];
-    let protected_result = vec![0xb0, 0x02, 0x00, 0xfe];
+    let remote_key_material = Arc::new(MemoryRemoteSealProvider::new(
+        KeyId::new("aborted-roster-remote-key-2026-08").expect("remote roster key ID"),
+        KeyPurpose::Session,
+        key.tenant.clone(),
+        Zeroizing::new([0x6d; AES_256_GCM_SIV_KEY_LEN]),
+    ));
+    let remote_provider = Arc::new(CountingRemoteSealProvider::new(Arc::clone(
+        &remote_key_material,
+    )));
+    let canary = |state_type: &'static str, plaintext: &'static [u8]| StoredSessionRecord {
+        key: key.clone(),
+        generation: expected_generation,
+        owner: owner.clone(),
+        fence: original_guard.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static(state_type),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new(plaintext),
+    };
+    let protected_plan = EncryptedSessionPayload::remote_seal(
+        remote_provider.as_ref(),
+        &canary(
+            "aborted-roster-remote-plan",
+            b"aborted-roster-remote-protected-plan",
+        ),
+        "three-voter-aborted-roster-remote-rotation",
+    )
+    .await
+    .expect("remote-seal Aborted roster plan before admission")
+    .as_bytes()
+    .to_vec();
+    let protected_checkpoint = EncryptedSessionPayload::remote_seal(
+        remote_provider.as_ref(),
+        &canary(
+            "aborted-roster-remote-checkpoint",
+            b"aborted-roster-remote-protected-checkpoint",
+        ),
+        "three-voter-aborted-roster-remote-rotation",
+    )
+    .await
+    .expect("remote-seal Aborted roster checkpoint before admission")
+    .as_bytes()
+    .to_vec();
+    let protected_result = EncryptedSessionPayload::remote_seal(
+        remote_provider.as_ref(),
+        &canary(
+            "aborted-roster-remote-result",
+            b"aborted-roster-remote-protected-result",
+        ),
+        "three-voter-aborted-roster-remote-rotation",
+    )
+    .await
+    .expect("remote-seal Aborted roster exact result before admission")
+    .as_bytes()
+    .to_vec();
+    assert!(protected_plan.len() <= FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES);
+    assert!(protected_checkpoint.len() <= FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES);
+    assert!(protected_result.len() <= FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES);
+    assert_eq!(remote_provider.call_counts(), (3, 0));
     let proposal = AdmissionProposal::new(
         FencedMutationRosterProfile::v1(),
         RosterId::from_bytes([0xb1; 16]).expect("Aborted snapshot roster ID"),
@@ -8634,6 +8821,17 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
     fleet
         .wait_all_application_sequences(admission_baseline + 2)
         .await;
+    let remote_key_id_before_rotation = remote_key_material
+        .active_key_id()
+        .await
+        .expect("read pre-rotation remote roster key ID");
+    let remote_key_id_after_rotation = remote_key_material
+        .rotate_key()
+        .await
+        .expect("rotate remote roster protection key after Aborted commit");
+    assert_ne!(remote_key_id_before_rotation, remote_key_id_after_rotation);
+    let remote_provider_calls_after_rotation = remote_provider.call_counts();
+    assert_eq!(remote_provider_calls_after_rotation, (3, 0));
     let terminal_log_index = fleet.stores[leader]
         .status()
         .last_log_index
@@ -8806,6 +9004,11 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
             .load(Ordering::SeqCst),
         0
     );
+    assert_eq!(
+        remote_provider.call_counts(),
+        remote_provider_calls_after_rotation,
+        "cross-voter Aborted recovery returns the admitted remote-sealed bytes without unseal or reseal"
+    );
 
     let (mut workload_leader, _, mut workload_term) = fleet.wait_for_observed_leader().await;
     let workload_baseline = fleet.stores[workload_leader]
@@ -8854,6 +9057,11 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
         "conclusive Aborted terminal",
     )
     .await;
+    assert_eq!(
+        remote_provider.call_counts(),
+        remote_provider_calls_after_rotation,
+        "snapshot creation copies the exact remote-sealed Aborted bytes without provider access"
+    );
 
     drop(recovery_client);
     drop(recovery_adapter);
@@ -8940,6 +9148,11 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
             .roster_terminal_calls
             .load(Ordering::SeqCst),
         0
+    );
+    assert_eq!(
+        remote_provider.call_counts(),
+        remote_provider_calls_after_rotation,
+        "full restart returns the byte-identical pre-rotation remote envelopes without unseal, reseal, or provider replay"
     );
 
     restart_shutdown.shutdown().await;
