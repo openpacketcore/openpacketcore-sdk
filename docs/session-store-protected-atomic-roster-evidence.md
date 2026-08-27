@@ -28,8 +28,8 @@ and one all-or-none Established or Aborted terminal mutation.
 ## Candidate lineage
 
 The signed semantic candidate immediately before this evidence-only refresh is
-`6086d735f55e9f35f8b23cc3b05e1d6dd3716fd6`, tree
-`903ba32cd566c1efd385ce1a029b837f2e189b41`. It is based directly on the
+`f380444d29a59e0a1fbea49bb4afff3adee3f0c8`, tree
+`05b3a52cdd86572d93d59a949eb260492276d4e1`. It is based directly on the
 normal PR #717 merge at `ff3d41b08b73d987e52c9a87481f3ef7266f760c` and is
 published as [draft PR #729](https://github.com/openpacketcore/openpacketcore-sdk/pull/729).
 The PR remains a candidate, not a consumable pin: hosted checks and the final
@@ -111,7 +111,10 @@ result: PASS (all three full-fleet durable-reopen cases)
 assertions: higher-fence cross-node recovery; old/expired fence rejection;
             exact checkpoint/result after restart/leader change; Established
             before publication; published-before-ACK and Attempted ambiguity
-            do not repeat the external publication effect
+            do not repeat the external publication effect; the snapshot case
+            rotates the local protection key after admission, then recovers
+            through a voter distinct from the admission voter without key
+            lookup, reconstruction, reseal, or a new IV draw
 ```
 
 The three full-fleet restart cases are serialized with a test-only semaphore;
@@ -131,7 +134,9 @@ assertions: six SDK-issued NotApplied + Reconciled member proofs commit
             Aborted; a different voter recovers the exact protected
             checkpoint/result before physical snapshot compaction; a full
             three-voter durable reopen returns byte-identical Aborted bytes and
-            has no publication authority or publication path
+            has no publication authority or publication path; the remote seal
+            key rotates after commit and seal/unseal call counts remain frozen
+            through cross-voter recovery, snapshot creation, and full restart
 ```
 
 ## Retention and snapshot evidence
@@ -173,15 +178,65 @@ conversion without a second capacity charge, snapshot/restart restoration,
 local and remote key rotation, terminal record plus receipt atomicity, exact
 replay/conflict, successor fencing, and fixed numeric diagnostics.
 
-## Successor gate audit
+## SQLite writer-handoff reliability evidence
 
-The 2026-08-26 successor-lineage audit completed these exact local gates at
-the signed semantic candidate above:
+The fixed-profile startup recovery lane first proves with read-only statements
+that a durable physical-prune backlog exists. A pristine reopen therefore does
+not take SQLite's singleton writer transaction merely to discover an empty
+purge floor. When a primary preempts real prune work, interrupt delivery is
+serialized with rollback and the secondary connection must be autocommit (or
+be dropped) before the primary handoff opens.
 
 ```text
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-result: PASS
+cargo test --locked -p opc-session-store --all-features --lib \
+  consensus::storage::tests::pristine_fixed_store_prune_recovery_never_takes_sqlite_writer \
+  -- --exact --nocapture --test-threads=1
 
+cargo test --locked -p opc-session-store --all-features --lib \
+  consensus::storage::tests::fixed_prune_yields_writer_to_later_adapter_append_and_resumes \
+  -- --exact --nocapture --test-threads=1
+
+cargo test --locked -p opc-session-store --all-features --lib \
+  consensus::storage::tests::fixed_prune_preempts_for_state_machine_apply_without_applied_lag \
+  -- --exact --nocapture --test-threads=1
+
+cargo test --locked -p opc-session-store --all-features --lib \
+  consensus_log_prune -- --nocapture --test-threads=1
+
+result: PASS; exact cases pass and all 14 prune-lane tests pass
+stress: 500/500 pristine fresh processes; 500/500 backlog handoffs;
+        200/200 apply + prune + pinned-reader checkpoint processes
+assertions: no needless startup writer; no late interrupt during rollback;
+            primary apply/append succeeds inside the existing one-second
+            bound; physical backlog resumes; pinned PASSIVE checkpoint drains
+```
+
+The same bytes pass the affected real topology cases:
+
+```text
+cargo test --locked -p opc-session-net --all-features --test stateless_quorum_consumer \
+  persistent_three_voter_protected_roster_survives_real_os_process_loss \
+  -- --exact --nocapture --test-threads=1
+result: PASS; 193.86s
+
+CARGO_PROFILE_TEST_OPT_LEVEL=1 \
+  cargo test --locked -p opc-session-net --all-features --test stateless_quorum_consumer \
+  persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running \
+  -- --exact --nocapture --test-threads=1
+result: PASS; 36.44s
+```
+
+## Successor gate audit
+
+The 2026-08-26 successor-lineage audit first completed the full local behavior
+suites at signed semantic checkpoint
+`d109854e7e5b46e946bf8bf125de87981c8538a8`, tree
+`1a9e2157adf79fdfb38ad048759ee84246cab82f`. Later additive commits close the
+bounded SQLite writer handoff and extend the cross-voter key-rotation evidence;
+their focused gates and the exact-head hosted lanes are recorded separately so
+this document does not attribute an earlier full-suite run to newer bytes.
+
+```text
 cargo fmt --all -- --check
 git diff --check
 result: PASS
@@ -201,21 +256,25 @@ result: PASS; 44 passed, 0 failed
 
 cargo test --locked -p opc-session-net --all-features --test stateless_quorum_consumer \
   -- --nocapture
-result: PASS; 40 passed, 0 failed, 2 release-only latency tests ignored
+result: PASS; 43 passed, 0 failed, 2 release-only latency tests ignored
 ```
 
-The predecessor published checkpoint passed hosted strict Clippy, Rust gates,
-MSRV, generated-code drift, the persistence contract,
-security/advisory/license scans, and the privileged Linux datapath jobs. The
-exact candidate above must rerun every hosted lane and obtain an independent
-exact-head review; this document does not claim merge readiness.
+At the signed semantic candidate above, focused local strict Clippy for
+`opc-session-store` and `opc-session-net`, the production roster transport, and
+the Established and Aborted cross-voter key-rotation/restart cases pass. Hosted
+run `33031393057` at predecessor semantic SHA `17e9f05d5fa44e463521d2f49eefe6aefae58c55`
+passes workspace strict Clippy, Rust gates, MSRV, generated-code drift, the
+persistence contract, both integration shards, both heavy shards, docs,
+feature powerset, platform checks, and security/advisory/license scans. The
+remaining hosted workflows and independent frozen-head review are still
+required; this document does not claim merge readiness.
 
 ## Required final gates
 
 Before publication, rerun on the exact final head:
 
 ```text
-cargo fmt --all --check
+cargo fmt --all -- --check
 git diff --check
 cargo check --locked --workspace --all-targets --all-features
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
