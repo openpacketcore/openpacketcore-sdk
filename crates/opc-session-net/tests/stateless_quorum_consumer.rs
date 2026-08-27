@@ -7736,10 +7736,18 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
     } else {
         fleet.wait_for_observed_leader().await
     };
-    // Exercise recovery through the currently observed leader while all three
-    // voters independently validate and apply the retained state. Endpoint
-    // routing is intentionally outside this roster qualification boundary.
-    let recovery_voter = recovery_leader;
+    // The physical snapshot/reopen qualification recovers through a voter
+    // distinct from the original admission voter. Other crash cuts retain the
+    // observed-leader route while all three voters independently validate and
+    // apply the retained state.
+    let recovery_voter = if force_snapshot_before_full_restart && recovery_leader == leader {
+        (leader + 1) % THREE_VOTER_COUNT
+    } else {
+        recovery_leader
+    };
+    if force_snapshot_before_full_restart {
+        assert_ne!(recovery_voter, leader);
+    }
     let recovery_server_spiffe = three_voter_spiffe(recovery_voter);
     let recovery_service = Arc::new(fleet.stores[recovery_voter].consumer_service());
     let recovery_transport = Arc::new(CommitThenLoseConsumerResponse::roster_passthrough(
@@ -7749,7 +7757,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
     let (recovery_server, recovery_address) = SessionQuorumConsumerServer::new(
         recovery_transport.clone(),
         pki.server_config(&recovery_server_spiffe),
-        authorizer,
+        three_voter_authorizer(&fleet.stores[recovery_voter], &client_spiffe).await,
     )
     .with_roster_ingress(recovery_transport.clone(), ingress_signer.clone())
     .listen(
@@ -7760,9 +7768,10 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
     .await
     .expect("start durable crash-cut recovery listener");
     let recovery_server = AbortConsumerServerOnDrop::new(recovery_server);
-    // Mutating lease acquisition and the read-only recovery boundary both use
-    // the current leader; durable-reopen evidence comes from the discarded
-    // clients/providers and the full-fleet restart cuts.
+    // Mutating lease acquisition uses the current leader. The read-only
+    // snapshot recovery boundary uses the distinct voter selected above;
+    // durable-reopen evidence also comes from discarded clients/providers and
+    // the full-fleet restart.
     let lease_server_spiffe = three_voter_spiffe(recovery_leader);
     let lease_service = Arc::new(fleet.stores[recovery_leader].consumer_service());
     let lease_transport = Arc::new(CommitThenLoseConsumerResponse::roster_passthrough(
