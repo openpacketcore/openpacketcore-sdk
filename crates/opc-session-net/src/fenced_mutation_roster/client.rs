@@ -1243,9 +1243,10 @@ pub struct FencedMutationRosterClient {
 impl FencedMutationRosterClient {
     /// Compose the client inside the crate from the startup-owned executor.
     ///
-    /// `SessionBackend` integration is intentionally the only intended caller.
-    /// There is no public constructor and no per-operation provider or backend
-    /// argument, preventing substitution of consensus/admin authority.
+    /// The startup-owned persistent `/3` provider-adapter composition is the
+    /// only intended caller. There is no public constructor and no
+    /// per-operation provider or backend argument, preventing substitution of
+    /// consensus/admin authority.
     pub(crate) fn new<P, B>(executor: RosterExecutor<P, B>, scope: Scope) -> Self
     where
         P: super::canonical::MemberProvider,

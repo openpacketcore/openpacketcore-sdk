@@ -18,6 +18,24 @@ scope, and one bounded persistent pool for the adapter lifetime. There is no
 public raw consensus/store constructor and no per-subscriber connection, task,
 channel, provider, or authority entry.
 
+Every fixed-durable voter must activate the exact current roster profile before
+advertising `/3`, then install the protected ingress signer on the quorum
+consumer server:
+
+```text
+store.activate_protected_roster_profile().await?
+service = Arc::new(store.consumer_service())
+server = SessionQuorumConsumerServer::new(service.clone(), tls, authorizer)
+    .with_roster_ingress(service, ingress_signer)
+```
+
+Activation persists the voter-set-bound profile certificate. Missing or stale
+activation, a mixed-capability voter set, an ingress signer whose trust-root
+identity does not match the store, or omission of `with_roster_ingress` keeps
+the dedicated lane unavailable and admission fails closed. The public client
+path is the persistent `/3` composition above; #707 does not add a generic
+`SessionBackend` implementation or expose a raw consensus client.
+
 The public contract is additive under the `FencedMutationRoster*` names in
 `opc-session-net`. The principal entry points are:
 
