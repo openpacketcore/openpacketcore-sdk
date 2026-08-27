@@ -14,6 +14,7 @@ on:
       - "crates/opc-session-testkit/qualification/v6/session-ha-profile.schema.json"
       - "crates/opc-session-testkit/tests/qualification_profile.rs"
       - "scripts/build-egress-fence-ebpf.sh"
+      - "ci/setup-fsverity-tmp.sh"
       - "scripts/publish-order.py"
       - ".github/workflows/egress-fence.yml"
       - "Cargo.toml"
@@ -33,6 +34,7 @@ on:
       - "crates/opc-session-testkit/qualification/v6/session-ha-profile.schema.json"
       - "crates/opc-session-testkit/tests/qualification_profile.rs"
       - "scripts/build-egress-fence-ebpf.sh"
+      - "ci/setup-fsverity-tmp.sh"
       - "scripts/publish-order.py"
       - ".github/workflows/egress-fence.yml"
       - "Cargo.toml"
@@ -98,6 +100,9 @@ jobs:
           sudo install -m 0755 "${bpftool_path}" /usr/local/bin/bpftool
           bpftool version
           cargo install bpf-linker --version 0.10.3 --locked
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
 
       - name: Gate host sources
         run: |

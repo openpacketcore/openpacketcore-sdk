@@ -872,6 +872,17 @@ floor and otherwise fails closed. Fences, lease credentials, application
 sequence, request outcomes, and logical time move together with the
 authoritative state-machine image.
 
+The fixed-immutable authority profile additionally requires Linux fs-verity on
+the snapshot filesystem. The SDK closes all writable aliases, reopens the
+final inode read-only with `O_NOFOLLOW`, enables the fixed v1/SHA-256/4 KiB
+profile with no salt or signature, and only then performs the bounded envelope
+scan outside the primary SQLite lock. Metadata publication remeasures the
+sealed inode in constant time. Build, install, startup, and offline recovery
+fail closed when the filesystem does not support that exact profile or when a
+fixed snapshot is unsealed; a byte-identical mutable replacement is not valid
+fixed-profile evidence. Dynamic authority retains bounded corruption
+detection and does not claim kernel-enforced immutability.
+
 Runbook: keep traffic and ownership publication closed unless readiness is
 `Ready`. During `catching_up` or `awaiting_quorum`, restore authenticated peer
 reachability and let Openraft reconcile; do not invoke raw rebuild or edit a

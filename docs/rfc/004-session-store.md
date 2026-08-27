@@ -890,6 +890,13 @@ epoch-derived and do not include the fixed-profile or placement-policy binding.
 `ConsensusSessionStore::open_fixed_durable_quorum` is supported only on Linux,
 where descriptor-pinned SQLite snapshots are available; other platforms MUST
 return `FixedQuorumUnsupportedPlatform` before durable initialization.
+Linux alone is insufficient for the fixed profile: the snapshot filesystem
+MUST support the exact fs-verity v1 profile (SHA-256, 4 KiB block size, no salt,
+and no signature). Build, installation, startup, and recovery MUST reject an
+unsupported filesystem or an unsealed fixed-profile artifact before it can be
+accepted as durable state. The dynamic profile remains available without this
+fixed artifact requirement, but MUST retain its bounded corruption detection
+and fail closed on invalid snapshot evidence.
 Fixed membership does not authorize dynamic membership transitions, a second
 consensus engine, a controller feed, or a new packet-core protocol path.
 `try_from_fixed_durable_quorum_with_authenticated_placement` may additionally
@@ -1614,25 +1621,25 @@ umbrella until that fleet evidence passes.
 application-consumer boundary. They MUST use mutual TLS and the dedicated
 `opc-session-consumer/1` ALPN with transport revision 5 for the existing V1
 operation family. The additive V2 epoch-fenced-transition family MUST use only
-the distinct `opc-session-consumer/2` ALPN with transport revision 5. These are
+the distinct `opc-session-consumer/2` ALPN with transport revision 6. These are
 separate exact protocols from both `opc-session-consensus/2` and the
 quarantined `opc-session-net/5` compatibility protocol. A V2 client MUST NOT
 fall back to V1, and a lane authenticated for either ALPN MUST NOT carry or be
 reused for the other's Hello or request envelope. A listener MAY offer both
 exact ALPNs, but only as independently authenticated, independently decoded
 lanes; it MUST NOT negotiate a common revision or treat either as equivalent
-consumer authority. The server MUST reject every V2 revision other than 5
+consumer authority. The server MUST reject every V2 revision other than 6
 before dispatch; a V1-only peer therefore also fails before V2 dispatch.
 
 V1 revision 5 does not interoperate with revisions 1, 2, 3, or 4. Because this
 SDK is unreleased, a V1 revision cutover MUST drain consumer clients and
 listeners; fallback, V1 dual-mode, and mixed-revision V1 operation are
-unsupported. Deployment MUST provision revision-5 V2 listener support,
+unsupported. Deployment MUST provision revision-6 V2 listener support,
 V2-capable store authority, and the required protected-wrapper V2 journal before
 enabling an explicit V2 client call. V1 traffic may continue on its revision-5
 ALPN while V2 is introduced or drained, but that coexistence is not fallback,
 dual-mode wire negotiation, or mixed-revision operation of one request family.
-Removal of V2 requires draining V2 callers first. Revision-5 V1 and revision-5
+Removal of V2 requires draining V2 callers first. Revision-5 V1 and revision-6
 V2 private JSON DTO bytes are canonical; reordered or otherwise noncanonical
 encodings, aliases, omissions, and unknown fields MUST fail closed.
 
@@ -1718,33 +1725,46 @@ to catch up merely because it did not acknowledge activation: an old reader
 could silently omit new snapshot state, which the persistent fence prevents by
 rejecting the activated image.
 
-Each request connection carries a connection-local, nonzero `u32` sequence
-that increases monotonically and never wraps, paired with a fresh unpredictable
-UUID nonce serialized after the complete request. The server admits only the
-exact next sequence and the client accepts only the exact composite response
-correlation. A lane retires after at most 4,096 sequential calls. There is
+Each V2 request connection carries a connection-local, nonzero `u32` sequence
+that increases monotonically and never wraps, paired with a fresh full-width
+128-bit OS-CSPRNG nonce and a domain-separated commitment to the exact canonical
+request bytes and operation phase. The server admits only the exact next
+sequence and the client accepts only the exact composite response tuple. A V2
+lane retires after at most 4,096 sequential calls. There is
 exactly one in-flight call per connection, with no multiplexing. This is
 structural: it isolates cancellation and pre-staged/late responses and removes
-write-position ambiguity. The client uses a
+write-position ambiguity.
+
+Revision 6 validates the HelloAck request-frame ceiling independently from the
+client's response-frame capacity: any nonzero request ceiling through the fixed
+16 MiB maximum is valid, and the exact bounded encoder MUST reject an
+oversized Call before writing its length prefix. The response-frame capacity
+retains the larger fixed minimum required by bounded batch responses.
+
+The client uses a
 fixed, fair pool of four request connections by default (at most 16 when
 configured), with 64 pending calls by default and a hard maximum of 256. A
 pending call may wait or age for at most 250 ms. Watches use two separate slots
 by default (at most 16 when configured), never consuming request-pool capacity.
 
-`PersistentSessionConsumerClient` has separate fixed V2 lanes of the same
-configured request width. `prewarm_v2` establishes revision-5 lanes without
+`PersistentSessionConsumerClient` has an ALPN-specific V2 idle pool while V1
+and V2 share one configured request width, pending queue, and prewarm gate.
+`prewarm_v2` establishes revision-6 lanes within that aggregate width without
 dispatching an operation, `execute_v2` dispatches only on a V2 lane, and
-`v2_diagnostics` reports only V2 redaction-safe pool state. V1 and V2 queues,
-sockets, and authenticated Hello exchanges are never cross-reused. Their shared
-physical request admission remains bounded but is sized so the legal fixed
-widths of both revisions coexist; it does not allocate a connection, task,
-channel, or pool per subscriber. DNS resolution, TCP, TLS, and Hello are
+`v2_diagnostics` reports only V2 redaction-safe pool state. V1 and V2 idle
+sockets and authenticated Hello exchanges are never cross-reused; their
+logical lane and pending-call admission is aggregate. Their
+aggregate persistent width is the configured request width (at most 16), and
+may rebalance only by retiring an opposite-protocol idle lane (never active
+work or V2 poison debt) before the existing setup deadline; it does not
+allocate a connection, task, channel, or pool per subscriber. DNS resolution,
+TCP, TLS, and Hello are
 performed only on establishment or re-establishment of the relevant lane, not
 on reuse.
 
 Stateless-client clones share a bounded physical-admission ceiling per clone
-lineage. Request admission is sized for the legal simultaneous fixed V1 and V2
-persistent widths, while watch admission remains capped at 16. The respective
+lineage. V1 and V2 share exactly 16 request connections, while watch admission
+remains separately capped at 16. The respective
 permit MUST be acquired before resolve/TCP and held for the complete physical
 connection lifetime, including by a persistent client derived from that
 stateless lineage. Independently constructed stateless clients define
@@ -1888,11 +1908,12 @@ or record-scaled maintenance state is introduced.
 The v7 qualification profile remains the revision-2 persistent-transport
 inventory and records its connection, frame, request/response, watch, task,
 and lifecycle limits beside the consensus profile. The published v6 profile
-remains the unchanged revision-1 contract. Revision 5 retains those bounded
+remains the unchanged revision-1 contract. V1 revision 5 retains those bounded
 transport properties, the revision-3 generic #696 family, and revision-4 exact
-retained status recovery for ordinary leases, then adds unpredictable causal
-correlation, exact below-TLS write observation, rolling fresh prewarm, and
-pool-wide cold-setup serialization. The live v8 exact-head schema remains
+retained status recovery for ordinary leases. V2 revision 6 adds the full-width
+attempt tuple and exact request/phase commitment while retaining exact below-TLS
+write observation, rolling fresh prewarm, and pool-wide cold-setup serialization.
+The live v8 exact-head schema remains
 experimental and fixes `qualification_complete=false`. No profile or evidence
 records consumer identity or scope material. Synthetic warm accept/reuse checks
 gate only their transport method; elapsed samples are non-gating and are not an

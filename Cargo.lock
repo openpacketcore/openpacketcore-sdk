@@ -2831,6 +2831,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-fs-verity-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "linux-raw-sys",
+ "tempfile",
+]
+
+[[package]]
 name = "opc-gnmi-server"
 version = "0.2.0"
 dependencies = [
@@ -3692,6 +3701,7 @@ dependencies = [
  "opc-config-model",
  "opc-consensus",
  "opc-crypto",
+ "opc-fs-verity-sys",
  "opc-key",
  "opc-mgmt-audit",
  "opc-redaction",

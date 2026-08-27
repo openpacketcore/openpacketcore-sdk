@@ -668,7 +668,7 @@ observation.
 A post-retention history must likewise be re-derived from current authoritative
 state under a fresh ID; the old transition is never revived. The consumer-wire
 revision-5 V1 contract preserves every V1 status distinction. The distinct V2
-consumer ALPN uses wire revision 5 and preserves every V2 status distinction,
+consumer ALPN uses wire revision 6 and preserves every V2 status distinction,
 including `EpochNotActive` and `StorageExhausted` inside `Recorded`,
 through a closed wire-safe enum. Frozen legacy session-net v5 maps this result
 fail-closed as an unknown capability; no v5 wire enum changes and that protocol
@@ -734,7 +734,7 @@ surface retains #695's capability, observation, execution, ambiguity, and
 exact-status contract over both the one-shot and bounded persistent
 least-authority mTLS clients. Its public transition ID is the frozen 16-byte V1
 ID. V2 does not extend that wire shape: it uses the separate ALPN `/2`
-revision-5 lane documented above, including V2's full 56-byte identity and
+revision-6 lane documented above, including V2's full 56-byte identity and
 V2-specific status set. Neither lane exposes a generic backend, replication,
 membership, snapshot, rebuild, or administrative authority. Product/ePDG
 composition and workflow semantics remain outside this SDK operation.

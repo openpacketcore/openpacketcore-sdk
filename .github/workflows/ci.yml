@@ -168,6 +168,9 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
       # Each shard builds only its own test targets, so the tree stays far
       # below the former single-job peak that forced `cargo clean` between
       # steps. Debug symbols remain off via CARGO_PROFILE_*_DEBUG above; do

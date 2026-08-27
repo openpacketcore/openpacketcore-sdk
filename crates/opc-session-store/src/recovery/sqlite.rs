@@ -3145,7 +3145,12 @@ fn ensure_target_backup(
         limits,
     )? {
         let destination = backup_snapshots.join(&snapshot.file_name);
-        copy_file_bounded(&snapshot.path, &destination, limits.max_snapshot_bytes())?;
+        copy_snapshot_file_bounded(
+            &snapshot.path,
+            &destination,
+            limits.max_snapshot_bytes(),
+            snapshot.fixed_immutable,
+        )?;
         let (digest, length) = digest_file(&destination, limits.max_snapshot_bytes())?;
         files.push(BackupFileEvidence {
             role: "snapshot".to_string(),
@@ -3350,7 +3355,12 @@ fn create_checkpoint(
     )?;
     let (snapshot_name, snapshot_digest) = if let Some(snapshot) = snapshot {
         let destination = snapshots.join(&snapshot.file_name);
-        copy_file_bounded(&snapshot.path, &destination, limits.max_snapshot_bytes())?;
+        copy_snapshot_file_bounded(
+            &snapshot.path,
+            &destination,
+            limits.max_snapshot_bytes(),
+            snapshot.fixed_immutable,
+        )?;
         let digest = digest_file(&destination, limits.max_snapshot_bytes())?.0;
         (Some(snapshot.file_name), Some(digest))
     } else {
@@ -3572,7 +3582,12 @@ fn stage_source(
     let snapshot =
         current_snapshot_reference(staged, plan.body.identity, &paths.snapshots, limits)?;
     let source_snapshot_name = if let Some(snapshot) = snapshot {
-        copy_file_bounded(&snapshot.path, staged_snapshot, limits.max_snapshot_bytes())?;
+        copy_snapshot_file_bounded(
+            &snapshot.path,
+            staged_snapshot,
+            limits.max_snapshot_bytes(),
+            snapshot.fixed_immutable,
+        )?;
         Some(snapshot.file_name)
     } else {
         None
@@ -3835,7 +3850,15 @@ fn install_staged_snapshot(
     } else {
         require_path_absent(&temporary)?;
     }
-    copy_file_bounded(staged_snapshot, &temporary, limits.max_snapshot_bytes())?;
+    let fixed_immutable = fixed_immutable_profile(&open_read_only(&paths.database)?)?;
+    // `temporary` owns the only writer produced by copy_file_bounded. Seal it
+    // before atomic promotion or any target metadata/database use.
+    copy_snapshot_file_bounded(
+        staged_snapshot,
+        &temporary,
+        limits.max_snapshot_bytes(),
+        fixed_immutable,
+    )?;
     fs::rename(&temporary, paths.snapshots.join(file_name))
         .map_err(|_| RecoveryError::FileOperationFailed)?;
     sync_directory(&paths.snapshots)
@@ -3865,6 +3888,11 @@ fn verify_installed_snapshot(
     validate_snapshot_name(file_name)?;
     let paths = canonical_replica_paths(target, false)?;
     let expected = verify_snapshot_file(staged_snapshot, limits.max_snapshot_bytes(), None)?;
+    let fixed_immutable = fixed_immutable_profile(&open_read_only(&paths.database)?)?;
+    if fixed_immutable {
+        measure_fixed_snapshot(staged_snapshot)?;
+        measure_fixed_snapshot(&paths.snapshots.join(file_name))?;
+    }
     let observed = verify_snapshot_file(
         &paths.snapshots.join(file_name),
         limits.max_snapshot_bytes(),
@@ -4407,6 +4435,7 @@ fn write_workflow(
 struct SnapshotReference {
     file_name: String,
     path: PathBuf,
+    fixed_immutable: bool,
 }
 
 fn current_snapshot_reference(
@@ -4433,11 +4462,99 @@ fn current_snapshot_reference(
     };
     validate_snapshot_name(&file_name)?;
     let path = snapshot_dir.join(&file_name);
+    let fixed_immutable = fixed_immutable_profile(&conn)?;
+    if fixed_immutable {
+        measure_fixed_snapshot(&path)?;
+    }
     let (checksum, length) = verify_snapshot_file(&path, limits.max_snapshot_bytes(), None)?;
     if checksum != expected_checksum || length != expected_length {
         return Err(RecoveryError::CorruptReplica);
     }
-    Ok(Some(SnapshotReference { file_name, path }))
+    Ok(Some(SnapshotReference {
+        file_name,
+        path,
+        fixed_immutable,
+    }))
+}
+
+/// Return whether this offline replica carries the fixed authority profile.
+/// The profile is persisted with the identity, so recovery can preserve the
+/// same fail-closed transport invariant without guessing from membership.
+fn fixed_immutable_profile(conn: &Connection) -> Result<bool, RecoveryError> {
+    let present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('consensus_identity') WHERE name = 'authority_profile')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    if !present {
+        return Ok(false);
+    }
+    let profile: Option<i64> = conn
+        .query_row(
+            "SELECT authority_profile FROM consensus_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| RecoveryError::CorruptReplica)?;
+    match profile {
+        Some(1) => Ok(false),
+        Some(2) => Ok(true),
+        _ => Err(RecoveryError::CorruptReplica),
+    }
+}
+
+/// Require an existing fixed fs-verity seal on a recovery source artifact.
+/// A byte-identical but unsealed replacement is not equivalent evidence.
+fn measure_fixed_snapshot(path: &Path) -> Result<(), RecoveryError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsFd as _;
+
+        let file = open_regular_read(path).map_err(|_| RecoveryError::CorruptReplica)?;
+        opc_fs_verity_sys::measure(file.as_fd()).map_err(|_| RecoveryError::CorruptReplica)?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(RecoveryError::CorruptReplica)
+    }
+}
+
+/// Seal a freshly copied recovery snapshot after its writer has closed. This
+/// is intentionally distinct from database copies: recovery later writes its
+/// SQLite database, while snapshot envelopes are immutable transport objects.
+fn seal_fixed_snapshot(path: &Path) -> Result<(), RecoveryError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsFd as _;
+
+        let file = open_regular_read(path).map_err(|_| RecoveryError::FileOperationFailed)?;
+        opc_fs_verity_sys::enable_fixed_profile(file.as_fd())
+            .map_err(|_| RecoveryError::FileOperationFailed)?;
+        opc_fs_verity_sys::measure(file.as_fd()).map_err(|_| RecoveryError::FileOperationFailed)?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(RecoveryError::FileOperationFailed)
+    }
+}
+
+fn copy_snapshot_file_bounded(
+    source: &Path,
+    destination: &Path,
+    max: u64,
+    fixed_immutable: bool,
+) -> Result<(), RecoveryError> {
+    copy_file_bounded(source, destination, max)?;
+    if fixed_immutable {
+        seal_fixed_snapshot(destination)?;
+    }
+    Ok(())
 }
 
 fn verify_snapshot_file(
@@ -4883,6 +5000,37 @@ fn open_directory(path: &Path) -> std::io::Result<File> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY);
     }
     options.open(path)
+}
+
+#[cfg(test)]
+mod fixed_snapshot_copy_tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_recovery_copy_is_sealed_only_after_the_writer_closes() {
+        let directory = tempfile::tempdir().expect("fs-verity recovery directory");
+        let source = directory.path().join("source.opc");
+        let fixed_destination = directory.path().join("fixed-copy.opc");
+        let dynamic_destination = directory.path().join("dynamic-copy.opc");
+        std::fs::write(&source, b"fixed recovery snapshot").expect("write fixed recovery source");
+        match seal_fixed_snapshot(&source) {
+            Ok(()) => {}
+            Err(RecoveryError::FileOperationFailed) => return,
+            Err(error) => panic!("unexpected source seal error: {error:?}"),
+        }
+        copy_snapshot_file_bounded(&source, &fixed_destination, 1024, true)
+            .expect("copy and seal fixed recovery artifact");
+        measure_fixed_snapshot(&fixed_destination)
+            .expect("fixed recovery copy has a kernel seal before use");
+
+        copy_snapshot_file_bounded(&source, &dynamic_destination, 1024, false)
+            .expect("copy dynamic recovery artifact");
+        assert!(
+            measure_fixed_snapshot(&dynamic_destination).is_err(),
+            "dynamic recovery copy must not be described as immutable"
+        );
+    }
 }
 
 #[cfg(test)]

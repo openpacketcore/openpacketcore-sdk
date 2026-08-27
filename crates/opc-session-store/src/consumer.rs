@@ -597,7 +597,7 @@ impl fmt::Debug for SessionConsumerRequest {
     }
 }
 
-/// Explicit revision-5-only operations for the V2 fenced-transition
+/// Explicit revision-6-only operations for the V2 fenced-transition
 /// contract.
 ///
 /// This is deliberately a distinct request family rather than variants on
@@ -692,7 +692,7 @@ impl SessionConsumerV2Operation {
     }
 }
 
-/// One scope-bound revision-5 V2 consumer request.
+/// One scope-bound revision-6 V2 consumer request.
 ///
 /// V2 execute/status retain the full 56-byte V2 request identity outside the
 /// operation body as well as inside it. The duplicated value is intentional:
@@ -708,7 +708,7 @@ pub struct SessionConsumerV2Request {
 }
 
 impl SessionConsumerV2Request {
-    /// Construct an exact revision-5 V2 request.
+    /// Construct an exact revision-6 V2 request.
     pub fn new(scope: SessionConsumerScope, operation: SessionConsumerV2Operation) -> Self {
         let request_id = operation.request_id();
         Self {
@@ -731,7 +731,7 @@ impl SessionConsumerV2Request {
         self.request_id
     }
 
-    /// Typed revision-5-only operation.
+    /// Typed revision-6-only operation.
     pub const fn operation(&self) -> &SessionConsumerV2Operation {
         &self.operation
     }
@@ -1637,7 +1637,7 @@ pub enum SessionConsumerResponse {
     Rejected(SessionConsumerRejection),
 }
 
-/// Typed response carried only by the revision-5 V2 consumer lane.
+/// Typed response carried only by the revision-6 V2 consumer lane.
 ///
 /// This intentionally does not extend [`SessionConsumerResponse`]: adding a
 /// V2 response discriminator there would allow a revision-3 decoder to
@@ -1732,7 +1732,7 @@ pub trait SessionQuorumConsumer: Send + Sync {
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse;
 
-    /// Execute one authenticated revision-5 V2 request.
+    /// Execute one authenticated revision-6 V2 request.
     ///
     /// The default does no backend work and keeps an existing V1-only quorum
     /// implementation fail-closed on the new lane. Implementations that

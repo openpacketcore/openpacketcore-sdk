@@ -17,7 +17,7 @@ use sha2::Digest as _;
 #[cfg(test)]
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd as _, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt as _;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -154,11 +154,15 @@ pub(crate) struct PinnedSqliteFile {
     cleanup: Option<UnpublishedSnapshotArtifact>,
 }
 
-/// Content, length, and Linux inode-generation authority bound to an immutable
-/// snapshot artifact. This is kept separate from the live SQLite descriptor
-/// identity: SQLite legitimately changes a live database through another
-/// descriptor while a published or install artifact must never change after it
-/// is verified.
+/// Kernel-enforced content, length, and Linux inode-generation authority
+/// bound to a fixed snapshot artifact. This is kept separate from the live
+/// SQLite descriptor identity: SQLite legitimately changes a live database
+/// through another descriptor while a published or install artifact must
+/// never change after it is verified.
+///
+/// This is deliberately not a userspace hash claim: `digest` is the
+/// fixed-profile fs-verity measurement of the read-only descriptor.  A live
+/// SQLite descriptor must never carry this state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ImmutableFileGeneration {
     length: u64,
@@ -580,24 +584,84 @@ impl PinnedSqliteFile {
         }
     }
 
-    /// Bind this handle to the exact contents of an artifact that has become
-    /// immutable. Live SQLite descriptors intentionally never use this.
-    pub(crate) fn pin_immutable(mut self) -> io::Result<Self> {
-        self.verify_identity()?;
-        self.immutable_generation = Some(immutable_file_generation(&self.file, &self.path)?);
-        Ok(self)
+    /// Reopen a final artifact read-only with `O_NOFOLLOW`, authenticate the
+    /// pathname to the new descriptor, and enable the fixed fs-verity profile.
+    /// Every writable alias held by this process must have been dropped before
+    /// this call. The kernel rejects a concurrent writer, which is the point
+    /// of sealing rather than merely observing a hash.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reopen_and_seal_fixed(path: &Path) -> io::Result<Self> {
+        let file = readonly_nofollow(path)?;
+        let mut pinned = Self::from_file(file, path.to_path_buf())?;
+        pinned.verify_linked_identity()?;
+        if !pinned.path_matches_identity(path)? {
+            return Err(invalid_data("fixed snapshot path changed before sealing"));
+        }
+        let digest = opc_fs_verity_sys::enable_fixed_profile(pinned.file.as_fd())
+            .map_err(fs_verity_enable_error)?;
+        let metadata = pinned.file.metadata()?;
+        pinned.immutable_generation = Some(ImmutableFileGeneration {
+            length: metadata.len(),
+            digest,
+            change_time: linux_file_change_time(&metadata),
+        });
+        pinned.verify_immutable_generation()?;
+        Ok(pinned)
+    }
+
+    /// Reopen a final fixed artifact and require an existing fixed fs-verity
+    /// seal. This is used after restart and for received fixed snapshots;
+    /// unsealed byte-identical replacements fail closed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reopen_and_measure_fixed(path: &Path) -> io::Result<Self> {
+        let file = readonly_nofollow(path)?;
+        let mut pinned = Self::from_file(file, path.to_path_buf())?;
+        pinned.verify_linked_identity()?;
+        if !pinned.path_matches_identity(path)? {
+            return Err(invalid_data(
+                "fixed snapshot path changed before measurement",
+            ));
+        }
+        let digest =
+            opc_fs_verity_sys::measure(pinned.file.as_fd()).map_err(fs_verity_measure_error)?;
+        let metadata = pinned.file.metadata()?;
+        pinned.immutable_generation = Some(ImmutableFileGeneration {
+            length: metadata.len(),
+            digest,
+            change_time: linux_file_change_time(&metadata),
+        });
+        pinned.verify_immutable_generation()?;
+        Ok(pinned)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn reopen_and_seal_fixed(_path: &Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fixed snapshot sealing is unavailable",
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn reopen_and_measure_fixed(_path: &Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fixed snapshot sealing is unavailable",
+        ))
     }
 
     /// Recheck the previously bound immutable content generation.
     pub(crate) fn verify_immutable_generation(&self) -> io::Result<()> {
-        self.verify_identity()?;
+        self.verify_linked_identity()?;
         let expected = self.immutable_generation.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "pinned SQLite file immutable generation is absent",
             )
         })?;
-        if immutable_file_generation(&self.file, &self.path)? == expected {
+        self.verify_bound_immutable_metadata(expected)?;
+        let digest = fixed_verity_measurement(&self.file)?;
+        if digest == expected.digest {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -607,13 +671,15 @@ impl PinnedSqliteFile {
         }
     }
 
-    /// Validate a sealed snapshot envelope and bind its immutable generation
-    /// from exactly one bounded, sequential descriptor scan.
+    /// Validate a snapshot envelope through exactly one bounded, sequential
+    /// descriptor scan. Fixed callers must seal and measure this descriptor
+    /// before entering this method; the envelope scan itself never claims
+    /// userspace hashing makes a mutable file immutable.
     ///
     /// The trailing footer is retained in a fixed-size buffer while the
-    /// preceding bytes feed the payload digest. The same bytes also feed the
-    /// immutable-generation digest, so fixed-profile publication does not
-    /// first verify an envelope and then rehash it to bind its generation.
+    /// preceding bytes feed the payload digest. Fixed-profile generation
+    /// authority comes from the kernel measurement, never this userspace
+    /// validation digest.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn verify_snapshot_envelope_and_bind_immutable_generation(
         &mut self,
@@ -661,7 +727,6 @@ impl PinnedSqliteFile {
         block_fixed_prepublication_scan(&self.path);
         let mut reader = self.file.try_clone()?;
         reader.seek(io::SeekFrom::Start(0))?;
-        let mut envelope_hasher = sha2::Sha256::new();
         let mut payload_hasher = sha2::Sha256::new();
         let mut trailing = [0_u8; 48];
         let mut trailing_len = 0_usize;
@@ -688,7 +753,6 @@ impl PinnedSqliteFile {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "snapshot length overflow")
                 })?;
-            envelope_hasher.update(&buffer[..read]);
             if trailing_len + read <= footer_len {
                 trailing[trailing_len..trailing_len + read].copy_from_slice(&buffer[..read]);
                 trailing_len = trailing_len.checked_add(read).ok_or_else(|| {
@@ -808,12 +872,9 @@ impl PinnedSqliteFile {
                 "session consensus snapshot changed during verification",
             ));
         }
-        self.immutable_generation = Some(ImmutableFileGeneration {
-            length: total_length,
-            digest: envelope_hasher.finalize().into(),
-            #[cfg(target_os = "linux")]
-            change_time: bound_change_time,
-        });
+        // The envelope hash is validation only. Fixed callers bind and
+        // remeasure the kernel fs-verity generation separately; this method
+        // remains a bounded envelope validator for Dynamic corruption checks.
         Ok(ImmutableSnapshotEnvelope {
             payload_length,
             total_length,
@@ -825,8 +886,8 @@ impl PinnedSqliteFile {
     ///
     /// The bounded scan above remains the sole content authority. This method
     /// deliberately performs only descriptor identity/link, pathname identity,
-    /// length, and Linux kernel change-time generation checks so SQLite's
-    /// mutex need not cover a second full-file hash.
+    /// fs-verity measurement, length, and Linux kernel change-time generation
+    /// checks so SQLite's mutex need not cover a second full-file hash.
     pub(crate) fn verify_bound_immutable_snapshot_envelope(
         &self,
         path: &Path,
@@ -845,8 +906,7 @@ impl PinnedSqliteFile {
             ));
         }
 
-        self.verify_linked_identity()?;
-        self.verify_bound_immutable_metadata(immutable_generation)?;
+        self.verify_immutable_generation()?;
         if !self.path_matches_identity(path)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -856,8 +916,7 @@ impl PinnedSqliteFile {
 
         // Recheck after resolving the pathname so a replacement or unlink
         // racing that lookup cannot authorize the metadata write.
-        self.verify_linked_identity()?;
-        self.verify_bound_immutable_metadata(immutable_generation)?;
+        self.verify_immutable_generation()?;
         if !self.path_matches_identity(path)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -945,51 +1004,60 @@ impl PinnedSqliteFile {
     }
 }
 
-fn immutable_file_generation(
-    file: &std::fs::File,
-    _path: &Path,
-) -> io::Result<ImmutableFileGeneration> {
-    use sha2::{Digest as _, Sha256};
+#[cfg(target_os = "linux")]
+fn readonly_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
 
-    let mut reader = file.try_clone()?;
-    reader.seek(io::SeekFrom::Start(0))?;
-    let initial_metadata = reader.metadata()?;
-    let length = initial_metadata.len();
-    #[cfg(target_os = "linux")]
-    let initial_change_time = linux_file_change_time(&initial_metadata);
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options.open(path)
+}
+
+#[cfg(target_os = "linux")]
+fn fixed_verity_measurement(file: &std::fs::File) -> io::Result<[u8; 32]> {
+    opc_fs_verity_sys::measure(file.as_fd()).map_err(fs_verity_measure_error)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fixed_verity_measurement(_file: &std::fs::File) -> io::Result<[u8; 32]> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "fixed snapshot sealing is unavailable",
+    ))
+}
+
+fn invalid_data(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn fs_verity_enable_error(error: opc_fs_verity_sys::Error) -> io::Error {
+    let kind = match error {
+        opc_fs_verity_sys::Error::Unsupported
+        | opc_fs_verity_sys::Error::UnsupportedProfile { .. } => io::ErrorKind::Unsupported,
+        opc_fs_verity_sys::Error::Enable(error) => {
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)
+            ) {
+                io::ErrorKind::Unsupported
+            } else {
+                io::ErrorKind::InvalidData
+            }
         }
-        digest.update(&buffer[..read]);
-    }
-    let scanned_metadata = file.metadata()?;
-    #[cfg(target_os = "linux")]
-    let bound_change_time = linux_file_change_time(&scanned_metadata);
-    if scanned_metadata.len() != length {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "pinned SQLite file changed during immutable generation scan",
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    if bound_change_time != initial_change_time {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "pinned SQLite file changed during immutable generation scan",
-        ));
-    }
-    #[cfg(test)]
-    record_fixed_prepublication_scan(_path, length);
-    Ok(ImmutableFileGeneration {
-        length,
-        digest: digest.finalize().into(),
-        #[cfg(target_os = "linux")]
-        change_time: bound_change_time,
-    })
+        // An enable operation that cannot immediately measure the requested
+        // fixed profile is not an artifact authorization success.
+        opc_fs_verity_sys::Error::Measure(_) => io::ErrorKind::InvalidData,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, "fixed snapshot sealing is unavailable")
+}
+
+fn fs_verity_measure_error(_error: opc_fs_verity_sys::Error) -> io::Error {
+    // A fixed artifact without a readable fixed-profile measurement is corrupt
+    // (or unavailable), but never a pathname-bearing diagnostic.
+    io::Error::new(io::ErrorKind::InvalidData, "fixed snapshot seal is invalid")
 }
 
 impl fmt::Debug for PinnedSqliteFile {
@@ -1773,17 +1841,15 @@ impl AsyncSeek for SessionSnapshotFile {
 mod tests {
     use std::io;
     #[cfg(target_os = "linux")]
-    use std::io::{Read as _, Seek as _, Write as _};
+    use std::io::{Read as _, Write as _};
     use std::pin::Pin;
     use std::sync::Arc;
 
     #[cfg(not(target_os = "linux"))]
     use super::PinnedSqliteFile;
     #[cfg(target_os = "linux")]
-    use super::{PinnedSqliteFile, UnpublishedSnapshotArtifact};
+    use super::{fs_verity_enable_error, PinnedSqliteFile, UnpublishedSnapshotArtifact};
     use super::{SessionSnapshotFile, SnapshotArtifactGate, SnapshotReplayRead};
-    #[cfg(target_os = "linux")]
-    use sha2::Digest as _;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncSeek as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
@@ -2144,65 +2210,60 @@ mod tests {
         let directory = tempdir()?;
         let path = directory.path().join("snapshot");
         std::fs::write(&path, b"original")?;
-        let pinned = PinnedSqliteFile::from_file(std::fs::File::open(&path)?, path.clone())?
-            .pin_immutable()?;
+        let pinned = match PinnedSqliteFile::reopen_and_seal_fixed(&path) {
+            Ok(pinned) => pinned,
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
 
-        let mut writer = std::fs::OpenOptions::new().append(true).open(path)?;
-        writer.write_all(b" changed")?;
-        writer.sync_all()?;
-
-        let error = pinned
+        match std::fs::OpenOptions::new().append(true).open(path) {
+            Err(_) => {}
+            Ok(mut writer) => assert!(writer.write_all(b" changed").is_err()),
+        }
+        pinned
             .verify_immutable_generation()
-            .err()
-            .ok_or("mutated immutable artifact was accepted")?;
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            .expect("sealed descriptor retains its fixed measurement");
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bound_envelope_rejects_same_inode_same_length_mutation_after_scan(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        const FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
-        const FOOTER_BYTES: u64 = 48;
-
+    fn fixed_seal_rejects_a_preexisting_writer() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
-        let path = directory.path().join("snapshot.opc");
-        let payload = b"descriptor-bound immutable envelope";
-        let payload_length = u64::try_from(payload.len())?;
-        let checksum: [u8; 32] = sha2::Sha256::digest(payload).into();
-        let total_length = payload_length
-            .checked_add(FOOTER_BYTES)
-            .ok_or("fixture length overflow")?;
-        let mut envelope = Vec::from(payload.as_slice());
-        envelope.extend_from_slice(FOOTER_MAGIC);
-        envelope.extend_from_slice(&payload_length.to_be_bytes());
-        envelope.extend_from_slice(&checksum);
-        std::fs::write(&path, envelope)?;
+        let path = directory.path().join("snapshot");
+        std::fs::write(&path, b"fixed snapshot")?;
+        let writer = std::fs::OpenOptions::new().append(true).open(&path)?;
+        match PinnedSqliteFile::reopen_and_seal_fixed(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return Ok(()),
+            Err(_) => {}
+            Ok(_) => return Err("fixed seal accepted a preexisting writer".into()),
+        }
+        drop(writer);
+        match PinnedSqliteFile::reopen_and_seal_fixed(&path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 
-        let mut pinned = PinnedSqliteFile::from_file(std::fs::File::open(&path)?, path.clone())?;
-        pinned.verify_snapshot_envelope_and_bind_immutable_generation(
-            &path,
-            FOOTER_MAGIC,
-            FOOTER_BYTES,
-            1024,
-            checksum,
-            total_length,
-        )?;
-
-        let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
-        writer.seek(io::SeekFrom::Start(0))?;
-        writer.write_all(b"X")?;
-        writer.sync_all()?;
-        assert_eq!(std::fs::metadata(&path)?.len(), total_length);
-        pinned.verify_linked_identity()?;
-        assert!(pinned.path_matches_identity(&path)?);
-
-        let error = pinned
-            .verify_bound_immutable_snapshot_envelope(&path, total_length)
-            .expect_err("same-inode same-length post-scan mutation was accepted");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        Ok(())
+    #[test]
+    fn fixed_enable_errno_classification_preserves_unsupported_admission() {
+        for errno in [libc::ENOTTY, libc::EOPNOTSUPP, libc::ENOSYS] {
+            assert_eq!(
+                io::ErrorKind::Unsupported,
+                fs_verity_enable_error(opc_fs_verity_sys::Error::Enable(
+                    io::Error::from_raw_os_error(errno,)
+                ))
+                .kind()
+            );
+        }
+        assert_eq!(
+            io::ErrorKind::InvalidData,
+            fs_verity_enable_error(opc_fs_verity_sys::Error::Enable(
+                io::Error::from_raw_os_error(libc::EBUSY,)
+            ))
+            .kind()
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

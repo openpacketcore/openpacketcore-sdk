@@ -314,6 +314,13 @@ its vote/log/commit/application/membership state from SQLite and resumes
 through its normal recovery path. Keep readiness false until the fresh
 linearizable probe succeeds.
 
+For a fixed-immutable quorum, the snapshot directory must remain on a Linux
+filesystem with the fixed fs-verity v1/SHA-256/4 KiB profile available. Every
+referenced snapshot must retain its kernel seal across restart. Copying the
+same bytes to an unsealed inode, moving the directory to an unsupported
+filesystem, or leaving a writable alias open is a fail-closed storage error,
+not a rebootstrap or checksum-repair condition.
+
 On open, the adapter first verifies any snapshot referenced by durable state.
 It then scans at most 8,192 directory entries and removes only recognized
 interrupted receive/build/install/promote, approved-recovery, SQLite-sidecar,

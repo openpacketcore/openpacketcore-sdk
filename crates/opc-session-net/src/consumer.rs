@@ -43,7 +43,7 @@ use opc_session_store::{
 use opc_types::SpiffeId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -62,7 +62,7 @@ use crate::protocol::{
     read_authenticated_frame_payload_with_active_timeout_until,
     validate_restore_scan_wire_payload_bytes, write_frame_bounded_until,
     write_frame_bounded_until_classified_with_progress, FrameWriteError, FrameWriteProgress,
-    WireBackendCapabilities, MAX_NEGOTIATED_FRAME_SIZE,
+    WireBackendCapabilities, FRAME_READ_CHUNK_BYTES, MAX_NEGOTIATED_FRAME_SIZE,
 };
 
 /// Dedicated ALPN for authenticated session-quorum consumers.
@@ -70,8 +70,8 @@ pub const SESSION_QUORUM_CONSUMER_ALPN: &[u8] = b"opc-session-consumer/1";
 
 /// Dedicated ALPN for the explicit V2 fenced-transition consumer lane.
 ///
-/// It is intentionally distinguishable from revision 5 at TLS negotiation;
-/// a V1-only peer therefore cannot mistake a V2 operation for a new V1
+/// It is intentionally distinguishable from the V1 ALPN at TLS negotiation;
+/// a V1-only peer therefore cannot mistake a V2 operation for a V1
 /// operation even before the authenticated revision handshake is checked.
 pub const SESSION_QUORUM_CONSUMER_V2_ALPN: &[u8] = b"opc-session-consumer/2";
 
@@ -81,16 +81,21 @@ pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 5;
 /// Fixed wire revision for [`SESSION_QUORUM_CONSUMER_V2_ALPN`].
 ///
 /// The V2 server rejects every other Hello revision before dispatch.
-pub const SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION: u16 = 5;
+pub const SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION: u16 = 6;
 
 /// Maximum sequential application requests processed on one consumer
 /// connection. Every request has an exact nonzero connection-local
 /// correlation and only one can be in flight.
 pub const MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION: usize = 4096;
-/// Fixed logical width of the nonzero connection-local correlation value.
+/// Fixed V1 logical width of the nonzero connection-local correlation value.
 pub const SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES: usize =
     std::mem::size_of::<u32>() + std::mem::size_of::<uuid::Uuid>();
-/// Revision 5 deliberately admits one in-flight request per physical lane.
+/// Exact fixed width of a revision-6 V2 Call attempt tuple: a nonzero
+/// connection-local correlation, a full 128-bit attempt nonce, and the
+/// 256-bit domain-separated request commitment.
+pub const SESSION_QUORUM_CONSUMER_V2_ATTEMPT_TUPLE_BYTES: usize =
+    std::mem::size_of::<u32>() + std::mem::size_of::<[u8; 16]>() + std::mem::size_of::<[u8; 32]>();
+/// Revision 6 deliberately admits one in-flight request per physical V2 lane.
 pub const MAX_SESSION_QUORUM_CONSUMER_IN_FLIGHT_PER_CONNECTION: usize = 1;
 
 /// Default number of authenticated request lanes retained by a persistent
@@ -139,6 +144,14 @@ const MIN_SESSION_CONSUMER_RESPONSE_FRAME_SIZE: usize =
 fn checked_consumer_frame_size(size: u32) -> Result<usize, ProtocolError> {
     let size = usize::try_from(size).map_err(|_| ProtocolError::InvalidWireValue)?;
     if !(MIN_SESSION_CONSUMER_RESPONSE_FRAME_SIZE..=MAX_NEGOTIATED_FRAME_SIZE).contains(&size) {
+        return Err(ProtocolError::InvalidWireValue);
+    }
+    Ok(size)
+}
+
+fn checked_consumer_v2_request_frame_size(size: u32) -> Result<usize, ProtocolError> {
+    let size = usize::try_from(size).map_err(|_| ProtocolError::InvalidWireValue)?;
+    if !(1..=MAX_NEGOTIATED_FRAME_SIZE).contains(&size) {
         return Err(ProtocolError::InvalidWireValue);
     }
     Ok(size)
@@ -239,9 +252,12 @@ impl QueuedConsumerWatchItem {
         if let Some(pool) = self.watch_pool.take() {
             pool.counters.watch_buffered.fetch_sub(1, Ordering::Relaxed);
         }
-        self.item
-            .take()
-            .expect("queued watch item is returned at most once")
+        match self.item.take() {
+            Some(item) => item,
+            None => Err(StoreError::BackendUnavailable(
+                "queued watch item ownership invariant failed".to_owned(),
+            )),
+        }
     }
 }
 
@@ -695,9 +711,11 @@ pub enum PersistentSessionConsumerConfigError {
 ///
 /// Fields are private so a pool cannot be constructed with an unbounded task,
 /// queue, or connection cardinality. A pending-call count of zero deliberately
-/// selects fail-fast admission. V1 and V2 each use revision 5 and receive this
-/// fixed request width (at most 16) and their own bounded pending queue; their
-/// sockets and physical admission ceilings remain ALPN-isolated.
+/// selects fail-fast admission. Revision 3 and revision 5 share this fixed
+/// aggregate request width (at most 16), its bounded pending queue, and one
+/// prewarm gate. Their authenticated idle sockets remain ALPN-isolated; an
+/// aggregate-cap request may retire only an opposite-protocol idle lane to
+/// rebalance that fixed capacity.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PersistentSessionConsumerConfig {
     request_connections: usize,
@@ -1924,7 +1942,7 @@ enum ConsumerWireResponse {
     WatchEntry(ConsumerWatchEntry),
 }
 
-/// Revision-5-only call envelope. It intentionally has no V1 operation or
+/// Revision-6-only call envelope. It intentionally has no V1 operation or
 /// response member, so a V2 frame cannot be decoded as a V1 call frame.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1944,16 +1962,84 @@ struct ConsumerV2CallResponse {
     response: Box<SessionConsumerV2Response>,
 }
 
+/// Typed failure to construct the V2 Call body witness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2RequestCommitmentError {
+    Serialize,
+    UnsupportedOperation,
+}
+
+const V2_REQUEST_COMMITMENT_DOMAIN: &[u8] =
+    b"openpacketcore/session-consumer/v2/call-commitment/v1\0";
+
+fn v2_request_operation_tag(
+    operation: &SessionConsumerV2Operation,
+) -> Result<&'static [u8], V2RequestCommitmentError> {
+    Ok(match operation {
+        SessionConsumerV2Operation::FencedTransitionV2Capability => {
+            b"fenced_transition_v2_capability"
+        }
+        SessionConsumerV2Operation::FencedTransitionV2HistoryState => {
+            b"fenced_transition_v2_history_state"
+        }
+        SessionConsumerV2Operation::FencedTransitionV2 { .. } => b"fenced_transition_v2",
+        SessionConsumerV2Operation::FencedTransitionV2Batch { .. } => b"fenced_transition_v2_batch",
+        SessionConsumerV2Operation::FencedTransitionV2Status { .. } => {
+            b"fenced_transition_v2_status"
+        }
+        _ => return Err(V2RequestCommitmentError::UnsupportedOperation),
+    })
+}
+
 fn v2_request_commitment(
     request: &SessionConsumerV2Request,
-) -> Result<[u8; 32], serde_json::Error> {
-    use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(request)?;
-    let mut domain = Vec::with_capacity(32 + bytes.len());
-    domain.extend_from_slice(b"opc-session-consumer-v2-call-phase");
-    domain.extend_from_slice(&SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION.to_be_bytes());
-    domain.extend_from_slice(&bytes);
-    Ok(Sha256::digest(domain).into())
+) -> Result<[u8; 32], V2RequestCommitmentError> {
+    v2_request_commitment_with_serializer(request, serde_json::to_vec)
+}
+
+fn v2_request_commitment_with_serializer<E, F>(
+    request: &SessionConsumerV2Request,
+    serialize: F,
+) -> Result<[u8; 32], V2RequestCommitmentError>
+where
+    F: FnOnce(&SessionConsumerV2Request) -> Result<Vec<u8>, E>,
+{
+    let request_bytes = serialize(request).map_err(|_| V2RequestCommitmentError::Serialize)?;
+    let operation = v2_request_operation_tag(request.operation())?;
+    Ok(v2_request_commitment_from_parts(
+        V2_REQUEST_COMMITMENT_DOMAIN,
+        SESSION_QUORUM_CONSUMER_V2_ALPN,
+        SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+        b"Call",
+        b"request",
+        operation,
+        &request_bytes,
+    ))
+}
+
+fn v2_request_commitment_from_parts(
+    domain: &[u8],
+    alpn: &[u8],
+    transport_revision: u16,
+    wire_kind: &[u8],
+    body_kind: &[u8],
+    operation: &[u8],
+    request_bytes: &[u8],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update((alpn.len() as u16).to_be_bytes());
+    digest.update(alpn);
+    digest.update(transport_revision.to_be_bytes());
+    digest.update((wire_kind.len() as u16).to_be_bytes());
+    digest.update(wire_kind);
+    digest.update((body_kind.len() as u16).to_be_bytes());
+    digest.update(body_kind);
+    digest.update((operation.len() as u16).to_be_bytes());
+    digest.update(operation);
+    digest.update((request_bytes.len() as u64).to_be_bytes());
+    digest.update(request_bytes);
+    digest.finalize().into()
 }
 
 fn v2_attempt_nonce() -> Result<[u8; 16], rand::rngs::SysError> {
@@ -1964,7 +2050,13 @@ fn v2_attempt_nonce() -> Result<[u8; 16], rand::rngs::SysError> {
     Ok(nonce)
 }
 
-/// Private wire family admitted only after the V2 ALPN and exact revision-5
+#[cfg(test)]
+type V2AttemptEntropyTestHook = Arc<dyn Fn() -> Result<[u8; 16], ()> + Send + Sync>;
+#[cfg(test)]
+type V2RequestCommitmentTestHook =
+    Arc<dyn Fn(&SessionConsumerV2Request) -> Result<[u8; 32], ()> + Send + Sync>;
+
+/// Private wire family admitted only after the V2 ALPN and exact revision-6
 /// handshake. Keeping it as a separate enum keeps V1 and V2 discriminators
 /// isolated.
 #[derive(Serialize, Deserialize)]
@@ -2063,7 +2155,10 @@ fn v2_response_matches_request(
                     result.request_id() == request.request_id()
                         && match result.result() {
                             Ok(outcome) => outcome.matches_v2_request(request),
-                            Err(error) => error.is_wire_valid(),
+                            Err(error) => {
+                                error.is_pre_dispatch_deterministic()
+                                    || error.is_recorded_deterministic()
+                            }
                         }
                 })
         }
@@ -3276,7 +3371,7 @@ fn consumer_client_tls_config_for_alpn(
 fn consumer_server_tls_config(config: Arc<opc_tls::ServerConfig>) -> Arc<opc_tls::ServerConfig> {
     let mut config = config.as_ref().clone();
     // The client's one-element ALPN offer selects exactly one lane. Keeping
-    // both names here lets one listener serve V1/revision 5 and V2/revision 5
+    // both names here lets one listener serve V1/revision 5 and V2/revision 6
     // without falling back across their semantic boundary.
     config.alpn_protocols = vec![
         SESSION_QUORUM_CONSUMER_V2_ALPN.to_vec(),
@@ -3607,6 +3702,9 @@ struct ConsumerConnection {
     /// Watch and stateless connections deliberately leave it empty.
     pool_connection: Option<Weak<PersistentSessionConsumerPool>>,
     _physical_admission: Option<OwnedSemaphorePermit>,
+    /// Aggregate V1/V2 persistent socket-width admission, retained for the
+    /// lifetime of this connection including while it is idle.
+    _persistent_physical_admission: Option<OwnedSemaphorePermit>,
 }
 
 struct ConsumerRotationReceivers<'a> {
@@ -3624,22 +3722,16 @@ impl Drop for ConsumerConnection {
 
 #[derive(Clone)]
 struct StatelessConsumerPhysicalAdmission {
-    v1_requests: Arc<Semaphore>,
-    v2_requests: Arc<Semaphore>,
+    requests: Arc<Semaphore>,
     watches: Arc<Semaphore>,
 }
 
 impl StatelessConsumerPhysicalAdmission {
     fn new() -> Self {
         Self {
-            // Request revisions are physically and cryptographically
-            // separated by ALPN. Keep their fixed admissions separate too:
-            // legal V1 and V2 pools can coexist, while stateless clones can
-            // never consume more than the published V1 bound.
-            v1_requests: Arc::new(Semaphore::new(
-                MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS,
-            )),
-            v2_requests: Arc::new(Semaphore::new(
+            // V1 and V2 keep distinct ALPN connection pools but all
+            // stateless request sockets share one physical cap.
+            requests: Arc::new(Semaphore::new(
                 MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS,
             )),
             watches: Arc::new(Semaphore::new(
@@ -3649,13 +3741,13 @@ impl StatelessConsumerPhysicalAdmission {
     }
 
     fn try_acquire_v1(&self) -> Result<OwnedSemaphorePermit, SessionConsumerClientError> {
-        Arc::clone(&self.v1_requests)
+        Arc::clone(&self.requests)
             .try_acquire_owned()
             .map_err(|_| SessionConsumerClientError::Overloaded)
     }
 
     fn try_acquire_v2(&self) -> Result<OwnedSemaphorePermit, SessionConsumerClientError> {
-        Arc::clone(&self.v2_requests)
+        Arc::clone(&self.requests)
             .try_acquire_owned()
             .map_err(|_| SessionConsumerClientError::Overloaded)
     }
@@ -4474,6 +4566,10 @@ pub struct StatelessSessionConsumerClient {
     reauthentication: SessionReauthenticationControl,
     physical_admission: StatelessConsumerPhysicalAdmission,
     #[cfg(test)]
+    v2_attempt_entropy_test_hook: Option<V2AttemptEntropyTestHook>,
+    #[cfg(test)]
+    v2_request_commitment_test_hook: Option<V2RequestCommitmentTestHook>,
+    #[cfg(test)]
     final_admission_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -4539,6 +4635,10 @@ impl StatelessSessionConsumerClient {
             reauthentication: SessionReauthenticationControl::new(),
             physical_admission: StatelessConsumerPhysicalAdmission::new(),
             #[cfg(test)]
+            v2_attempt_entropy_test_hook: None,
+            #[cfg(test)]
+            v2_request_commitment_test_hook: None,
+            #[cfg(test)]
             final_admission_test_hook: None,
         }
     }
@@ -4547,6 +4647,37 @@ impl StatelessSessionConsumerClient {
     fn with_final_admission_test_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.final_admission_test_hook = Some(hook);
         self
+    }
+
+    #[cfg(test)]
+    fn with_v2_attempt_entropy_test_hook(mut self, hook: V2AttemptEntropyTestHook) -> Self {
+        self.v2_attempt_entropy_test_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_v2_request_commitment_test_hook(mut self, hook: V2RequestCommitmentTestHook) -> Self {
+        self.v2_request_commitment_test_hook = Some(hook);
+        self
+    }
+
+    fn generate_v2_attempt_nonce(&self) -> Result<[u8; 16], ()> {
+        #[cfg(test)]
+        if let Some(hook) = &self.v2_attempt_entropy_test_hook {
+            return hook();
+        }
+        v2_attempt_nonce().map_err(|_| ())
+    }
+
+    fn generate_v2_request_commitment(
+        &self,
+        request: &SessionConsumerV2Request,
+    ) -> Result<[u8; 32], ()> {
+        #[cfg(test)]
+        if let Some(hook) = &self.v2_request_commitment_test_hook {
+            return hook(request);
+        }
+        v2_request_commitment(request).map_err(|_| ())
     }
 
     /// Set the finite bootstrap and active-frame idle timeout.
@@ -4647,6 +4778,7 @@ impl StatelessSessionConsumerClient {
             shutdown_io,
             None,
             None,
+            None,
             false,
         )
         .await
@@ -4661,6 +4793,7 @@ impl StatelessSessionConsumerClient {
         watch: bool,
         shutdown_io: Option<Arc<PersistentConsumerIoBarrier>>,
         physical_admission: Option<OwnedSemaphorePermit>,
+        persistent_physical_admission: Option<OwnedSemaphorePermit>,
         reconnect_control: Option<&Arc<PersistentConsumerReconnectControl>>,
         coordinate_recovery: bool,
     ) -> Result<ConsumerConnection, SessionConsumerClientError> {
@@ -4908,6 +5041,7 @@ impl StatelessSessionConsumerClient {
             accepted_ciphertext_writes,
             pool_connection: None,
             _physical_admission: Some(physical_admission),
+            _persistent_physical_admission: persistent_physical_admission,
         };
         if !connection.current(&self.tls_config, &self.reauthentication) {
             return reconnect_setup.reject_connection_lifecycle();
@@ -5233,7 +5367,7 @@ impl StatelessSessionConsumerClient {
             .map_err(SessionConsumerCallError::into_client_error)
     }
 
-    /// Execute one explicit revision-5 V2 consumer request.
+    /// Execute one explicit revision-6 V2 consumer request.
     ///
     /// This deliberately opens a fresh V2-ALPN connection. Persistent V1
     /// lanes are never reused, so a caller cannot accidentally send a V2
@@ -5413,7 +5547,7 @@ impl StatelessSessionConsumerClient {
                 if ack.transport_revision == SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION
                     && ack.scope == self.scope =>
             {
-                checked_consumer_frame_size(ack.request_frame_size)
+                checked_consumer_v2_request_frame_size(ack.request_frame_size)
                     .map_err(SessionConsumerClientError::from)
                     .map_err(
                         |cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause },
@@ -5481,12 +5615,12 @@ impl StatelessSessionConsumerClient {
         ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
             .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?;
         let correlation = NonZeroU32::MIN;
-        let attempt_nonce = v2_attempt_nonce().map_err(|_| {
+        let attempt_nonce = self.generate_v2_attempt_nonce().map_err(|_| {
             PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             }
         })?;
-        let request_commitment = v2_request_commitment(request).map_err(|_| {
+        let request_commitment = self.generate_v2_request_commitment(request).map_err(|_| {
             PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             }
@@ -6281,6 +6415,7 @@ impl StatelessSessionConsumerClient {
                 true,
                 shutdown_io,
                 None,
+                None,
                 reconnect_control,
                 true,
             )
@@ -6913,8 +7048,8 @@ struct PersistentConsumerCounters {
     deadline: AtomicU64,
 }
 
-/// Redaction-safe revision-5 lane counters. They are deliberately separate
-/// from the revision-5 pool: a V2 outage must not consume V1's finite queue.
+/// Redaction-safe revision-6 V2 lane counters. V1 and V2 retain distinct
+/// ALPN-specific idle pools while sharing one aggregate logical admission.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct PersistentSessionConsumerV2Diagnostics {
     /// Physical V2 lane setup attempts, including cancelled attempts.
@@ -7049,6 +7184,7 @@ struct PersistentV2LaneLifetime {
     pool_connection: Weak<PersistentSessionConsumerV2Pool>,
     state: Arc<PersistentV2LaneState>,
     _pool_width_admission: Option<OwnedSemaphorePermit>,
+    _persistent_physical_admission: Option<OwnedSemaphorePermit>,
     _physical_admission: Option<OwnedSemaphorePermit>,
 }
 
@@ -7058,6 +7194,7 @@ struct PersistentV2LaneLifetime {
 struct PersistentV2LaneState {
     poisoned: AtomicBool,
     healthy: AtomicBool,
+    retired: Notify,
 }
 
 impl PersistentV2LaneState {
@@ -7065,6 +7202,7 @@ impl PersistentV2LaneState {
         Arc::new(Self {
             poisoned: AtomicBool::new(false),
             healthy: AtomicBool::new(false),
+            retired: Notify::new(),
         })
     }
 }
@@ -7158,6 +7296,7 @@ impl Drop for PersistentV2LaneLifetime {
         // waiter woken by `active == 0` must never observe either admission
         // permit still held by the actor that published that state.
         drop(self._physical_admission.take());
+        drop(self._persistent_physical_admission.take());
         drop(self._pool_width_admission.take());
         if let Some(pool) = self.pool_connection.upgrade() {
             let _accounting = pool
@@ -7174,6 +7313,7 @@ impl Drop for PersistentV2LaneLifetime {
             counter_increment(&pool.reconnects);
             pool.drained_notify.notify_waiters();
         }
+        self.state.retired.notify_waiters();
     }
 }
 
@@ -7715,10 +7855,18 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
     drop(lifetime);
 }
 
+#[derive(Default)]
+struct PersistentSessionConsumerSiblings {
+    v1: StdMutex<Weak<PersistentSessionConsumerPool>>,
+    v2: StdMutex<Weak<PersistentSessionConsumerV2Pool>>,
+}
+
 struct PersistentSessionConsumerV2Pool {
     client: StatelessSessionConsumerClient,
     config: PersistentSessionConsumerConfig,
+    siblings: Arc<PersistentSessionConsumerSiblings>,
     lanes: Arc<Semaphore>,
+    physical_lanes: Arc<Semaphore>,
     actor_lanes: Arc<Semaphore>,
     pending: Arc<Semaphore>,
     prewarm: Arc<Semaphore>,
@@ -7840,6 +7988,28 @@ impl Drop for PersistentV2ActivityLease {
 }
 
 impl PersistentSessionConsumerV2Pool {
+    fn reclaim_v1_idle(&self) -> bool {
+        let sibling = self
+            .siblings
+            .v1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade();
+        let Some(sibling) = sibling else {
+            return false;
+        };
+        let connection = sibling
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front();
+        let Some(connection) = connection else {
+            return false;
+        };
+        drop(connection);
+        true
+    }
+
     fn reconnect_delay(&self) -> Duration {
         let maximum_millis = duration_millis(self.config.reconnect_jitter);
         let jitter = if maximum_millis == 0 {
@@ -8173,7 +8343,25 @@ impl PersistentSessionConsumerV2Pool {
                 .await
                 .map_err(|_| SessionConsumerClientError::Unavailable)?
                 .map_err(|_| SessionConsumerClientError::ShuttingDown)?;
-        let physical_admission = self.client.physical_admission.try_acquire_v2()?;
+        let persistent_physical_admission = match Arc::clone(&self.physical_lanes)
+            .try_acquire_owned()
+        {
+            Ok(admission) => admission,
+            Err(_) => {
+                let _ = self.reclaim_v1_idle();
+                tokio::time::timeout_at(deadline, Arc::clone(&self.physical_lanes).acquire_owned())
+                    .await
+                    .map_err(|_| SessionConsumerClientError::Unavailable)?
+                    .map_err(|_| SessionConsumerClientError::ShuttingDown)?
+            }
+        };
+        let physical_admission = match self.client.physical_admission.try_acquire_v2() {
+            Ok(admission) => admission,
+            Err(SessionConsumerClientError::Overloaded) if self.reclaim_v1_idle() => {
+                self.client.physical_admission.try_acquire_v2()?
+            }
+            Err(error) => return Err(error),
+        };
         let address = tokio::time::timeout_at(
             deadline,
             poll_persistent_consumer_setup_io((self.client.resolve)(), Some(&self.shutdown_io)),
@@ -8282,7 +8470,7 @@ impl PersistentSessionConsumerV2Pool {
                 if ack.transport_revision == SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION
                     && ack.scope == self.client.scope =>
             {
-                checked_consumer_frame_size(ack.request_frame_size)
+                checked_consumer_v2_request_frame_size(ack.request_frame_size)
                     .map_err(SessionConsumerClientError::from)?
             }
             ConsumerV2WireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch) => {
@@ -8326,10 +8514,11 @@ impl PersistentSessionConsumerV2Pool {
             pool_connection: Arc::downgrade(self),
             state: Arc::clone(&state),
             _pool_width_admission: Some(pool_width_admission),
+            _persistent_physical_admission: Some(persistent_physical_admission),
             _physical_admission: Some(physical_admission),
         };
         tokio::spawn(run_persistent_v2_lane(PersistentV2LaneActor {
-            reader: Box::new(reader),
+            reader: Box::new(BufReader::with_capacity(FRAME_READ_CHUNK_BYTES, reader)),
             writer: Box::new(writer),
             request_frame_size,
             lifecycle,
@@ -8462,16 +8651,19 @@ impl PersistentSessionConsumerV2Pool {
                 cause: SessionConsumerClientError::Deadline,
             });
         }
-        let attempt_nonce = v2_attempt_nonce().map_err(|_| {
+        let attempt_nonce = self.client.generate_v2_attempt_nonce().map_err(|_| {
             PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             }
         })?;
-        let request_commitment = v2_request_commitment(request).map_err(|_| {
-            PersistentSessionConsumerV2ExecuteError::NotTransmitted {
-                cause: SessionConsumerClientError::Protocol,
-            }
-        })?;
+        let request_commitment = self
+            .client
+            .generate_v2_request_commitment(request)
+            .map_err(
+                |_| PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Protocol,
+                },
+            )?;
         let (completion, completed) = oneshot::channel();
         let write_progress = Arc::new(crate::protocol::FrameWriteProgress::new());
         connection
@@ -8817,8 +9009,12 @@ impl PersistentSessionConsumerV2Pool {
     }
 
     fn readiness(&self) -> PersistentSessionConsumerReadiness {
-        let lane_count = u32::try_from(self.config.request_connections)
-            .expect("validated persistent V2 request width fits u32");
+        let Ok(lane_count) = u32::try_from(self.config.request_connections) else {
+            return PersistentSessionConsumerReadiness {
+                configured_request_connections: self.config.request_connections,
+                ..PersistentSessionConsumerReadiness::default()
+            };
+        };
         let all_lanes_idle = Arc::clone(&self.lanes)
             .try_acquire_many_owned(lane_count)
             .ok();
@@ -8909,6 +9105,26 @@ fn v2_response_is_outcome_unknown(response: &SessionConsumerV2Response) -> bool 
         )) | SessionConsumerV2Response::FencedTransitionV2Batch(Err(
             opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchError::OutcomeUnknown { .. }
         ))
+    ) || matches!(
+        response,
+        SessionConsumerV2Response::FencedTransitionV2Batch(Ok(results))
+            if results.iter().any(|result| matches!(
+                result.result(),
+                Err(error) if v2_item_error_is_nonreceipt_ambiguity(*error)
+            ))
+    )
+}
+
+fn v2_item_error_is_nonreceipt_ambiguity(
+    error: opc_session_store::SessionConsumerV2FencedTransitionError,
+) -> bool {
+    matches!(
+        error,
+        opc_session_store::SessionConsumerV2FencedTransitionError::OutcomeUnknown
+            | opc_session_store::SessionConsumerV2FencedTransitionError::Store(
+                SessionConsumerStoreError::Unavailable
+                    | SessionConsumerStoreError::OutcomeUnavailable
+            )
     )
 }
 
@@ -8917,14 +9133,15 @@ fn v2_operation_is_effectful(operation: &SessionConsumerV2Operation) -> bool {
 }
 
 fn v2_response_retires_connection_authority(response: &SessionConsumerV2Response) -> bool {
-    matches!(
-        response,
-        SessionConsumerV2Response::Rejected(
-            SessionConsumerRejection::ScopeMismatch
-                | SessionConsumerRejection::Unauthorized
-                | SessionConsumerRejection::MalformedRequest
+    v2_response_is_outcome_unknown(response)
+        || matches!(
+            response,
+            SessionConsumerV2Response::Rejected(
+                SessionConsumerRejection::ScopeMismatch
+                    | SessionConsumerRejection::Unauthorized
+                    | SessionConsumerRejection::MalformedRequest
+            )
         )
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9213,8 +9430,10 @@ impl Drop for PersistentIdleReaper {
 struct PersistentSessionConsumerPool {
     client: StatelessSessionConsumerClient,
     config: PersistentSessionConsumerConfig,
+    siblings: Arc<PersistentSessionConsumerSiblings>,
     reconnect_control: Arc<PersistentConsumerReconnectControl>,
     lanes: Arc<Semaphore>,
+    physical_lanes: Arc<Semaphore>,
     pending: Arc<Semaphore>,
     watches: Arc<Semaphore>,
     prewarm: Arc<Semaphore>,
@@ -9394,10 +9613,8 @@ impl PersistentCheckedOutConnection {
         }
     }
 
-    fn connection_mut(&mut self) -> &mut ConsumerConnection {
-        self.connection
-            .as_mut()
-            .expect("checked-out consumer connection is returned at most once")
+    fn connection_mut(&mut self) -> Option<&mut ConsumerConnection> {
+        self.connection.as_mut()
     }
 
     fn return_idle(mut self) {
@@ -9470,6 +9687,38 @@ impl Drop for PersistentPrewarmActivity {
 impl PersistentSessionConsumerPool {
     fn phase(&self) -> PersistentShutdownPhase {
         PersistentShutdownPhase::load(&self.shutdown_phase)
+    }
+
+    async fn reclaim_v2_idle_until(&self, deadline: tokio::time::Instant) -> bool {
+        let sibling = self
+            .siblings
+            .v2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade();
+        let Some(sibling) = sibling else {
+            return false;
+        };
+        let connection = {
+            let mut idle = sibling
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            idle.iter()
+                .position(|entry| matches!(entry, PersistentV2PoolEntry::Lane(_)))
+                .and_then(|position| idle.remove(position))
+        };
+        let Some(PersistentV2PoolEntry::Lane(connection)) = connection else {
+            return false;
+        };
+        let state = Arc::clone(&connection.state);
+        let released = state.retired.notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        drop(connection);
+        tokio::time::timeout_at(deadline, &mut released)
+            .await
+            .is_ok()
     }
 
     fn ensure_idle_reaper(self: &Arc<Self>) {
@@ -9898,7 +10147,7 @@ impl PersistentSessionConsumerPool {
         self: &Arc<Self>,
         operation_deadline: tokio::time::Instant,
     ) -> Result<ConsumerConnection, SessionConsumerClientError> {
-        self.connect_with_physical_admission(operation_deadline, None, true)
+        self.connect_with_physical_admission(operation_deadline, None, None, true)
             .await
     }
 
@@ -9906,6 +10155,7 @@ impl PersistentSessionConsumerPool {
         self: &Arc<Self>,
         operation_deadline: tokio::time::Instant,
         physical_admission: Option<OwnedSemaphorePermit>,
+        persistent_physical_admission: Option<OwnedSemaphorePermit>,
         coordinate_recovery: bool,
     ) -> Result<ConsumerConnection, SessionConsumerClientError> {
         let setup_started = tokio::time::Instant::now();
@@ -9920,6 +10170,22 @@ impl PersistentSessionConsumerPool {
         {
             setup_deadline = setup_deadline.min(inherited_deadline);
         }
+        let persistent_physical_admission = match persistent_physical_admission {
+            Some(admission) => admission,
+            None => match Arc::clone(&self.physical_lanes).try_acquire_owned() {
+                Ok(admission) => admission,
+                Err(_) => {
+                    let _ = self.reclaim_v2_idle_until(setup_deadline).await;
+                    tokio::time::timeout_at(
+                        setup_deadline,
+                        Arc::clone(&self.physical_lanes).acquire_owned(),
+                    )
+                    .await
+                    .map_err(|_| SessionConsumerClientError::Unavailable)?
+                    .map_err(|_| SessionConsumerClientError::ShuttingDown)?
+                }
+            },
+        };
         let setup_attempt = PersistentSetupAttempt::begin(&self.counters);
         let result = self
             .client
@@ -9930,10 +10196,38 @@ impl PersistentSessionConsumerPool {
                 false,
                 Some(Arc::clone(&self.shutdown_io)),
                 physical_admission,
+                Some(persistent_physical_admission),
                 Some(&self.reconnect_control),
                 coordinate_recovery,
             )
             .await;
+        let result = match result {
+            Err(SessionConsumerClientError::Overloaded)
+                if self.reclaim_v2_idle_until(setup_deadline).await =>
+            {
+                let persistent_physical_admission = tokio::time::timeout_at(
+                    setup_deadline,
+                    Arc::clone(&self.physical_lanes).acquire_owned(),
+                )
+                .await
+                .map_err(|_| SessionConsumerClientError::Unavailable)?
+                .map_err(|_| SessionConsumerClientError::ShuttingDown)?;
+                self.client
+                    .connect_with_controls(
+                        setup_deadline,
+                        true,
+                        Some(&self.counters),
+                        false,
+                        Some(Arc::clone(&self.shutdown_io)),
+                        None,
+                        Some(persistent_physical_admission),
+                        Some(&self.reconnect_control),
+                        coordinate_recovery,
+                    )
+                    .await
+            }
+            result => result,
+        };
         // Tokio polls a timed inner future before its deadline future. Reject
         // setup that completed while this task was descheduled before the
         // connection can carry an application frame.
@@ -10064,20 +10358,27 @@ impl PersistentSessionConsumerClient {
         // clients from aligning their otherwise bounded reconnect sequences.
         // The seed is local-only and is never included in diagnostics.
         let (jitter_seed_high, jitter_seed_low) = uuid::Uuid::new_v4().as_u64_pair();
+        let request_lanes = Arc::new(Semaphore::new(config.request_connections));
+        let persistent_physical_lanes = Arc::new(Semaphore::new(config.request_connections));
+        let request_pending = Arc::new(Semaphore::new(
+            config
+                .request_connections
+                .saturating_add(config.pending_calls),
+        ));
+        let request_prewarm = Arc::new(Semaphore::new(1));
+        let siblings = Arc::new(PersistentSessionConsumerSiblings::default());
         let pool = Arc::new(PersistentSessionConsumerPool {
             client,
             config,
+            siblings: Arc::clone(&siblings),
             reconnect_control,
-            lanes: Arc::new(Semaphore::new(config.request_connections)),
+            lanes: Arc::clone(&request_lanes),
+            physical_lanes: Arc::clone(&persistent_physical_lanes),
             // Includes active lane owners so `pending_calls == 0` is
             // fail-fast only once every request lane is occupied.
-            pending: Arc::new(Semaphore::new(
-                config
-                    .request_connections
-                    .saturating_add(config.pending_calls),
-            )),
+            pending: Arc::clone(&request_pending),
             watches: Arc::new(Semaphore::new(config.watch_connections)),
-            prewarm: Arc::new(Semaphore::new(1)),
+            prewarm: Arc::clone(&request_prewarm),
             idle: StdMutex::new(VecDeque::with_capacity(config.request_connections)),
             idle_reaper: PersistentIdleReaper::new(),
             wait_started: StdMutex::new(vec![None; config.pending_calls]),
@@ -10104,17 +10405,15 @@ impl PersistentSessionConsumerClient {
         let v2_pool = Arc::new(PersistentSessionConsumerV2Pool {
             client: pool.client.clone(),
             config,
+            siblings: Arc::clone(&siblings),
             // V2 retains its own fixed logical admission budget. Its actor
             // and physical caps remain separately bounded below.
-            lanes: Arc::new(Semaphore::new(config.request_connections)),
+            lanes: request_lanes,
+            physical_lanes: persistent_physical_lanes,
             actor_lanes: Arc::new(Semaphore::new(config.request_connections)),
             // Includes active V2 lane owners, independently of V1's queue.
-            pending: Arc::new(Semaphore::new(
-                config
-                    .request_connections
-                    .saturating_add(config.pending_calls),
-            )),
-            prewarm: Arc::new(Semaphore::new(1)),
+            pending: request_pending,
+            prewarm: request_prewarm,
             idle: StdMutex::new(VecDeque::with_capacity(config.request_connections)),
             shutdown: AtomicBool::new(false),
             shutdown_forced_tx: v2_shutdown_forced_tx,
@@ -10148,6 +10447,14 @@ impl PersistentSessionConsumerClient {
             ),
             live_accounting: StdMutex::new(()),
         });
+        *siblings
+            .v1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&pool);
+        *siblings
+            .v2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&v2_pool);
         Ok(Self { pool, v2_pool })
     }
 
@@ -10186,14 +10493,15 @@ impl PersistentSessionConsumerClient {
         Ok(generation)
     }
 
-    /// Establish the independent fixed revision-5 pool without dispatching a
-    /// V2 operation. V1 and V2 retain separate queues and sockets while
-    /// sharing the stateless client's bounded physical connection admission.
+    /// Establish the ALPN-specific fixed revision-6 idle pool without
+    /// dispatching a V2 operation. V1 and V2 retain separate authenticated
+    /// idle sockets while sharing aggregate lane, pending-call, prewarm, and
+    /// physical connection admission.
     pub async fn prewarm_v2(&self) -> Result<(), SessionConsumerClientError> {
         self.v2_pool.prewarm().await
     }
 
-    /// Execute one revision-5 request on a dedicated bounded V2 lane.
+    /// Execute one revision-6 request on a dedicated bounded V2 lane.
     ///
     /// A post-write transport loss reports the complete caller-retained V2
     /// ID as `OutcomeUnknown`; callers recover through V2 status rather than
@@ -10205,13 +10513,14 @@ impl PersistentSessionConsumerClient {
         self.v2_pool.execute(request).await
     }
 
-    /// Return the independent V2 fixed-pool diagnostics.
+    /// Return the ALPN-specific V2 idle-pool diagnostics within the shared
+    /// aggregate admission bounds.
     pub fn v2_diagnostics(&self) -> PersistentSessionConsumerV2Diagnostics {
         self.v2_pool.diagnostics()
     }
 
     /// Return a conservative authenticated-idle-capacity snapshot for the
-    /// independent revision-5 pool.
+    /// ALPN-specific revision-6 V2 idle pool.
     pub async fn v2_readiness(&self) -> PersistentSessionConsumerReadiness {
         self.v2_pool.readiness()
     }
@@ -10963,7 +11272,11 @@ impl PersistentSessionConsumerClient {
                 .pool
                 .client
                 .execute_on_connection_with_progress(
-                    connection.connection_mut(),
+                    connection.connection_mut().ok_or(
+                        SessionConsumerCallError::BeforeCallWrite(
+                            SessionConsumerClientError::Protocol,
+                        ),
+                    )?,
                     request,
                     pre_request_deadline,
                     pre_request_budget_active,
@@ -10989,7 +11302,12 @@ impl PersistentSessionConsumerClient {
                     ) =>
                 {
                     let (failed_generation, failed_material_epoch) = {
-                        let lifecycle = &connection.connection_mut().lifecycle;
+                        let connection = connection.connection_mut().ok_or(
+                            SessionConsumerCallError::BeforeCallWrite(
+                                SessionConsumerClientError::Protocol,
+                            ),
+                        )?;
+                        let lifecycle = &connection.lifecycle;
                         (
                             lifecycle.admitted_generation(),
                             lifecycle.admitted_material_epoch(),
@@ -11096,18 +11414,23 @@ impl PersistentSessionConsumerClient {
             idle.len()
         };
         for index in 0..self.pool.config.request_connections {
-            let physical_admission = if index < refresh_count {
+            let (physical_admission, persistent_physical_admission) = if index < refresh_count {
                 let mut idle = self
                     .pool
                     .idle
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                idle.pop_front().and_then(|mut connection| {
-                    counter_increment(&self.pool.counters.reconnects);
-                    connection._physical_admission.take()
-                })
+                idle.pop_front()
+                    .map(|mut connection| {
+                        counter_increment(&self.pool.counters.reconnects);
+                        (
+                            connection._physical_admission.take(),
+                            connection._persistent_physical_admission.take(),
+                        )
+                    })
+                    .unwrap_or((None, None))
             } else {
-                None
+                (None, None)
             };
             let deadline = tokio::time::Instant::now()
                 .checked_add(self.pool.config.setup_timeout)
@@ -11120,6 +11443,7 @@ impl PersistentSessionConsumerClient {
                 connection = self.pool.connect_with_physical_admission(
                     deadline,
                     physical_admission,
+                    persistent_physical_admission,
                     true,
                 ) => connection?,
             };
@@ -11135,8 +11459,12 @@ impl PersistentSessionConsumerClient {
 
     /// Return a conservative authenticated-idle-capacity snapshot.
     pub async fn readiness(&self) -> PersistentSessionConsumerReadiness {
-        let lane_count = u32::try_from(self.pool.config.request_connections)
-            .expect("validated persistent request width fits u32");
+        let Ok(lane_count) = u32::try_from(self.pool.config.request_connections) else {
+            return PersistentSessionConsumerReadiness {
+                configured_request_connections: self.pool.config.request_connections,
+                ..PersistentSessionConsumerReadiness::default()
+            };
+        };
         // Holding every request-lane permit closes the checkout/return race:
         // readiness is true only for fixed authenticated capacity that is
         // idle for the complete snapshot, never for a merely leased lane.
@@ -11849,8 +12177,8 @@ where
     .await
 }
 
-/// Serve the deliberately narrow revision-5 lane after mTLS selected its
-/// dedicated ALPN. No V1 DTO is decoded on this path, and a revision-5
+/// Serve the deliberately narrow revision-6 lane after mTLS selected its
+/// dedicated ALPN. No V1 DTO is decoded on this path, and a revision-6
 /// decoder cannot emit V1 responses or watch frames.
 struct ConsumerV2ServerConnectionContext {
     service: Arc<dyn SessionQuorumConsumer>,
@@ -12345,7 +12673,10 @@ async fn handle_server_connection_v2(
         if expected != correlation {
             return Err(ProtocolError::UnexpectedResponse);
         }
-        if v2_request_commitment(&request).map_or(true, |digest| request_commitment != digest) {
+        let Ok(commitment) = v2_request_commitment(&request) else {
+            return Err(ProtocolError::UnexpectedResponse);
+        };
+        if request_commitment != commitment {
             return Err(ProtocolError::UnexpectedResponse);
         }
         if !server_connection_current(
@@ -13595,25 +13926,27 @@ mod tests {
         write_consumer_call_rejection_supervised, BorrowedConsumerCall,
         BorrowedConsumerCallResponse, BorrowedConsumerWireRequest, BorrowedConsumerWireResponse,
         BoxStream, ConsumerCall, ConsumerCallResponse, ConsumerConnection, ConsumerCorrelation,
-        ConsumerHello, ConsumerLeaseWireContext, ConsumerOperationKind, ConsumerServerCancellation,
-        ConsumerServerSetupTestHooks, ConsumerSessionLeaseMutationResultWire,
-        ConsumerSessionLeaseMutationStatusWire, ConsumerSessionResponseWire, ConsumerSetupPhase,
-        ConsumerSetupPhaseAttempt, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
-        ConsumerWireRequest, ConsumerWireResponse, PersistentCheckedOutConnection,
-        PersistentConsumerCounters, PersistentConsumerIoBarrier,
-        PersistentConsumerReconnectControl, PersistentConsumerShutdownIo,
-        PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
-        PersistentReconnectSetup, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
+        ConsumerHello, ConsumerHelloAck, ConsumerLeaseWireContext, ConsumerOperationKind,
+        ConsumerServerCancellation, ConsumerServerSetupTestHooks,
+        ConsumerSessionLeaseMutationResultWire, ConsumerSessionLeaseMutationStatusWire,
+        ConsumerSessionResponseWire, ConsumerSetupPhase, ConsumerSetupPhaseAttempt, ConsumerV2Call,
+        ConsumerV2CallResponse, ConsumerV2WireRequest, ConsumerV2WireResponse,
+        ConsumerWatchTerminal, ConsumerWatchTerminalSlot, ConsumerWireRequest,
+        ConsumerWireResponse, PersistentCheckedOutConnection, PersistentConsumerCounters,
+        PersistentConsumerIoBarrier, PersistentConsumerReconnectControl,
+        PersistentConsumerShutdownIo, PersistentConsumerShutdownReader,
+        PersistentConsumerShutdownWriter, PersistentReconnectSetup,
+        PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
         PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
-        PersistentSetupAttempt, PersistentShutdownPhase, PersistentWatchRecovery,
-        QueuedConsumerWatchItem, SessionConsumerAuthorizationError, SessionConsumerAuthorizer,
-        SessionConsumerCallError, SessionConsumerChange, SessionConsumerClientError,
-        SessionConsumerFencedTransitionBackend, SessionConsumerFencedTransitionMutationError,
-        SessionConsumerIdentity, SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-        SessionConsumerRejection, SessionQuorumConsumer, SessionQuorumConsumerServer,
-        StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
-        DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+        PersistentSessionConsumerV2ExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
+        PersistentWatchRecovery, QueuedConsumerWatchItem, SessionConsumerAuthorizationError,
+        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
+        SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
+        SessionConsumerFencedTransitionMutationError, SessionConsumerIdentity,
+        SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionConsumerRejection,
+        SessionQuorumConsumer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
+        DEFAULT_CONSUMER_IDLE_TIMEOUT, DEFAULT_CONSUMER_MAX_CONNECTIONS,
+        DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
@@ -13625,6 +13958,7 @@ mod tests {
         MAX_PERSISTENT_SESSION_CONSUMER_REQUEST_CONNECTIONS,
         MAX_PERSISTENT_SESSION_CONSUMER_WATCH_CONNECTIONS,
         MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS,
+        MAX_STATELESS_SESSION_CONSUMER_WATCH_CONNECTIONS,
     };
     use bytes::Bytes;
     use futures_util::StreamExt;
@@ -13634,7 +13968,8 @@ mod tests {
         EncryptedSessionPayload, FakeSessionBackend, FenceToken, FencedTransitionExecuteError,
         FencedTransitionLease, FencedTransitionMutation, FencedTransitionObservation,
         FencedTransitionOutcome, FencedTransitionRequest, FencedTransitionRequestId,
-        FencedTransitionStatus, Generation, LeaseGuard, OwnerId, PreparedFencedTransition,
+        FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2HistoryEpoch,
+        FencedTransitionV2RequestId, Generation, LeaseGuard, OwnerId, PreparedFencedTransition,
         RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionBackend,
         SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
         SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
@@ -13643,13 +13978,16 @@ mod tests {
         SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
         SessionConsumerLeaseMutationStatus, SessionConsumerOperation,
         SessionConsumerOutcomeUnknown, SessionConsumerRequest, SessionConsumerRequestId,
-        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError, SessionKey,
-        SessionKeyType, SessionLeaseManager, SessionOp, StateClass, StateType, StoreError,
-        StoredSessionRecord, MAX_SESSION_TTL,
+        SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+        SessionConsumerV2FencedTransitionError, SessionConsumerV2Operation,
+        SessionConsumerV2Request, SessionConsumerV2Response, SessionKey, SessionKeyType,
+        SessionLeaseManager, SessionOp, StateClass, StateType, StoreError, StoredSessionRecord,
+        MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, SpiffeId, TenantId, Timestamp};
     use serde::{Deserialize, Serialize};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::net::TcpListener;
     use tokio::sync::{mpsc, watch, Notify, Semaphore};
 
     use crate::consensus::RemoteAddrResolver;
@@ -13721,6 +14059,110 @@ mod tests {
         }
     }
 
+    /// Records every V2 dispatch while retaining a deterministic response for
+    /// the small raw-transport fail-closed regression below.
+    struct CountingV2RejectingTestConsumer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for CountingV2RejectingTestConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        async fn execute_v2(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _request: SessionConsumerV2Request,
+        ) -> SessionConsumerV2Response {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
+
+    /// Deliberately returns a structurally valid batch item error that does
+    /// not constitute a receipt. The transport must not turn this into a
+    /// successful `Ok(Batch)` response after Call transmission.
+    struct V2BatchItemAmbiguityTestConsumer {
+        error: SessionConsumerV2FencedTransitionError,
+        v2_calls: Arc<AtomicUsize>,
+        batches: Arc<StdMutex<Vec<SessionConsumerV2Request>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for V2BatchItemAmbiguityTestConsumer {
+        async fn execute(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        async fn execute_v2(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            request: SessionConsumerV2Request,
+        ) -> SessionConsumerV2Response {
+            self.v2_calls.fetch_add(1, Ordering::SeqCst);
+            match request.operation() {
+                SessionConsumerV2Operation::FencedTransitionV2Batch { requests } => {
+                    self.batches
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(request.clone());
+                    SessionConsumerV2Response::FencedTransitionV2Batch(Ok(
+                        requests
+                            .iter()
+                            .map(|request| {
+                                opc_session_store::consumer::SessionConsumerV2FencedTransitionBatchResult::new(
+                                    request.request_id(),
+                                    Err(self.error),
+                                )
+                            })
+                            .collect(),
+                    ))
+                }
+                SessionConsumerV2Operation::FencedTransitionV2Capability => {
+                    SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
+                }
+                _ => {
+                    SessionConsumerV2Response::Rejected(SessionConsumerRejection::MalformedRequest)
+                }
+            }
+        }
+
+        async fn watch(
+            &self,
+            _identity: &SessionConsumerIdentity,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
+
     struct AuthorityRejectingTestConsumer {
         calls: Arc<AtomicUsize>,
     }
@@ -13755,6 +14197,68 @@ mod tests {
             SessionConsensusConfigurationId::from_bytes([2; 32]),
             SessionConsensusConfigurationEpoch::new(1).expect("non-zero configuration epoch"),
         ))
+    }
+
+    fn v2_effectful_request(nonce: u8) -> SessionConsumerV2Request {
+        let key = SessionKey {
+            tenant: TenantId::new("v2-effect-boundary").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"v2-effect-boundary")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let transition = opc_session_store::FencedTransitionV2Request::new(
+            FencedTransitionV2HistoryEpoch::new(1).expect("nonzero history epoch"),
+            FencedTransitionV2CallerNonce::from_bytes([nonce; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("v2-effect-boundary-owner").expect("test owner"),
+                FenceToken::new(0),
+                Duration::from_secs(30),
+            )
+            .expect("bounded acquire"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("bounded V2 transition");
+        SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2 {
+                request: Box::new(transition),
+            },
+        )
+    }
+
+    fn v2_effectful_batch_request(nonces: &[u8]) -> SessionConsumerV2Request {
+        let requests = nonces
+            .iter()
+            .map(|nonce| {
+                let singleton = v2_effectful_request(*nonce);
+                let SessionConsumerV2Operation::FencedTransitionV2 { request } =
+                    singleton.operation()
+                else {
+                    panic!("test singleton remains an effectful V2 transition");
+                };
+                (**request).clone()
+            })
+            .collect();
+        SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Batch { requests },
+        )
+    }
+
+    fn v2_batch_request_ids(
+        request: &SessionConsumerV2Request,
+    ) -> Vec<FencedTransitionV2RequestId> {
+        let SessionConsumerV2Operation::FencedTransitionV2Batch { requests } = request.operation()
+        else {
+            panic!("test request is an effectful V2 batch");
+        };
+        requests
+            .iter()
+            .map(|request| request.request_id())
+            .collect()
     }
 
     async fn authenticated_consumer_physical_create_request(
@@ -14279,6 +14783,7 @@ mod tests {
                 accepted_ciphertext_writes: Arc::new(AtomicU64::new(0)),
                 pool_connection: None,
                 _physical_admission: None,
+                _persistent_physical_admission: None,
             },
             observed_lifecycle,
         )
@@ -17032,6 +17537,1521 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_v2_two_frame_stale_tuple_poisoning_preserves_effect_boundary() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("persistent-v2-two-frame-client");
+        let server_identity = material_spiffe("persistent-v2-two-frame-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let server_material = material.trusted_server_config(server_identity.as_str());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw V2 peer");
+        let address = listener.local_addr().expect("raw V2 peer address");
+        let first_request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        );
+        let second_request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2HistoryState,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let coalesced_write = Arc::new(Notify::new());
+        let peer_first_request = first_request.clone();
+        let peer_second_request = second_request.clone();
+        let peer = tokio::spawn({
+            let calls = Arc::clone(&calls);
+            let coalesced_write = Arc::clone(&coalesced_write);
+            async move {
+                let (tcp, _) = listener.accept().await.expect("accept V2 client");
+                let handshake = server_material.begin_handshake().expect("server handshake");
+                let acceptor = tokio_rustls::TlsAcceptor::from(super::consumer_server_tls_config(
+                    handshake.rustls_config(),
+                ));
+                let mut tls = acceptor.accept(tcp).await.expect("complete raw V2 TLS");
+                handshake.admit().expect("admit peer");
+                assert!(matches!(
+                    super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                        &mut tls,
+                        super::MAX_NEGOTIATED_FRAME_SIZE,
+                    )
+                    .await
+                    .expect("read Hello"),
+                    ConsumerV2WireRequest::Hello(_)
+                ));
+                super::write_frame_bounded_until(
+                    &mut tls,
+                    &ConsumerV2WireResponse::HelloAck(ConsumerHelloAck {
+                        transport_revision: super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                        scope: scope(),
+                        request_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                            .expect("test frame cap"),
+                    }),
+                    super::MAX_NEGOTIATED_FRAME_SIZE,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+                .expect("write HelloAck");
+                let ConsumerV2WireRequest::Call(ConsumerV2Call {
+                    correlation,
+                    attempt_nonce,
+                    request_commitment,
+                    request,
+                }) = super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                    &mut tls,
+                    super::MAX_NEGOTIATED_FRAME_SIZE,
+                )
+                .await
+                .expect("read Call 1")
+                else {
+                    panic!("expected Call 1")
+                };
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(*request, peer_first_request);
+                let first = ConsumerV2WireResponse::Response(ConsumerV2CallResponse {
+                    correlation,
+                    attempt_nonce,
+                    request_commitment,
+                    response: Box::new(SessionConsumerV2Response::Rejected(
+                        SessionConsumerRejection::MalformedRequest,
+                    )),
+                });
+                let second = ConsumerV2WireResponse::Response(ConsumerV2CallResponse {
+                    correlation: NonZeroU32::new(correlation.get() + 1).expect("next correlation"),
+                    // This is the sole forged field: all other future-Call
+                    // fields are exactly valid for Call 2.
+                    attempt_nonce,
+                    request_commitment: super::v2_request_commitment(&peer_second_request)
+                        .expect("second commitment"),
+                    response: Box::new(SessionConsumerV2Response::Rejected(
+                        SessionConsumerRejection::MalformedRequest,
+                    )),
+                });
+                // Two complete authenticated frames cross TLS in one write,
+                // forcing the V2 actor to observe the future frame before a
+                // checkout can write Call 2.
+                let first = serde_json::to_vec(&first).expect("encode first response");
+                let second = serde_json::to_vec(&second).expect("encode forged response");
+                let mut bytes = Vec::with_capacity(8 + first.len() + second.len());
+                bytes.extend_from_slice(&(first.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(&first);
+                bytes.extend_from_slice(&(second.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(&second);
+                tokio::time::timeout(Duration::from_secs(1), tls.write_all(&bytes))
+                    .await
+                    .expect("one coalesced TLS write deadline")
+                    .expect("one coalesced TLS write");
+                coalesced_write.notify_one();
+                if let Ok(Ok(ConsumerV2WireRequest::Call(_))) = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                        &mut tls,
+                        super::MAX_NEGOTIATED_FRAME_SIZE,
+                    ),
+                )
+                .await
+                {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let persistent = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new(
+                address,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                server_identity,
+                scope(),
+                material.config(),
+            )
+            .with_operation_timeout(Duration::from_secs(2)),
+        )
+        .expect("persistent V2 client");
+        assert_eq!(
+            persistent.execute_v2(&first_request).await,
+            Ok(SessionConsumerV2Response::Rejected(
+                SessionConsumerRejection::MalformedRequest,
+            ))
+        );
+        tokio::time::timeout(Duration::from_secs(1), coalesced_write.notified())
+            .await
+            .expect("the one coalesced response write completed before Call 2");
+        assert_eq!(
+            persistent.execute_v2(&second_request).await,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            }),
+            "the forged future frame poisons the lane before any Call 2 byte"
+        );
+        peer.await.expect("join raw peer");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only Call 1 reached the peer"
+        );
+        let _ = persistent.shutdown().await;
+    }
+
+    #[test]
+    fn persistent_v1_v2_pools_share_exact_aggregate_admission_caps() {
+        let (client, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        let persistent = PersistentSessionConsumerClient::from_stateless(client)
+            .expect("construct persistent aggregate client");
+        let width = u32::try_from(persistent.config().request_connections)
+            .expect("validated test request width");
+        let v1_lanes = Arc::clone(&persistent.pool.lanes)
+            .try_acquire_many_owned(width)
+            .expect("V1 admits its complete configured width");
+        assert!(
+            Arc::clone(&persistent.v2_pool.lanes)
+                .try_acquire_owned()
+                .is_err(),
+            "V2 cannot exceed the V1-owned aggregate width"
+        );
+        drop(v1_lanes);
+        let v2_lanes = Arc::clone(&persistent.v2_pool.lanes)
+            .try_acquire_many_owned(width)
+            .expect("V2 admits its complete configured width after V1 releases it");
+        assert!(
+            Arc::clone(&persistent.pool.lanes)
+                .try_acquire_owned()
+                .is_err(),
+            "V1 cannot exceed the V2-owned aggregate width"
+        );
+        drop(v2_lanes);
+        let pending = Arc::clone(&persistent.pool.pending)
+            .try_acquire_many_owned(
+                u32::try_from(
+                    persistent.config().request_connections + persistent.config().pending_calls,
+                )
+                .expect("validated aggregate pending cap"),
+            )
+            .expect("aggregate pending cap admits its exact bound");
+        assert!(
+            Arc::clone(&persistent.v2_pool.pending)
+                .try_acquire_owned()
+                .is_err(),
+            "one pending cap gates both protocols before resolve"
+        );
+        drop(pending);
+    }
+
+    #[tokio::test]
+    async fn persistent_v1_v2_prewarm_retain_one_aggregate_socket_width_and_rebalance() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("aggregate-socket-client");
+        let server_identity = material_spiffe("aggregate-socket-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("aggregate socket authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            Arc::new(RejectingTestConsumer),
+            material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for aggregate socket prewarm");
+        let persistent =
+            PersistentSessionConsumerClient::from_stateless(StatelessSessionConsumerClient::new(
+                address,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                server_identity,
+                scope(),
+                material.config(),
+            ))
+            .expect("construct aggregate socket client");
+        let width = u64::try_from(persistent.config().request_connections)
+            .expect("validated aggregate socket width");
+
+        assert!(persistent.prewarm().await.expect("prewarm V1").ready);
+        assert_eq!(persistent.diagnostics().await.active, width);
+        assert_eq!(persistent.v2_diagnostics().active, 0);
+
+        let v2_client = persistent.clone();
+        let v2_prewarm = tokio::spawn(async move { v2_client.prewarm_v2().await });
+        tokio::pin!(v2_prewarm);
+        loop {
+            tokio::select! {
+                result = &mut v2_prewarm => {
+                    result.expect("join V2 prewarm").expect("prewarm V2");
+                    break;
+                }
+                _ = tokio::task::yield_now() => {
+                    let total = persistent.diagnostics().await.active
+                        .saturating_add(persistent.v2_diagnostics().active);
+                    assert!(
+                        total <= width,
+                        "all retained V1 and V2 TLS sockets share one physical width"
+                    );
+                }
+            }
+        }
+        assert_eq!(persistent.diagnostics().await.active, 0);
+        assert_eq!(persistent.v2_diagnostics().active, width);
+
+        let v1_request = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::from_bytes([0xc1; 16]),
+            SessionConsumerOperation::Capabilities,
+        );
+        assert_eq!(
+            persistent.execute(&v1_request).await,
+            Ok(SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::Unavailable
+            )),
+            "V1 reclaims only one idle V2 actor and progresses after V2 prewarm"
+        );
+        assert_eq!(
+            persistent.diagnostics().await.active + persistent.v2_diagnostics().active,
+            width
+        );
+        assert_eq!(
+            persistent
+                .execute_v2(&SessionConsumerV2Request::new(
+                    scope(),
+                    SessionConsumerV2Operation::FencedTransitionV2Capability,
+                ))
+                .await,
+            Ok(SessionConsumerV2Response::Rejected(
+                SessionConsumerRejection::Unavailable
+            )),
+            "V2 progresses on its remaining ALPN-specific actor after V1 reclaim"
+        );
+        assert_eq!(
+            persistent.diagnostics().await.active + persistent.v2_diagnostics().active,
+            width
+        );
+        let _ = persistent.shutdown().await;
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn persistent_v1_global_overload_fallback_reacquires_aggregate_socket_permit() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("aggregate-fallback-client");
+        let server_identity = material_spiffe("aggregate-fallback-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("aggregate fallback authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            Arc::new(RejectingTestConsumer),
+            material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for aggregate fallback");
+        let config = PersistentSessionConsumerConfig {
+            request_connections: 2,
+            ..PersistentSessionConsumerConfig::default()
+        };
+        let persistent = PersistentSessionConsumerClient::try_from_stateless(
+            StatelessSessionConsumerClient::new(
+                address,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                server_identity,
+                scope(),
+                material.config(),
+            ),
+            config,
+        )
+        .expect("construct two-wide aggregate client");
+        assert_eq!(
+            persistent
+                .execute_v2(&SessionConsumerV2Request::new(
+                    scope(),
+                    SessionConsumerV2Operation::FencedTransitionV2Capability,
+                ))
+                .await,
+            Ok(SessionConsumerV2Response::Rejected(
+                SessionConsumerRejection::Unavailable
+            )),
+            "one idle V2 actor occupies only one of the two aggregate slots"
+        );
+        let global_saturation = (0..15)
+            .map(|_| {
+                persistent
+                    .pool
+                    .client
+                    .physical_admission
+                    .try_acquire_v1()
+                    .expect("saturate every remaining shared stateless request slot")
+            })
+            .collect::<Vec<_>>();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let connection = persistent
+            .pool
+            .connect_with_physical_admission(deadline, None, None, true)
+            .await
+            .expect("global-overload fallback connects after retiring one idle V2 actor");
+        assert!(
+            connection._persistent_physical_admission.is_some(),
+            "the fallback V1 connection retains the aggregate physical permit"
+        );
+        assert_eq!(persistent.pool.physical_lanes.available_permits(), 1);
+        drop(connection);
+        assert_eq!(persistent.pool.physical_lanes.available_permits(), 2);
+        drop(global_saturation);
+        let _ = persistent.shutdown().await;
+        server.abort_and_wait().await;
+    }
+
+    #[test]
+    fn persistent_v1_v2_prewarm_gate_is_one_cross_alpn_permit() {
+        let (client, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        let persistent = PersistentSessionConsumerClient::from_stateless(client)
+            .expect("construct persistent aggregate client");
+        let permit = Arc::clone(&persistent.pool.prewarm)
+            .try_acquire_owned()
+            .expect("V1 prewarm gate");
+        assert!(
+            Arc::clone(&persistent.v2_pool.prewarm)
+                .try_acquire_owned()
+                .is_err(),
+            "V2 prewarm shares the one aggregate gate"
+        );
+        drop(permit);
+        assert!(
+            Arc::clone(&persistent.v2_pool.prewarm)
+                .try_acquire_owned()
+                .is_ok(),
+            "V2 progresses after V1 releases the shared gate"
+        );
+    }
+
+    #[test]
+    fn v2_request_commitment_golden_and_domain_mutation_vectors() {
+        let capability = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        );
+        let history = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2HistoryState,
+        );
+        let capability_commitment =
+            super::v2_request_commitment(&capability).expect("capability commitment");
+        let history_commitment =
+            super::v2_request_commitment(&history).expect("history commitment");
+        assert_eq!(
+            capability_commitment,
+            [
+                108, 147, 71, 16, 6, 104, 139, 196, 43, 64, 144, 184, 125, 182, 183, 205, 219,
+                93, 98, 150, 22, 153, 81, 121, 197, 110, 21, 230, 122, 60, 61, 149,
+            ],
+            "the V2 Call domain binds the exact ALPN, revision, Call/request phase, and canonical capability body"
+        );
+        assert_eq!(
+            history_commitment,
+            [
+                183, 45, 145, 208, 39, 163, 250, 104, 24, 195, 87, 11, 126, 116, 6, 187, 32, 18,
+                137, 190, 10, 135, 109, 189, 46, 41, 224, 61, 225, 147, 44, 129,
+            ],
+            "the operation tag is a distinct commitment input"
+        );
+        assert_ne!(capability_commitment, history_commitment);
+
+        let request_bytes = serde_json::to_vec(&capability).expect("canonical capability body");
+        let operation = super::v2_request_operation_tag(capability.operation())
+            .expect("capability operation tag");
+        let committed = |domain: &[u8],
+                         alpn: &[u8],
+                         revision: u16,
+                         wire_kind: &[u8],
+                         body_kind: &[u8],
+                         operation: &[u8],
+                         request_bytes: &[u8]| {
+            super::v2_request_commitment_from_parts(
+                domain,
+                alpn,
+                revision,
+                wire_kind,
+                body_kind,
+                operation,
+                request_bytes,
+            )
+        };
+        assert_eq!(
+            committed(
+                super::V2_REQUEST_COMMITMENT_DOMAIN,
+                super::SESSION_QUORUM_CONSUMER_V2_ALPN,
+                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                b"Call",
+                b"request",
+                operation,
+                &request_bytes,
+            ),
+            capability_commitment
+        );
+        assert_ne!(
+            committed(
+                b"openpacketcore/session-consumer/v2/call-commitment/v2\0",
+                super::SESSION_QUORUM_CONSUMER_V2_ALPN,
+                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                b"Call",
+                b"request",
+                operation,
+                &request_bytes,
+            ),
+            capability_commitment,
+            "the protocol-domain version is committed"
+        );
+        assert_ne!(
+            committed(
+                super::V2_REQUEST_COMMITMENT_DOMAIN,
+                super::SESSION_QUORUM_CONSUMER_ALPN,
+                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                b"Call",
+                b"request",
+                operation,
+                &request_bytes,
+            ),
+            capability_commitment,
+            "the exact V2 ALPN is committed"
+        );
+        assert_ne!(
+            committed(
+                super::V2_REQUEST_COMMITMENT_DOMAIN,
+                super::SESSION_QUORUM_CONSUMER_V2_ALPN,
+                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION - 1,
+                b"Call",
+                b"request",
+                operation,
+                &request_bytes,
+            ),
+            capability_commitment,
+            "the exact transport revision is committed"
+        );
+        assert_ne!(
+            committed(
+                super::V2_REQUEST_COMMITMENT_DOMAIN,
+                super::SESSION_QUORUM_CONSUMER_V2_ALPN,
+                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                b"Response",
+                b"request",
+                operation,
+                &request_bytes,
+            ),
+            capability_commitment,
+            "the Call wire phase is committed"
+        );
+        assert_ne!(
+            committed(
+                super::V2_REQUEST_COMMITMENT_DOMAIN,
+                super::SESSION_QUORUM_CONSUMER_V2_ALPN,
+                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                b"Call",
+                b"response",
+                operation,
+                &request_bytes,
+            ),
+            capability_commitment,
+            "the request body phase is committed"
+        );
+        assert_ne!(
+            committed(
+                super::V2_REQUEST_COMMITMENT_DOMAIN,
+                super::SESSION_QUORUM_CONSUMER_V2_ALPN,
+                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                b"Call",
+                b"request",
+                b"fenced_transition_v2_history_state",
+                &request_bytes,
+            ),
+            capability_commitment,
+            "the operation phase is committed independently of body bytes"
+        );
+        let mut substituted_body = request_bytes.clone();
+        substituted_body.push(b' ');
+        assert_ne!(
+            committed(
+                super::V2_REQUEST_COMMITMENT_DOMAIN,
+                super::SESSION_QUORUM_CONSUMER_V2_ALPN,
+                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                b"Call",
+                b"request",
+                operation,
+                &substituted_body,
+            ),
+            capability_commitment,
+            "the exact canonical request bytes and their length are committed"
+        );
+        assert_eq!(
+            super::v2_request_commitment_with_serializer(&capability, |_| {
+                Err::<Vec<u8>, _>(())
+            }),
+            Err(super::V2RequestCommitmentError::Serialize),
+            "a canonical serializer failure is typed and fail closed"
+        );
+    }
+
+    #[test]
+    fn consumer_v2_attempt_tuple_has_the_exact_fixed_width() {
+        assert_eq!(super::SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES, 20);
+        assert_eq!(super::SESSION_QUORUM_CONSUMER_V2_ATTEMPT_TUPLE_BYTES, 52);
+        assert_eq!(
+            super::SESSION_QUORUM_CONSUMER_V2_ATTEMPT_TUPLE_BYTES,
+            std::mem::size_of::<u32>() + std::mem::size_of::<[u8; 16]>() + 32
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_attempt_entropy_is_full_width_zero_valid_and_failure_is_not_transmitted() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("v2-entropy-client");
+        let server_identity = material_spiffe("v2-entropy-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let server_material = material.trusted_server_config(server_identity.as_str());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw V2 entropy peer");
+        let address = listener.local_addr().expect("raw V2 entropy peer address");
+        let call_frames = Arc::new(AtomicUsize::new(0));
+        let sentinel = [
+            0x00, 0x80, 0xff, 0x00, 0x01, 0x7f, 0x42, 0x00, 0xfe, 0x10, 0x00, 0xa5, 0x5a, 0x00,
+            0xc3, 0x3c,
+        ];
+        let peer = tokio::spawn({
+            let call_frames = Arc::clone(&call_frames);
+            async move {
+                for scenario in 0..4 {
+                    let (tcp, _) = listener.accept().await.expect("accept V2 entropy client");
+                    let handshake = server_material
+                        .begin_handshake()
+                        .expect("raw entropy server handshake snapshot");
+                    let acceptor = tokio_rustls::TlsAcceptor::from(
+                        super::consumer_server_tls_config(handshake.rustls_config()),
+                    );
+                    let mut tls = acceptor
+                        .accept(tcp)
+                        .await
+                        .expect("complete raw V2 entropy TLS");
+                    handshake.admit().expect("admit raw V2 entropy peer");
+                    assert!(matches!(
+                        super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                            &mut tls,
+                            super::MAX_NEGOTIATED_FRAME_SIZE,
+                        )
+                        .await
+                        .expect("read V2 entropy Hello"),
+                        ConsumerV2WireRequest::Hello(_)
+                    ));
+                    super::write_frame_bounded_until(
+                        &mut tls,
+                        &ConsumerV2WireResponse::HelloAck(ConsumerHelloAck {
+                            transport_revision:
+                                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                            scope: scope(),
+                            request_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                                .expect("test V2 frame cap fits u32"),
+                        }),
+                        super::MAX_NEGOTIATED_FRAME_SIZE,
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                    )
+                    .await
+                    .expect("write V2 entropy HelloAck");
+                    if scenario < 2 {
+                        let ConsumerV2WireRequest::Call(ConsumerV2Call {
+                            correlation,
+                            attempt_nonce,
+                            request_commitment,
+                            request: _,
+                        }) = super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                            &mut tls,
+                            super::MAX_NEGOTIATED_FRAME_SIZE,
+                        )
+                        .await
+                        .expect("read sentinel V2 Call")
+                        else {
+                            panic!("sentinel entropy peer received a control frame after Hello");
+                        };
+                        call_frames.fetch_add(1, Ordering::SeqCst);
+                        if scenario == 0 {
+                            assert_eq!(attempt_nonce, [0; 16]);
+                        } else {
+                            assert_eq!(attempt_nonce, sentinel);
+                        }
+                        super::write_frame_bounded_until(
+                            &mut tls,
+                            &ConsumerV2WireResponse::Response(ConsumerV2CallResponse {
+                                correlation,
+                                attempt_nonce,
+                                request_commitment,
+                                response: Box::new(SessionConsumerV2Response::Rejected(
+                                    SessionConsumerRejection::Unavailable,
+                                )),
+                            }),
+                            super::MAX_NEGOTIATED_FRAME_SIZE,
+                            tokio::time::Instant::now() + Duration::from_secs(1),
+                        )
+                        .await
+                        .expect("write sentinel V2 response");
+                    } else {
+                        let mut post_hello_byte = [0_u8; 1];
+                        let no_call_byte = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            tls.read(&mut post_hello_byte),
+                        )
+                        .await;
+                        match no_call_byte {
+                            Ok(Ok(0)) => {}
+                            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                            other => panic!(
+                                "entropy failure must close at TLS EOF with zero post-Hello Call bytes: {other:?}"
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+        let zero_client = StatelessSessionConsumerClient::new(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity.clone(),
+            scope(),
+            material.config(),
+        )
+        .with_v2_attempt_entropy_test_hook(Arc::new(|| Ok([0; 16])));
+        assert_eq!(
+            zero_client
+                .execute_v2(&SessionConsumerV2Request::new(
+                    scope(),
+                    SessionConsumerV2Operation::FencedTransitionV2Capability,
+                ))
+                .await,
+            Ok(SessionConsumerV2Response::Rejected(
+                SessionConsumerRejection::Unavailable
+            ))
+        );
+        let sentinel_client = StatelessSessionConsumerClient::new(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity.clone(),
+            scope(),
+            material.config(),
+        )
+        .with_v2_attempt_entropy_test_hook(Arc::new(move || Ok(sentinel)));
+        assert_eq!(
+            sentinel_client
+                .execute_v2(&SessionConsumerV2Request::new(
+                    scope(),
+                    SessionConsumerV2Operation::FencedTransitionV2Capability,
+                ))
+                .await,
+            Ok(SessionConsumerV2Response::Rejected(
+                SessionConsumerRejection::Unavailable
+            ))
+        );
+        let client = StatelessSessionConsumerClient::new(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity,
+            scope(),
+            material.config(),
+        )
+        .with_v2_attempt_entropy_test_hook(Arc::new(|| Err(())));
+        let request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        );
+        assert_eq!(
+            client.execute_v2(&request).await,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            })
+        );
+        let persistent = PersistentSessionConsumerClient::from_stateless(client)
+            .expect("construct persistent entropy client");
+        assert_eq!(
+            persistent.execute_v2(&request).await,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            })
+        );
+        peer.await.expect("join raw V2 entropy peer");
+        assert_eq!(call_frames.load(Ordering::SeqCst), 2);
+        let _ = persistent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v2_commitment_serialization_failure_is_not_transmitted_before_any_call_byte() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("v2-commitment-failure-client");
+        let server_identity = material_spiffe("v2-commitment-failure-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let server_material = material.trusted_server_config(server_identity.as_str());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw V2 commitment peer");
+        let address = listener
+            .local_addr()
+            .expect("raw V2 commitment peer address");
+        let post_hello_call_bytes = Arc::new(AtomicUsize::new(0));
+        let peer = tokio::spawn({
+            let post_hello_call_bytes = Arc::clone(&post_hello_call_bytes);
+            async move {
+                for _ in 0..2 {
+                    let (tcp, _) = listener
+                        .accept()
+                        .await
+                        .expect("accept V2 commitment client");
+                    let handshake = server_material
+                        .begin_handshake()
+                        .expect("raw commitment server handshake snapshot");
+                    let acceptor = tokio_rustls::TlsAcceptor::from(
+                        super::consumer_server_tls_config(handshake.rustls_config()),
+                    );
+                    let mut tls = acceptor
+                        .accept(tcp)
+                        .await
+                        .expect("complete raw V2 commitment TLS");
+                    handshake.admit().expect("admit raw V2 commitment peer");
+                    assert!(matches!(
+                        super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                            &mut tls,
+                            super::MAX_NEGOTIATED_FRAME_SIZE,
+                        )
+                        .await
+                        .expect("read V2 commitment Hello"),
+                        ConsumerV2WireRequest::Hello(_)
+                    ));
+                    super::write_frame_bounded_until(
+                        &mut tls,
+                        &ConsumerV2WireResponse::HelloAck(ConsumerHelloAck {
+                            transport_revision:
+                                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                            scope: scope(),
+                            request_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                                .expect("test V2 frame cap fits u32"),
+                        }),
+                        super::MAX_NEGOTIATED_FRAME_SIZE,
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                    )
+                    .await
+                    .expect("write V2 commitment HelloAck");
+                    let mut byte = [0_u8; 1];
+                    let read =
+                        tokio::time::timeout(Duration::from_secs(1), tls.read(&mut byte)).await;
+                    if let Ok(Ok(count)) = read {
+                        post_hello_call_bytes.fetch_add(count, Ordering::SeqCst);
+                    }
+                    match read {
+                        Ok(Ok(0)) => {}
+                        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                        other => panic!(
+                            "commitment construction failure must close at TLS EOF with zero Call bytes: {other:?}"
+                        ),
+                    }
+                }
+            }
+        });
+        let client = StatelessSessionConsumerClient::new(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity,
+            scope(),
+            material.config(),
+        )
+        .with_v2_request_commitment_test_hook(Arc::new(|_| Err(())));
+        let request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        );
+        assert_eq!(
+            client.execute_v2(&request).await,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            })
+        );
+        let persistent = PersistentSessionConsumerClient::from_stateless(client)
+            .expect("construct persistent commitment-failure client");
+        assert_eq!(
+            persistent.execute_v2(&request).await,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            })
+        );
+        peer.await.expect("join raw V2 commitment peer");
+        assert_eq!(post_hello_call_bytes.load(Ordering::SeqCst), 0);
+        let _ = persistent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pinned_revision_five_v2_client_fails_at_new_hello_before_ack_call_or_dispatch() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        const PINNED_V2_TRANSPORT_REVISION: u16 = 5;
+        assert_eq!(
+            super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+            PINNED_V2_TRANSPORT_REVISION + 1
+        );
+        let client_identity = material_spiffe("v2-revision-five-client");
+        let server_identity = material_spiffe("v2-revision-five-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let service = Arc::new(CountingV2RejectingTestConsumer {
+            calls: Arc::clone(&dispatches),
+        });
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("revision-five V2 authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service,
+            material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for revision-five V2 peer");
+
+        let tcp = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect raw revision-five V2 client");
+        let handshake = material
+            .config()
+            .begin_handshake()
+            .expect("raw revision-five V2 client handshake snapshot");
+        let connector = tokio_rustls::TlsConnector::from(super::consumer_client_tls_config_v2(
+            handshake.rustls_config(),
+        ));
+        let mut tls = connector
+            .connect(
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                tcp,
+            )
+            .await
+            .expect("complete revision-five V2 TLS");
+        handshake
+            .admit()
+            .expect("admit revision-five V2 server identity");
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        writes.fetch_add(1, Ordering::SeqCst);
+        super::write_frame_bounded_until(
+            &mut tls,
+            &ConsumerV2WireRequest::Hello(ConsumerHello {
+                transport_revision: PINNED_V2_TRANSPORT_REVISION,
+                scope: scope(),
+                response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                    .expect("test V2 frame cap fits u32"),
+            }),
+            super::MAX_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("write exactly one pinned-revision-five V2 Hello");
+        let peer_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::read_consumer_frame::<_, ConsumerV2WireResponse>(
+                &mut tls,
+                super::MAX_NEGOTIATED_FRAME_SIZE,
+            ),
+        )
+        .await
+        .expect("revision-five V2 peer closes promptly");
+        assert!(matches!(
+            peer_result,
+            Err(ProtocolError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn revision_six_v2_client_fails_at_pinned_revision_five_hello_before_call() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        const PINNED_V2_TRANSPORT_REVISION: u16 = 5;
+        let client_identity = material_spiffe("v2-revision-six-client");
+        let server_identity = material_spiffe("v2-pinned-revision-five-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let server_material = material.trusted_server_config(server_identity.as_str());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind pinned-revision-five V2 peer");
+        let address = listener
+            .local_addr()
+            .expect("pinned-revision-five V2 peer address");
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener
+                .accept()
+                .await
+                .expect("accept revision-six V2 client");
+            let handshake = server_material
+                .begin_handshake()
+                .expect("pinned-revision-five server handshake snapshot");
+            let acceptor = tokio_rustls::TlsAcceptor::from(super::consumer_server_tls_config(
+                handshake.rustls_config(),
+            ));
+            let mut tls = acceptor
+                .accept(tcp)
+                .await
+                .expect("complete pinned-revision-five V2 TLS");
+            handshake
+                .admit()
+                .expect("admit revision-six V2 client identity");
+            let ConsumerV2WireRequest::Hello(hello) =
+                super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                    &mut tls,
+                    super::MAX_NEGOTIATED_FRAME_SIZE,
+                )
+                .await
+                .expect("read revision-six V2 Hello")
+            else {
+                panic!("a new V2 client sent Call before Hello");
+            };
+            assert_eq!(
+                hello.transport_revision,
+                super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION
+            );
+            assert_eq!(hello.scope, scope());
+            assert_eq!(
+                usize::try_from(hello.response_frame_size).expect("response frame size"),
+                super::MAX_NEGOTIATED_FRAME_SIZE
+            );
+            assert_ne!(
+                hello.transport_revision, PINNED_V2_TRANSPORT_REVISION,
+                "the pinned peer rejects the new revision before Ack"
+            );
+            tls.shutdown()
+                .await
+                .expect("close pinned-revision-five V2 lane after Hello");
+            let mut post_hello = [0_u8; 1];
+            match tls.read(&mut post_hello).await {
+                Ok(0) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                other => {
+                    panic!("revision mismatch must leave zero Call bytes after Hello: {other:?}")
+                }
+            }
+        });
+        let client = StatelessSessionConsumerClient::new(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity,
+            scope(),
+            material.config(),
+        );
+        let request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        );
+        assert_eq!(
+            client.execute_v2(&request).await,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Unavailable,
+            })
+        );
+        peer.await.expect("join pinned-revision-five V2 peer");
+    }
+
+    #[tokio::test]
+    async fn v2_negotiated_call_frame_exact_limit_and_one_byte_over_preserve_not_transmitted() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("v2-frame-limit-client");
+        let server_identity = material_spiffe("v2-frame-limit-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let server_material = material.trusted_server_config(server_identity.as_str());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw V2 frame-limit peer");
+        let address = listener
+            .local_addr()
+            .expect("raw V2 frame-limit peer address");
+        let request = v2_effectful_request(0xe1);
+        let attempt_nonce = [0xa5; 16];
+        let request_commitment =
+            super::v2_request_commitment(&request).expect("frame-limit commitment");
+        let exact_call = ConsumerV2WireRequest::Call(ConsumerV2Call {
+            correlation: NonZeroU32::MIN,
+            attempt_nonce,
+            request_commitment,
+            request: Box::new(request.clone()),
+        });
+        let exact_call_bytes = serde_json::to_vec(&exact_call)
+            .expect("encode exact V2 frame-limit Call")
+            .len();
+        assert!(exact_call_bytes > 1);
+        assert!(exact_call_bytes <= super::MAX_NEGOTIATED_FRAME_SIZE);
+        let one_byte_small = exact_call_bytes
+            .checked_sub(1)
+            .expect("nonempty exact V2 Call");
+        let peer_request = request.clone();
+        let expected_response = SessionConsumerV2Response::FencedTransitionV2(Err(
+            SessionConsumerV2FencedTransitionError::RequestConflict,
+        ));
+        let peer_response = expected_response.clone();
+        let peer = tokio::spawn(async move {
+            for scenario in 0..2 {
+                let (tcp, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept V2 frame-limit client");
+                let handshake = server_material
+                    .begin_handshake()
+                    .expect("raw frame-limit server handshake snapshot");
+                let acceptor = tokio_rustls::TlsAcceptor::from(super::consumer_server_tls_config(
+                    handshake.rustls_config(),
+                ));
+                let mut tls = acceptor
+                    .accept(tcp)
+                    .await
+                    .expect("complete raw V2 frame-limit TLS");
+                handshake.admit().expect("admit raw V2 frame-limit peer");
+                let ConsumerV2WireRequest::Hello(hello) =
+                    super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                        &mut tls,
+                        super::MAX_NEGOTIATED_FRAME_SIZE,
+                    )
+                    .await
+                    .expect("read V2 frame-limit Hello")
+                else {
+                    panic!("V2 frame-limit client sent Call before Hello");
+                };
+                assert_eq!(
+                    hello.transport_revision,
+                    super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION
+                );
+                assert_eq!(hello.scope, scope());
+                let request_frame_size = if scenario == 0 {
+                    exact_call_bytes
+                } else {
+                    one_byte_small
+                };
+                super::write_frame_bounded_until(
+                    &mut tls,
+                    &ConsumerV2WireResponse::HelloAck(ConsumerHelloAck {
+                        transport_revision: super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                        scope: scope(),
+                        request_frame_size: u32::try_from(request_frame_size)
+                            .expect("test frame limit fits u32"),
+                    }),
+                    super::MAX_NEGOTIATED_FRAME_SIZE,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                )
+                .await
+                .expect("write exact V2 frame-limit HelloAck");
+                if scenario == 0 {
+                    let ConsumerV2WireRequest::Call(ConsumerV2Call {
+                        correlation,
+                        attempt_nonce: received_nonce,
+                        request_commitment: received_commitment,
+                        request: received_request,
+                    }) = super::read_consumer_frame::<_, ConsumerV2WireRequest>(
+                        &mut tls,
+                        exact_call_bytes,
+                    )
+                    .await
+                    .expect("read exact-limit V2 Call")
+                    else {
+                        panic!("expected exact-limit V2 Call");
+                    };
+                    assert_eq!(correlation, NonZeroU32::MIN);
+                    assert_eq!(received_nonce, attempt_nonce);
+                    assert_eq!(received_commitment, request_commitment);
+                    assert_eq!(*received_request, peer_request);
+                    super::write_frame_bounded_until(
+                        &mut tls,
+                        &ConsumerV2WireResponse::Response(ConsumerV2CallResponse {
+                            correlation,
+                            attempt_nonce: received_nonce,
+                            request_commitment: received_commitment,
+                            response: Box::new(peer_response.clone()),
+                        }),
+                        super::MAX_NEGOTIATED_FRAME_SIZE,
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                    )
+                    .await
+                    .expect("write exact-limit V2 response");
+                } else {
+                    let mut byte = [0_u8; 1];
+                    match tls.read(&mut byte).await {
+                        Ok(0) => {}
+                        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                        other => panic!(
+                            "one-byte-over V2 Call must leave zero transport bytes: {other:?}"
+                        ),
+                    }
+                }
+            }
+        });
+        let client = StatelessSessionConsumerClient::new(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity,
+            scope(),
+            material.config(),
+        )
+        .with_operation_timeout(Duration::from_secs(10))
+        .with_v2_attempt_entropy_test_hook(Arc::new(move || Ok(attempt_nonce)));
+        assert_eq!(
+            client.execute_v2(&request).await,
+            Ok(expected_response),
+            "the exact negotiated V2 Call frame is transmitted and tuple-matched"
+        );
+        assert_eq!(
+            client.execute_v2(&request).await,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            }),
+            "one byte over the negotiated V2 Call limit is rejected before any write"
+        );
+        peer.await.expect("join raw V2 frame-limit peer");
+    }
+
+    #[tokio::test]
+    async fn server_rejects_oversized_inbound_v2_frame_before_dispatch() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("v2-oversized-frame-client");
+        let server_identity = material_spiffe("v2-oversized-frame-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let service = Arc::new(CountingV2RejectingTestConsumer {
+            calls: Arc::clone(&dispatches),
+        });
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("oversized V2 frame authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service,
+            material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for oversized V2 frame peer");
+        let tcp = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect oversized V2 frame client");
+        let handshake = material
+            .config()
+            .begin_handshake()
+            .expect("oversized V2 client handshake snapshot");
+        let connector = tokio_rustls::TlsConnector::from(super::consumer_client_tls_config_v2(
+            handshake.rustls_config(),
+        ));
+        let mut tls = connector
+            .connect(
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                tcp,
+            )
+            .await
+            .expect("complete oversized V2 TLS");
+        handshake
+            .admit()
+            .expect("admit oversized V2 server identity");
+        super::write_frame_bounded_until(
+            &mut tls,
+            &ConsumerV2WireRequest::Hello(ConsumerHello {
+                transport_revision: super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                scope: scope(),
+                response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                    .expect("test V2 frame cap fits u32"),
+            }),
+            super::MAX_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("write oversized-frame Hello");
+        assert!(matches!(
+            super::read_consumer_frame::<_, ConsumerV2WireResponse>(
+                &mut tls,
+                super::MAX_NEGOTIATED_FRAME_SIZE,
+            )
+            .await
+            .expect("read oversized-frame HelloAck"),
+            ConsumerV2WireResponse::HelloAck(ConsumerHelloAck {
+                transport_revision: super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                scope: acknowledged_scope,
+                ..
+            }) if acknowledged_scope == scope()
+        ));
+        let oversized = u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE + 1)
+            .expect("one-over frame length fits u32")
+            .to_be_bytes();
+        tls.write_all(&oversized)
+            .await
+            .expect("write one oversized V2 frame prefix");
+        tls.flush()
+            .await
+            .expect("flush one oversized V2 frame prefix");
+        let closed = super::read_consumer_frame::<_, ConsumerV2WireResponse>(
+            &mut tls,
+            super::MAX_NEGOTIATED_FRAME_SIZE,
+        )
+        .await;
+        assert!(
+            matches!(closed, Err(ProtocolError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof),
+            "an oversized inbound V2 frame closes the lane before dispatch"
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn server_rejects_substituted_v2_commitment_before_dispatch() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = material_spiffe("v2-substituted-commitment-client");
+        let server_identity = material_spiffe("v2-substituted-commitment-server");
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let service = Arc::new(CountingV2RejectingTestConsumer {
+            calls: Arc::clone(&dispatches),
+        });
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("substituted commitment authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service,
+            material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for substituted commitment peer");
+
+        let tcp = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect raw substituted commitment client");
+        let handshake = material
+            .config()
+            .begin_handshake()
+            .expect("substituted commitment client handshake snapshot");
+        let connector = tokio_rustls::TlsConnector::from(super::consumer_client_tls_config_v2(
+            handshake.rustls_config(),
+        ));
+        let mut tls = connector
+            .connect(
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                tcp,
+            )
+            .await
+            .expect("complete substituted commitment V2 TLS");
+        handshake
+            .admit()
+            .expect("admit substituted commitment server identity");
+        super::write_frame_bounded_until(
+            &mut tls,
+            &ConsumerV2WireRequest::Hello(ConsumerHello {
+                transport_revision: super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                scope: scope(),
+                response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                    .expect("test V2 frame cap fits u32"),
+            }),
+            super::MAX_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("write substituted commitment Hello");
+        assert!(matches!(
+            super::read_consumer_frame::<_, ConsumerV2WireResponse>(
+                &mut tls,
+                super::MAX_NEGOTIATED_FRAME_SIZE,
+            )
+            .await
+            .expect("read substituted commitment HelloAck"),
+            ConsumerV2WireResponse::HelloAck(ConsumerHelloAck {
+                transport_revision: super::SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
+                scope: acknowledged_scope,
+                ..
+            }) if acknowledged_scope == scope()
+        ));
+        let request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        );
+        let substituted = [0_u8; 32];
+        assert_ne!(
+            super::v2_request_commitment(&request).expect("canonical commitment"),
+            substituted
+        );
+        super::write_frame_bounded_until(
+            &mut tls,
+            &ConsumerV2WireRequest::Call(ConsumerV2Call {
+                correlation: NonZeroU32::MIN,
+                attempt_nonce: [0x5a; 16],
+                request_commitment: substituted,
+                request: Box::new(request),
+            }),
+            super::MAX_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("write one substituted commitment Call");
+        let closed = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::read_consumer_frame::<_, ConsumerV2WireResponse>(
+                &mut tls,
+                super::MAX_NEGOTIATED_FRAME_SIZE,
+            ),
+        )
+        .await
+        .expect("server rejects substituted commitment promptly");
+        assert!(
+            matches!(
+                &closed,
+                Err(ProtocolError::Io(error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof
+            ),
+            "a substituted commitment closes the authenticated lane: {}",
+            matches!(&closed, Err(ProtocolError::Io(_)))
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        server.abort_and_wait().await;
+    }
+
+    async fn assert_v2_batch_item_ambiguity_is_never_success(
+        identity_suffix: &str,
+        error: SessionConsumerV2FencedTransitionError,
+    ) {
+        let client_identity = material_spiffe(&format!("v2-batch-item-{identity_suffix}-client"));
+        let server_identity = material_spiffe(&format!("v2-batch-item-{identity_suffix}-server"));
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let batches = Arc::new(StdMutex::new(Vec::new()));
+        let service = Arc::new(V2BatchItemAmbiguityTestConsumer {
+            error,
+            v2_calls: Arc::clone(&calls),
+            batches: Arc::clone(&batches),
+        });
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("V2 batch item ambiguity authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service,
+            material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for V2 batch item ambiguity");
+        let stateless = StatelessSessionConsumerClient::new(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity,
+            scope(),
+            material.config(),
+        );
+
+        let stateless_batch = v2_effectful_batch_request(&[0xb1, 0xb2]);
+        let stateless_ids = v2_batch_request_ids(&stateless_batch);
+        let expected_stateless_body = stateless_batch.clone();
+        assert_eq!(
+            stateless.execute_v2(&stateless_batch).await,
+            Err(
+                PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch {
+                    request_ids: stateless_ids,
+                }
+            ),
+            "a per-item {identity_suffix} response is never accepted as a successful batch"
+        );
+
+        let persistent = PersistentSessionConsumerClient::from_stateless(stateless)
+            .expect("construct persistent V2 client");
+        let persistent_batch = v2_effectful_batch_request(&[0xb3, 0xb4]);
+        let persistent_ids = v2_batch_request_ids(&persistent_batch);
+        let expected_persistent_body = persistent_batch.clone();
+        assert_eq!(
+            persistent.execute_v2(&persistent_batch).await,
+            Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch {
+                request_ids: persistent_ids,
+            }),
+            "a persistent per-item {identity_suffix} response preserves the exact batch recovery vector"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if persistent.v2_diagnostics().active == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ambiguous batch item retires its persistent V2 actor");
+        assert_eq!(persistent.v2_diagnostics().idle, 0);
+        assert_eq!(persistent.v2_diagnostics().setup_successes, 1);
+        assert_eq!(
+            *batches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![expected_stateless_body, expected_persistent_body],
+            "the service saw the exact stable batch IDs and complete request bodies"
+        );
+        assert_eq!(
+            persistent
+                .execute_v2(&SessionConsumerV2Request::new(
+                    scope(),
+                    SessionConsumerV2Operation::FencedTransitionV2Capability,
+                ))
+                .await,
+            Ok(SessionConsumerV2Response::Rejected(
+                SessionConsumerRejection::Unavailable
+            )),
+            "the next persistent call starts a fresh V2 Hello, not a reused ambiguous lane"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(persistent.v2_diagnostics().setup_successes, 2);
+        let _ = persistent.shutdown().await;
+        server.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn v2_per_item_ambiguous_batch_errors_are_outcome_unknown_and_retire_lanes() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        assert_v2_batch_item_ambiguity_is_never_success(
+            "outcome-unknown",
+            SessionConsumerV2FencedTransitionError::OutcomeUnknown,
+        )
+        .await;
+        assert_v2_batch_item_ambiguity_is_never_success(
+            "unavailable",
+            SessionConsumerV2FencedTransitionError::Store(SessionConsumerStoreError::Unavailable),
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn server_lifecycle_expiry_at_final_boundary_publishes_no_hello_ack() {
         let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
             .lock()
@@ -17159,61 +19179,52 @@ mod tests {
     }
 
     #[test]
-    fn stateless_clone_lineage_bounds_physical_request_and_watch_connections() {
+    fn stateless_clone_lineage_shares_request_and_separate_watch_admission() {
         let control = SessionReauthenticationControl::new();
         let (client, _material) = stateless_test_client(control);
         let clone = client.clone();
         let mut v1_requests = Vec::new();
-        for _ in 0..MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS {
+        for _ in 0..MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS / 2 {
             v1_requests.push(
                 client
                     .physical_admission
                     .try_acquire_v1()
-                    .expect("configured V1 request cap admits its exact bound"),
+                    .expect("configured V1 cap admits its exact bound"),
             );
         }
-        assert!(
-            matches!(
-                clone.physical_admission.try_acquire_v1(),
-                Err(SessionConsumerClientError::Overloaded)
-            ),
-            "clones share V1 physical admission before resolve or write"
-        );
-        assert!(
-            clone.physical_admission.try_acquire_v2().is_ok(),
-            "V2 physical admission is isolated from saturated V1 lanes"
-        );
-        assert!(
-            clone.physical_admission.try_acquire_watch().is_ok(),
-            "watch physical admission is isolated from normal request lanes"
-        );
-        drop(v1_requests);
-
         let mut v2_requests = Vec::new();
-        for _ in 0..MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS {
+        for _ in 0..MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS / 2 {
             v2_requests.push(
                 client
                     .physical_admission
                     .try_acquire_v2()
-                    .expect("configured V2 request cap admits its exact bound"),
+                    .expect("configured aggregate cap admits exactly eight V2 lanes"),
             );
         }
         assert!(
             matches!(
-                clone.physical_admission.try_acquire_v2(),
+                client.physical_admission.try_acquire_v2(),
                 Err(SessionConsumerClientError::Overloaded)
             ),
-            "clones share V2 physical admission before resolve or write"
+            "the seventeenth aggregate request is rejected before resolve or write"
         );
+        let mut watches = Vec::new();
+        for _ in 0..MAX_STATELESS_SESSION_CONSUMER_WATCH_CONNECTIONS {
+            watches.push(
+                clone
+                    .physical_admission
+                    .try_acquire_watch()
+                    .expect("the separate watch cap admits alongside full aggregate requests"),
+            );
+        }
         assert!(
-            clone.physical_admission.try_acquire_v1().is_ok(),
-            "V1 physical admission is isolated from saturated V2 lanes"
+            matches!(
+                client.physical_admission.try_acquire_watch(),
+                Err(SessionConsumerClientError::Overloaded)
+            ),
+            "watch physical admission remains exact and independent"
         );
-        assert!(
-            clone.physical_admission.try_acquire_watch().is_ok(),
-            "watch physical admission remains isolated from V2 lanes"
-        );
-        drop(v2_requests);
+        drop((v1_requests, v2_requests, watches));
     }
 
     #[test]

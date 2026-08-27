@@ -1687,6 +1687,7 @@ pub(crate) struct ConsensusLogPruneLane {
     sender: tokio::sync::mpsc::Sender<()>,
     stop: tokio::sync::watch::Sender<bool>,
     stopping: AtomicBool,
+    degraded: AtomicBool,
     active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
@@ -1727,6 +1728,7 @@ impl ConsensusLogPruneLane {
             sender,
             stop,
             stopping: AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
             active_interrupt: Mutex::new(None),
             worker: tokio::sync::Mutex::new(None),
             diagnostics,
@@ -1734,6 +1736,9 @@ impl ConsensusLogPruneLane {
             #[cfg(all(test, target_os = "linux"))]
             turn_gate: consensus_log_prune_turn_gate_for_source(&source),
         });
+        if let Some(diagnostics) = &lane.diagnostics {
+            diagnostics.clear_consensus_log_prune_degraded();
+        }
         let worker = tokio::spawn(run_consensus_log_prune_lane(
             receiver,
             stop_receiver,
@@ -1749,17 +1754,29 @@ impl ConsensusLogPruneLane {
             .worker
             .try_lock()
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)? = Some(worker);
+        lane.signal();
         Ok(lane)
     }
 
     pub(crate) fn signal(&self) {
-        if self.stopping.load(Ordering::Acquire) {
+        if self.stopping.load(Ordering::Acquire) || self.degraded.load(Ordering::Acquire) {
             return;
         }
         if self.sender.try_send(()).is_ok() {
             if let Some(diagnostics) = &self.diagnostics {
                 diagnostics.observe_consensus_log_prune_signal();
             }
+        }
+    }
+
+    pub(crate) fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Acquire)
+    }
+
+    fn fail_permanently(&self) {
+        self.degraded.store(true, Ordering::Release);
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.fail_consensus_log_prune_turn();
         }
     }
 
@@ -1990,9 +2007,7 @@ async fn run_consensus_log_prune_lane(
                     }
                     return;
                 }
-                if let Some(diagnostics) = &lane.diagnostics {
-                    diagnostics.fail_consensus_log_prune_turn();
-                }
+                lane.fail_permanently();
                 return;
             }
             Ok((returned, Err(ConsensusLogPruneTurnError::Permanent))) => {
@@ -2003,9 +2018,7 @@ async fn run_consensus_log_prune_lane(
                     }
                     return;
                 }
-                if let Some(diagnostics) = &lane.diagnostics {
-                    diagnostics.fail_consensus_log_prune_turn();
-                }
+                lane.fail_permanently();
                 return;
             }
             Err(_) => {
@@ -2015,9 +2028,7 @@ async fn run_consensus_log_prune_lane(
                     }
                     return;
                 }
-                if let Some(diagnostics) = &lane.diagnostics {
-                    diagnostics.fail_consensus_log_prune_turn();
-                }
+                lane.fail_permanently();
                 return;
             }
         }
@@ -8669,6 +8680,20 @@ impl MembershipLogProjection {
         command: &SessionConsensusCommand,
         storage_identity: SessionConsensusIdentity,
     ) -> io::Result<()> {
+        self.project_fenced_transition_v2_with_durable_probe(conn, command, storage_identity, None)
+    }
+
+    /// Project one V2 item, optionally reusing the exact durable-ledger probe
+    /// already performed by its enclosing physical batch.  A standalone
+    /// command always supplies `None` and retains the full fail-closed schema
+    /// and receipt validation below.
+    fn project_fenced_transition_v2_with_durable_probe(
+        &mut self,
+        conn: &Connection,
+        command: &SessionConsensusCommand,
+        storage_identity: SessionConsensusIdentity,
+        durable_probe: Option<(FencedTransitionV2LedgerLayout, bool)>,
+    ) -> io::Result<()> {
         let request = fenced_transition_v2_request(&command.intent)
             .ok_or_else(|| invalid_data("projected fenced transition V2 request is missing"))?;
         // Do not advance the projection's logical clock for a command whose
@@ -8780,12 +8805,23 @@ impl MembershipLogProjection {
         // follower append admission runs.  Do not query its receipt table
         // until a prior committed entry has published the V3 layout; doing so
         // would reject the very activation/bind entry that creates it.
-        let durable_receipt_exists = if fenced_transition_v2_ledger_layout_sync(conn)?
-            == FencedTransitionV2LedgerLayout::Activated
-        {
-            read_fenced_transition_v2_receipt_sync(conn, storage_identity, request)?.is_some()
-        } else {
-            false
+        let durable_receipt_exists = match durable_probe {
+            Some((FencedTransitionV2LedgerLayout::Absent, true)) => {
+                return Err(invalid_data(
+                    "projected fenced transition V2 durable receipt probe is invalid",
+                ));
+            }
+            Some((_, exists)) => exists,
+            None => {
+                if fenced_transition_v2_ledger_layout_sync(conn)?
+                    == FencedTransitionV2LedgerLayout::Activated
+                {
+                    read_fenced_transition_v2_receipt_sync(conn, storage_identity, request)?
+                        .is_some()
+                } else {
+                    false
+                }
+            }
         };
         if self.projected_v2_bound_requests.contains(&full_id) || durable_receipt_exists {
             self.advance_projected_logical_time(command.logical_time);
@@ -8889,17 +8925,38 @@ impl MembershipLogProjection {
             .ok_or_else(|| invalid_data("projected fenced transition V2 count is invalid"))?;
         let before_sequence = self.projected_application_sequence;
         let mut admitted_fresh = 0usize;
+        // A physical batch has one immutable SQLite schema for the duration
+        // of admission.  Audit it at most once, lazily at the same precedence
+        // point where a standalone item would first need durable state.
+        let mut durable_layout = None;
         for request in requests {
-            let is_fresh = matches!(request.validate(), Ok(()))
+            let already_projected = self
+                .projected_v2_bound_requests
+                .contains(&request.request_id().to_bytes());
+            let may_need_durable_probe = matches!(request.validate(), Ok(()))
                 && history.active_epoch == Some(request.request_id().epoch())
-                && request.request_id().epoch().get() > history.retired_through
-                && !self
-                    .projected_v2_bound_requests
-                    .contains(&request.request_id().to_bytes())
-                && (fenced_transition_v2_ledger_layout_sync(conn)?
-                    == FencedTransitionV2LedgerLayout::Activated
+                && request.request_id().epoch().get() > history.retired_through;
+            let durable_probe = if may_need_durable_probe {
+                let layout = match durable_layout {
+                    Some(layout) => layout,
+                    None => {
+                        let layout = fenced_transition_v2_ledger_layout_sync(conn)?;
+                        durable_layout = Some(layout);
+                        layout
+                    }
+                };
+                let exists = layout == FencedTransitionV2LedgerLayout::Activated
                     && read_fenced_transition_v2_receipt_sync(conn, storage_identity, request)?
-                        .is_none());
+                        .is_some();
+                Some((layout, exists))
+            } else {
+                None
+            };
+            let is_fresh = !already_projected
+                && matches!(
+                    durable_probe,
+                    Some((FencedTransitionV2LedgerLayout::Activated, false))
+                );
             if is_fresh {
                 if admitted_fresh >= available {
                     continue;
@@ -8916,8 +8973,19 @@ impl MembershipLogProjection {
                 logical_time: command.logical_time,
                 intent,
             };
-            self.project_fenced_transition_v2(conn, &singleton, storage_identity)?;
+            self.project_fenced_transition_v2_with_durable_probe(
+                conn,
+                &singleton,
+                storage_identity,
+                durable_probe,
+            )?;
         }
+        // Even when every fresh item is beyond the remaining capacity and
+        // therefore skips singleton projection, apply commits the physical
+        // batch as a no-effect HistoryFull response and advances its logical
+        // clock. A following lower-timestamp maintenance entry in the same
+        // append must observe that identical clock.
+        self.advance_projected_logical_time(command.logical_time);
         if self.projected_application_sequence > before_sequence {
             self.projected_application_sequence =
                 before_sequence.checked_add(1).ok_or_else(|| {
@@ -11610,24 +11678,25 @@ fn read_fenced_transition_v2_receipt_sync(
     request: &FencedTransitionV2Request,
 ) -> io::Result<Option<FencedTransitionV2Receipt>> {
     let request_id = request.request_id().to_bytes();
-    let row = conn
-        .query_row(
+    let mut statement = conn
+        .prepare_cached(
             "SELECT request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest FROM consensus_fenced_transition_v2_receipts WHERE request_id = ?1",
-            [request_id.as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
-                    row.get::<_, Option<Vec<u8>>>(7)?,
-                    row.get::<_, Option<Vec<u8>>>(8)?,
-                ))
-            },
         )
+        .map_err(db_error)?;
+    let row = statement
+        .query_row([request_id.as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
+                row.get::<_, Option<Vec<u8>>>(8)?,
+            ))
+        })
         .optional()
         .map_err(db_error)?;
     let Some((
@@ -11735,7 +11804,7 @@ fn read_fenced_transition_v2_receipt_sync(
     }))
 }
 
-fn store_fenced_transition_v2_receipt_sync(
+fn store_fenced_transition_v2_receipt_row_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     request: &FencedTransitionV2Request,
@@ -11761,20 +11830,13 @@ fn store_fenced_transition_v2_receipt_sync(
     )?;
     let response_digest = fenced_transition_v2_receipt_response_digest(binding_digest, &encoded)?;
     let history_epoch = request.request_id().epoch().get();
-    let changed = conn
-        .execute(
-            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = current_bound_count + 1 WHERE singleton = 1 AND active_epoch = ?1 AND current_bound_count = ?2",
-            params![checked_positive_i64(history_epoch)?, checked_i64(ordinal.checked_sub(1).ok_or_else(|| invalid_data("fenced transition V2 ordinal is invalid"))?)?],
+    let mut statement = conn
+        .prepare_cached(
+            "INSERT INTO consensus_fenced_transition_v2_receipts (request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .map_err(db_error)?;
-    if changed != 1 {
-        return Err(invalid_data(
-            "fenced transition V2 history bind state is invalid",
-        ));
-    }
-    conn.execute(
-        "INSERT INTO consensus_fenced_transition_v2_receipts (request_id, history_epoch, ordinal, configuration_epoch, payload_digest, retained_until, binding_digest, response_json, response_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
+    statement
+        .execute(params![
             request.request_id().to_bytes().as_slice(),
             checked_positive_i64(history_epoch)?,
             checked_positive_i64(ordinal)?,
@@ -11784,10 +11846,73 @@ fn store_fenced_transition_v2_receipt_sync(
             binding_digest.as_slice(),
             encoded,
             response_digest.as_slice(),
-        ],
-    )
-    .map_err(db_error)?;
+        ])
+        .map_err(db_error)?;
     Ok(())
+}
+
+fn advance_fenced_transition_v2_history_count_sync(
+    conn: &Connection,
+    history_epoch: u64,
+    previous_count: u64,
+    next_count: u64,
+) -> io::Result<()> {
+    if next_count <= previous_count
+        || next_count
+            > u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                .map_err(|_| invalid_data("fenced transition V2 history bound is invalid"))?
+    {
+        return Err(invalid_data(
+            "fenced transition V2 history bind range is invalid",
+        ));
+    }
+    let mut statement = conn
+        .prepare_cached(
+            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = ?3 WHERE singleton = 1 AND active_epoch = ?1 AND current_bound_count = ?2",
+        )
+        .map_err(db_error)?;
+    let changed = statement
+        .execute(params![
+            checked_positive_i64(history_epoch)?,
+            checked_i64(previous_count)?,
+            checked_i64(next_count)?,
+        ])
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data(
+            "fenced transition V2 history bind state is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn store_fenced_transition_v2_receipt_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request: &FencedTransitionV2Request,
+    ordinal: u64,
+    payload_digest: [u8; 32],
+    retained_until: Timestamp,
+    response: &SessionConsensusResponse,
+) -> io::Result<()> {
+    let previous_count = ordinal
+        .checked_sub(1)
+        .ok_or_else(|| invalid_data("fenced transition V2 ordinal is invalid"))?;
+    advance_fenced_transition_v2_history_count_sync(
+        conn,
+        request.request_id().epoch().get(),
+        previous_count,
+        ordinal,
+    )?;
+    store_fenced_transition_v2_receipt_row_sync(
+        conn,
+        identity,
+        request,
+        ordinal,
+        payload_digest,
+        retained_until,
+        response,
+    )
 }
 
 fn compact_fenced_transition_v2_receipt_sync(
@@ -13752,8 +13877,9 @@ fn apply_fenced_transition_v2_batch_command_sync(
     } else {
         (machine.0, machine.1)
     };
-    let mut ordinal = u64::try_from(history.current_bound_count)
+    let initial_bound_count = u64::try_from(history.current_bound_count)
         .map_err(|_| invalid_data("fenced transition V2 ordinal is invalid"))?;
+    let mut ordinal = initial_bound_count;
     for (slot, payload_digest) in fresh {
         if outcomes[slot].is_some() {
             continue;
@@ -13815,7 +13941,7 @@ fn apply_fenced_transition_v2_batch_command_sync(
             logical_time: Some(logical_time),
             raft_log_index,
         };
-        store_fenced_transition_v2_receipt_sync(
+        store_fenced_transition_v2_receipt_row_sync(
             tx,
             storage_identity,
             request,
@@ -13825,6 +13951,14 @@ fn apply_fenced_transition_v2_batch_command_sync(
             &response,
         )?;
         outcomes[slot] = Some(result);
+    }
+    if ordinal != initial_bound_count {
+        advance_fenced_transition_v2_history_count_sync(
+            tx,
+            requests[0].request_id().epoch().get(),
+            initial_bound_count,
+            ordinal,
+        )?;
     }
     let outcomes = outcomes
         .into_iter()
@@ -21146,6 +21280,14 @@ mod tests {
             .expect("pin prune primary descriptor"),
         );
         let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        primary
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
+                [placement_policy_i64(
+                    PlacementResiliencePolicy::AllowReducedResilience,
+                )],
+            )
+            .expect("tamper fixed prune authority before the startup signal");
         let lane = ConsensusLogPruneLane::start(
             Arc::clone(&pinned),
             None,
@@ -21156,21 +21298,17 @@ mod tests {
             Some(Arc::clone(&diagnostics)),
         )
         .expect("start prune lane");
-        primary
-            .execute(
-                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
-                [placement_policy_i64(
-                    PlacementResiliencePolicy::AllowReducedResilience,
-                )],
-            )
-            .expect("tamper fixed prune authority");
-        lane.signal();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let snapshot = diagnostics.snapshot();
-                if snapshot.consensus_log_prune_permanent_failures == 1 {
+                if snapshot.consensus_log_prune_permanent_failures == 1
+                    && diagnostics.consensus_log_prune_gauges_for_test() == (0, 0)
+                {
                     assert_eq!(snapshot.consensus_log_prune_completed_turns, 0);
                     assert_eq!(snapshot.consensus_log_prune_rows_deleted, 0);
+                    assert_eq!(snapshot.consensus_log_prune_attempts, 1);
+                    assert!(snapshot.consensus_log_prune_degraded);
+                    assert!(lane.is_degraded());
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -21186,7 +21324,15 @@ mod tests {
                 )],
             )
             .expect("restore fixed prune authority");
+        let stopped = diagnostics.snapshot();
         lane.signal();
+        lane.signal();
+        lane.signal();
+        assert_eq!(
+            diagnostics.snapshot(),
+            stopped,
+            "a degraded lane rejects repeated signals without retrying or restarting"
+        );
         lane.shutdown().await;
         let reopened = ConsensusLogPruneLane::start(
             pinned,
@@ -21198,7 +21344,6 @@ mod tests {
             Some(Arc::clone(&diagnostics)),
         )
         .expect("reopen prune lane after permanent failure");
-        reopened.signal();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let snapshot = diagnostics.snapshot();
@@ -21207,6 +21352,8 @@ mod tests {
                     assert_eq!(snapshot.consensus_log_prune_completed_turns, 2);
                     assert_eq!(snapshot.consensus_log_prune_more_turns, 1);
                     assert_eq!(snapshot.consensus_log_prune_rows_deleted, 130);
+                    assert!(!snapshot.consensus_log_prune_degraded);
+                    assert!(!reopened.is_degraded());
                     assert_eq!(snapshot.consensus_log_prune_queue_high_water, 1);
                     assert_eq!(snapshot.consensus_log_prune_active_high_water, 1);
                     assert_eq!(snapshot.consensus_log_prune_worker_high_water, 1);
@@ -21969,6 +22116,21 @@ mod tests {
                 intent: SessionMutationIntent::FencedTransitionV2Batch(requests),
             }),
         }
+    }
+
+    fn maximum_fenced_transition_v2_batch_requests() -> Vec<FencedTransitionV2Request> {
+        (0..crate::consensus::types::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS)
+            .map(|index| {
+                let request_byte = u8::try_from((index % usize::from(u8::MAX)) + 1)
+                    .expect("the nonzero fixture byte is bounded");
+                let fixture_owner = if index < usize::from(u8::MAX) {
+                    "v2-max-batch-item-a"
+                } else {
+                    "v2-max-batch-item-b"
+                };
+                fenced_transition_v2_request(request_byte, 1, fixture_owner)
+            })
+            .collect()
     }
 
     fn fenced_transition_v2_authorized_entry(
@@ -26276,6 +26438,182 @@ LIMIT 20000;
                 }
             ))),
         );
+    }
+
+    #[test]
+    fn fenced_transition_v2_projection_batch_reuses_one_schema_audit_and_one_receipt_probe() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let activation = fenced_transition_v2_request(0xA7, 1, "v2-projection-batch-activation");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                activating_fenced_transition_v2_entry(1, activation, timestamp(1)),
+            ],
+        )
+        .expect("activate durable V2 ledger");
+        let batch = fenced_transition_v2_batch_entry(
+            2,
+            maximum_fenced_transition_v2_batch_requests(),
+            timestamp(2),
+        );
+        let mut projection =
+            MembershipLogProjection::load(&conn, identity(), false).expect("load V2 projection");
+
+        // Disable statement caching only for this causal execution counter:
+        // one authorization of the selected `ordinal` column corresponds to
+        // one actual receipt lookup. Production keeps the fixed statement
+        // cache enabled.
+        conn.set_prepared_statement_cache_capacity(0);
+        let schema_definition_reads = Arc::new(AtomicUsize::new(0));
+        let observed_schema_definition_reads = Arc::clone(&schema_definition_reads);
+        let receipt_ordinal_reads = Arc::new(AtomicUsize::new(0));
+        let observed_receipt_ordinal_reads = Arc::clone(&receipt_ordinal_reads);
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            match context.action {
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "sqlite_master" | "sqlite_schema",
+                    column_name: "sql",
+                } => {
+                    observed_schema_definition_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "consensus_fenced_transition_v2_receipts",
+                    column_name: "ordinal",
+                } => {
+                    observed_receipt_ordinal_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
+
+        projection
+            .project(&conn, &batch, identity())
+            .expect("project maximum V2 batch");
+        let projected_once = (
+            projection.projected_v2_history,
+            projection.projected_v2_bound_requests.clone(),
+            projection.projected_application_sequence,
+            projection.projected_logical_time,
+        );
+        projection
+            .project(&conn, &batch, identity())
+            .expect("project exact still-unapplied replay");
+        assert_eq!(
+            (
+                projection.projected_v2_history,
+                projection.projected_v2_bound_requests.clone(),
+                projection.projected_application_sequence,
+                projection.projected_logical_time,
+            ),
+            projected_once,
+            "an exact projected replay must not reserve or advance a second time",
+        );
+        let logical_items =
+            crate::consensus::types::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS;
+        assert_eq!(
+            receipt_ordinal_reads.load(Ordering::Relaxed),
+            logical_items * 2,
+            "the original projection and exact replay each probe every receipt exactly once",
+        );
+        assert!(
+            schema_definition_reads.load(Ordering::Relaxed) <= 64,
+            "two physical projections must perform at most one bounded schema audit each; observed {} schema-definition reads",
+            schema_definition_reads.load(Ordering::Relaxed),
+        );
+    }
+
+    #[test]
+    fn fenced_transition_v2_projection_full_batch_preserves_clock_for_following_maintenance() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let activation = fenced_transition_v2_request(0xA8, 1, "v2-full-clock-activation");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                activating_fenced_transition_v2_entry(1, activation, timestamp(1)),
+            ],
+        )
+        .expect("activate V2 ledger");
+        conn.execute(
+            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = ?1 WHERE singleton = 1",
+            [i64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                .expect("V2 capacity fits SQLite")],
+        )
+        .expect("seed exact full active epoch");
+
+        let candidate = fenced_transition_v2_request(0xA9, 1, "v2-full-clock-candidate");
+        let full_batch = fenced_transition_v2_batch_entry(2, vec![candidate], timestamp(10));
+        let initial_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial V2 epoch");
+        let maintenance = Entry {
+            log_id: log_id(3),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes([0xAA; 16]),
+                logical_time: timestamp(9),
+                intent: SessionMutationIntent::MaintainFencedTransitionV2History {
+                    expected_generation: 0,
+                    expected_active_epoch: Some(initial_epoch),
+                    expected_retired_through: 0,
+                    expected_bound_entries: u64::try_from(FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES)
+                        .expect("V2 capacity fits u64"),
+                },
+            }),
+        };
+
+        let mut projection = MembershipLogProjection::load(&conn, identity(), false)
+            .expect("load full-epoch projection");
+        projection
+            .project(&conn, &full_batch, identity())
+            .expect("project all-HistoryFull batch");
+        assert_eq!(
+            projection.projected_logical_time,
+            Some(timestamp(10)),
+            "a committed no-effect physical batch still advances projected logical time",
+        );
+        projection
+            .project(&conn, &maintenance, identity())
+            .expect("project lower-timestamp successor maintenance");
+
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![full_batch, maintenance],
+        )
+        .expect("apply full batch and successor maintenance");
+        assert!(matches!(
+            applied.responses.as_slice(),
+            [
+                SessionConsensusResponse {
+                    result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+                    ..
+                },
+                SessionConsensusResponse {
+                    result: Ok(SessionMutationOutcome::Unit),
+                    ..
+                },
+            ] if matches!(outcomes.as_slice(), [Err(StoreError::FencedTransitionHistoryFull)])
+        ));
+        let durable_history =
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history after successor maintenance");
+        let durable_machine =
+            read_machine_sync(&conn, identity()).expect("machine after successor maintenance");
+        assert_eq!(projection.projected_v2_history, Some(durable_history));
+        assert_eq!(projection.projected_application_sequence, durable_machine.0,);
+        assert_eq!(projection.projected_logical_time, durable_machine.2);
+        assert_eq!(durable_machine.2, Some(timestamp(10)));
     }
 
     #[test]
@@ -35356,6 +35694,63 @@ BEGIN IMMEDIATE;
             }]
         ));
         assert!(rejected.notifications.is_empty());
+    }
+
+    #[test]
+    fn fenced_transition_v2_max_batch_advances_history_with_one_row_update() {
+        let backend = SqliteSessionBackend::in_memory().expect("backend");
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
+        let activation = fenced_transition_v2_request(0xA7, 1, "v2-max-batch-cas-activation");
+        apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![
+                membership_entry(),
+                activating_fenced_transition_v2_entry(1, activation, timestamp(1)),
+            ],
+        )
+        .expect("activate V2");
+
+        let history_updates = Arc::new(AtomicUsize::new(0));
+        let observed_history_updates = Arc::clone(&history_updates);
+        conn.update_hook(Some(move |action, database: &str, table: &str, _row_id| {
+            if action == rusqlite::hooks::Action::SQLITE_UPDATE
+                && database == "main"
+                && table == "consensus_fenced_transition_v2_history"
+            {
+                observed_history_updates.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+        let requests = maximum_fenced_transition_v2_batch_requests();
+        let applied = apply_entries_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            vec![fenced_transition_v2_batch_entry(2, requests, timestamp(2))],
+        )
+        .expect("apply maximum V2 batch");
+        let outcomes = match &applied.responses[0].result {
+            Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)) => outcomes,
+            other => panic!("unexpected maximum V2 batch result: {other:?}"),
+        };
+        assert_eq!(
+            outcomes.len(),
+            crate::consensus::types::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
+        );
+        assert_eq!(
+            history_updates.load(Ordering::Relaxed),
+            1,
+            "one already-atomic batch must compare-and-set its shared history count once",
+        );
+        assert_eq!(
+            read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+                .expect("history after maximum batch")
+                .current_bound_count,
+            crate::consensus::types::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS + 1,
+            "activation and every independently bound batch item consume one exact slot",
+        );
     }
 
     #[test]

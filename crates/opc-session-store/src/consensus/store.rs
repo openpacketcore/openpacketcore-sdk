@@ -746,6 +746,9 @@ pub struct ConsensusStoreDiagnosticSnapshot {
     pub consensus_log_prune_busy_retries: u64,
     /// Permanent physical log-prune failures; the worker stops until reopen.
     pub consensus_log_prune_permanent_failures: u64,
+    /// Whether this fixed lane is permanently degraded until the store is
+    /// reopened. This has no identifying error detail.
+    pub consensus_log_prune_degraded: bool,
     /// Physical consensus-log rows deleted by completed prune turns.
     pub consensus_log_prune_rows_deleted: u64,
     /// Encoded consensus-log bytes deleted by completed prune turns.
@@ -799,6 +802,7 @@ pub(crate) struct ConsensusStoreDiagnosticCounters {
     consensus_log_prune_drained_turns: AtomicU64,
     consensus_log_prune_busy_retries: AtomicU64,
     consensus_log_prune_permanent_failures: AtomicU64,
+    consensus_log_prune_degraded: AtomicBool,
     consensus_log_prune_rows_deleted: AtomicU64,
     consensus_log_prune_encoded_bytes_deleted: AtomicU64,
     consensus_log_prune_backlog_turns: AtomicU64,
@@ -933,6 +937,13 @@ impl ConsensusStoreDiagnosticCounters {
             .fetch_sub(1, Ordering::Relaxed);
         self.consensus_log_prune_permanent_failures
             .fetch_add(1, Ordering::Relaxed);
+        self.consensus_log_prune_degraded
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn clear_consensus_log_prune_degraded(&self) {
+        self.consensus_log_prune_degraded
+            .store(false, Ordering::Release);
     }
 
     /// End an active physical-prune turn cancelled by store shutdown. This is
@@ -1025,6 +1036,7 @@ impl ConsensusStoreDiagnosticCounters {
             consensus_log_prune_permanent_failures: self
                 .consensus_log_prune_permanent_failures
                 .load(Ordering::Relaxed),
+            consensus_log_prune_degraded: self.consensus_log_prune_degraded.load(Ordering::Acquire),
             consensus_log_prune_rows_deleted: self
                 .consensus_log_prune_rows_deleted
                 .load(Ordering::Relaxed),
@@ -4559,6 +4571,14 @@ impl ConsensusSessionStore {
         if let Some(report) = self.fatal_engine_readiness_report() {
             return report;
         }
+        if self
+            .inner
+            .consensus_log_prune_lane
+            .as_ref()
+            .is_some_and(|lane| lane.is_degraded())
+        {
+            return self.recovery_required_durable_readiness_report();
+        }
         match tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_record_is_exact())
             .await
         {
@@ -5081,31 +5101,33 @@ impl ConsensusSessionStore {
     /// known recovery-required state cannot be downgraded to transient
     /// no-quorum.
     fn fatal_engine_readiness_report(&self) -> Option<DurableReadinessReport> {
-        let metrics = self.inner.raft.metrics();
-        let metrics = metrics.borrow();
-        if metrics.running_state.is_ok() {
+        if self.inner.raft.metrics().borrow().running_state.is_ok() {
             return None;
         }
+        Some(self.recovery_required_durable_readiness_report())
+    }
+
+    fn recovery_required_durable_readiness_report(&self) -> DurableReadinessReport {
         let configured = self.current_member_count().unwrap_or(0);
         let quorum = (configured / 2) + 1;
-        Some(
-            DurableReadinessReport::new(
-                DurableReadinessState::RecoveryRequired,
-                configured,
-                0,
-                0,
-                quorum,
-                None,
-                Vec::new(),
-            )
-            .with_recovery_progress(DurableRecoveryProgress::new(
-                DurableRecoveryState::RecoveryRequired,
-                metrics.last_log_index,
-                metrics.last_applied.as_ref().map(|log_id| log_id.index),
-                metrics.snapshot.as_ref().map(|log_id| log_id.index),
-                metrics.purged.as_ref().map(|log_id| log_id.index),
-            )),
+        let metrics = self.inner.raft.metrics();
+        let metrics = metrics.borrow();
+        DurableReadinessReport::new(
+            DurableReadinessState::RecoveryRequired,
+            configured,
+            0,
+            0,
+            quorum,
+            None,
+            Vec::new(),
         )
+        .with_recovery_progress(DurableRecoveryProgress::new(
+            DurableRecoveryState::RecoveryRequired,
+            metrics.last_log_index,
+            metrics.last_applied.as_ref().map(|log_id| log_id.index),
+            metrics.snapshot.as_ref().map(|log_id| log_id.index),
+            metrics.purged.as_ref().map(|log_id| log_id.index),
+        ))
     }
 
     async fn submit_intent(
@@ -9876,6 +9898,7 @@ mod membership_tests {
                 consensus_log_prune_drained_turns: 1,
                 consensus_log_prune_busy_retries: 1,
                 consensus_log_prune_permanent_failures: 1,
+                consensus_log_prune_degraded: true,
                 consensus_log_prune_rows_deleted: 20,
                 consensus_log_prune_encoded_bytes_deleted: 40,
                 consensus_log_prune_backlog_turns: 1,
@@ -9896,6 +9919,7 @@ mod membership_tests {
         assert!(encoded.contains("route_metrics_watch_closed"));
         assert!(encoded.contains("fixed_raw_v2_acceptance_snapshots"));
         assert!(encoded.contains("consensus_log_prune_permanent_failures"));
+        assert!(encoded.contains("consensus_log_prune_degraded"));
     }
 
     #[test]

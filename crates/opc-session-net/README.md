@@ -254,11 +254,11 @@ private JSON DTO bytes are canonical; reordered or otherwise noncanonical
 encodings, aliases, omissions, and unknown fields fail closed.
 
 The additive V2 epoch-fenced-transition family uses only
-`opc-session-consumer/2` with transport revision 5. A V2 offer never falls back
+`opc-session-consumer/2` with transport revision 6. A V2 offer never falls back
 to V1, and neither revision reuses the other's authenticated connection, Hello,
 or JSON envelope. A listener may provision both exact ALPNs during a cutover,
 but this is coexistence of separate protocols, not dual-mode negotiation or
-mixed-revision equivalence. A V2-only operation requires a revision-5-capable
+mixed-revision equivalence. A V2-only operation requires a revision-6-capable
 listener and client; the server rejects every other V2 revision before dispatch,
 and a V1-only peer fails before V2 dispatch. Deploy listener support and any
 required V2 store/journal provisioning before enabling the explicit V2 API,
@@ -298,26 +298,36 @@ ordinary admission; exact replay and status return it as a closed
 restore effect. Frozen legacy session-net v5 maps it fail-closed as an unknown
 capability without a wire-enum change.
 
-Each request connection carries a nonzero, monotonically increasing
-connection-local `u32` sequence with no wrap plus a fresh unpredictable UUID
-nonce. The request is serialized before that complete correlation, the server
-admits the exact next sequence, and the client accepts only the exact composite
-value. A lane retires after at most 4,096 sequential calls and admits only one
+Each V2 request connection carries a nonzero, monotonically increasing
+connection-local `u32` sequence with no wrap, a fresh full-width 128-bit
+OS-CSPRNG nonce, and a domain-separated commitment to the exact canonical
+request bytes and operation phase. The server admits the exact next sequence,
+and the client accepts only the exact composite response tuple. A V2 lane
+retires after at most 4,096 sequential calls and admits only one
 in-flight call: no multiplexing is permitted, because cancellation,
 pre-staged/late-response isolation, and write-position ambiguity are structural.
+Revision 6 treats the HelloAck request-frame ceiling independently from the
+client's response-frame capacity: every nonzero value through the fixed 16 MiB
+ceiling is valid, and the exact bounded encoder rejects an oversized Call
+before writing its length prefix. The response-frame capacity retains the
+larger fixed minimum needed for bounded batch results.
+
 The fair request pool defaults to four connections, allows at most
 16 configured connections, and bounds pending calls to 64 by default and 256
 absolutely; queue wait/age is at most 250 ms. Watches have two separate slots
 by default and at most 16 configured slots, so they cannot consume request
 capacity.
 
-`PersistentSessionConsumerClient` keeps an additional, independent fixed V2
-request pool of the same configured width. `prewarm_v2` establishes those
-revision-5 lanes without a V2 operation, `execute_v2` uses only a V2 lane, and
+`PersistentSessionConsumerClient` keeps an ALPN-specific V2 idle pool.
+V1 and V2 share one configured request width, pending queue, and prewarm gate;
+`prewarm_v2` establishes those revision-6 lanes within that aggregate width
+without a V2 operation, `execute_v2` uses only a V2 lane, and
 `v2_diagnostics` reports only that pool's redaction-safe counters. Each V1 or
-V2 lane still permits one in-flight request. Their queues and sockets are never
-cross-reused, but both pools share a bounded physical request-admission ceiling
-sized so their legal V1 and V2 widths can coexist. This preserves least
+V2 lane still permits one in-flight request. Their authenticated idle sockets
+are never cross-reused; lane and pending-call admission is aggregate. At the
+aggregate physical ceiling, a requested protocol
+may retire an opposite-protocol idle lane (never active work or V2 poison debt)
+and rebalance within the existing setup deadline. This preserves least
 authority without adding per-subscriber connections, tasks, channels, or pools.
 DNS resolution, TCP, TLS, and the authenticated Hello occur only while
 establishing or re-establishing that lane, never while reusing an established
@@ -330,7 +340,8 @@ Authenticated unsolicited plaintext creates bounded, front-priority protocol
 debt. That debt survives reaping and prewarm, never counts as an authenticated
 lane or ready capacity, and the next logical checkout consumes it as
 `NotTransmitted` before selecting, reconnecting, or writing on a lane; prewarm
-independently restores the configured physical lane width.
+restores the configured aggregate physical lane width without doubling it
+across ALPNs.
 
 An establishment has a 1,500 ms setup limit and a call makes at most two
 pre-write attempts. Resolution occurs only when establishing or
@@ -356,8 +367,8 @@ enter diagnostics. A rejected same-epoch material publication retains the
 authenticated lane.
 
 One stateless client lineage shares a bounded physical-admission ceiling across
-its clones: request admission is sized for the legal simultaneous fixed V1 and
-V2 persistent widths, and watch admission remains capped at 16. The permits are
+its clones: V1 and V2 share exactly 16 request connections, while watch
+admission remains separately capped at 16. The permits are
 acquired before resolve/TCP and remain held for the physical connection
 lifetime, including for persistent clients derived from that lineage.
 Independent stateless constructors create independent logical clients, as
