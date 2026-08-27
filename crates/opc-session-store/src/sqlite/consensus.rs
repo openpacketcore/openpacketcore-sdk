@@ -339,7 +339,7 @@ const CONSENSUS_SCHEMA_OBJECT_SQL_MAX_BYTES: i64 = 16 * 1024;
 // current V2-roster layout has exactly 38 objects. This remains a hard schema
 // manifest bound: an additional object is never admitted.
 pub(crate) const CONSENSUS_SCHEMA_MAX_OBJECTS: usize = 38;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 const FROZEN_CURRENT_CONSENSUS_SCHEMA_OBJECTS: usize = 33;
 /// V1's activation fenced database readers at format two.  V2 is deliberately
 /// a second, independently certified history protocol and writes format three

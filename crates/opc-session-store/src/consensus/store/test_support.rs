@@ -3,6 +3,8 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use opc_consensus::engine::error::Fatal;
+use opc_consensus::engine::StorageError;
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
     serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
@@ -109,6 +111,64 @@ pub async fn trigger_consensus_snapshot_for_test(
         .snapshot()
         .await
         .map_err(|_| "test consensus snapshot capture rejected".to_owned())
+}
+
+/// Fixed test-only classification of the local consensus engine state.
+///
+/// Failure sources and internal error text are deliberately discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusEngineStateForTest {
+    /// The local Openraft engine remains running.
+    Running,
+    /// A durable storage I/O operation stopped the local engine.
+    StorageIo,
+    /// A defensive storage invariant stopped the local engine.
+    StorageDefensive,
+    /// The local engine task panicked.
+    Panicked,
+    /// The local engine stopped normally.
+    Stopped,
+}
+
+/// Fixed-cardinality, redaction-safe local durable progress for integration
+/// qualification. No node identity, payload, path, or raw error is exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsensusLocalDurableProgressForTest {
+    /// Fixed local engine-state category.
+    pub engine_state: ConsensusEngineStateForTest,
+    /// Highest log index stored locally.
+    pub last_log_index: Option<u64>,
+    /// Highest log index applied locally.
+    pub applied_index: Option<u64>,
+    /// Highest log index represented by the current local snapshot.
+    pub snapshot_index: Option<u64>,
+    /// Highest log index durably purged locally.
+    pub purged_index: Option<u64>,
+}
+
+/// Return one passive local consensus observation without issuing a read
+/// barrier or changing consensus state.
+pub fn consensus_local_durable_progress_for_test(
+    store: &ConsensusSessionStore,
+) -> ConsensusLocalDurableProgressForTest {
+    let metrics = store.inner.raft.metrics();
+    let current = metrics.borrow();
+    let engine_state = match &current.running_state {
+        Ok(()) => ConsensusEngineStateForTest::Running,
+        Err(Fatal::StorageError(StorageError::IO { .. })) => ConsensusEngineStateForTest::StorageIo,
+        Err(Fatal::StorageError(StorageError::Defensive { .. })) => {
+            ConsensusEngineStateForTest::StorageDefensive
+        }
+        Err(Fatal::Panicked) => ConsensusEngineStateForTest::Panicked,
+        Err(Fatal::Stopped) => ConsensusEngineStateForTest::Stopped,
+    };
+    ConsensusLocalDurableProgressForTest {
+        engine_state,
+        last_log_index: current.last_log_index,
+        applied_index: current.last_applied.as_ref().map(|log_id| log_id.index),
+        snapshot_index: current.snapshot.as_ref().map(|log_id| log_id.index),
+        purged_index: current.purged.as_ref().map(|log_id| log_id.index),
+    }
 }
 
 /// Wait until the engine has purged beyond an isolated follower's previously

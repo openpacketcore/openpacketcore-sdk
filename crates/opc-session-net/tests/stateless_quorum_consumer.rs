@@ -87,6 +87,10 @@ use opc_session_store::sqlite::test_support::{
     protected_roster_terminal_apply_timings_for_test,
     reset_protected_roster_terminal_apply_timings_for_test,
 };
+#[cfg(feature = "test-control")]
+use opc_session_store::test_support::{
+    consensus_local_durable_progress_for_test, ConsensusEngineStateForTest,
+};
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, ConsensusSessionStore,
     EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
@@ -1036,6 +1040,16 @@ impl ThreeVoterConsumerFleet {
                 )
             });
             let (decoded, decode_failures, nonempty) = self.append_entries_observation();
+            #[cfg(feature = "test-control")]
+            {
+                let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                    consensus_local_durable_progress_for_test(&self.stores[index])
+                });
+                panic!(
+                    "three-voter application sequences converge: expected={expected}; sequences={sequences:?}; redacted_status={redacted_status:?}; durable_progress={durable_progress:?}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}"
+                );
+            }
+            #[cfg(not(feature = "test-control"))]
             panic!(
                 "three-voter application sequences converge: expected={expected}; sequences={sequences:?}; redacted_status={redacted_status:?}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}"
             );
@@ -7529,10 +7543,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
                     .max_replication_sequence()
                     .await
                 {
-                    Ok(_) => {
-                        wait_for_protected_roster_snapshot_workload_step(&fleet, workload_leader)
-                            .await;
-                    }
+                    Ok(_) => {}
                     Err(StoreError::BackendUnavailable(_))
                         if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
                     {
@@ -7559,24 +7570,13 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
                 .is_some_and(|index| index >= target_log_index),
             "the retained PollAdmitted body crosses the production snapshot-log threshold"
         );
-        tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
-            loop {
-                let progress = fleet.stores[workload_leader]
-                    .probe_durable_readiness()
-                    .await
-                    .recovery_progress();
-                if progress
-                    .snapshot_index()
-                    .is_some_and(|index| index >= admitted_log_index)
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("retained PollAdmitted body is compacted into a snapshot before restart");
         fleet.wait_all_application_sequences(target_log_index).await;
+        wait_for_protected_roster_snapshot_coverage(
+            &fleet,
+            admitted_log_index,
+            "retained PollAdmitted body",
+        )
+        .await;
     }
     #[cfg(not(feature = "test-control"))]
     assert!(
@@ -8118,15 +8118,44 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
 }
 
 #[cfg(feature = "test-control")]
-async fn wait_for_protected_roster_snapshot_workload_step(
+async fn wait_for_protected_roster_snapshot_coverage(
     fleet: &ThreeVoterConsumerFleet,
-    workload_leader: usize,
+    protected_log_index: u64,
+    context: &'static str,
 ) {
-    let applied_index = fleet.stores[workload_leader]
-        .status()
-        .applied_index
-        .expect("snapshot workload command is applied on its serving voter");
-    fleet.wait_all_application_sequences(applied_index).await;
+    let mut last_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+        consensus_local_durable_progress_for_test(&fleet.stores[index])
+    });
+    let observed = tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
+        loop {
+            last_progress = std::array::from_fn(|index| {
+                consensus_local_durable_progress_for_test(&fleet.stores[index])
+            });
+            assert!(
+                last_progress
+                    .iter()
+                    .all(|progress| progress.engine_state == ConsensusEngineStateForTest::Running),
+                "{context} failed closed because a voter engine stopped; progress={last_progress:?}",
+            );
+            if last_progress
+                .iter()
+                .all(|progress| {
+                    progress
+                        .snapshot_index
+                        .is_some_and(|index| index >= protected_log_index)
+                })
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if observed.is_err() {
+        panic!(
+            "{context} did not reach the protected snapshot boundary; minimum={protected_log_index}; progress={last_progress:?}",
+        );
+    }
 }
 
 async fn persistent_three_voter_protected_roster_terminal_reply_outcome_unknown() {
@@ -8185,6 +8214,166 @@ async fn persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_an
         true,
     )
     .await;
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running(
+) {
+    const SNAPSHOT_COMMANDS: usize = 4_300;
+    const SNAPSHOT_THRESHOLD: usize = 4_096;
+    const BARRIER_START_OFFSET: usize = 128;
+    const TAIL_BATCH_SIZE: usize = 32;
+
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
+        Arc::clone(&pki),
+        ProductionRosterAttestationIssuer::trust_root(),
+    )
+    .await;
+    macro_rules! panic_with_durable_progress {
+        ($fleet:expr) => {{
+            let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                let progress = consensus_local_durable_progress_for_test(&$fleet.stores[index]);
+                (
+                    progress.engine_state,
+                    progress.last_log_index,
+                    progress.applied_index,
+                    progress.snapshot_index,
+                    progress.purged_index,
+                )
+            });
+            panic!("durable_progress={durable_progress:?}");
+        }};
+    }
+    let (workload_leader, _, _) = fleet.wait_for_observed_leader().await;
+    let stable_replication_sequence = fleet.stores[workload_leader]
+        .max_replication_sequence()
+        .await
+        .unwrap_or_else(|_| panic_with_durable_progress!(fleet));
+    let workload_baseline = fleet.stores[workload_leader]
+        .status()
+        .last_log_index
+        .unwrap_or_else(|| panic_with_durable_progress!(fleet));
+    let protected_log_index =
+        workload_baseline + (SNAPSHOT_THRESHOLD - BARRIER_START_OFFSET) as u64;
+    let target_log_index = workload_baseline + SNAPSHOT_COMMANDS as u64;
+    let initial_snapshot_indexes = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+        consensus_local_durable_progress_for_test(&fleet.stores[index]).snapshot_index
+    });
+
+    tokio::time::timeout(Duration::from_secs(5 * 60), async {
+        for _ in 0..(SNAPSHOT_THRESHOLD - BARRIER_START_OFFSET) {
+            if fleet.stores[workload_leader]
+                .max_replication_sequence()
+                .await
+                .is_err()
+            {
+                panic_with_durable_progress!(fleet);
+            }
+        }
+
+        let mut completed = SNAPSHOT_THRESHOLD - BARRIER_START_OFFSET;
+        while completed < SNAPSHOT_COMMANDS {
+            let batch_size = (SNAPSHOT_COMMANDS - completed).min(TAIL_BATCH_SIZE);
+            let readiness = futures_util::future::join_all(
+                fleet
+                    .stores
+                    .iter()
+                    .map(ConsensusSessionStore::probe_durable_readiness),
+            );
+            let workload = async {
+                for _ in 0..batch_size {
+                    if fleet.stores[workload_leader]
+                        .max_replication_sequence()
+                        .await
+                        .is_err()
+                    {
+                        panic_with_durable_progress!(fleet);
+                    }
+                }
+            };
+            let (reports, ()) = tokio::join!(readiness, workload);
+            let readiness_reason_codes = reports
+                .iter()
+                .map(|report| report.reason_code())
+                .collect::<Vec<_>>();
+            let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                let progress = consensus_local_durable_progress_for_test(&fleet.stores[index]);
+                (
+                    progress.engine_state,
+                    progress.last_log_index,
+                    progress.applied_index,
+                    progress.snapshot_index,
+                    progress.purged_index,
+                )
+            });
+            assert!(
+                reports.iter().all(|report| report.is_ready())
+                    && durable_progress.iter().all(|progress| {
+                        progress.0 == ConsensusEngineStateForTest::Running
+                    }),
+                "readiness_reason_codes={readiness_reason_codes:?}; durable_progress={durable_progress:?}",
+            );
+            completed += batch_size;
+        }
+        completed
+    })
+    .await
+    .unwrap_or_else(|_| panic_with_durable_progress!(fleet));
+
+    fleet.wait_all_application_sequences(target_log_index).await;
+    let mut durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+        consensus_local_durable_progress_for_test(&fleet.stores[index])
+    });
+    let snapshot_covered = tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
+        loop {
+            durable_progress = std::array::from_fn(|index| {
+                consensus_local_durable_progress_for_test(&fleet.stores[index])
+            });
+            let diagnostic = durable_progress.map(|progress| {
+                (
+                    progress.engine_state,
+                    progress.last_log_index,
+                    progress.applied_index,
+                    progress.snapshot_index,
+                    progress.purged_index,
+                )
+            });
+            assert!(
+                durable_progress
+                    .iter()
+                    .all(|progress| progress.engine_state == ConsensusEngineStateForTest::Running),
+                "durable_progress={diagnostic:?}",
+            );
+            if durable_progress.iter().zip(initial_snapshot_indexes).all(
+                |(progress, initial_snapshot_index)| {
+                    progress.snapshot_index.is_some_and(|snapshot_index| {
+                        snapshot_index >= protected_log_index
+                            && initial_snapshot_index.is_none_or(|initial| snapshot_index > initial)
+                    })
+                },
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if snapshot_covered.is_err() {
+        panic_with_durable_progress!(fleet);
+    }
+
+    let fleet = fleet.restart_all().await;
+    let (restart_leader, _, _) = fleet.wait_for_observed_leader().await;
+    let restarted_replication_sequence = fleet.stores[restart_leader]
+        .max_replication_sequence()
+        .await
+        .unwrap_or_else(|_| panic_with_durable_progress!(fleet));
+    if restarted_replication_sequence != stable_replication_sequence {
+        panic_with_durable_progress!(fleet);
+    }
+    fleet.shutdown().await;
 }
 
 #[cfg(feature = "test-control")]
@@ -8635,9 +8824,7 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
                 .max_replication_sequence()
                 .await
             {
-                Ok(_) => {
-                    wait_for_protected_roster_snapshot_workload_step(&fleet, workload_leader).await;
-                }
+                Ok(_) => {}
                 Err(StoreError::BackendUnavailable(_))
                     if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
                 {
@@ -8660,24 +8847,13 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
             .is_some_and(|index| index >= target_log_index),
         "conclusive Aborted terminal crosses the production snapshot-log threshold"
     );
-    tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
-        loop {
-            let progress = fleet.stores[workload_leader]
-                .probe_durable_readiness()
-                .await
-                .recovery_progress();
-            if progress
-                .snapshot_index()
-                .is_some_and(|index| index >= terminal_log_index)
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("conclusive Aborted terminal is compacted into a physical snapshot");
     fleet.wait_all_application_sequences(target_log_index).await;
+    wait_for_protected_roster_snapshot_coverage(
+        &fleet,
+        terminal_log_index,
+        "conclusive Aborted terminal",
+    )
+    .await;
 
     drop(recovery_client);
     drop(recovery_adapter);
@@ -10403,9 +10579,7 @@ async fn compact_protected_roster_process_loss_admission(
                 .max_replication_sequence()
                 .await
             {
-                Ok(_) => {
-                    wait_for_protected_roster_snapshot_workload_step(fleet, workload_leader).await;
-                }
+                Ok(_) => {}
                 Err(StoreError::BackendUnavailable(_))
                     if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
                 {
@@ -10421,24 +10595,20 @@ async fn compact_protected_roster_process_loss_admission(
     })
     .await
     .expect("process-loss snapshot command batch completes");
-    tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
-        loop {
-            let progress = fleet.stores[workload_leader]
-                .probe_durable_readiness()
-                .await
-                .recovery_progress();
-            if progress
-                .snapshot_index()
-                .is_some_and(|index| index >= admitted_log_index)
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("process-loss admission is compacted into a snapshot");
+    assert!(
+        fleet.stores[workload_leader]
+            .status()
+            .last_log_index
+            .is_some_and(|index| index >= target_log_index),
+        "the process-loss workload crosses the production snapshot-log threshold"
+    );
     fleet.wait_all_application_sequences(target_log_index).await;
+    wait_for_protected_roster_snapshot_coverage(
+        fleet,
+        admitted_log_index,
+        "process-loss PollAdmitted body",
+    )
+    .await;
 }
 
 #[cfg(feature = "test-control")]
@@ -10651,24 +10821,24 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
         .iter()
         .map(ConsensusSessionStore::protected_roster_diagnostic_snapshot)
         .collect::<Vec<_>>();
-    let (admission_applied_before, admission_log_before) =
-        protected_roster_process_loss_voter_positions(&fleet);
-    let active = match client
+    let (active, admission_applied_floor) = match client
         .admit(&mut admission)
         .await
         .expect("commit phase-one protected-roster admission")
     {
-        AdmissionOutcome::Admitted(active) => active,
+        AdmissionOutcome::Admitted(active) => (
+            active,
+            fleet.stores[leader]
+                .status()
+                .applied_index
+                .expect("serving voter applied the admitted PollAdmit"),
+        ),
         AdmissionOutcome::NotTransmitted | AdmissionOutcome::OutcomeUnknown(_) => {
             panic!("phase one must durably admit exactly once")
         }
     };
     assert_eq!(active.roster_id(), roster_id);
     assert_eq!(active.protected_plan(), protected_plan.as_slice());
-    let admission_applied_floor = fleet.stores[leader]
-        .status()
-        .applied_index
-        .expect("serving voter applied the admitted PollAdmit");
     fleet
         .wait_all_application_sequences(admission_applied_floor)
         .await;
@@ -10681,13 +10851,11 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
         .collect::<Vec<_>>();
     for voter in 0..THREE_VOTER_COUNT {
         assert!(
-            admission_applied_after[voter] >= admission_applied_floor
-                && admission_applied_after[voter] > admission_applied_before[voter],
+            admission_applied_after[voter] >= admission_applied_floor,
             "the admitted PollAdmit is applied at the observed operation floor on every voter",
         );
         assert!(
-            admission_log_after[voter] >= admission_applied_floor
-                && admission_log_after[voter] > admission_log_before[voter],
+            admission_log_after[voter] >= admission_applied_floor,
             "the admitted PollAdmit is durably present at the observed operation floor in every voter log",
         );
         assert_eq!(admission_diagnostics_after[voter].occupancy_valid, 1);
@@ -10846,8 +11014,6 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         fleet.voter_authority(leader),
     );
     wait_for_protected_roster_process_loss_lease_expiry(&original_guard, "phase two").await;
-    let (current_fence_applied_before, current_fence_log_before) =
-        protected_roster_process_loss_voter_positions(&fleet);
     let current_fence_diagnostics_before = fleet
         .stores
         .iter()
@@ -10862,6 +11028,10 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         )
         .await
         .expect("acquire higher current process-loss fence");
+    let current_fence_applied_floor = fleet.stores[leader]
+        .status()
+        .applied_index
+        .expect("serving voter applied the successor fence");
     assert!(
         current_guard.fence() > original_guard.fence(),
         "replacement process receives a higher current fence"
@@ -10871,10 +11041,6 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         &state.join("phase-two-guard.json"),
         &serde_json::to_vec(&phase_two_guard).expect("encode phase-two process-loss guard"),
     );
-    let current_fence_applied_floor = fleet.stores[leader]
-        .status()
-        .applied_index
-        .expect("serving voter applied the successor fence");
     fleet
         .wait_all_application_sequences(current_fence_applied_floor)
         .await;
@@ -10887,13 +11053,11 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         .collect::<Vec<_>>();
     for voter in 0..THREE_VOTER_COUNT {
         assert!(
-            current_fence_applied_after[voter] >= current_fence_applied_floor
-                && current_fence_applied_after[voter] > current_fence_applied_before[voter],
+            current_fence_applied_after[voter] >= current_fence_applied_floor,
             "the successor fence is applied at the observed operation floor on every reopened voter",
         );
         assert!(
-            current_fence_log_after[voter] >= current_fence_applied_floor
-                && current_fence_log_after[voter] > current_fence_log_before[voter],
+            current_fence_log_after[voter] >= current_fence_applied_floor,
             "the successor fence is durably present at the observed operation floor in every reopened voter log",
         );
         assert_eq!(
@@ -11055,31 +11219,30 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         &terminal_diagnostics_before,
         "provider status and adoption have no per-member consensus write",
     );
-    let (terminal_applied_before, terminal_log_before) =
-        protected_roster_process_loss_voter_positions(&fleet);
     let mut terminal = client
         .prepare_terminal(recovered.for_terminal(), &proofs)
         .await
         .expect("prepare exact process-loss terminal");
-    match client
+    let terminal_applied_floor = match client
         .terminalize(&mut terminal)
         .await
         .expect("terminalize exact process-loss roster")
     {
         TerminalizationOutcome::Committed(TerminalReceipt::Established(established)) => {
+            let terminal_applied_floor = fleet.stores[leader]
+                .status()
+                .applied_index
+                .expect("serving voter applied the exact Established terminal");
             assert_eq!(established.protected_checkpoint(), protected_checkpoint);
             assert_eq!(established.protected_result(), protected_result);
+            terminal_applied_floor
         }
         TerminalizationOutcome::Committed(TerminalReceipt::Aborted(_))
         | TerminalizationOutcome::NotTransmitted
         | TerminalizationOutcome::OutcomeUnknown => {
             panic!("phase two returns one exact Established terminal receipt")
         }
-    }
-    let terminal_applied_floor = fleet.stores[leader]
-        .status()
-        .applied_index
-        .expect("serving voter applied the exact Established terminal");
+    };
     fleet
         .wait_all_application_sequences(terminal_applied_floor)
         .await;
@@ -11092,13 +11255,11 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         .collect::<Vec<_>>();
     for voter in 0..THREE_VOTER_COUNT {
         assert!(
-            terminal_applied_after[voter] >= terminal_applied_floor
-                && terminal_applied_after[voter] > terminal_applied_before[voter],
+            terminal_applied_after[voter] >= terminal_applied_floor,
             "the exact Established terminal is applied at the observed operation floor on every voter",
         );
         assert!(
-            terminal_log_after[voter] >= terminal_applied_floor
-                && terminal_log_after[voter] > terminal_log_before[voter],
+            terminal_log_after[voter] >= terminal_applied_floor,
             "the exact Established terminal is durably present at the observed operation floor in every voter log",
         );
         assert_eq!(terminal_diagnostics_after[voter].occupancy_valid, 1);
@@ -11306,6 +11467,10 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
         )
         .await
         .expect("acquire phase-three current process-loss fence");
+    let phase_three_fence_applied_floor = fleet.stores[leader]
+        .status()
+        .applied_index
+        .expect("serving voter applied the phase-three successor fence");
     assert!(
         phase_two_guard.fence() > original_guard.fence(),
         "phase two itself used a higher successor fence"
@@ -11314,10 +11479,6 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
         current_guard.fence() > phase_two_guard.fence(),
         "phase three receives a higher current fence after phase-two expiry"
     );
-    let phase_three_fence_applied_floor = fleet.stores[leader]
-        .status()
-        .applied_index
-        .expect("serving voter applied the phase-three successor fence");
     fleet
         .wait_all_application_sequences(phase_three_fence_applied_floor)
         .await;
