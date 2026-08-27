@@ -20,13 +20,13 @@ use thiserror::Error;
 
 use super::*;
 use crate::membership::{
-    SessionTopologyAbortAdmissionProof, SessionTopologyCandidateRetirementProof,
-    SessionTopologyJointCommitAdmissionProof, SessionTopologyLearnersReadyAdmissionProof,
-    SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionError,
-    SessionTopologyTransitionLogIndexes, SessionTopologyTransitionOutcome,
-    SessionTopologyTransitionPhase, SessionTopologyTransitionReason,
-    SessionTopologyTransitionRequest, SessionTopologyTransitionStatus,
-    SessionTopologyUniformCommitAdmissionProof,
+    validate_transition_request_roster_attestation_root, SessionTopologyAbortAdmissionProof,
+    SessionTopologyCandidateRetirementProof, SessionTopologyJointCommitAdmissionProof,
+    SessionTopologyLearnersReadyAdmissionProof, SessionTopologyPrePrepareUnstageProof,
+    SessionTopologyTransitionError, SessionTopologyTransitionLogIndexes,
+    SessionTopologyTransitionOutcome, SessionTopologyTransitionPhase,
+    SessionTopologyTransitionReason, SessionTopologyTransitionRequest,
+    SessionTopologyTransitionStatus, SessionTopologyUniformCommitAdmissionProof,
 };
 use crate::sqlite::consensus::{
     MembershipScopeMutationError, MembershipTransitionEvidence, MembershipValidationScope,
@@ -101,6 +101,30 @@ impl SessionTopologyCandidateBootstrap {
                 current_identity,
             ))
             .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        Self::try_new_from_validated_current_topology(
+            storage_anchor,
+            current_topology,
+            request,
+            local_candidate,
+        )
+    }
+
+    /// Validate a joining-candidate manifest against the predecessor topology
+    /// that already carries its immutable roster root. The root remains local
+    /// topology configuration: it is never supplied as a transition field.
+    pub fn try_new_from_validated_current_topology(
+        storage_anchor: SessionConsensusStorageAnchor,
+        current_topology: ValidatedQuorumTopology,
+        request: SessionTopologyTransitionRequest,
+        local_candidate: QuorumReplicaDescriptor,
+    ) -> Result<Self, SessionTopologyTransitionError> {
+        let current_identity = current_topology
+            .consensus_identity()
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        validate_transition_request_roster_attestation_root(
+            current_topology.roster_attestation_trust_root(),
+            &request,
+        )?;
         if current_identity.cluster_id() != request.cluster_id()
             || current_identity.configuration_epoch() != request.expected_epoch()
             || storage_anchor.0.cluster_id() != request.cluster_id()
@@ -1191,7 +1215,52 @@ impl ConsensusSessionStore {
         snapshot_dir: impl Into<PathBuf>,
         desired_peers: SessionTopologyTransitionPeers,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::open_membership_candidate_with_clock_inner(
+            bootstrap,
+            backend,
+            snapshot_dir,
+            desired_peers,
+            Arc::new(SystemClock),
+            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Open a joining learner with an injected logical clock and bounded
+    /// complete operation deadline. This preserves the same candidate,
+    /// topology, peer, and durable-storage admission as
+    /// [`Self::open_membership_candidate`].
+    pub async fn open_membership_candidate_with_clock(
+        bootstrap: SessionTopologyCandidateBootstrap,
+        backend: SqliteSessionBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        desired_peers: SessionTopologyTransitionPeers,
+        clock: Arc<dyn Clock>,
+        operation_timeout: Duration,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        Self::open_membership_candidate_with_clock_inner(
+            bootstrap,
+            backend,
+            snapshot_dir,
+            desired_peers,
+            clock,
+            operation_timeout,
+        )
+        .await
+    }
+
+    async fn open_membership_candidate_with_clock_inner(
+        bootstrap: SessionTopologyCandidateBootstrap,
+        backend: SqliteSessionBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        desired_peers: SessionTopologyTransitionPeers,
+        clock: Arc<dyn Clock>,
+        operation_timeout: Duration,
+    ) -> Result<Self, ConsensusSessionStoreOpenError> {
         Self::require_dynamic_consensus_platform()?;
+        if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
+            return Err(ConsensusSessionStoreOpenError::InvalidRuntimeConfiguration);
+        }
         let SessionTopologyCandidateBootstrap {
             storage_anchor,
             current_topology,
@@ -1214,6 +1283,11 @@ impl ConsensusSessionStore {
         {
             return Err(ConsensusSessionStoreOpenError::InvalidTopology);
         }
+        crate::membership::validate_transition_request_roster_attestation_root(
+            current_topology.roster_attestation_trust_root(),
+            &request,
+        )
+        .map_err(|_| ConsensusSessionStoreOpenError::InvalidTopology)?;
         let desired_descriptor = request
             .desired_members()
             .iter()
@@ -1222,12 +1296,17 @@ impl ConsensusSessionStore {
         if desired_descriptor != &local_candidate {
             return Err(ConsensusSessionStoreOpenError::InvalidTopology);
         }
-        let desired_topology =
-            ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
-                local_candidate.replica_id().clone(),
-                request.desired_members().to_vec(),
-                request.desired_identity(),
-            ))
+        let roster_attestation_trust_root =
+            current_topology.roster_attestation_trust_root().cloned();
+        let mut desired_config = QuorumTopologyConfig::new_consensus(
+            local_candidate.replica_id().clone(),
+            request.desired_members().to_vec(),
+            request.desired_identity(),
+        );
+        if let Some(root) = roster_attestation_trust_root.clone() {
+            desired_config = desired_config.with_roster_attestation_trust_root(root);
+        }
+        let desired_topology = ValidatedQuorumTopology::try_from(desired_config)
             .map_err(|_| ConsensusSessionStoreOpenError::InvalidTopology)?;
         let local_node_id = desired_topology
             .local_consensus_node_id()
@@ -1277,24 +1356,29 @@ impl ConsensusSessionStore {
         let desired_bindings = request.desired_node_bindings();
         let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
         let backend = backend.with_consensus_diagnostics(Arc::clone(&diagnostics));
-        let (log_store, state_machine, storage_identity) = storage::open_with_pending_membership(
-            &backend,
-            snapshot_dir,
-            storage_anchor.0,
-            current_identity,
-            current_members.clone(),
-            current_bindings.clone(),
-            local_node_id,
-            request.transition_id().as_bytes(),
-            request.request_digest().as_bytes(),
-            request.desired_identity(),
-            &desired_members,
-            &desired_bindings,
-            peer_directory.clone(),
-        )
-        .await?;
+        let (log_store, state_machine, storage_identity) =
+            storage::open_with_pending_membership_and_roster_attestation_root(
+                &backend,
+                snapshot_dir,
+                storage_anchor.0,
+                current_identity,
+                current_members.clone(),
+                current_bindings.clone(),
+                local_node_id,
+                request.transition_id().as_bytes(),
+                request.request_digest().as_bytes(),
+                request.desired_identity(),
+                &desired_members,
+                &desired_bindings,
+                peer_directory.clone(),
+                roster_attestation_trust_root.clone(),
+            )
+            .await?;
         let proactive_checkpoint_lane = log_store.proactive_checkpoint_lane();
         let consensus_log_prune_lane = log_store.consensus_log_prune_lane();
+        let storage_shutdown = state_machine
+            .shutdown_observer()
+            .ok_or(ConsensusSessionStoreOpenError::StorageUnavailable)?;
         let (membership_scope, _) = backend
             .consensus_membership_scope_snapshot(storage_identity)
             .await
@@ -1344,6 +1428,7 @@ impl ConsensusSessionStore {
             FencedTransitionV2StatusBatchSupervisor::new();
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            storage_shutdown,
             raft_handler,
             backend,
             proactive_checkpoint_lane,
@@ -1355,8 +1440,9 @@ impl ConsensusSessionStore {
             bootstrap_members: current_members,
             bootstrap_bindings: current_bindings,
             topology: topology_summary,
-            clock: Arc::new(SystemClock),
-            operation_timeout: DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+            roster_attestation_trust_root,
+            clock,
+            operation_timeout,
             admitted: Arc::new(AtomicBool::new(false)),
             topology_attestation_time_high_water: AtomicU64::new(
                 topology_attestation_time_high_water,
@@ -1405,6 +1491,53 @@ impl ConsensusSessionStore {
         SessionConsensusStorageAnchor(self.inner.storage_identity)
     }
 
+    /// Construct the next dynamic-membership request from this store's
+    /// already admitted current scope. The optional roster root is copied from
+    /// validated opening topology held by the store; no caller-provided root,
+    /// administrator capability, or raw attestation material is accepted.
+    pub fn new_topology_transition_request(
+        &self,
+        transition_id: crate::membership::SessionTopologyTransitionId,
+        desired_members: Vec<QuorumReplicaDescriptor>,
+        operation_timeout: Duration,
+    ) -> Result<SessionTopologyTransitionRequest, SessionTopologyTransitionError> {
+        self.require_dynamic_membership_profile()?;
+        let (current_identity, current_members) = self
+            .inner
+            .peer_directory
+            .current_scope()
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        let descriptors = self
+            .inner
+            .topology_coordinator
+            .current_member_descriptors(current_identity)
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        if descriptors.keys().copied().collect::<BTreeSet<_>>() != current_members {
+            return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+        }
+        let validation_local = descriptors
+            .values()
+            .next()
+            .map(|member| member.replica_id().clone())
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        let mut current_topology = QuorumTopologyConfig::new_consensus(
+            validation_local,
+            descriptors.into_values().collect(),
+            current_identity,
+        );
+        if let Some(root) = self.inner.roster_attestation_trust_root.clone() {
+            current_topology = current_topology.with_roster_attestation_trust_root(root);
+        }
+        let current_topology = ValidatedQuorumTopology::try_from(current_topology)
+            .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        SessionTopologyTransitionRequest::try_new_from_validated_current_topology(
+            &current_topology,
+            transition_id,
+            desired_members,
+            operation_timeout,
+        )
+    }
+
     /// Bind the one local transport-admission adapter used by topology changes.
     ///
     /// Binding is set-once for the process lifetime. Dynamic membership APIs
@@ -1432,6 +1565,10 @@ impl ConsensusSessionStore {
         desired_peers: SessionTopologyTransitionPeers,
     ) -> Result<(), SessionTopologyTransitionError> {
         self.require_dynamic_membership_profile()?;
+        validate_transition_request_roster_attestation_root(
+            self.inner.roster_attestation_trust_root.as_ref(),
+            request,
+        )?;
         let desired_members =
             validate_desired_peer_map(self.inner.local_node_id, request, &desired_peers)?;
         let inserted_bindings = self

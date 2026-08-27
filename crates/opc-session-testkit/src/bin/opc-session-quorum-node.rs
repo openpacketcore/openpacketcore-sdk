@@ -39,19 +39,19 @@ use opc_session_net::{
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload,
     EncryptingSessionBackend, FenceToken, Generation, LeaseError, LeaseGuard, OwnerId,
-    QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationEntry, ReplicationOp,
-    RestoreScanCursorProfile, RestoreScanRequest, RestoreScanScope, SessionBackend,
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerAuthorization,
-    SessionConsumerAuthorizationGrant, SessionConsumerChange, SessionConsumerOperation,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
-    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response, SessionKey,
-    SessionKeyType, SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer,
-    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
-    ValidatedQuorumTopology,
+    ProtectedRosterEstablishedSuccessor, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    ReplicationEntry, ReplicationOp, RestoreScanCursorProfile, RestoreScanRequest,
+    RestoreScanScope, SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionConsumerAuthorization, SessionConsumerAuthorizationGrant, SessionConsumerChange,
+    SessionConsumerOperation, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerTenantNfScope, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
+    SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
+    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_key_bytes_sha256, qualification_owner_sha256, qualification_state_type_sha256,
@@ -2699,6 +2699,30 @@ fn append_concurrent_watch_events(
                     record,
                 });
             }
+            ReplicationOp::ProtectedRosterEstablished {
+                expected_record,
+                successor,
+                ..
+            } => {
+                let record = match *successor {
+                    ProtectedRosterEstablishedSuccessor::Put { record } => Some(*record),
+                    ProtectedRosterEstablishedSuccessor::NoOp => Some(expected_record),
+                    ProtectedRosterEstablishedSuccessor::Delete => None,
+                };
+                let Some(record) = record else {
+                    continue;
+                };
+                let Some(record) = concurrent_record_snapshot(&record)? else {
+                    continue;
+                };
+                if events.len() >= QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS {
+                    return Err(());
+                }
+                events.push(QualificationConcurrentWatchEvent {
+                    journal_sequence: sequence,
+                    record,
+                });
+            }
             ReplicationOp::Batch { ops } => pending.extend(ops.into_iter().rev()),
             ReplicationOp::DeleteFenced { .. }
             | ReplicationOp::RefreshTtl { .. }
@@ -3757,6 +3781,24 @@ fn observe_applied_records(
                     watch_traffic_generations[node_index].store(generation, Ordering::Release);
                 }
             }
+            ReplicationOp::ProtectedRosterEstablished { key, successor, .. } => {
+                let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor else {
+                    continue;
+                };
+                count = count.saturating_add(1);
+                if let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                {
+                    if record.key != *key {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    let generation = record.generation.get();
+                    let previous = watch_traffic_generations[node_index].load(Ordering::Acquire);
+                    if previous.checked_add(1) != Some(generation) {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    watch_traffic_generations[node_index].store(generation, Ordering::Release);
+                }
+            }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
             ReplicationOp::DeleteFenced { .. }
             | ReplicationOp::RefreshTtl { .. }
@@ -3809,6 +3851,32 @@ fn reconcile_applied_traffic_records(
                 }
                 traffic_generations[node_index] = generation;
                 traffic_record_fences[node_index] = new_record.fence.get();
+            }
+            ReplicationOp::ProtectedRosterEstablished { key, successor, .. } => {
+                let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor else {
+                    continue;
+                };
+                let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                else {
+                    continue;
+                };
+                let generation = record.generation.get();
+                let expected_record = expected_traffic_record(
+                    key,
+                    seed,
+                    member_count,
+                    node_index,
+                    generation,
+                    record.fence.get(),
+                )?;
+                if record.fence.get() == 0
+                    || !traffic_record_is_exact(&expected_record, record)
+                    || traffic_generations[node_index].checked_add(1) != Some(generation)
+                {
+                    return Err(QualificationTrafficFailureCode::InvariantViolation);
+                }
+                traffic_generations[node_index] = generation;
+                traffic_record_fences[node_index] = record.fence.get();
             }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
             ReplicationOp::DeleteFenced { .. }
@@ -5990,6 +6058,80 @@ mod tests {
                     .as_bytes(),
                 ),
             },
+        }
+    }
+
+    fn reconciliation_roster_put(node_index: usize, generation: u64) -> ReplicationOp {
+        let key = qualification_traffic_key(node_index).expect("traffic key");
+        let previous_generation = generation.checked_sub(1).expect("previous generation");
+        let expected_record = expected_traffic_record(
+            &key,
+            qualification_traffic_seed(3).expect("traffic seed"),
+            3,
+            node_index,
+            previous_generation,
+            previous_generation.saturating_add(1),
+        )
+        .expect("expected traffic record");
+        let ReplicationOp::CompareAndSet { new_record, .. } =
+            reconciliation_cas(node_index, generation)
+        else {
+            unreachable!()
+        };
+        ReplicationOp::ProtectedRosterEstablished {
+            key,
+            expected_record,
+            successor: Box::new(ProtectedRosterEstablishedSuccessor::Put {
+                record: Box::new(new_record.clone()),
+            }),
+            owner: new_record.owner,
+            fence: new_record.fence,
+            credential_id: 1,
+            guard_acquired_at: opc_types::Timestamp::now_utc(),
+            guard_expires_at: opc_types::Timestamp::now_utc(),
+        }
+    }
+
+    #[test]
+    fn traffic_watch_and_reconciliation_project_roster_put_only() {
+        let keys = (0..3)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let operation = reconciliation_roster_put(0, 2);
+        let watched = [AtomicU64::new(1), AtomicU64::new(0), AtomicU64::new(0)];
+        assert_eq!(observe_applied_records(&operation, &keys, &watched), Ok(1));
+        assert_eq!(watched[0].load(Ordering::Acquire), 2);
+
+        let seed = qualification_traffic_seed(3).expect("traffic seed");
+        let mut generations = [1, 0, 0];
+        let mut fences = [2, 0, 0];
+        assert!(reconcile_applied_traffic_records(
+            &operation,
+            &keys,
+            &mut generations,
+            &mut fences,
+            seed,
+            3,
+        )
+        .is_ok());
+        assert_eq!(generations, [2, 0, 0]);
+        assert_eq!(fences, [3, 0, 0]);
+
+        for successor in [
+            ProtectedRosterEstablishedSuccessor::NoOp,
+            ProtectedRosterEstablishedSuccessor::Delete,
+        ] {
+            let mut non_write = operation.clone();
+            let ReplicationOp::ProtectedRosterEstablished {
+                successor: operation_successor,
+                ..
+            } = &mut non_write
+            else {
+                unreachable!()
+            };
+            **operation_successor = successor;
+            assert_eq!(observe_applied_records(&non_write, &keys, &watched), Ok(0));
         }
     }
 

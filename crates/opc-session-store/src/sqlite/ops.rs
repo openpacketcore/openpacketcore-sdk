@@ -461,6 +461,18 @@ pub(crate) fn get_sync(
     key: &SessionKey,
     now: Timestamp,
 ) -> Result<Option<StoredSessionRecord>, StoreError> {
+    Ok(get_raw_sync(conn, key)?.filter(|record| !record.is_expired_at(now)))
+}
+
+/// Read and hydrate the exact stored session row without applying logical TTL.
+///
+/// This is an internal persistence primitive for callers that must compare a
+/// durable raw pre-state. It deliberately does not prune or otherwise mutate
+/// the database, and an expired row is returned as present.
+pub(crate) fn get_raw_sync(
+    conn: &Connection,
+    key: &SessionKey,
+) -> Result<Option<StoredSessionRecord>, StoreError> {
     let mut stmt = conn
         .prepare(
             r#"
@@ -565,12 +577,7 @@ pub(crate) fn get_sync(
         payload,
     };
 
-    let result = if record.is_expired_at(now) {
-        None
-    } else {
-        Some(record)
-    };
-    Ok(result)
+    Ok(Some(record))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1340,6 +1347,79 @@ pub(crate) fn refresh_ttl_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    #[test]
+    fn raw_get_returns_logically_expired_row_without_deleting_it() {
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session_records (
+                tenant TEXT NOT NULL,
+                nf_kind TEXT NOT NULL,
+                key_type TEXT NOT NULL,
+                stable_id BLOB NOT NULL,
+                generation INTEGER NOT NULL,
+                owner TEXT NOT NULL,
+                fence INTEGER NOT NULL,
+                state_class TEXT NOT NULL,
+                state_type TEXT NOT NULL,
+                expires_at TEXT,
+                payload BLOB NOT NULL,
+                encoding INTEGER NOT NULL,
+                PRIMARY KEY (tenant, nf_kind, key_type, stable_id)
+            );
+            "#,
+        )
+        .expect("session table");
+        let key = SessionKey {
+            tenant: TenantId::from_static("raw-get-tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"raw-get-key")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let expires_at =
+            Timestamp::from_str("2026-08-25T00:00:00.000000000Z").expect("expiry timestamp");
+        conn.execute(
+            "INSERT INTO session_records \
+             (tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding) \
+             VALUES (?1, ?2, ?3, ?4, 7, 'raw-get-owner', 9, 'authoritative-session', 'raw-get-state', ?5, X'0102', 0)",
+            params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+                format_rfc3339_normalized(expires_at),
+            ],
+        )
+        .expect("expired row");
+
+        let raw = get_raw_sync(&conn, &key)
+            .expect("raw read")
+            .expect("raw row remains present");
+        assert_eq!(raw.key, key);
+        assert_eq!(raw.generation, Generation::new(7));
+        assert_eq!(raw.fence, FenceToken::new(9));
+        assert_eq!(raw.expires_at, Some(expires_at));
+
+        let logical_time =
+            Timestamp::from_str("2026-08-25T00:00:00.000000001Z").expect("logical timestamp");
+        assert_eq!(
+            get_sync(&conn, &key, logical_time).expect("logical read"),
+            None
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session_records", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("raw row count"),
+            1,
+            "neither raw nor logical get physically prunes the expired row"
+        );
+    }
 
     #[test]
     fn restore_continuation_uses_primary_key_range_search() {

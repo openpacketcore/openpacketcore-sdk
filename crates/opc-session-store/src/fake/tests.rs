@@ -183,6 +183,8 @@ async fn failed_replication_preserves_expired_internal_state_and_watchers() {
     let now = backend.clock.now_utc();
     let expired_at =
         Timestamp::from_offset_datetime(*now.as_offset_datetime() - time::Duration::seconds(1));
+    let acquired_at =
+        Timestamp::from_offset_datetime(*now.as_offset_datetime() - time::Duration::seconds(2));
     let existing_entry =
         replication_entry(1, "existing", now, ReplicationOp::Batch { ops: Vec::new() });
 
@@ -198,6 +200,7 @@ async fn failed_replication_preserves_expired_internal_state_and_watchers() {
                 credential_id: 8,
                 owner,
                 fence,
+                acquired_at,
                 expires_at: expired_at,
                 guard_expires_at: expired_at,
             },

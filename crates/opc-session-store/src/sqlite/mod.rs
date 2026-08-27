@@ -43,6 +43,19 @@ use crate::{
 
 pub mod audit;
 pub(crate) mod consensus;
+
+/// Non-production consensus timing hooks for deterministic integration tests.
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub mod test_support {
+    pub use super::consensus::{
+        protected_roster_terminal_apply_timing_test_guard,
+        protected_roster_terminal_apply_timings_for_test,
+        reset_protected_roster_terminal_apply_timings_for_test,
+        ProtectedRosterTerminalApplyTimings,
+    };
+}
+
 pub(crate) mod lease;
 pub(crate) mod ops;
 pub(crate) mod replication;
@@ -816,6 +829,18 @@ impl SqliteSessionBackend {
     fn finish_file_open(path: &Path, conn: Connection) -> Result<Self, StoreError> {
         let database_path = std::fs::canonicalize(path)
             .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+        let database_bytes = std::fs::metadata(&database_path)
+            .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?
+            .len();
+        if database_bytes > crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES {
+            return Err(StoreError::BackendUnavailable(
+                "SQLite database exceeds the fixed snapshot extent".into(),
+            ));
+        }
+        // Install before the auxiliary latch reader opens the file. An
+        // existing image that cannot accept the common writer guard is never
+        // examined as a normal SDK database.
+        install_consensus_snapshot_extent_guard(&conn)?;
         if let Some(latch) =
             consensus::read_operator_recovery_latch_sync(&database_path).map_err(|_| {
                 StoreError::BackendUnavailable(
@@ -1907,6 +1932,135 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read one exact immutable protected-roster admission and the effective
+    /// authority time under one backend lock after a caller-owned linearizable
+    /// barrier. The current authority may be the original live lease or a
+    /// strictly higher-fence successor; this path never allocates a consensus
+    /// request or advances logical time.
+    pub(crate) async fn consensus_protected_roster_admission_status(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        admission: crate::fenced_mutation_roster::Admission,
+        current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_admission_status_sync(
+                conn,
+                identity,
+                &admission,
+                &current_authority,
+                logical_time,
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Recover one exact protected roster under a valid strictly newer fence,
+    /// with effective authority time and state selected under one backend
+    /// lock after a caller-owned linearizable barrier. Missing remains
+    /// ambiguous.
+    pub(crate) async fn consensus_protected_roster_recovery(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        recovery: crate::fenced_mutation_roster_executor::RecoveryRequest,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_recovery_sync(
+                conn,
+                identity,
+                &recovery,
+                logical_time,
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Read one exact terminal body and effective authority time under one
+    /// backend lock after a caller-owned linearizable barrier. No status read
+    /// can select a new terminal phase or body.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn consensus_protected_roster_terminal_status(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        binding: crate::fenced_mutation_roster::RequestBindingKey,
+        registration_parts: ([u8; 32], crate::fenced_mutation_roster::RequestId, [u8; 32]),
+        current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
+        terminal_body_commitment: [u8; 32],
+        terminal_evidence: crate::fenced_mutation_roster::RosterCompactTerminalEvidenceV2,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_terminal_status_sync(
+                conn,
+                identity,
+                binding,
+                consensus::ProtectedRosterTerminalStatusRequest {
+                    registration_parts,
+                    current_authority: &current_authority,
+                    terminal_body_commitment,
+                    terminal_evidence: &terminal_evidence,
+                    logical_time,
+                },
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Resolve one complete Established publication identity and current
+    /// authority under one SQLite read task after the caller's linearizable
+    /// barrier.  This is intentionally read-only: it neither proposes nor
+    /// retains a consumer receipt.
+    pub(crate) async fn consensus_protected_roster_current_publication_authority(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        request: crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<opc_types::Timestamp, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            consensus::read_protected_roster_current_publication_authority_sync(
+                conn,
+                identity,
+                &request,
+                logical_time,
+            )?;
+            Ok(logical_time)
+        })
+        .await
+    }
+
     /// Check the bounded V1 activation certificate after a caller-owned
     /// consensus barrier.  A missing or stale certificate is a normal
     /// unsupported state; storage failure remains unavailable.
@@ -1925,6 +2079,31 @@ impl SqliteSessionBackend {
             )
             .map_err(|_| {
                 StoreError::BackendUnavailable("fenced transition activation is unavailable".into())
+            })
+        })
+        .await
+    }
+
+    /// Check the exact immutable protected-roster profile certificate after a
+    /// caller-owned consensus barrier. A generic V1 certificate is not
+    /// sufficient for this capability.
+    pub(crate) async fn consensus_protected_roster_profile_activation_matches_scope(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        scope_identity: crate::consensus::SessionConsensusIdentity,
+        voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::protected_roster_profile_activation_matches_scope_sync(
+                conn,
+                storage_identity,
+                scope_identity,
+                &voters,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "protected roster profile activation is unavailable".into(),
+                )
             })
         })
         .await
@@ -2576,6 +2755,93 @@ fn consensus_value_cap_stays_below_unexpanded_transport_contract() {
 }
 
 #[cfg(test)]
+#[test]
+fn snapshot_page_guard_uses_the_actual_sparse_sqlite_page_size() {
+    let conn = Connection::open_in_memory().expect("open SQLite fixture");
+    install_consensus_snapshot_extent_guard(&conn).expect("install physical snapshot guard");
+    let page_size: u64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+        .expect("read SQLite page size")
+        .try_into()
+        .expect("positive SQLite page size");
+    let maximum_pages: i64 = conn
+        .query_row("PRAGMA max_page_count", [], |row| row.get(0))
+        .expect("read SQLite page bound");
+    assert_eq!(
+        u64::try_from(maximum_pages).expect("positive SQLite page bound") * page_size,
+        crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES / page_size * page_size
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn file_backed_snapshot_guard_reopens_and_read_only_validation_preserves_identity() {
+    let directory = tempfile::tempdir().expect("create SQLite fixture directory");
+    let path = directory.path().join("session.sqlite");
+    let backend = SqliteSessionBackend::open(&path).expect("create file-backed SQLite backend");
+    drop(backend);
+
+    // Exercise the production file-backed reopen path before inspecting the
+    // independently observable SQLite setting below.
+    let reopened_backend =
+        SqliteSessionBackend::open(&path).expect("reopen file-backed SQLite backend");
+    drop(reopened_backend);
+
+    // Every normal file-backed reopen reinstalls the writer guard at the
+    // actual SQLite page size. The query-only handle uses the independent
+    // extent validation instead, which cannot mutate the database identity.
+    let reopened = Connection::open(&path).expect("reopen SQLite fixture");
+    install_consensus_snapshot_extent_guard(&reopened).expect("reinstall physical guard");
+    let page_size: u64 = reopened
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+        .expect("read SQLite page size")
+        .try_into()
+        .expect("positive SQLite page size");
+    let maximum_pages: i64 = reopened
+        .query_row("PRAGMA max_page_count", [], |row| row.get(0))
+        .expect("read SQLite page bound");
+    assert_eq!(
+        u64::try_from(maximum_pages).expect("positive SQLite page bound") * page_size,
+        crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES / page_size * page_size
+    );
+    drop(reopened);
+
+    let before = std::fs::metadata(&path).expect("read fixture identity");
+    let read_only = Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open query-only SQLite fixture");
+    consensus::snapshot_database_extent_sync(&read_only)
+        .expect("query-only fixture is within the shared physical extent");
+    drop(read_only);
+    let after = std::fs::metadata(&path).expect("re-read fixture identity");
+    assert_eq!(before.len(), after.len());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn file_backed_open_rejects_a_sparse_file_beyond_the_common_extent() {
+    let directory = tempfile::tempdir().expect("create SQLite fixture directory");
+    let path = directory.path().join("oversized.sqlite");
+    let backend = SqliteSessionBackend::open(&path).expect("create file-backed SQLite backend");
+    drop(backend);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open sparse SQLite fixture");
+    file.set_len(crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES + 1)
+        .expect("extend sparse SQLite fixture without allocating it");
+    drop(file);
+    assert!(SqliteSessionBackend::open(&path).is_err());
+}
+
+#[cfg(test)]
 mod fenced_transition_observation_redaction_tests {
     use super::*;
     use crate::model::SessionKeyType;
@@ -2788,6 +3054,15 @@ fn apply_pragma_profile(
     conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MILLIS))
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
+    // This writer guard caps the shared physical SQLite image. Protected
+    // roster HistoryFull/RetentionExhausted remains protocol/logical
+    // accounting; arbitrary non-roster rows are governed only by this common
+    // extent. Read-only snapshot and recovery opens verify the same actual
+    // extent because they cannot safely install a write-like pragma.
+    if !in_memory {
+        install_consensus_snapshot_extent_guard(conn)?;
+    }
+
     if !in_memory && primary_write_connection {
         conn.pragma_update(
             None,
@@ -2826,6 +3101,11 @@ fn apply_pragma_profile(
     }
 
     Ok(())
+}
+
+fn install_consensus_snapshot_extent_guard(conn: &Connection) -> Result<(), StoreError> {
+    consensus::install_snapshot_database_extent_guard_sync(conn)
+        .map_err(|error| StoreError::BackendUnavailable(error.to_string()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

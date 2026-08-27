@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use opc_consensus::engine::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
@@ -27,19 +27,21 @@ use super::snapshot::{
     fixed_prepublication_scan_boundary, FixedPrepublicationScanGateGuard, SnapshotArtifactGate,
 };
 use super::snapshot::{
-    PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact, SNAPSHOT_MAX_BYTES,
+    PinnedSqliteFile, SessionSnapshotFile, UnpublishedSnapshotArtifact,
+    SNAPSHOT_ENVELOPE_FOOTER_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES, SNAPSHOT_MAX_BYTES,
 };
 use super::{
     SessionConsensusIdentity, SessionConsensusNodeId, SessionRaftTypeConfig,
     SessionTopologyMemberBinding,
 };
 use crate::backend::ReplicationEntry;
+use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
 use crate::readiness::PlacementResiliencePolicy;
 use crate::sqlite::consensus::{self, SqliteConsensusCore};
 use crate::sqlite::SqliteSessionBackend;
 
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
-const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 8 + 32;
+const SNAPSHOT_FOOTER_BYTES: u64 = SNAPSHOT_ENVELOPE_FOOTER_BYTES;
 // At most one published image and a bounded set of interrupted-attempt
 // artifacts may coexist under the one snapshot gate.
 const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 32;
@@ -295,9 +297,94 @@ pub(crate) enum ConsensusAuthorityProfile {
 }
 
 /// Serialized Openraft vote/log persistence.
-#[derive(Clone)]
 pub(crate) struct SqliteConsensusLogStore {
     core: SqliteConsensusCore,
+    // Last-drop notification follows release of the log reader's SQLite core.
+    shutdown_guard: ConsensusStorageShutdownGuard,
+}
+
+impl SqliteConsensusLogStore {
+    fn tracked_reader(&self) -> Self {
+        Self {
+            core: self.core.clone(),
+            shutdown_guard: self.shutdown_guard.child(),
+        }
+    }
+}
+
+struct ConsensusStorageShutdownCompletion {
+    active_owners: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+/// Observation that every Openraft-owned SQLite storage handle has exited.
+#[derive(Clone)]
+pub(crate) struct ConsensusStorageShutdownObserver(Arc<ConsensusStorageShutdownCompletion>);
+
+impl ConsensusStorageShutdownObserver {
+    pub(crate) async fn wait(&self) {
+        loop {
+            if self.0.active_owners.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.0.active_owners.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct ConsensusStorageShutdownGuard(Option<Arc<ConsensusStorageShutdownCompletion>>);
+
+impl ConsensusStorageShutdownGuard {
+    fn tracked() -> Self {
+        Self(Some(Arc::new(ConsensusStorageShutdownCompletion {
+            active_owners: AtomicUsize::new(1),
+            notify: tokio::sync::Notify::new(),
+        })))
+    }
+
+    const fn detached() -> Self {
+        Self(None)
+    }
+
+    fn observer(&self) -> Option<ConsensusStorageShutdownObserver> {
+        self.0
+            .as_ref()
+            .map(|completion| ConsensusStorageShutdownObserver(Arc::clone(completion)))
+    }
+
+    fn child(&self) -> Self {
+        let Some(completion) = self.0.as_ref() else {
+            return Self::detached();
+        };
+        let incremented =
+            completion
+                .active_owners
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                });
+        assert!(
+            incremented.is_ok(),
+            "bounded consensus storage ownership cannot overflow"
+        );
+        Self(Some(Arc::clone(completion)))
+    }
+}
+
+impl Drop for ConsensusStorageShutdownGuard {
+    fn drop(&mut self) {
+        let Some(completion) = self.0.take() else {
+            return;
+        };
+        if completion.active_owners.fetch_sub(1, Ordering::AcqRel) == 1 {
+            completion.notify.notify_waiters();
+        }
+    }
 }
 
 impl SqliteConsensusLogStore {
@@ -314,13 +401,32 @@ impl SqliteConsensusLogStore {
 }
 
 /// Persistent session state machine and snapshot owner.
-#[derive(Clone)]
 pub(crate) struct SqliteConsensusStateMachine {
     core: SqliteConsensusCore,
     membership_admission: Option<SessionRaftPeerDirectory>,
+    // This field must remain last: its Drop is the completion edge after the
+    // worker has released the SQLite core and membership admission fields.
+    shutdown_guard: ConsensusStorageShutdownGuard,
+}
+
+#[cfg(test)]
+impl Clone for SqliteConsensusStateMachine {
+    fn clone(&self) -> Self {
+        Self {
+            core: self.core.clone(),
+            membership_admission: self.membership_admission.clone(),
+            // Test-only direct state-machine clones are not worker owners and
+            // must never satisfy the store's shutdown barrier.
+            shutdown_guard: ConsensusStorageShutdownGuard::detached(),
+        }
+    }
 }
 
 impl SqliteConsensusStateMachine {
+    pub(crate) fn shutdown_observer(&self) -> Option<ConsensusStorageShutdownObserver> {
+        self.shutdown_guard.observer()
+    }
+
     async fn begin_membership_apply(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
         match self.membership_admission.as_ref() {
             Some(admission) => Some(admission.begin_membership_apply().await),
@@ -360,8 +466,21 @@ impl SqliteConsensusStateMachine {
 /// serialization of the session database.
 pub(crate) struct SqliteConsensusSnapshotBuilder {
     core: SqliteConsensusCore,
+    // Last-drop notification follows release of the builder's SQLite core.
+    _shutdown_guard: ConsensusStorageShutdownGuard,
 }
 
+/// Detached blocking snapshot capture and its exact SQLite-owner lifetime.
+///
+/// Field order is intentional: Rust drops `reader` before `_shutdown_guard`,
+/// so the shutdown observer cannot complete while the WAL-pinning connection
+/// remains live after cancellation of the async snapshot caller.
+struct SnapshotCaptureWorker {
+    reader: consensus::SnapshotReadConnection,
+    _shutdown_guard: ConsensusStorageShutdownGuard,
+}
+
+#[cfg(test)]
 pub(crate) async fn open_with_member_bindings(
     backend: &SqliteSessionBackend,
     snapshot_dir: impl Into<PathBuf>,
@@ -386,6 +505,41 @@ pub(crate) async fn open_with_member_bindings(
         membership_admission,
         ConsensusAuthorityProfile::Dynamic,
         None,
+        None,
+    )
+    .await
+}
+
+/// Open dynamic consensus with the immutable topology-provisioned roster
+/// attestation root. Passing `None` preserves ordinary non-roster operation;
+/// roster mutations then fail closed in deterministic apply.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_with_member_bindings_and_roster_attestation_root(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
+    open_with_member_bindings_for_profile(
+        backend,
+        snapshot_dir,
+        identity,
+        expected_members,
+        expected_bindings,
+        membership_admission,
+        ConsensusAuthorityProfile::Dynamic,
+        None,
+        roster_attestation_trust_root,
     )
     .await
 }
@@ -394,6 +548,7 @@ pub(crate) async fn open_with_member_bindings(
 ///
 /// Unlike the dynamic entry point, this binds the original durable storage
 /// identity to `identity` permanently and rejects membership transitions.
+#[cfg(test)]
 pub(crate) async fn open_fixed_with_member_bindings(
     backend: &SqliteSessionBackend,
     snapshot_dir: impl Into<PathBuf>,
@@ -419,6 +574,40 @@ pub(crate) async fn open_fixed_with_member_bindings(
         membership_admission,
         ConsensusAuthorityProfile::FixedImmutable,
         Some(placement_policy),
+        None,
+    )
+    .await
+}
+
+/// Fixed-quorum counterpart that persists the immutable roster root.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_fixed_with_member_bindings_and_roster_attestation_root(
+    backend: &SqliteSessionBackend,
+    snapshot_dir: impl Into<PathBuf>,
+    identity: SessionConsensusIdentity,
+    expected_members: BTreeSet<SessionConsensusNodeId>,
+    expected_bindings: BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
+    membership_admission: SessionRaftPeerDirectory,
+    placement_policy: PlacementResiliencePolicy,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+) -> Result<
+    (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        SessionConsensusIdentity,
+    ),
+    SessionConsensusStorageError,
+> {
+    open_with_member_bindings_for_profile(
+        backend,
+        snapshot_dir,
+        identity,
+        expected_members,
+        expected_bindings,
+        membership_admission,
+        ConsensusAuthorityProfile::FixedImmutable,
+        Some(placement_policy),
+        roster_attestation_trust_root,
     )
     .await
 }
@@ -433,6 +622,7 @@ async fn open_with_member_bindings_for_profile(
     membership_admission: SessionRaftPeerDirectory,
     authority_profile: ConsensusAuthorityProfile,
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -441,7 +631,7 @@ async fn open_with_member_bindings_for_profile(
     ),
     SessionConsensusStorageError,
 > {
-    let core = SqliteConsensusCore::initialize(
+    let core = SqliteConsensusCore::initialize_with_roster_attestation_root(
         backend,
         snapshot_dir.into(),
         identity,
@@ -449,15 +639,22 @@ async fn open_with_member_bindings_for_profile(
         expected_bindings,
         authority_profile,
         fixed_placement_policy,
+        roster_attestation_trust_root,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
     let storage_identity = core.storage_identity;
+    let shutdown_guard = ConsensusStorageShutdownGuard::tracked();
+    let state_machine_shutdown_guard = shutdown_guard.child();
     Ok((
-        SqliteConsensusLogStore { core: core.clone() },
+        SqliteConsensusLogStore {
+            core: core.clone(),
+            shutdown_guard,
+        },
         SqliteConsensusStateMachine {
             core,
             membership_admission: Some(membership_admission),
+            shutdown_guard: state_machine_shutdown_guard,
         },
         storage_identity,
     ))
@@ -499,23 +696,25 @@ async fn open(
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
+    let shutdown_guard = ConsensusStorageShutdownGuard::tracked();
+    let state_machine_shutdown_guard = shutdown_guard.child();
     Ok((
-        SqliteConsensusLogStore { core: core.clone() },
+        SqliteConsensusLogStore {
+            core: core.clone(),
+            shutdown_guard,
+        },
         SqliteConsensusStateMachine {
             core,
             membership_admission: None,
+            shutdown_guard: state_machine_shutdown_guard,
         },
     ))
 }
 
-/// Open a pristine or restarted candidate with one exact successor scope
-/// durably staged in the same SQLite transaction as schema admission.
-///
-/// The candidate's node may be absent from `expected_members`; membership and
-/// transport admission remain driver responsibilities. Snapshot installation
-/// subsequently requires the source to carry this exact pending scope.
+/// Root-aware pending-membership open that preserves the current immutable
+/// roster root while durably staging one successor scope.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn open_with_pending_membership(
+pub(crate) async fn open_with_pending_membership_and_roster_attestation_root(
     backend: &SqliteSessionBackend,
     snapshot_dir: impl Into<PathBuf>,
     storage_identity: SessionConsensusIdentity,
@@ -529,6 +728,7 @@ pub(crate) async fn open_with_pending_membership(
     desired_members: &BTreeSet<SessionConsensusNodeId>,
     desired_bindings: &BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding>,
     membership_admission: SessionRaftPeerDirectory,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
 ) -> Result<
     (
         SqliteConsensusLogStore,
@@ -537,7 +737,7 @@ pub(crate) async fn open_with_pending_membership(
     ),
     SessionConsensusStorageError,
 > {
-    let core = SqliteConsensusCore::initialize_with_pending(
+    let core = SqliteConsensusCore::initialize_with_pending_and_roster_attestation_root(
         backend,
         snapshot_dir.into(),
         storage_identity,
@@ -554,15 +754,22 @@ pub(crate) async fn open_with_pending_membership(
         },
         ConsensusAuthorityProfile::Dynamic,
         None,
+        roster_attestation_trust_root,
     )
     .await?;
     validate_and_clean_snapshot_directory(&core).await?;
     let storage_identity = core.storage_identity;
+    let shutdown_guard = ConsensusStorageShutdownGuard::tracked();
+    let state_machine_shutdown_guard = shutdown_guard.child();
     Ok((
-        SqliteConsensusLogStore { core: core.clone() },
+        SqliteConsensusLogStore {
+            core: core.clone(),
+            shutdown_guard,
+        },
         SqliteConsensusStateMachine {
             core,
             membership_admission: Some(membership_admission),
+            shutdown_guard: state_machine_shutdown_guard,
         },
         storage_identity,
     ))
@@ -639,12 +846,29 @@ async fn validate_and_clean_snapshot_directory(
             .file_type()
             .await
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-        if !file_type.is_file() && !file_type.is_symlink() {
+        // Never follow or unlink a replacement by pathname alone. Staging is
+        // constrained to the exact prefixes above; after this type check the
+        // cleanup guard rechecks the observed inode immediately before unlink.
+        // A raced replacement remains visible and fails this startup instead
+        // of being deleted as an SDK artifact.
+        if !file_type.is_file() {
             return Err(SessionConsensusStorageError::CorruptState);
         }
-        tokio::fs::remove_file(entry.path())
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
             .await
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        if !metadata.is_file() {
+            return Err(SessionConsensusStorageError::CorruptState);
+        }
+        let cleanup = UnpublishedSnapshotArtifact::from_metadata(path.clone(), &metadata, false)
+            .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+        drop(cleanup);
+        match tokio::fs::symlink_metadata(&path).await {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(SessionConsensusStorageError::BackendUnavailable),
+        }
         removed = true;
     }
     if removed {
@@ -792,15 +1016,15 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
-        self.clone()
+        self.tracked_reader()
     }
 
     async fn save_vote(
         &mut self,
         vote: &Vote<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::save_vote_with_authority_sync(
                 &conn,
@@ -839,8 +1063,8 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         committed: Option<LogId<SessionConsensusNodeId>>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::save_committed_with_authority_sync(
                 &conn,
@@ -886,10 +1110,10 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     {
         let entries: Vec<_> = entries.into_iter().collect();
         let has_entries = !entries.is_empty();
+        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
-            consensus::append_logs_with_authority_sync(
+            consensus::append_logs_with_authority_and_diagnostics_sync(
                 &conn,
                 self.core.storage_identity,
                 self.core.authority_profile,
@@ -897,6 +1121,7 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
                 &self.core.expected_bindings,
                 self.core.fixed_placement_policy,
                 &entries,
+                self.core.diagnostics.as_deref(),
             )
         };
         match result {
@@ -919,8 +1144,8 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         log_id: LogId<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::truncate_logs_with_authority_sync(
                 &conn,
@@ -946,8 +1171,8 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         wait_until_applied(&self.core, &log_id)
             .await
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
+        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable
                 && self.core.consensus_log_prune_lane().is_none()
@@ -1057,9 +1282,9 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             } else {
                 None
             };
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
             let conn = self.core.conn.lock().await;
-            let applied = consensus::apply_entries_with_authority_sync(
+            let applied = consensus::apply_entries_with_authority_and_diagnostics_sync(
                 &conn,
                 self.core.storage_identity,
                 &self.core.caps,
@@ -1068,6 +1293,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 &self.core.expected_bindings,
                 self.core.fixed_placement_policy,
                 entries,
+                self.core.diagnostics.as_deref(),
             )
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
             if applies_membership {
@@ -1096,6 +1322,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         SqliteConsensusSnapshotBuilder {
             core: self.core.clone(),
+            _shutdown_guard: self.shutdown_guard.child(),
         }
     }
 
@@ -1121,15 +1348,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         SessionSnapshotFile::create_with_cleanup_bounded(
             path,
             Some(Arc::clone(&self.core.snapshot_cleanup_failed)),
-            SNAPSHOT_MAX_BYTES
-                .checked_add(SNAPSHOT_FOOTER_BYTES)
-                .ok_or_else(|| {
-                    storage_error(
-                        ErrorSubject::Snapshot(None),
-                        ErrorVerb::Write,
-                        consensus::invalid_data("session consensus snapshot size limit is invalid"),
-                    )
-                })?,
+            SNAPSHOT_ENVELOPE_MAX_BYTES,
             Some(receive_admission),
         )
         .await
@@ -1272,7 +1491,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             } else {
                 None
             };
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
             let conn = self.core.conn.lock().await;
             let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
                 .map_err(|error| {
@@ -1352,6 +1571,16 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             Ok(previous) => previous,
             Err(error) => return Err(error),
         };
+        if let Some(diagnostics) = &self.core.diagnostics {
+            let conn = self.core.conn.lock().await;
+            match consensus::protected_roster_diagnostic_occupancy_sync(
+                &conn,
+                self.core.storage_identity,
+            ) {
+                Ok(occupancy) => diagnostics.set_protected_roster_occupancy(occupancy),
+                Err(_) => diagnostics.invalidate_protected_roster_occupancy(),
+            }
+        }
         self.core.signal_proactive_checkpoint();
         // The readback helper has disarmed the exact published-file guard, so
         // later staging reclamation cannot delete the authoritative image.
@@ -1495,6 +1724,7 @@ async fn build_file_backed_snapshot_database(
     raw_artifact: SnapshotArtifact,
     vacuum_artifact: SnapshotArtifact,
     snapshot_guard: tokio::sync::OwnedMutexGuard<()>,
+    worker_shutdown_guard: ConsensusStorageShutdownGuard,
 ) -> Result<
     (
         tokio::sync::OwnedMutexGuard<()>,
@@ -1514,11 +1744,14 @@ async fn build_file_backed_snapshot_database(
     let Some(database_file) = &core.database_file else {
         return Ok((snapshot_guard, None, raw_artifact, None));
     };
-    let reader = consensus::open_snapshot_read_connection(database_file)
-        .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
+    let worker = SnapshotCaptureWorker {
+        reader: consensus::open_snapshot_read_connection(database_file)
+            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?,
+        _shutdown_guard: worker_shutdown_guard,
+    };
     let source_cut = {
         let conn = core.conn.lock().await;
-        match consensus::begin_snapshot_read_sync(&reader, core.storage_identity) {
+        match consensus::begin_snapshot_read_sync(&worker.reader, core.storage_identity) {
             Ok(source_cut) => {
                 let live_file = opc_sqlite_file_control_sys::main_file_descriptor(&conn)
                     .map_err(|_| {
@@ -1562,7 +1795,7 @@ async fn build_file_backed_snapshot_database(
     let source_cut = match source_cut {
         Ok(source_cut) => source_cut,
         Err(error) => {
-            let error = match consensus::release_snapshot_read_sync(&reader) {
+            let error = match consensus::release_snapshot_read_sync(&worker.reader) {
                 Ok(()) => error,
                 Err(release_error) => release_error,
             };
@@ -1583,16 +1816,16 @@ async fn build_file_backed_snapshot_database(
     let vacuum_path = vacuum_artifact.path().to_path_buf();
     #[cfg(test)]
     let snapshot_capture_gate = Arc::clone(&core.snapshot_capture_gate);
-    // The owned guard moves into the worker and comes back with its result.
-    // Cancellation of the async caller therefore cannot detach a second
-    // snapshot worker or a second WAL-pinning reader for this consensus core.
+    // The owned gate guard moves into the worker and comes back with its
+    // result. Cancellation of the async caller therefore cannot detach a
+    // second snapshot worker or a second WAL-pinning reader for this core.
     let (captured, snapshot_guard) = tokio::task::spawn_blocking(move || {
         let raw_artifact = raw_artifact;
         let vacuum_artifact = vacuum_artifact;
         #[cfg(test)]
         snapshot_capture_gate.block_after_capture();
         let captured = consensus::capture_snapshot_database_from_reader_sync(
-            &reader,
+            &worker.reader,
             storage_identity,
             authority_profile,
             &expected_members,
@@ -1603,7 +1836,7 @@ async fn build_file_backed_snapshot_database(
         );
         // The source transaction is retained only through `Backup`; all
         // cleanup, VACUUM, validation, hashing, and sealing follow release.
-        let released = consensus::release_snapshot_read_sync(&reader);
+        let released = consensus::release_snapshot_read_sync(&worker.reader);
         let captured = match (captured, released) {
             (Ok(captured), Ok(())) => {
                 let (captured_cut, raw_snapshot, wal_bytes) = captured;
@@ -1619,7 +1852,7 @@ async fn build_file_backed_snapshot_database(
                 )
                 // Keep both guards through sealing and publication.  The raw
                 // source is explicitly removed only after metadata commits;
-                // only the independently verified `VACUUM INTO` descriptor
+                // only the independently verified compacted descriptor
                 // may proceed to sealing.
                 .map(|raw_snapshot| {
                     (
@@ -1638,6 +1871,10 @@ async fn build_file_backed_snapshot_database(
         // If the async caller is cancelled, Tokio drops this detached worker
         // output in field order, so every unpublished artifact is removed
         // before another snapshot builder can acquire sole-worker ownership.
+        // Force Rust 2021 to retain the complete wrapper: field-disjoint
+        // closure capture must not detach its reader from the shutdown guard
+        // that bounds the WAL-pinning SQLite owner's lifetime.
+        drop(worker);
         (captured, snapshot_guard)
     })
     .await
@@ -1703,6 +1940,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                 raw_artifact,
                 vacuum_artifact,
                 snapshot_guard,
+                self._shutdown_guard.child(),
             )
             .await?;
         let (
@@ -1712,7 +1950,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             captured_wal_bytes,
         ) = if let Some((membership, raw_snapshot, wal_bytes)) = file_backed {
             // `raw_snapshot` is the independently validated, descriptor-pinned
-            // `VACUUM INTO` inode. Seal that exact inode in place: copying it
+            // compacted inode. Seal that exact inode in place: copying it
             // into a third full-payload artifact would multiply peak snapshot
             // storage and leave a second publication boundary to defend.
             let sealed = seal_snapshot_database_in_place(raw_snapshot, &final_path)
@@ -1850,7 +2088,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             };
         let _snapshot_guard = snapshot_guard;
         let previous = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
             let conn = self.core.conn.lock().await;
             let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
                 .map_err(|error| {
@@ -2123,9 +2361,7 @@ async fn verify_snapshot_envelope_reader(
     file: &mut SessionSnapshotFile,
 ) -> io::Result<(u64, [u8; 32], u64)> {
     let total_length = file.seek(io::SeekFrom::End(0)).await?;
-    if total_length <= SNAPSHOT_FOOTER_BYTES
-        || total_length > SNAPSHOT_MAX_BYTES.saturating_add(SNAPSHOT_FOOTER_BYTES)
-    {
+    if total_length <= SNAPSHOT_FOOTER_BYTES || total_length > SNAPSHOT_ENVELOPE_MAX_BYTES {
         return Err(consensus::invalid_data(
             "session consensus snapshot size is invalid",
         ));
@@ -2374,7 +2610,8 @@ mod tests {
     use super::*;
     use crate::backend::CompareAndSet;
     use crate::consensus::{
-        SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+        store::ConsensusStoreDiagnosticCounters, SessionConsensusClusterId,
+        SessionConsensusCommand, SessionConsensusConfigurationEpoch,
         SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusRequestId,
         SessionMutationIntent, SessionMutationOutcome, SESSION_CONSENSUS_SCHEMA_VERSION,
     };
@@ -2383,6 +2620,81 @@ mod tests {
     use crate::record::{EncryptedSessionPayload, StoredSessionRecord};
 
     const PLAINTEXT_CANARY: &[u8] = b"never-persist-this-plaintext-canary";
+
+    #[tokio::test]
+    async fn shutdown_observer_waits_for_all_tracked_sqlite_owners() {
+        let root = ConsensusStorageShutdownGuard::tracked();
+        let observer = root.observer().expect("tracked root has an observer");
+        let state_machine = root.child();
+        let replication_reader = root.child();
+        let snapshot_builder = state_machine.child();
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 4);
+
+        drop(root);
+        assert_eq!(
+            observer.0.active_owners.load(Ordering::Acquire),
+            3,
+            "the log root cannot complete while other engine tasks own SQLite"
+        );
+        drop(state_machine);
+        drop(replication_reader);
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 1);
+        drop(snapshot_builder);
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 0);
+        tokio::time::timeout(Duration::from_secs(1), observer.wait())
+            .await
+            .expect("the final tracked SQLite owner releases the shutdown barrier");
+    }
+
+    #[tokio::test]
+    async fn shutdown_observer_tracks_real_openraft_storage_wrappers() {
+        let directory = tempfile::tempdir().expect("storage ownership directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
+            .expect("storage ownership backend");
+        let (mut log_store, mut state_machine) = open(
+            &backend,
+            directory.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("storage ownership wrappers");
+        let observer = state_machine
+            .shutdown_observer()
+            .expect("production wrappers share a shutdown observer");
+        let replication_reader = log_store.get_log_reader().await;
+        let snapshot_builder = state_machine.get_snapshot_builder().await;
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 4);
+
+        let first_waiter = tokio::spawn({
+            let observer = observer.clone();
+            async move { observer.wait().await }
+        });
+        let second_waiter = tokio::spawn({
+            let observer = observer.clone();
+            async move { observer.wait().await }
+        });
+        tokio::task::yield_now().await;
+
+        drop(log_store);
+        drop(state_machine);
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 2);
+        assert!(!first_waiter.is_finished());
+        assert!(!second_waiter.is_finished());
+
+        drop(replication_reader);
+        assert_eq!(observer.0.active_owners.load(Ordering::Acquire), 1);
+        assert!(!first_waiter.is_finished());
+        assert!(!second_waiter.is_finished());
+
+        drop(snapshot_builder);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first_waiter.await.expect("first shutdown observer");
+            second_waiter.await.expect("second shutdown observer");
+        })
+        .await
+        .expect("all waiters observe final wrapper release");
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -3105,8 +3417,23 @@ mod tests {
         SqliteConsensusStateMachine,
         PathBuf,
     ) {
+        open_fixed_raw_read_store_with_diagnostics(directory, None).await
+    }
+
+    async fn open_fixed_raw_read_store_with_diagnostics(
+        directory: &tempfile::TempDir,
+        diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
+    ) -> (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        PathBuf,
+    ) {
         let database = directory.path().join("fixed-raw-read.sqlite");
         let backend = SqliteSessionBackend::open(&database).expect("fixed raw-read backend");
+        let backend = match diagnostics {
+            Some(diagnostics) => backend.with_consensus_diagnostics(diagnostics),
+            None => backend,
+        };
         let members = fixed_raw_read_members();
         let core = SqliteConsensusCore::initialize(
             &backend,
@@ -3120,17 +3447,21 @@ mod tests {
         .await
         .expect("open exact fixed raw-read store");
         (
-            SqliteConsensusLogStore { core: core.clone() },
+            SqliteConsensusLogStore {
+                core: core.clone(),
+                shutdown_guard: ConsensusStorageShutdownGuard::detached(),
+            },
             SqliteConsensusStateMachine {
                 core,
                 membership_admission: None,
+                shutdown_guard: ConsensusStorageShutdownGuard::detached(),
             },
             database,
         )
     }
 
     #[cfg(target_os = "linux")]
-    async fn prepare_fixed_prune_backlog(
+    async fn append_apply_fixed_prune_backlog(
         log_store: &mut SqliteConsensusLogStore,
         state_machine: &mut SqliteConsensusStateMachine,
     ) {
@@ -3145,6 +3476,14 @@ mod tests {
             .apply(entries)
             .await
             .expect("apply fixed prune backlog through the storage adapter");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn prepare_fixed_prune_backlog(
+        log_store: &mut SqliteConsensusLogStore,
+        state_machine: &mut SqliteConsensusStateMachine,
+    ) {
+        append_apply_fixed_prune_backlog(log_store, state_machine).await;
         log_store
             .purge(log_id(129))
             .await
@@ -3152,39 +3491,132 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fixed_prune_yields_writer_to_later_adapter_append_and_resumes() {
-        let directory = tempfile::tempdir().expect("fixed prune priority directory");
-        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
-            directory.path(),
-        );
-        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+    async fn prepare_dormant_fixed_prune_backlog(directory: &tempfile::TempDir) {
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(directory).await;
         let lane = state_machine
             .core
             .consensus_log_prune_lane()
             .expect("fixed store installs one physical prune lane");
-        prepare_fixed_prune_backlog(&mut log_store, &mut state_machine).await;
+        append_apply_fixed_prune_backlog(&mut log_store, &mut state_machine).await;
+        lane.shutdown().await;
+        log_store
+            .purge(log_id(129))
+            .await
+            .expect("durably record a dormant fixed logical purge floor");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn prepare_dormant_fixed_prune_backlog_with_next_log(directory: &tempfile::TempDir) {
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(directory).await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+        append_apply_fixed_prune_backlog(&mut log_store, &mut state_machine).await;
+        lane.shutdown().await;
+        log_store
+            .purge(log_id(129))
+            .await
+            .expect("durably record a dormant fixed logical purge floor");
+        log_store
+            .blocking_append([blank_entry(130)])
+            .await
+            .expect("durably append the next unapplied fixed log");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pristine_fixed_store_prune_recovery_never_takes_sqlite_writer() {
+        let directory = tempfile::tempdir().expect("pristine fixed prune directory");
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
+            directory.path(),
+        );
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let (mut log_store, state_machine, _) =
+            open_fixed_raw_read_store_with_diagnostics(&directory, Some(Arc::clone(&diagnostics)))
+                .await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if diagnostics.snapshot().consensus_log_prune_completed_turns == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup prune recovery completes its read-only preflight");
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.consensus_log_prune_attempts, 1);
+        assert_eq!(snapshot.consensus_log_prune_busy_retries, 0);
+        assert!(
+            !gate.wait_until_entered(Duration::from_millis(10)),
+            "a pristine startup prune preflight must not take SQLite's writer transaction"
+        );
+
+        log_store
+            .blocking_append([fixed_initial_membership_entry()])
+            .await
+            .expect("the first fixed-store append succeeds after read-only prune recovery");
+        assert!(
+            !gate.wait_until_entered(Duration::from_millis(10)),
+            "the first append cannot race a needless startup prune writer"
+        );
+        lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_prune_yields_writer_to_later_adapter_append_and_resumes() {
+        let directory = tempfile::tempdir().expect("fixed prune priority directory");
+        prepare_dormant_fixed_prune_backlog(&directory).await;
+        // The gate is captured when the reopened lane starts. Its startup turn
+        // now has eligible physical work, so this one-shot gate cannot be
+        // consumed by an earlier empty turn.
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
+            directory.path(),
+        );
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let (mut log_store, state_machine, _) =
+            open_fixed_raw_read_store_with_diagnostics(&directory, Some(Arc::clone(&diagnostics)))
+                .await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
         assert!(
             gate.wait_until_entered(Duration::from_secs(1)),
             "the prune turn owns SQLite's writer before the primary adapter append arrives"
         );
 
-        let mut append =
+        let append =
             tokio::spawn(async move { log_store.blocking_append([blank_entry(130)]).await });
-        let appended = tokio::time::timeout(Duration::from_millis(100), &mut append).await;
-        if appended.is_err() {
-            gate.release();
-            let _ = tokio::time::timeout(Duration::from_secs(1), append).await;
-            lane.shutdown().await;
-        }
-        appended
-            .expect("later primary append must not exhaust its existing SQLite busy deadline")
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.preemption_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later primary append publishes deterministic prune preemption");
+        tokio::time::timeout(Duration::from_secs(1), append)
+            .await
+            .expect("preempted prune returns its local writer turn")
             .expect("join later primary adapter append")
             .expect("later primary adapter append succeeds without SQLITE_BUSY");
 
-        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+        if tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
             .await
-            .expect("preempted prune resumes and completes its durable logical backlog");
+            .is_err()
+        {
+            panic!(
+                "preempted prune did not resume and complete its durable logical backlog; diagnostics={:?}",
+                diagnostics.snapshot()
+            );
+        }
         let conn = state_machine.core.conn.lock().await;
         assert_eq!(
             conn.query_row(
@@ -3198,6 +3630,146 @@ mod tests {
         );
         drop(conn);
         lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_prune_preempts_for_state_machine_apply_without_applied_lag() {
+        let directory = tempfile::tempdir().expect("fixed prune apply priority directory");
+        prepare_dormant_fixed_prune_backlog_with_next_log(&directory).await;
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
+            directory.path(),
+        );
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let (mut log_store, mut state_machine, _) =
+            open_fixed_raw_read_store_with_diagnostics(&directory, Some(Arc::clone(&diagnostics)))
+                .await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+        let checkpoint_lane = state_machine
+            .core
+            .proactive_checkpoint_lane()
+            .expect("file-backed store installs one proactive checkpoint lane");
+        assert!(
+            gate.wait_until_entered(Duration::from_secs(1)),
+            "the prune turn owns SQLite's writer before the state-machine apply arrives"
+        );
+        let reader = consensus::open_snapshot_read_connection(
+            state_machine
+                .core
+                .database_file
+                .as_deref()
+                .expect("file-backed store retains its snapshot source"),
+        )
+        .expect("open deferred snapshot reader");
+        let reader_cut =
+            consensus::begin_snapshot_read_sync(&reader, state_machine.core.storage_identity)
+                .expect("pin snapshot reader before the next state-machine apply");
+        assert_eq!(
+            reader_cut.0,
+            Some(log_id(129)),
+            "the pinned reader observes the durable applied cut before the next log"
+        );
+        assert_eq!(
+            state_machine
+                .applied_state()
+                .await
+                .expect("read durable applied state before the apply")
+                .0,
+            Some(log_id(129)),
+            "the next durable log is intentionally one ahead of applied"
+        );
+
+        let apply = tokio::spawn(async move {
+            let result = state_machine.apply([blank_entry(130)]).await;
+            (state_machine, result)
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.preemption_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("state-machine apply publishes deterministic prune preemption");
+        assert!(
+            gate.preemption_requested(),
+            "the active physical prune observes the state-machine writer's preemption"
+        );
+        let (mut state_machine, responses) = tokio::time::timeout(Duration::from_secs(1), apply)
+            .await
+            .expect("preempted prune returns its writer turn to the state-machine apply")
+            .expect("join state-machine apply");
+        responses.expect("state-machine apply succeeds without SQLITE_BUSY");
+        assert_eq!(
+            state_machine
+                .applied_state()
+                .await
+                .expect("read durable applied state after the apply")
+                .0,
+            Some(log_id(130)),
+            "the real state-machine apply advances durable applied exactly once"
+        );
+        assert_eq!(
+            log_store
+                .get_log_state()
+                .await
+                .expect("storage remains usable after the preempted apply")
+                .last_log_id,
+            Some(log_id(130)),
+            "the durable log and applied state converge at the next entry"
+        );
+
+        // The state-machine apply accounts for the first durable-write signal;
+        // the remaining fixed cadence signals schedule one observed PASSIVE
+        // checkpoint while the reader still pins its pre-apply WAL cut.
+        for _ in 1..64 {
+            checkpoint_lane.signal();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if diagnostics.snapshot().proactive_checkpoint_busy == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader-pinned PASSIVE checkpoint reports incomplete progress");
+        consensus::release_snapshot_read_sync(&reader).expect("release deferred snapshot reader");
+        for _ in 0..64 {
+            checkpoint_lane.signal();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if diagnostics.snapshot().proactive_checkpoint_completed == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("PASSIVE checkpoint drains after the deferred reader releases");
+
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+            .await
+            .expect("preempted prune resumes and drains after the state-machine apply");
+        let conn = state_machine.core.conn.lock().await;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_log WHERE log_index <= 129",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count resumed fixed prune backlog"),
+            0,
+            "the resumed physical prune drains the durable logical backlog"
+        );
+        drop(conn);
+        lane.shutdown().await;
+        checkpoint_lane.shutdown().await;
     }
 
     #[cfg(target_os = "linux")]
@@ -3218,22 +3790,26 @@ mod tests {
             "the dequeued prune turn reaches its pre-active boundary"
         );
 
-        let mut primary_priority =
-            Some(state_machine.core.request_consensus_log_prune_preemption());
+        let mut primary_priority = Some(
+            state_machine
+                .core
+                .request_consensus_log_prune_preemption()
+                .await,
+        );
         gate.release();
-        let mut append =
-            tokio::spawn(async move { log_store.blocking_append([blank_entry(130)]).await });
-        let appended = tokio::time::timeout(Duration::from_millis(100), &mut append).await;
-        if appended.is_err() {
-            gate.release();
-            drop(primary_priority.take());
-            let _ = tokio::time::timeout(Duration::from_secs(1), append).await;
-            lane.shutdown().await;
-        }
-        appended
-            .expect("primary priority claimed before activation must retain the SQLite deadline")
-            .expect("join pre-active primary adapter append")
-            .expect("pre-active primary adapter append succeeds without SQLITE_BUSY");
+        let conn = state_machine.core.conn.lock().await;
+        consensus::append_logs_with_authority_and_diagnostics_sync(
+            &conn,
+            state_machine.core.storage_identity,
+            state_machine.core.authority_profile,
+            &state_machine.core.expected_members,
+            &state_machine.core.expected_bindings,
+            state_machine.core.fixed_placement_policy,
+            &[blank_entry(130)],
+            state_machine.core.diagnostics.as_deref(),
+        )
+        .expect("pre-active primary writer succeeds without SQLITE_BUSY");
+        drop(conn);
         drop(primary_priority.take());
 
         tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
@@ -3251,6 +3827,54 @@ mod tests {
             "the logical purge remains durable while a pre-active priority claim defers pruning"
         );
         drop(conn);
+        lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_primary_waiting_for_prune_turn_releases_priority() {
+        let directory = tempfile::tempdir().expect("fixed prune cancellation directory");
+        prepare_dormant_fixed_prune_backlog(&directory).await;
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_before_authority_read(
+            directory.path(),
+        );
+        let (_log_store, state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+        assert!(
+            gate.wait_until_entered(Duration::from_secs(1)),
+            "the gated prune turn owns its transaction permit before primary admission"
+        );
+
+        let waiting_lane = Arc::clone(&lane);
+        let waiting_primary = tokio::spawn(async move {
+            let _preemption = waiting_lane.request_primary_preemption().await;
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if lane.primary_writers_for_test() == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiting primary publishes priority before cancellation");
+        waiting_primary.abort();
+        assert!(matches!(waiting_primary.await, Err(error) if error.is_cancelled()));
+        assert_eq!(
+            lane.primary_writers_for_test(),
+            0,
+            "cancelling while awaiting the prune permit releases primary priority"
+        );
+
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+            .await
+            .expect("prune resumes after the cancelled primary releases priority");
         lane.shutdown().await;
     }
 
@@ -4048,6 +4672,14 @@ mod tests {
         let interrupted_install_wal = snapshots.join("install-interrupted.sqlite-wal");
         let interrupted_vacuum = snapshots.join("vacuum-interrupted.sqlite");
         let interrupted_vacuum_wal = snapshots.join("vacuum-interrupted.sqlite-wal");
+        // Model process loss after the dynamic/in-memory builder has created
+        // its descriptor-pinned raw sibling but before its RAII owner can
+        // drop. The sibling and every SQLite sidecar deliberately use the
+        // same strict `vacuum-*.sqlite` staging namespace.
+        let interrupted_dynamic_raw = snapshots.join("vacuum-raw-4242-7.sqlite");
+        let interrupted_dynamic_raw_journal = snapshots.join("vacuum-raw-4242-7.sqlite-journal");
+        let interrupted_dynamic_raw_wal = snapshots.join("vacuum-raw-4242-7.sqlite-wal");
+        let interrupted_dynamic_raw_shm = snapshots.join("vacuum-raw-4242-7.sqlite-shm");
         let orphan_promoted = snapshots.join("snapshot-orphan.opc");
         tokio::fs::write(&cancelled_receive, b"partial authenticated stream")
             .await
@@ -4064,6 +4696,30 @@ mod tests {
         tokio::fs::write(&interrupted_vacuum_wal, b"partial compacted SQLite WAL")
             .await
             .expect("write interrupted vacuum WAL artifact");
+        tokio::fs::write(
+            &interrupted_dynamic_raw,
+            b"interrupted dynamic raw SQLite snapshot",
+        )
+        .await
+        .expect("write interrupted dynamic raw artifact");
+        tokio::fs::write(
+            &interrupted_dynamic_raw_journal,
+            b"interrupted dynamic raw SQLite journal",
+        )
+        .await
+        .expect("write interrupted dynamic raw journal artifact");
+        tokio::fs::write(
+            &interrupted_dynamic_raw_wal,
+            b"interrupted dynamic raw SQLite WAL",
+        )
+        .await
+        .expect("write interrupted dynamic raw WAL artifact");
+        tokio::fs::write(
+            &interrupted_dynamic_raw_shm,
+            b"interrupted dynamic raw SQLite SHM",
+        )
+        .await
+        .expect("write interrupted dynamic raw SHM artifact");
         tokio::fs::write(&orphan_promoted, b"promoted before metadata commit")
             .await
             .expect("write orphan promoted artifact");
@@ -4075,6 +4731,10 @@ mod tests {
         assert!(!interrupted_install_wal.exists());
         assert!(!interrupted_vacuum.exists());
         assert!(!interrupted_vacuum_wal.exists());
+        assert!(!interrupted_dynamic_raw.exists());
+        assert!(!interrupted_dynamic_raw_journal.exists());
+        assert!(!interrupted_dynamic_raw_wal.exists());
+        assert!(!interrupted_dynamic_raw_shm.exists());
         assert!(!orphan_promoted.exists());
         let error = match open(&backend, &snapshots, identity(2), expected_members()).await {
             Ok(_) => panic!("different configuration must fail"),
@@ -4789,7 +5449,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("snapshot cancellation directory");
         let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
             .expect("snapshot cancellation backend");
-        let (_, mut state_machine) = open(
+        let (log_store, mut state_machine) = open(
             &backend,
             directory.path().join("snapshots"),
             identity(1),
@@ -4797,6 +5457,9 @@ mod tests {
         )
         .await
         .expect("snapshot cancellation storage");
+        let shutdown_observer = state_machine
+            .shutdown_observer()
+            .expect("snapshot wrappers share a shutdown observer");
         state_machine
             .apply([initial_membership_entry()])
             .await
@@ -4857,10 +5520,57 @@ mod tests {
             .await
             .expect("subsequent snapshot succeeds after cancellation");
         drop(successful);
+        drop(successful_builder);
         assert_eq!(
             1,
             core.snapshot_observation.snapshot().3,
             "only the returned, durable snapshot advances completion status"
         );
+
+        capture_gate.arm();
+        let mut cancelled_builder = state_machine.get_snapshot_builder().await;
+        let cancelled = tokio::spawn(async move { cancelled_builder.build_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !capture_gate.started() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("final snapshot worker reaches its fixed source cut");
+        cancelled.abort();
+        assert!(cancelled
+            .await
+            .expect_err("final snapshot future is cancelled")
+            .is_cancelled());
+
+        let shutdown_waiter = tokio::spawn({
+            let observer = shutdown_observer.clone();
+            async move { observer.wait().await }
+        });
+        tokio::task::yield_now().await;
+        drop(log_store);
+        drop(state_machine);
+        assert_eq!(
+            shutdown_observer.0.active_owners.load(Ordering::Acquire),
+            1,
+            "the detached WAL reader remains the final SQLite owner"
+        );
+        assert!(
+            !shutdown_waiter.is_finished(),
+            "shutdown must remain pending while detached capture owns SQLite"
+        );
+
+        capture_gate.release();
+        let worker_released = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&core.snapshot_gate).lock_owned(),
+        )
+        .await
+        .expect("final cancelled snapshot worker exits within the bounded window");
+        drop(worker_released);
+        tokio::time::timeout(Duration::from_secs(1), shutdown_waiter)
+            .await
+            .expect("shutdown observes detached snapshot worker exit")
+            .expect("shutdown observer task remains available");
     }
 }

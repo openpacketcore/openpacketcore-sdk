@@ -434,6 +434,9 @@ impl OwnedSessionMutationError {
             StoreError::FencedTransitionStorageExhausted => Self::StoreRejected {
                 code: "fenced-transition-storage-exhausted",
             },
+            StoreError::SessionRecordReserved => Self::StoreRejected {
+                code: "session-record-reserved",
+            },
             StoreError::BackendOperationOutcomeUnavailable => Self::StoreRejected {
                 code: "backend-operation-outcome-unavailable",
             },
@@ -760,6 +763,14 @@ mod tests {
             )
             .code(),
             "fenced-transition-storage-exhausted"
+        );
+    }
+
+    #[test]
+    fn session_record_reservation_has_a_fixed_safe_error_code() {
+        assert_eq!(
+            OwnedSessionMutationError::from_store_error(StoreError::SessionRecordReserved).code(),
+            "session-record-reserved"
         );
     }
 }

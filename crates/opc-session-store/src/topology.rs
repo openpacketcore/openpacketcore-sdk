@@ -17,6 +17,7 @@ use thiserror::Error;
 use crate::capability::SessionStorePlatformProfile;
 use crate::consensus::{SessionConsensusIdentity, SessionConsensusNodeId};
 use crate::consumer::{SessionConsumerRoster, SessionConsumerRosterError, SessionConsumerScope};
+use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
 use crate::readiness::PlacementResiliencePolicy;
 use crate::topology_attestation::{
     verify_topology_attestations, QuorumTopologyAttestor, TopologyAttestationAdmission,
@@ -499,6 +500,25 @@ pub fn derive_fixed_durable_quorum_consensus_identity(
     member_fingerprints: &[[u8; 32]],
     placement_policy: PlacementResiliencePolicy,
 ) -> SessionConsensusIdentity {
+    derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
+        cluster_id,
+        configuration_epoch,
+        member_fingerprints,
+        placement_policy,
+        None,
+    )
+}
+
+/// Derive a fixed durable identity that additionally commits the immutable
+/// roster-attestation root fingerprint. Root rotation changes this identity;
+/// operators must drain live rosters before rotating the root.
+pub fn derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
+    cluster_id: crate::consensus::SessionConsensusClusterId,
+    configuration_epoch: crate::consensus::SessionConsensusConfigurationEpoch,
+    member_fingerprints: &[[u8; 32]],
+    placement_policy: PlacementResiliencePolicy,
+    roster_attestation_trust_root: Option<&RosterAttestationTrustRootV1>,
+) -> SessionConsensusIdentity {
     let mut profile_hasher = Sha256::new();
     profile_hasher.update(FIXED_QUORUM_AUTHORITY_PROFILE_DOMAIN);
     profile_hasher.update([1_u8]);
@@ -515,11 +535,31 @@ pub fn derive_fixed_durable_quorum_consensus_identity(
     let mut authority_components = member_fingerprints.to_vec();
     authority_components.push(profile_binding);
     authority_components.push(policy_binding);
+    if let Some(root) = roster_attestation_trust_root {
+        authority_components.push(root.fingerprint());
+    }
     let configuration_id = opc_consensus::derive_configuration_id(
         cluster_id,
         configuration_epoch,
         &authority_components,
     );
+    SessionConsensusIdentity::new(cluster_id, configuration_id, configuration_epoch)
+}
+
+/// Derive a dynamic quorum identity, optionally binding the immutable roster
+/// trust root. The absence form preserves ordinary non-roster SDK use.
+pub fn derive_durable_quorum_consensus_identity_with_roster_attestation_root(
+    cluster_id: crate::consensus::SessionConsensusClusterId,
+    configuration_epoch: crate::consensus::SessionConsensusConfigurationEpoch,
+    member_fingerprints: &[[u8; 32]],
+    roster_attestation_trust_root: Option<&RosterAttestationTrustRootV1>,
+) -> SessionConsensusIdentity {
+    let mut components = member_fingerprints.to_vec();
+    if let Some(root) = roster_attestation_trust_root {
+        components.push(root.fingerprint());
+    }
+    let configuration_id =
+        opc_consensus::derive_configuration_id(cluster_id, configuration_epoch, &components);
     SessionConsensusIdentity::new(cluster_id, configuration_id, configuration_epoch)
 }
 
@@ -612,6 +652,7 @@ pub struct QuorumTopologyConfig {
     local_replica_id: ReplicaId,
     members: Vec<QuorumReplicaDescriptor>,
     consensus_identity: Option<SessionConsensusIdentity>,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
 }
 
 impl QuorumTopologyConfig {
@@ -629,6 +670,7 @@ impl QuorumTopologyConfig {
             local_replica_id,
             members,
             consensus_identity: None,
+            roster_attestation_trust_root: None,
         }
     }
 
@@ -646,7 +688,32 @@ impl QuorumTopologyConfig {
             local_replica_id,
             members,
             consensus_identity: Some(consensus_identity),
+            roster_attestation_trust_root: None,
         }
+    }
+
+    /// Bind one immutable topology-provisioned roster-attestation root.
+    /// Root rotation changes the configuration identity; drain live rosters
+    /// before replacing this value.
+    #[doc(hidden)]
+    pub fn with_roster_attestation_trust_root(
+        mut self,
+        root: RosterAttestationTrustRootV1,
+    ) -> Self {
+        self.roster_attestation_trust_root = Some(root);
+        self
+    }
+
+    /// Construct a consensus topology whose identity already commits `root`.
+    #[doc(hidden)]
+    pub fn new_consensus_with_roster_attestation_trust_root(
+        local_replica_id: ReplicaId,
+        members: Vec<QuorumReplicaDescriptor>,
+        consensus_identity: SessionConsensusIdentity,
+        root: RosterAttestationTrustRootV1,
+    ) -> Self {
+        Self::new_consensus(local_replica_id, members, consensus_identity)
+            .with_roster_attestation_trust_root(root)
     }
 }
 
@@ -764,6 +831,7 @@ pub struct ValidatedQuorumTopology {
     summary: QuorumTopologySummary,
     members: Vec<QuorumReplicaDescriptor>,
     consensus_identity: Option<SessionConsensusIdentity>,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
     consensus_node_ids: BTreeMap<ReplicaId, SessionConsensusNodeId>,
 }
 
@@ -793,6 +861,7 @@ impl ValidatedQuorumTopology {
             config.members,
             QuorumTopologyMode::AttestedHa,
             config.consensus_identity,
+            config.roster_attestation_trust_root,
             false,
             None,
         )?;
@@ -832,11 +901,29 @@ impl ValidatedQuorumTopology {
         members: Vec<QuorumReplicaDescriptor>,
         consensus_identity: SessionConsensusIdentity,
     ) -> Result<Self, QuorumTopologyError> {
+        Self::try_new_consensus_lab_singleton_with_roster_attestation_trust_root(
+            local_replica_id,
+            members,
+            consensus_identity,
+            None,
+        )
+    }
+
+    /// Root-aware counterpart to [`Self::try_new_consensus_lab_singleton`].
+    /// The root is configuration identity material, not a consensus capability.
+    #[doc(hidden)]
+    pub fn try_new_consensus_lab_singleton_with_roster_attestation_trust_root(
+        local_replica_id: ReplicaId,
+        members: Vec<QuorumReplicaDescriptor>,
+        consensus_identity: SessionConsensusIdentity,
+        roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
+    ) -> Result<Self, QuorumTopologyError> {
         validate_topology(
             local_replica_id,
             members,
             QuorumTopologyMode::LabSingleton,
             Some(consensus_identity),
+            roster_attestation_trust_root,
             false,
             None,
         )
@@ -874,6 +961,7 @@ impl ValidatedQuorumTopology {
             config.members,
             QuorumTopologyMode::FixedDurableQuorum,
             config.consensus_identity,
+            config.roster_attestation_trust_root,
             matches!(
                 placement_policy,
                 PlacementResiliencePolicy::AllowReducedResilience
@@ -951,6 +1039,14 @@ impl ValidatedQuorumTopology {
         self.consensus_identity
     }
 
+    /// The immutable topology root used to authenticate roster Executor and
+    /// TransportIngress leaves. `None` preserves ordinary non-roster SDK use;
+    /// roster admission and terminalization fail closed without it.
+    #[doc(hidden)]
+    pub fn roster_attestation_trust_root(&self) -> Option<&RosterAttestationTrustRootV1> {
+        self.roster_attestation_trust_root.as_ref()
+    }
+
     /// Stable cluster-scoped Openraft node ID for one admitted logical member.
     pub fn consensus_node_id(&self, replica_id: &ReplicaId) -> Option<SessionConsensusNodeId> {
         self.consensus_node_ids.get(replica_id).copied()
@@ -985,10 +1081,13 @@ impl ValidatedQuorumTopology {
                 .expect("validated topology retains every member node ID");
             (node_id.get(), descriptor.clone())
         });
-        SessionConsumerRoster::try_new(
+        SessionConsumerRoster::try_new_with_roster_attestation_root_identity(
             SessionConsumerScope::new(identity),
             &expected_members,
             descriptors,
+            self.roster_attestation_trust_root
+                .as_ref()
+                .map(RosterAttestationTrustRootV1::identity),
         )
     }
 }
@@ -1002,6 +1101,7 @@ impl TryFrom<QuorumTopologyConfig> for ValidatedQuorumTopology {
             config.members,
             QuorumTopologyMode::ValidatedHa,
             config.consensus_identity,
+            config.roster_attestation_trust_root,
             false,
             None,
         )
@@ -1013,6 +1113,7 @@ fn validate_topology(
     members: Vec<QuorumReplicaDescriptor>,
     mode: QuorumTopologyMode,
     consensus_identity: Option<SessionConsensusIdentity>,
+    roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
     allow_correlated_failure_domains: bool,
     fixed_durable_placement_policy: Option<PlacementResiliencePolicy>,
 ) -> Result<ValidatedQuorumTopology, QuorumTopologyError> {
@@ -1093,21 +1194,19 @@ fn validate_topology(
             .collect::<Vec<_>>();
         let expected_identity = match (mode, fixed_durable_placement_policy) {
             (QuorumTopologyMode::FixedDurableQuorum, Some(placement_policy)) => {
-                derive_fixed_durable_quorum_consensus_identity(
+                derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
                     identity.cluster_id(),
                     identity.configuration_epoch(),
                     &component_fingerprints,
                     placement_policy,
+                    roster_attestation_trust_root.as_ref(),
                 )
             }
-            _ => SessionConsensusIdentity::new(
+            _ => derive_durable_quorum_consensus_identity_with_roster_attestation_root(
                 identity.cluster_id(),
-                opc_consensus::derive_configuration_id(
-                    identity.cluster_id(),
-                    identity.configuration_epoch(),
-                    &component_fingerprints,
-                ),
                 identity.configuration_epoch(),
+                &component_fingerprints,
+                roster_attestation_trust_root.as_ref(),
             ),
         };
         if identity != expected_identity {
@@ -1150,6 +1249,181 @@ fn validate_topology(
         },
         members,
         consensus_identity,
+        roster_attestation_trust_root,
         consensus_node_ids,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::{SessionConsensusClusterId, SessionConsensusConfigurationEpoch};
+
+    const P256_GENERATOR_COMPRESSED: [u8; 33] = [
+        0x03, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
+        0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8,
+        0x98, 0xc2, 0x96,
+    ];
+
+    fn roster_root(seed: u8) -> RosterAttestationTrustRootV1 {
+        RosterAttestationTrustRootV1::new([seed; 32], P256_GENERATOR_COMPRESSED)
+            .expect("valid fixed test root")
+    }
+
+    fn test_members() -> (ReplicaId, Vec<QuorumReplicaDescriptor>) {
+        let local = ReplicaId::new("topology-root-a").expect("local replica ID");
+        let members = [("a", 4101), ("b", 4102), ("c", 4103)]
+            .into_iter()
+            .map(|(suffix, port)| {
+                QuorumReplicaDescriptor::new(
+                    ReplicaId::new(format!("topology-root-{suffix}")).expect("replica ID"),
+                    ReplicaEndpoint::new(format!("{suffix}.example.test"), port).expect("endpoint"),
+                    ReplicaTlsIdentity::new(format!("spiffe://example.test/{suffix}"))
+                        .expect("TLS identity"),
+                    ReplicaFailureDomain::new(format!("failure-domain-{suffix}"))
+                        .expect("failure domain"),
+                    ReplicaBackingIdentity::new(format!("backing-{suffix}"))
+                        .expect("backing identity"),
+                )
+            })
+            .collect();
+        (local, members)
+    }
+
+    fn test_scope() -> (
+        SessionConsensusClusterId,
+        SessionConsensusConfigurationEpoch,
+    ) {
+        (
+            SessionConsensusClusterId::new("topology-roster-root-tests").expect("cluster ID"),
+            SessionConsensusConfigurationEpoch::new(1).expect("configuration epoch"),
+        )
+    }
+
+    #[test]
+    fn roster_root_binds_dynamic_identity_and_topology_getter() {
+        let first_root = roster_root(0x31);
+        let second_root = roster_root(0x32);
+        let (local, members) = test_members();
+        let fingerprints = members
+            .iter()
+            .map(QuorumReplicaDescriptor::configuration_fingerprint)
+            .collect::<Vec<_>>();
+        let (cluster, epoch) = test_scope();
+        let first_identity = derive_durable_quorum_consensus_identity_with_roster_attestation_root(
+            cluster,
+            epoch,
+            &fingerprints,
+            Some(&first_root),
+        );
+        let second_identity = derive_durable_quorum_consensus_identity_with_roster_attestation_root(
+            cluster,
+            epoch,
+            &fingerprints,
+            Some(&second_root),
+        );
+        assert_ne!(first_identity, second_identity);
+
+        let topology = ValidatedQuorumTopology::try_from(
+            QuorumTopologyConfig::new_consensus_with_roster_attestation_trust_root(
+                local.clone(),
+                members.clone(),
+                first_identity,
+                first_root.clone(),
+            ),
+        )
+        .expect("root-bound topology");
+        assert!(topology
+            .roster_attestation_trust_root()
+            .is_some_and(|root| root.identity() == first_root.identity()));
+
+        assert!(matches!(
+            ValidatedQuorumTopology::try_from(
+                QuorumTopologyConfig::new_consensus_with_roster_attestation_trust_root(
+                    local,
+                    members,
+                    first_identity,
+                    second_root,
+                ),
+            ),
+            Err(QuorumTopologyError::ConsensusConfigurationIdMismatch)
+        ));
+    }
+
+    #[test]
+    fn rootless_topology_preserves_legacy_dynamic_identity() {
+        let (local, members) = test_members();
+        let fingerprints = members
+            .iter()
+            .map(QuorumReplicaDescriptor::configuration_fingerprint)
+            .collect::<Vec<_>>();
+        let (cluster, epoch) = test_scope();
+        let legacy_identity = SessionConsensusIdentity::new(
+            cluster,
+            opc_consensus::derive_configuration_id(cluster, epoch, &fingerprints),
+            epoch,
+        );
+        let rootless_identity =
+            derive_durable_quorum_consensus_identity_with_roster_attestation_root(
+                cluster,
+                epoch,
+                &fingerprints,
+                None,
+            );
+        assert_eq!(legacy_identity, rootless_identity);
+
+        let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+            local,
+            members,
+            legacy_identity,
+        ))
+        .expect("rootless topology remains valid");
+        assert!(topology.roster_attestation_trust_root().is_none());
+        assert_eq!(topology.consensus_identity(), Some(legacy_identity));
+    }
+
+    #[test]
+    fn fixed_identity_also_diverges_for_different_roots() {
+        let first_root = roster_root(0x41);
+        let second_root = roster_root(0x42);
+        let (_, members) = test_members();
+        let fingerprints = members
+            .iter()
+            .map(QuorumReplicaDescriptor::configuration_fingerprint)
+            .collect::<Vec<_>>();
+        let (cluster, epoch) = test_scope();
+        let placement_policy = PlacementResiliencePolicy::RequireIndependentFailureDomains;
+
+        let first = derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
+            cluster,
+            epoch,
+            &fingerprints,
+            placement_policy,
+            Some(&first_root),
+        );
+        let second = derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
+            cluster,
+            epoch,
+            &fingerprints,
+            placement_policy,
+            Some(&second_root),
+        );
+        assert_ne!(first, second);
+
+        let rootless = derive_fixed_durable_quorum_consensus_identity(
+            cluster,
+            epoch,
+            &fingerprints,
+            placement_policy,
+        );
+        let explicit_none =
+            derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
+                cluster,
+                epoch,
+                &fingerprints,
+                placement_policy,
+                None,
+            );
+        assert_eq!(rootless, explicit_none);
+    }
 }

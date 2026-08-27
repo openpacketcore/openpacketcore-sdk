@@ -3653,6 +3653,7 @@ name = "opc-session-net"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "opc-consensus",
@@ -3663,6 +3664,8 @@ dependencies = [
  "opc-session-store",
  "opc-tls",
  "opc-types",
+ "p256 0.14.0",
+ "postcard",
  "rand 0.10.2",
  "rcgen",
  "rustls-pki-types",
@@ -3698,6 +3701,7 @@ dependencies = [
  "opc-redaction",
  "opc-sqlite-file-control-sys",
  "opc-types",
+ "p256 0.14.0",
  "postcard",
  "proptest",
  "rand 0.10.2",

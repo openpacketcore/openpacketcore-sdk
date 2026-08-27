@@ -428,6 +428,72 @@ struct RejectFencedTransitionV2CapabilityProbeHandler {
     inner: Arc<dyn SessionConsensusRpcHandler>,
 }
 
+/// Test-only shape of the immutable protected-roster profile probe.
+#[derive(Deserialize)]
+struct ProtectedRosterProfileCapabilityProbe {
+    domain: [u8; 8],
+    schema_version: u16,
+    profile_digest: [u8; 32],
+}
+
+/// Wire-identical test shape for the private profile-capability reply.
+#[derive(Serialize)]
+#[allow(dead_code)]
+struct ProtectedRosterProfileCapabilityReply {
+    domain: [u8; 8],
+    schema_version: u16,
+    outcome: ProtectedRosterProfileCapabilityOutcome,
+}
+
+#[derive(Serialize)]
+#[allow(dead_code)]
+enum ProtectedRosterProfileCapabilityOutcome {
+    Supported { profile_digest: [u8; 32] },
+    Unsupported,
+}
+
+struct MismatchedProtectedRosterProfileCapabilityProbeHandler {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+}
+
+impl fmt::Debug for MismatchedProtectedRosterProfileCapabilityProbeHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MismatchedProtectedRosterProfileCapabilityProbeHandler(<redacted>)")
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for MismatchedProtectedRosterProfileCapabilityProbeHandler {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if request.family == SessionConsensusRpcFamily::ReadBarrier
+            && matches!(
+                decode_bounded::<ProtectedRosterProfileCapabilityProbe>(&request.payload),
+                Ok(ProtectedRosterProfileCapabilityProbe {
+                    domain: _domain,
+                    schema_version: _schema_version,
+                    profile_digest: _profile_digest,
+                })
+            )
+        {
+            return SessionConsensusWireResponse {
+                result: Ok(encode_bounded(&ProtectedRosterProfileCapabilityReply {
+                    domain: *b"opc-rr-1",
+                    schema_version: 1,
+                    outcome: ProtectedRosterProfileCapabilityOutcome::Supported {
+                        profile_digest: [0xa7; 32],
+                    },
+                })
+                .expect("bounded mismatched protected-roster profile reply")),
+            };
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
+
 impl fmt::Debug for RejectFencedTransitionV2CapabilityProbeHandler {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RejectFencedTransitionV2CapabilityProbeHandler(<redacted>)")
@@ -1142,6 +1208,17 @@ impl TestCluster {
             .install(Arc::new(RejectFencedTransitionV2CapabilityProbeHandler {
                 inner: self.stores[target].rpc_handler(),
             }));
+    }
+
+    fn mismatch_protected_roster_profile_capability_probe(&self, source: usize, target: usize) {
+        self.paths
+            .get(&(source, target))
+            .expect("outbound path")
+            .install(Arc::new(
+                MismatchedProtectedRosterProfileCapabilityProbeHandler {
+                    inner: self.stores[target].rpc_handler(),
+                },
+            ));
     }
 
     fn restore_current_rpc_handler(&self, source: usize, target: usize) {
@@ -4670,6 +4747,116 @@ async fn state_voter_activation_treats_an_unavailable_exact_probe_as_transient()
     cluster
         .paths
         .get(&(leader, unavailable_peer))
+        .expect("leader outbound peer path")
+        .set_enabled(true);
+}
+
+#[tokio::test]
+async fn protected_roster_profile_activation_requires_three_exact_voters_and_reuses_certificate() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let before = cluster.stores[leader]
+        .status()
+        .last_log_index
+        .expect("formed cluster has a durable log head");
+
+    cluster.stores[leader]
+        .activate_protected_roster_profile()
+        .await
+        .expect("all three exact current voters activate the immutable protected-roster profile");
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("all current voters apply the protected-roster profile certificate");
+    for voter in &cluster.stores {
+        assert_eq!(
+            voter.status().last_log_index,
+            Some(before + 1),
+            "the unanimous exact profile appends one reusable cluster-scope certificate"
+        );
+        assert_eq!(
+            voter.status().applied_index,
+            Some(before + 1),
+            "every current voter applies the exact protected-roster profile certificate"
+        );
+    }
+
+    cluster.stores[leader]
+        .activate_protected_roster_profile()
+        .await
+        .expect("the durable exact profile certificate is reusable");
+    assert!(
+        cluster
+            .stores
+            .iter()
+            .all(|voter| voter.status().last_log_index == Some(before + 1)),
+        "reusing the durable exact profile certificate does not append another activation"
+    );
+}
+
+#[tokio::test]
+async fn protected_roster_profile_activation_rejects_mismatched_current_voter_without_certificate()
+{
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let mismatched_voter = (leader + 1) % MEMBER_COUNT;
+    let before = cluster.stores[leader]
+        .status()
+        .last_log_index
+        .expect("formed cluster has a durable log head");
+
+    // This remains a live authenticated current voter and preserves ordinary
+    // Raft traffic. It only advertises a different immutable roster profile,
+    // which must not count toward the exact all-voter activation proof.
+    cluster.mismatch_protected_roster_profile_capability_probe(leader, mismatched_voter);
+    assert!(
+        matches!(
+            cluster.stores[leader]
+                .activate_protected_roster_profile()
+                .await,
+            Err(StoreError::CapabilityNotSupported(capability))
+                if capability == "atomic_fenced_transition_v1"
+        ),
+        "one mismatched current voter fails protected-roster profile activation closed"
+    );
+    assert!(
+        cluster
+            .stores
+            .iter()
+            .all(|voter| voter.status().last_log_index == Some(before)),
+        "a failed exact profile proof creates no protected-roster profile certificate"
+    );
+    cluster.restore_current_rpc_handler(leader, mismatched_voter);
+}
+
+#[tokio::test]
+async fn protected_roster_profile_activation_requires_every_voter_to_be_available() {
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let unavailable_voter = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[leader];
+    let before = store
+        .status()
+        .last_log_index
+        .expect("formed cluster has a durable log head");
+
+    cluster
+        .paths
+        .get(&(leader, unavailable_voter))
+        .expect("leader outbound peer path")
+        .set_enabled(false);
+    assert!(matches!(
+        store.activate_protected_roster_profile().await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(
+        store.status().last_log_index,
+        Some(before),
+        "an unavailable exact voter cannot be omitted from the immutable profile proof",
+    );
+    cluster
+        .paths
+        .get(&(leader, unavailable_voter))
         .expect("leader outbound peer path")
         .set_enabled(true);
 }

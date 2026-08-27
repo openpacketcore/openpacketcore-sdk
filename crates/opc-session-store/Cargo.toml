@@ -43,6 +43,7 @@ uuid = { workspace = true }
 time = { workspace = true, features = ["serde"] }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
 sha2-zeroize = { workspace = true }
 hmac = { workspace = true }
 subtle = { workspace = true }
