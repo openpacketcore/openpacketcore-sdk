@@ -2127,7 +2127,7 @@ impl ConsensusLogPruneLane {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn primary_writers_for_test(&self) -> usize {
         self.primary_writers.load(Ordering::Acquire)
     }
