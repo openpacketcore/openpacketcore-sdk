@@ -162,8 +162,9 @@ commitment, expected version and generation, authenticated scope/key/owner,
 current fence and credential, and half-open lease window.
 
 A provider response is only an observation.
-`FencedMutationRosterProviderCallOutcome::conclusive` accepts exactly four
-truth-table rows:
+`FencedMutationRosterProviderCallOutcome::conclusive_receipt` accepts a signed
+provider receipt whose typed outcome must be one of exactly four truth-table
+rows:
 
 | Disposition | Adoption | Terminal direction |
 | --- | --- | --- |
