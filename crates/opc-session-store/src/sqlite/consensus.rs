@@ -1993,6 +1993,14 @@ impl ConsensusLogPruneTurnGateForTest {
         self.gate.progress_preempted()
     }
 
+    pub(crate) fn preemption_requested(&self) -> bool {
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .preempted
+    }
+
     pub(crate) fn progress_steps_seen(&self) -> usize {
         self.gate.progress_steps_seen()
     }
@@ -2018,10 +2026,12 @@ impl Drop for ConsensusLogPruneTurnGateForTest {
 #[derive(Default)]
 pub(crate) struct ConsensusLogPrunePrimaryPreemption {
     primary_writers: Option<Arc<AtomicUsize>>,
+    turn_ownership: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl Drop for ConsensusLogPrunePrimaryPreemption {
     fn drop(&mut self) {
+        drop(self.turn_ownership.take());
         if let Some(primary_writers) = self.primary_writers.take() {
             primary_writers.fetch_sub(1, Ordering::AcqRel);
         }
@@ -2035,6 +2045,11 @@ pub(crate) struct ConsensusLogPruneLane {
     sender: tokio::sync::mpsc::Sender<()>,
     stop: tokio::sync::watch::Sender<bool>,
     stopping: AtomicBool,
+    /// One writer turn owns this from its pre-publication recheck through its
+    /// SQLite transaction rollback or commit. Primary writers hold an owned
+    /// permit through their transaction; the prune lane only try-acquires it
+    /// so it can never queue ahead of a primary writer.
+    turn_ownership: Arc<tokio::sync::Mutex<()>>,
     active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
@@ -2075,6 +2090,7 @@ impl ConsensusLogPruneLane {
             sender,
             stop,
             stopping: AtomicBool::new(false),
+            turn_ownership: Arc::new(tokio::sync::Mutex::new(())),
             active_interrupt: Mutex::new(None),
             worker: tokio::sync::Mutex::new(None),
             diagnostics,
@@ -2111,26 +2127,36 @@ impl ConsensusLogPruneLane {
         }
     }
 
-    pub(crate) fn request_primary_preemption(&self) -> ConsensusLogPrunePrimaryPreemption {
-        if self.stopping.load(Ordering::Acquire) {
-            return ConsensusLogPrunePrimaryPreemption::default();
-        }
+    #[cfg(test)]
+    pub(crate) fn primary_writers_for_test(&self) -> usize {
+        self.primary_writers.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn request_primary_preemption(&self) -> ConsensusLogPrunePrimaryPreemption {
         let primary_writers = Arc::clone(&self.primary_writers);
         primary_writers.fetch_add(1, Ordering::AcqRel);
+        let mut preemption = ConsensusLogPrunePrimaryPreemption {
+            primary_writers: Some(primary_writers),
+            turn_ownership: None,
+        };
         let active_interrupt = self
             .active_interrupt
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(interrupt) = active_interrupt.as_ref() {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(interrupt) = active_interrupt {
             #[cfg(all(test, target_os = "linux"))]
             if let Some(gate) = &self.turn_gate {
                 gate.notify_preemption();
             }
             interrupt.interrupt();
         }
-        ConsensusLogPrunePrimaryPreemption {
-            primary_writers: Some(primary_writers),
-        }
+        // This local permit acknowledges that an interrupted prune turn has
+        // returned its SQLite transaction. It intentionally has no timeout:
+        // the primary connection's existing 100ms SQLite busy timeout remains
+        // reserved for real external SQLite contention, not scheduler delay.
+        preemption.turn_ownership = Some(Arc::clone(&self.turn_ownership).lock_owned().await);
+        preemption
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -2200,6 +2226,39 @@ async fn run_consensus_log_prune_lane(
             lane.signal();
             continue;
         }
+        // Never queue the low-priority lane behind a primary writer. It must
+        // acquire before publishing an interrupt handle, then recheck primary
+        // priority while synchronized with primary interruption publication.
+        let turn_ownership = match lane.turn_ownership.try_lock() {
+            Ok(turn_ownership) => turn_ownership,
+            Err(_) => {
+                if !wait_consensus_log_prune_pacing(&mut stop, &lane).await {
+                    return;
+                }
+                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                    return;
+                }
+                lane.signal();
+                continue;
+            }
+        };
+        if lane.stopping.load(Ordering::Acquire)
+            || *stop.borrow()
+            || lane.primary_writers.load(Ordering::Acquire) != 0
+        {
+            drop(turn_ownership);
+            if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                return;
+            }
+            if !wait_consensus_log_prune_pacing(&mut stop, &lane).await {
+                return;
+            }
+            if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                return;
+            }
+            lane.signal();
+            continue;
+        }
         let interrupt = Arc::new(connection.get_interrupt_handle());
         let primary_writer_waiting = {
             let mut active_interrupt = lane
@@ -2215,6 +2274,7 @@ async fn run_consensus_log_prune_lane(
             }
         };
         if primary_writer_waiting {
+            drop(turn_ownership);
             if !wait_consensus_log_prune_pacing(&mut stop, &lane).await {
                 return;
             }
@@ -2229,6 +2289,7 @@ async fn run_consensus_log_prune_lane(
                 .active_interrupt
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            drop(turn_ownership);
             return;
         }
         if let Some(diagnostics) = &lane.diagnostics {
@@ -2279,6 +2340,9 @@ async fn run_consensus_log_prune_lane(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *active_interrupt = None;
         }
+        // The transaction has returned its connection (and therefore rolled
+        // back or committed) before a primary can pass the handoff barrier.
+        drop(turn_ownership);
         match turn {
             Ok((returned, Ok(completion))) => {
                 connection = returned;
@@ -3199,11 +3263,11 @@ impl SqliteConsensusCore {
 
     /// Keep this core's low-priority physical-prune lane yielded for the
     /// lifetime of one primary consensus write.
-    pub(crate) fn request_consensus_log_prune_preemption(
+    pub(crate) async fn request_consensus_log_prune_preemption(
         &self,
     ) -> ConsensusLogPrunePrimaryPreemption {
         if let Some(lane) = &self.consensus_log_prune_lane {
-            lane.request_primary_preemption()
+            lane.request_primary_preemption().await
         } else {
             ConsensusLogPrunePrimaryPreemption::default()
         }
@@ -31235,8 +31299,18 @@ mod tests {
             "the real lane is parked after its final explicit check with no VDBE active"
         );
 
-        let primary_guard = lane.request_primary_preemption();
+        let primary_lane = Arc::clone(&lane);
+        let primary_guard =
+            tokio::spawn(async move { primary_lane.request_primary_preemption().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.preemption_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("primary priority interrupts the gated prune turn before handoff");
         gate.release();
+        let primary_guard = primary_guard.await.expect("join primary prune handoff");
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if diagnostics.snapshot().consensus_log_prune_busy_retries == 1 {

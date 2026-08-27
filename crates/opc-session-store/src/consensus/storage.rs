@@ -1023,8 +1023,8 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         vote: &Vote<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::save_vote_with_authority_sync(
                 &conn,
@@ -1063,8 +1063,8 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         committed: Option<LogId<SessionConsensusNodeId>>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::save_committed_with_authority_sync(
                 &conn,
@@ -1110,8 +1110,8 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
     {
         let entries: Vec<_> = entries.into_iter().collect();
         let has_entries = !entries.is_empty();
+        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::append_logs_with_authority_and_diagnostics_sync(
                 &conn,
@@ -1144,8 +1144,8 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         &mut self,
         log_id: LogId<SessionConsensusNodeId>,
     ) -> Result<(), StorageError<SessionConsensusNodeId>> {
+        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             consensus::truncate_logs_with_authority_sync(
                 &conn,
@@ -1171,8 +1171,8 @@ impl RaftLogStorage<SessionRaftTypeConfig> for SqliteConsensusLogStore {
         wait_until_applied(&self.core, &log_id)
             .await
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
+        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let result = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
             let conn = self.core.conn.lock().await;
             if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable
                 && self.core.consensus_log_prune_lane().is_none()
@@ -1282,7 +1282,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             } else {
                 None
             };
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
             let conn = self.core.conn.lock().await;
             let applied = consensus::apply_entries_with_authority_and_diagnostics_sync(
                 &conn,
@@ -1491,7 +1491,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             } else {
                 None
             };
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
             let conn = self.core.conn.lock().await;
             let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
                 .map_err(|error| {
@@ -2088,7 +2088,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             };
         let _snapshot_guard = snapshot_guard;
         let previous = {
-            let _prune_preemption = self.core.request_consensus_log_prune_preemption();
+            let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
             let conn = self.core.conn.lock().await;
             let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
                 .map_err(|error| {
@@ -3445,7 +3445,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    async fn prepare_fixed_prune_backlog(
+    async fn append_apply_fixed_prune_backlog(
         log_store: &mut SqliteConsensusLogStore,
         state_machine: &mut SqliteConsensusStateMachine,
     ) {
@@ -3460,6 +3460,14 @@ mod tests {
             .apply(entries)
             .await
             .expect("apply fixed prune backlog through the storage adapter");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn prepare_fixed_prune_backlog(
+        log_store: &mut SqliteConsensusLogStore,
+        state_machine: &mut SqliteConsensusStateMachine,
+    ) {
+        append_apply_fixed_prune_backlog(log_store, state_machine).await;
         log_store
             .purge(log_id(129))
             .await
@@ -3467,33 +3475,53 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fixed_prune_yields_writer_to_later_adapter_append_and_resumes() {
-        let directory = tempfile::tempdir().expect("fixed prune priority directory");
-        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
-            directory.path(),
-        );
-        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+    async fn prepare_dormant_fixed_prune_backlog(directory: &tempfile::TempDir) {
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(directory).await;
         let lane = state_machine
             .core
             .consensus_log_prune_lane()
             .expect("fixed store installs one physical prune lane");
-        prepare_fixed_prune_backlog(&mut log_store, &mut state_machine).await;
+        append_apply_fixed_prune_backlog(&mut log_store, &mut state_machine).await;
+        lane.shutdown().await;
+        log_store
+            .purge(log_id(129))
+            .await
+            .expect("durably record a dormant fixed logical purge floor");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_prune_yields_writer_to_later_adapter_append_and_resumes() {
+        let directory = tempfile::tempdir().expect("fixed prune priority directory");
+        prepare_dormant_fixed_prune_backlog(&directory).await;
+        // The gate is captured when the reopened lane starts. Its startup turn
+        // now has eligible physical work, so this one-shot gate cannot be
+        // consumed by an earlier empty turn.
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
+            directory.path(),
+        );
+        let (mut log_store, state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
         assert!(
             gate.wait_until_entered(Duration::from_secs(1)),
             "the prune turn owns SQLite's writer before the primary adapter append arrives"
         );
 
-        let mut append =
+        let append =
             tokio::spawn(async move { log_store.blocking_append([blank_entry(130)]).await });
-        let appended = tokio::time::timeout(Duration::from_millis(100), &mut append).await;
-        if appended.is_err() {
-            gate.release();
-            let _ = tokio::time::timeout(Duration::from_secs(1), append).await;
-            lane.shutdown().await;
-        }
-        appended
-            .expect("later primary append must not exhaust its existing SQLite busy deadline")
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.preemption_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later primary append publishes deterministic prune preemption");
+        tokio::time::timeout(Duration::from_secs(1), append)
+            .await
+            .expect("preempted prune returns its local writer turn")
             .expect("join later primary adapter append")
             .expect("later primary adapter append succeeds without SQLITE_BUSY");
 
@@ -3533,22 +3561,26 @@ mod tests {
             "the dequeued prune turn reaches its pre-active boundary"
         );
 
-        let mut primary_priority =
-            Some(state_machine.core.request_consensus_log_prune_preemption());
+        let mut primary_priority = Some(
+            state_machine
+                .core
+                .request_consensus_log_prune_preemption()
+                .await,
+        );
         gate.release();
-        let mut append =
-            tokio::spawn(async move { log_store.blocking_append([blank_entry(130)]).await });
-        let appended = tokio::time::timeout(Duration::from_millis(100), &mut append).await;
-        if appended.is_err() {
-            gate.release();
-            drop(primary_priority.take());
-            let _ = tokio::time::timeout(Duration::from_secs(1), append).await;
-            lane.shutdown().await;
-        }
-        appended
-            .expect("primary priority claimed before activation must retain the SQLite deadline")
-            .expect("join pre-active primary adapter append")
-            .expect("pre-active primary adapter append succeeds without SQLITE_BUSY");
+        let conn = state_machine.core.conn.lock().await;
+        consensus::append_logs_with_authority_and_diagnostics_sync(
+            &conn,
+            state_machine.core.storage_identity,
+            state_machine.core.authority_profile,
+            &state_machine.core.expected_members,
+            &state_machine.core.expected_bindings,
+            state_machine.core.fixed_placement_policy,
+            &[blank_entry(130)],
+            state_machine.core.diagnostics.as_deref(),
+        )
+        .expect("pre-active primary writer succeeds without SQLITE_BUSY");
+        drop(conn);
         drop(primary_priority.take());
 
         tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
@@ -3566,6 +3598,54 @@ mod tests {
             "the logical purge remains durable while a pre-active priority claim defers pruning"
         );
         drop(conn);
+        lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_primary_waiting_for_prune_turn_releases_priority() {
+        let directory = tempfile::tempdir().expect("fixed prune cancellation directory");
+        prepare_dormant_fixed_prune_backlog(&directory).await;
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_before_authority_read(
+            directory.path(),
+        );
+        let (_log_store, state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+        assert!(
+            gate.wait_until_entered(Duration::from_secs(1)),
+            "the gated prune turn owns its transaction permit before primary admission"
+        );
+
+        let waiting_lane = Arc::clone(&lane);
+        let waiting_primary = tokio::spawn(async move {
+            let _preemption = waiting_lane.request_primary_preemption().await;
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if lane.primary_writers_for_test() == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiting primary publishes priority before cancellation");
+        waiting_primary.abort();
+        assert!(matches!(waiting_primary.await, Err(error) if error.is_cancelled()));
+        assert_eq!(
+            lane.primary_writers_for_test(),
+            0,
+            "cancelling while awaiting the prune permit releases primary priority"
+        );
+
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+            .await
+            .expect("prune resumes after the cancelled primary releases priority");
         lane.shutdown().await;
     }
 
