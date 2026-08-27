@@ -928,6 +928,26 @@ impl ThreeVoterConsumerFleet {
     /// progress. A recovering third voter may legitimately lag the leader
     /// election across compaction, so this intentionally does not require
     /// all three status observations to converge.
+    #[cfg(feature = "test-control")]
+    fn process_loss_durable_progress_diagnostic_for_test(&self) -> (bool, String) {
+        let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+            let progress = consensus_local_durable_progress_for_test(&self.stores[index]);
+            (
+                progress.engine_state,
+                progress.storage_error_subject,
+                progress.storage_error_verb,
+                progress.last_log_index,
+                progress.applied_index,
+                progress.snapshot_index,
+                progress.purged_index,
+            )
+        });
+        let engines_running = durable_progress
+            .iter()
+            .all(|progress| progress.0 == ConsensusEngineStateForTest::Running);
+        (engines_running, format!("{durable_progress:?}"))
+    }
+
     async fn wait_for_admitted_quorum_leader(
         &self,
         eligible_voters: &[usize],
@@ -984,20 +1004,25 @@ impl ThreeVoterConsumerFleet {
         if let Ok(observed) = observed {
             return observed;
         }
-        let redacted = eligible_voters
-            .iter()
-            .map(|index| {
-                let status = self.stores[*index].status();
-                (
-                    *index,
-                    status.term,
-                    status.leader_id.is_some(),
-                    status.admitted,
-                    status.applied_index,
-                    status.last_log_index,
-                )
-            })
-            .collect::<Vec<_>>();
+        let redacted = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+            let status = self.stores[index].status();
+            (
+                status.term,
+                status.leader_id.is_some(),
+                status.admitted,
+                status.applied_index,
+                status.last_log_index,
+            )
+        });
+        #[cfg(feature = "test-control")]
+        {
+            let (_, durable_progress) = self.process_loss_durable_progress_diagnostic_for_test();
+            eprintln!(
+                "admitted-quorum leader wait timed out; redacted_status={redacted:?}; durable_progress={durable_progress}"
+            );
+        }
+        #[cfg(not(feature = "test-control"))]
+        eprintln!("admitted-quorum leader wait timed out; redacted_status={redacted:?}");
         panic!(
             "an admitted quorum elects a self-reporting leader at or above term {minimum_term}; redacted_status={redacted:?}"
         )
@@ -10805,6 +10830,13 @@ async fn compact_protected_roster_process_loss_admission(
                 Err(StoreError::BackendUnavailable(_))
                     if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
                 {
+                    let (engines_running, durable_progress) =
+                        fleet.process_loss_durable_progress_diagnostic_for_test();
+                    if !engines_running {
+                        panic!(
+                            "process-loss snapshot maintenance retry fails closed because a voter engine stopped; durable_progress={durable_progress}"
+                        );
+                    }
                     maintenance_rejections += 1;
                     (workload_leader, _, workload_term) = fleet
                         .wait_for_admitted_quorum_leader(&[0, 1, 2], workload_term)

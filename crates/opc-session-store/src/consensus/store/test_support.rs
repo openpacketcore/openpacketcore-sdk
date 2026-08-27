@@ -130,12 +130,158 @@ pub enum ConsensusEngineStateForTest {
     Stopped,
 }
 
+/// Fixed test-only classification of the Openraft storage-error subject.
+///
+/// This contains category names only. Log identifiers, snapshot signatures,
+/// and every other subject payload are deliberately discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusStorageErrorSubjectForTest {
+    /// Whole-store operation.
+    Store,
+    /// Vote state.
+    Vote,
+    /// Log collection.
+    Logs,
+    /// One log entry.
+    Log,
+    /// One log index.
+    LogIndex,
+    /// State-machine application of one log.
+    Apply,
+    /// State-machine operation.
+    StateMachine,
+    /// Snapshot operation.
+    Snapshot,
+    /// Upstream supplied no subject.
+    None,
+    /// Future or unrecognized upstream subject.
+    Other,
+}
+
+/// Fixed test-only classification of the Openraft storage-error verb.
+///
+/// This contains category names only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusStorageErrorVerbForTest {
+    /// Read operation.
+    Read,
+    /// Write operation.
+    Write,
+    /// Seek operation.
+    Seek,
+    /// Delete operation.
+    Delete,
+    /// Future or unrecognized upstream verb.
+    Other,
+}
+
+fn consensus_storage_error_subject_for_test<NID>(
+    subject: &opc_consensus::engine::ErrorSubject<NID>,
+) -> ConsensusStorageErrorSubjectForTest
+where
+    NID: opc_consensus::engine::NodeId,
+{
+    #[allow(unreachable_patterns)]
+    match subject {
+        opc_consensus::engine::ErrorSubject::Store => ConsensusStorageErrorSubjectForTest::Store,
+        opc_consensus::engine::ErrorSubject::Vote => ConsensusStorageErrorSubjectForTest::Vote,
+        opc_consensus::engine::ErrorSubject::Logs => ConsensusStorageErrorSubjectForTest::Logs,
+        opc_consensus::engine::ErrorSubject::Log(_) => ConsensusStorageErrorSubjectForTest::Log,
+        opc_consensus::engine::ErrorSubject::LogIndex(_) => {
+            ConsensusStorageErrorSubjectForTest::LogIndex
+        }
+        opc_consensus::engine::ErrorSubject::Apply(_) => ConsensusStorageErrorSubjectForTest::Apply,
+        opc_consensus::engine::ErrorSubject::StateMachine => {
+            ConsensusStorageErrorSubjectForTest::StateMachine
+        }
+        opc_consensus::engine::ErrorSubject::Snapshot(_) => {
+            ConsensusStorageErrorSubjectForTest::Snapshot
+        }
+        opc_consensus::engine::ErrorSubject::None => ConsensusStorageErrorSubjectForTest::None,
+        _ => ConsensusStorageErrorSubjectForTest::Other,
+    }
+}
+
+fn storage_io_error_categories_for_test<NID>(
+    source: &opc_consensus::engine::StorageIOError<NID>,
+) -> (
+    ConsensusStorageErrorSubjectForTest,
+    ConsensusStorageErrorVerbForTest,
+)
+where
+    NID: opc_consensus::engine::NodeId,
+{
+    // Openraft does not expose accessors for these two fields. Its serde form
+    // is stable within the pinned dependency, so extract only the enum variant
+    // names and immediately discard the source and backtrace fields. Nothing
+    // from the serialized error is returned or formatted.
+    let Ok(serde_json::Value::Object(mut fields)) = serde_json::to_value(source) else {
+        return (
+            ConsensusStorageErrorSubjectForTest::Other,
+            ConsensusStorageErrorVerbForTest::Other,
+        );
+    };
+    let subject = fields.remove("subject");
+    let verb = fields.remove("verb");
+    drop(fields);
+
+    let subject = match serialized_enum_variant_for_test(subject.as_ref()) {
+        Some("Store") => ConsensusStorageErrorSubjectForTest::Store,
+        Some("Vote") => ConsensusStorageErrorSubjectForTest::Vote,
+        Some("Logs") => ConsensusStorageErrorSubjectForTest::Logs,
+        Some("Log") => ConsensusStorageErrorSubjectForTest::Log,
+        Some("LogIndex") => ConsensusStorageErrorSubjectForTest::LogIndex,
+        Some("Apply") => ConsensusStorageErrorSubjectForTest::Apply,
+        Some("StateMachine") => ConsensusStorageErrorSubjectForTest::StateMachine,
+        Some("Snapshot") => ConsensusStorageErrorSubjectForTest::Snapshot,
+        Some("None") => ConsensusStorageErrorSubjectForTest::None,
+        _ => ConsensusStorageErrorSubjectForTest::Other,
+    };
+    let verb = match serialized_enum_variant_for_test(verb.as_ref()) {
+        Some("Read") => ConsensusStorageErrorVerbForTest::Read,
+        Some("Write") => ConsensusStorageErrorVerbForTest::Write,
+        Some("Seek") => ConsensusStorageErrorVerbForTest::Seek,
+        Some("Delete") => ConsensusStorageErrorVerbForTest::Delete,
+        _ => ConsensusStorageErrorVerbForTest::Other,
+    };
+    (subject, verb)
+}
+
+fn serialized_enum_variant_for_test(value: Option<&serde_json::Value>) -> Option<&str> {
+    match value? {
+        serde_json::Value::String(variant) => Some(variant.as_str()),
+        serde_json::Value::Object(variant) if variant.len() == 1 => {
+            variant.keys().next().map(String::as_str)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn storage_io_error_category_for_test_returns_only_fixed_variants() {
+    let source = opc_consensus::engine::StorageIOError::<u64>::write_state_machine(
+        &std::io::Error::other("raw error text must never enter the diagnostic"),
+    );
+    assert_eq!(
+        storage_io_error_categories_for_test(&source),
+        (
+            ConsensusStorageErrorSubjectForTest::StateMachine,
+            ConsensusStorageErrorVerbForTest::Write,
+        )
+    );
+}
+
 /// Fixed-cardinality, redaction-safe local durable progress for integration
 /// qualification. No node identity, payload, path, or raw error is exposed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsensusLocalDurableProgressForTest {
     /// Fixed local engine-state category.
     pub engine_state: ConsensusEngineStateForTest,
+    /// Fixed storage-error subject category when the engine stopped for storage.
+    pub storage_error_subject: Option<ConsensusStorageErrorSubjectForTest>,
+    /// Fixed storage-error verb category when the engine stopped for storage I/O.
+    pub storage_error_verb: Option<ConsensusStorageErrorVerbForTest>,
     /// Highest log index stored locally.
     pub last_log_index: Option<u64>,
     /// Highest log index applied locally.
@@ -153,17 +299,28 @@ pub fn consensus_local_durable_progress_for_test(
 ) -> ConsensusLocalDurableProgressForTest {
     let metrics = store.inner.raft.metrics();
     let current = metrics.borrow();
-    let engine_state = match &current.running_state {
-        Ok(()) => ConsensusEngineStateForTest::Running,
-        Err(Fatal::StorageError(StorageError::IO { .. })) => ConsensusEngineStateForTest::StorageIo,
-        Err(Fatal::StorageError(StorageError::Defensive { .. })) => {
-            ConsensusEngineStateForTest::StorageDefensive
+    let (engine_state, storage_error_subject, storage_error_verb) = match &current.running_state {
+        Ok(()) => (ConsensusEngineStateForTest::Running, None, None),
+        Err(Fatal::StorageError(StorageError::IO { source })) => {
+            let (subject, verb) = storage_io_error_categories_for_test(source);
+            (
+                ConsensusEngineStateForTest::StorageIo,
+                Some(subject),
+                Some(verb),
+            )
         }
-        Err(Fatal::Panicked) => ConsensusEngineStateForTest::Panicked,
-        Err(Fatal::Stopped) => ConsensusEngineStateForTest::Stopped,
+        Err(Fatal::StorageError(StorageError::Defensive { source })) => (
+            ConsensusEngineStateForTest::StorageDefensive,
+            Some(consensus_storage_error_subject_for_test(&source.subject)),
+            None,
+        ),
+        Err(Fatal::Panicked) => (ConsensusEngineStateForTest::Panicked, None, None),
+        Err(Fatal::Stopped) => (ConsensusEngineStateForTest::Stopped, None, None),
     };
     ConsensusLocalDurableProgressForTest {
         engine_state,
+        storage_error_subject,
+        storage_error_verb,
         last_log_index: current.last_log_index,
         applied_index: current.last_applied.as_ref().map(|log_id| log_id.index),
         snapshot_index: current.snapshot.as_ref().map(|log_id| log_id.index),
