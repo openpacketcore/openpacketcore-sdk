@@ -2610,7 +2610,8 @@ mod tests {
     use super::*;
     use crate::backend::CompareAndSet;
     use crate::consensus::{
-        SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,
+        store::ConsensusStoreDiagnosticCounters, SessionConsensusClusterId,
+        SessionConsensusCommand, SessionConsensusConfigurationEpoch,
         SessionConsensusConfigurationId, SessionConsensusEntryDigest, SessionConsensusRequestId,
         SessionMutationIntent, SessionMutationOutcome, SESSION_CONSENSUS_SCHEMA_VERSION,
     };
@@ -3416,8 +3417,23 @@ mod tests {
         SqliteConsensusStateMachine,
         PathBuf,
     ) {
+        open_fixed_raw_read_store_with_diagnostics(directory, None).await
+    }
+
+    async fn open_fixed_raw_read_store_with_diagnostics(
+        directory: &tempfile::TempDir,
+        diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
+    ) -> (
+        SqliteConsensusLogStore,
+        SqliteConsensusStateMachine,
+        PathBuf,
+    ) {
         let database = directory.path().join("fixed-raw-read.sqlite");
         let backend = SqliteSessionBackend::open(&database).expect("fixed raw-read backend");
+        let backend = match diagnostics {
+            Some(diagnostics) => backend.with_consensus_diagnostics(diagnostics),
+            None => backend,
+        };
         let members = fixed_raw_read_members();
         let core = SqliteConsensusCore::initialize(
             &backend,
@@ -3490,6 +3506,70 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn prepare_dormant_fixed_prune_backlog_with_next_log(directory: &tempfile::TempDir) {
+        let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(directory).await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+        append_apply_fixed_prune_backlog(&mut log_store, &mut state_machine).await;
+        lane.shutdown().await;
+        log_store
+            .purge(log_id(129))
+            .await
+            .expect("durably record a dormant fixed logical purge floor");
+        log_store
+            .blocking_append([blank_entry(130)])
+            .await
+            .expect("durably append the next unapplied fixed log");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pristine_fixed_store_prune_recovery_never_takes_sqlite_writer() {
+        let directory = tempfile::tempdir().expect("pristine fixed prune directory");
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
+            directory.path(),
+        );
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let (mut log_store, state_machine, _) =
+            open_fixed_raw_read_store_with_diagnostics(&directory, Some(Arc::clone(&diagnostics)))
+                .await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if diagnostics.snapshot().consensus_log_prune_completed_turns == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup prune recovery completes its read-only preflight");
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.consensus_log_prune_attempts, 1);
+        assert_eq!(snapshot.consensus_log_prune_busy_retries, 0);
+        assert!(
+            !gate.wait_until_entered(Duration::from_millis(10)),
+            "a pristine startup prune preflight must not take SQLite's writer transaction"
+        );
+
+        log_store
+            .blocking_append([fixed_initial_membership_entry()])
+            .await
+            .expect("the first fixed-store append succeeds after read-only prune recovery");
+        assert!(
+            !gate.wait_until_entered(Duration::from_millis(10)),
+            "the first append cannot race a needless startup prune writer"
+        );
+        lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_prune_yields_writer_to_later_adapter_append_and_resumes() {
         let directory = tempfile::tempdir().expect("fixed prune priority directory");
@@ -3500,7 +3580,10 @@ mod tests {
         let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
             directory.path(),
         );
-        let (mut log_store, state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let (mut log_store, state_machine, _) =
+            open_fixed_raw_read_store_with_diagnostics(&directory, Some(Arc::clone(&diagnostics)))
+                .await;
         let lane = state_machine
             .core
             .consensus_log_prune_lane()
@@ -3525,9 +3608,15 @@ mod tests {
             .expect("join later primary adapter append")
             .expect("later primary adapter append succeeds without SQLITE_BUSY");
 
-        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+        if tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
             .await
-            .expect("preempted prune resumes and completes its durable logical backlog");
+            .is_err()
+        {
+            panic!(
+                "preempted prune did not resume and complete its durable logical backlog; diagnostics={:?}",
+                diagnostics.snapshot()
+            );
+        }
         let conn = state_machine.core.conn.lock().await;
         assert_eq!(
             conn.query_row(
@@ -3541,6 +3630,146 @@ mod tests {
         );
         drop(conn);
         lane.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_prune_preempts_for_state_machine_apply_without_applied_lag() {
+        let directory = tempfile::tempdir().expect("fixed prune apply priority directory");
+        prepare_dormant_fixed_prune_backlog_with_next_log(&directory).await;
+        let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
+            directory.path(),
+        );
+        let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
+        let (mut log_store, mut state_machine, _) =
+            open_fixed_raw_read_store_with_diagnostics(&directory, Some(Arc::clone(&diagnostics)))
+                .await;
+        let lane = state_machine
+            .core
+            .consensus_log_prune_lane()
+            .expect("fixed store installs one physical prune lane");
+        let checkpoint_lane = state_machine
+            .core
+            .proactive_checkpoint_lane()
+            .expect("file-backed store installs one proactive checkpoint lane");
+        assert!(
+            gate.wait_until_entered(Duration::from_secs(1)),
+            "the prune turn owns SQLite's writer before the state-machine apply arrives"
+        );
+        let reader = consensus::open_snapshot_read_connection(
+            state_machine
+                .core
+                .database_file
+                .as_deref()
+                .expect("file-backed store retains its snapshot source"),
+        )
+        .expect("open deferred snapshot reader");
+        let reader_cut =
+            consensus::begin_snapshot_read_sync(&reader, state_machine.core.storage_identity)
+                .expect("pin snapshot reader before the next state-machine apply");
+        assert_eq!(
+            reader_cut.0,
+            Some(log_id(129)),
+            "the pinned reader observes the durable applied cut before the next log"
+        );
+        assert_eq!(
+            state_machine
+                .applied_state()
+                .await
+                .expect("read durable applied state before the apply")
+                .0,
+            Some(log_id(129)),
+            "the next durable log is intentionally one ahead of applied"
+        );
+
+        let apply = tokio::spawn(async move {
+            let result = state_machine.apply([blank_entry(130)]).await;
+            (state_machine, result)
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.preemption_requested() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("state-machine apply publishes deterministic prune preemption");
+        assert!(
+            gate.preemption_requested(),
+            "the active physical prune observes the state-machine writer's preemption"
+        );
+        let (mut state_machine, responses) = tokio::time::timeout(Duration::from_secs(1), apply)
+            .await
+            .expect("preempted prune returns its writer turn to the state-machine apply")
+            .expect("join state-machine apply");
+        responses.expect("state-machine apply succeeds without SQLITE_BUSY");
+        assert_eq!(
+            state_machine
+                .applied_state()
+                .await
+                .expect("read durable applied state after the apply")
+                .0,
+            Some(log_id(130)),
+            "the real state-machine apply advances durable applied exactly once"
+        );
+        assert_eq!(
+            log_store
+                .get_log_state()
+                .await
+                .expect("storage remains usable after the preempted apply")
+                .last_log_id,
+            Some(log_id(130)),
+            "the durable log and applied state converge at the next entry"
+        );
+
+        // The state-machine apply accounts for the first durable-write signal;
+        // the remaining fixed cadence signals schedule one observed PASSIVE
+        // checkpoint while the reader still pins its pre-apply WAL cut.
+        for _ in 1..64 {
+            checkpoint_lane.signal();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if diagnostics.snapshot().proactive_checkpoint_busy == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader-pinned PASSIVE checkpoint reports incomplete progress");
+        consensus::release_snapshot_read_sync(&reader).expect("release deferred snapshot reader");
+        for _ in 0..64 {
+            checkpoint_lane.signal();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if diagnostics.snapshot().proactive_checkpoint_completed == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("PASSIVE checkpoint drains after the deferred reader releases");
+
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_completed())
+            .await
+            .expect("preempted prune resumes and drains after the state-machine apply");
+        let conn = state_machine.core.conn.lock().await;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_log WHERE log_index <= 129",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count resumed fixed prune backlog"),
+            0,
+            "the resumed physical prune drains the durable logical backlog"
+        );
+        drop(conn);
+        lane.shutdown().await;
+        checkpoint_lane.shutdown().await;
     }
 
     #[cfg(target_os = "linux")]

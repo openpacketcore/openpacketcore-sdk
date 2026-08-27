@@ -2050,6 +2050,9 @@ pub(crate) struct ConsensusLogPruneLane {
     /// permit through their transaction; the prune lane only try-acquires it
     /// so it can never queue ahead of a primary writer.
     turn_ownership: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes cross-thread interrupt delivery with transaction cleanup so
+    /// a late sqlite3_interrupt cannot land inside the rollback it requested.
+    interrupt_delivery: Arc<Mutex<()>>,
     active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
@@ -2091,6 +2094,7 @@ impl ConsensusLogPruneLane {
             stop,
             stopping: AtomicBool::new(false),
             turn_ownership: Arc::new(tokio::sync::Mutex::new(())),
+            interrupt_delivery: Arc::new(Mutex::new(())),
             active_interrupt: Mutex::new(None),
             worker: tokio::sync::Mutex::new(None),
             diagnostics,
@@ -2133,6 +2137,10 @@ impl ConsensusLogPruneLane {
     }
 
     pub(crate) async fn request_primary_preemption(&self) -> ConsensusLogPrunePrimaryPreemption {
+        let interrupt_delivery = self
+            .interrupt_delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let primary_writers = Arc::clone(&self.primary_writers);
         primary_writers.fetch_add(1, Ordering::AcqRel);
         let mut preemption = ConsensusLogPrunePrimaryPreemption {
@@ -2151,6 +2159,7 @@ impl ConsensusLogPruneLane {
             }
             interrupt.interrupt();
         }
+        drop(interrupt_delivery);
         // This local permit acknowledges that an interrupted prune turn has
         // returned its SQLite transaction. It intentionally has no timeout:
         // the primary connection's existing 100ms SQLite busy timeout remains
@@ -2161,6 +2170,10 @@ impl ConsensusLogPruneLane {
 
     pub(crate) async fn shutdown(&self) {
         self.stopping.store(true, Ordering::Release);
+        let interrupt_delivery = self
+            .interrupt_delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(interrupt) = self
             .active_interrupt
             .lock()
@@ -2169,6 +2182,7 @@ impl ConsensusLogPruneLane {
         {
             interrupt.interrupt();
         }
+        drop(interrupt_delivery);
         let _ = self.stop.send(true);
         let mut slot = self.worker.lock().await;
         if let Some(worker) = slot.as_mut() {
@@ -2299,6 +2313,7 @@ async fn run_consensus_log_prune_lane(
         let expected_members_for_turn = expected_members.clone();
         let expected_bindings_for_turn = expected_bindings.clone();
         let primary_writers = Arc::clone(&lane.primary_writers);
+        let interrupt_delivery = Arc::clone(&lane.interrupt_delivery);
         #[cfg(all(test, target_os = "linux"))]
         let turn_gate = lane.turn_gate.clone();
         let turn = tokio::task::spawn_blocking(move || {
@@ -2318,6 +2333,7 @@ async fn run_consensus_log_prune_lane(
                 fixed_placement_policy,
                 ConsensusLogPruneTurnControl {
                     primary_writers: Arc::clone(&primary_writers),
+                    interrupt_delivery: Arc::clone(&interrupt_delivery),
                     #[cfg(all(test, target_os = "linux"))]
                     turn_gate: turn_gate.clone(),
                 },
@@ -2340,12 +2356,47 @@ async fn run_consensus_log_prune_lane(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *active_interrupt = None;
         }
-        // The transaction has returned its connection (and therefore rolled
-        // back or committed) before a primary can pass the handoff barrier.
-        drop(turn_ownership);
-        match turn {
-            Ok((returned, Ok(completion))) => {
+        // Do not release the primary handoff until the returned connection is
+        // demonstrably outside a transaction. A failed rollback must lose the
+        // secondary connection before a primary can enter SQLite.
+        let turn = match turn {
+            Ok((returned, result)) if returned.is_autocommit() => {
                 connection = returned;
+                drop(turn_ownership);
+                result
+            }
+            Ok((returned, _)) => {
+                drop(returned);
+                drop(turn_ownership);
+                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                    if let Some(diagnostics) = &lane.diagnostics {
+                        diagnostics.cancel_consensus_log_prune_turn();
+                    }
+                    return;
+                }
+                if let Some(diagnostics) = &lane.diagnostics {
+                    diagnostics.fail_consensus_log_prune_turn();
+                }
+                return;
+            }
+            Err(_) => {
+                // A completed join error has already dropped the worker-owned
+                // connection. Keep the handoff closed until that is certain.
+                drop(turn_ownership);
+                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
+                    if let Some(diagnostics) = &lane.diagnostics {
+                        diagnostics.cancel_consensus_log_prune_turn();
+                    }
+                    return;
+                }
+                if let Some(diagnostics) = &lane.diagnostics {
+                    diagnostics.fail_consensus_log_prune_turn();
+                }
+                return;
+            }
+        };
+        match turn {
+            Ok(completion) => {
                 if let Some(diagnostics) = &lane.diagnostics {
                     diagnostics.complete_consensus_log_prune_turn(
                         completion.rows_deleted,
@@ -2369,14 +2420,10 @@ async fn run_consensus_log_prune_lane(
                     lane.signal();
                 }
             }
-            Ok((
-                returned,
-                Err(
-                    ConsensusLogPruneTurnError::TransientContention
-                    | ConsensusLogPruneTurnError::PreemptedByPrimary,
-                ),
-            )) => {
-                connection = returned;
+            Err(
+                ConsensusLogPruneTurnError::TransientContention
+                | ConsensusLogPruneTurnError::PreemptedByPrimary,
+            ) => {
                 if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
                     if let Some(diagnostics) = &lane.diagnostics {
                         diagnostics.cancel_consensus_log_prune_turn();
@@ -2394,8 +2441,7 @@ async fn run_consensus_log_prune_lane(
                 }
                 lane.signal();
             }
-            Ok((returned, Err(ConsensusLogPruneTurnError::Interrupted))) => {
-                connection = returned;
+            Err(ConsensusLogPruneTurnError::Interrupted) => {
                 if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
                     if let Some(diagnostics) = &lane.diagnostics {
                         diagnostics.cancel_consensus_log_prune_turn();
@@ -2420,20 +2466,7 @@ async fn run_consensus_log_prune_lane(
                 }
                 lane.signal();
             }
-            Ok((returned, Err(ConsensusLogPruneTurnError::Permanent))) => {
-                let _ = returned;
-                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
-                    if let Some(diagnostics) = &lane.diagnostics {
-                        diagnostics.cancel_consensus_log_prune_turn();
-                    }
-                    return;
-                }
-                if let Some(diagnostics) = &lane.diagnostics {
-                    diagnostics.fail_consensus_log_prune_turn();
-                }
-                return;
-            }
-            Err(_) => {
+            Err(ConsensusLogPruneTurnError::Permanent) => {
                 if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
                     if let Some(diagnostics) = &lane.diagnostics {
                         diagnostics.cancel_consensus_log_prune_turn();
@@ -2492,6 +2525,7 @@ async fn wait_consensus_log_prune_pacing(
 
 struct ConsensusLogPruneTurnControl {
     primary_writers: Arc<AtomicUsize>,
+    interrupt_delivery: Arc<Mutex<()>>,
     #[cfg(all(test, target_os = "linux"))]
     turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
 }
@@ -2569,6 +2603,30 @@ fn prune_consensus_log_turn_sync(
         drop(progress);
         return Err(error);
     }
+    // Startup recovery signals this lane before a caller can submit its first
+    // append. Prove that physical work exists with read-only statements before
+    // taking SQLite's singleton writer transaction; a pristine store must not
+    // manufacture writer contention merely to discover an empty purge floor.
+    let backlog_exists = consensus_log_prune_backlog_exists_sync(conn, identity);
+    let backlog_exists = match backlog_exists {
+        Ok(backlog_exists) => backlog_exists,
+        Err(error) => {
+            drop(progress);
+            return Err(error);
+        }
+    };
+    if !backlog_exists {
+        drop(progress);
+        return Ok(ConsensusLogPruneTurnCompletion {
+            more: false,
+            rows_deleted: 0,
+            encoded_bytes_deleted: 0,
+        });
+    }
+    if let Err(error) = preempt_consensus_log_prune_if_requested(control.primary_writers.as_ref()) {
+        drop(progress);
+        return Err(error);
+    }
     let mut tx = match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
         Ok(tx) => tx,
         Err(error) => {
@@ -2637,8 +2695,13 @@ fn prune_consensus_log_turn_sync(
             tx.set_drop_behavior(DropBehavior::Ignore);
             drop(progress);
             if commit.is_err() {
+                let interrupt_delivery = control
+                    .interrupt_delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let rollback = rollback_consensus_log_prune_transaction(conn);
                 drop(tx);
+                drop(interrupt_delivery);
                 rollback.map_err(|_| ConsensusLogPruneTurnError::Permanent)?;
             } else {
                 drop(tx);
@@ -2651,8 +2714,13 @@ fn prune_consensus_log_turn_sync(
             // never interrupted and cannot strand the write lock.
             tx.set_drop_behavior(DropBehavior::Ignore);
             drop(progress);
+            let interrupt_delivery = control
+                .interrupt_delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let rollback = rollback_consensus_log_prune_transaction(conn);
             drop(tx);
+            drop(interrupt_delivery);
             rollback.map_err(|_| ConsensusLogPruneTurnError::Permanent)?;
             Err(error)
         }
@@ -2724,6 +2792,21 @@ fn read_purged_for_prune_sync(
         return Err(ConsensusLogPruneTurnError::Permanent);
     }
     Ok(Some(log_id))
+}
+
+fn consensus_log_prune_backlog_exists_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> Result<bool, ConsensusLogPruneTurnError> {
+    let Some(floor) = read_purged_for_prune_sync(conn, identity)? else {
+        return Ok(false);
+    };
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM consensus_log WHERE log_index <= ?1)",
+        [checked_i64(floor.index).map_err(consensus_log_prune_permanent)?],
+        |row| row.get(0),
+    )
+    .map_err(|error| classify_consensus_log_prune_sqlite_error(&error))
 }
 
 fn prune_consensus_log_rows_in_tx(
