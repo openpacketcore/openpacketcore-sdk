@@ -42,6 +42,7 @@ use crate::{
 };
 
 const PATH_MAX_BYTES: usize = 4_096;
+#[cfg(any(target_os = "linux", test))]
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCSNP01";
 const PLAN_MAC_DOMAIN: &[u8] = b"openpacketcore/session-recovery/plan-seal/v1\0";
@@ -54,6 +55,7 @@ const BACKUP_MAC_DOMAIN: &[u8] = b"openpacketcore/session-recovery/backup/v1\0";
 const CURRENT_BRANCH_DOMAIN: &[u8] = b"openpacketcore/session-recovery/current-branch/v2\0";
 const LEGACY_BRANCH_DOMAIN: &[u8] = b"openpacketcore/session-recovery/legacy-branch/v1\0";
 const PATH_BINDING_DOMAIN: &[u8] = b"openpacketcore/session-recovery/path-binding/v1\0";
+#[cfg(target_os = "linux")]
 const FILE_IDENTITY_DOMAIN: &[u8] = b"openpacketcore/session-recovery/file-identity/v1\0";
 const LOGICAL_STATE_DOMAIN: &[u8] = b"openpacketcore/session-recovery/logical-state/v1\0";
 /// Stable projection of logical state across the one V2 finalization
@@ -1641,7 +1643,7 @@ fn validate_retained_consensus_log(
         .unwrap_or(0);
     let limit =
         usize::try_from(budget.limits.max_rows()).map_err(|_| RecoveryError::WorkLimitExceeded)?;
-    let entries = consensus::read_log_range_for_recovery_sync(
+    let entries = consensus::read_physical_log_range_for_recovery_sync(
         conn,
         identity,
         physical_start,
@@ -2275,8 +2277,9 @@ fn current_snapshot_branch_role(
     // selected snapshot immediately followed by the first physical row.
     // Keep that snapshot as branch authority; it is the retained suffix's
     // durable predecessor rather than a source-local historical artifact.
-    let first = consensus::read_log_range_for_recovery_sync(conn, identity, 0, None, Some(1))
-        .map_err(|_| RecoveryError::CorruptReplica)?;
+    let first =
+        consensus::read_physical_log_range_for_recovery_sync(conn, identity, 0, None, Some(1))
+            .map_err(|_| RecoveryError::CorruptReplica)?;
     match (snapshot_log, first.as_slice()) {
         (Some(snapshot), [entry])
             if entry.log_id.index
@@ -11326,6 +11329,34 @@ mod fixed_snapshot_copy_tests {
         bytes
     }
 
+    fn fs_verity_snapshot_tempdir(prefix: &str) -> tempfile::TempDir {
+        const QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
+        const SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+
+        let qualification_required = std::env::var_os(QUALIFICATION_ENV).as_deref()
+            == Some(std::ffi::OsStr::new("required"));
+        match std::env::var_os(SNAPSHOT_ROOT_ENV) {
+            Some(root) => {
+                let root = PathBuf::from(root);
+                assert!(
+                    root.is_absolute(),
+                    "{SNAPSHOT_ROOT_ENV} must be an absolute fs-verity snapshot root"
+                );
+                tempfile::Builder::new()
+                    .prefix(prefix)
+                    .tempdir_in(root)
+                    .expect("create fs-verity snapshot fixture directory")
+            }
+            None if qualification_required => {
+                panic!("required fs-verity qualification requires {SNAPSHOT_ROOT_ENV}")
+            }
+            None => tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir()
+                .expect("create local snapshot fixture directory"),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn regular_reader_rejects_a_fifo_without_waiting_for_a_writer() {
@@ -12070,7 +12101,7 @@ mod fixed_snapshot_copy_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fixed_recovery_copy_is_sealed_only_after_the_writer_closes() {
-        let directory = tempfile::tempdir().expect("fs-verity recovery directory");
+        let directory = fs_verity_snapshot_tempdir("fs-verity-recovery-");
         let source = directory.path().join("source.opc");
         let fixed_destination = directory.path().join("fixed-copy.opc");
         let dynamic_destination = directory.path().join("dynamic-copy.opc");

@@ -14092,6 +14092,11 @@ mod membership_tests {
             .expect("shutdown task completes")
             .expect("shutdown succeeds after releasing the core gate");
 
+        // The snapshot namespace lease is exclusive for the lifetime of every
+        // store clone, including handles that have completed their core
+        // shutdown. Reopen only after this fixture releases its last old
+        // store handle, exactly as a process restart does.
+        drop(store);
         let reopened = ConsensusSessionStore::open_fixed_durable_quorum(
             topology.clone(),
             SqliteSessionBackend::open(&database_path).expect("reopen file-backed backend"),

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
@@ -84,6 +84,37 @@ const PLAINTEXT_CANARY_BEFORE_ROTATION: &[u8] =
 const PLAINTEXT_CANARY_AFTER_ROTATION: &[u8] =
     b"opc-session-consensus-plaintext-canary-after-key-rotation";
 const RAW_KEY_MATERIAL_CANARY: &[u8; AES_256_GCM_SIV_KEY_LEN] = &[0x5a; AES_256_GCM_SIV_KEY_LEN];
+const FS_VERITY_QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
+const FS_VERITY_SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+
+/// Create a snapshot-only fixture root on CI's prepared fs-verity mount.
+///
+/// SQLite databases intentionally continue to use the normal tempfile root,
+/// so their mutable database, WAL, and journal I/O never share the loop mount.
+fn fs_verity_snapshot_tempdir(prefix: &str) -> TempDir {
+    let qualification_required = std::env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref()
+        == Some(std::ffi::OsStr::new("required"));
+    match std::env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV) {
+        Some(root) => {
+            let root = PathBuf::from(root);
+            assert!(
+                root.is_absolute(),
+                "{FS_VERITY_SNAPSHOT_ROOT_ENV} must be an absolute fs-verity snapshot root"
+            );
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(&root)
+                .expect("create fs-verity snapshot fixture directory")
+        }
+        None if qualification_required => {
+            panic!("required fs-verity qualification requires {FS_VERITY_SNAPSHOT_ROOT_ENV}")
+        }
+        None => tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create local snapshot fixture directory"),
+    }
+}
 
 #[derive(Clone, Copy)]
 struct AppendEntriesRequestDelay {
@@ -735,6 +766,7 @@ struct TestCluster {
     stores: Vec<ConsensusSessionStore>,
     _backends: Vec<SqliteSessionBackend>,
     _directory: TempDir,
+    _snapshot_directory: TempDir,
     _test_permit: tokio::sync::SemaphorePermit<'static>,
 }
 
@@ -862,7 +894,8 @@ impl TestCluster {
         test_permit: tokio::sync::SemaphorePermit<'static>,
     ) -> Self {
         assert_eq!(topologies.len(), MEMBER_COUNT);
-        let directory = tempfile::tempdir().expect("create fleet directory");
+        let directory = tempfile::tempdir().expect("create fleet database directory");
+        let snapshot_directory = fs_verity_snapshot_tempdir("consensus-openraft-snapshots-");
         let backends = (0..MEMBER_COUNT)
             .map(|index| {
                 SqliteSessionBackend::open(directory.path().join(format!("node-{index}.sqlite")))
@@ -900,7 +933,7 @@ impl TestCluster {
             let store = ConsensusSessionStore::open_with_clock(
                 topologies[index].clone(),
                 backends[index].clone(),
-                directory.path().join(format!("snapshots-{index}")),
+                snapshot_directory.path().join(format!("snapshots-{index}")),
                 peers,
                 clock.clone(),
                 operation_timeout,
@@ -915,6 +948,7 @@ impl TestCluster {
             stores,
             _backends: backends,
             _directory: directory,
+            _snapshot_directory: snapshot_directory,
             _test_permit: test_permit,
         };
 
@@ -2937,7 +2971,7 @@ async fn encryption_wrapper_keeps_plaintext_above_consensus_and_durable_authorit
                 .join(format!("node-{index}.sqlite")),
         );
     }
-    assert_file_tree_is_sealed(cluster._directory.path());
+    assert_file_tree_is_sealed(cluster._snapshot_directory.path());
 }
 
 #[tokio::test]

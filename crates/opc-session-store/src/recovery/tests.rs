@@ -1918,11 +1918,7 @@ fn current_dynamic_inspection_rejects_retained_log_gaps_and_term_regression() {
             &members,
             LogId::new(CommittedLeaderId::new(3, leader), 0),
         );
-        let second_term = if case == "term-regression" { 2 } else { 3 };
-        append_current_blank_checkpoint(
-            &replica,
-            LogId::new(CommittedLeaderId::new(second_term, leader), 1),
-        );
+        append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(3, leader), 1));
         if case != "term-regression" {
             append_current_blank_checkpoint(
                 &replica,
@@ -1939,7 +1935,36 @@ fn current_dynamic_inspection_rejects_retained_log_gaps_and_term_regression() {
                 conn.execute("DELETE FROM consensus_log WHERE log_index = 1", [])
                     .expect("remove interior retained row");
             }
-            "term-regression" => {}
+            "term-regression" => {
+                // Build a valid suffix first: durable append correctly refuses
+                // to create regressed Raft lineage.  Then forge every copy of
+                // the terminal LogId so inspection reaches the retained-log
+                // lineage check rather than rejecting a pointer/row mismatch.
+                let regressed = LogId::new(CommittedLeaderId::new(2, leader), 1);
+                let entry: Entry<SessionRaftTypeConfig> = Entry {
+                    log_id: regressed,
+                    payload: EntryPayload::Blank,
+                };
+                let encoded_entry = serde_json::to_vec(&entry).expect("encode regressed log");
+                let encoded_log_id =
+                    serde_json::to_vec(&regressed).expect("encode regressed pointer");
+                let term = i64::try_from(regressed.leader_id.term).expect("regressed term");
+                let index = i64::try_from(regressed.index).expect("regressed index");
+                conn.execute(
+                    "UPDATE consensus_log SET term = ?1, entry_json = ?2 WHERE log_index = ?3",
+                    params![term, encoded_entry, index],
+                )
+                .expect("forge regressed retained row");
+                for table in ["consensus_committed", "consensus_applied"] {
+                    conn.execute(
+                        &format!(
+                            "UPDATE {table} SET term = ?1, log_index = ?2, log_id_json = ?3 WHERE singleton = 1"
+                        ),
+                        params![term, index, &encoded_log_id],
+                    )
+                    .expect("forge regressed terminal pointer");
+                }
+            }
             _ => unreachable!("known retained-log corruption case"),
         }
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -2540,16 +2565,38 @@ fn compacted_finalization_lineage_rejects_lower_term_and_same_term_leader_forks(
         "a term-5/index-10 finalization is not covered by term-4/index-11 compacted evidence",
     );
 
+    // At an equal index, a different term is likewise a distinct full LogId;
+    // it cannot replace the finalized record as compacted branch evidence.
+    let same_index_newer_term = LogId::new(CommittedLeaderId::new(6, fork_leader), 10);
+    assert_eq!(
+        super::sqlite::require_compacted_terminal_log_lineage(
+            &finalized,
+            Some(&same_index_newer_term),
+            &same_index_newer_term,
+        ),
+        Err(RecoveryError::BackupCorrupt),
+        "same-index compacted evidence must equal the finalized full LogId",
+    );
+
     let same_term_fork_purged = LogId::new(CommittedLeaderId::new(5, fork_leader), 11);
     let same_term_fork_snapshot = LogId::new(CommittedLeaderId::new(5, fork_leader), 11);
+    // This SDK's OpenRaft profile uses `single-term-leader`: the durable
+    // leader component is the term itself, so different node inputs at one
+    // term canonicalize to the same leader ID. This is not an observable
+    // full-LogId fork; genuine fork rejection remains in
+    // `full_log_id_not_after` for formats that serialize leader identity.
+    assert_eq!(
+        finalized.leader_id, same_term_fork_purged.leader_id,
+        "single-term-leader canonicalizes same-term leader inputs"
+    );
     assert_eq!(
         super::sqlite::require_compacted_terminal_log_lineage(
             &finalized,
             Some(&same_term_fork_purged),
             &same_term_fork_snapshot,
         ),
-        Err(RecoveryError::BackupCorrupt),
-        "a same-term different-leader compacted branch is not finalization lineage",
+        Ok(()),
+        "a canonical same-term LogId is valid finalization lineage",
     );
 
     let authentic_purged = LogId::new(CommittedLeaderId::new(5, certified_leader), 11);

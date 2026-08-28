@@ -285,6 +285,10 @@ async fn v2_durable_restart_preserves_exact_replay_and_changed_body_conflict() {
         .fenced_transition_v2(request.clone())
         .await
         .expect("commit V2 transition before restart");
+    initial
+        .shutdown()
+        .await
+        .expect("fully drain one-voter consensus store before durable reopen");
     drop(initial);
 
     let restarted = store(directory.path()).await;

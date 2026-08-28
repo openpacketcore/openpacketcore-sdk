@@ -59,7 +59,8 @@ use opc_session_store::{
     StoreError, StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
-    qualification_key_bytes_sha256, qualification_owner_sha256, qualification_state_type_sha256,
+    qualification_key_bytes_sha256, qualification_owner_sha256,
+    qualification_roster_attestation_trust_root, qualification_state_type_sha256,
     qualification_traffic_schedule_sha256, qualification_traffic_seed, qualification_traffic_value,
     qualification_value_sha256, read_bounded_json_line, write_json_line,
     QualificationConcurrentBatchOutcome, QualificationConcurrentBatchSlot,
@@ -143,6 +144,49 @@ const QUALIFICATION_RETAINED_RELEASED_LEASE_HANDLES: usize = 4;
 const QUALIFICATION_DELAYED_CONSUMER_RESPONSE: Duration = Duration::from_secs(2);
 
 type ProtectedStore = EncryptingSessionBackend<ConsensusSessionStore, MemoryKeyProvider>;
+
+/// The narrow journal/watch surface used by the fixed traffic observer.
+///
+/// Keeping this boundary local lets the recovery state machine exercise its
+/// exact sequence rules against a scripted backend without changing the store
+/// watch contract that production uses.
+#[async_trait::async_trait]
+trait TrafficWatchBackend: Send + Sync {
+    async fn traffic_replication_head(&self) -> Result<u64, StoreError>;
+
+    async fn traffic_replication_log(
+        &self,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError>;
+
+    async fn open_traffic_watch(
+        &self,
+        start_sequence: u64,
+    ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError>;
+}
+
+#[async_trait::async_trait]
+impl TrafficWatchBackend for ProtectedStore {
+    async fn traffic_replication_head(&self) -> Result<u64, StoreError> {
+        SessionBackend::max_replication_sequence(self).await
+    }
+
+    async fn traffic_replication_log(
+        &self,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<ReplicationEntry>, StoreError> {
+        SessionBackend::get_replication_log(self, start, limit).await
+    }
+
+    async fn open_traffic_watch(
+        &self,
+        start_sequence: u64,
+    ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
+        SessionBackend::watch(self, start_sequence).await
+    }
+}
 
 struct QualificationLease {
     guard: LeaseGuard,
@@ -380,10 +424,7 @@ struct QualificationRosterIngressSigner {
 
 impl QualificationRosterIngressSigner {
     fn root() -> Result<RosterAttestationTrustRootV1, NodeFailure> {
-        let root_key = SigningKey::from_bytes((&[0x31; 32]).into()).map_err(|_| NodeFailure)?;
-        let public_key = root_key.verifying_key().to_sec1_point(true);
-        let public_key = public_key.as_bytes().try_into().map_err(|_| NodeFailure)?;
-        RosterAttestationTrustRootV1::new([0xa1; 32], public_key).map_err(|_| NodeFailure)
+        Ok(qualification_roster_attestation_trust_root())
     }
 
     fn new(
@@ -1667,9 +1708,12 @@ impl QualificationNode {
         ));
         let (watch_cancel, watch_cancel_rx) = oneshot::channel();
         let watch_task = tokio::spawn(run_traffic_watch_task(
+            self.protected.clone(),
             stream,
             watch_start,
             self.member_count,
+            seed,
+            self.node_index,
             watch_cancel_rx,
             Arc::clone(&observation),
         ));
@@ -1720,10 +1764,10 @@ impl QualificationNode {
             .as_ref()
             .map(|traffic| Arc::clone(&traffic.observation));
         let process_restart = existing_observation.is_none();
-        let mut reconciled_sequence = existing_observation.as_ref().map_or(0, |observation| {
+        let reconciled_sequence = existing_observation.as_ref().map_or(0, |observation| {
             observation.watch_sequence.load(Ordering::Acquire)
         });
-        let mut reconciled_generations = existing_observation.as_ref().map_or_else(
+        let reconciled_generations = existing_observation.as_ref().map_or_else(
             || vec![0; self.member_count],
             |observation| {
                 observation
@@ -1738,90 +1782,36 @@ impl QualificationNode {
             reconciled_record_fences[self.node_index] =
                 observation.last_record_fence.load(Ordering::Acquire);
         }
-        let deadline = tokio::time::Instant::now()
+        let recovery_started_at = tokio::time::Instant::now();
+        let deadline = recovery_started_at
             + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
-        let mut reconciled_entries = 0_u64;
-        let (stream, watch_start, reconciled_head) = loop {
-            if tokio::time::Instant::now() >= deadline {
-                return QualificationNodeReply::Error {
-                    code: QualificationNodeErrorCode::TrafficUnavailable,
-                };
-            }
-            let head =
-                match tokio::time::timeout_at(deadline, self.protected.max_replication_sequence())
-                    .await
-                {
-                    Ok(Ok(head)) if head >= reconciled_sequence => head,
-                    Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
-                        return QualificationNodeReply::Error {
-                            code: QualificationNodeErrorCode::TrafficUnavailable,
-                        }
-                    }
-                };
-            while reconciled_sequence < head {
-                let Ok(Some((start, limit))) =
-                    traffic_reconciliation_page_plan(reconciled_sequence, head, reconciled_entries)
-                else {
-                    return QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::TrafficUnavailable,
-                    };
-                };
-                let entries = match tokio::time::timeout_at(
-                    deadline,
-                    self.protected.get_replication_log(start, limit),
-                )
-                .await
-                {
-                    Ok(Ok(entries)) if entries.len() == limit => entries,
-                    Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
-                        return QualificationNodeReply::Error {
-                            code: QualificationNodeErrorCode::TrafficUnavailable,
-                        }
-                    }
-                };
-                for entry in entries {
-                    let Some(expected_sequence) = reconciled_sequence.checked_add(1) else {
-                        return QualificationNodeReply::Error {
-                            code: QualificationNodeErrorCode::TrafficUnavailable,
-                        };
-                    };
-                    if entry.sequence != expected_sequence
-                        || reconcile_applied_traffic_records(
-                            &entry.op,
-                            &traffic_keys,
-                            &mut reconciled_generations,
-                            &mut reconciled_record_fences,
-                            seed,
-                            self.member_count,
-                        )
-                        .is_err()
-                    {
-                        return QualificationNodeReply::Error {
-                            code: QualificationNodeErrorCode::TrafficUnavailable,
-                        };
-                    }
-                    reconciled_sequence = entry.sequence;
-                    reconciled_entries = reconciled_entries.saturating_add(1);
-                }
-            }
-            let Some(watch_start) = head.checked_add(1) else {
-                return QualificationNodeReply::Error {
-                    code: QualificationNodeErrorCode::TrafficUnavailable,
-                };
+        // The command has no cooperative cancellation source, but the shared
+        // reconciler requires one so it can use the same cancellation-aware
+        // waits as the in-task recovery path. Retain the sender for the whole
+        // call: a dropped sender is an explicit cancellation signal.
+        let (_reconciliation_cancel, mut reconciliation_cancel_rx) = oneshot::channel();
+        let Some(reconciliation) = reconcile_traffic_watch_stream(
+            &self.protected,
+            &traffic_keys,
+            seed,
+            self.member_count,
+            reconciled_sequence,
+            reconciled_generations,
+            reconciled_record_fences,
+            recovery_started_at,
+            deadline,
+            &mut reconciliation_cancel_rx,
+        )
+        .await
+        .ok()
+        .flatten() else {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::TrafficUnavailable,
             };
-            match tokio::time::timeout_at(deadline, self.protected.watch(watch_start)).await {
-                Ok(Ok(stream)) => break (stream, watch_start, head),
-                Ok(Err(StoreError::ReplicationWatchCatchUpRequired)) => continue,
-                Ok(Err(_)) | Err(_) => {
-                    return QualificationNodeReply::Error {
-                        code: QualificationNodeErrorCode::TrafficUnavailable,
-                    }
-                }
-            }
         };
 
-        let resumed_generation = reconciled_generations[self.node_index];
-        let resumed_record_fence = reconciled_record_fences[self.node_index];
+        let resumed_generation = reconciliation.generations[self.node_index];
+        let resumed_record_fence = reconciliation.record_fences[self.node_index];
         if process_restart
             && !restart_traffic_record_is_exact(
                 &self.protected,
@@ -1842,7 +1832,7 @@ impl QualificationNode {
 
         let observation = existing_observation.unwrap_or_else(|| {
             Arc::new(QualificationTrafficObservation::new(
-                reconciled_head,
+                reconciliation.head,
                 self.member_count,
             ))
         });
@@ -1852,24 +1842,27 @@ impl QualificationNode {
         for (generation, reconciled) in observation
             .watch_traffic_generations
             .iter()
-            .zip(reconciled_generations)
+            .zip(&reconciliation.generations)
         {
-            generation.store(reconciled, Ordering::Release);
+            generation.store(*reconciled, Ordering::Release);
         }
         observation
             .watch_sequence
-            .store(reconciled_head, Ordering::Release);
-        observation.record_authoritative_replication_head(reconciled_head);
+            .store(reconciliation.head, Ordering::Release);
+        observation.record_authoritative_replication_head(reconciliation.head);
         observation
             .watch_reconciled_sequence
-            .store(reconciled_head, Ordering::Release);
+            .store(reconciliation.head, Ordering::Release);
         increment(&observation.watch_reconciliations);
 
         let (watch_cancel, watch_cancel_rx) = oneshot::channel();
         let watch_task = tokio::spawn(run_traffic_watch_task(
-            stream,
-            watch_start,
+            self.protected.clone(),
+            reconciliation.stream,
+            reconciliation.watch_start,
             self.member_count,
+            seed,
+            self.node_index,
             watch_cancel_rx,
             Arc::clone(&observation),
         ));
@@ -3872,10 +3865,262 @@ fn traffic_reconciliation_page_plan(
     Ok(Some((start, limit)))
 }
 
-async fn run_traffic_watch_task(
+struct ReconciledTrafficWatch {
+    stream: BoxStream<'static, Result<ReplicationEntry, StoreError>>,
+    watch_start: u64,
+    head: u64,
+    generations: Vec<u64>,
+    record_fences: Vec<u64>,
+}
+
+enum TrafficWatchRecoveryRetry {
+    Retry,
+    Cancelled,
+    DeadlineExceeded,
+}
+
+async fn wait_for_traffic_watch_reconciliation_retry(
+    cancellation: &mut oneshot::Receiver<()>,
+    deadline: tokio::time::Instant,
+) -> TrafficWatchRecoveryRetry {
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+        return TrafficWatchRecoveryRetry::DeadlineExceeded;
+    }
+    let delay = Duration::from_millis(QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS)
+        .min(deadline.saturating_duration_since(now));
+    tokio::select! {
+        biased;
+        _ = &mut *cancellation => TrafficWatchRecoveryRetry::Cancelled,
+        _ = tokio::time::sleep(delay) => {
+            if tokio::time::Instant::now() < deadline {
+                TrafficWatchRecoveryRetry::Retry
+            } else {
+                TrafficWatchRecoveryRetry::DeadlineExceeded
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
+    backend: &B,
+    traffic_keys: &[SessionKey],
+    seed: u64,
+    member_count: usize,
+    mut reconciled_sequence: u64,
+    mut reconciled_generations: Vec<u64>,
+    mut reconciled_record_fences: Vec<u64>,
+    recovery_started_at: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    cancellation: &mut oneshot::Receiver<()>,
+) -> Result<Option<ReconciledTrafficWatch>, QualificationTrafficFailure> {
+    if traffic_keys.len() != member_count
+        || reconciled_generations.len() != member_count
+        || reconciled_record_fences.len() != member_count
+    {
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::InvariantViolation,
+            QualificationTrafficFailureStage::Watch,
+        ));
+    }
+
+    let mut reconciled_entries = 0_u64;
+    'coherent_head: loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                QualificationTrafficFailureStage::Watch,
+                recovery_started_at,
+            ));
+        }
+        let head = tokio::select! {
+            biased;
+            _ = &mut *cancellation => return Ok(None),
+            result = tokio::time::timeout_at(deadline, backend.traffic_replication_head()) => {
+                match result {
+                    Ok(Ok(head)) if head >= reconciled_sequence => head,
+                    Ok(Ok(_)) => {
+                        return Err(QualificationTrafficFailure::fixed(
+                            QualificationTrafficFailureCode::InvariantViolation,
+                            QualificationTrafficFailureStage::Watch,
+                        ));
+                    }
+                    Ok(Err(StoreError::BackendUnavailable(_))) => {
+                        match wait_for_traffic_watch_reconciliation_retry(cancellation, deadline).await {
+                            TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
+                            TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
+                            TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                                    QualificationTrafficFailureStage::Watch,
+                                    recovery_started_at,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        return Err(QualificationTrafficFailure::store(
+                            QualificationTrafficFailureCode::WatchUnavailable,
+                            QualificationTrafficFailureStage::Watch,
+                            &error,
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                            QualificationTrafficFailureStage::Watch,
+                            recovery_started_at,
+                        ));
+                    }
+                }
+            }
+        };
+
+        while reconciled_sequence < head {
+            let Some((start, limit)) =
+                traffic_reconciliation_page_plan(reconciled_sequence, head, reconciled_entries)
+                    .map_err(|_| {
+                        QualificationTrafficFailure::fixed(
+                            QualificationTrafficFailureCode::InvariantViolation,
+                            QualificationTrafficFailureStage::Watch,
+                        )
+                    })?
+            else {
+                return Err(QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::Watch,
+                ));
+            };
+            let entries = tokio::select! {
+                biased;
+                _ = &mut *cancellation => return Ok(None),
+                result = tokio::time::timeout_at(deadline, backend.traffic_replication_log(start, limit)) => {
+                    match result {
+                        Ok(Ok(entries)) if entries.len() == limit => entries,
+                        Ok(Ok(_)) => {
+                            return Err(QualificationTrafficFailure::fixed(
+                                QualificationTrafficFailureCode::InvariantViolation,
+                                QualificationTrafficFailureStage::Watch,
+                            ));
+                        }
+                        Ok(Err(StoreError::BackendUnavailable(_))) => {
+                            match wait_for_traffic_watch_reconciliation_retry(cancellation, deadline).await {
+                                TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
+                                TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
+                                TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                    return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                                        QualificationTrafficFailureStage::Watch,
+                                        recovery_started_at,
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            return Err(QualificationTrafficFailure::store(
+                                QualificationTrafficFailureCode::WatchUnavailable,
+                                QualificationTrafficFailureStage::Watch,
+                                &error,
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                                QualificationTrafficFailureStage::Watch,
+                                recovery_started_at,
+                            ));
+                        }
+                    }
+                }
+            };
+            for entry in entries {
+                let Some(expected_sequence) = reconciled_sequence.checked_add(1) else {
+                    return Err(QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::InvariantViolation,
+                        QualificationTrafficFailureStage::Watch,
+                    ));
+                };
+                if entry.sequence != expected_sequence
+                    || reconcile_applied_traffic_records(
+                        &entry.op,
+                        traffic_keys,
+                        &mut reconciled_generations,
+                        &mut reconciled_record_fences,
+                        seed,
+                        member_count,
+                    )
+                    .is_err()
+                {
+                    return Err(QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::InvariantViolation,
+                        QualificationTrafficFailureStage::Watch,
+                    ));
+                }
+                reconciled_sequence = entry.sequence;
+                reconciled_entries = reconciled_entries.checked_add(1).ok_or_else(|| {
+                    QualificationTrafficFailure::fixed(
+                        QualificationTrafficFailureCode::InvariantViolation,
+                        QualificationTrafficFailureStage::Watch,
+                    )
+                })?;
+            }
+        }
+
+        let Some(watch_start) = head.checked_add(1) else {
+            return Err(QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::Watch,
+            ));
+        };
+        let stream = tokio::select! {
+            biased;
+            _ = &mut *cancellation => return Ok(None),
+            result = tokio::time::timeout_at(deadline, backend.open_traffic_watch(watch_start)) => {
+                match result {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(StoreError::ReplicationWatchCatchUpRequired)) => continue 'coherent_head,
+                    Ok(Err(StoreError::BackendUnavailable(_))) => {
+                        match wait_for_traffic_watch_reconciliation_retry(cancellation, deadline).await {
+                            TrafficWatchRecoveryRetry::Retry => continue 'coherent_head,
+                            TrafficWatchRecoveryRetry::Cancelled => return Ok(None),
+                            TrafficWatchRecoveryRetry::DeadlineExceeded => {
+                                return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                                    QualificationTrafficFailureStage::Watch,
+                                    recovery_started_at,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        return Err(QualificationTrafficFailure::store(
+                            QualificationTrafficFailureCode::WatchUnavailable,
+                            QualificationTrafficFailureStage::Watch,
+                            &error,
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
+                            QualificationTrafficFailureStage::Watch,
+                            recovery_started_at,
+                        ));
+                    }
+                }
+            }
+        };
+        return Ok(Some(ReconciledTrafficWatch {
+            stream,
+            watch_start,
+            head,
+            generations: reconciled_generations,
+            record_fences: reconciled_record_fences,
+        }));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_traffic_watch_task<B: TrafficWatchBackend + 'static>(
+    backend: B,
     mut stream: BoxStream<'static, Result<ReplicationEntry, StoreError>>,
     mut expected_sequence: u64,
     member_count: usize,
+    seed: u64,
+    node_index: usize,
     mut cancellation: oneshot::Receiver<()>,
     observation: Arc<QualificationTrafficObservation>,
 ) -> Result<(), QualificationTrafficFailure> {
@@ -3898,17 +4143,79 @@ async fn run_traffic_watch_task(
             biased;
             _ = &mut cancellation => return Ok(()),
             entry = stream.next() => {
-                let Some(entry) = entry else {
-                    let failure = QualificationTrafficFailure::fixed(
-                        QualificationTrafficFailureCode::WatchUnavailable,
-                        QualificationTrafficFailureStage::Watch,
-                    );
-                    observation.record_failure(failure);
-                    return Err(failure);
-                };
                 let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
+                    Some(Ok(entry)) => entry,
+                    None | Some(Err(StoreError::BackendUnavailable(_))) => {
+                        let reconciled_sequence = observation.watch_sequence.load(Ordering::Acquire);
+                        if reconciled_sequence.checked_add(1) != Some(expected_sequence) {
+                            let failure = QualificationTrafficFailure::fixed(
+                                QualificationTrafficFailureCode::InvariantViolation,
+                                QualificationTrafficFailureStage::Watch,
+                            );
+                            observation.record_failure(failure);
+                            return Err(failure);
+                        }
+                        let reconciled_generations = observation
+                            .watch_traffic_generations
+                            .iter()
+                            .map(|generation| generation.load(Ordering::Acquire))
+                            .collect();
+                        let mut reconciled_record_fences = vec![0; member_count];
+                        reconciled_record_fences[node_index] =
+                            observation.last_record_fence.load(Ordering::Acquire);
+                        let recovery_started_at = tokio::time::Instant::now();
+                        let deadline = recovery_started_at
+                            + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
+                        let reconciliation = reconcile_traffic_watch_stream(
+                            &backend,
+                            &traffic_keys,
+                            seed,
+                            member_count,
+                            reconciled_sequence,
+                            reconciled_generations,
+                            reconciled_record_fences,
+                            recovery_started_at,
+                            deadline,
+                            &mut cancellation,
+                        )
+                        .await;
+                        let Some(reconciliation) = (match reconciliation {
+                            Ok(reconciliation) => reconciliation,
+                            Err(failure) => {
+                                observation.record_failure(failure);
+                                return Err(failure);
+                            }
+                        }) else {
+                            return Ok(());
+                        };
+                        let ReconciledTrafficWatch {
+                            stream: replacement_stream,
+                            watch_start,
+                            head,
+                            generations,
+                            record_fences: _,
+                        } = reconciliation;
+                        // `watch()` has registered the replacement stream
+                        // atomically with its captured backlog. Install that
+                        // stream before publishing the reconciled cursor, so
+                        // observers never see a recovered sequence without a
+                        // live successor source.
+                        stream = replacement_stream;
+                        expected_sequence = watch_start;
+                        for (generation, reconciled) in observation
+                            .watch_traffic_generations
+                            .iter()
+                            .zip(&generations)
+                        {
+                            generation.store(*reconciled, Ordering::Release);
+                        }
+                        observation.watch_sequence.store(head, Ordering::Release);
+                        observation.record_authoritative_replication_head(head);
+                        observation.watch_reconciled_sequence.store(head, Ordering::Release);
+                        increment(&observation.watch_reconciliations);
+                        continue;
+                    }
+                    Some(Err(error)) => {
                         let failure = QualificationTrafficFailure::store(
                             QualificationTrafficFailureCode::WatchUnavailable,
                             QualificationTrafficFailureStage::Watch,
@@ -6302,6 +6609,338 @@ mod tests {
             guard_acquired_at: opc_types::Timestamp::now_utc(),
             guard_expires_at: opc_types::Timestamp::now_utc(),
         }
+    }
+
+    #[derive(Clone)]
+    struct ScriptedTrafficWatchBackend {
+        state: Arc<tokio::sync::Mutex<ScriptedTrafficWatchState>>,
+    }
+
+    struct ScriptedTrafficWatchState {
+        heads: std::collections::VecDeque<Result<u64, StoreError>>,
+        logs: std::collections::VecDeque<Result<Vec<ReplicationEntry>, StoreError>>,
+        watches: std::collections::VecDeque<
+            Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError>,
+        >,
+        log_requests: Vec<(u64, usize)>,
+        watch_starts: Vec<u64>,
+    }
+
+    impl ScriptedTrafficWatchBackend {
+        fn new(
+            heads: impl IntoIterator<Item = Result<u64, StoreError>>,
+            logs: impl IntoIterator<Item = Result<Vec<ReplicationEntry>, StoreError>>,
+            watches: impl IntoIterator<
+                Item = Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError>,
+            >,
+        ) -> Self {
+            Self {
+                state: Arc::new(tokio::sync::Mutex::new(ScriptedTrafficWatchState {
+                    heads: heads.into_iter().collect(),
+                    logs: logs.into_iter().collect(),
+                    watches: watches.into_iter().collect(),
+                    log_requests: Vec::new(),
+                    watch_starts: Vec::new(),
+                })),
+            }
+        }
+
+        async fn log_requests(&self) -> Vec<(u64, usize)> {
+            self.state.lock().await.log_requests.clone()
+        }
+
+        async fn watch_starts(&self) -> Vec<u64> {
+            self.state.lock().await.watch_starts.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TrafficWatchBackend for ScriptedTrafficWatchBackend {
+        async fn traffic_replication_head(&self) -> Result<u64, StoreError> {
+            self.state.lock().await.heads.pop_front().unwrap_or(Ok(0))
+        }
+
+        async fn traffic_replication_log(
+            &self,
+            start: u64,
+            limit: usize,
+        ) -> Result<Vec<ReplicationEntry>, StoreError> {
+            let mut state = self.state.lock().await;
+            state.log_requests.push((start, limit));
+            state.logs.pop_front().unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        async fn open_traffic_watch(
+            &self,
+            start_sequence: u64,
+        ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
+            let mut state = self.state.lock().await;
+            state.watch_starts.push(start_sequence);
+            state.watches.pop_front().unwrap_or_else(|| {
+                Err(StoreError::CapabilityNotSupported(
+                    "scripted traffic watch exhausted".to_owned(),
+                ))
+            })
+        }
+    }
+
+    fn scripted_live_traffic_watch(
+        entries: Vec<Result<ReplicationEntry, StoreError>>,
+    ) -> BoxStream<'static, Result<ReplicationEntry, StoreError>> {
+        futures_util::stream::iter(entries)
+            .chain(futures_util::stream::pending())
+            .boxed()
+    }
+
+    fn scripted_traffic_replication_entry(sequence: u64, op: ReplicationOp) -> ReplicationEntry {
+        ReplicationEntry {
+            sequence,
+            tx_id: opc_session_store::ReplicationTxId::new(
+                format!("scripted-traffic-{sequence}").as_str(),
+            )
+            .expect("scripted transaction ID"),
+            op,
+            timestamp: Timestamp::now_utc(),
+        }
+    }
+
+    async fn wait_for_traffic_watch_reconciliation(observation: &QualificationTrafficObservation) {
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while observation.watch_reconciliations.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("traffic watch recovery installs a replacement stream");
+    }
+
+    #[tokio::test]
+    async fn traffic_watch_closure_recovers_to_a_live_stream() {
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let backend = ScriptedTrafficWatchBackend::new(
+            [Ok(0)],
+            [],
+            [Ok(scripted_live_traffic_watch(vec![Ok(
+                scripted_traffic_replication_entry(1, reconciliation_cas(0, 1)),
+            )]))],
+        );
+        let observation = Arc::new(QualificationTrafficObservation::new(0, member_count));
+        let (cancel, cancellation) = oneshot::channel();
+        let task = tokio::spawn(run_traffic_watch_task(
+            backend.clone(),
+            futures_util::stream::empty().boxed(),
+            1,
+            member_count,
+            seed,
+            0,
+            cancellation,
+            Arc::clone(&observation),
+        ));
+
+        wait_for_traffic_watch_reconciliation(&observation).await;
+        assert_eq!(observation.failure(), None);
+        assert_eq!(observation.watch_sequence.load(Ordering::Acquire), 1);
+        assert_eq!(
+            observation.watch_traffic_generations[0].load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(backend.watch_starts().await, vec![1]);
+        assert!(cancel.send(()).is_ok());
+        assert_eq!(task.await.expect("watch task joins"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn traffic_watch_backend_unavailable_recovers_to_a_live_stream() {
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let backend = ScriptedTrafficWatchBackend::new(
+            [Ok(0)],
+            [],
+            [Ok(scripted_live_traffic_watch(vec![Ok(
+                scripted_traffic_replication_entry(1, reconciliation_cas(0, 1)),
+            )]))],
+        );
+        let observation = Arc::new(QualificationTrafficObservation::new(0, member_count));
+        let (cancel, cancellation) = oneshot::channel();
+        let task = tokio::spawn(run_traffic_watch_task(
+            backend.clone(),
+            futures_util::stream::iter([Err(StoreError::BackendUnavailable(
+                "scripted closure".to_owned(),
+            ))])
+            .boxed(),
+            1,
+            member_count,
+            seed,
+            0,
+            cancellation,
+            Arc::clone(&observation),
+        ));
+
+        wait_for_traffic_watch_reconciliation(&observation).await;
+        assert_eq!(observation.failure(), None);
+        assert_eq!(observation.watch_sequence.load(Ordering::Acquire), 1);
+        assert_eq!(backend.watch_starts().await, vec![1]);
+        assert!(cancel.send(()).is_ok());
+        assert_eq!(task.await.expect("watch task joins"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn traffic_watch_replays_the_exact_prefix_before_consuming_a_live_successor() {
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let replayed = scripted_traffic_replication_entry(1, reconciliation_cas(0, 1));
+        let backend = ScriptedTrafficWatchBackend::new(
+            [Ok(1)],
+            [Ok(vec![replayed])],
+            [Ok(scripted_live_traffic_watch(vec![Ok(
+                scripted_traffic_replication_entry(2, reconciliation_cas(0, 2)),
+            )]))],
+        );
+        let observation = Arc::new(QualificationTrafficObservation::new(0, member_count));
+        let (cancel, cancellation) = oneshot::channel();
+        let task = tokio::spawn(run_traffic_watch_task(
+            backend.clone(),
+            futures_util::stream::empty().boxed(),
+            1,
+            member_count,
+            seed,
+            0,
+            cancellation,
+            Arc::clone(&observation),
+        ));
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while observation.watch_sequence.load(Ordering::Acquire) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("live successor is observed after exact replay");
+        assert_eq!(observation.failure(), None);
+        assert_eq!(
+            observation
+                .watch_reconciled_sequence
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            observation.watch_traffic_generations[0].load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(backend.log_requests().await, vec![(1, 1)]);
+        assert_eq!(backend.watch_starts().await, vec![2]);
+        assert!(cancel.send(()).is_ok());
+        assert_eq!(task.await.expect("watch task joins"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn traffic_watch_recovery_rejects_gap_and_malformed_prefixes() {
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let mut malformed = reconciliation_cas(0, 1);
+        let ReplicationOp::CompareAndSet { new_record, .. } = &mut malformed else {
+            unreachable!()
+        };
+        new_record.payload = EncryptedSessionPayload::new(b"malformed-traffic-replay");
+
+        for entry in [
+            scripted_traffic_replication_entry(2, reconciliation_cas(0, 1)),
+            scripted_traffic_replication_entry(1, malformed),
+        ] {
+            let backend = ScriptedTrafficWatchBackend::new([Ok(1)], [Ok(vec![entry])], []);
+            let observation = Arc::new(QualificationTrafficObservation::new(0, member_count));
+            let (_cancel, cancellation) = oneshot::channel();
+            let result = run_traffic_watch_task(
+                backend.clone(),
+                futures_util::stream::empty().boxed(),
+                1,
+                member_count,
+                seed,
+                0,
+                cancellation,
+                Arc::clone(&observation),
+            )
+            .await;
+            assert_eq!(
+                result,
+                Err(QualificationTrafficFailure::fixed(
+                    QualificationTrafficFailureCode::InvariantViolation,
+                    QualificationTrafficFailureStage::Watch,
+                ))
+            );
+            assert_eq!(observation.failure(), result.err());
+            assert!(backend.watch_starts().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn traffic_watch_reconciliation_deadline_and_entry_bound_fail_closed() {
+        let member_count = 3;
+        let seed = qualification_traffic_seed(member_count).expect("traffic seed");
+        let keys = (0..member_count)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let backend = ScriptedTrafficWatchBackend::new([], [], []);
+        let (_cancel, mut cancellation) = oneshot::channel();
+        let now = tokio::time::Instant::now();
+        let Err(failure) = reconcile_traffic_watch_stream(
+            &backend,
+            &keys,
+            seed,
+            member_count,
+            0,
+            vec![0; member_count],
+            vec![0; member_count],
+            now,
+            now,
+            &mut cancellation,
+        )
+        .await
+        else {
+            panic!("expired reconciliation deadline must fail closed");
+        };
+        assert_eq!(
+            failure.code,
+            QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
+        );
+        assert_eq!(failure.stage, QualificationTrafficFailureStage::Watch);
+
+        let backend = ScriptedTrafficWatchBackend::new(
+            [Ok(
+                QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MAX_ENTRIES + 1
+            )],
+            [],
+            [],
+        );
+        let (_cancel, mut cancellation) = oneshot::channel();
+        let recovery_started_at = tokio::time::Instant::now();
+        let result = reconcile_traffic_watch_stream(
+            &backend,
+            &keys,
+            seed,
+            member_count,
+            0,
+            vec![0; member_count],
+            vec![0; member_count],
+            recovery_started_at,
+            recovery_started_at + Duration::from_millis(100),
+            &mut cancellation,
+        )
+        .await;
+        let Err(failure) = result else {
+            panic!("over-bound reconciliation prefix must fail closed");
+        };
+        assert_eq!(
+            failure,
+            QualificationTrafficFailure::fixed(
+                QualificationTrafficFailureCode::InvariantViolation,
+                QualificationTrafficFailureStage::Watch,
+            )
+        );
+        assert!(backend.log_requests().await.is_empty());
+        assert!(backend.watch_starts().await.is_empty());
     }
 
     #[test]

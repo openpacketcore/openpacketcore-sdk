@@ -415,6 +415,35 @@ impl GatedReadBarrierPeer {
 
 #[allow(dead_code)]
 static THREE_VOTER_FLEET_TEST_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+const FS_VERITY_QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
+const FS_VERITY_SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+
+/// Creates snapshot storage on CI's dedicated fs-verity mount when required.
+/// Mutable SQLite files remain below the normal tempfile root.
+fn fs_verity_snapshot_tempdir(prefix: &str) -> tempfile::TempDir {
+    let qualification_required = std::env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref()
+        == Some(std::ffi::OsStr::new("required"));
+    match std::env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV) {
+        Some(root) => {
+            let root = PathBuf::from(root);
+            assert!(
+                root.is_absolute(),
+                "{FS_VERITY_SNAPSHOT_ROOT_ENV} must be an absolute fs-verity snapshot root"
+            );
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(&root)
+                .expect("create fs-verity snapshot fixture directory")
+        }
+        None if qualification_required => {
+            panic!("required fs-verity qualification requires {FS_VERITY_SNAPSHOT_ROOT_ENV}")
+        }
+        None => tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create local snapshot fixture directory"),
+    }
+}
 
 /// Test-only listener ownership that aborts a live consumer server if an
 /// assertion unwinds before the test can await its normal shutdown.
@@ -447,10 +476,26 @@ impl Drop for AbortConsumerServerOnDrop {
 /// process-loss qualification retains that exact directory under a parent-owned
 /// temporary root after phase one, then gives later child phases a non-owning reopen
 /// handle. This is deliberately a fixture-lifetime distinction only: both
-/// forms use the same SQLite files and OpenRaft snapshot directories.
+/// forms use the same SQLite files. Snapshot directories have separate
+/// ownership because hosted fs-verity qualification places only immutable
+/// snapshots on its dedicated mount.
 enum ThreeVoterFleetDirectory {
     Owned(tempfile::TempDir),
     Reopened(PathBuf),
+}
+
+enum ThreeVoterFleetSnapshotDirectory {
+    Owned(tempfile::TempDir),
+    Reopened(PathBuf),
+}
+
+impl ThreeVoterFleetSnapshotDirectory {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Owned(directory) => directory.path(),
+            Self::Reopened(path) => path,
+        }
+    }
 }
 
 impl ThreeVoterFleetDirectory {
@@ -488,6 +533,7 @@ struct ThreeVoterConsumerFleet {
     stores: Vec<ConsensusSessionStore>,
     backends: Vec<SqliteSessionBackend>,
     directory: Option<ThreeVoterFleetDirectory>,
+    snapshot_directory: Option<ThreeVoterFleetSnapshotDirectory>,
     read_barrier_delay: Option<Duration>,
     roster_attestation_root: Option<RosterAttestationTrustRootV1>,
     test_gate: Option<tokio::sync::SemaphorePermit<'static>>,
@@ -539,8 +585,11 @@ impl ThreeVoterConsumerFleet {
             fixed_durable,
             roster_attestation_root,
             ThreeVoterFleetDirectory::Owned(
-                tempfile::tempdir().expect("three-voter fleet directory"),
+                tempfile::tempdir().expect("three-voter fleet database directory"),
             ),
+            ThreeVoterFleetSnapshotDirectory::Owned(fs_verity_snapshot_tempdir(
+                "three-voter-fleet-snapshots-",
+            )),
             None,
         )
         .await
@@ -552,6 +601,7 @@ impl ThreeVoterConsumerFleet {
         fixed_durable: bool,
         roster_attestation_root: Option<RosterAttestationTrustRootV1>,
         directory: ThreeVoterFleetDirectory,
+        snapshot_directory: ThreeVoterFleetSnapshotDirectory,
         inherited_test_gate: Option<tokio::sync::SemaphorePermit<'static>>,
     ) -> Self {
         let test_gate = match inherited_test_gate {
@@ -697,7 +747,7 @@ impl ThreeVoterConsumerFleet {
                 ConsensusSessionStore::open_fixed_durable_quorum(
                     topologies[index].clone(),
                     backends[index].clone(),
-                    directory.path().join(format!("snapshots-{index}")),
+                    snapshot_directory.path().join(format!("snapshots-{index}")),
                     peers,
                 )
                 .await
@@ -705,7 +755,7 @@ impl ThreeVoterConsumerFleet {
                 ConsensusSessionStore::open_with_operation_timeout(
                     topologies[index].clone(),
                     backends[index].clone(),
-                    directory.path().join(format!("snapshots-{index}")),
+                    snapshot_directory.path().join(format!("snapshots-{index}")),
                     peers,
                     opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                 )
@@ -757,6 +807,7 @@ impl ThreeVoterConsumerFleet {
             stores,
             backends,
             directory: Some(directory),
+            snapshot_directory: Some(snapshot_directory),
             read_barrier_delay,
             roster_attestation_root,
             test_gate: Some(test_gate),
@@ -1209,6 +1260,10 @@ impl ThreeVoterConsumerFleet {
             .directory
             .take()
             .expect("full restart retains durable test directory");
+        let snapshot_directory = self
+            .snapshot_directory
+            .take()
+            .expect("full restart retains durable snapshot directory");
         let test_gate = self
             .test_gate
             .take()
@@ -1220,6 +1275,7 @@ impl ThreeVoterConsumerFleet {
             fixed_durable,
             roster_attestation_root,
             directory,
+            snapshot_directory,
             Some(test_gate),
         )
         .await
@@ -10879,6 +10935,9 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
         true,
         Some(ProductionRosterAttestationIssuer::trust_root()),
         ThreeVoterFleetDirectory::Owned(durable_root),
+        ThreeVoterFleetSnapshotDirectory::Owned(fs_verity_snapshot_tempdir(
+            "protected-roster-process-loss-snapshots-",
+        )),
         None,
     )
     .await;
@@ -11174,6 +11233,19 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
             .expect("durable directory is UTF-8")
             .as_bytes(),
     );
+    let durable_snapshot_directory = fleet
+        .snapshot_directory
+        .as_ref()
+        .expect("phase one retains the three voter durable snapshot directory")
+        .path()
+        .to_path_buf();
+    write_protected_roster_process_loss_state(
+        &state.join("durable-snapshot-directory"),
+        durable_snapshot_directory
+            .to_str()
+            .expect("durable snapshot directory is UTF-8")
+            .as_bytes(),
+    );
     write_protected_roster_process_loss_state(
         &state.join("roster-mutations"),
         &protected_roster_process_loss_mutation_counts(
@@ -11205,6 +11277,13 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
     );
     assert!(durable_directory.starts_with(state));
     assert!(durable_directory.is_dir());
+    let durable_snapshot_directory = PathBuf::from(
+        String::from_utf8(read_protected_roster_process_loss_state(
+            &state.join("durable-snapshot-directory"),
+        ))
+        .expect("durable snapshot directory state is UTF-8"),
+    );
+    assert!(durable_snapshot_directory.is_dir());
     let original_guard: LeaseGuard = serde_json::from_slice(
         &read_protected_roster_process_loss_state(&state.join("original-guard.json")),
     )
@@ -11216,6 +11295,7 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         true,
         Some(ProductionRosterAttestationIssuer::trust_root()),
         ThreeVoterFleetDirectory::Reopened(durable_directory),
+        ThreeVoterFleetSnapshotDirectory::Reopened(durable_snapshot_directory.clone()),
         None,
     )
     .await;
@@ -11638,6 +11718,13 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
     );
     assert!(durable_directory.starts_with(state));
     assert!(durable_directory.is_dir());
+    let durable_snapshot_directory = PathBuf::from(
+        String::from_utf8(read_protected_roster_process_loss_state(
+            &state.join("durable-snapshot-directory"),
+        ))
+        .expect("durable snapshot directory state is UTF-8"),
+    );
+    assert!(durable_snapshot_directory.is_dir());
     let original_guard: LeaseGuard = serde_json::from_slice(
         &read_protected_roster_process_loss_state(&state.join("original-guard.json")),
     )
@@ -11654,6 +11741,7 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
         true,
         Some(ProductionRosterAttestationIssuer::trust_root()),
         ThreeVoterFleetDirectory::Reopened(durable_directory),
+        ThreeVoterFleetSnapshotDirectory::Reopened(durable_snapshot_directory.clone()),
         None,
     )
     .await;
@@ -11944,6 +12032,8 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
     shutdown_client.shutdown().await;
     server.abort_and_wait().await;
     fleet.shutdown().await;
+    std::fs::remove_dir_all(&durable_snapshot_directory)
+        .expect("remove completed process-loss snapshot fixture directory");
     write_protected_roster_process_loss_state(&state.join("phase-three-complete"), b"complete");
 }
 

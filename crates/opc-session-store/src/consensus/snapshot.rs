@@ -982,6 +982,7 @@ impl UnpublishedSnapshotArtifact {
     /// Reconstruct an interrupted tombstone using the retained directory
     /// descriptor. Recovery keeps the durable/latch spelling logical while
     /// every retry stays in the original namespace.
+    #[cfg(target_os = "linux")]
     pub(crate) fn from_existing_tombstone_in_namespace(
         namespace: Arc<RetainedSnapshotDirectory>,
         tombstone_name: &OsStr,
@@ -1001,6 +1002,27 @@ impl UnpublishedSnapshotArtifact {
             sidecars: Vec::new(),
             armed: true,
         })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn from_existing_tombstone_in_namespace(
+        namespace: Arc<RetainedSnapshotDirectory>,
+        tombstone_name: &OsStr,
+        original_name: &OsStr,
+        metadata: &std::fs::Metadata,
+        sqlite_sidecars: bool,
+    ) -> io::Result<Self> {
+        let _ = (
+            namespace,
+            tombstone_name,
+            original_name,
+            metadata,
+            sqlite_sidecars,
+        );
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "snapshot identity-bound cleanup requires Linux",
+        ))
     }
 
     /// Reconstruct a durable final-unlink guard after a process stopped after
@@ -2375,6 +2397,7 @@ fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[cfg(target_os = "linux")]
 fn fs_verity_enable_error(error: opc_fs_verity_sys::Error) -> io::Error {
     // Preserve only the kernel errno for operator qualification.  The
     // descriptor-only fs-verity API never contains a pathname or contents,
@@ -2413,6 +2436,7 @@ fn fs_verity_enable_error(error: opc_fs_verity_sys::Error) -> io::Error {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn fs_verity_measure_error(_error: opc_fs_verity_sys::Error) -> io::Error {
     // A fixed artifact without a readable fixed-profile measurement is corrupt
     // (or unavailable), but never a pathname-bearing diagnostic.
@@ -2614,6 +2638,7 @@ fn sync_snapshot_parent_directory(path: &Path) -> io::Result<()> {
 /// this state before any fallible durability or identity step, which keeps
 /// every retry and Drop attempt pinned to the exact tombstone rather than the
 /// now-vacant public name.
+#[cfg(target_os = "linux")]
 enum SnapshotCleanupLocation {
     Original,
     Tombstone(PathBuf),
@@ -2627,6 +2652,7 @@ enum SnapshotCleanupLocation {
 struct SnapshotCleanupState {
     original: PathBuf,
     namespace: Option<Arc<RetainedSnapshotDirectory>>,
+    #[cfg(target_os = "linux")]
     location: SnapshotCleanupLocation,
 }
 
@@ -2635,6 +2661,7 @@ impl SnapshotCleanupState {
         Self {
             original: path,
             namespace: None,
+            #[cfg(target_os = "linux")]
             location: SnapshotCleanupLocation::Original,
         }
     }
@@ -2643,6 +2670,7 @@ impl SnapshotCleanupState {
         Ok(Self {
             original: namespace.logical_child(name)?,
             namespace: Some(namespace),
+            #[cfg(target_os = "linux")]
             location: SnapshotCleanupLocation::Original,
         })
     }
@@ -2651,9 +2679,13 @@ impl SnapshotCleanupState {
     fn rebind(&mut self, path: PathBuf) {
         self.original = path;
         self.namespace = None;
-        self.location = SnapshotCleanupLocation::Original;
+        #[cfg(target_os = "linux")]
+        {
+            self.location = SnapshotCleanupLocation::Original;
+        }
     }
 
+    #[cfg(target_os = "linux")]
     fn active_path(&self) -> Option<&Path> {
         match &self.location {
             SnapshotCleanupLocation::Original => Some(&self.original),
@@ -2663,6 +2695,7 @@ impl SnapshotCleanupState {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn tombstone_path(&self) -> Option<&Path> {
         match &self.location {
             SnapshotCleanupLocation::Tombstone(path) => Some(path),
@@ -2671,6 +2704,7 @@ impl SnapshotCleanupState {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn active_name(&self) -> io::Result<&OsStr> {
         self.active_path()
             .and_then(Path::file_name)
@@ -2684,6 +2718,7 @@ impl SnapshotCleanupState {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn open_active(&self) -> io::Result<std::fs::File> {
         match &self.namespace {
             Some(namespace) => namespace.open_read(self.active_name()?),
@@ -2709,14 +2744,7 @@ impl SnapshotCleanupState {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn rename_noreplace(&self, _from: &OsStr, _to: &OsStr) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "identity-bound snapshot rename requires Linux renameat2",
-        ))
-    }
-
+    #[cfg(target_os = "linux")]
     fn unlink_active(&self) -> io::Result<()> {
         match &self.namespace {
             Some(namespace) => namespace.unlink(self.active_name()?),
@@ -2771,6 +2799,7 @@ fn take_snapshot_cleanup_hook(after_rename: bool) -> (Option<SnapshotCleanupTest
     (hook, fail_sync)
 }
 
+#[cfg(target_os = "linux")]
 fn snapshot_cleanup_before_rename(original: &Path, tombstone: &Path) {
     #[cfg(test)]
     if let (Some(hook), _) = take_snapshot_cleanup_hook(false) {
@@ -2780,6 +2809,7 @@ fn snapshot_cleanup_before_rename(original: &Path, tombstone: &Path) {
     let _ = (original, tombstone);
 }
 
+#[cfg(target_os = "linux")]
 fn sync_snapshot_cleanup_after_rename(
     state: &SnapshotCleanupState,
     original: &Path,
@@ -2806,6 +2836,7 @@ fn sync_snapshot_cleanup_after_rename(
 /// callback runs before the authenticated tombstone is captured under its
 /// private guard name, making the historical check-to-unlink race causal and
 /// deterministic without exposing a production interleaving point.
+#[cfg(target_os = "linux")]
 fn snapshot_cleanup_after_final_identity_before_unlink(tombstone: &Path, guard: &Path) {
     #[cfg(test)]
     if let Some(hook) = snapshot_cleanup_test_hooks()
@@ -2823,6 +2854,7 @@ fn snapshot_cleanup_after_final_identity_before_unlink(tombstone: &Path, guard: 
 /// Persist a successful final guard rename before unlinking.  A retry after a
 /// crash or a returned error therefore targets this exact bounded guard name,
 /// never the original public or tombstone spelling.
+#[cfg(target_os = "linux")]
 fn sync_snapshot_cleanup_after_unlink_guard_rename(state: &SnapshotCleanupState) -> io::Result<()> {
     state.sync_parent()?;
     #[cfg(test)]
@@ -3576,11 +3608,6 @@ fn same_file_object(left: FileIdentity, right: FileIdentity) -> bool {
 #[allow(dead_code)]
 fn file_identity(_metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
     Ok(FileIdentity)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn same_file_object(_left: FileIdentity, _right: FileIdentity) -> bool {
-    false
 }
 
 fn snapshot_open_options(create_new: bool, read: bool, write: bool) -> tokio::fs::OpenOptions {
@@ -4530,6 +4557,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn fixed_enable_errno_classification_preserves_unsupported_admission() {
         for errno in [libc::ENOTTY, libc::EOPNOTSUPP, libc::ENOSYS] {

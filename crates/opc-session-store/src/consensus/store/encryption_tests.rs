@@ -836,6 +836,10 @@ impl RemoteRotationPeer {
         *self.handler.write().await = Some(handler);
     }
 
+    async fn uninstall(&self) {
+        *self.handler.write().await = None;
+    }
+
     fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
     }
@@ -969,7 +973,9 @@ impl RemoteRotationCluster {
                 peers,
             )
             .await
-            .expect("open remote rotation consensus node");
+            .unwrap_or_else(|error| {
+                panic!("open remote rotation consensus node {index}: {error:?}")
+            });
             stores.push(store);
         }
 
@@ -1243,13 +1249,26 @@ impl RemoteRotationCluster {
     }
 
     async fn shutdown_and_restart(self) -> Self {
-        let results = futures_util::future::join_all(
-            self.stores.iter().map(|store| store.inner.raft.shutdown()),
-        )
-        .await;
-        for result in results {
-            result.expect("shut down remote rotation member");
+        // Retire each member's inbound RPC handlers before its clone-wide
+        // shutdown, matching the production transport lifecycle, while the
+        // remaining members and their peer paths stay live. Concurrently
+        // draining every member can leave an in-flight Raft RPC with no live
+        // peer to complete against.
+        for (target, store) in self.stores.iter().enumerate() {
+            for ((_, path_target), path) in &self.paths {
+                if *path_target == target {
+                    path.uninstall().await;
+                }
+            }
+            store
+                .shutdown()
+                .await
+                .expect("shut down remote rotation member");
         }
+        // The per-member retirement above also breaks the in-process cycle
+        // from every transport to its target store before the old stores are
+        // dropped, releasing their exclusive snapshot namespace leases just
+        // as process loss does.
         let Self {
             directory,
             backends,
@@ -1263,11 +1282,15 @@ impl RemoteRotationCluster {
     }
 
     async fn shutdown(&self) {
-        let results = futures_util::future::join_all(
-            self.stores.iter().map(|store| store.inner.raft.shutdown()),
-        )
-        .await;
-        assert!(results.into_iter().all(|result| result.is_ok()));
+        for path in self.paths.values() {
+            path.uninstall().await;
+        }
+        for store in &self.stores {
+            store
+                .shutdown()
+                .await
+                .expect("shut down remote rotation member after retiring ingress");
+        }
     }
 }
 
@@ -1418,14 +1441,20 @@ async fn remote_seal_rotation_survives_three_node_snapshot_install_and_restart()
         .last_applied
         .is_some_and(|log_id| log_id.index > lagging_applied));
     drop(recovered_metrics);
+    let lagging_store = &cluster.stores[partition.lagging_follower];
+    let logical_time = cluster.backends[partition.lagging_follower]
+        .consensus_logical_time(lagging_store.recovery_identity())
+        .await
+        .expect("read committed logical time after snapshot install")
+        .expect("snapshot-installed state has committed logical time");
     for (session_key, expected_key_id, plaintext) in [
         (&before_key, &old_key_id, PLAINTEXT_BEFORE_ROTATION),
         (&after_key, &new_key_id, PLAINTEXT_AFTER_ROTATION),
     ] {
-        let raw = cluster.stores[partition.lagging_follower]
-            .get(session_key)
+        let raw = cluster.backends[partition.lagging_follower]
+            .consensus_get_at(session_key, logical_time)
             .await
-            .expect("raw read after snapshot install")
+            .expect("committed raw read after snapshot install")
             .expect("snapshot-installed record");
         let envelope = CryptoEnvelopeV1::decode(raw.payload.as_bytes()).expect("envelope");
         assert_eq!(&envelope.key_id, expected_key_id);

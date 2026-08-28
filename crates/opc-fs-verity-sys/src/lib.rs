@@ -763,7 +763,7 @@ mod platform {
                 target_arch = "sparc",
                 target_arch = "sparc64"
             )))]
-            assert_eq!(FS_IOC_GETFSUUID, 0x8011_1500);
+            assert_eq!(FS_IOC_GETFSUUID, 0x8011_1500_u32 as libc::Ioctl);
         }
 
         #[test]
@@ -1422,7 +1422,7 @@ mod platform {
 
         #[test]
         fn linux_ioctl_qualification_requires_ci_filesystem_to_seal() {
-            let mut temporary = tempfile::NamedTempFile::new().expect("create qualification file");
+            let mut temporary = fs_verity_qualification_file();
             temporary
                 .write_all(b"fixed fs-verity qualification payload")
                 .expect("write qualification file");
@@ -1506,7 +1506,7 @@ mod platform {
         }
 
         fn assert_nonstandard_profile_is_rejected(profile: &str, enable: &EnableArg) {
-            let mut temporary = tempfile::NamedTempFile::new().expect("create qualification file");
+            let mut temporary = fs_verity_qualification_file();
             temporary
                 .write_all(b"nonstandard fs-verity qualification payload")
                 .expect("write qualification file");
@@ -1560,6 +1560,29 @@ mod platform {
         fn qualification_required() -> bool {
             std::env::var_os("OPC_FS_VERITY_QUALIFICATION").as_deref()
                 == Some(std::ffi::OsStr::new("required"))
+        }
+
+        /// Creates only kernel-seal qualification artifacts on CI's prepared
+        /// fs-verity mount. General temporary I/O remains on the runner's
+        /// native filesystem.
+        fn fs_verity_qualification_file() -> tempfile::NamedTempFile {
+            const SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+
+            match std::env::var_os(SNAPSHOT_ROOT_ENV) {
+                Some(root) => {
+                    let root = PathBuf::from(root);
+                    assert!(
+                        root.is_absolute(),
+                        "{SNAPSHOT_ROOT_ENV} must be an absolute fs-verity qualification root"
+                    );
+                    tempfile::NamedTempFile::new_in(root)
+                        .expect("create fs-verity qualification file")
+                }
+                None if qualification_required() => {
+                    panic!("required fs-verity qualification requires {SNAPSHOT_ROOT_ENV}")
+                }
+                None => tempfile::NamedTempFile::new().expect("create local qualification file"),
+            }
         }
 
         fn custom_profile_is_unavailable(error: &std::io::Error) -> bool {

@@ -72,8 +72,9 @@ use opc_session_store::{
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
 };
 use opc_session_testkit::qualification::{
-    qualification_owner_sha256, qualification_traffic_schedule_sha256, qualification_traffic_seed,
-    qualification_traffic_value, qualification_value_sha256, read_bounded_json_line,
+    qualification_owner_sha256, qualification_roster_attestation_trust_root,
+    qualification_traffic_schedule_sha256, qualification_traffic_seed, qualification_traffic_value,
+    qualification_value_sha256, read_bounded_json_line,
     session_mtls_batch_release_gate_achieved_rate_milli,
     session_mtls_batch_release_gate_schedule_sha256, session_mtls_candidate_schedule_sha256,
     write_json_line, QualificationConnectionLifecycleConfig,
@@ -2971,6 +2972,105 @@ struct Fleet {
     readiness_probe_commands: usize,
 }
 
+fn stateless_consumer_voter_topology_for_configuration(
+    members: &[QualificationMember],
+    configuration_generation: &str,
+    configuration_epoch: u64,
+) -> ValidatedQuorumTopology {
+    let descriptors = members
+        .iter()
+        .map(|member| {
+            QuorumReplicaDescriptor::new(
+                ReplicaId::new(member.replica_id.clone())
+                    .expect("qualification consumer replica ID"),
+                ReplicaEndpoint::new(member.endpoint_host.clone(), member.endpoint_port)
+                    .expect("qualification consumer endpoint"),
+                ReplicaTlsIdentity::new(member.tls_identity.clone())
+                    .expect("qualification consumer TLS identity"),
+                ReplicaFailureDomain::new(member.failure_domain.clone())
+                    .expect("qualification consumer failure domain"),
+                ReplicaBackingIdentity::new(member.backing_identity.clone())
+                    .expect("qualification consumer backing identity"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let roster_attestation_root = qualification_roster_attestation_trust_root();
+    let manifest = SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
+        SessionClusterId::new(format!("qualification-mtls-{}-cluster", members.len()))
+            .expect("qualification consumer cluster ID"),
+        SessionConfigurationGeneration::new(configuration_generation)
+            .expect("qualification consumer configuration generation"),
+        SessionConfigurationEpoch::new(configuration_epoch)
+            .expect("qualification consumer configuration epoch"),
+        descriptors.clone(),
+        Some(roster_attestation_root.clone()),
+    )
+    .expect("qualification consumer replication manifest");
+    let local_replica = descriptors
+        .first()
+        .expect("qualification consumer local replica")
+        .replica_id()
+        .clone();
+    ValidatedQuorumTopology::try_from_fixed_durable_quorum(
+        QuorumTopologyConfig::new_consensus_with_roster_attestation_trust_root(
+            local_replica,
+            descriptors,
+            manifest.fixed_durable_quorum_consensus_identity(),
+            roster_attestation_root,
+        ),
+    )
+    .expect("qualification consumer validated fixed topology")
+}
+
+#[test]
+fn stateless_consumer_voter_topology_binds_fixed_root_and_epoch_scope() {
+    let members = (0..3)
+        .map(|node_index| QualificationMember {
+            node_index,
+            replica_id: format!("node-{node_index}"),
+            endpoint_host: format!("node-{node_index}.qualification.invalid"),
+            endpoint_port: 41_000 + u16::try_from(node_index).expect("qualification node index"),
+            dial_addr: None,
+            tls_identity: spiffe_id(node_index),
+            failure_domain: format!("zone-{node_index}"),
+            backing_identity: format!("disk-{node_index}"),
+        })
+        .collect::<Vec<_>>();
+    let topology = stateless_consumer_voter_topology_for_configuration(&members, "v1", 1);
+    let expected_root = qualification_roster_attestation_trust_root();
+    assert_eq!(
+        topology
+            .roster_attestation_trust_root()
+            .map(opc_session_store::RosterAttestationTrustRootV1::identity),
+        Some(expected_root.identity())
+    );
+    let roster = topology
+        .session_consumer_roster()
+        .expect("fixed qualification consumer roster");
+    assert_eq!(
+        topology.consensus_identity(),
+        Some(roster.scope().consensus_identity())
+    );
+    for member in &members {
+        let replica_id =
+            ReplicaId::new(member.replica_id.clone()).expect("qualification consumer replica ID");
+        let node_id = topology
+            .consensus_node_id(&replica_id)
+            .expect("qualification consumer consensus node ID");
+        let authority = roster
+            .voter(node_id)
+            .expect("qualification consumer voter authority");
+        assert_eq!(authority.scope(), roster.scope());
+        assert_eq!(authority.tls_identity(), member.tls_identity);
+        assert_eq!(authority.voter_count(), members.len());
+    }
+
+    let epoch_two = stateless_consumer_voter_topology_for_configuration(&members, "v1-negative", 2)
+        .session_consumer_roster()
+        .expect("epoch-two qualification consumer roster");
+    assert_ne!(roster.scope(), epoch_two.scope());
+}
+
 impl Fleet {
     fn start(member_count: usize) -> Self {
         let schedule = session_mtls_candidate_schedule_sha256(
@@ -3218,48 +3318,11 @@ impl Fleet {
         configuration_generation: &str,
         configuration_epoch: u64,
     ) -> Vec<SessionConsumerVoterAuthority> {
-        let descriptors = self
-            .members
-            .iter()
-            .map(|member| {
-                QuorumReplicaDescriptor::new(
-                    ReplicaId::new(member.replica_id.clone())
-                        .expect("qualification consumer replica ID"),
-                    ReplicaEndpoint::new(member.endpoint_host.clone(), member.endpoint_port)
-                        .expect("qualification consumer endpoint"),
-                    ReplicaTlsIdentity::new(member.tls_identity.clone())
-                        .expect("qualification consumer TLS identity"),
-                    ReplicaFailureDomain::new(member.failure_domain.clone())
-                        .expect("qualification consumer failure domain"),
-                    ReplicaBackingIdentity::new(member.backing_identity.clone())
-                        .expect("qualification consumer backing identity"),
-                )
-            })
-            .collect::<Vec<_>>();
-        let manifest = SessionReplicationManifest::try_new_with_epoch(
-            SessionClusterId::new(format!(
-                "qualification-mtls-{}-cluster",
-                self.member_count()
-            ))
-            .expect("qualification consumer cluster ID"),
-            SessionConfigurationGeneration::new(configuration_generation)
-                .expect("qualification consumer configuration generation"),
-            SessionConfigurationEpoch::new(configuration_epoch)
-                .expect("qualification consumer configuration epoch"),
-            descriptors.clone(),
-        )
-        .expect("qualification consumer replication manifest");
-        let local_replica = descriptors
-            .first()
-            .expect("qualification consumer local replica")
-            .replica_id()
-            .clone();
-        let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
-            local_replica,
-            descriptors,
-            manifest.consensus_identity(),
-        ))
-        .expect("qualification consumer validated topology");
+        let topology = stateless_consumer_voter_topology_for_configuration(
+            &self.members,
+            configuration_generation,
+            configuration_epoch,
+        );
         let roster = topology
             .session_consumer_roster()
             .expect("qualification consumer roster");
@@ -12922,14 +12985,8 @@ impl QualificationRosterIssuer {
         let root_key = SigningKey::from_bytes((&[0x31; 32]).into()).expect("fixed roster root");
         let executor_key =
             SigningKey::from_bytes((&[0x33; 32]).into()).expect("fixed roster executor");
-        let root_public: [u8; 33] = root_key
-            .verifying_key()
-            .to_sec1_point(true)
-            .as_bytes()
-            .try_into()
-            .expect("P-256 compressed root key");
-        let root = opc_session_store::RosterAttestationTrustRootV1::new([0xa1; 32], root_public)
-            .expect("fixed roster trust root");
+        let root = qualification_roster_attestation_trust_root();
+        let root_public = root.compressed_public_key();
         let now = Timestamp::now_utc();
         let not_before = now.add_seconds(-60).expect("roster leaf lower bound");
         let not_after = now.add_seconds(3_600).expect("roster leaf upper bound");
@@ -17552,12 +17609,17 @@ fn assert_batch_credential_negative_handshake(
         .map(stateless_consumer_identity)
         .collect::<Vec<_>>();
     let identity = consumer_identities[TARGET].clone();
-    let (endpoint, _scope) = fleet.start_stateless_consumer(TARGET, consumer_identities);
+    let (endpoint, scope) = fleet.start_stateless_consumer(TARGET, consumer_identities);
     let voter_authority = fleet
         .stateless_consumer_voter_authorities()
         .into_iter()
         .nth(TARGET)
         .expect("qualification target voter authority");
+    assert_eq!(
+        voter_authority.scope(),
+        scope,
+        "matching credential control must use the listener's exact fixed authority scope"
+    );
     let source_before = fleet.projected_status(TARGET);
     let controller_before = fleet.material_status(TARGET);
     fleet.publish_known_projected_generation(TARGET, server_credential, server_trust, phase);

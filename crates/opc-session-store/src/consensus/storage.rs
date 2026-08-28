@@ -72,6 +72,71 @@ const SNAPSHOT_FIXED_INSTALL_RESERVATION_ENTRIES: usize = SNAPSHOT_SQLITE_ARTIFA
 const SNAPSHOT_BUILD_RESERVATION_ENTRIES: usize = SNAPSHOT_SQLITE_ARTIFACT_MAX_ENTRIES * 2;
 const SNAPSHOT_APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Test-only witness for the expensive live-terminal branch. The production
+/// fast probe cannot reach `reconcile_with_gate`, so a focused test can prove
+/// that clear/active calls neither select nor open a current snapshot.
+#[cfg(test)]
+struct LiveTerminalRecoveryFullReconciliationObserver {
+    full_reconciliations: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+fn live_terminal_recovery_full_reconciliation_observer(
+) -> &'static std::sync::Mutex<Option<Arc<AtomicUsize>>> {
+    static OBSERVER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<AtomicUsize>>>> =
+        std::sync::OnceLock::new();
+    OBSERVER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+impl LiveTerminalRecoveryFullReconciliationObserver {
+    fn install() -> Self {
+        let full_reconciliations = Arc::new(AtomicUsize::new(0));
+        let mut installed = live_terminal_recovery_full_reconciliation_observer()
+            .lock()
+            .expect("live terminal recovery full reconciliation observer");
+        assert!(
+            installed.is_none(),
+            "live terminal recovery full reconciliation observer already installed"
+        );
+        *installed = Some(Arc::clone(&full_reconciliations));
+        Self {
+            full_reconciliations,
+        }
+    }
+
+    fn full_reconciliations(&self) -> usize {
+        self.full_reconciliations.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for LiveTerminalRecoveryFullReconciliationObserver {
+    fn drop(&mut self) {
+        let mut installed = live_terminal_recovery_full_reconciliation_observer()
+            .lock()
+            .expect("live terminal recovery full reconciliation observer");
+        assert!(
+            installed
+                .as_ref()
+                .is_some_and(|observer| Arc::ptr_eq(observer, &self.full_reconciliations)),
+            "live terminal recovery full reconciliation observer changed"
+        );
+        *installed = None;
+    }
+}
+
+#[cfg(test)]
+fn observe_live_terminal_recovery_full_reconciliation() {
+    if let Some(observer) = live_terminal_recovery_full_reconciliation_observer()
+        .lock()
+        .expect("live terminal recovery full reconciliation observer")
+        .as_ref()
+    {
+        observer.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SnapshotDirectoryValidationFailure {
@@ -201,6 +266,64 @@ impl Drop for SnapshotCleanupGenerationAckGateGuard {
 #[cfg(test)]
 async fn wait_after_snapshot_cleanup_failure_sync_before_ack(directory: &Path) {
     let gate = snapshot_cleanup_generation_ack_gates()
+        .lock()
+        .ok()
+        .and_then(|gates| gates.get(directory).cloned());
+    if let Some(gate) = gate {
+        gate.block_if_armed().await;
+    }
+}
+
+// OpenRaft dispatches snapshot installation to its state-machine worker, then
+// may issue the matching log purge on the core worker without awaiting that
+// task.  This test seam holds only after the replacement transaction has
+// committed and the in-memory applied frontier has been published, proving a
+// concurrent purge does not depend on later diagnostics or cleanup.
+#[cfg(test)]
+fn snapshot_install_applied_progress_gates(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+struct SnapshotInstallAppliedProgressGateGuard {
+    directory: PathBuf,
+    gate: Arc<SnapshotArtifactGate>,
+}
+
+#[cfg(test)]
+impl SnapshotInstallAppliedProgressGateGuard {
+    fn install(directory: PathBuf, gate: Arc<SnapshotArtifactGate>) -> Self {
+        snapshot_install_applied_progress_gates()
+            .lock()
+            .expect("install snapshot applied-progress gate")
+            .insert(directory.clone(), Arc::clone(&gate));
+        Self { directory, gate }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SnapshotInstallAppliedProgressGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+        let mut gates = snapshot_install_applied_progress_gates()
+            .lock()
+            .expect("remove snapshot applied-progress gate");
+        if gates
+            .get(&self.directory)
+            .is_some_and(|installed| Arc::ptr_eq(installed, &self.gate))
+        {
+            gates.remove(&self.directory);
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_after_snapshot_install_applied_progress(directory: &Path) {
+    let gate = snapshot_install_applied_progress_gates()
         .lock()
         .ok()
         .and_then(|gates| gates.get(directory).cloned());
@@ -629,6 +752,36 @@ struct SnapshotArtifact {
     state: Arc<SnapshotArtifactState>,
 }
 
+/// Holds the current published image while a successor is being prepared.
+/// Until replacement metadata is known committed, dropping this holder must
+/// preserve the authoritative predecessor rather than treating it as a failed
+/// attempt's disposable artifact.
+struct RetainedCurrentSnapshotArtifact {
+    artifact: Option<SnapshotArtifact>,
+}
+
+impl RetainedCurrentSnapshotArtifact {
+    fn new(artifact: SnapshotArtifact) -> Self {
+        Self {
+            artifact: Some(artifact),
+        }
+    }
+
+    fn into_cleanup_artifact(mut self) -> SnapshotArtifact {
+        self.artifact
+            .take()
+            .expect("retained current snapshot artifact is present")
+    }
+}
+
+impl Drop for RetainedCurrentSnapshotArtifact {
+    fn drop(&mut self) {
+        if let Some(artifact) = &self.artifact {
+            artifact.disarm();
+        }
+    }
+}
+
 struct SnapshotArtifactState {
     // `path` is the stable diagnostic/original name. Cleanup itself advances
     // through `cleanup` after a successful rename.
@@ -676,6 +829,7 @@ struct SnapshotArtifactIdentity {
     inode: u64,
 }
 
+#[cfg(target_os = "linux")]
 enum SnapshotArtifactCleanupLocation {
     Original,
     Tombstone(PathBuf),
@@ -687,18 +841,25 @@ enum SnapshotArtifactCleanupLocation {
 }
 
 struct SnapshotArtifactCleanupState {
+    #[cfg(target_os = "linux")]
     original: PathBuf,
+    #[cfg(target_os = "linux")]
     location: SnapshotArtifactCleanupLocation,
 }
 
 impl SnapshotArtifactCleanupState {
     fn new(path: PathBuf) -> Self {
+        #[cfg(not(target_os = "linux"))]
+        let _ = path;
         Self {
+            #[cfg(target_os = "linux")]
             original: path,
+            #[cfg(target_os = "linux")]
             location: SnapshotArtifactCleanupLocation::Original,
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn active_path(&self) -> Option<&Path> {
         match &self.location {
             SnapshotArtifactCleanupLocation::Original => Some(&self.original),
@@ -708,6 +869,7 @@ impl SnapshotArtifactCleanupState {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn tombstone_path(&self) -> Option<&Path> {
         match &self.location {
             SnapshotArtifactCleanupLocation::Tombstone(path) => Some(path),
@@ -800,6 +962,7 @@ fn take_snapshot_artifact_cleanup_hook(
     (hook, fail_before_rename, fail_post_rename_sync)
 }
 
+#[cfg(target_os = "linux")]
 fn snapshot_artifact_cleanup_before_rename(original: &Path, tombstone: &Path) -> io::Result<()> {
     #[cfg(test)]
     {
@@ -818,6 +981,7 @@ fn snapshot_artifact_cleanup_before_rename(original: &Path, tombstone: &Path) ->
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn sync_snapshot_artifact_cleanup_after_rename(
     original: &Path,
     tombstone: &Path,
@@ -855,6 +1019,7 @@ fn sync_snapshot_artifact_cleanup_after_rename(
 /// production transition immediately moves the authenticated tombstone to a
 /// private guard afterward; a replacement introduced here is reauthenticated
 /// under that guard and must fail closed.
+#[cfg(target_os = "linux")]
 fn snapshot_artifact_cleanup_after_final_identity_before_unlink(tombstone: &Path, guard: &Path) {
     #[cfg(test)]
     if let Some(hook) = snapshot_artifact_cleanup_test_hooks()
@@ -872,6 +1037,7 @@ fn snapshot_artifact_cleanup_after_final_identity_before_unlink(tombstone: &Path
 /// A successful final guard rename is durable before unlink.  A crash/failure
 /// at this point can replay only the exact guard instead of generating nested
 /// tombstones or returning to a public artifact spelling.
+#[cfg(target_os = "linux")]
 fn sync_snapshot_artifact_cleanup_after_unlink_guard_rename(
     cleanup: &SnapshotArtifactCleanupState,
     namespace: Option<&RetainedSnapshotDirectory>,
@@ -1003,6 +1169,10 @@ impl SnapshotArtifact {
 
     fn path(&self) -> &Path {
         &self.state.path
+    }
+
+    fn disarm(&self) {
+        self.state.armed.store(false, Ordering::Release);
     }
 
     fn retain_namespace_lease<T>(&self, lease: Arc<T>) -> io::Result<()>
@@ -1150,6 +1320,7 @@ impl SnapshotArtifact {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn remove_identity_bound_snapshot_artifact(
     cleanup: &mut SnapshotArtifactCleanupState,
     expected: Option<SnapshotArtifactIdentity>,
@@ -1341,8 +1512,6 @@ fn remove_identity_bound_snapshot_artifact(
             snapshot_artifact_cleanup_after_final_identity_before_unlink(&tombstone, &guard);
             #[cfg(unix)]
             {
-                use nix::fcntl::{renameat2, RenameFlags};
-
                 match namespace {
                     Some(namespace) => namespace.rename_noreplace(
                         tombstone.file_name().ok_or_else(|| {
@@ -1366,7 +1535,7 @@ fn remove_identity_bound_snapshot_artifact(
                             )
                         })?;
                         let directory = std::fs::File::open(parent)?;
-                        renameat2(
+                        rename_noreplace_in_directory(
                             &directory,
                             tombstone.file_name().ok_or_else(|| {
                                 io::Error::new(
@@ -1374,16 +1543,13 @@ fn remove_identity_bound_snapshot_artifact(
                                     "snapshot tombstone has no name",
                                 )
                             })?,
-                            &directory,
                             guard.file_name().ok_or_else(|| {
                                 io::Error::new(
                                     io::ErrorKind::InvalidInput,
                                     "snapshot unlink guard has no name",
                                 )
                             })?,
-                            RenameFlags::RENAME_NOREPLACE,
-                        )
-                        .map_err(io::Error::from)?;
+                        )?;
                     }
                 }
             }
@@ -1423,8 +1589,6 @@ fn remove_identity_bound_snapshot_artifact(
                 };
                 #[cfg(unix)]
                 {
-                    use nix::fcntl::{renameat2, RenameFlags};
-
                     let restored = match namespace {
                         Some(namespace) => namespace.rename_noreplace(
                             guard.file_name().ok_or_else(|| {
@@ -1448,7 +1612,7 @@ fn remove_identity_bound_snapshot_artifact(
                                 )
                             })?;
                             let directory = std::fs::File::open(parent)?;
-                            renameat2(
+                            rename_noreplace_in_directory(
                                 &directory,
                                 guard.file_name().ok_or_else(|| {
                                     io::Error::new(
@@ -1456,16 +1620,13 @@ fn remove_identity_bound_snapshot_artifact(
                                         "snapshot unlink guard has no name",
                                     )
                                 })?,
-                                &directory,
                                 tombstone.file_name().ok_or_else(|| {
                                     io::Error::new(
                                         io::ErrorKind::InvalidInput,
                                         "snapshot tombstone has no name",
                                     )
                                 })?,
-                                RenameFlags::RENAME_NOREPLACE,
                             )
-                            .map_err(io::Error::from)
                         }
                     };
                     if restored.is_ok() {
@@ -1506,6 +1667,18 @@ fn remove_identity_bound_snapshot_artifact(
     }
     cleanup.location = SnapshotArtifactCleanupLocation::Unlinked;
     sync_parent()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_identity_bound_snapshot_artifact(
+    _cleanup: &mut SnapshotArtifactCleanupState,
+    _expected: Option<SnapshotArtifactIdentity>,
+    _namespace: Option<&RetainedSnapshotDirectory>,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "identity-bound snapshot cleanup requires Linux",
+    ))
 }
 
 impl Drop for SnapshotArtifactState {
@@ -2000,15 +2173,48 @@ impl LiveTerminalRecoveryHandoffConsumer {
 
     /// Reconcile the recovery sidecar observed by this already-open core.
     ///
-    /// A pending slot left by a cancelled or failed prior attempt is retried
-    /// through validation without replacing its retained classifier evidence.
-    /// A valid Active sidecar remains a closed recovery gate; malformed
-    /// terminal evidence remains a typed `CorruptState` error.
+    /// Clear and Active observations re-prove the SQLite descriptor/path
+    /// binding and sidecar state without contending on snapshot work. Any
+    /// terminal evidence, and a pending slot left by a cancelled or failed
+    /// prior attempt, enters the existing gate-held validation path without
+    /// replacing retained classifier evidence. A valid Active sidecar remains
+    /// closed; malformed terminal evidence remains `CorruptState`.
     pub(crate) async fn reconcile(
         &self,
     ) -> Result<LiveTerminalRecoveryHandoffState, SessionConsensusStorageError> {
+        if !self.core.terminal_recovery_handoff_pending()? {
+            match self.probe_live_recovery_handoff().await? {
+                consensus::LiveTerminalRecoveryHandoffProbe::Clear => {
+                    return Ok(LiveTerminalRecoveryHandoffState::Clear);
+                }
+                consensus::LiveTerminalRecoveryHandoffProbe::Active => {
+                    return Ok(LiveTerminalRecoveryHandoffState::Active);
+                }
+                consensus::LiveTerminalRecoveryHandoffProbe::TerminalNeedsSnapshot => {}
+            }
+        }
         let gate = self.acquire_gate().await?;
+        #[cfg(test)]
+        observe_live_terminal_recovery_full_reconciliation();
         self.reconcile_with_gate(&gate).await
+    }
+
+    /// Observe a nonterminal recovery state without selecting a snapshot.
+    /// The SQLite helper repeats the VFS-descriptor/public-path binding and
+    /// final sidecar absence fence on every Clear result; callers therefore
+    /// never reuse a cached readiness decision.
+    async fn probe_live_recovery_handoff(
+        &self,
+    ) -> Result<consensus::LiveTerminalRecoveryHandoffProbe, SessionConsensusStorageError> {
+        let database = self
+            .core
+            .database_file
+            .as_ref()
+            .map(|file| file.path())
+            .ok_or(SessionConsensusStorageError::CorruptState)?;
+        let conn = self.core.conn.lock().await;
+        consensus::probe_live_terminal_recovery_handoff_with_connection_sync(database, &conn)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)
     }
 
     /// Reconcile while the caller retains this core's snapshot transaction
@@ -4317,7 +4523,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
         } else {
             None
         };
-        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
+        let mut prune_preemption = Some(self.core.request_consensus_log_prune_preemption().await);
         let conn = live_terminal_consumer
             .acquire_publication_connection(&snapshot_gate)
             .await
@@ -4400,10 +4606,33 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 }
             }
         };
+        // `acquire_publication_connection()` intentionally holds this guard
+        // through the irreversible replacement transaction.  That boundary
+        // is complete now; retaining the named guard through post-commit
+        // diagnostics would self-deadlock on the diagnostic re-lock below,
+        // and would also strand OpenRaft's concurrently dispatched PurgeLog.
+        drop(conn);
         let (previous, previous_artifact) = match install_result {
             Ok(previous) => previous,
             Err(error) => return Err(error),
         };
+        // OpenRaft may enqueue PurgeLog immediately after dispatching this
+        // install to its independent state-machine worker.  The replacement
+        // transaction has now committed both the installed applied frontier
+        // and the snapshot's exact logical purge floor, so it is safe to
+        // release that waiter before best-effort diagnostics or artifact
+        // reclamation.  Those follow-up steps cannot revoke the committed
+        // coverage contract.
+        self.core.applied_progress.send_replace(meta.last_log_id);
+        // The fixed-profile prune lane permit protects the replacement
+        // transaction itself, not post-commit diagnostics or staging-file
+        // cleanup.  OpenRaft may already be awaiting the matching PurgeLog on
+        // its core worker; retaining this non-reentrant permit after the
+        // durable applied/snapshot/purge frontiers are committed would make
+        // that purge wait on this install's return path.
+        drop(prune_preemption.take());
+        #[cfg(test)]
+        wait_after_snapshot_install_applied_progress(self.core.snapshot_dir.as_ref()).await;
         if let Some(diagnostics) = &self.core.diagnostics {
             let conn = self.core.conn.lock().await;
             match consensus::protected_roster_diagnostic_occupancy_sync(
@@ -4415,9 +4644,6 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             }
         }
         self.core.signal_proactive_checkpoint();
-        // The readback helper has disarmed the exact published-file guard, so
-        // later staging reclamation cannot delete the authoritative image.
-        self.core.applied_progress.send_replace(meta.last_log_id);
         raw_artifact.remove().await.map_err(|error| {
             storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
@@ -4425,15 +4651,19 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 error,
             )
         })?;
-        remove_old_snapshot(previous, &file_name, previous_artifact)
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Write,
-                    error,
-                )
-            })?;
+        remove_old_snapshot(
+            previous,
+            &file_name,
+            previous_artifact.map(RetainedCurrentSnapshotArtifact::into_cleanup_artifact),
+        )
+        .await
+        .map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                error,
+            )
+        })?;
         Ok(())
     }
 
@@ -5223,15 +5453,19 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         // Every raw/vacuum staging pin either dropped during SQLite
         // finalization or transferred its exact cleanup guard to
         // `published_cleanup`; no separate pathname artifact may race it.
-        remove_old_snapshot(previous, &file_name, previous_artifact)
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Write,
-                    error,
-                )
-            })?;
+        remove_old_snapshot(
+            previous,
+            &file_name,
+            previous_artifact.map(RetainedCurrentSnapshotArtifact::into_cleanup_artifact),
+        )
+        .await
+        .map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                error,
+            )
+        })?;
         let snapshot = if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
             // The descriptor was sealed, measured, scanned, and bound before
             // metadata publication. Return that exact descriptor: reopening
@@ -5350,6 +5584,7 @@ fn secure_snapshot_create_file(path: &Path) -> io::Result<std::fs::File> {
     options.open(path)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn open_snapshot_nofollow_read(path: &Path) -> io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -5943,7 +6178,7 @@ async fn track_previous_snapshot_artifact(
     cleanup_failed: Arc<AtomicBool>,
     authority_profile: ConsensusAuthorityProfile,
     namespace_lease: Arc<SnapshotDirectoryLease>,
-) -> io::Result<Option<SnapshotArtifact>> {
+) -> io::Result<Option<RetainedCurrentSnapshotArtifact>> {
     let Some((_, file_name, expected_checksum, expected_length)) = previous.as_ref() else {
         return Ok(None);
     };
@@ -6003,7 +6238,7 @@ async fn track_previous_snapshot_artifact(
     artifact.retain_namespace_lease(namespace_lease)?;
     // `record_identity_from_file` owns an exact duplicate, retaining it
     // through successor metadata publication and identity-bound cleanup.
-    Ok(Some(artifact))
+    Ok(Some(RetainedCurrentSnapshotArtifact::new(artifact)))
 }
 
 /// Publish one already-durable snapshot file without deleting it after an
@@ -8535,8 +8770,9 @@ mod tests {
 
         let gate = Arc::new(SnapshotArtifactGate::new());
         gate.arm();
-        let _gate_guard =
-            PromotedVerifyGateGuard::install(target_snapshot_directory.clone(), Arc::clone(&gate));
+        let hook_directory =
+            snapshot_namespace_test_hook_directory(&target._snapshot_directory_lease);
+        let _gate_guard = PromotedVerifyGateGuard::install(hook_directory, Arc::clone(&gate));
         assert!(
             tokio::time::timeout(
                 Duration::from_secs(1),
@@ -8781,8 +9017,68 @@ mod tests {
             .to_path_buf()
     }
 
+    /// Owns the separate native SQLite and fs-verity snapshot roots used by
+    /// every fixed-profile raw-store fixture. The two roots must outlive the
+    /// store together so cancellation and panic still clean both namespaces.
+    struct FixedRawReadStoreFixture {
+        database: tempfile::TempDir,
+        snapshots: tempfile::TempDir,
+    }
+
+    impl FixedRawReadStoreFixture {
+        fn new() -> Self {
+            Self {
+                database: tempfile::Builder::new()
+                    .prefix("fixed-raw-read-database-")
+                    .tempdir()
+                    .expect("create fixed raw-read database directory"),
+                snapshots: fs_verity_snapshot_tempdir("fixed-raw-read-snapshots-"),
+            }
+        }
+
+        fn snapshot_path(&self) -> &Path {
+            self.snapshots.path()
+        }
+    }
+
+    impl std::ops::Deref for FixedRawReadStoreFixture {
+        type Target = tempfile::TempDir;
+
+        fn deref(&self) -> &Self::Target {
+            &self.database
+        }
+    }
+
+    fn fs_verity_snapshot_tempdir(prefix: &str) -> tempfile::TempDir {
+        const QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
+        const SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+
+        let qualification_required = std::env::var_os(QUALIFICATION_ENV).as_deref()
+            == Some(std::ffi::OsStr::new("required"));
+        match std::env::var_os(SNAPSHOT_ROOT_ENV) {
+            Some(root) => {
+                let root = PathBuf::from(root);
+                assert!(
+                    root.is_absolute(),
+                    "{SNAPSHOT_ROOT_ENV} must be an absolute fs-verity snapshot root"
+                );
+                tempfile::Builder::new()
+                    .prefix(prefix)
+                    .tempdir_in(root)
+                    .expect("create fs-verity snapshot fixture directory")
+            }
+            None if qualification_required => {
+                panic!("required fs-verity qualification requires {SNAPSHOT_ROOT_ENV}")
+            }
+            None => tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir()
+                .expect("create local snapshot fixture directory"),
+        }
+    }
+
     async fn open_fixed_raw_read_store(
-        directory: &tempfile::TempDir,
+        directory: &FixedRawReadStoreFixture,
     ) -> (
         SqliteConsensusLogStore,
         SqliteConsensusStateMachine,
@@ -8792,7 +9088,7 @@ mod tests {
     }
 
     async fn open_fixed_raw_read_store_with_diagnostics(
-        directory: &tempfile::TempDir,
+        directory: &FixedRawReadStoreFixture,
         diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
     ) -> (
         SqliteConsensusLogStore,
@@ -8808,7 +9104,7 @@ mod tests {
         let members = fixed_raw_read_members();
         let core = SqliteConsensusCore::initialize(
             &backend,
-            directory.path().join("fixed-raw-read-snapshots"),
+            directory.snapshot_path().join("fixed-raw-read-snapshots"),
             identity(1),
             members.clone(),
             fixed_raw_read_bindings(&members),
@@ -8875,7 +9171,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    async fn prepare_dormant_fixed_prune_backlog(directory: &tempfile::TempDir) {
+    async fn prepare_dormant_fixed_prune_backlog(directory: &FixedRawReadStoreFixture) {
         let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(directory).await;
         let lane = state_machine
             .core
@@ -8896,7 +9192,9 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    async fn prepare_dormant_fixed_prune_backlog_with_next_log(directory: &tempfile::TempDir) {
+    async fn prepare_dormant_fixed_prune_backlog_with_next_log(
+        directory: &FixedRawReadStoreFixture,
+    ) {
         let (mut log_store, mut state_machine, _) = open_fixed_raw_read_store(directory).await;
         let lane = state_machine
             .core
@@ -8923,7 +9221,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pristine_fixed_store_prune_recovery_never_takes_sqlite_writer() {
-        let directory = tempfile::tempdir().expect("pristine fixed prune directory");
+        let directory = FixedRawReadStoreFixture::new();
         let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
             directory.path(),
         );
@@ -8968,7 +9266,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_prune_yields_writer_to_later_adapter_append_and_resumes() {
-        let directory = tempfile::tempdir().expect("fixed prune priority directory");
+        let directory = FixedRawReadStoreFixture::new();
         prepare_dormant_fixed_prune_backlog(&directory).await;
         // The gate is captured when the reopened lane starts. Its startup turn
         // now has eligible physical work, so this one-shot gate cannot be
@@ -9031,7 +9329,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_prune_preempts_for_state_machine_apply_without_applied_lag() {
-        let directory = tempfile::tempdir().expect("fixed prune apply priority directory");
+        let directory = FixedRawReadStoreFixture::new();
         prepare_dormant_fixed_prune_backlog_with_next_log(&directory).await;
         let gate = consensus::ConsensusLogPruneTurnGateForTest::install_after_writer_acquired(
             directory.path(),
@@ -9171,7 +9469,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_prune_defers_for_primary_priority_claimed_before_active_turn() {
-        let directory = tempfile::tempdir().expect("fixed prune pre-active priority directory");
+        let directory = FixedRawReadStoreFixture::new();
         let gate = consensus::ConsensusLogPruneTurnGateForTest::install_before_active_interrupt(
             directory.path(),
         );
@@ -9229,7 +9527,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_primary_waiting_for_prune_turn_releases_priority() {
-        let directory = tempfile::tempdir().expect("fixed prune cancellation directory");
+        let directory = FixedRawReadStoreFixture::new();
         prepare_dormant_fixed_prune_backlog(&directory).await;
         let gate = consensus::ConsensusLogPruneTurnGateForTest::install_before_authority_read(
             directory.path(),
@@ -9545,7 +9843,7 @@ mod tests {
     #[test]
     fn fixed_prepublication_descriptor_scan_accepts_one_valid_bounded_envelope_and_rejects_tampering(
     ) {
-        let directory = tempfile::tempdir().expect("fixed prepublication fixture directory");
+        let directory = fs_verity_snapshot_tempdir("fixed-prepublication-fixture-");
         let payload = b"fixed prepublication envelope";
         let checksum = fixture_checksum(payload);
         let length =
@@ -9761,7 +10059,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_prepublication_seal_rejects_writes_without_blocking_primary_connection() {
-        let directory = tempfile::tempdir().expect("fixed mutation directory");
+        let directory = FixedRawReadStoreFixture::new();
         let (_, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
         state_machine
             .apply([fixed_initial_membership_entry()])
@@ -9827,7 +10125,7 @@ mod tests {
 
     #[tokio::test]
     async fn fixed_restart_rejects_a_byte_identical_unsealed_snapshot_replacement() {
-        let directory = tempfile::tempdir().expect("fixed restart directory");
+        let directory = FixedRawReadStoreFixture::new();
         let (_, mut state_machine, database) = open_fixed_raw_read_store(&directory).await;
         state_machine
             .apply([fixed_initial_membership_entry()])
@@ -9867,7 +10165,7 @@ mod tests {
         let backend = SqliteSessionBackend::open(&database).expect("reopen fixed backend");
         let reopened = match SqliteConsensusCore::initialize(
             &backend,
-            directory.path().join("fixed-raw-read-snapshots"),
+            directory.snapshot_path().join("fixed-raw-read-snapshots"),
             identity(1),
             members.clone(),
             fixed_raw_read_bindings(&members),
@@ -9896,7 +10194,7 @@ mod tests {
     async fn fixed_snapshot_builder_returns_the_sealed_descriptor_after_pathname_replacement() {
         use std::os::fd::AsFd as _;
 
-        let directory = tempfile::tempdir().expect("fixed return descriptor directory");
+        let directory = FixedRawReadStoreFixture::new();
         let (_, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
         state_machine
             .apply([fixed_initial_membership_entry()])
@@ -9905,10 +10203,9 @@ mod tests {
 
         let gate = Arc::new(SnapshotArtifactGate::new());
         gate.arm();
-        let _gate_guard = FixedSnapshotReturnGateGuard::install(
-            state_machine.core.snapshot_dir.as_ref().clone(),
-            Arc::clone(&gate),
-        );
+        let hook_directory =
+            snapshot_namespace_test_hook_directory(&state_machine._snapshot_directory_lease);
+        let _gate_guard = FixedSnapshotReturnGateGuard::install(hook_directory, Arc::clone(&gate));
         let mut builder = state_machine.get_snapshot_builder().await;
         let build = tokio::spawn(async move { builder.build_snapshot().await });
         tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
@@ -9960,7 +10257,7 @@ mod tests {
 
     #[tokio::test]
     async fn fixed_snapshot_install_seals_the_extracted_database_and_envelope() {
-        let source_directory = tempfile::tempdir().expect("fixed source directory");
+        let source_directory = FixedRawReadStoreFixture::new();
         let (_, mut source, _) = open_fixed_raw_read_store(&source_directory).await;
         source
             .apply([fixed_initial_membership_entry()])
@@ -9972,7 +10269,7 @@ mod tests {
             .await
             .expect("build fixed source snapshot");
 
-        let target_directory = tempfile::tempdir().expect("fixed target directory");
+        let target_directory = FixedRawReadStoreFixture::new();
         let (_, mut target, _) = open_fixed_raw_read_store(&target_directory).await;
         target
             .apply([fixed_initial_membership_entry()])
@@ -10010,7 +10307,7 @@ mod tests {
         // profile at all. Production qualification runs this exact test on a
         // verity-capable filesystem; a capability absence is not a storage
         // capacity result.
-        let probe_directory = tempfile::tempdir().expect("fixed capacity verity probe");
+        let probe_directory = fs_verity_snapshot_tempdir("fixed-capacity-verity-probe-");
         let probe_path = probe_directory.path().join("probe");
         let probe = std::fs::OpenOptions::new()
             .create_new(true)
@@ -10032,7 +10329,7 @@ mod tests {
         }
 
         async fn run(foreign_entries: usize) -> bool {
-            let source_dir = tempfile::tempdir().expect("fixed capacity source");
+            let source_dir = FixedRawReadStoreFixture::new();
             let (_, mut source, _) = open_fixed_raw_read_store(&source_dir).await;
             source
                 .apply([fixed_initial_membership_entry()])
@@ -10044,7 +10341,7 @@ mod tests {
                 .await
                 .expect("fixed capacity source snapshot");
 
-            let target_dir = tempfile::tempdir().expect("fixed capacity target");
+            let target_dir = FixedRawReadStoreFixture::new();
             let (_, mut target, _) = open_fixed_raw_read_store(&target_dir).await;
             target
                 .apply([fixed_initial_membership_entry()])
@@ -10092,7 +10389,7 @@ mod tests {
     async fn fixed_install_uses_one_sealed_envelope_for_publication_and_database_extraction() {
         use std::io::{Seek as _, Write as _};
 
-        let source_directory = tempfile::tempdir().expect("fixed source directory");
+        let source_directory = FixedRawReadStoreFixture::new();
         let (_, mut source, _) = open_fixed_raw_read_store(&source_directory).await;
         source
             .apply([fixed_initial_membership_entry()])
@@ -10141,7 +10438,7 @@ mod tests {
             "the hostile writer must be able to alternate valid same-length envelopes"
         );
 
-        let target_directory = tempfile::tempdir().expect("fixed target directory");
+        let target_directory = FixedRawReadStoreFixture::new();
         let (_, mut target, _) = open_fixed_raw_read_store(&target_directory).await;
         target
             .apply([fixed_initial_membership_entry()])
@@ -10214,7 +10511,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_prepublication_descriptor_scan_does_not_block_consensus_reads_or_writes() {
-        let directory = tempfile::tempdir().expect("fixed scan contention directory");
+        let directory = FixedRawReadStoreFixture::new();
         let (_, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
         state_machine
             .apply([fixed_initial_membership_entry()])
@@ -10280,7 +10577,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_fixed_prepublication_scan_retains_snapshot_worker_ownership() {
-        let directory = tempfile::tempdir().expect("fixed scan cancellation directory");
+        let directory = FixedRawReadStoreFixture::new();
         let (_, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
         state_machine
             .apply([fixed_initial_membership_entry()])
@@ -10339,7 +10636,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fixed_prepublication_observer_is_directory_scoped_and_counts_one_successful_build() {
-        let observed_directory = tempfile::tempdir().expect("observed fixed build directory");
+        let observed_directory = FixedRawReadStoreFixture::new();
         let (_, mut observed_state_machine, _) =
             open_fixed_raw_read_store(&observed_directory).await;
         observed_state_machine
@@ -10347,7 +10644,7 @@ mod tests {
             .await
             .expect("apply observed fixed membership");
 
-        let unrelated_directory = tempfile::tempdir().expect("unrelated fixed build directory");
+        let unrelated_directory = FixedRawReadStoreFixture::new();
         let (_, mut unrelated_state_machine, _) =
             open_fixed_raw_read_store(&unrelated_directory).await;
         unrelated_state_machine
@@ -10461,7 +10758,7 @@ mod tests {
             "UPDATE consensus_identity SET fixed_placement_policy = 1 WHERE singleton = 1",
             "UPDATE consensus_membership_scope SET application_authority_epoch = application_authority_epoch + 1 WHERE singleton = 1",
         ] {
-            let directory = tempfile::tempdir().expect("fixed raw-read directory");
+            let directory = FixedRawReadStoreFixture::new();
             let (mut log_store, mut state_machine, database) =
                 open_fixed_raw_read_store(&directory).await;
             let connection = rusqlite::Connection::open(database).expect("open fixed raw-read db");
@@ -10687,6 +10984,222 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("covered log count")
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_publishes_applied_frontier_before_concurrent_purge() {
+        let source_dir = tempfile::tempdir().expect("snapshot source directory");
+        let source_backend = SqliteSessionBackend::open(source_dir.path().join("sessions.sqlite"))
+            .expect("snapshot source backend");
+        let (_, mut source) = open(
+            &source_backend,
+            source_dir.path().join("snapshots"),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("snapshot source storage");
+        let membership = initial_membership_entry();
+        let command = normal_entry(1, advance_time_command(identity(1), 16, 1));
+        source
+            .apply([membership.clone(), command.clone()])
+            .await
+            .expect("apply source snapshot cut");
+        let mut built = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("build source snapshot");
+
+        let target_dir = tempfile::tempdir().expect("snapshot target directory");
+        let target_backend = SqliteSessionBackend::open(target_dir.path().join("sessions.sqlite"))
+            .expect("snapshot target backend");
+        let target_snapshot_dir = target_dir.path().join("snapshots");
+        let (mut log_store, mut target) = open(
+            &target_backend,
+            target_snapshot_dir,
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("snapshot target storage");
+        {
+            let conn = target.core.conn.lock().await;
+            consensus::append_logs_sync(&conn, identity(1), &[membership, command])
+                .expect("append target snapshot-covered logs");
+        }
+        let mut receiving = target
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin target snapshot receive");
+        built
+            .snapshot
+            .rewind()
+            .await
+            .expect("rewind source snapshot");
+        tokio::io::copy(&mut built.snapshot, &mut receiving)
+            .await
+            .expect("stream source snapshot");
+        receiving.flush().await.expect("flush target snapshot");
+
+        // Model OpenRaft's command ordering: its core invokes PurgeLog while
+        // InstallFullSnapshot is still executing on the independent
+        // state-machine worker.
+        let purge = tokio::spawn(async move { log_store.purge(log_id(1)).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while target.core.applied_progress.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("concurrent purge subscribes before snapshot publication");
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let _gate_guard = SnapshotInstallAppliedProgressGateGuard::install(
+            target.core.snapshot_dir.as_ref().clone(),
+            Arc::clone(&gate),
+        );
+        let meta = built.meta.clone();
+        let mut installer = target.clone();
+        let install =
+            tokio::spawn(async move { installer.install_snapshot(&meta, receiving).await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("snapshot install commits and publishes its applied frontier");
+        assert_eq!(
+            Some(log_id(1)),
+            *target.core.applied_progress.borrow(),
+            "the gate is reached only after the durable installed frontier is published"
+        );
+        let post_commit_connection =
+            tokio::time::timeout(Duration::from_secs(1), target.core.conn.lock())
+                .await
+                .expect("post-commit snapshot work releases the publication connection");
+        drop(post_commit_connection);
+        gate.release();
+        install
+            .await
+            .expect("snapshot install task")
+            .expect("snapshot install succeeds");
+        purge
+            .await
+            .expect("purge task")
+            .expect("purge succeeds once the installed frontier is durable");
+
+        let conn = target.core.conn.lock().await;
+        assert_eq!(
+            Some(log_id(1)),
+            consensus::read_applied_sync(&conn, identity(1)).expect("installed applied frontier")
+        );
+        assert_eq!(
+            Some(log_id(1)),
+            consensus::read_purged_sync(&conn, identity(1)).expect("installed purge floor")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixed_snapshot_install_publishes_applied_frontier_before_concurrent_purge() {
+        let source_directory = FixedRawReadStoreFixture::new();
+        let (_, mut source, _) = open_fixed_raw_read_store(&source_directory).await;
+        let membership = fixed_initial_membership_entry();
+        let command = blank_entry(1);
+        source
+            .apply([membership.clone(), command.clone()])
+            .await
+            .expect("apply fixed source snapshot cut");
+        let mut built = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("build fixed source snapshot");
+
+        let target_directory = FixedRawReadStoreFixture::new();
+        let (mut log_store, mut target, _) = open_fixed_raw_read_store(&target_directory).await;
+        target
+            .apply([membership.clone()])
+            .await
+            .expect("apply fixed target predecessor");
+        log_store
+            .blocking_append([membership])
+            .await
+            .expect("append the only retained fixed target predecessor");
+        let mut receiving = target
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin fixed target snapshot receive");
+        built
+            .snapshot
+            .seek(io::SeekFrom::Start(0))
+            .await
+            .expect("rewind fixed source snapshot");
+        tokio::io::copy(&mut built.snapshot, &mut receiving)
+            .await
+            .expect("stream fixed source snapshot");
+        receiving
+            .flush()
+            .await
+            .expect("flush fixed target snapshot");
+
+        // This is the OpenRaft interleaving from the production failure: its
+        // core is already awaiting PurgeLog(1) while the independent
+        // state-machine worker installs the snapshot that establishes applied
+        // coverage for that exact LogId.
+        let purge = tokio::spawn(async move { log_store.purge(log_id(1)).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while target.core.applied_progress.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixed concurrent purge subscribes before snapshot publication");
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let _gate_guard = SnapshotInstallAppliedProgressGateGuard::install(
+            target.core.snapshot_dir.as_ref().clone(),
+            Arc::clone(&gate),
+        );
+        let meta = built.meta.clone();
+        let mut installer = target.clone();
+        let install =
+            tokio::spawn(async move { installer.install_snapshot(&meta, receiving).await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("fixed snapshot install commits and publishes its applied frontier");
+        assert_eq!(
+            Some(log_id(1)),
+            *target.core.applied_progress.borrow(),
+            "the fixed gate is reached only after the durable installed frontier is published"
+        );
+        let post_commit_connection =
+            tokio::time::timeout(Duration::from_secs(1), target.core.conn.lock())
+                .await
+                .expect("fixed post-commit snapshot work releases the publication connection");
+        drop(post_commit_connection);
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), install)
+            .await
+            .expect("fixed snapshot install completes after the test gate")
+            .expect("fixed snapshot install task")
+            .expect("fixed snapshot install succeeds");
+        tokio::time::timeout(Duration::from_secs(5), purge)
+            .await
+            .expect("fixed purge completes after the installed frontier is durable")
+            .expect("fixed purge task")
+            .expect("fixed purge succeeds once the installed frontier is durable");
+
+        let conn = target.core.conn.lock().await;
+        assert_eq!(
+            Some(log_id(1)),
+            consensus::read_applied_sync(&conn, identity(1))
+                .expect("fixed installed applied frontier")
+        );
+        assert_eq!(
+            Some(log_id(1)),
+            consensus::read_purged_sync(&conn, identity(1)).expect("fixed installed purge floor")
         );
     }
 
@@ -11222,13 +11735,20 @@ mod tests {
                 timestamp(2),
             )
             .expect("advanced digest");
+        let advanced_entry = normal_entry(2, advanced);
+        let advanced_log_id = advanced_entry.log_id;
+        {
+            let conn = target_sm.core.conn.lock().await;
+            consensus::append_logs_sync(&conn, identity(1), std::slice::from_ref(&advanced_entry))
+                .expect("persist exact advanced log before committed floor");
+        }
         target_sm
-            .apply([normal_entry(2, advanced)])
+            .apply([advanced_entry])
             .await
             .expect("advance target beyond snapshot");
         {
             let conn = target_sm.core.conn.lock().await;
-            consensus::save_committed_sync(&conn, identity(1), Some(log_id(2)))
+            consensus::save_committed_sync(&conn, identity(1), Some(advanced_log_id))
                 .expect("persist newer committed floor");
         }
         let mut stale_receiving = target_sm
@@ -11346,6 +11866,7 @@ mod tests {
         file.sync_all().await.expect("sync corruption");
         assert!(target_sm.get_current_snapshot().await.is_err());
         drop(file);
+        drop(target_sm);
         let reopen_error = match open(
             &target_backend,
             target_dir.path().join("snapshots"),
@@ -12554,6 +13075,130 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn live_terminal_reconciliation_skips_snapshot_selection_until_terminal_evidence() {
+        let directory = tempfile::tempdir().expect("live terminal probe directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshots = directory.path().join("snapshots");
+        let backend = SqliteSessionBackend::open(&database).expect("open live terminal backend");
+        let (log_store, mut state_machine) =
+            open(&backend, snapshots.clone(), identity(1), expected_members())
+                .await
+                .expect("open live terminal storage");
+        state_machine
+            .apply([initial_membership_entry()])
+            .await
+            .expect("apply membership before snapshot");
+        let mut snapshot_builder = state_machine.get_snapshot_builder().await;
+        let built_snapshot = snapshot_builder
+            .build_snapshot()
+            .await
+            .expect("build current snapshot for terminal fixture");
+        drop(built_snapshot);
+        drop(snapshot_builder);
+
+        let terminal_snapshot = {
+            let conn = state_machine.core.conn.lock().await;
+            let (_, file_name, _, _) =
+                consensus::read_current_snapshot_sync(&conn, state_machine.core.storage_identity)
+                    .expect("read current terminal fixture snapshot")
+                    .expect("current terminal fixture snapshot");
+            let path = snapshots.join(file_name);
+            let file = std::fs::File::open(&path).expect("open current terminal fixture snapshot");
+            consensus::operator_recovery_terminal_snapshot(&path, &file, false)
+                .expect("bind current terminal fixture snapshot")
+        };
+        let consumer = log_store.live_terminal_recovery_handoff_consumer();
+        let observer = LiveTerminalRecoveryFullReconciliationObserver::install();
+
+        assert_eq!(
+            LiveTerminalRecoveryHandoffState::Clear,
+            consumer
+                .reconcile()
+                .await
+                .expect("clear probe revalidates application authority"),
+            "clear steady state does not enter snapshot reconciliation"
+        );
+        assert_eq!(
+            0,
+            observer.full_reconciliations(),
+            "clear steady state must not select, open, or classify the current snapshot"
+        );
+
+        let latch = consensus::OperatorRecoveryLatch {
+            identity: identity(1),
+            recovery_epoch: 1,
+            plan_digest: [0xA9; 32],
+            audit_pending: false,
+        };
+        {
+            let conn = state_machine.core.conn.lock().await;
+            consensus::mark_operator_recovery_pending_sync(&conn, identity(1), 1, [0xA9; 32])
+                .expect("mark terminal fixture recovery pending");
+        }
+        consensus::ensure_operator_recovery_latch_sync(&database, latch)
+            .expect("publish active terminal fixture latch");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffState::Active,
+            consumer
+                .reconcile()
+                .await
+                .expect("active probe remains closed without snapshot work")
+        );
+        assert_eq!(
+            0,
+            observer.full_reconciliations(),
+            "an active sidecar remains closed without current snapshot selection"
+        );
+
+        {
+            let conn = state_machine.core.conn.lock().await;
+            assert_eq!(
+                consensus::OperatorRecoveryApply::Applied,
+                consensus::finalize_operator_recovery_sync(
+                    &conn,
+                    identity(1),
+                    1,
+                    [0xA9; 32],
+                    consensus::observed_fence_high_water_sync(&conn)
+                        .expect("read terminal fixture fence high-water"),
+                    consensus::observed_credential_high_water_sync(&conn)
+                        .expect("read terminal fixture credential high-water"),
+                )
+                .expect("finalize terminal fixture recovery")
+            );
+        }
+        let database_file = std::fs::File::open(&database).expect("open terminal fixture database");
+        consensus::terminalize_operator_recovery_latch_sync(
+            &database,
+            latch,
+            &database_file,
+            Some(terminal_snapshot),
+        )
+        .expect("publish pending terminal fixture handoff");
+        drop(database_file);
+
+        assert_eq!(
+            LiveTerminalRecoveryHandoffState::Consumed,
+            consumer
+                .reconcile()
+                .await
+                .expect("terminal evidence enters full snapshot reconciliation")
+        );
+        assert_eq!(
+            1,
+            observer.full_reconciliations(),
+            "terminal evidence must select/open/classify the retained current snapshot"
+        );
+        assert!(
+            !state_machine
+                .core
+                .terminal_recovery_handoff_pending_for_test(),
+            "the terminal path completes descriptor-bound handoff consumption"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn live_terminal_handoff_consumer_retains_d1_after_active_terminalization() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -12912,7 +13557,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn fixed_terminal_snapshot_handoff_measures_the_retained_descriptor_then_consumes() {
-        let directory = tempfile::tempdir().expect("fixed terminal handoff directory");
+        let directory = FixedRawReadStoreFixture::new();
         let (mut log, mut state_machine, database) = open_fixed_raw_read_store(&directory).await;
         let membership = fixed_initial_membership_entry();
         let membership_log_id = membership.log_id;
@@ -12987,11 +13632,14 @@ mod tests {
         let members = fixed_raw_read_members();
         let backend =
             SqliteSessionBackend::open(&database).expect("classify fixed terminal handoff");
-        let configured_snapshot_directory = directory.path().join("fixed-raw-read-snapshots");
+        let configured_snapshot_directory =
+            directory.snapshot_path().join("fixed-raw-read-snapshots");
         let lease = acquire_snapshot_directory_lease(&backend, &configured_snapshot_directory)
             .await
             .expect("acquire fixed terminal retained namespace lease");
-        let detached_snapshot_directory = directory.path().join("fixed-raw-read-snapshots-old");
+        let detached_snapshot_directory = directory
+            .snapshot_path()
+            .join("fixed-raw-read-snapshots-old");
         std::fs::rename(&configured_snapshot_directory, &detached_snapshot_directory)
             .expect("detach terminal snapshot namespace after lease admission");
         std::fs::create_dir(&configured_snapshot_directory)

@@ -607,6 +607,20 @@ pub(crate) enum LiveTerminalRecoveryHandoffInstallOutcome {
     Clear,
 }
 
+/// Cheap descriptor-bound observation of a live recovery sidecar.
+///
+/// `Clear` is returned only after the SQLite main descriptor, configured
+/// database pathname, recovery rows, and repeated sidecar absence all agree.
+/// A terminal record deliberately remains unresolved here: its selected
+/// snapshot must be opened through the retained namespace and classified by
+/// the full handoff path before application traffic can proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveTerminalRecoveryHandoffProbe {
+    Clear,
+    Active,
+    TerminalNeedsSnapshot,
+}
+
 pub(crate) fn operator_recovery_terminal_snapshot(
     path: &Path,
     file: &File,
@@ -1282,6 +1296,95 @@ pub(crate) fn classify_operator_recovery_latch_with_connection_sync(
     )
 }
 
+/// Prove the cheap live-recovery state for one already-open SQLite core.
+///
+/// This does not select or open a current snapshot.  A terminal sidecar is
+/// therefore not admitted here; it is returned as `TerminalNeedsSnapshot` so
+/// the caller can take the snapshot transaction gate and run the existing
+/// descriptor-bound terminal classifier.  Clear remains a fresh, fail-closed
+/// observation on every call rather than an in-memory readiness cache.
+pub(crate) fn probe_live_terminal_recovery_handoff_with_connection_sync(
+    database: &Path,
+    connection: &Connection,
+) -> io::Result<LiveTerminalRecoveryHandoffProbe> {
+    #[cfg(target_os = "linux")]
+    {
+        if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+        {
+            return Err(invalid_data("session operator recovery descriptor moved"));
+        }
+        let database_file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
+            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?;
+        let incarnation = operator_recovery_file_incarnation(&database_file)?;
+        let path_file = open_nofollow_read(database)?;
+        if !path_file.metadata()?.is_file()
+            || operator_recovery_file_incarnation(&path_file)? != incarnation
+        {
+            return Err(invalid_data(
+                "session operator recovery pathname does not match SQLite descriptor",
+            ));
+        }
+
+        // Retain the descriptor across the final sidecar and database fences.
+        // The terminal branches intentionally stop here: their snapshot
+        // binding is proved only by the full retained-namespace path.
+        let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
+        let probe = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
+            Some(OperatorRecoveryLatchRecord::Active(latch)) => {
+                active_latch_is_coherent_with_connection(connection, *latch)?;
+                LiveTerminalRecoveryHandoffProbe::Active
+            }
+            Some(OperatorRecoveryLatchRecord::Terminal(_)) => {
+                LiveTerminalRecoveryHandoffProbe::TerminalNeedsSnapshot
+            }
+            None => {
+                ensure_absent_operator_recovery_latch_is_ready(connection)?;
+                LiveTerminalRecoveryHandoffProbe::Clear
+            }
+        };
+
+        // Preserve the classifier's final descriptor/path/sidecar fence for
+        // both Clear and Active.  In particular, a sidecar which appears
+        // after the first absent read must fail closed rather than becoming a
+        // cached Clear observation.
+        if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+        {
+            return Err(invalid_data("session operator recovery descriptor moved"));
+        }
+        let post_path_file = open_nofollow_read(database)?;
+        if !post_path_file.metadata()?.is_file()
+            || operator_recovery_file_incarnation(&post_path_file)? != incarnation
+        {
+            return Err(invalid_data(
+                "session operator recovery pathname changed during classification",
+            ));
+        }
+        #[cfg(test)]
+        run_latch_classify_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
+        match pinned_sidecar.as_mut() {
+            Some(sidecar) => revalidate_operator_recovery_latch_record_path(database, sidecar)?,
+            None => {
+                if read_operator_recovery_latch_record_pinned(database)?.is_some() {
+                    return Err(invalid_data(
+                        "session operator recovery latch appeared during classification",
+                    ));
+                }
+            }
+        }
+        revalidate_terminal_database_path_binding(database, connection, incarnation)?;
+        Ok(probe)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (database, connection);
+        Err(invalid_data(
+            "session operator recovery descriptor binding is unsupported",
+        ))
+    }
+}
+
 /// Classify a recovery latch while retaining the snapshot descriptor which an
 /// already-admitted snapshot-directory namespace supplied.  Normal backend
 /// admission has no retained namespace and delegates with `None`; a live
@@ -1317,7 +1420,10 @@ pub(crate) fn classify_operator_recovery_latch_with_connection_and_admitted_snap
         // It is only moved into a pending handoff after the final path fence.
         let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
         let latch = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
-            Some(OperatorRecoveryLatchRecord::Active(latch)) => Some(*latch),
+            Some(OperatorRecoveryLatchRecord::Active(latch)) => {
+                active_latch_is_coherent_with_connection(connection, *latch)?;
+                Some(*latch)
+            }
             Some(OperatorRecoveryLatchRecord::Terminal(terminal)) => {
                 let OperatorRecoveryTerminalRecord {
                     latch,
@@ -1366,32 +1472,7 @@ pub(crate) fn classify_operator_recovery_latch_with_connection_and_admitted_snap
                 }
             }
             None => {
-                // An absent sidecar means ready only for a database which has
-                // never entered operator recovery.  A crash after a durable
-                // recovery transition may otherwise turn sidecar removal or
-                // loss into accidental admission.
-                let has_identity =
-                    table_exists(connection, "consensus_identity").map_err(db_error)?;
-                let has_recovery =
-                    table_exists(connection, "consensus_operator_recovery").map_err(db_error)?;
-                if has_identity != has_recovery {
-                    return Err(invalid_data(
-                        "session operator recovery schema is incomplete",
-                    ));
-                }
-                if has_identity {
-                    let identity = read_storage_identity_sync(connection).map_err(|_| {
-                        invalid_data("session operator recovery identity is unavailable")
-                    })?;
-                    let recovery = read_operator_recovery_sync(connection, identity)?;
-                    if recovery.recovery_epoch != 0
-                        || recovery.last_plan_digest != [0; 32]
-                        || recovery.pending_epoch.is_some()
-                        || recovery.pending_plan_digest.is_some()
-                    {
-                        return Err(invalid_data("session operator recovery latch is missing"));
-                    }
-                }
+                ensure_absent_operator_recovery_latch_is_ready(connection)?;
                 None
             }
         };
@@ -1461,11 +1542,81 @@ pub(crate) fn classify_operator_recovery_latch_with_connection_and_admitted_snap
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (database, connection);
+        let _ = (database, connection, admitted_snapshot_file);
         Err(invalid_data(
             "session operator recovery descriptor binding is unsupported",
         ))
     }
+}
+
+/// An absent sidecar is ready only for a database that has never entered
+/// operator recovery. A crash after a durable recovery transition must not
+/// turn sidecar removal or loss into ordinary application admission.
+fn ensure_absent_operator_recovery_latch_is_ready(connection: &Connection) -> io::Result<()> {
+    let has_identity = table_exists(connection, "consensus_identity").map_err(db_error)?;
+    let has_recovery = table_exists(connection, "consensus_operator_recovery").map_err(db_error)?;
+    if has_identity != has_recovery {
+        return Err(invalid_data(
+            "session operator recovery schema is incomplete",
+        ));
+    }
+    if has_identity {
+        let identity = read_storage_identity_sync(connection)
+            .map_err(|_| invalid_data("session operator recovery identity is unavailable"))?;
+        let recovery = read_operator_recovery_sync(connection, identity)?;
+        if recovery.recovery_epoch != 0
+            || recovery.last_plan_digest != [0; 32]
+            || recovery.pending_epoch.is_some()
+            || recovery.pending_plan_digest.is_some()
+        {
+            return Err(invalid_data("session operator recovery latch is missing"));
+        }
+    }
+    Ok(())
+}
+
+/// An Active sidecar remains a closed readiness gate only while it names this
+/// exact durable recovery state.  Treat a stale or substituted identity,
+/// epoch, or plan digest as corruption rather than letting it masquerade as
+/// an ordinary active recovery hold.
+fn active_latch_is_coherent_with_connection(
+    connection: &Connection,
+    latch: OperatorRecoveryLatch,
+) -> io::Result<()> {
+    let has_identity = table_exists(connection, "consensus_identity").map_err(db_error)?;
+    let has_recovery = table_exists(connection, "consensus_operator_recovery").map_err(db_error)?;
+    if has_identity != has_recovery {
+        return Err(invalid_data(
+            "session operator recovery active schema is incomplete",
+        ));
+    }
+    if !has_identity {
+        // Recovery publishes the Active sidecar before migrating an admitted
+        // legacy database. With no current-schema authority to compare, that
+        // pinned sidecar remains the closed readiness gate; standalone
+        // traffic is still denied until recovery replaces the legacy image.
+        return Ok(());
+    }
+    let identity = read_storage_identity_sync(connection)
+        .map_err(|_| invalid_data("session operator recovery active identity is unavailable"))?;
+    if identity != latch.identity {
+        return Err(invalid_data(
+            "session operator recovery active identity does not match",
+        ));
+    }
+    let recovery = read_operator_recovery_sync(connection, identity)?;
+    let finalized_matches = recovery.recovery_epoch == latch.recovery_epoch
+        && recovery.last_plan_digest == latch.plan_digest
+        && recovery.pending_epoch.is_none()
+        && recovery.pending_plan_digest.is_none();
+    let pending_matches = recovery.pending_epoch == Some(latch.recovery_epoch)
+        && recovery.pending_plan_digest == Some(latch.plan_digest);
+    if !finalized_matches && !pending_matches {
+        return Err(invalid_data(
+            "session operator recovery active state is incoherent",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn active_operator_recovery_latch_sync(
@@ -19906,6 +20057,68 @@ fn validated_log_markers_sync(
     Ok(markers)
 }
 
+// This is deliberately local to the committed-log validation tests. It counts
+// decoded rows from the shared range reader, so the regression asserts the
+// actual selected SQL interval rather than a host-contended wall-clock time.
+#[cfg(test)]
+thread_local! {
+    static COMMITTED_LOG_VALIDATION_DECODED_ROWS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_committed_log_validation_decoded_rows_for_test() {
+    COMMITTED_LOG_VALIDATION_DECODED_ROWS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn committed_log_validation_decoded_rows_for_test() -> usize {
+    COMMITTED_LOG_VALIDATION_DECODED_ROWS.with(std::cell::Cell::get)
+}
+
+fn insert_validated_log_rows_in_range_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    start: u64,
+    end: u64,
+    witnesses: &mut BTreeMap<u64, LogId<SessionConsensusNodeId>>,
+) -> io::Result<()> {
+    if start > end {
+        return Ok(());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log \
+             WHERE log_index >= ?1 AND log_index <= ?2 ORDER BY log_index ASC",
+        )
+        .map_err(db_error)?;
+    let mut rows = statement
+        .query(params![checked_i64(start)?, checked_i64(end)?])
+        .map_err(db_error)?;
+    while let Some(row) = rows.next().map_err(db_error)? {
+        let epoch: i64 = row.get(0).map_err(db_error)?;
+        let term: i64 = row.get(1).map_err(db_error)?;
+        let index: i64 = row.get(2).map_err(db_error)?;
+        let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
+        validate_epoch(epoch, identity)?;
+        let log_id = decode_consensus_log_entry(&encoded)?.log_id;
+        #[cfg(test)]
+        COMMITTED_LOG_VALIDATION_DECODED_ROWS.with(|count| count.set(count.get() + 1));
+        validate_log_id(&log_id)?;
+        if checked_u64(term)? != log_id.leader_id.term || checked_u64(index)? != log_id.index {
+            return Err(invalid_data("persisted session consensus log row mismatch"));
+        }
+        if let Some(previous) = witnesses.insert(log_id.index, log_id) {
+            if previous != log_id {
+                return Err(invalid_data(
+                    "session consensus compacted marker conflicts with retained log",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Merge compaction markers and physical rows into ordered exact witnesses.
 /// Markers are inline evidence, rather than scan boundaries: they can attest
 /// their own index but cannot hide a missing index between two witnesses.
@@ -19938,37 +20151,13 @@ fn validated_log_witnesses_through_sync(
             }
         }
     }
-    let mut statement = conn
-        .prepare(
-            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log \
-             WHERE log_index >= ?1 AND log_index <= ?2 ORDER BY log_index ASC",
-        )
-        .map_err(db_error)?;
-    let mut rows = statement
-        .query(params![
-            checked_i64(0)?,
-            checked_i64(highest_witness_index)?
-        ])
-        .map_err(db_error)?;
-    while let Some(row) = rows.next().map_err(db_error)? {
-        let epoch: i64 = row.get(0).map_err(db_error)?;
-        let term: i64 = row.get(1).map_err(db_error)?;
-        let index: i64 = row.get(2).map_err(db_error)?;
-        let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
-        validate_epoch(epoch, identity)?;
-        let log_id = decode_consensus_log_entry(&encoded)?.log_id;
-        validate_log_id(&log_id)?;
-        if checked_u64(term)? != log_id.leader_id.term || checked_u64(index)? != log_id.index {
-            return Err(invalid_data("persisted session consensus log row mismatch"));
-        }
-        if let Some(previous) = witnesses.insert(log_id.index, log_id) {
-            if previous != log_id {
-                return Err(invalid_data(
-                    "session consensus compacted marker conflicts with retained log",
-                ));
-            }
-        }
-    }
+    insert_validated_log_rows_in_range_sync(
+        conn,
+        identity,
+        0,
+        highest_witness_index,
+        &mut witnesses,
+    )?;
     for pair in witnesses.values().collect::<Vec<_>>().windows(2) {
         ensure_log_id_not_after(
             pair[0],
@@ -19977,6 +20166,112 @@ fn validated_log_witnesses_through_sync(
         )?;
     }
     Ok(witnesses)
+}
+
+fn exact_log_prefix_start_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    target: &LogId<SessionConsensusNodeId>,
+) -> io::Result<u64> {
+    if let Some(known) = read_purged_sync(conn, identity)? {
+        return known
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus log index is exhausted"));
+    }
+    Ok(selected_snapshot_log_id_sync(conn, identity)?
+        .filter(|snapshot| snapshot.index <= target.index)
+        // A selected snapshot is exact evidence for its own compacted
+        // boundary when no logical purge row predates it. Once a purge row
+        // exists, however, a later snapshot stays inline and cannot erase
+        // the required witnesses between the two markers.
+        .map(|snapshot| snapshot.index)
+        .unwrap_or(0))
+}
+
+/// Prove a monotonic committed-pointer advance from the immediately prior
+/// durable committed frontier. The prior pointer was published only after a
+/// complete prefix audit. Append-only log writes preserve that audited prefix,
+/// while destructive and recovery boundaries retain their complete audits.
+/// Consequently an ordinary advance need only prove the new interval, its
+/// exact endpoints, and every compaction witness it crosses (or which follows
+/// it and can otherwise splice the lineage).
+fn validate_exact_committed_log_advance_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    previous: &LogId<SessionConsensusNodeId>,
+    target: &LogId<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    require_exact_log_id_coverage_sync(conn, identity, previous)?;
+    ensure_log_id_not_after(
+        previous,
+        target,
+        "session consensus committed index regressed",
+    )?;
+    if previous == target {
+        return Ok(());
+    }
+
+    validate_log_id(target)?;
+    let markers = validated_log_markers_sync(conn, identity)?;
+    let highest_witness_index = markers
+        .iter()
+        .map(|marker| marker.index)
+        .chain(std::iter::once(target.index))
+        .max()
+        .expect("target is always an inline witness bound");
+    let mut witnesses = BTreeMap::new();
+    witnesses.insert(previous.index, *previous);
+    for marker in markers {
+        if let Some(existing) = witnesses.insert(marker.index, marker) {
+            if existing != marker {
+                return Err(invalid_data(
+                    "session consensus compacted marker conflicts with committed frontier",
+                ));
+            }
+        }
+    }
+    let extension_start = previous
+        .index
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
+    insert_validated_log_rows_in_range_sync(
+        conn,
+        identity,
+        extension_start,
+        highest_witness_index,
+        &mut witnesses,
+    )?;
+    for pair in witnesses.values().collect::<Vec<_>>().windows(2) {
+        ensure_log_id_not_after(
+            pair[0],
+            pair[1],
+            "session consensus durable log leader ordering regressed",
+        )?;
+    }
+    match witnesses.get(&target.index) {
+        Some(witness) if witness == target => {}
+        Some(_) => {
+            return Err(invalid_data(
+                "session consensus durable pointer conflicts with retained log",
+            ));
+        }
+        None => {
+            return Err(invalid_data(
+                "session consensus durable pointer lacks exact log coverage",
+            ));
+        }
+    }
+
+    let start = exact_log_prefix_start_sync(conn, identity, target)?.max(extension_start);
+    for index in start..=target.index {
+        if !witnesses.contains_key(&index) {
+            return Err(invalid_data(
+                "session consensus durable log prefix contains a hole",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Prove that the target is an exact durable identity and every index above
@@ -20010,26 +20305,7 @@ fn validate_exact_log_prefix_through_sync(
         _ => {}
     }
 
-    let purged = read_purged_sync(conn, identity)?;
-    let start = purged
-        .as_ref()
-        .map(|known| {
-            known
-                .index
-                .checked_add(1)
-                .ok_or_else(|| invalid_data("session consensus log index is exhausted"))
-        })
-        .transpose()?
-        .unwrap_or(
-            selected_snapshot_log_id_sync(conn, identity)?
-                .filter(|snapshot| snapshot.index <= target.index)
-                // A selected snapshot is exact evidence for its own compacted
-                // boundary when no logical purge row predates it. Once a purge
-                // row exists, however, a later snapshot stays inline and cannot
-                // erase the required witnesses between the two markers.
-                .map(|snapshot| snapshot.index)
-                .unwrap_or(0),
-        );
+    let start = exact_log_prefix_start_sync(conn, identity, target)?;
     for index in start..=target.index {
         if !witnesses.contains_key(&index) {
             return Err(invalid_data(
@@ -20190,14 +20466,13 @@ fn save_committed_in_tx(
         return Ok(());
     };
     if let Some(current) = read_committed_sync(tx, identity)? {
-        require_exact_log_id_coverage_sync(tx, identity, &current)?;
-        ensure_log_id_not_after(
-            &current,
-            &committed,
-            "session consensus committed index regressed",
-        )?;
+        validate_exact_committed_log_advance_sync(tx, identity, &current, &committed)?;
+    } else {
+        // No committed frontier has yet been durably audited. Establish the
+        // inheritance base with the complete prefix proof before publishing
+        // the first committed pointer.
+        validate_exact_log_prefix_through_sync(tx, identity, &committed, false)?;
     }
-    validate_exact_log_prefix_through_sync(tx, identity, &committed, false)?;
     save_log_pointer(tx, "consensus_committed", identity, &committed)?;
     Ok(())
 }
@@ -20253,7 +20528,7 @@ pub(crate) fn read_log_range_sync(
         end,
         limit,
         false,
-        false,
+        LogRangeRecoveryProfile::Strict,
     )
 }
 
@@ -20274,7 +20549,30 @@ pub(crate) fn read_log_range_for_recovery_sync(
         end,
         limit,
         false,
-        true,
+        LogRangeRecoveryProfile::Published684,
+    )
+}
+
+/// Read the physical retained suffix during offline recovery. When no purge
+/// marker exists, the first row establishes only the physical cursor; the
+/// recovery layer must authenticate any omitted prefix against the selected
+/// snapshot. Every subsequent row remains strictly contiguous. A durable
+/// purge marker keeps the ordinary exact `purged + 1` start requirement.
+pub(crate) fn read_physical_log_range_for_recovery_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
+    read_log_range_with_batch_sync(
+        conn,
+        identity,
+        logical_log_start(conn, identity, start)?,
+        end,
+        limit,
+        false,
+        LogRangeRecoveryProfile::PhysicalRetained,
     )
 }
 
@@ -20286,8 +20584,15 @@ pub(crate) fn read_limited_log_range_sync(
     limit: usize,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
     let start = logical_log_start(conn, identity, start)?;
-    let entries =
-        read_log_range_with_batch_sync(conn, identity, start, Some(end), Some(limit), true, false)?;
+    let entries = read_log_range_with_batch_sync(
+        conn,
+        identity,
+        start,
+        Some(end),
+        Some(limit),
+        true,
+        LogRangeRecoveryProfile::Strict,
+    )?;
     let purged = read_purged_sync(conn, identity)?;
     let expected_start = match purged {
         Some(purged) if start <= purged.index => purged.index.checked_add(1),
@@ -20337,6 +20642,23 @@ fn logical_log_start(
     }
 }
 
+#[derive(Clone, Copy)]
+enum LogRangeRecoveryProfile {
+    Strict,
+    Published684,
+    PhysicalRetained,
+}
+
+impl LogRangeRecoveryProfile {
+    const fn allows_published_684(self) -> bool {
+        !matches!(self, Self::Strict)
+    }
+
+    const fn scans_physical_retained_suffix(self) -> bool {
+        matches!(self, Self::PhysicalRetained)
+    }
+}
+
 fn read_log_range_with_batch_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -20344,7 +20666,7 @@ fn read_log_range_with_batch_sync(
     end: Option<u64>,
     limit: Option<usize>,
     append_entries_batch: bool,
-    allow_published_684_recovery_layout: bool,
+    recovery_profile: LogRangeRecoveryProfile,
 ) -> io::Result<Vec<Entry<SessionRaftTypeConfig>>> {
     let start_u64 = start;
     let start = checked_i64(start)?;
@@ -20356,13 +20678,30 @@ fn read_log_range_with_batch_sync(
         })
         .transpose()?;
     let mut projection =
-        MembershipLogProjection::load(conn, identity, allow_published_684_recovery_layout)?;
+        MembershipLogProjection::load(conn, identity, recovery_profile.allows_published_684())?;
     // The durable purge floor is the only predecessor which may have been
     // removed.  Seed ordering validation from it so a retained first row
     // cannot regress the OpenRaft leader term across compaction.  Later rows
     // are compared directly as they are decoded; this covers recovery's full
     // retained scan as well as normal bounded reads.
     let mut previous_log = read_purged_sync(conn, identity)?;
+    // SQLite returns a sparse ordered subset when a row is missing. A normal
+    // range read may stop at its requested upper bound or payload limit, but
+    // it must never skip a retained index within the portion it returns. The
+    // recovery-only physical scan may establish its first cursor from the
+    // first row when no purge marker exists; its caller separately proves the
+    // omitted prefix from an exact selected snapshot.
+    let mut expected_log_index = previous_log
+        .as_ref()
+        .map(|log_id| {
+            log_id
+                .index
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("session consensus log index is exhausted"))
+        })
+        .transpose()?
+        .unwrap_or(0)
+        .max(start_u64);
     let applied_index =
         replay_unapplied_log_prefix_sync(conn, identity, start_u64, &mut projection)?;
     let mut entries = Vec::new();
@@ -20401,6 +20740,17 @@ fn read_log_range_with_batch_sync(
             || checked_u64(index)? != entry.log_id.index
         {
             return Err(invalid_data("persisted session consensus log row mismatch"));
+        }
+        if recovery_profile.scans_physical_retained_suffix()
+            && previous_log.is_none()
+            && entries.is_empty()
+        {
+            expected_log_index = entry.log_id.index;
+        }
+        if entry.log_id.index != expected_log_index {
+            return Err(invalid_data(
+                "persisted session consensus log range contains a hole",
+            ));
         }
         if let Some(previous) = previous_log.as_ref() {
             if entry.log_id.leader_id.term < previous.leader_id.term
@@ -20441,6 +20791,10 @@ fn read_log_range_with_batch_sync(
             Some(AppendEntriesBatchDecision::StopBefore) => break,
         }
         previous_log = Some(log_id);
+        expected_log_index = log_id
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
     }
     Ok(entries)
 }
@@ -20838,7 +21192,19 @@ fn purge_logs_in_tx(
             return Err(invalid_data("session consensus purged index regressed"));
         }
         if through == &current {
-            validate_exact_log_prune_lineage_in_tx(tx, identity, &current)?;
+            if selected_snapshot_log_id_sync(tx, identity)? != Some(current) {
+                // An ordinary physical purge must retain its exact terminal
+                // row until this transaction removes the verified contiguous
+                // prefix. A selected snapshot at this exact full LogId is
+                // the narrow exception: snapshot installation records the
+                // logical floor atomically even though its portable image
+                // deliberately carries no Raft rows. In that case retained
+                // local rows below the cut are stale covered debris, not a
+                // required suffix; the preceding exact-marker validation
+                // already rejects an inconsistent selected cut or any
+                // conflicting retained marker.
+                validate_exact_log_prune_lineage_in_tx(tx, identity, &current)?;
+            }
             tx.execute("DELETE FROM consensus_log WHERE log_index <= ?1", [index])
                 .map_err(db_error)?;
             return Ok(());
@@ -32491,6 +32857,15 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
                     "session consensus snapshot purge floor is not exact",
                 ));
             }
+            // Openraft advances its in-memory committed frontier when it
+            // accepts a full snapshot, but does not issue a separate
+            // `save_committed` command for that cut. Persist the same exact
+            // full LogId inside this replacement transaction so a process
+            // loss cannot leave the installed applied state ahead of the
+            // durable committed frontier. The selected snapshot and purge
+            // rows above are the exact compacted witnesses required by the
+            // ordinary committed-pointer validator.
+            save_committed_in_tx(&tx, identity, Some(*snapshot_log_id))?;
         }
         validate_existing_schema(&tx, identity)
             .map_err(|_| invalid_data("installed session consensus schema is invalid"))?;
@@ -33479,6 +33854,7 @@ mod tests {
             )
             .expect("write consumed terminal latch"),
         );
+        let terminal_bytes = std::fs::read(&sidecar).expect("read terminal latch bytes");
         let replacement = OperatorRecoveryLatch {
             recovery_epoch: 2,
             plan_digest: [0xB1; 32],
@@ -33494,15 +33870,14 @@ mod tests {
         let error = ensure_operator_recovery_latch_sync(&database, replacement)
             .expect_err("byte-identical terminal replacement must not be overwritten");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            read_operator_recovery_latch_record(&database).is_err(),
+            "a copied sidecar is not a valid replacement for its bound inode"
+        );
         assert_eq!(
-            read_operator_recovery_latch_record(&database).expect("read copied terminal latch"),
-            Some(OperatorRecoveryLatchRecord::terminal(
-                terminal_latch,
-                incarnation,
-                OperatorRecoveryTerminalPhase::Consumed,
-                None,
-            )),
-            "the substituted terminal remains at the public name"
+            std::fs::read(&sidecar).expect("read substituted terminal bytes"),
+            terminal_bytes,
+            "the substituted terminal remains byte-identical at the public name"
         );
     }
 
@@ -33561,6 +33936,9 @@ mod tests {
             audit_pending: false,
         };
         ensure_operator_recovery_latch_sync(&database, latch).expect("write active recovery latch");
+        let active_bytes =
+            std::fs::read(operator_recovery_latch_path(&database).expect("active latch path"))
+                .expect("read active latch bytes");
         install_latch_transition_before_replace_hook(move |path| {
             let replacement = path.with_extension("attacker-pre-resync-active");
             std::fs::copy(path, &replacement).expect("copy active latch");
@@ -33571,10 +33949,15 @@ mod tests {
         let error = ensure_operator_recovery_latch_sync(&database, latch)
             .expect_err("retry must retain its original sidecar through resync");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
+        assert!(
+            read_operator_recovery_latch_record(&database).is_err(),
+            "a copied sidecar is not treated as the retry's old descriptor"
+        );
         assert_eq!(
-            read_operator_recovery_latch_record(&database).expect("read public active latch"),
-            Some(OperatorRecoveryLatchRecord::Active(latch)),
-            "the replacement is never treated as the retry's old descriptor"
+            std::fs::read(operator_recovery_latch_path(&database).expect("active latch path"))
+                .expect("read substituted active bytes"),
+            active_bytes,
+            "the replacement remains byte-identical at the public name"
         );
     }
 
@@ -39393,6 +39776,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_log_validation_decodes_only_successive_extensions() {
+        const LAST_INDEX: u64 = 4_096;
+
+        let backend = backend_with_blank_logs(LAST_INDEX).await;
+        let conn = backend.conn.lock().await;
+        save_committed_sync(&conn, identity(), Some(log_id(0)))
+            .expect("first committed pointer establishes the complete-audit base");
+
+        reset_committed_log_validation_decoded_rows_for_test();
+        for index in 1..=LAST_INDEX {
+            save_committed_sync(&conn, identity(), Some(log_id(index)))
+                .expect("monotonic committed pointer advance");
+        }
+
+        assert_eq!(
+            committed_log_validation_decoded_rows_for_test(),
+            usize::try_from(LAST_INDEX).expect("test index fits usize"),
+            "each ordinary advance decodes its one newly crossed durable-log row; \
+             a repeated complete-prefix scan would grow quadratically",
+        );
+        assert_eq!(
+            read_committed_sync(&conn, identity()).expect("read final committed pointer"),
+            Some(log_id(LAST_INDEX)),
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_log_incremental_validation_fails_closed_for_frontier_gap_and_corruption() {
+        let frontier = backend_with_blank_logs(2).await;
+        let frontier_conn = frontier.conn.lock().await;
+        save_committed_sync(&frontier_conn, identity(), Some(log_id(1)))
+            .expect("establish committed frontier");
+        let alternate_target = LogId::new(CommittedLeaderId::new(2, node_id()), 2);
+        replace_test_blank_log(&frontier_conn, &alternate_target);
+        assert_eq!(
+            save_committed_sync(&frontier_conn, identity(), Some(log_id(2)))
+                .expect_err("new committed frontier must exactly match its retained row")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_committed_sync(&frontier_conn, identity())
+                .expect("read committed pointer after rejected frontier"),
+            Some(log_id(1)),
+        );
+
+        let gap = backend_with_blank_logs(3).await;
+        let gap_conn = gap.conn.lock().await;
+        save_committed_sync(&gap_conn, identity(), Some(log_id(1)))
+            .expect("establish committed frontier before retained gap");
+        gap_conn
+            .execute("DELETE FROM consensus_log WHERE log_index = 2", [])
+            .expect("create newly crossed retained gap");
+        assert_eq!(
+            save_committed_sync(&gap_conn, identity(), Some(log_id(3)))
+                .expect_err("newly crossed retained gap rejects")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_committed_sync(&gap_conn, identity())
+                .expect("read committed pointer after rejected gap"),
+            Some(log_id(1)),
+        );
+
+        let corrupt = backend_with_blank_logs(2).await;
+        let corrupt_conn = corrupt.conn.lock().await;
+        save_committed_sync(&corrupt_conn, identity(), Some(log_id(1)))
+            .expect("establish committed frontier before corrupt extension");
+        corrupt_conn
+            .execute(
+                "UPDATE consensus_log SET entry_json = X'00' WHERE log_index = 2",
+                [],
+            )
+            .expect("inject corrupt newly crossed log row");
+        assert_eq!(
+            save_committed_sync(&corrupt_conn, identity(), Some(log_id(2)))
+                .expect_err("corrupt newly crossed log row rejects")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_committed_sync(&corrupt_conn, identity())
+                .expect("read committed pointer after rejected corruption"),
+            Some(log_id(1)),
+        );
+
+        let later_marker = backend_with_blank_logs(3).await;
+        let later_marker_conn = later_marker.conn.lock().await;
+        save_committed_sync(&later_marker_conn, identity(), Some(log_id(1)))
+            .expect("establish committed frontier before later marker splice");
+        later_marker_conn
+            .execute("DELETE FROM consensus_log WHERE log_index = 3", [])
+            .expect("remove physical row represented by later marker");
+        save_test_snapshot_marker(
+            &later_marker_conn,
+            LogId::new(CommittedLeaderId::new(0, node_id()), 3),
+            "incremental-later-marker-splice",
+        );
+        assert_eq!(
+            save_committed_sync(&later_marker_conn, identity(), Some(log_id(2)))
+                .expect_err("later lower-term snapshot marker rejects incremental splice")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_committed_sync(&later_marker_conn, identity())
+                .expect("read committed pointer after rejected marker splice"),
+            Some(log_id(1)),
+        );
+    }
+
+    #[tokio::test]
     async fn fixed_in_memory_purge_retains_synchronous_physical_delete_without_a_lane() {
         let backend = SqliteSessionBackend::in_memory().expect("in-memory backend");
         let conn = backend.conn.lock().await;
@@ -39466,6 +39962,80 @@ mod tests {
             )
             .expect("count physically purged rows"),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_synchronous_purge_reclaims_snapshot_covered_stale_prefix_without_a_lane() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory backend");
+        let conn = backend.conn.lock().await;
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        initialize_schema_with_profile(
+            &conn,
+            identity(),
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed in-memory authority");
+        let membership = membership_entry_at(0, vec![members.clone()], members.clone());
+        let command = blank_entry(1);
+        append_logs_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &[membership.clone(), command.clone()],
+        )
+        .expect("append fixed snapshot cut");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity(),
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            vec![membership, command],
+        )
+        .expect("apply fixed snapshot cut");
+        save_test_snapshot_marker(&conn, log_id(1), "snapshot-covered-stale-prefix");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin durable snapshot floor");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(1), 1)
+            .expect("publish exact snapshot purge floor");
+        tx.commit().expect("commit durable snapshot floor");
+        conn.execute("DELETE FROM consensus_log WHERE log_index = 1", [])
+            .expect("portable snapshot leaves only the stale predecessor row");
+
+        // A snapshot has atomically established applied/snapshot/purged L1,
+        // so L0 is covered debris even though it cannot form a physical
+        // suffix ending at L1. This is the no-lane path used when OpenRaft
+        // immediately purges after snapshot install.
+        purge_logs_without_prune_lane_with_authority_sync(
+            &conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &log_id(1),
+        )
+        .expect("snapshot-covered stale prefix is physically reclaimable");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_log WHERE log_index <= 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count reclaimed stale rows"),
+            0
+        );
+        assert_eq!(
+            Some(log_id(1)),
+            read_purged_sync(&conn, identity()).expect("exact snapshot floor survives reclaim")
         );
     }
 
@@ -40502,6 +41072,8 @@ mod tests {
             );
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
                 .expect("append predecessor membership");
+            save_committed_sync(&conn, storage_identity, Some(initial.log_id))
+                .expect("commit predecessor membership");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![initial])
                 .expect("apply predecessor membership");
             stage_membership_scope_sync(
@@ -40528,6 +41100,8 @@ mod tests {
             );
             append_logs_sync(&conn, storage_identity, &[learners.clone(), ready.clone()])
                 .expect("append successor readiness");
+            save_committed_sync(&conn, storage_identity, Some(ready.log_id))
+                .expect("commit successor readiness");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![learners, ready])
                 .expect("apply successor readiness");
             fence_application_authority_sync(
@@ -40561,6 +41135,8 @@ mod tests {
                 &[joint.clone(), uniform.clone(), finalize.clone()],
             )
             .expect("append successor cutover");
+            save_committed_sync(&conn, storage_identity, Some(finalize.log_id))
+                .expect("commit successor cutover");
             apply_entries_sync(
                 &conn,
                 storage_identity,
@@ -40568,6 +41144,12 @@ mod tests {
                 vec![joint, uniform, finalize],
             )
             .expect("apply successor cutover");
+
+            let retained_horizon = [blank_entry(6), blank_entry(7), blank_entry(8)];
+            append_logs_sync(&conn, storage_identity, &retained_horizon)
+                .expect("append retained roster horizon");
+            save_committed_sync(&conn, storage_identity, Some(retained_horizon[2].log_id))
+                .expect("commit retained roster horizon");
 
             let retained =
                 retirement_fixture_retained_with_terminal_sequence(0x76, 1, 1, retained_at, 8);
@@ -40619,6 +41201,14 @@ mod tests {
             vec![predecessor_members.clone()],
             predecessor_members.clone(),
         );
+        append_logs_sync(
+            &target_conn,
+            storage_identity,
+            std::slice::from_ref(&target_initial),
+        )
+        .expect("append target predecessor membership");
+        save_committed_sync(&target_conn, storage_identity, Some(target_initial.log_id))
+            .expect("commit target predecessor membership");
         apply_entries_sync(
             &target_conn,
             storage_identity,
@@ -47649,24 +48239,28 @@ LIMIT 20000;
         let source_conn = source.conn.blocking_lock();
         initialize_schema(&source_conn, storage_identity, &current)
             .expect("initialize activated source");
-        apply_entries_sync(
+        let source_initial = vec![
+            membership_entry_at(0, vec![current.clone()], current.clone()),
+            activating_fenced_transition_authorized_entry(
+                1,
+                request.clone(),
+                timestamp(1),
+                member(7),
+                storage_identity,
+                storage_identity,
+                &current,
+            ),
+        ];
+        append_logs_sync(&source_conn, storage_identity, &source_initial)
+            .expect("append source activation");
+        save_committed_sync(
             &source_conn,
             storage_identity,
-            &source.caps,
-            vec![
-                membership_entry_at(0, vec![current.clone()], current.clone()),
-                activating_fenced_transition_authorized_entry(
-                    1,
-                    request.clone(),
-                    timestamp(1),
-                    member(7),
-                    storage_identity,
-                    storage_identity,
-                    &current,
-                ),
-            ],
+            Some(source_initial[1].log_id),
         )
-        .expect("activate source scope");
+        .expect("commit source activation");
+        apply_entries_sync(&source_conn, storage_identity, &source.caps, source_initial)
+            .expect("activate source scope");
         assert!(fenced_transition_activation_matches_scope_sync(
             &source_conn,
             storage_identity,
@@ -47679,24 +48273,28 @@ LIMIT 20000;
         let target_conn = target.conn.blocking_lock();
         initialize_schema(&target_conn, storage_identity, &current)
             .expect("initialize activated target");
-        apply_entries_sync(
+        let target_initial = vec![
+            membership_entry_at(0, vec![current.clone()], current.clone()),
+            activating_fenced_transition_authorized_entry(
+                1,
+                request.clone(),
+                timestamp(1),
+                member(7),
+                storage_identity,
+                storage_identity,
+                &current,
+            ),
+        ];
+        append_logs_sync(&target_conn, storage_identity, &target_initial)
+            .expect("append target activation");
+        save_committed_sync(
             &target_conn,
             storage_identity,
-            &target.caps,
-            vec![
-                membership_entry_at(0, vec![current.clone()], current.clone()),
-                activating_fenced_transition_authorized_entry(
-                    1,
-                    request.clone(),
-                    timestamp(1),
-                    member(7),
-                    storage_identity,
-                    storage_identity,
-                    &current,
-                ),
-            ],
+            Some(target_initial[1].log_id),
         )
-        .expect("activate target scope");
+        .expect("commit target activation");
+        apply_entries_sync(&target_conn, storage_identity, &target.caps, target_initial)
+            .expect("activate target scope");
         assert!(fenced_transition_activation_matches_scope_sync(
             &target_conn,
             storage_identity,
@@ -47850,11 +48448,19 @@ LIMIT 20000;
                 request_digest: transition_digest,
             },
         );
+        append_logs_sync(
+            &source_conn,
+            storage_identity,
+            &[learners.clone(), ready.clone()],
+        )
+        .expect("append successor eligibility");
+        save_committed_sync(&source_conn, storage_identity, Some(ready.log_id))
+            .expect("commit successor eligibility");
         apply_entries_sync(
             &source_conn,
             storage_identity,
             &source.caps,
-            vec![learners, ready],
+            vec![learners.clone(), ready.clone()],
         )
         .expect("make successor eligible");
         fence_application_authority_sync(
@@ -47874,13 +48480,65 @@ LIMIT 20000;
             vec![successor_members.clone()],
             successor_members.clone(),
         );
+        append_logs_sync(
+            &source_conn,
+            storage_identity,
+            &[joint.clone(), uniform.clone()],
+        )
+        .expect("append successor promotion");
+        save_committed_sync(&source_conn, storage_identity, Some(uniform.log_id))
+            .expect("commit successor promotion");
         apply_entries_sync(
             &source_conn,
             storage_identity,
             &source.caps,
-            vec![joint, uniform],
+            vec![joint.clone(), uniform.clone()],
         )
         .expect("promote successor scope");
+        // The destination received the committed follower suffix but has not
+        // applied it; the later snapshot supplies that state.  Its prior
+        // snapshot established a logical purge at index one, so retaining the
+        // exact suffix is required evidence rather than an optional fixture
+        // convenience.
+        stage_membership_scope_sync(
+            &target_conn,
+            storage_identity,
+            transition_id,
+            transition_digest,
+            successor_identity,
+            &successor_members,
+        )
+        .expect("stage destination successor scope");
+        append_logs_sync(
+            &target_conn,
+            storage_identity,
+            &[learners.clone(), ready.clone()],
+        )
+        .expect("retain successor learner suffix");
+        save_committed_sync(&target_conn, storage_identity, Some(ready.log_id))
+            .expect("commit successor learner suffix");
+        apply_entries_sync(
+            &target_conn,
+            storage_identity,
+            &target.caps,
+            vec![learners.clone(), ready.clone()],
+        )
+        .expect("apply successor learner suffix");
+        fence_application_authority_sync(
+            &target_conn,
+            storage_identity,
+            transition_id,
+            transition_digest,
+        )
+        .expect("fence destination predecessor authority");
+        append_logs_sync(
+            &target_conn,
+            storage_identity,
+            &[joint.clone(), uniform.clone()],
+        )
+        .expect("retain successor promotion suffix");
+        save_committed_sync(&target_conn, storage_identity, Some(uniform.log_id))
+            .expect("commit successor promotion suffix");
         assert!(!fenced_transition_activation_matches_scope_sync(
             &source_conn,
             storage_identity,
@@ -48077,11 +48735,20 @@ LIMIT 20000;
             let source_conn = source.conn.blocking_lock();
             initialize_schema(&source_conn, identity(), &expected_members())
                 .expect("source consensus schema");
+            let initial_membership = membership_entry();
+            append_logs_sync(
+                &source_conn,
+                identity(),
+                std::slice::from_ref(&initial_membership),
+            )
+            .expect("append source membership");
+            save_committed_sync(&source_conn, identity(), Some(initial_membership.log_id))
+                .expect("commit source membership");
             apply_entries_sync(
                 &source_conn,
                 identity(),
                 &source.caps,
-                vec![membership_entry()],
+                vec![initial_membership],
             )
             .expect("source membership");
             if state != "empty" {
@@ -48114,6 +48781,19 @@ LIMIT 20000;
             let target_conn = target.conn.blocking_lock();
             initialize_schema(&target_conn, identity(), &expected_members())
                 .expect("target consensus schema");
+            let target_initial_membership = membership_entry();
+            append_logs_sync(
+                &target_conn,
+                identity(),
+                std::slice::from_ref(&target_initial_membership),
+            )
+            .expect("append target membership");
+            save_committed_sync(
+                &target_conn,
+                identity(),
+                Some(target_initial_membership.log_id),
+            )
+            .expect("commit target membership");
             let meta = opc_consensus::engine::SnapshotMeta {
                 last_log_id,
                 last_membership,
@@ -49764,6 +50444,11 @@ BEGIN IMMEDIATE;
             read_purged_sync(&conn, identity()).expect("snapshot install purge floor"),
             Some(expected_finalize_log_id),
             "the snapshot replacement transaction records the exact full cut before publication"
+        );
+        assert_eq!(
+            read_committed_sync(&conn, identity()).expect("snapshot install committed frontier"),
+            Some(expected_finalize_log_id),
+            "the installed snapshot cut is the exact durable committed frontier"
         );
         purge_logs_sync(&conn, identity(), &expected_finalize_log_id)
             .expect("same exact queued Raft purge remains idempotent");
@@ -54757,6 +55442,8 @@ BEGIN IMMEDIATE;
             let initial = membership_entry_at(0, vec![current.clone()], current.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
                 .expect("append initial membership");
+            save_committed_sync(&conn, storage_identity, Some(initial.log_id))
+                .expect("commit initial membership");
             apply_entries_sync(&conn, storage_identity, &backend.caps, vec![initial])
                 .expect("apply initial membership");
 
@@ -54790,6 +55477,8 @@ BEGIN IMMEDIATE;
                 ],
             )
             .expect("append first abort");
+            save_committed_sync(&conn, storage_identity, Some(first_cleanup.log_id))
+                .expect("commit first abort");
             apply_entries_sync(
                 &conn,
                 storage_identity,
@@ -54833,6 +55522,8 @@ BEGIN IMMEDIATE;
                 ],
             )
             .expect("append second abort");
+            save_committed_sync(&conn, storage_identity, Some(second_cleanup.log_id))
+                .expect("commit second abort");
             apply_entries_sync(
                 &conn,
                 storage_identity,
@@ -55133,6 +55824,8 @@ BEGIN IMMEDIATE;
             let initial = membership_entry_at(0, vec![current.clone()], current.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
                 .expect("append current membership");
+            save_committed_sync(&conn, storage_identity, Some(initial.log_id))
+                .expect("commit current membership");
             apply_entries_sync(&conn, storage_identity, &backend.caps, vec![initial])
                 .expect("apply current membership");
             stage_membership_scope_sync(
@@ -55147,6 +55840,8 @@ BEGIN IMMEDIATE;
             let learners = membership_entry_at(1, vec![current.clone()], desired.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&learners))
                 .expect("append learners");
+            save_committed_sync(&conn, storage_identity, Some(learners.log_id))
+                .expect("commit learners");
             apply_entries_sync(&conn, storage_identity, &backend.caps, vec![learners])
                 .expect("apply learners");
             let abort = topology_entry_at(
@@ -55159,11 +55854,14 @@ BEGIN IMMEDIATE;
             );
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&abort))
                 .expect("append abort");
+            save_committed_sync(&conn, storage_identity, Some(abort.log_id)).expect("commit abort");
             apply_entries_sync(&conn, storage_identity, &backend.caps, vec![abort])
                 .expect("apply abort");
             let cleanup = membership_entry_at(3, vec![current.clone()], current.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&cleanup))
                 .expect("append exact abort cleanup");
+            save_committed_sync(&conn, storage_identity, Some(cleanup.log_id))
+                .expect("commit exact abort cleanup");
             apply_entries_sync(&conn, storage_identity, &backend.caps, vec![cleanup])
                 .expect("apply exact abort cleanup");
         }
@@ -55273,6 +55971,8 @@ BEGIN IMMEDIATE;
             let initial = membership_entry_at(0, vec![current.clone()], current.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&initial))
                 .expect("append source membership");
+            save_committed_sync(&conn, storage_identity, Some(initial.log_id))
+                .expect("commit source membership");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![initial])
                 .expect("apply source membership");
             stage_membership_scope_sync(
@@ -55287,6 +55987,8 @@ BEGIN IMMEDIATE;
             let learners = membership_entry_at(1, vec![current.clone()], desired.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&learners))
                 .expect("append source learners");
+            save_committed_sync(&conn, storage_identity, Some(learners.log_id))
+                .expect("commit source learners");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![learners])
                 .expect("apply source learners");
             let ready = topology_entry_at(
@@ -55299,6 +56001,8 @@ BEGIN IMMEDIATE;
             );
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&ready))
                 .expect("append source readiness");
+            save_committed_sync(&conn, storage_identity, Some(ready.log_id))
+                .expect("commit source readiness");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![ready])
                 .expect("apply source readiness");
             fence_application_authority_sync(
@@ -55312,6 +56016,8 @@ BEGIN IMMEDIATE;
                 membership_entry_at(3, vec![current.clone(), desired.clone()], desired.clone());
             append_logs_sync(&conn, storage_identity, std::slice::from_ref(&joint))
                 .expect("append source joint membership");
+            save_committed_sync(&conn, storage_identity, Some(joint.log_id))
+                .expect("commit source joint membership");
             apply_entries_sync(&conn, storage_identity, &source.caps, vec![joint])
                 .expect("apply source joint membership");
         }
@@ -56680,6 +57386,27 @@ BEGIN IMMEDIATE;
                 ConsensusAuthorityProfile::FixedImmutable,
             )
             .expect("initialize fixed authority");
+            let initial_formation = membership_entry_at(0, vec![members.clone()], members.clone());
+            append_logs_with_authority_sync(
+                &conn,
+                identity,
+                ConsensusAuthorityProfile::FixedImmutable,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                std::slice::from_ref(&initial_formation),
+            )
+            .expect("append fixed quorum");
+            save_committed_with_authority_sync(
+                &conn,
+                identity,
+                ConsensusAuthorityProfile::FixedImmutable,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                Some(initial_formation.log_id),
+            )
+            .expect("commit fixed quorum");
             apply_entries_with_authority_sync(
                 &conn,
                 identity,
@@ -56688,11 +57415,7 @@ BEGIN IMMEDIATE;
                 &members,
                 &bindings,
                 FIXED_TEST_PLACEMENT_POLICY,
-                vec![membership_entry_at(
-                    0,
-                    vec![members.clone()],
-                    members.clone(),
-                )],
+                vec![initial_formation],
             )
             .expect("form fixed quorum");
             drop(conn);
@@ -56736,6 +57459,27 @@ BEGIN IMMEDIATE;
             ConsensusAuthorityProfile::FixedImmutable,
         )
         .expect("initialize fixed authority");
+        let initial_formation = membership_entry_at(0, vec![members.clone()], members.clone());
+        append_logs_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            std::slice::from_ref(&initial_formation),
+        )
+        .expect("append fixed quorum");
+        save_committed_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            Some(initial_formation.log_id),
+        )
+        .expect("commit fixed quorum");
         apply_entries_with_authority_sync(
             &conn,
             identity,
@@ -56744,11 +57488,7 @@ BEGIN IMMEDIATE;
             &members,
             &bindings,
             Some(placement_policy),
-            vec![membership_entry_at(
-                0,
-                vec![members.clone()],
-                members.clone(),
-            )],
+            vec![initial_formation],
         )
         .expect("form fixed quorum");
         drop(conn);
@@ -56767,15 +57507,17 @@ BEGIN IMMEDIATE;
         mark_operator_recovery_pending_sync(&conn, identity, 1, [0x71; 32])
             .expect("mark recovery pending");
         drop(conn);
-        assert!(!backend
-            .fixed_quorum_application_traffic_authority_is_exact(
-                identity,
-                members.clone(),
-                bindings.clone(),
-                placement_policy,
-            )
-            .await
-            .expect("pending recovery snapshot"));
+        assert!(matches!(
+            backend
+                .fixed_quorum_application_traffic_authority_is_exact(
+                    identity,
+                    members.clone(),
+                    bindings.clone(),
+                    placement_policy,
+                )
+                .await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
 
         ensure_operator_recovery_latch_sync(
             &database,

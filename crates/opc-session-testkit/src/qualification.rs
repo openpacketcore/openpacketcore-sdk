@@ -32,7 +32,7 @@ use opc_session_net::{
 };
 use opc_session_store::{
     validate_session_ttl, OwnerId, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
-    ReplicaId, ReplicaTlsIdentity, SessionConsumerScope, StateType,
+    ReplicaId, ReplicaTlsIdentity, RosterAttestationTrustRootV1, SessionConsumerScope, StateType,
     MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, STABLE_ID_MAX_BYTES,
 };
 use opc_tls::{TlsMaterialAvailability, TlsMaterialReloadReason, TlsMaterialStatus};
@@ -807,6 +807,23 @@ pub const QUALIFICATION_MAX_LEASE_HANDLES: usize = 1024;
 /// qualification. Keeping the value here makes the process budget and the
 /// listener configuration one contract rather than an inferred default.
 pub const QUALIFICATION_INBOUND_CONNECTION_SLOTS: usize = 128;
+/// Construct the qualification-only deterministic roster-attestation trust
+/// root shared by the parent harness and every child process.
+///
+/// This public seam is hidden because it is fixed test material for the
+/// non-published testkit, not a production provisioning mechanism.
+#[doc(hidden)]
+pub fn qualification_roster_attestation_trust_root() -> RosterAttestationTrustRootV1 {
+    let root_key = p256::ecdsa::SigningKey::from_bytes((&[0x31; 32]).into())
+        .expect("fixed qualification roster root signing key");
+    let public_key = root_key.verifying_key().to_sec1_point(true);
+    let public_key = public_key
+        .as_bytes()
+        .try_into()
+        .expect("fixed qualification roster root compressed P-256 key");
+    RosterAttestationTrustRootV1::new([0xa1; 32], public_key)
+        .expect("fixed qualification roster trust root")
+}
 /// Domain-separated deterministic seed for the repeated-rotation workload.
 pub const QUALIFICATION_TRAFFIC_SEED_BASE: u64 = 0x0164_7A11_C0DE_2026;
 /// Number of same-issuer leaf rotations applied to every voter.
