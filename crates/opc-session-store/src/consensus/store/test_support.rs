@@ -113,6 +113,32 @@ pub async fn trigger_consensus_snapshot_for_test(
         .map_err(|_| "test consensus snapshot capture rejected".to_owned())
 }
 
+/// Append one acknowledged, otherwise inert consensus command for a test.
+///
+/// The supplied request ID is retained by the normal durable idempotency
+/// path. A successful return therefore proves that this exact command was
+/// committed and applied at the returned nonzero Raft log index.
+pub async fn append_consensus_padding_entry_for_test(
+    store: &ConsensusSessionStore,
+    request_id: [u8; 16],
+) -> Result<u64, StoreError> {
+    match store
+        .submit_request(
+            SessionConsensusRequestId::from_bytes(request_id),
+            SessionMutationIntent::AdvanceLogicalTime,
+        )
+        .await
+    {
+        Ok(SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::Unit),
+            raft_log_index,
+            ..
+        }) if raft_log_index != 0 => Ok(raft_log_index),
+        Ok(_) => Err(StoreError::BackendOperationOutcomeUnavailable),
+        Err(error) => Err(error),
+    }
+}
+
 /// Request an engine-owned log purge through one exact local log index after
 /// proving that the engine has already recorded a snapshot which covers it.
 /// This exercises OpenRaft's real compaction path without exposing a

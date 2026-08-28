@@ -27734,6 +27734,10 @@ mod tests {
         .expect("two-attempt accepted-status configuration");
         let persistent = PersistentSessionConsumerClient::try_from_stateless(stateless, config)
             .expect("persistent accepted-status client");
+        persistent
+            .prewarm_v2()
+            .await
+            .expect("prewarm the V2 status lane before the accepted-status retry");
         let mutation = persistent_v2_effectful_test_request(0xd4).await;
         let status = match mutation.operation() {
             SessionConsumerV2Operation::FencedTransitionV2 { request } => {
@@ -27822,6 +27826,10 @@ mod tests {
             config,
         )
         .expect("persistent accepted-status shutdown client");
+        persistent
+            .prewarm_v2()
+            .await
+            .expect("prewarm the V2 status lane before the forced-shutdown race");
         let mutation = persistent_v2_effectful_test_request(0xd5).await;
         let status = match mutation.operation() {
             SessionConsumerV2Operation::FencedTransitionV2 { request } => {

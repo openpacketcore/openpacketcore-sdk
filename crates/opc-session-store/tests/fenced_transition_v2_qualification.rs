@@ -10560,7 +10560,7 @@ fn existing_release_evidence_namespace_validation_is_read_only_and_strict() {
 
 #[test]
 fn bounded_nofollow_evidence_reads_reject_fifo_device_growth_and_oversize() {
-    use nix::{sys::stat::Mode, unistd::mkfifoat};
+    use nix::sys::stat::Mode;
 
     let root = tempfile::tempdir().expect("bounded evidence read root");
     let parent_path = root.path().join("parent");
@@ -10569,8 +10569,18 @@ fn bounded_nofollow_evidence_reads_reject_fifo_device_growth_and_oversize() {
     let parent = pinned_parent_file(&parent_path, parent_metadata.dev(), parent_metadata.ino())
         .expect("open bounded evidence parent");
 
-    mkfifoat(&parent, "candidate.fifo", Mode::S_IRUSR | Mode::S_IWUSR)
+    // Linux preserves the descriptor-relative setup. Apple lacks `mkfifoat`,
+    // but this private, test-owned temporary parent has no concurrent writer,
+    // so path-based FIFO setup is equivalent for the pinned-parent reader.
+    #[cfg(not(target_vendor = "apple"))]
+    nix::unistd::mkfifoat(&parent, "candidate.fifo", Mode::S_IRUSR | Mode::S_IWUSR)
         .expect("create bounded-read FIFO");
+    #[cfg(target_vendor = "apple")]
+    nix::unistd::mkfifo(
+        &parent_path.join("candidate.fifo"),
+        Mode::S_IRUSR | Mode::S_IWUSR,
+    )
+    .expect("create bounded-read FIFO");
     assert!(
         read_bounded_nofollow_regular_file(&parent, OsStr::new("candidate.fifo"), 16, "FIFO")
             .is_err(),
@@ -10635,7 +10645,7 @@ fn bounded_nofollow_evidence_reads_reject_fifo_device_growth_and_oversize() {
 
 #[test]
 fn private_lease_descriptor_rejects_a_fifo_and_a_shared_parent() {
-    use nix::{sys::stat::Mode as NixMode, unistd::mkfifoat};
+    use nix::sys::stat::Mode as NixMode;
     use rustix::fs::{openat, Mode, OFlags};
 
     let root = tempfile::tempdir().expect("private lease root");
@@ -10652,6 +10662,7 @@ fn private_lease_descriptor_rejects_a_fifo_and_a_shared_parent() {
         .is_err(),
         "a mode-0755 lease parent cannot acquire qualification authority"
     );
+
     std::fs::set_permissions(&parent_path, std::fs::Permissions::from_mode(0o700))
         .expect("set private lease parent mode");
     let parent = pinned_current_user_private_directory(
@@ -10661,7 +10672,19 @@ fn private_lease_descriptor_rejects_a_fifo_and_a_shared_parent() {
         "private lease parent",
     )
     .expect("open private lease parent");
-    mkfifoat(&parent, "lease", NixMode::S_IRUSR | NixMode::S_IWUSR).expect("create lease FIFO");
+
+    // Linux preserves the descriptor-relative setup. Apple lacks `mkfifoat`,
+    // but this private, test-owned temporary parent has no concurrent writer,
+    // so path-based FIFO setup is equivalent for the pinned-parent validator.
+    #[cfg(not(target_vendor = "apple"))]
+    nix::unistd::mkfifoat(&parent, "lease", NixMode::S_IRUSR | NixMode::S_IWUSR)
+        .expect("create lease FIFO");
+    #[cfg(target_vendor = "apple")]
+    nix::unistd::mkfifo(
+        &parent_path.join("lease"),
+        NixMode::S_IRUSR | NixMode::S_IWUSR,
+    )
+    .expect("create lease FIFO");
     let fifo = File::from(
         openat(
             &parent,
