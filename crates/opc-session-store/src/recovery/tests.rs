@@ -16,22 +16,28 @@ use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membe
 use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{
-    serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider,
-    SessionAad, Zeroizing, AEAD_TAG_LEN, AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN,
+    serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+    AES_256_GCM_SIV_NONCE_LEN,
 };
+#[cfg(feature = "test-control")]
+use opc_key::{KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_mgmt_audit::{AuditError, AuditEvent, AuditOutcome, AuditSink};
 use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 use rusqlite::{params, types::Value, Connection};
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
 use super::sqlite::{
-    acquire_finalization_pins, backup_and_reset_replica, classify_finalization_pins,
-    clear_pinned_inspection_path_swap_hooks, clear_target_database_after_identity_admission_hook,
+    acquire_finalization_pins, classify_finalization_pins,
+    clear_target_database_after_identity_admission_hook,
+    install_legacy_classification_before_proof_hook,
+    install_target_database_after_identity_admission_hook, legacy_finalization_predecessor,
+};
+use super::sqlite::{
+    backup_and_reset_replica, clear_pinned_inspection_path_swap_hooks,
     database_promotion_temporary_path_for_test, fail_next_promotion_after_rename,
     inspect_replica_with_descriptor_snapshot_proof_for_test,
-    install_legacy_classification_before_proof_hook, install_pinned_inspection_path_swap_hooks,
-    install_target_backup_snapshot_directory_sync_hook,
-    install_target_database_after_identity_admission_hook, legacy_finalization_predecessor,
+    install_pinned_inspection_path_swap_hooks, install_target_backup_snapshot_directory_sync_hook,
     planned_fleet_inspection_count, prepare_test_workflow_with_current_snapshot,
     promotion_cleanup_journals_are_empty_for_test, reset_planned_fleet_inspection_count, seal_plan,
     snapshot_promotion_temporary_path_for_test, RecoveryFailpoint, ResetInput,
@@ -48,17 +54,18 @@ use crate::topology::{
     QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
     ReplicaFailureDomain, ReplicaTlsIdentity, ValidatedQuorumTopology,
 };
+#[cfg(feature = "test-control")]
+use crate::{CompareAndSet, CompareAndSetResult, EncryptingSessionBackend};
 use crate::{
-    CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend,
-    Generation, OwnerId, ReplicationEntry, ReplicationOp, SessionBackend, SessionConsensusCommand,
-    SessionConsensusEntryDigest, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpcHandler,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
-    SessionLeaseManager, SessionMutationIntent, SqliteSessionBackend, StateClass, StateType,
-    StoredSessionRecord, SystemClock, FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS,
-    FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_SCHEMA_V1,
-    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, REPLICATION_TX_ID_MAX_BYTES,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    EncryptedSessionPayload, Generation, OwnerId, ReplicationEntry, ReplicationOp, SessionBackend,
+    SessionConsensusCommand, SessionConsensusEntryDigest, SessionConsensusPeer,
+    SessionConsensusPeerError, SessionConsensusRequestId, SessionConsensusResponse,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionKey, SessionKeyType, SessionLeaseManager, SessionMutationIntent, SqliteSessionBackend,
+    StateClass, StateType, StoredSessionRecord, SystemClock,
+    FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS, FENCED_TRANSITION_OUTCOME_RETENTION,
+    FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+    REPLICATION_TX_ID_MAX_BYTES, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 
 const RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
@@ -495,6 +502,7 @@ fn file_digest(path: &Path) -> [u8; 32] {
     Sha256::digest(std::fs::read(path).expect("read database")).into()
 }
 
+#[cfg(feature = "test-control")]
 fn assert_tree_does_not_contain(root: &Path, needle: &[u8]) {
     for entry in std::fs::read_dir(root).expect("read protected artifact tree") {
         let entry = entry.expect("protected artifact entry");

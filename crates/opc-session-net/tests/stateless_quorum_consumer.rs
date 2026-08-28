@@ -2156,7 +2156,13 @@ async fn three_voter_authorizer(
         )
         .expect("three-voter explicit consumer grant")])
         .await
-        .expect("three-voter consumer manifest");
+        .unwrap_or_else(|error| {
+            panic!(
+                "three-voter consumer manifest: {error:?}; status={:?}; diagnostics={:?}",
+                store.status(),
+                store.diagnostic_snapshot(),
+            )
+        });
     SessionConsumerAuthorizer::try_new(manifest).expect("three-voter consumer authorizer")
 }
 
@@ -5976,15 +5982,13 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
         .last_log_index
         .expect("committed transition log index");
     let target_log_index = transition_log_index + SNAPSHOT_COMMANDS as u64;
-    const MAX_SNAPSHOT_MAINTENANCE_REJECTIONS: usize = 8;
     let mut workload_leader = new_leader;
     let mut workload_term = fleet.stores[workload_leader].status().term;
-    tokio::time::timeout(Duration::from_secs(5 * 60), async {
+    let workload_result = tokio::time::timeout(Duration::from_secs(5 * 60), async {
         // Each command must finish before the next begins. Concurrent
         // logical-time reads intentionally share one bounded consensus
         // proposal, while this proof must cross the production snapshot-log
         // threshold with distinct committed entries.
-        let mut maintenance_rejections = 0_usize;
         while fleet.stores[workload_leader]
             .status()
             .last_log_index
@@ -5995,21 +5999,34 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
                 .await
             {
                 Ok(_) => {}
-                Err(StoreError::BackendUnavailable(_))
-                    if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
-                {
-                    maintenance_rejections += 1;
+                Err(StoreError::BackendUnavailable(_)) => {
+                    let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                        consensus_local_durable_progress_for_test(&fleet.stores[index])
+                    });
+                    assert!(
+                        durable_progress.iter().all(|progress| {
+                            progress.engine_state == ConsensusEngineStateForTest::Running
+                        }),
+                        "status-compaction maintenance stopped an engine: durable_progress={durable_progress:?}",
+                    );
                     (workload_leader, _, workload_term) = fleet
                         .wait_for_admitted_quorum_leader(&[0, 1, 2], workload_term)
                         .await;
                     tokio::task::yield_now().await;
                 }
-                Err(_) => panic!("snapshot qualification command was rejected"),
+                Err(error) => panic!("snapshot qualification command was rejected: {error:?}"),
             }
         }
     })
-    .await
-    .expect("snapshot qualification command batch completes");
+    .await;
+    if workload_result.is_err() {
+        let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+            consensus_local_durable_progress_for_test(&fleet.stores[index])
+        });
+        panic!(
+            "status-compaction qualification exceeded its bound: durable_progress={durable_progress:?}"
+        );
+    }
     assert!(
         fleet.stores[workload_leader]
             .status()
@@ -7737,9 +7754,7 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
             .last_log_index
             .expect("retained PollAdmitted log index before snapshot");
         let target_log_index = admitted_log_index + SNAPSHOT_COMMANDS as u64;
-        tokio::time::timeout(Duration::from_secs(5 * 60), async {
-            const MAX_SNAPSHOT_MAINTENANCE_REJECTIONS: usize = 8;
-            let mut maintenance_rejections = 0_usize;
+        let workload_result = tokio::time::timeout(Duration::from_secs(5 * 60), async {
             while fleet.stores[workload_leader]
                 .status()
                 .last_log_index
@@ -7750,25 +7765,41 @@ async fn persistent_three_voter_protected_roster_recovers_provider_crash_cut(
                     .await
                 {
                     Ok(_) => {}
-                    Err(StoreError::BackendUnavailable(_))
-                        if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
-                    {
+                    Err(StoreError::BackendUnavailable(_)) => {
+                        let durable_progress =
+                            std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                                consensus_local_durable_progress_for_test(&fleet.stores[index])
+                            });
+                        assert!(
+                            durable_progress.iter().all(|progress| {
+                                progress.engine_state == ConsensusEngineStateForTest::Running
+                            }),
+                            "crash-cut snapshot maintenance stopped an engine: durable_progress={durable_progress:?}",
+                        );
                         // Snapshot installation can briefly close ordinary
                         // proposal admission. Count the committed index—not
                         // replies—and continue through any self-reporting
                         // admitted-quorum successor at a monotonic term.
-                        maintenance_rejections += 1;
                         (workload_leader, _, workload_term) = fleet
                             .wait_for_admitted_quorum_leader(&[0, 1, 2], workload_term)
                             .await;
                         tokio::task::yield_now().await;
                     }
-                    Err(_) => panic!("snapshot qualification command was rejected"),
+                    Err(error) => {
+                        panic!("snapshot qualification command was rejected: {error:?}")
+                    }
                 }
             }
         })
-        .await
-        .expect("snapshot qualification command batch completes");
+        .await;
+        if workload_result.is_err() {
+            let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                consensus_local_durable_progress_for_test(&fleet.stores[index])
+            });
+            panic!(
+                "crash-cut snapshot qualification exceeded its bound: durable_progress={durable_progress:?}"
+            );
+        }
         assert!(
             fleet.stores[workload_leader]
                 .status()
@@ -8454,6 +8485,19 @@ async fn persistent_three_voter_snapshot_maintenance_with_concurrent_read_barrie
     )
     .await;
     macro_rules! panic_with_durable_progress {
+        ($fleet:expr, $error:expr) => {{
+            let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                let progress = consensus_local_durable_progress_for_test(&$fleet.stores[index]);
+                (
+                    progress.engine_state,
+                    progress.last_log_index,
+                    progress.applied_index,
+                    progress.snapshot_index,
+                    progress.purged_index,
+                )
+            });
+            panic!("error={:?}; durable_progress={durable_progress:?}", $error);
+        }};
         ($fleet:expr) => {{
             let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
                 let progress = consensus_local_durable_progress_for_test(&$fleet.stores[index]);
@@ -8483,21 +8527,52 @@ async fn persistent_three_voter_snapshot_maintenance_with_concurrent_read_barrie
     let initial_snapshot_indexes = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
         consensus_local_durable_progress_for_test(&fleet.stores[index]).snapshot_index
     });
+    let mut workload_leader = workload_leader;
+    let mut workload_term = fleet.stores[workload_leader].status().term;
+    macro_rules! advance_workload_to {
+        ($target:expr) => {{
+            while fleet.stores[workload_leader]
+                .status()
+                .last_log_index
+                .is_none_or(|index| index < $target)
+            {
+                match fleet.stores[workload_leader]
+                    .max_replication_sequence()
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(StoreError::BackendUnavailable(_)) => {
+                        let engines_running = (0..THREE_VOTER_COUNT).all(|index| {
+                            consensus_local_durable_progress_for_test(&fleet.stores[index])
+                                .engine_state
+                                == ConsensusEngineStateForTest::Running
+                        });
+                        if !engines_running {
+                            panic_with_durable_progress!(fleet);
+                        }
+                        // Snapshot maintenance may close a proposal admission
+                        // boundary after the command committed. Count durable
+                        // log progress rather than successful replies, retain
+                        // the existing outer qualification bound, and fail
+                        // immediately for any stopped engine or other error.
+                        (workload_leader, _, workload_term) = fleet
+                            .wait_for_admitted_quorum_leader(&[0, 1, 2], workload_term)
+                            .await;
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic_with_durable_progress!(fleet, error),
+                }
+            }
+        }};
+    }
 
     tokio::time::timeout(Duration::from_secs(5 * 60), async {
-        for _ in 0..(SNAPSHOT_THRESHOLD - BARRIER_START_OFFSET) {
-            if fleet.stores[workload_leader]
-                .max_replication_sequence()
-                .await
-                .is_err()
-            {
-                panic_with_durable_progress!(fleet);
-            }
-        }
+        advance_workload_to!(protected_log_index);
 
         let mut completed = SNAPSHOT_THRESHOLD - BARRIER_START_OFFSET;
         while completed < SNAPSHOT_COMMANDS {
             let batch_size = (SNAPSHOT_COMMANDS - completed).min(TAIL_BATCH_SIZE);
+            let batch_target = workload_baseline + (completed + batch_size) as u64;
             let readiness = futures_util::future::join_all(
                 fleet
                     .stores
@@ -8505,15 +8580,7 @@ async fn persistent_three_voter_snapshot_maintenance_with_concurrent_read_barrie
                     .map(ConsensusSessionStore::probe_durable_readiness),
             );
             let workload = async {
-                for _ in 0..batch_size {
-                    if fleet.stores[workload_leader]
-                        .max_replication_sequence()
-                        .await
-                        .is_err()
-                    {
-                        panic_with_durable_progress!(fleet);
-                    }
-                }
+                advance_workload_to!(batch_target);
             };
             let (reports, ()) = tokio::join!(readiness, workload);
             let readiness_reason_codes = reports
@@ -8607,7 +8674,6 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
     // SDK-issued NotApplied + Reconciled proof; therefore the durable terminal
     // is conclusively Aborted and cannot produce publication authority.
     const SNAPSHOT_COMMANDS: usize = 4_300;
-    const MAX_SNAPSHOT_MAINTENANCE_REJECTIONS: usize = 8;
 
     let pki = Arc::new(TestPki::new());
     let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
@@ -9107,8 +9173,7 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
         .last_log_index
         .expect("Aborted snapshot workload baseline");
     let target_log_index = workload_baseline + SNAPSHOT_COMMANDS as u64;
-    tokio::time::timeout(Duration::from_secs(5 * 60), async {
-        let mut maintenance_rejections = 0_usize;
+    let workload_result = tokio::time::timeout(Duration::from_secs(5 * 60), async {
         while fleet.stores[workload_leader]
             .status()
             .last_log_index
@@ -9119,21 +9184,55 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
                 .await
             {
                 Ok(_) => {}
-                Err(StoreError::BackendUnavailable(_))
-                    if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
-                {
-                    maintenance_rejections += 1;
+                Err(StoreError::BackendUnavailable(_)) => {
+                    let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                        let progress =
+                            consensus_local_durable_progress_for_test(&fleet.stores[index]);
+                        (
+                            progress.engine_state,
+                            progress.last_log_index,
+                            progress.applied_index,
+                            progress.snapshot_index,
+                            progress.purged_index,
+                        )
+                    });
+                    assert!(
+                        durable_progress.iter().all(|progress| {
+                            progress.0 == ConsensusEngineStateForTest::Running
+                        }),
+                        "Aborted snapshot maintenance stopped an engine: durable_progress={durable_progress:?}",
+                    );
+                    // Snapshot maintenance may close proposal admission after
+                    // the command became durable. Count that durable progress,
+                    // retain the existing outer bound, and retry only this
+                    // exact transient while every engine remains Running.
                     (workload_leader, _, workload_term) = fleet
                         .wait_for_admitted_quorum_leader(&[0, 1, 2], workload_term)
                         .await;
                     tokio::task::yield_now().await;
                 }
-                Err(_) => panic!("Aborted snapshot qualification command was rejected"),
+                Err(error) => {
+                    panic!("Aborted snapshot qualification command was rejected: {error:?}")
+                }
             }
         }
     })
-    .await
-    .expect("Aborted snapshot qualification command batch completes");
+    .await;
+    if workload_result.is_err() {
+        let durable_progress = std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+            let progress = consensus_local_durable_progress_for_test(&fleet.stores[index]);
+            (
+                progress.engine_state,
+                progress.last_log_index,
+                progress.applied_index,
+                progress.snapshot_index,
+                progress.purged_index,
+            )
+        });
+        panic!(
+            "Aborted snapshot qualification command batch exceeded its bound: durable_progress={durable_progress:?}"
+        );
+    }
     assert!(
         fleet.stores[workload_leader]
             .status()
@@ -10867,13 +10966,11 @@ async fn compact_protected_roster_process_loss_admission(
     admitted_log_index: u64,
 ) {
     const SNAPSHOT_COMMANDS: usize = 4_300;
-    const MAX_SNAPSHOT_MAINTENANCE_REJECTIONS: usize = 8;
 
     let target_log_index = admitted_log_index + SNAPSHOT_COMMANDS as u64;
     let mut workload_leader = leader;
     let mut workload_term = fleet.stores[workload_leader].status().term;
-    tokio::time::timeout(PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_BOUND, async {
-        let mut maintenance_rejections = 0_usize;
+    let workload_result = tokio::time::timeout(PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_BOUND, async {
         while fleet.stores[workload_leader]
             .status()
             .last_log_index
@@ -10884,9 +10981,7 @@ async fn compact_protected_roster_process_loss_admission(
                 .await
             {
                 Ok(_) => {}
-                Err(StoreError::BackendUnavailable(_))
-                    if maintenance_rejections < MAX_SNAPSHOT_MAINTENANCE_REJECTIONS =>
-                {
+                Err(StoreError::BackendUnavailable(_)) => {
                     let (engines_running, durable_progress) =
                         fleet.process_loss_durable_progress_diagnostic_for_test();
                     if !engines_running {
@@ -10894,18 +10989,24 @@ async fn compact_protected_roster_process_loss_admission(
                             "process-loss snapshot maintenance retry fails closed because a voter engine stopped; durable_progress={durable_progress}"
                         );
                     }
-                    maintenance_rejections += 1;
                     (workload_leader, _, workload_term) = fleet
                         .wait_for_admitted_quorum_leader(&[0, 1, 2], workload_term)
                         .await;
                     tokio::task::yield_now().await;
                 }
-                Err(_) => panic!("process-loss snapshot command was rejected"),
+                Err(error) => {
+                    panic!("process-loss snapshot command was rejected: {error:?}")
+                }
             }
         }
     })
-    .await
-    .expect("process-loss snapshot command batch completes");
+    .await;
+    if workload_result.is_err() {
+        let (_, durable_progress) = fleet.process_loss_durable_progress_diagnostic_for_test();
+        panic!(
+            "process-loss snapshot command batch exceeded its bound; durable_progress={durable_progress}"
+        );
+    }
     assert!(
         fleet.stores[workload_leader]
             .status()
