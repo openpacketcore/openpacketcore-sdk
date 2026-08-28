@@ -496,6 +496,12 @@ impl SessionCache {
                     );
                     lock.remove(&key);
                 }
+                ReplicationOp::ProtectedRosterEstablishedCreate { key, .. } => {
+                    debug!(
+                        "Invalidating cache entry from protected-roster Established-create replication"
+                    );
+                    lock.remove(&key);
+                }
                 ReplicationOp::Batch { ops } => pending.extend(ops),
             }
         }
@@ -692,6 +698,7 @@ fn collect_replication_op_keys(op: &ReplicationOp, keys: &mut Vec<SessionKey>) {
                 keys.push(key.clone());
             }
             ReplicationOp::ProtectedRosterEstablished { key, .. } => keys.push(key.clone()),
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, .. } => keys.push(key.clone()),
             ReplicationOp::Batch { ops } => pending.extend(ops),
         }
     }
@@ -1052,6 +1059,18 @@ mod tests {
         }
     }
 
+    fn protected_roster_established_create_op(key: SessionKey) -> ReplicationOp {
+        ReplicationOp::ProtectedRosterEstablishedCreate {
+            record: test_record(key.clone(), 1),
+            key,
+            owner: OwnerId::new("owner-a").expect("owner"),
+            fence: FenceToken::new(2),
+            credential_id: 2,
+            guard_acquired_at: Timestamp::now_utc(),
+            guard_expires_at: Timestamp::now_utc(),
+        }
+    }
+
     fn operation_tree_at_depth(depth: usize, key: SessionKey) -> ReplicationOp {
         let mut op = delete_op(key);
         for _ in 1..depth {
@@ -1161,6 +1180,53 @@ mod tests {
             assert!(!entries.contains_key(&target_key));
             assert_eq!(entries.get(&unrelated_key), Some(&unrelated_record));
         }
+    }
+
+    #[test]
+    fn protected_roster_established_create_invalidates_only_bound_watch_key() {
+        let target_key = test_key();
+        let unrelated_key = unrelated_test_key();
+        let target_record = test_record(target_key.clone(), 1);
+        let unrelated_record = test_record(unrelated_key.clone(), 1);
+        let mut entries = HashMap::from([
+            (target_key.clone(), target_record),
+            (unrelated_key.clone(), unrelated_record.clone()),
+        ]);
+
+        SessionCache::apply_invalidation_op(
+            &mut entries,
+            protected_roster_established_create_op(target_key.clone()),
+        );
+
+        assert!(!entries.contains_key(&target_key));
+        assert_eq!(entries.get(&unrelated_key), Some(&unrelated_record));
+    }
+
+    #[tokio::test]
+    async fn nested_protected_roster_established_create_invalidates_bound_replication_key() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend);
+        let target_key = test_key();
+        let unrelated_key = unrelated_test_key();
+        let target_record = test_record(target_key.clone(), 1);
+        let unrelated_record = test_record(unrelated_key.clone(), 1);
+        {
+            let mut entries = cache.cache.write().await;
+            entries.insert(target_key.clone(), target_record);
+            entries.insert(unrelated_key.clone(), unrelated_record.clone());
+        }
+
+        cache
+            .invalidate_replication_op(&ReplicationOp::Batch {
+                ops: vec![ReplicationOp::Batch {
+                    ops: vec![protected_roster_established_create_op(target_key.clone())],
+                }],
+            })
+            .await;
+
+        let entries = cache.cache.read().await;
+        assert!(!entries.contains_key(&target_key));
+        assert_eq!(entries.get(&unrelated_key), Some(&unrelated_record));
     }
 
     #[tokio::test]

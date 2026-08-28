@@ -1158,6 +1158,55 @@ pub(crate) fn insert_or_replace_record_sync(
     Ok(())
 }
 
+/// Insert one authoritative row only when its exact key remains absent.
+///
+/// Protected-roster terminal creation uses this after an in-transaction
+/// absence comparison. Unlike the ordinary upsert helper, a violated absence
+/// predicate remains a no-effect conflict and can never overwrite a row.
+pub(crate) fn insert_record_if_absent_sync(
+    conn: &Connection,
+    record: &StoredSessionRecord,
+) -> Result<(), StoreError> {
+    let expires_at_str = record.expires_at.map(format_rfc3339_normalized);
+    let encoding_val = match record.payload.encoding() {
+        SessionPayloadEncoding::Plaintext => 0,
+        SessionPayloadEncoding::LegacyPlaintext => 1,
+        SessionPayloadEncoding::EnvelopeV1 => 2,
+        SessionPayloadEncoding::Unclassified => 3,
+    };
+
+    let inserted = conn
+        .execute(
+            r#"
+            INSERT INTO session_records (
+                tenant, nf_kind, key_type, stable_id, generation, owner, fence, state_class, state_type, expires_at, payload, encoding
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+            params![
+                record.key.tenant.as_str(),
+                record.key.nf_kind.as_str(),
+                record.key.key_type.to_string(),
+                record.key.stable_id.as_ref(),
+                sqlite_u64(record.generation.get())?,
+                record.owner.as_str(),
+                sqlite_u64(record.fence.get())?,
+                record.state_class.to_string(),
+                record.state_type.as_str(),
+                expires_at_str,
+                record.payload.as_bytes(),
+                encoding_val,
+            ],
+        )
+        .map_err(|_| StoreError::BackendUnavailable("session create conflict".into()))?;
+    if inserted != 1 {
+        return Err(StoreError::BackendUnavailable(
+            "session create conflict".into(),
+        ));
+    }
+    advance_restore_scan_revision_sync(conn)?;
+    Ok(())
+}
+
 pub(crate) fn insert_or_replace_fence_sync(
     conn: &Connection,
     key: &SessionKey,

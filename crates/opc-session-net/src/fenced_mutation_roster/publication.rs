@@ -466,8 +466,8 @@ mod tests {
         runtime::{
             AuthorityBinding, BackendRegistration, ConsensusCommitMetadata,
             CurrentPublicationAuthorityRead, FencedMutationRosterExecutorAttestor,
-            PublicationAuthorityReader, RegistrationDecision, RosterExecutor,
-            RosterExecutorBackend, TerminalStatusDecision, TerminalizeDecision,
+            PublicationAuthorityReader, RegistrationAdmissionProvenance, RegistrationDecision,
+            RosterExecutor, RosterExecutorBackend, TerminalStatusDecision, TerminalizeDecision,
         },
     };
     use async_trait::async_trait;
@@ -1245,7 +1245,10 @@ mod tests {
                 .expect("current authority lock") = Some(request.authority().clone());
             Ok(RegistrationDecision::FreshlyAdmittedWithProvenance(
                 registration,
-                test_compact_admission_provenance(request.admission(), request.authority()),
+                RegistrationAdmissionProvenance::V1(test_compact_admission_provenance(
+                    request.admission(),
+                    request.authority(),
+                )),
             ))
         }
 

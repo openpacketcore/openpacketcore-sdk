@@ -70,7 +70,7 @@ pub const MAX_NEGOTIATED_FRAME_SIZE: usize = 16 * 1024 * 1024;
 /// that ceiling merely because it was declared.
 pub(crate) const FRAME_READ_CHUNK_BYTES: usize = 8 * 1024;
 pub const MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE: usize = MIN_NEGOTIATED_FRAME_SIZE;
-/// Fixed v5 revision-7 restore-page payload ceiling.
+/// Fixed v5 revision-8 restore-page payload ceiling.
 ///
 /// This is a wire-contract value, intentionally independent from a local
 /// backend's stored-record and local restore-page ceiling. It uses the same
@@ -168,7 +168,10 @@ pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractPr
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     };
 
-const WIRE_SCHEMA_REVISION: u16 = 7;
+// `ProtectedRosterEstablishedCreate` adds a replication-node discriminant.
+// Keep old revision-7 peers out at bootstrap, before either side can decode
+// or emit a replication operation tree containing that variant.
+const WIRE_SCHEMA_REVISION: u16 = 8;
 const ERROR_SET_REVISION: u16 = 9;
 
 /// Exact semantic and resource-bound contract required by protocol v5.
@@ -1056,6 +1059,9 @@ fn validate_replication_payload_limit(
                     validate_record_payload_limit(record, max)?;
                 }
             }
+            Some(ReplicationOp::ProtectedRosterEstablishedCreate { record, .. }) => {
+                validate_record_payload_limit(record, max)?;
+            }
             Some(ReplicationOp::Batch { ops }) => pending.push(ops.iter()),
             Some(
                 ReplicationOp::DeleteFenced { .. }
@@ -1255,6 +1261,10 @@ fn validate_replication_retained_profile(
                 if let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor {
                     validate_record_profile(record)?;
                 }
+            }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. } => {
+                validate_session_key_profile(key)?;
+                validate_record_profile(record)?;
             }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
         }
@@ -2147,6 +2157,15 @@ enum WireReplicationNodeRef<'a> {
     Batch {
         child_count: u16,
     },
+    ProtectedRosterEstablishedCreate {
+        key: &'a SessionKey,
+        record: &'a StoredSessionRecord,
+        owner: &'a OwnerId,
+        fence: &'a FenceToken,
+        credential_id: u64,
+        guard_acquired_at: &'a Timestamp,
+        guard_expires_at: &'a Timestamp,
+    },
 }
 
 #[derive(Deserialize)]
@@ -2205,6 +2224,15 @@ enum WireReplicationNode {
     },
     Batch {
         child_count: u16,
+    },
+    ProtectedRosterEstablishedCreate {
+        key: SessionKey,
+        record: StoredSessionRecord,
+        owner: OwnerId,
+        fence: FenceToken,
+        credential_id: u64,
+        guard_acquired_at: Timestamp,
+        guard_expires_at: Timestamp,
     },
 }
 
@@ -2301,6 +2329,23 @@ impl WireReplicationNode {
                 key,
                 expected_record,
                 successor: Box::new(successor),
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
+            },
+            Self::ProtectedRosterEstablishedCreate {
+                key,
+                record,
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
+            } => ReplicationOp::ProtectedRosterEstablishedCreate {
+                key,
+                record,
                 owner,
                 fence,
                 credential_id,
@@ -2490,6 +2535,23 @@ impl<'a> TryFrom<&'a ReplicationEntry> for WireReplicationEntryRef<'a> {
                     key,
                     expected_record,
                     successor,
+                    owner,
+                    fence,
+                    credential_id: *credential_id,
+                    guard_acquired_at,
+                    guard_expires_at,
+                },
+                ReplicationOp::ProtectedRosterEstablishedCreate {
+                    key,
+                    record,
+                    owner,
+                    fence,
+                    credential_id,
+                    guard_acquired_at,
+                    guard_expires_at,
+                } => WireReplicationNodeRef::ProtectedRosterEstablishedCreate {
+                    key,
+                    record,
                     owner,
                     fence,
                     credential_id: *credential_id,
@@ -5396,7 +5458,7 @@ mod tests {
     fn contract_profile_and_bootstrap_frames_are_exact_and_version_tolerant() {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/5");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
-        assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 7);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 8);
         assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 9);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
@@ -5405,7 +5467,7 @@ mod tests {
         assert_eq!(
             profile,
             serde_json::json!({
-                "wire_schema_revision": 7,
+                "wire_schema_revision": 8,
                 "error_set_revision": 9,
                 "max_restore_scan_page_records": 1024,
                 "max_restore_scan_page_payload_bytes": 2096128,
@@ -5896,6 +5958,27 @@ mod tests {
         }
     }
 
+    fn protected_roster_create_replication_entry(payload: Vec<u8>) -> ReplicationEntry {
+        let key = test_session_key();
+        let owner = OwnerId::new("roster-create-owner").expect("owner");
+        let fence = FenceToken::new(7);
+        let mut record = test_record(key.clone(), owner.clone(), fence);
+        record.payload = EncryptedSessionPayload::new(payload);
+        let guard_acquired_at = Timestamp::now_utc();
+        let guard_expires_at = guard_acquired_at
+            .add_seconds(60)
+            .expect("test guard interval");
+        replication_entry(ReplicationOp::ProtectedRosterEstablishedCreate {
+            key,
+            record,
+            owner,
+            fence,
+            credential_id: 9,
+            guard_acquired_at,
+            guard_expires_at,
+        })
+    }
+
     fn operation_at_depth(mut operation: ReplicationOp, depth: usize) -> ReplicationOp {
         for _ in 1..depth {
             operation = ReplicationOp::Batch {
@@ -6018,6 +6101,55 @@ mod tests {
         entry.remove("operation_nodes");
         entry.insert("op".to_string(), serde_json::json!({"Batch": {"ops": []}}));
         assert!(serde_json::from_value::<Request>(legacy_nested).is_err());
+    }
+
+    #[test]
+    fn protected_roster_create_replication_discriminant_round_trips_and_obeys_payload_cap() {
+        let entry = protected_roster_create_replication_entry(vec![0xa5; 7]);
+        let request = Request::ReplicateEntry {
+            entry: entry.clone(),
+        };
+        let encoded = serde_json::to_value(&request).expect("create replication request encodes");
+        assert!(
+            encoded["ReplicateEntry"]["entry"]["operation_nodes"][0]
+                .get("ProtectedRosterEstablishedCreate")
+                .is_some(),
+            "the additive replication variant has its own exact wire discriminant"
+        );
+        let decoded: Request =
+            serde_json::from_value(encoded).expect("create replication request decodes");
+        assert!(matches!(
+            decoded,
+            Request::ReplicateEntry { entry: decoded_entry } if decoded_entry == entry
+        ));
+        assert!(validate_request_payload_limit(&request, 7).is_ok());
+
+        let oversized = Request::ReplicateEntry {
+            entry: protected_roster_create_replication_entry(vec![0xa5; 8]),
+        };
+        assert_eq!(
+            validate_request_payload_limit(&oversized, 7),
+            Err(StoreError::PayloadTooLarge { actual: 8, max: 7 }),
+            "the create record is bounded before replication dispatch"
+        );
+    }
+
+    #[test]
+    fn revision_seven_replication_profile_is_rejected_before_create_dispatch() {
+        let mut revision_seven = CURRENT_CONTRACT_PROFILE;
+        revision_seven.wire_schema_revision = 7;
+        assert!(
+            !revision_seven.is_current(),
+            "revision-7 peers are rejected by the exact bootstrap profile before a create node can be decoded"
+        );
+
+        // A current peer still has an unambiguous, independently bounded
+        // create discriminant.  It is reachable only after the exact profile
+        // comparison above has accepted the connection.
+        let request = Request::ReplicateEntry {
+            entry: protected_roster_create_replication_entry(vec![0xa5]),
+        };
+        assert!(serde_json::to_vec(&request).is_ok());
     }
 
     #[test]

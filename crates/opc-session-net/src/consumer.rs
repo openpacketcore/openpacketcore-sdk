@@ -29,8 +29,7 @@ use opc_session_store::consumer::{
     SessionConsumerRosterCurrentPublicationAuthorityReadResponse,
     SessionConsumerRosterTerminalCapsule, SessionConsumerRosterTerminalMutationResponse,
     SessionConsumerRosterTerminalReadResponse, SessionConsumerRosterTransportProfile,
-    SessionQuorumRosterIngress, MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES,
-    MAX_SESSION_CONSUMER_ROSTER_TERMINAL_FRAME_BYTES,
+    SessionQuorumRosterIngress,
 };
 use opc_session_store::{
     checked_session_deadline, session_consumer_batch_result_into_store,
@@ -52,10 +51,10 @@ use opc_session_store::{
     SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
     SessionConsumerLeaseMutationStatus, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
     SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
-    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
-    SessionConsumerVoterAuthority, SessionOp, SessionOpResult, SessionPayloadEncoding,
-    SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
+    SessionConsumerResponse, SessionConsumerRosterRejection, SessionConsumerScope,
+    SessionConsumerStoreError, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionConsumerVoterAuthority, SessionOp, SessionOpResult,
+    SessionPayloadEncoding, SessionQuorumConsumer, StatelessSessionConsumer, StoreError,
     MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
 use opc_types::SpiffeId;
@@ -67,9 +66,14 @@ use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore}
 use tokio::task::JoinSet;
 
 use crate::consensus::RemoteAddrResolver;
-use crate::error::{classify_tls_io_error, tls_peer_credential_rejection, ProtocolError};
+use crate::error::{
+    classify_tls_io_error, tls_io_error_is_no_application_protocol, tls_peer_credential_rejection,
+    ProtocolError,
+};
 use crate::fenced_mutation_roster::{
-    transport::{compose_client, compose_provider_adapter},
+    transport::{
+        compose_client, compose_client_v2, compose_provider_adapter, compose_provider_adapter_v2,
+    },
     FencedMutationRosterClient, FencedMutationRosterEstablishedPublicationProvider,
     FencedMutationRosterExecutorAttestor, FencedMutationRosterMemberProvider,
     FencedMutationRosterProviderAdapter, ProtectedRosterTransportError,
@@ -94,9 +98,13 @@ use crate::protocol::{
 use opc_session_store::fenced_mutation_roster::{
     RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
     RosterAttestationLeafCertificateV1, RosterAttestationTrustRootIdentityV1,
-    RosterAttestationTrustRootV1, RosterCompactAdmissionProvenanceSigningInputV2,
-    RosterCompactAdmissionProvenanceV2, RosterIngressAttestationSigningInputV1,
-    RosterIngressAttestationV1,
+    RosterAttestationTrustRootV1, RosterCompactAdmissionProvenance,
+    RosterCompactAdmissionProvenanceInput, RosterCompactAdmissionProvenanceSigningInputV2,
+    RosterCompactAdmissionProvenanceV2, RosterIngressAttestation,
+    RosterIngressAttestationSigningInputV1, RosterIngressAttestationSigningInputV2,
+    RosterIngressAttestationV1, RosterIngressAttestationV2,
+    RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
+    RosterProfileV2CompactAdmissionProvenanceV1,
 };
 
 /// Dedicated ALPN for authenticated session-quorum consumers.
@@ -117,8 +125,7 @@ pub const SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION: u16 = 6;
 /// The V2 server rejects every other Hello revision before dispatch.
 pub const SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION: u16 = 5;
 
-/// Additive protected-roster consumer ALPN. It is fixed at revision five; the
-/// current general consumer lane remains source- and wire-compatible.
+/// Frozen V1 protected-roster consumer ALPN.
 pub const SESSION_QUORUM_CONSUMER_ROSTER_ALPN: &[u8] =
     opc_session_store::consumer::SESSION_CONSUMER_ROSTER_ALPN;
 
@@ -126,15 +133,24 @@ pub const SESSION_QUORUM_CONSUMER_ROSTER_ALPN: &[u8] =
 pub const SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION: u16 =
     opc_session_store::consumer::SESSION_CONSUMER_ROSTER_TRANSPORT_REVISION;
 
+/// Additive V2 protected-roster consumer ALPN.
+pub const SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN: &[u8] =
+    opc_session_store::consumer::SESSION_CONSUMER_ROSTER_V2_ALPN;
+
+/// Fixed revision negotiated by [`SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN`].
+pub const SESSION_QUORUM_CONSUMER_ROSTER_V2_TRANSPORT_REVISION: u16 =
+    opc_session_store::consumer::SESSION_CONSUMER_ROSTER_V2_TRANSPORT_REVISION;
+
 /// One TLS/Hello capability lane accepted by the consumer transport.
 ///
-/// Revision five is additive. It is intentionally not a version bump for the
-/// general revision-six lane because legacy/general and protected-roster
-/// services must not negotiate different authority rules by accident.
+/// The protected-roster profiles are additive lanes.  Neither is a version
+/// bump of the general revision-six lane, and V2 is never an interpretation
+/// of the frozen V1 `/3` contract.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConsumerTransportCapability {
     GeneralV6,
     ProtectedRosterV5,
+    ProtectedRosterV6,
 }
 
 impl ConsumerTransportCapability {
@@ -142,6 +158,7 @@ impl ConsumerTransportCapability {
         match self {
             Self::GeneralV6 => SESSION_QUORUM_CONSUMER_ALPN,
             Self::ProtectedRosterV5 => SESSION_QUORUM_CONSUMER_ROSTER_ALPN,
+            Self::ProtectedRosterV6 => SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN,
         }
     }
 
@@ -149,6 +166,7 @@ impl ConsumerTransportCapability {
         match self {
             Self::GeneralV6 => SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
             Self::ProtectedRosterV5 => SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
+            Self::ProtectedRosterV6 => SESSION_QUORUM_CONSUMER_ROSTER_V2_TRANSPORT_REVISION,
         }
     }
 
@@ -156,6 +174,7 @@ impl ConsumerTransportCapability {
         match self {
             Self::GeneralV6 => None,
             Self::ProtectedRosterV5 => Some(SessionConsumerRosterTransportProfile::current()),
+            Self::ProtectedRosterV6 => Some(SessionConsumerRosterTransportProfile::v2()),
         }
     }
 
@@ -165,8 +184,15 @@ impl ConsumerTransportCapability {
             Some(value) if value == SESSION_QUORUM_CONSUMER_ROSTER_ALPN => {
                 Ok(Self::ProtectedRosterV5)
             }
+            Some(value) if value == SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN => {
+                Ok(Self::ProtectedRosterV6)
+            }
             _ => Err(ProtocolError::UnexpectedResponse),
         }
+    }
+
+    const fn is_protected_roster(self) -> bool {
+        matches!(self, Self::ProtectedRosterV5 | Self::ProtectedRosterV6)
     }
 }
 
@@ -186,8 +212,7 @@ fn consumer_operation_matches_transport(
     operation: &SessionConsumerOperation,
     capability: ConsumerTransportCapability,
 ) -> bool {
-    consumer_operation_requires_roster_capability(operation)
-        == matches!(capability, ConsumerTransportCapability::ProtectedRosterV5)
+    consumer_operation_requires_roster_capability(operation) == capability.is_protected_roster()
 }
 
 fn roster_ingress_unavailable_response(
@@ -255,6 +280,17 @@ pub trait RosterIngressSigner: Send + Sync {
         input: &RosterIngressAttestationSigningInputV1,
     ) -> Result<RosterIngressAttestationV1, RosterIngressSignerError>;
 
+    /// Issue one exact protected `/4` transport-ingress attestation.
+    ///
+    /// The fail-closed default keeps V1 signer implementations source
+    /// compatible while preventing them from authorizing Profile V2 ingress.
+    async fn attest_v2(
+        &self,
+        _input: &RosterIngressAttestationSigningInputV2,
+    ) -> Result<RosterIngressAttestationV2, RosterIngressSignerError> {
+        Err(RosterIngressSignerError)
+    }
+
     /// Return the already root-signed `TransportIngress` leaf used for the
     /// compact admission provenance.  The fail-closed default keeps existing
     /// V1-only implementations source compatible, while ensuring they cannot
@@ -277,6 +313,95 @@ pub trait RosterIngressSigner: Send + Sync {
     ) -> Result<[u8; 64], RosterIngressSignerError> {
         Err(RosterIngressSignerError)
     }
+
+    /// Return the exact scope-selected `/4` leaf used by an authenticated V2
+    /// ingress attestation. Implementations must never substitute a global
+    /// listener certificate here.
+    fn compact_admission_certificate_v2(
+        &self,
+        _attestation: &RosterIngressAttestationV2,
+    ) -> Result<RosterAttestationLeafCertificatePartsV1, RosterIngressSignerError> {
+        Err(RosterIngressSignerError)
+    }
+
+    /// Sign one Profile V2-only compact-admission provenance preimage.
+    async fn sign_compact_admission_v2(
+        &self,
+        _input: &RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
+        _attestation: &RosterIngressAttestationV2,
+    ) -> Result<[u8; 64], RosterIngressSignerError> {
+        Err(RosterIngressSignerError)
+    }
+}
+
+/// Exact authenticated transport facts common to the two profile-specific
+/// ingress preimages.
+#[derive(Clone, Copy)]
+struct RosterIngressAttestationFields {
+    peer_identity_commitment: [u8; 32],
+    consumer_scope: [u8; 32],
+    request_id: [u8; 16],
+    operation_tag: u8,
+    canonical_capsule_digest: [u8; 32],
+    authenticated_at: opc_types::Timestamp,
+    peer_certificate_expires_at: opc_types::Timestamp,
+    material_generation: u64,
+    handshake_epoch: u64,
+}
+
+impl RosterIngressAttestationFields {
+    const fn v1(self) -> RosterIngressAttestationSigningInputV1 {
+        RosterIngressAttestationSigningInputV1 {
+            peer_identity_commitment: self.peer_identity_commitment,
+            consumer_scope: self.consumer_scope,
+            request_id: self.request_id,
+            operation_tag: self.operation_tag,
+            canonical_capsule_digest: self.canonical_capsule_digest,
+            authenticated_at: self.authenticated_at,
+            peer_certificate_expires_at: self.peer_certificate_expires_at,
+            material_generation: self.material_generation,
+            handshake_epoch: self.handshake_epoch,
+        }
+    }
+
+    const fn v2(self) -> RosterIngressAttestationSigningInputV2 {
+        RosterIngressAttestationSigningInputV2 {
+            peer_identity_commitment: self.peer_identity_commitment,
+            consumer_scope: self.consumer_scope,
+            request_id: self.request_id,
+            operation_tag: self.operation_tag,
+            canonical_capsule_digest: self.canonical_capsule_digest,
+            authenticated_at: self.authenticated_at,
+            peer_certificate_expires_at: self.peer_certificate_expires_at,
+            material_generation: self.material_generation,
+            handshake_epoch: self.handshake_epoch,
+        }
+    }
+}
+
+/// Issue an ingress envelope only in the exact negotiated profile domain.
+///
+/// This boundary runs before the ingress service receives a request, so a
+/// V1-only signer cannot authorize `/4` and a V2-only signer cannot authorize
+/// `/3` by falling through to the other method.
+async fn attest_roster_ingress_for_profile(
+    signer: &dyn RosterIngressSigner,
+    profile: SessionConsumerRosterTransportProfile,
+    fields: RosterIngressAttestationFields,
+) -> Result<RosterIngressAttestation, RosterIngressSignerError> {
+    if profile.is_current() {
+        return signer
+            .attest(&fields.v1())
+            .await
+            .map(RosterIngressAttestation::V1);
+    }
+    if profile.is_v2() {
+        return signer
+            .attest_v2(&fields.v2())
+            .await
+            .map(RosterIngressAttestation::V2);
+    }
+    Err(RosterIngressSignerError)
 }
 
 #[derive(Clone)]
@@ -318,16 +443,45 @@ fn compact_admission_signer_available(signer: &dyn RosterIngressSigner) -> bool 
 async fn issue_compact_admission_provenance(
     signer: &dyn RosterIngressSigner,
     input: RosterCompactAdmissionProvenanceSigningInputV2,
+    certificate: RosterAttestationLeafCertificatePartsV1,
     request_deadline: tokio::time::Instant,
 ) -> Result<RosterCompactAdmissionProvenanceV2, RosterIngressSignerError> {
     let root = signer.trust_root();
-    let certificate = signer.compact_admission_certificate()?;
     input.digest().map_err(|_| RosterIngressSignerError)?;
     let signature =
         tokio::time::timeout_at(request_deadline, signer.sign_compact_admission(&input))
             .await
             .map_err(|_| RosterIngressSignerError)??;
     RosterCompactAdmissionProvenanceV2::issue_from_signed_parts(
+        &root,
+        certificate,
+        &input,
+        signature,
+    )
+    .map_err(|_| RosterIngressSignerError)
+}
+
+/// Issue only a V2-profile compact provenance using the same exact leaf that
+/// issued the authenticated `/4` ingress attestation.
+async fn issue_compact_admission_provenance_v2(
+    signer: &dyn RosterIngressSigner,
+    input: RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
+    attestation: &RosterIngressAttestationV2,
+    certificate: RosterAttestationLeafCertificatePartsV1,
+    request_deadline: tokio::time::Instant,
+) -> Result<RosterProfileV2CompactAdmissionProvenanceV1, RosterIngressSignerError> {
+    let root = signer.trust_root();
+    attestation
+        .verify_same_leaf_certificate(&root, &certificate)
+        .map_err(|_| RosterIngressSignerError)?;
+    input.digest().map_err(|_| RosterIngressSignerError)?;
+    let signature = tokio::time::timeout_at(
+        request_deadline,
+        signer.sign_compact_admission_v2(&input, attestation),
+    )
+    .await
+    .map_err(|_| RosterIngressSignerError)??;
+    RosterProfileV2CompactAdmissionProvenanceV1::issue_from_signed_parts(
         &root,
         certificate,
         &input,
@@ -396,7 +550,7 @@ fn roster_profile_fits_consumer_frames(
     request_frame_size: usize,
     response_frame_size: usize,
 ) -> bool {
-    profile.is_current()
+    (profile.is_current() || profile.is_v2())
         && request_frame_size >= profile.admission_frame_bytes()
         && response_frame_size >= profile.admission_frame_bytes()
         && request_frame_size >= profile.terminal_frame_bytes()
@@ -816,6 +970,44 @@ pub enum SessionConsumerClientError {
     ShuttingDown,
 }
 
+/// Private setup classification retained only until the protected-roster port
+/// can convert a conclusively rejected ALPN into its existing capability
+/// rejection. All public consumer surfaces collapse it to `Protocol`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumerSetupError {
+    Client(SessionConsumerClientError),
+    NoApplicationProtocol,
+}
+
+impl From<SessionConsumerClientError> for ConsumerSetupError {
+    fn from(value: SessionConsumerClientError) -> Self {
+        Self::Client(value)
+    }
+}
+
+impl ConsumerSetupError {
+    const fn into_client_error(self) -> SessionConsumerClientError {
+        match self {
+            Self::Client(error) => error,
+            Self::NoApplicationProtocol => SessionConsumerClientError::Protocol,
+        }
+    }
+}
+
+fn consumer_tls_setup_error(
+    error: std::io::Error,
+    pre_request_budget_active: bool,
+) -> ConsumerSetupError {
+    if tls_io_error_is_no_application_protocol(&error) {
+        ConsumerSetupError::NoApplicationProtocol
+    } else {
+        ConsumerSetupError::Client(pre_request_error(
+            SessionConsumerClientError::from(classify_tls_io_error(error)),
+            pre_request_budget_active,
+        ))
+    }
+}
+
 /// Effect-boundary-preserving failure from the persistent client's raw typed
 /// request surface.
 ///
@@ -883,6 +1075,28 @@ fn persistent_execute_error_for_request(
     )
 }
 
+/// Private roster-only preservation of a TLS capability rejection. The
+/// generic persistent surface deliberately continues to report the same
+/// pre-Call `NotTransmitted` attribution.
+pub(crate) enum PersistentRosterExecuteError {
+    Generic(PersistentSessionConsumerExecuteError),
+    NoApplicationProtocol,
+}
+
+fn persistent_roster_execute_error_for_request(
+    request: &SessionConsumerRequest,
+    error: SessionConsumerCallError,
+) -> PersistentRosterExecuteError {
+    match error {
+        SessionConsumerCallError::NoApplicationProtocol => {
+            PersistentRosterExecuteError::NoApplicationProtocol
+        }
+        error => PersistentRosterExecuteError::Generic(persistent_execute_error_for_request(
+            request, error,
+        )),
+    }
+}
+
 #[cfg(test)]
 fn persistent_execute_error(
     request_id: SessionConsumerRequestId,
@@ -899,6 +1113,11 @@ fn persistent_execute_error_with_effect(
     match error {
         SessionConsumerCallError::BeforeCallWrite(cause) => {
             PersistentSessionConsumerExecuteError::NotTransmitted { cause }
+        }
+        SessionConsumerCallError::NoApplicationProtocol => {
+            PersistentSessionConsumerExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            }
         }
         SessionConsumerCallError::MayHaveSent(cause) if !effectful => {
             PersistentSessionConsumerExecuteError::ReadUnavailable { cause }
@@ -1176,12 +1395,14 @@ pub struct PersistentSessionConsumerShutdownReport {
 enum SessionConsumerCallError {
     BeforeCallWrite(SessionConsumerClientError),
     MayHaveSent(SessionConsumerClientError),
+    NoApplicationProtocol,
 }
 
 impl SessionConsumerCallError {
     const fn into_client_error(self) -> SessionConsumerClientError {
         match self {
             Self::BeforeCallWrite(error) | Self::MayHaveSent(error) => error,
+            Self::NoApplicationProtocol => SessionConsumerClientError::Protocol,
         }
     }
 }
@@ -3844,34 +4065,39 @@ fn consumer_client_tls_config_for(
 
 #[cfg(test)]
 fn consumer_server_tls_config(config: Arc<opc_tls::ServerConfig>) -> Arc<opc_tls::ServerConfig> {
-    consumer_server_tls_config_for(config, true)
+    consumer_server_tls_config_for(config, Some(ConsumerTransportCapability::ProtectedRosterV5))
 }
 
 fn consumer_server_tls_config_for(
     config: Arc<opc_tls::ServerConfig>,
-    roster_transport_enabled: bool,
+    roster_transport_capability: Option<ConsumerTransportCapability>,
 ) -> Arc<opc_tls::ServerConfig> {
     let mut config = config.as_ref().clone();
-    // A client offers exactly one ALPN. Keep the existing V1/V2 lanes and
-    // add `/3` only while the separately-authorized roster ingress exists.
-    config.alpn_protocols = if roster_transport_enabled {
-        vec![
-            SESSION_QUORUM_CONSUMER_ROSTER_ALPN.to_vec(),
-            SESSION_QUORUM_CONSUMER_V2_ALPN.to_vec(),
-            SESSION_QUORUM_CONSUMER_ALPN.to_vec(),
-        ]
-    } else {
-        vec![
-            SESSION_QUORUM_CONSUMER_V2_ALPN.to_vec(),
-            SESSION_QUORUM_CONSUMER_ALPN.to_vec(),
-        ]
-    };
+    config.alpn_protocols = consumer_server_alpn_protocols(roster_transport_capability);
     config.session_storage = Arc::new(tokio_rustls::rustls::server::NoServerSessionStorage {});
     config.ticketer = Arc::new(DisabledConsumerSessionTickets);
     config.send_tls13_tickets = 0;
     config.max_early_data_size = 0;
     config.send_half_rtt_data = false;
     Arc::new(config)
+}
+
+fn consumer_server_alpn_protocols(
+    roster_transport_capability: Option<ConsumerTransportCapability>,
+) -> Vec<Vec<u8>> {
+    // A client offers exactly one ALPN. Keep the existing general lanes and
+    // advertise exactly one protected roster ALPN only while its separately
+    // authorized ingress exists. A V1 and a V2 listener are intentionally
+    // disjoint: a peer cannot negotiate one profile and dispatch the other.
+    let mut alpn_protocols = Vec::with_capacity(3);
+    if let Some(capability) = roster_transport_capability {
+        alpn_protocols.push(capability.alpn().to_vec());
+    }
+    alpn_protocols.extend([
+        SESSION_QUORUM_CONSUMER_V2_ALPN.to_vec(),
+        SESSION_QUORUM_CONSUMER_ALPN.to_vec(),
+    ]);
+    alpn_protocols
 }
 
 #[derive(Debug)]
@@ -5732,7 +5958,7 @@ impl StatelessSessionConsumerClient {
         self
     }
 
-    /// Opt into the isolated revision-five protected-roster capability lane.
+    /// Opt into the frozen revision-five protected-roster capability lane.
     ///
     /// This changes both TLS ALPN and the exact Hello profile. Once selected,
     /// the client accepts only protected-roster consumer operations; ordinary
@@ -5743,11 +5969,29 @@ impl StatelessSessionConsumerClient {
         self
     }
 
-    /// Return whether this client has opted into the protected-roster lane.
+    /// Opt into the additive revision-six protected-roster capability lane.
+    ///
+    /// V2 uses its own ALPN and exact Hello profile. It cannot be selected by
+    /// upgrading or relabelling a frozen V1 connection.
+    #[must_use]
+    pub(crate) fn with_fenced_mutation_roster_v2_transport(mut self) -> Self {
+        self.transport_capability = ConsumerTransportCapability::ProtectedRosterV6;
+        self
+    }
+
+    /// Return whether this client has opted into the frozen V1 roster lane.
     pub fn fenced_mutation_roster_transport_enabled(&self) -> bool {
         matches!(
             self.transport_capability,
             ConsumerTransportCapability::ProtectedRosterV5
+        )
+    }
+
+    /// Return whether this client has opted into the additive V2 roster lane.
+    pub fn fenced_mutation_roster_v2_transport_enabled(&self) -> bool {
+        matches!(
+            self.transport_capability,
+            ConsumerTransportCapability::ProtectedRosterV6
         )
     }
 
@@ -5820,6 +6064,7 @@ impl StatelessSessionConsumerClient {
             None,
         )
         .await
+        .map_err(ConsumerSetupError::into_client_error)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5834,7 +6079,7 @@ impl StatelessSessionConsumerClient {
         reconnect_control: Option<&Arc<PersistentConsumerReconnectControl>>,
         coordinate_recovery: bool,
         resolved_address: Option<SocketAddr>,
-    ) -> Result<ConsumerConnection, SessionConsumerClientError> {
+    ) -> Result<ConsumerConnection, ConsumerSetupError> {
         if self.idle_timeout.is_zero()
             || self.operation_timeout.is_zero()
             || self
@@ -5842,7 +6087,9 @@ impl StatelessSessionConsumerClient {
                 .validate_at(tokio::time::Instant::now())
                 .is_err()
         {
-            return Err(SessionConsumerClientError::Protocol);
+            return Err(ConsumerSetupError::Client(
+                SessionConsumerClientError::Protocol,
+            ));
         }
         // Physical cardinality is authoritative and fail-fast. Never enter a
         // recovery cooldown for local cap exhaustion.
@@ -5930,16 +6177,19 @@ impl StatelessSessionConsumerClient {
         )
         .await?
         .map_err(|_| pre_request_timeout_error(pre_request_budget_active))?
-        .map_err(|error| SessionConsumerClientError::from(classify_tls_io_error(error)))
-        .map_err(|error| pre_request_error(error, pre_request_budget_active))?;
+        .map_err(|error| consumer_tls_setup_error(error, pre_request_budget_active))?;
         let established_at = tokio::time::Instant::now();
         if tls.get_ref().1.alpn_protocol() != Some(self.transport_capability.alpn()) {
-            return Err(SessionConsumerClientError::Protocol);
+            return Err(ConsumerSetupError::Client(
+                SessionConsumerClientError::Protocol,
+            ));
         }
         let peer = opc_tls::peer_tls_identity_from_client_connection(tls.get_ref().1)
             .map_err(|_| SessionConsumerClientError::Authentication)?;
         if peer.spiffe_id().as_str() != self.voter.tls_identity() {
-            return Err(SessionConsumerClientError::Authentication);
+            return Err(ConsumerSetupError::Client(
+                SessionConsumerClientError::Authentication,
+            ));
         }
         let rotation_jitter = handshake.consumer_rotation_jitter(peer.spiffe_id());
         let lifecycle = ConnectionLifecycle::new(
@@ -5998,15 +6248,19 @@ impl StatelessSessionConsumerClient {
             tokio::pin!(hello_write);
             let setup_deadline = pre_request_deadline.min(lifecycle.retire_at());
             if tokio::time::Instant::now() >= setup_deadline {
-                return Err(pre_request_timeout_error(pre_request_budget_active));
+                return Err(ConsumerSetupError::Client(pre_request_timeout_error(
+                    pre_request_budget_active,
+                )));
             }
             let result = tokio::select! {
                 biased;
                 _ = reconnect_setup.superseded() => {
-                    return Err(SessionConsumerClientError::Deadline);
+                    return Err(ConsumerSetupError::Client(SessionConsumerClientError::Deadline));
                 }
                 _ = tokio::time::sleep_until(setup_deadline) => {
-                    return Err(pre_request_timeout_error(pre_request_budget_active));
+                    return Err(ConsumerSetupError::Client(pre_request_timeout_error(
+                        pre_request_budget_active,
+                    )));
                 }
                 result = &mut hello_write => result,
             };
@@ -6024,15 +6278,19 @@ impl StatelessSessionConsumerClient {
             tokio::pin!(ack);
             let setup_deadline = pre_request_deadline.min(lifecycle.retire_at());
             if tokio::time::Instant::now() >= setup_deadline {
-                return Err(pre_request_timeout_error(pre_request_budget_active));
+                return Err(ConsumerSetupError::Client(pre_request_timeout_error(
+                    pre_request_budget_active,
+                )));
             }
             let result = tokio::select! {
                 biased;
                 _ = reconnect_setup.superseded() => {
-                    return Err(SessionConsumerClientError::Deadline);
+                    return Err(ConsumerSetupError::Client(SessionConsumerClientError::Deadline));
                 }
                 _ = tokio::time::sleep_until(setup_deadline) => {
-                    return Err(pre_request_timeout_error(pre_request_budget_active));
+                    return Err(ConsumerSetupError::Client(pre_request_timeout_error(
+                        pre_request_budget_active,
+                    )));
                 }
                 result = &mut ack => result,
             };
@@ -6055,13 +6313,19 @@ impl StatelessSessionConsumerClient {
                     .map_err(SessionConsumerClientError::from)?
             }
             ConsumerWireResponse::HelloRejected(SessionConsumerRejection::ScopeMismatch) => {
-                return Err(SessionConsumerClientError::Scope);
+                return Err(ConsumerSetupError::Client(
+                    SessionConsumerClientError::Scope,
+                ));
             }
             ConsumerWireResponse::HelloRejected(SessionConsumerRejection::Unauthorized) => {
-                return Err(SessionConsumerClientError::Authentication);
+                return Err(ConsumerSetupError::Client(
+                    SessionConsumerClientError::Authentication,
+                ));
             }
             _ => {
-                return Err(SessionConsumerClientError::Protocol);
+                return Err(ConsumerSetupError::Client(
+                    SessionConsumerClientError::Protocol,
+                ));
             }
         };
         if let Some(profile) = self.transport_capability.roster_profile() {
@@ -6070,14 +6334,18 @@ impl StatelessSessionConsumerClient {
                 request_frame_size,
                 MAX_NEGOTIATED_FRAME_SIZE,
             ) {
-                return Err(SessionConsumerClientError::Protocol);
+                return Err(ConsumerSetupError::Client(
+                    SessionConsumerClientError::Protocol,
+                ));
             }
         }
         let admission = match handshake.admit() {
             Ok(admission) => admission,
             Err(_) => {
                 reconnect_setup.reject_if_stale()?;
-                return Err(SessionConsumerClientError::Authentication);
+                return Err(ConsumerSetupError::Client(
+                    SessionConsumerClientError::Authentication,
+                ));
             }
         };
         if !consumer_fresh_admission_is_current(
@@ -6087,7 +6355,9 @@ impl StatelessSessionConsumerClient {
             self.tls_config.material_status().epoch(),
         ) {
             reconnect_setup.observe_current_reconnect_epoch();
-            return Err(SessionConsumerClientError::Deadline);
+            return Err(ConsumerSetupError::Client(
+                SessionConsumerClientError::Deadline,
+            ));
         }
         let reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(reader);
         let writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(writer);
@@ -6111,7 +6381,9 @@ impl StatelessSessionConsumerClient {
             _physical_admission: Some(physical_admission),
         };
         if !connection.current(&self.tls_config, &self.reauthentication) {
-            return reconnect_setup.reject_connection_lifecycle();
+            return reconnect_setup
+                .reject_connection_lifecycle()
+                .map_err(ConsumerSetupError::from);
         }
         // This is the fresh-lane publication boundary. A material change
         // observed after this exact sample belongs to an already-admitted
@@ -6128,7 +6400,9 @@ impl StatelessSessionConsumerClient {
             self.tls_config.material_status().epoch(),
         ) {
             reconnect_setup.observe_current_reconnect_epoch();
-            return Err(SessionConsumerClientError::Deadline);
+            return Err(ConsumerSetupError::Client(
+                SessionConsumerClientError::Deadline,
+            ));
         }
         hello_attempt.complete();
         reconnect_setup.succeeded();
@@ -7542,6 +7816,7 @@ impl StatelessSessionConsumerClient {
                 None,
             )
             .await
+            .map_err(ConsumerSetupError::into_client_error)
             .map_err(SessionConsumerCallError::BeforeCallWrite)?;
         let mut reauthentication_changes = self.reauthentication.subscribe();
         let mut material_changes = Some(self.tls_config.subscribe_material_changes());
@@ -11800,8 +12075,8 @@ impl PersistentSessionConsumerPool {
     async fn connect(
         self: &Arc<Self>,
         operation_deadline: tokio::time::Instant,
-    ) -> Result<ConsumerConnection, SessionConsumerClientError> {
-        self.connect_with_physical_admission(operation_deadline, None, true, None)
+    ) -> Result<ConsumerConnection, ConsumerSetupError> {
+        self.connect_with_physical_admission_classified(operation_deadline, None, true, None)
             .await
     }
 
@@ -11812,6 +12087,23 @@ impl PersistentSessionConsumerPool {
         coordinate_recovery: bool,
         resolved_address: Option<SocketAddr>,
     ) -> Result<ConsumerConnection, SessionConsumerClientError> {
+        self.connect_with_physical_admission_classified(
+            operation_deadline,
+            physical_admission,
+            coordinate_recovery,
+            resolved_address,
+        )
+        .await
+        .map_err(ConsumerSetupError::into_client_error)
+    }
+
+    async fn connect_with_physical_admission_classified(
+        self: &Arc<Self>,
+        operation_deadline: tokio::time::Instant,
+        physical_admission: Option<OwnedSemaphorePermit>,
+        coordinate_recovery: bool,
+        resolved_address: Option<SocketAddr>,
+    ) -> Result<ConsumerConnection, ConsumerSetupError> {
         let setup_started = tokio::time::Instant::now();
         // Capture before resolver/TCP so a normal cold connection that began
         // before a later ensure target publication cannot inherit the newer
@@ -11850,13 +12142,16 @@ impl PersistentSessionConsumerPool {
         // Tokio polls a timed inner future before its deadline future. Reject
         // setup that completed while this task was descheduled before the
         // connection can carry an application frame.
-        match result.and_then(|connection| {
-            complete_before_deadline(
+        let result = match result {
+            Ok(connection) => complete_before_deadline(
                 connection,
                 setup_deadline,
                 SessionConsumerClientError::Unavailable,
             )
-        }) {
+            .map_err(ConsumerSetupError::from),
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(mut connection) => {
                 connection.pool_connection = Some(Arc::downgrade(self));
                 connection.warm_target_generation = warm_target_generation;
@@ -12004,15 +12299,20 @@ impl AuthenticatedRosterConsumer {
             .await
         {
             Ok(response) => Ok(response),
-            Err(PersistentSessionConsumerExecuteError::NotTransmitted { .. }) => {
-                Ok(SessionConsumerRosterAdmissionMutationResponse::NotTransmitted)
+            Err(PersistentRosterExecuteError::NoApplicationProtocol) => {
+                Ok(SessionConsumerRosterAdmissionMutationResponse::Rejected(
+                    SessionConsumerRosterRejection::Capability,
+                ))
             }
-            Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { .. }) => {
-                Ok(SessionConsumerRosterAdmissionMutationResponse::OutcomeUnknown)
-            }
-            Err(PersistentSessionConsumerExecuteError::ReadUnavailable { .. }) => {
-                Err(ProtectedRosterTransportError)
-            }
+            Err(PersistentRosterExecuteError::Generic(
+                PersistentSessionConsumerExecuteError::NotTransmitted { .. },
+            )) => Ok(SessionConsumerRosterAdmissionMutationResponse::NotTransmitted),
+            Err(PersistentRosterExecuteError::Generic(
+                PersistentSessionConsumerExecuteError::OutcomeUnknown { .. },
+            )) => Ok(SessionConsumerRosterAdmissionMutationResponse::OutcomeUnknown),
+            Err(PersistentRosterExecuteError::Generic(
+                PersistentSessionConsumerExecuteError::ReadUnavailable { .. },
+            )) => Err(ProtectedRosterTransportError),
         }
     }
 
@@ -12049,15 +12349,20 @@ impl AuthenticatedRosterConsumer {
             .await
         {
             Ok(response) => Ok(response),
-            Err(PersistentSessionConsumerExecuteError::NotTransmitted { .. }) => {
-                Ok(SessionConsumerRosterTerminalMutationResponse::NotTransmitted)
+            Err(PersistentRosterExecuteError::NoApplicationProtocol) => {
+                Ok(SessionConsumerRosterTerminalMutationResponse::Rejected(
+                    SessionConsumerRosterRejection::Capability,
+                ))
             }
-            Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { .. }) => {
-                Ok(SessionConsumerRosterTerminalMutationResponse::OutcomeUnknown)
-            }
-            Err(PersistentSessionConsumerExecuteError::ReadUnavailable { .. }) => {
-                Err(ProtectedRosterTransportError)
-            }
+            Err(PersistentRosterExecuteError::Generic(
+                PersistentSessionConsumerExecuteError::NotTransmitted { .. },
+            )) => Ok(SessionConsumerRosterTerminalMutationResponse::NotTransmitted),
+            Err(PersistentRosterExecuteError::Generic(
+                PersistentSessionConsumerExecuteError::OutcomeUnknown { .. },
+            )) => Ok(SessionConsumerRosterTerminalMutationResponse::OutcomeUnknown),
+            Err(PersistentRosterExecuteError::Generic(
+                PersistentSessionConsumerExecuteError::ReadUnavailable { .. },
+            )) => Err(ProtectedRosterTransportError),
         }
     }
 
@@ -12109,6 +12414,17 @@ impl PersistentSessionConsumerClient {
         )
     }
 
+    /// Construct the one persistent client permitted to compose a V2
+    /// absent-predecessor protected roster.
+    pub fn from_fenced_mutation_roster_v2_stateless(
+        client: StatelessSessionConsumerClient,
+    ) -> Result<Self, PersistentSessionConsumerConfigError> {
+        Self::try_from_fenced_mutation_roster_v2_stateless(
+            client,
+            PersistentSessionConsumerConfig::default(),
+        )
+    }
+
     /// Construct a fixed-capacity revision-five protected-roster pool.
     ///
     /// Selecting the roster lane before the pool exists prevents an ordinary
@@ -12118,6 +12434,17 @@ impl PersistentSessionConsumerClient {
         config: PersistentSessionConsumerConfig,
     ) -> Result<Self, PersistentSessionConsumerConfigError> {
         Self::try_from_stateless(client.with_fenced_mutation_roster_transport(), config)
+    }
+
+    /// Construct a fixed-capacity V2 protected-roster pool.
+    ///
+    /// Selecting `/4` before the pool exists prevents a V1 pool or retained
+    /// V1 connection from being relabelled as the absent-predecessor lane.
+    pub fn try_from_fenced_mutation_roster_v2_stateless(
+        client: StatelessSessionConsumerClient,
+        config: PersistentSessionConsumerConfig,
+    ) -> Result<Self, PersistentSessionConsumerConfigError> {
+        Self::try_from_stateless(client.with_fenced_mutation_roster_v2_transport(), config)
     }
 
     /// Construct a bounded pool from a configured stateless client.
@@ -12255,16 +12582,44 @@ impl PersistentSessionConsumerClient {
         self.pool.client.fenced_mutation_roster_transport_enabled()
     }
 
+    /// Return whether this fixed pool was constructed for the additive V2
+    /// protected-roster transport profile.
+    pub fn fenced_mutation_roster_v2_transport_enabled(&self) -> bool {
+        self.pool
+            .client
+            .fenced_mutation_roster_v2_transport_enabled()
+    }
+
     /// Consume this exact revision-five pool into the SDK-internal roster
     /// transport capability.
     pub(crate) fn try_into_authenticated_roster_consumer(
         self,
     ) -> Result<AuthenticatedRosterConsumer, ProtectedRosterTransportError> {
+        self.try_into_authenticated_roster_consumer_for(
+            ConsumerTransportCapability::ProtectedRosterV5,
+        )
+    }
+
+    /// Consume this exact V2 pool into the SDK-internal roster transport
+    /// capability. The V2 profile is checked before any provider can be
+    /// constructed or any request can be dispatched.
+    pub(crate) fn try_into_authenticated_roster_v2_consumer(
+        self,
+    ) -> Result<AuthenticatedRosterConsumer, ProtectedRosterTransportError> {
+        self.try_into_authenticated_roster_consumer_for(
+            ConsumerTransportCapability::ProtectedRosterV6,
+        )
+    }
+
+    fn try_into_authenticated_roster_consumer_for(
+        self,
+        expected_capability: ConsumerTransportCapability,
+    ) -> Result<AuthenticatedRosterConsumer, ProtectedRosterTransportError> {
         let capability = self.pool.client.transport_capability;
-        if capability != ConsumerTransportCapability::ProtectedRosterV5
-            || capability.alpn() != SESSION_QUORUM_CONSUMER_ROSTER_ALPN
-            || capability.revision() != SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION
-            || capability.roster_profile() != Some(SessionConsumerRosterTransportProfile::current())
+        if capability != expected_capability
+            || capability.alpn() != expected_capability.alpn()
+            || capability.revision() != expected_capability.revision()
+            || capability.roster_profile() != expected_capability.roster_profile()
         {
             return Err(ProtectedRosterTransportError);
         }
@@ -12304,6 +12659,25 @@ impl PersistentSessionConsumerClient {
         )
     }
 
+    /// Consume this exact V2 pool into the public protected-roster client
+    /// bound to one startup-owned provider and terminal attestor.
+    pub fn into_fenced_mutation_roster_v2_client<P>(
+        self,
+        provider: Arc<P>,
+        attestor: Arc<dyn FencedMutationRosterExecutorAttestor>,
+        max_in_flight: NonZeroUsize,
+    ) -> Result<FencedMutationRosterClient, ProtectedRosterTransportError>
+    where
+        P: FencedMutationRosterMemberProvider,
+    {
+        compose_client_v2(
+            self.try_into_authenticated_roster_v2_consumer()?,
+            provider,
+            attestor,
+            max_in_flight,
+        )
+    }
+
     /// Consume this exact revision-five pool into an opaque roster client
     /// with both startup-owned provider seams and one terminal attestor fixed
     /// for its lifetime.
@@ -12324,6 +12698,29 @@ impl PersistentSessionConsumerClient {
     {
         compose_provider_adapter(
             self.try_into_authenticated_roster_consumer()?,
+            member_provider,
+            publication_provider,
+            attestor,
+            max_in_flight,
+        )
+    }
+
+    /// Consume this exact V2 pool into an opaque roster client with both
+    /// startup-owned provider seams and one terminal attestor fixed for its
+    /// lifetime.
+    pub fn into_fenced_mutation_roster_v2_provider_adapter<P, Q>(
+        self,
+        member_provider: Arc<P>,
+        publication_provider: Arc<Q>,
+        attestor: Arc<dyn FencedMutationRosterExecutorAttestor>,
+        max_in_flight: NonZeroUsize,
+    ) -> Result<FencedMutationRosterProviderAdapter<Q>, ProtectedRosterTransportError>
+    where
+        P: FencedMutationRosterMemberProvider,
+        Q: FencedMutationRosterEstablishedPublicationProvider,
+    {
+        compose_provider_adapter_v2(
+            self.try_into_authenticated_roster_v2_consumer()?,
             member_provider,
             publication_provider,
             attestor,
@@ -12433,10 +12830,10 @@ impl PersistentSessionConsumerClient {
     async fn execute_roster_internal(
         &self,
         request: &SessionConsumerRequest,
-    ) -> Result<SessionConsumerResponse, PersistentSessionConsumerExecuteError> {
+    ) -> Result<SessionConsumerResponse, PersistentRosterExecuteError> {
         match self.execute_classified(request).await {
             Ok(response) => Ok(response),
-            Err(error) => Err(persistent_execute_error_for_request(request, error)),
+            Err(error) => Err(persistent_roster_execute_error_for_request(request, error)),
         }
     }
 
@@ -12463,8 +12860,7 @@ impl PersistentSessionConsumerClient {
         &self,
         request_id: SessionConsumerRequestId,
         capsule: &SessionConsumerRosterAdmissionCapsule,
-    ) -> Result<SessionConsumerRosterAdmissionMutationResponse, PersistentSessionConsumerExecuteError>
-    {
+    ) -> Result<SessionConsumerRosterAdmissionMutationResponse, PersistentRosterExecuteError> {
         match self
             .execute_roster_internal(&self.request(
                 request_id,
@@ -12475,7 +12871,9 @@ impl PersistentSessionConsumerClient {
             .await
         {
             Ok(SessionConsumerResponse::FencedMutationRosterPollAdmit(response)) => Ok(response),
-            Ok(_) => Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id }),
+            Ok(_) => Err(PersistentRosterExecuteError::Generic(
+                PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id },
+            )),
             Err(error) => Err(error),
         }
     }
@@ -12532,8 +12930,7 @@ impl PersistentSessionConsumerClient {
         &self,
         request_id: SessionConsumerRequestId,
         capsule: &SessionConsumerRosterTerminalCapsule,
-    ) -> Result<SessionConsumerRosterTerminalMutationResponse, PersistentSessionConsumerExecuteError>
-    {
+    ) -> Result<SessionConsumerRosterTerminalMutationResponse, PersistentRosterExecuteError> {
         match self
             .execute_roster_internal(&self.request(
                 request_id,
@@ -12544,7 +12941,9 @@ impl PersistentSessionConsumerClient {
             .await
         {
             Ok(SessionConsumerResponse::FencedMutationRosterTerminalize(response)) => Ok(response),
-            Ok(_) => Err(PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id }),
+            Ok(_) => Err(PersistentRosterExecuteError::Generic(
+                PersistentSessionConsumerExecuteError::OutcomeUnknown { request_id },
+            )),
             Err(error) => Err(error),
         }
     }
@@ -13293,6 +13692,11 @@ impl PersistentSessionConsumerClient {
                     self.pool.record_failure(error);
                     error
                 }
+                SessionConsumerCallError::NoApplicationProtocol => {
+                    self.pool
+                        .record_error(SessionConsumerClientError::Protocol, false, false);
+                    SessionConsumerClientError::Protocol
+                }
             }
         })?;
         setup_attempt.succeed();
@@ -13357,7 +13761,9 @@ impl PersistentSessionConsumerClient {
                 None => tokio::select! {
                     biased;
                     _ = wait_for_forced_shutdown(&mut shutdown, &self.pool.shutdown_phase) => {
-                        Err(SessionConsumerClientError::ShuttingDown)
+                        Err(ConsumerSetupError::Client(
+                            SessionConsumerClientError::ShuttingDown,
+                        ))
                     }
                     result = self.pool.connect(pre_request_deadline) => result.map(|connection| {
                         PersistentCheckedOutConnection::new(Arc::clone(&self.pool), connection)
@@ -13366,7 +13772,7 @@ impl PersistentSessionConsumerClient {
             };
             let mut connection = match connection {
                 Ok(connection) => connection,
-                Err(error)
+                Err(ConsumerSetupError::Client(error))
                     if attempt < connect_attempts
                         && matches!(
                             error,
@@ -13385,7 +13791,12 @@ impl PersistentSessionConsumerClient {
                     }
                     continue;
                 }
-                Err(error) => return Err(SessionConsumerCallError::BeforeCallWrite(error)),
+                Err(ConsumerSetupError::Client(error)) => {
+                    return Err(SessionConsumerCallError::BeforeCallWrite(error));
+                }
+                Err(ConsumerSetupError::NoApplicationProtocol) => {
+                    return Err(SessionConsumerCallError::NoApplicationProtocol);
+                }
             };
             ensure_pre_request_budget_remaining(pre_request_deadline, pre_request_budget_active)
                 .map_err(SessionConsumerCallError::BeforeCallWrite)?;
@@ -14336,7 +14747,8 @@ impl PersistentPreparedCompareAndSetToken {
                     dispatch.terminal();
                     return Err(PreparedCompareAndSetExecuteError::TopologyAuthorityRevoked);
                 }
-                Err(SessionConsumerCallError::BeforeCallWrite(_)) => {
+                Err(SessionConsumerCallError::BeforeCallWrite(_))
+                | Err(SessionConsumerCallError::NoApplicationProtocol) => {
                     self.state.not_transmitted();
                     continue;
                 }
@@ -14680,7 +15092,8 @@ impl PersistentPreparedLeaseAcquireToken {
                     dispatch.receipt_only();
                     return Err(PreparedLeaseAcquireExecuteError::OutcomeUnknown);
                 }
-                Err(SessionConsumerCallError::BeforeCallWrite(_)) => {
+                Err(SessionConsumerCallError::BeforeCallWrite(_))
+                | Err(SessionConsumerCallError::NoApplicationProtocol) => {
                     self.state.not_transmitted();
                     continue;
                 }
@@ -14828,6 +15241,11 @@ fn mutation_response<T>(
         Err(SessionConsumerCallError::BeforeCallWrite(cause)) => {
             Err(SessionConsumerMutationError::NotTransmitted { cause })
         }
+        Err(SessionConsumerCallError::NoApplicationProtocol) => {
+            Err(SessionConsumerMutationError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            })
+        }
         Err(SessionConsumerCallError::MayHaveSent(_)) => {
             Err(SessionConsumerMutationError::OutcomeUnknown { request_id })
         }
@@ -14848,6 +15266,11 @@ fn lease_response<T>(
         }
         Err(SessionConsumerCallError::BeforeCallWrite(cause)) => {
             Err(SessionConsumerLeaseMutationError::NotTransmitted { cause })
+        }
+        Err(SessionConsumerCallError::NoApplicationProtocol) => {
+            Err(SessionConsumerLeaseMutationError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            })
         }
         Ok(SessionConsumerResponse::Rejected(rejection)) => Err(
             SessionConsumerLeaseMutationError::Lease(rejection_into_lease_error(rejection)),
@@ -14920,6 +15343,11 @@ fn fenced_transition_response(
         Err(SessionConsumerCallError::BeforeCallWrite(cause)) => {
             Err(SessionConsumerFencedTransitionMutationError::NotTransmitted { cause })
         }
+        Err(SessionConsumerCallError::NoApplicationProtocol) => Err(
+            SessionConsumerFencedTransitionMutationError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            },
+        ),
         Ok(SessionConsumerResponse::Rejected(rejection)) => {
             Err(SessionConsumerFencedTransitionMutationError::Store(
                 rejection_into_store_error(rejection),
@@ -14974,6 +15402,7 @@ impl ConsumerServerSetupTestHooks {
 pub struct SessionQuorumConsumerServer {
     service: Arc<dyn SessionQuorumConsumer>,
     roster_ingress: Option<RosterIngressDispatch>,
+    roster_transport_capability: Option<ConsumerTransportCapability>,
     tls_config: opc_tls::AuthenticatedServerConfig,
     authorizer: SessionConsumerAuthorizer,
     max_connections: usize,
@@ -15014,6 +15443,7 @@ impl SessionQuorumConsumerServer {
         Self {
             service,
             roster_ingress: None,
+            roster_transport_capability: None,
             tls_config,
             authorizer,
             max_connections: DEFAULT_CONSUMER_MAX_CONNECTIONS,
@@ -15031,16 +15461,46 @@ impl SessionQuorumConsumerServer {
         }
     }
 
-    /// Install the sole protected-roster ingress lane.
+    /// Install the frozen V1 protected-roster ingress lane.
     ///
     /// `/3` is advertised only while this dedicated port and its typed
     /// transport-ingress signer are both present. The ordinary consumer
     /// service remains unable to dispatch roster operations.
     #[must_use]
     pub fn with_roster_ingress(
+        self,
+        service: Arc<dyn SessionQuorumRosterIngress>,
+        signer: Arc<dyn RosterIngressSigner>,
+    ) -> Self {
+        self.with_roster_ingress_transport(
+            service,
+            signer,
+            ConsumerTransportCapability::ProtectedRosterV5,
+        )
+    }
+
+    /// Install the additive V2 protected-roster ingress lane.
+    ///
+    /// This listener advertises only `/4`; it rejects V1 `/3` peers during
+    /// TLS negotiation, before consumer admission or a provider call.
+    #[must_use]
+    pub fn with_roster_v2_ingress(
+        self,
+        service: Arc<dyn SessionQuorumRosterIngress>,
+        signer: Arc<dyn RosterIngressSigner>,
+    ) -> Self {
+        self.with_roster_ingress_transport(
+            service,
+            signer,
+            ConsumerTransportCapability::ProtectedRosterV6,
+        )
+    }
+
+    fn with_roster_ingress_transport(
         mut self,
         service: Arc<dyn SessionQuorumRosterIngress>,
         signer: Arc<dyn RosterIngressSigner>,
+        capability: ConsumerTransportCapability,
     ) -> Self {
         let signer_root_identity = signer.trust_root().identity();
         let store_expected_root_identity =
@@ -15049,14 +15509,25 @@ impl SessionQuorumConsumerServer {
         // the protected profile reachable.  Keep the ordinary consumer lane
         // available and omit `/3` instead of accepting an admission that
         // cannot later carry root-verifiable compact provenance.
+        let signer_available = match capability {
+            ConsumerTransportCapability::ProtectedRosterV5 => {
+                compact_admission_signer_available(signer.as_ref())
+            }
+            // A `/4` certificate is selected from the authenticated scope on
+            // each request. Probing a fixed listener-global leaf here would
+            // reintroduce the cross-tenant certificate alias this lane forbids.
+            ConsumerTransportCapability::ProtectedRosterV6 => true,
+            ConsumerTransportCapability::GeneralV6 => false,
+        };
         self.roster_ingress = (store_expected_root_identity == Some(signer_root_identity)
-            && compact_admission_signer_available(signer.as_ref()))
-        .then_some(RosterIngressDispatch {
-            service,
-            signer,
-            signer_root_identity,
-            store_expected_root_identity,
-        });
+            && signer_available)
+            .then_some(RosterIngressDispatch {
+                service,
+                signer,
+                signer_root_identity,
+                store_expected_root_identity,
+            });
+        self.roster_transport_capability = self.roster_ingress.as_ref().map(|_| capability);
         self
     }
 
@@ -15145,6 +15616,7 @@ impl SessionQuorumConsumerServer {
         let connection_tasks = Arc::new(tokio::sync::Mutex::new(JoinSet::new()));
         let service = self.service;
         let roster_ingress = self.roster_ingress;
+        let roster_transport_capability = self.roster_transport_capability;
         let tls_config = self.tls_config;
         let authorizer = self.authorizer;
         let max_frame_size = self.max_frame_size;
@@ -15178,6 +15650,7 @@ impl SessionQuorumConsumerServer {
                     .expect("validated consumer setup has a bounded deadline");
                 let service = Arc::clone(&service);
                 let roster_ingress = roster_ingress.clone();
+                let roster_transport_capability = roster_transport_capability;
                 let tls_config = tls_config.clone();
                 let authorizer = authorizer.clone();
                 let cancellation = Arc::clone(&accept_cancellation);
@@ -15200,6 +15673,7 @@ impl SessionQuorumConsumerServer {
                         stream,
                         service,
                         roster_ingress,
+                        roster_transport_capability,
                         tls_config,
                         authorizer,
                         max_frame_size,
@@ -15244,6 +15718,7 @@ impl SessionQuorumConsumerServer {
             || self.roster_ingress.as_ref().is_some_and(|ingress| {
                 ingress.store_expected_root_identity != Some(ingress.signer_root_identity)
             })
+            || self.roster_ingress.is_some() != self.roster_transport_capability.is_some()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -16120,6 +16595,7 @@ async fn handle_server_connection(
     stream: TcpStream,
     service: Arc<dyn SessionQuorumConsumer>,
     roster_ingress: Option<RosterIngressDispatch>,
+    roster_transport_capability: Option<ConsumerTransportCapability>,
     tls_config: opc_tls::AuthenticatedServerConfig,
     authorizer: SessionConsumerAuthorizer,
     max_frame_size: usize,
@@ -16151,14 +16627,24 @@ async fn handle_server_connection(
     let handshake = tls_config
         .begin_handshake()
         .map_err(|_| ProtocolError::Authentication)?;
-    // `/3` is never advertised unless the server has a trust-root-matched
-    // roster ingress and can frame both complete opaque capsule families.
-    let roster_transport_enabled = roster_ingress.is_some()
-        && max_frame_size >= MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES
-        && max_frame_size >= MAX_SESSION_CONSUMER_ROSTER_TERMINAL_FRAME_BYTES;
+    // A protected-roster ALPN is advertised only when this server has its
+    // trust-root-matched ingress and can frame both complete capsule families.
+    // Keep exactly one profile selected for the listener; a mixed V1/V2 peer
+    // fails in TLS before consumer admission or provider dispatch.
+    let roster_transport_capability = roster_ingress
+        .as_ref()
+        .zip(roster_transport_capability)
+        .and_then(|(_, capability)| {
+            capability
+                .roster_profile()
+                .filter(|profile| {
+                    roster_profile_fits_consumer_frames(*profile, max_frame_size, max_frame_size)
+                })
+                .map(|_| capability)
+        });
     let acceptor = tokio_rustls::TlsAcceptor::from(consumer_server_tls_config_for(
         handshake.rustls_config(),
-        roster_transport_enabled,
+        roster_transport_capability,
     ));
     // TLS has the finite no-byte setup budget and is interruptible by abort.
     // The authenticated active-frame budget starts only after TLS, at the
@@ -16258,6 +16744,11 @@ async fn handle_server_connection(
     }
     let transport_capability =
         ConsumerTransportCapability::from_alpn(tls.get_ref().1.alpn_protocol())?;
+    if transport_capability.is_protected_roster()
+        && Some(transport_capability) != roster_transport_capability
+    {
+        return Err(ProtocolError::UnexpectedResponse);
+    }
     let (mut reader, mut writer) = tokio::io::split(tls);
     let hello = {
         let hello = read_authenticated_consumer_bootstrap_frame_until::<_, ConsumerWireRequest>(
@@ -16323,7 +16814,7 @@ async fn handle_server_connection(
         checked_consumer_frame_size(hello.response_frame_size)?.min(max_frame_size);
     if let Some(profile) = transport_capability.roster_profile() {
         if !roster_profile_fits_consumer_frames(profile, max_frame_size, response_frame_size) {
-            // `/3` cannot fall back to fragmented capsule transport. No
+            // A protected-roster lane cannot fall back to fragmented capsule transport. No
             // consumer request has been admitted or dispatched yet.
             return Err(ProtocolError::UnexpectedResponse);
         }
@@ -16735,11 +17226,11 @@ async fn handle_server_connection(
         let effectful = consumer_operation_is_effectful(request.operation());
         let scope = request.scope();
         let request_id = request.request_id();
-        let roster_dispatch = if matches!(
-            transport_capability,
-            ConsumerTransportCapability::ProtectedRosterV5
-        ) {
+        let roster_dispatch = if transport_capability.is_protected_roster() {
             let Some(ingress) = roster_ingress.as_ref() else {
+                return Ok(());
+            };
+            let Some(roster_profile) = transport_capability.roster_profile() else {
                 return Ok(());
             };
             let (operation_tag, canonical_capsule_digest) =
@@ -16751,7 +17242,7 @@ async fn handle_server_connection(
             // authorization and current lifecycle checks. The narrow
             // tenant/NF grant is retained for post-decode ingress validation;
             // the signer never sees or signs unverified caller-selected bytes.
-            let input = RosterIngressAttestationSigningInputV1 {
+            let fields = RosterIngressAttestationFields {
                 peer_identity_commitment: session_consumer_identity_commitment(
                     authorization.identity(),
                 ),
@@ -16764,11 +17255,13 @@ async fn handle_server_connection(
                 material_generation: tls_config.material_status().epoch().get(),
                 handshake_epoch: handshake.epoch().get(),
             };
-            let attestation =
-                tokio::time::timeout_at(request_deadline, ingress.signer.attest(&input))
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+            let attestation = tokio::time::timeout_at(
+                request_deadline,
+                attest_roster_ingress_for_profile(ingress.signer.as_ref(), roster_profile, fields),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
             // A signer can await an HSM/KMS. Revalidate just before the
             // isolated ingress can decode, look up, or propose anything.
             if !server_connection_current(
@@ -16788,26 +17281,60 @@ async fn handle_server_connection(
                     // decoding and V1 connection-attestation verification
                     // before returning this fixed V2 preimage.  The signer
                     // receives no caller bytes and no consensus capability.
-                    let certificate = ingress.signer.compact_admission_certificate().ok();
+                    let certificate = match &attestation {
+                        RosterIngressAttestation::V1(_) if roster_profile.is_current() => {
+                            ingress.signer.compact_admission_certificate().ok()
+                        }
+                        RosterIngressAttestation::V2(attestation) if roster_profile.is_v2() => {
+                            ingress
+                                .signer
+                                .compact_admission_certificate_v2(attestation)
+                                .ok()
+                        }
+                        _ => None,
+                    };
                     let Some(certificate) = certificate else {
                         return Ok(());
                     };
-                    let input = match ingress.service.prepare_compact_admission_provenance_input(
-                        &authorization.roster_authorization(),
-                        request.as_ref(),
-                        &attestation,
-                        certificate.subject_identity_commitment,
-                    ) {
+                    let input = match ingress
+                        .service
+                        .prepare_compact_admission_provenance_input_for_profile(
+                            roster_profile,
+                            &authorization.roster_authorization(),
+                            request.as_ref(),
+                            &attestation,
+                            certificate.subject_identity_commitment,
+                        ) {
                         Ok(input) => input,
                         Err(_) => return Ok(()),
                     };
-                    match issue_compact_admission_provenance(
-                        ingress.signer.as_ref(),
-                        input,
-                        request_deadline,
-                    )
-                    .await
-                    {
+                    let provenance = match (&attestation, input) {
+                        (
+                            RosterIngressAttestation::V1(_),
+                            RosterCompactAdmissionProvenanceInput::V1(input),
+                        ) if roster_profile.is_current() => issue_compact_admission_provenance(
+                            ingress.signer.as_ref(),
+                            input,
+                            certificate,
+                            request_deadline,
+                        )
+                        .await
+                        .map(RosterCompactAdmissionProvenance::V1),
+                        (
+                            RosterIngressAttestation::V2(attestation),
+                            RosterCompactAdmissionProvenanceInput::V2(input),
+                        ) if roster_profile.is_v2() => issue_compact_admission_provenance_v2(
+                            ingress.signer.as_ref(),
+                            input,
+                            attestation,
+                            certificate,
+                            request_deadline,
+                        )
+                        .await
+                        .map(RosterCompactAdmissionProvenance::V2),
+                        _ => Err(RosterIngressSignerError),
+                    };
+                    match provenance {
                         Ok(provenance) => Some(provenance),
                         Err(_) => return Ok(()),
                     }
@@ -16827,6 +17354,7 @@ async fn handle_server_connection(
             }
             Some((
                 Arc::clone(&ingress.service),
+                roster_profile,
                 attestation,
                 admission_provenance,
             ))
@@ -16840,9 +17368,10 @@ async fn handle_server_connection(
             let execute_service = Arc::clone(&service);
             let execute = async move {
                 match roster_dispatch {
-                    Some((ingress, attestation, admission_provenance)) => {
+                    Some((ingress, roster_profile, attestation, admission_provenance)) => {
                         ingress
-                            .execute_roster_ingress(
+                            .execute_roster_ingress_for_profile(
+                                roster_profile,
                                 &execute_roster_authorization,
                                 *request,
                                 attestation,
@@ -16851,10 +17380,7 @@ async fn handle_server_connection(
                             .await
                     }
                     None => {
-                        if matches!(
-                            transport_capability,
-                            ConsumerTransportCapability::ProtectedRosterV5
-                        ) {
+                        if transport_capability.is_protected_roster() {
                             roster_ingress_unavailable_response(request.operation())
                         } else {
                             execute_service
@@ -17505,12 +18031,13 @@ mod tests {
         consumer_execute_into_fenced_transition, consumer_fresh_admission_is_current,
         consumer_operation_is_effectful, consumer_payload_fragments_exceed_frame,
         consumer_public_response_from_wire, consumer_request_has_exact_fenced_transition_id,
-        consumer_response_fits, consumer_timeout_response, consumer_watch_error_is_legal,
-        consumer_wire_response_from_public, decode_consumer_frame_payload,
-        ensure_pre_request_budget_remaining, exact_correlation, fenced_transition_response,
-        lease_error_matches_operation, lease_mutation_status_matches_request,
-        lease_mutation_status_wire_matches_request, lease_response, mutation_response,
-        persistent_execute_error, poll_persistent_consumer_setup_io,
+        consumer_response_fits, consumer_timeout_response, consumer_tls_setup_error,
+        consumer_watch_error_is_legal, consumer_wire_response_from_public,
+        decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
+        fenced_transition_response, lease_error_matches_operation,
+        lease_mutation_status_matches_request, lease_mutation_status_wire_matches_request,
+        lease_response, mutation_response, persistent_execute_error,
+        persistent_roster_execute_error_for_request, poll_persistent_consumer_setup_io,
         poll_persistent_reconnect_setup, prepared_router_roster_is_distinct, prepared_voter_index,
         publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
         read_authenticated_consumer_frame_until, read_authenticated_consumer_frame_within,
@@ -17524,26 +18051,27 @@ mod tests {
         ConsumerHello, ConsumerHelloAck, ConsumerLeaseWireContext, ConsumerOperationKind,
         ConsumerServerCancellation, ConsumerServerSetupTestHooks,
         ConsumerSessionLeaseMutationResultWire, ConsumerSessionLeaseMutationStatusWire,
-        ConsumerSessionResponseWire, ConsumerSetupPhase, ConsumerSetupPhaseAttempt,
-        ConsumerVoterBinding, ConsumerWatchTerminal, ConsumerWatchTerminalSlot,
-        ConsumerWireRequest, ConsumerWireResponse, PersistentCapacityAdmission,
-        PersistentCheckedOutConnection, PersistentConsumerCounters, PersistentConsumerIoBarrier,
-        PersistentConsumerReconnectControl, PersistentConsumerShutdownIo,
-        PersistentConsumerShutdownReader, PersistentConsumerShutdownWriter,
-        PersistentPreparedCompareAndSetToken, PersistentPreparedLeaseAcquireToken,
-        PersistentReconnectSetup, PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-        PersistentSessionConsumerConfigError, PersistentSessionConsumerExecuteError,
-        PersistentSessionConsumerV2ExecuteError, PersistentSetupAttempt, PersistentShutdownPhase,
-        PersistentV2LaneActor, PersistentV2LaneCall, PersistentV2LaneLifetime,
-        PersistentV2LaneState, PersistentV2PreCallTestHook, PersistentWatchRecovery,
-        PreparedConsumerRouter, PreparedLeaseAcquireDispatchResult, PreparedRequestState,
-        QueuedConsumerWatchItem, SessionConsumerAuthorization, SessionConsumerAuthorizationError,
-        SessionConsumerAuthorizer, SessionConsumerCallError, SessionConsumerChange,
-        SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
-        SessionConsumerFencedTransitionMutationError, SessionConsumerLeaseMutationError,
-        SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
-        SessionConsumerRejection, SessionQuorumConsumer, SessionQuorumConsumerServer,
-        StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        ConsumerSessionResponseWire, ConsumerSetupError, ConsumerSetupPhase,
+        ConsumerSetupPhaseAttempt, ConsumerVoterBinding, ConsumerWatchTerminal,
+        ConsumerWatchTerminalSlot, ConsumerWireRequest, ConsumerWireResponse,
+        PersistentCapacityAdmission, PersistentCheckedOutConnection, PersistentConsumerCounters,
+        PersistentConsumerIoBarrier, PersistentConsumerReconnectControl,
+        PersistentConsumerShutdownIo, PersistentConsumerShutdownReader,
+        PersistentConsumerShutdownWriter, PersistentPreparedCompareAndSetToken,
+        PersistentPreparedLeaseAcquireToken, PersistentReconnectSetup,
+        PersistentRosterExecuteError, PersistentSessionConsumerClient,
+        PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
+        PersistentSessionConsumerExecuteError, PersistentSessionConsumerV2ExecuteError,
+        PersistentSetupAttempt, PersistentShutdownPhase, PersistentV2LaneActor,
+        PersistentV2LaneCall, PersistentV2LaneLifetime, PersistentV2LaneState,
+        PersistentV2PreCallTestHook, PersistentWatchRecovery, PreparedConsumerRouter,
+        PreparedLeaseAcquireDispatchResult, PreparedRequestState, QueuedConsumerWatchItem,
+        SessionConsumerAuthorization, SessionConsumerAuthorizationError, SessionConsumerAuthorizer,
+        SessionConsumerCallError, SessionConsumerChange, SessionConsumerClientError,
+        SessionConsumerFencedTransitionBackend, SessionConsumerFencedTransitionMutationError,
+        SessionConsumerLeaseMutationError, SessionConsumerMutationError,
+        SessionConsumerPreparedCheckpointBackend, SessionConsumerRejection, SessionQuorumConsumer,
+        SessionQuorumConsumerServer, StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
         DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
@@ -17574,9 +18102,12 @@ mod tests {
         PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome,
         PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError, PreparedFencedTransition,
         PreparedLeaseAcquireExecuteError, PreparedLeaseAcquireStatusError,
-        RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest, SessionBackend,
-        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsumerBatchResult,
+        RestoreScanCursorProfile, RestoreScanPage, RestoreScanRequest,
+        RosterAttestationTrustRootV1, RosterIngressAttestationSigningInputV1,
+        RosterIngressAttestationSigningInputV2, RosterIngressAttestationV1,
+        RosterIngressAttestationV2, SessionBackend, SessionConsensusClusterId,
+        SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
+        SessionConsensusIdentity, SessionConsumerBatchResult,
         SessionConsumerCompareAndSetReceiptOutcome, SessionConsumerCompareAndSetRequest,
         SessionConsumerCompareAndSetStatus, SessionConsumerFencedTransitionError,
         SessionConsumerFencedTransitionStatus, SessionConsumerLeaseError,
@@ -21293,6 +21824,46 @@ mod tests {
     }
 
     #[test]
+    fn tls_alpn_rejection_stays_private_to_the_roster_capability_boundary() {
+        let tls_error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            tokio_rustls::rustls::Error::NoApplicationProtocol,
+        );
+        assert!(matches!(
+            consumer_tls_setup_error(tls_error, false),
+            ConsumerSetupError::NoApplicationProtocol
+        ));
+
+        let request = SessionConsumerRequest::new(
+            scope(),
+            SessionConsumerRequestId::from_bytes([0x7c; 16]),
+            SessionConsumerOperation::Capabilities,
+        );
+        assert!(matches!(
+            persistent_roster_execute_error_for_request(
+                &request,
+                SessionConsumerCallError::NoApplicationProtocol,
+            ),
+            PersistentRosterExecuteError::NoApplicationProtocol
+        ));
+        assert!(matches!(
+            persistent_execute_error(
+                request.request_id(),
+                SessionConsumerCallError::NoApplicationProtocol,
+            ),
+            PersistentSessionConsumerExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            }
+        ));
+
+        let transport_error = io::Error::new(io::ErrorKind::ConnectionReset, "redacted");
+        assert!(matches!(
+            consumer_tls_setup_error(transport_error, false),
+            ConsumerSetupError::Client(SessionConsumerClientError::Unavailable)
+        ));
+    }
+
+    #[test]
     fn authority_and_malformed_rejections_have_explicit_lane_retirement_semantics() {
         for rejection in [
             SessionConsumerRejection::ScopeMismatch,
@@ -22869,6 +23440,281 @@ mod tests {
         assert!(protected
             .windows(b"roster_profile".len())
             .any(|window| window == b"roster_profile"));
+    }
+
+    #[test]
+    fn protected_roster_v1_and_v2_capabilities_are_exact_and_disjoint() {
+        assert_eq!(
+            super::SESSION_QUORUM_CONSUMER_ROSTER_ALPN,
+            b"opc-session-consumer/3"
+        );
+        assert_eq!(super::SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION, 5);
+        assert_eq!(
+            super::SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN,
+            b"opc-session-consumer/4"
+        );
+        assert_eq!(
+            super::SESSION_QUORUM_CONSUMER_ROSTER_V2_TRANSPORT_REVISION,
+            6
+        );
+
+        let v1 = SessionConsumerRosterTransportProfile::current();
+        let v2 = SessionConsumerRosterTransportProfile::v2();
+        assert!(v1.is_current());
+        assert!(!v1.is_v2());
+        assert!(v2.is_v2());
+        assert!(!v2.is_current());
+        assert_ne!(v1, v2);
+
+        let v2_hello = ConsumerWireRequest::Hello(ConsumerHello {
+            transport_revision: super::SESSION_QUORUM_CONSUMER_ROSTER_V2_TRANSPORT_REVISION,
+            scope: scope(),
+            expected_server_node_id: test_consumer_voter_authority().node_id().get(),
+            voter_count: u16::try_from(test_consumer_voter_authority().voter_count())
+                .expect("test voter count"),
+            roster_commitment: *test_consumer_voter_authority()
+                .roster_commitment()
+                .as_bytes(),
+            response_frame_size: u32::try_from(super::MAX_NEGOTIATED_FRAME_SIZE)
+                .expect("consumer frame cap fits u32"),
+            roster_profile: Some(v2),
+        });
+        let v2_hello_bytes =
+            serde_json::to_vec(&v2_hello).expect("V2 protected-roster Hello encodes");
+        let decoded_v2_hello =
+            super::decode_consumer_frame_payload::<ConsumerWireRequest>(&v2_hello_bytes)
+                .expect("V2 protected-roster Hello decodes");
+        assert_eq!(
+            serde_json::to_vec(&decoded_v2_hello).expect("V2 protected-roster Hello re-encodes"),
+            v2_hello_bytes,
+            "the exact V2 Hello survives its private request codec"
+        );
+        assert!(matches!(
+            v2_hello,
+            ConsumerWireRequest::Hello(ConsumerHello {
+                transport_revision: super::SESSION_QUORUM_CONSUMER_ROSTER_V2_TRANSPORT_REVISION,
+                roster_profile: Some(profile),
+                ..
+            }) if profile == v2
+        ));
+        assert!(super::roster_profile_fits_consumer_frames(
+            v2,
+            super::MAX_NEGOTIATED_FRAME_SIZE,
+            super::MAX_NEGOTIATED_FRAME_SIZE,
+        ));
+        assert!(!super::roster_profile_fits_consumer_frames(
+            v2,
+            v2.admission_frame_bytes() - 1,
+            super::MAX_NEGOTIATED_FRAME_SIZE,
+        ));
+
+        assert!(matches!(
+            super::ConsumerTransportCapability::from_alpn(Some(
+                super::SESSION_QUORUM_CONSUMER_ROSTER_ALPN
+            )),
+            Ok(super::ConsumerTransportCapability::ProtectedRosterV5)
+        ));
+        assert!(matches!(
+            super::ConsumerTransportCapability::from_alpn(Some(
+                super::SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN
+            )),
+            Ok(super::ConsumerTransportCapability::ProtectedRosterV6)
+        ));
+        assert_ne!(
+            super::ConsumerTransportCapability::ProtectedRosterV5.roster_profile(),
+            super::ConsumerTransportCapability::ProtectedRosterV6.roster_profile()
+        );
+
+        let v1_listener = super::consumer_server_alpn_protocols(Some(
+            super::ConsumerTransportCapability::ProtectedRosterV5,
+        ));
+        assert!(v1_listener.contains(&super::SESSION_QUORUM_CONSUMER_ROSTER_ALPN.to_vec()));
+        assert!(!v1_listener.contains(&super::SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN.to_vec()));
+
+        let v2_listener = super::consumer_server_alpn_protocols(Some(
+            super::ConsumerTransportCapability::ProtectedRosterV6,
+        ));
+        assert!(v2_listener.contains(&super::SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN.to_vec()));
+        assert!(!v2_listener.contains(&super::SESSION_QUORUM_CONSUMER_ROSTER_ALPN.to_vec()));
+    }
+
+    struct CountingIngressSigner {
+        v1_calls: AtomicUsize,
+        v2_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl super::RosterIngressSigner for CountingIngressSigner {
+        fn trust_root(&self) -> RosterAttestationTrustRootV1 {
+            RosterAttestationTrustRootV1::new(
+                [0x61; 32],
+                [
+                    0x02, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5,
+                    0x63, 0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4,
+                    0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96,
+                ],
+            )
+            .expect("valid P-256 root")
+        }
+
+        async fn attest(
+            &self,
+            _input: &RosterIngressAttestationSigningInputV1,
+        ) -> Result<RosterIngressAttestationV1, super::RosterIngressSignerError> {
+            self.v1_calls.fetch_add(1, Ordering::SeqCst);
+            Err(super::RosterIngressSignerError)
+        }
+
+        async fn attest_v2(
+            &self,
+            _input: &RosterIngressAttestationSigningInputV2,
+        ) -> Result<RosterIngressAttestationV2, super::RosterIngressSignerError> {
+            self.v2_calls.fetch_add(1, Ordering::SeqCst);
+            Err(super::RosterIngressSignerError)
+        }
+    }
+
+    #[tokio::test]
+    async fn roster_ingress_profile_selects_only_its_signer_before_dispatch() {
+        let signer = CountingIngressSigner {
+            v1_calls: AtomicUsize::new(0),
+            v2_calls: AtomicUsize::new(0),
+        };
+        let now = Timestamp::now_utc();
+        let fields = super::RosterIngressAttestationFields {
+            peer_identity_commitment: [0x62; 32],
+            consumer_scope: [0x63; 32],
+            request_id: [0x64; 16],
+            operation_tag: 7,
+            canonical_capsule_digest: [0x65; 32],
+            authenticated_at: now,
+            peer_certificate_expires_at: now.add_seconds(1).expect("test timestamp"),
+            material_generation: 2,
+            handshake_epoch: 3,
+        };
+        let mut ingress_callbacks = 0_u8;
+
+        if super::attest_roster_ingress_for_profile(
+            &signer,
+            SessionConsumerRosterTransportProfile::current(),
+            fields,
+        )
+        .await
+        .is_ok()
+        {
+            ingress_callbacks = ingress_callbacks.saturating_add(1);
+        }
+        assert_eq!(signer.v1_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(signer.v2_calls.load(Ordering::SeqCst), 0);
+
+        if super::attest_roster_ingress_for_profile(
+            &signer,
+            SessionConsumerRosterTransportProfile::v2(),
+            fields,
+        )
+        .await
+        .is_ok()
+        {
+            ingress_callbacks = ingress_callbacks.saturating_add(1);
+        }
+        assert_eq!(signer.v1_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(signer.v2_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ingress_callbacks, 0,
+            "a profile/signature failure prevents ingress dispatch"
+        );
+    }
+
+    struct TwoScopeV2IngressSigner {
+        scope_a_leaf_calls: AtomicUsize,
+        scope_b_leaf_calls: AtomicUsize,
+        unexpected_scope_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl super::RosterIngressSigner for TwoScopeV2IngressSigner {
+        fn trust_root(&self) -> RosterAttestationTrustRootV1 {
+            RosterAttestationTrustRootV1::new(
+                [0x71; 32],
+                [
+                    0x02, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5,
+                    0x63, 0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4,
+                    0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96,
+                ],
+            )
+            .expect("valid P-256 root")
+        }
+
+        async fn attest(
+            &self,
+            _input: &RosterIngressAttestationSigningInputV1,
+        ) -> Result<RosterIngressAttestationV1, super::RosterIngressSignerError> {
+            Err(super::RosterIngressSignerError)
+        }
+
+        async fn attest_v2(
+            &self,
+            input: &RosterIngressAttestationSigningInputV2,
+        ) -> Result<RosterIngressAttestationV2, super::RosterIngressSignerError> {
+            match input.consumer_scope {
+                scope if scope == [0x72; 32] => {
+                    self.scope_a_leaf_calls.fetch_add(1, Ordering::SeqCst)
+                }
+                scope if scope == [0x73; 32] => {
+                    self.scope_b_leaf_calls.fetch_add(1, Ordering::SeqCst)
+                }
+                _ => self.unexpected_scope_calls.fetch_add(1, Ordering::SeqCst),
+            };
+            // A failed selected-leaf issue must terminate before service/store
+            // dispatch; the counters below act as the pre-dispatch witness.
+            Err(super::RosterIngressSignerError)
+        }
+    }
+
+    #[tokio::test]
+    async fn roster_v2_one_listener_selects_exact_scope_leaf_before_service() {
+        let signer = TwoScopeV2IngressSigner {
+            scope_a_leaf_calls: AtomicUsize::new(0),
+            scope_b_leaf_calls: AtomicUsize::new(0),
+            unexpected_scope_calls: AtomicUsize::new(0),
+        };
+        let now = Timestamp::now_utc();
+        let fields = |consumer_scope| super::RosterIngressAttestationFields {
+            peer_identity_commitment: [0x74; 32],
+            consumer_scope,
+            request_id: [0x75; 16],
+            operation_tag: 7,
+            canonical_capsule_digest: [0x76; 32],
+            authenticated_at: now,
+            peer_certificate_expires_at: now.add_seconds(1).expect("test timestamp"),
+            material_generation: 2,
+            handshake_epoch: 3,
+        };
+        let mut service_or_store_callbacks = 0_u8;
+        for scope in [[0x72; 32], [0x73; 32]] {
+            if super::attest_roster_ingress_for_profile(
+                &signer,
+                SessionConsumerRosterTransportProfile::v2(),
+                fields(scope),
+            )
+            .await
+            .is_ok()
+            {
+                service_or_store_callbacks = service_or_store_callbacks.saturating_add(1);
+            }
+        }
+        // A `/3` invocation with a V2-looking scope cannot invoke either V2
+        // leaf-selection path, proving no cross-profile/scope fallback.
+        let _ = super::attest_roster_ingress_for_profile(
+            &signer,
+            SessionConsumerRosterTransportProfile::current(),
+            fields([0x73; 32]),
+        )
+        .await;
+        assert_eq!(signer.scope_a_leaf_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(signer.scope_b_leaf_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(signer.unexpected_scope_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service_or_store_callbacks, 0);
     }
 
     #[test]

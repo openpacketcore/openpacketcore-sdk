@@ -36,13 +36,15 @@ use super::{
 };
 use async_trait::async_trait;
 use opc_session_store::fenced_mutation_roster::{
-    verify_roster_provider_receipt_v1, RosterAttestationCertificateRoleV1,
-    RosterAttestationLeafCertificatePartsV1, RosterAttestationLeafCertificateV1,
-    RosterAttestationTrustRootIdentityV1, RosterAttestationTrustRootV1,
-    RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceBindingV2,
-    RosterCompactTerminalEvidenceV2, RosterCompactTerminalMemberProjectionV2,
-    RosterCompactTerminalMemberProofPartsV2, RosterCompactTerminalMemberSigningInputV2,
-    RosterExecutorMemberProofPartsV1, RosterExecutorProofBundleV1, RosterProviderOperationV1,
+    verify_roster_provider_receipt_v1, Profile as StoreRosterProfile,
+    RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+    RosterAttestationLeafCertificateV1, RosterAttestationTrustRootIdentityV1,
+    RosterAttestationTrustRootV1, RosterCompactAdmissionProvenanceV2,
+    RosterCompactTerminalEvidenceBindingV2, RosterCompactTerminalEvidenceV2,
+    RosterCompactTerminalMemberProjectionV2, RosterCompactTerminalMemberProofPartsV2,
+    RosterCompactTerminalMemberSigningInputV2, RosterExecutorMemberProofPartsV1,
+    RosterExecutorProofBundleV1, RosterProfileV2CompactAdmissionProvenanceV1,
+    RosterProfileV2TerminalAttestationSigningInputV1, RosterProviderOperationV1,
     RosterProviderOutcomeV1, RosterProviderReceiptSigningInputV1,
     RosterTerminalAttestationSigningInputV1,
 };
@@ -76,6 +78,14 @@ const MAX_LOCAL_AUTHORITY_ENTRIES: usize = super::canonical::MAX_RESERVED_AND_RE
 /// provider effects behind one process-wide lock. Keep this aligned with the
 /// fixed provider-work scheduler shard count.
 const LOCAL_AUTHORITY_SHARDS: usize = 16;
+
+fn store_roster_profile(profile: super::canonical::Profile) -> StoreRosterProfile {
+    if profile == super::canonical::Profile::v1() {
+        StoreRosterProfile::v1()
+    } else {
+        StoreRosterProfile::v2()
+    }
+}
 /// A fixed provider operation authorized by the durable control plane.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ProviderOperation {
@@ -150,6 +160,8 @@ pub enum ExecutorError {
     TerminalPayloadCompacted,
     /// Admission's required present session record was not available.
     AdmissionRecordMissing,
+    /// Admission's required absent session record was already present.
+    AdmissionRecordAlreadyExists,
     /// Admission's required present session generation differed.
     AdmissionGenerationConflict,
     /// Admission rejected a Put whose successor generation would overflow.
@@ -188,6 +200,7 @@ impl fmt::Display for ExecutorError {
             Self::TerminalizeNotTransmitted => "roster executor terminalization not transmitted",
             Self::TerminalPayloadCompacted => "roster terminal payload compacted",
             Self::AdmissionRecordMissing => "roster admission record missing",
+            Self::AdmissionRecordAlreadyExists => "roster admission record already exists",
             Self::AdmissionGenerationConflict => "roster admission generation conflict",
             Self::AdmissionGenerationExhausted => "roster admission generation exhausted",
             Self::AdmissionBusinessKeyReserved => "roster admission business key reserved",
@@ -347,8 +360,6 @@ struct FrozenExecutorAttestation {
 
 fn freeze_executor_attestation(
     attestor: &dyn FencedMutationRosterExecutorAttestor,
-    _admission: &Admission,
-    _admission_provenance: &RosterCompactAdmissionProvenanceV2,
     expected_root_identity: RosterAttestationTrustRootIdentityV1,
     current_configuration_identity: SessionConsensusIdentity,
     current_scope: Scope,
@@ -1514,22 +1525,47 @@ impl fmt::Debug for BackendRegistration {
 pub(crate) struct Registration {
     backend_registration: BackendRegistration,
     admission: Arc<Admission>,
-    admission_provenance: Option<RosterCompactAdmissionProvenanceV2>,
+    admission_provenance: Option<RegistrationAdmissionProvenance>,
     authority: AuthorityBinding,
     authority_permit: LocalAuthorityPermit,
     local: Arc<Mutex<LocalExecutionState>>,
     member_calls: Vec<Arc<AsyncMutex<()>>>,
 }
 
+/// Profile-sealed admission provenance retained by an executor capability.
+///
+/// The variants are intentionally concrete.  `/4` never downcasts or probes
+/// a V1 provenance, and `/3` never accepts this V2 carrier.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum RegistrationAdmissionProvenance {
+    V1(RosterCompactAdmissionProvenanceV2),
+    V2(RosterProfileV2CompactAdmissionProvenanceV1),
+}
+
+impl RegistrationAdmissionProvenance {
+    fn profile(&self) -> super::canonical::Profile {
+        match self {
+            Self::V1(_) => super::canonical::Profile::v1(),
+            Self::V2(_) => super::canonical::Profile::v2(),
+        }
+    }
+}
+
 impl Registration {
     fn issue(
         request: RegistrationRequest,
         backend_registration: BackendRegistration,
-        admission_provenance: Option<RosterCompactAdmissionProvenanceV2>,
+        admission_provenance: Option<RegistrationAdmissionProvenance>,
         reservation: LocalAdmissionReservation,
         local_authority: &LocalAuthorityRegistry,
     ) -> Result<Self, ExecutorError> {
         backend_registration.validate_for(&request.admission)?;
+        if admission_provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.profile() != request.admission.profile())
+        {
+            return Err(ExecutorError::AttestationUnavailable);
+        }
         let member_calls = member_call_guards(&request.admission);
         let authority_permit = local_authority.finalize_admission(
             reservation,
@@ -1560,20 +1596,46 @@ impl Registration {
         &self.authority
     }
 
-    fn admission_provenance(&self) -> Result<&RosterCompactAdmissionProvenanceV2, ExecutorError> {
-        self.admission_provenance
-            .as_ref()
-            .ok_or(ExecutorError::AttestationUnavailable)
+    fn admission_provenance_v1(
+        &self,
+    ) -> Result<&RosterCompactAdmissionProvenanceV2, ExecutorError> {
+        match self.admission_provenance.as_ref() {
+            Some(RegistrationAdmissionProvenance::V1(provenance))
+                if self.admission.profile() == super::canonical::Profile::v1() =>
+            {
+                Ok(provenance)
+            }
+            _ => Err(ExecutorError::AttestationUnavailable),
+        }
+    }
+
+    fn admission_provenance_v2(
+        &self,
+    ) -> Result<&RosterProfileV2CompactAdmissionProvenanceV1, ExecutorError> {
+        match self.admission_provenance.as_ref() {
+            Some(RegistrationAdmissionProvenance::V2(provenance))
+                if self.admission.profile() == super::canonical::Profile::v2() =>
+            {
+                Ok(provenance)
+            }
+            _ => Err(ExecutorError::AttestationUnavailable),
+        }
     }
 
     fn recover(
         request: RecoveryRequest,
         admission: Arc<Admission>,
         backend_registration: BackendRegistration,
-        admission_provenance: Option<RosterCompactAdmissionProvenanceV2>,
+        admission_provenance: Option<RegistrationAdmissionProvenance>,
         local_authority: &LocalAuthorityRegistry,
     ) -> Result<Self, ExecutorError> {
         backend_registration.validate_for(&admission)?;
+        if admission_provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.profile() != admission.profile())
+        {
+            return Err(ExecutorError::AttestationUnavailable);
+        }
         let member_calls = member_call_guards(&admission);
         let authority_permit = local_authority.install_successor(
             backend_registration,
@@ -1597,10 +1659,16 @@ impl Registration {
     fn readback(
         request: RegistrationRequest,
         backend_registration: BackendRegistration,
-        admission_provenance: Option<RosterCompactAdmissionProvenanceV2>,
+        admission_provenance: Option<RegistrationAdmissionProvenance>,
         local_authority: &LocalAuthorityRegistry,
     ) -> Result<Self, ExecutorError> {
         backend_registration.validate_for(&request.admission)?;
+        if admission_provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.profile() != request.admission.profile())
+        {
+            return Err(ExecutorError::AttestationUnavailable);
+        }
         let member_calls = member_call_guards(&request.admission);
         let authority_permit = local_authority.install_admission(
             backend_registration,
@@ -1789,6 +1857,8 @@ pub(crate) enum BackendRejection {
     TerminalConflict,
     /// Admission found no exact present protected business record.
     RecordMissing,
+    /// Admission found an already-present protected business record.
+    RecordAlreadyExists,
     /// Admission found a different protected business generation.
     GenerationConflict,
     /// Admission cannot produce a checked successor generation for Put.
@@ -1813,6 +1883,7 @@ impl From<BackendRejection> for ExecutorError {
             BackendRejection::RecoveryRequired => Self::RecoveryRequired,
             BackendRejection::TerminalConflict => Self::TerminalConflict,
             BackendRejection::RecordMissing => Self::AdmissionRecordMissing,
+            BackendRejection::RecordAlreadyExists => Self::AdmissionRecordAlreadyExists,
             BackendRejection::GenerationConflict => Self::AdmissionGenerationConflict,
             BackendRejection::GenerationExhausted => Self::AdmissionGenerationExhausted,
             BackendRejection::BusinessKeyReserved => Self::AdmissionBusinessKeyReserved,
@@ -1830,7 +1901,7 @@ impl From<BackendRejection> for ExecutorError {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum RegistrationDecision {
     /// Fresh admission with the exact ingress-issued compact provenance.
-    FreshlyAdmittedWithProvenance(BackendRegistration, RosterCompactAdmissionProvenanceV2),
+    FreshlyAdmittedWithProvenance(BackendRegistration, RegistrationAdmissionProvenance),
     /// The same immutable admission already exists and requires recovery flow.
     AdmissionReplayed,
     /// The backend proved that no admission request byte crossed transport.
@@ -1840,7 +1911,7 @@ pub(crate) enum RegistrationDecision {
     PollAdmittedWithProvenance {
         registration: BackendRegistration,
         admission: Arc<Admission>,
-        admission_provenance: RosterCompactAdmissionProvenanceV2,
+        admission_provenance: RegistrationAdmissionProvenance,
     },
     /// A read-only successor lookup returned an exact committed terminal row.
     Terminal {
@@ -1856,7 +1927,7 @@ pub(crate) enum RegistrationDecision {
         /// History epoch needed to validate the exact compact binding.
         history_epoch: u64,
         /// Bounded terminal conflict/status metadata with no protected payload.
-        tombstone: TerminalConflictTombstone,
+        tombstone: ProfiledTerminalConflictTombstone,
     },
     /// Registration was rejected before any provider effect.
     Reject(BackendRejection),
@@ -1988,6 +2059,17 @@ pub(crate) struct TerminalBody {
     // correspondence evidence after success.
     bundle: Option<RosterExecutorProofBundleV1>,
     compact_evidence: Option<RosterCompactTerminalEvidenceV2>,
+    v2: Option<TerminalBodyV2>,
+}
+
+/// `/4`-only prepared terminal evidence.
+///
+/// It intentionally contains no V1 executor bundle.  The voter which signs
+/// the fresh V2 terminal ingress combines this generic Executor evidence with
+/// retained V2 provenance into the distinct retained V2 evidence and bundle.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct TerminalBodyV2 {
+    compact_evidence: RosterCompactTerminalEvidenceV2,
 }
 
 impl TerminalBody {
@@ -2065,6 +2147,7 @@ impl TerminalBody {
             phase,
             bundle: None,
             compact_evidence: None,
+            v2: None,
         })
     }
 
@@ -2082,6 +2165,7 @@ impl TerminalBody {
             phase,
             bundle: None,
             compact_evidence: None,
+            v2: None,
         })
     }
 
@@ -2128,6 +2212,16 @@ impl TerminalBody {
             .ok_or(ExecutorError::AttestationUnavailable)
     }
 
+    /// Exact `/4` compact evidence, available only on the sealed V2 lane.
+    pub(crate) fn compact_evidence_v2(
+        &self,
+    ) -> Result<&RosterCompactTerminalEvidenceV2, ExecutorError> {
+        self.v2
+            .as_ref()
+            .map(|body| &body.compact_evidence)
+            .ok_or(ExecutorError::AttestationUnavailable)
+    }
+
     fn with_evidence(
         mut self,
         bundle: RosterExecutorProofBundleV1,
@@ -2135,6 +2229,11 @@ impl TerminalBody {
     ) -> Self {
         self.bundle = Some(bundle);
         self.compact_evidence = Some(compact_evidence);
+        self
+    }
+
+    fn with_v2_evidence(mut self, compact_evidence: RosterCompactTerminalEvidenceV2) -> Self {
+        self.v2 = Some(TerminalBodyV2 { compact_evidence });
         self
     }
 }
@@ -2234,11 +2333,40 @@ pub(crate) enum EstablishedMaterialization {
         /// Exact generation retained by the transaction.
         generation: Generation,
     },
+    /// The admitted checkpoint created the previously absent session record.
+    Created {
+        /// The fixed first generation written by the transaction.
+        generation: Generation,
+        /// Commitment to the immutable authoritative record header and bytes.
+        record_commitment: [u8; 32],
+    },
 }
 
 impl EstablishedMaterialization {
     fn for_admission(admission: &Admission) -> Result<Self, ExecutorError> {
         let mutation = admission.established_mutation();
+        if mutation.requires_absent_predecessor() {
+            let generation = Generation::new(1);
+            if admission.profile() != super::canonical::Profile::v2()
+                || admission.expected_generation() != generation
+            {
+                return Err(ExecutorError::InvalidTerminal);
+            }
+            let state_type = mutation
+                .state_type()
+                .ok_or(ExecutorError::InvalidTerminal)?;
+            return Ok(Self::Created {
+                generation,
+                record_commitment: terminal_record_commitment(
+                    admission,
+                    generation,
+                    state_type.as_str(),
+                ),
+            });
+        }
+        if admission.profile() != super::canonical::Profile::v1() {
+            return Err(ExecutorError::InvalidTerminal);
+        }
         if mutation == &super::canonical::EstablishedMutation::delete() {
             return Ok(Self::Deleted {
                 generation: admission.expected_generation(),
@@ -2282,6 +2410,14 @@ impl EstablishedMaterialization {
                 hasher.update([3]);
                 hasher.update(generation.get().to_be_bytes());
             }
+            Self::Created {
+                generation,
+                record_commitment,
+            } => {
+                hasher.update([4]);
+                hasher.update(generation.get().to_be_bytes());
+                hasher.update(record_commitment);
+            }
         }
     }
 }
@@ -2292,7 +2428,7 @@ impl fmt::Debug for EstablishedMaterialization {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum TerminalMaterializationWire {
     Updated {
         from: Generation,
@@ -2306,6 +2442,10 @@ enum TerminalMaterializationWire {
         generation: Generation,
     },
     Aborted,
+    Created {
+        generation: Generation,
+        record_commitment: [u8; 32],
+    },
 }
 
 impl From<&TerminalMaterialization> for TerminalMaterializationWire {
@@ -2329,6 +2469,13 @@ impl From<&TerminalMaterialization> for TerminalMaterializationWire {
                 generation,
             }) => Self::NoOp {
                 generation: *generation,
+            },
+            TerminalMaterialization::Established(EstablishedMaterialization::Created {
+                generation,
+                record_commitment,
+            }) => Self::Created {
+                generation: *generation,
+                record_commitment: *record_commitment,
             },
             TerminalMaterialization::Aborted => Self::Aborted,
         }
@@ -2354,6 +2501,13 @@ impl From<TerminalMaterializationWire> for TerminalMaterialization {
                 Self::Established(EstablishedMaterialization::NoOp { generation })
             }
             TerminalMaterializationWire::Aborted => Self::Aborted,
+            TerminalMaterializationWire::Created {
+                generation,
+                record_commitment,
+            } => Self::Established(EstablishedMaterialization::Created {
+                generation,
+                record_commitment,
+            }),
         }
     }
 }
@@ -3224,7 +3378,7 @@ pub(crate) enum TerminalizeDecision {
     /// The exact terminal payload has aged out and cannot authorize publication.
     Compacted {
         history_epoch: u64,
-        tombstone: TerminalConflictTombstone,
+        tombstone: ProfiledTerminalConflictTombstone,
     },
     /// The backend proved no request byte crossed its transport boundary.
     NotTransmitted,
@@ -3238,6 +3392,7 @@ pub(crate) struct TerminalizeRequest<'a> {
     admission: &'a Admission,
     authority: &'a AuthorityBinding,
     body: &'a TerminalBody,
+    admission_provenance: Option<&'a RegistrationAdmissionProvenance>,
 }
 
 impl TerminalizeRequest<'_> {
@@ -3260,11 +3415,77 @@ impl TerminalizeRequest<'_> {
     pub(crate) fn body(&self) -> &TerminalBody {
         self.body
     }
+
+    pub(crate) fn admission_provenance(&self) -> Option<&RegistrationAdmissionProvenance> {
+        self.admission_provenance
+    }
 }
 
 impl fmt::Debug for TerminalizeRequest<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("TerminalizeRequest(<redacted>)")
+    }
+}
+
+/// Profile-sealed compact terminal carrier. The Profile V2 branch is the
+/// common canonical tombstone decoded only after the negotiated outer wire
+/// profile has selected its branch.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum ProfiledTerminalConflictTombstone {
+    /// Frozen Profile V1 compact status carrier.
+    V1(TerminalConflictTombstone),
+    /// Profile V2 compact status carrier selected by the `/4` outer frame.
+    V2(TerminalConflictTombstone),
+}
+
+impl fmt::Debug for ProfiledTerminalConflictTombstone {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProfiledTerminalConflictTombstone(<redacted>)")
+    }
+}
+
+impl ProfiledTerminalConflictTombstone {
+    fn validate_for_terminal(
+        &self,
+        history_epoch: u64,
+        admission: &Admission,
+        phase: Phase,
+        terminal_body_commitment: [u8; 32],
+    ) -> Result<(), ()> {
+        match self {
+            Self::V1(tombstone) => {
+                if admission.profile() != super::canonical::Profile::v1() {
+                    return Err(());
+                }
+                let status = tombstone
+                    .validate_admission(history_epoch, admission)
+                    .map_err(|_| ())?;
+                if status.phase() != phase
+                    || status.terminal_body_commitment() != terminal_body_commitment
+                {
+                    return Err(());
+                }
+                Ok(())
+            }
+            Self::V2(tombstone) => {
+                if history_epoch == 0 || admission.profile() != super::canonical::Profile::v2() {
+                    return Err(());
+                }
+                let status = tombstone
+                    .validate_admission_for_profile(
+                        super::canonical::Profile::v2(),
+                        history_epoch,
+                        admission,
+                    )
+                    .map_err(|_| ())?;
+                if status.phase() != phase
+                    || status.terminal_body_commitment() != terminal_body_commitment
+                {
+                    return Err(());
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -3278,7 +3499,7 @@ pub(crate) enum TerminalStatusDecision {
     /// The exact terminal payload aged out; only nonpublishing conflict status remains.
     Compacted {
         history_epoch: u64,
-        tombstone: Box<TerminalConflictTombstone>,
+        tombstone: Box<ProfiledTerminalConflictTombstone>,
     },
     /// Scope, authority, admission, terminal slot, or exact body did not match.
     Reject(BackendRejection),
@@ -3301,6 +3522,7 @@ pub(crate) struct TerminalStatusRequest<'a> {
     admission: &'a Admission,
     authority: &'a AuthorityBinding,
     body: &'a TerminalBody,
+    admission_provenance: Option<&'a RegistrationAdmissionProvenance>,
 }
 
 impl TerminalStatusRequest<'_> {
@@ -3318,6 +3540,10 @@ impl TerminalStatusRequest<'_> {
 
     pub(crate) fn body(&self) -> &TerminalBody {
         self.body
+    }
+
+    pub(crate) fn admission_provenance(&self) -> Option<&RegistrationAdmissionProvenance> {
+        self.admission_provenance
     }
 }
 
@@ -3445,6 +3671,7 @@ pub(crate) struct RosterExecutor<P, B> {
     scheduler: ProviderWorkScheduler,
     local_authority: LocalAuthorityRegistry,
     diagnostics: RosterDiagnostics,
+    profile: super::canonical::Profile,
 }
 
 impl<P, B> Clone for RosterExecutor<P, B> {
@@ -3458,6 +3685,7 @@ impl<P, B> Clone for RosterExecutor<P, B> {
             scheduler: self.scheduler.clone(),
             local_authority: self.local_authority.clone(),
             diagnostics: self.diagnostics.clone(),
+            profile: self.profile,
         }
     }
 }
@@ -3481,6 +3709,19 @@ where
             max_in_flight,
             Arc::new(SystemClock),
         )
+    }
+
+    /// Construct the sealed `/4` executor lane.  Its later terminal path is
+    /// selected from this startup-fixed profile and never falls back to V1.
+    pub(crate) fn new_v2(
+        provider: Arc<P>,
+        backend: Arc<B>,
+        attestor: Arc<dyn FencedMutationRosterExecutorAttestor>,
+        max_in_flight: NonZeroUsize,
+    ) -> Self {
+        let mut executor = Self::new(provider, backend, attestor, max_in_flight);
+        executor.profile = super::canonical::Profile::v2();
+        executor
     }
 
     /// Fix one provider/backend pair and an injectable local expiry clock.
@@ -3508,6 +3749,7 @@ where
             scheduler,
             local_authority: LocalAuthorityRegistry::new(clock),
             diagnostics: RosterDiagnosticsInner::new(),
+            profile: super::canonical::Profile::v1(),
         }
     }
 
@@ -3541,6 +3783,9 @@ where
         &self,
         request: RegistrationRequest,
     ) -> Result<Registration, ExecutorError> {
+        if request.admission().profile() != self.profile {
+            return Err(ExecutorError::AttestationUnavailable);
+        }
         let reservation = self.local_authority.reserve_admission(&request)?;
         self.diagnostics
             .increment(DiagnosticsCounter::AdmissionCalls);
@@ -3620,9 +3865,20 @@ where
             tombstone,
         } = decision
         {
-            tombstone
-                .validate_lookup(request.compacted_terminal_lookup(history_epoch))
-                .map_err(|_| ExecutorError::AuthorityRejected)?;
+            match tombstone {
+                ProfiledTerminalConflictTombstone::V1(tombstone) => {
+                    tombstone
+                        .validate_lookup(request.compacted_terminal_lookup(history_epoch))
+                        .map_err(|_| ExecutorError::AuthorityRejected)?;
+                }
+                // A V2 compact row deliberately retains only its profile-V2
+                // terminal identity. A successor recovery has no immutable
+                // admission to compare it with, so accepting it here would
+                // weaken the V2 exact-binding check.
+                ProfiledTerminalConflictTombstone::V2(_) => {
+                    return Err(ExecutorError::AuthorityRejected);
+                }
+            }
             return Ok(RecoveryResult::Compacted);
         }
         let (backend_registration, admission, admission_provenance, committed_terminal) =
@@ -3889,10 +4145,14 @@ where
             local.terminal = LocalTerminalState::StatusOnly;
             body
         };
+        if registration.admission().profile() == super::canonical::Profile::v2() {
+            return self.prepare_terminal_v2(registration, body, proofs).await;
+        }
+        if registration.admission().profile() != super::canonical::Profile::v1() {
+            return Err(ExecutorError::AttestationUnavailable);
+        }
         let frozen = freeze_executor_attestation(
             self.attestor.as_ref(),
-            registration.admission(),
-            registration.admission_provenance()?,
             self.topology_attestation_root_identity
                 .ok_or(ExecutorError::AttestationUnavailable)?,
             self.topology_configuration_identity
@@ -3938,7 +4198,7 @@ where
         )
         .map_err(|_| ExecutorError::AttestationUnavailable)?;
         let compact_binding = RosterCompactTerminalEvidenceBindingV2::from_terminal_v1_input(
-            registration.admission_provenance()?,
+            registration.admission_provenance_v1()?,
             body.record().protected_checkpoint(),
             body.record().protected_result(),
             signing_inputs
@@ -4011,6 +4271,110 @@ where
         })
     }
 
+    /// Prepare the Profile V2 terminal evidence without constructing a V1
+    /// executor bundle or V1 admission provenance.  The terminal ingress is
+    /// deliberately unavailable on this worker; the authenticated voter
+    /// combines this evidence with its fresh V2 ingress attestation.
+    async fn prepare_terminal_v2(
+        &self,
+        registration: &Registration,
+        body: TerminalBody,
+        proofs: Vec<AppliedProof>,
+    ) -> Result<PreparedTerminal, ExecutorError> {
+        let provenance = registration.admission_provenance_v2()?;
+        let frozen = freeze_executor_attestation(
+            self.attestor.as_ref(),
+            self.topology_attestation_root_identity
+                .ok_or(ExecutorError::AttestationUnavailable)?,
+            self.topology_configuration_identity
+                .ok_or(ExecutorError::AttestationUnavailable)?,
+            registration.authority().ingress_scope(),
+        )?;
+        let mut signing_inputs = Vec::with_capacity(proofs.len());
+        for proof in &proofs {
+            self.validate_terminal_signing_state(registration, proof)?;
+            signing_inputs.push(terminal_attestation_signing_input_v2(
+                registration,
+                &body,
+                proof,
+                &frozen.certificate,
+                provenance,
+            )?);
+        }
+        let compact_binding = RosterCompactTerminalEvidenceBindingV2::from_terminal_v2_input(
+            provenance,
+            body.record().protected_checkpoint(),
+            body.record().protected_result(),
+            signing_inputs
+                .first()
+                .ok_or(ExecutorError::InvalidTerminal)?,
+        )
+        .map_err(|_| ExecutorError::AttestationUnavailable)?;
+        let mut compact_parts = Vec::with_capacity(signing_inputs.len());
+        for ((input, stable_proof_commitment), proof) in signing_inputs
+            .iter()
+            .zip(body.record().proof_commitments())
+            .zip(&proofs)
+        {
+            self.validate_terminal_signing_state(registration, proof)?;
+            let member = RosterCompactTerminalMemberProjectionV2::from_terminal_v2_input(
+                input,
+                *stable_proof_commitment,
+            )
+            .map_err(|_| ExecutorError::AttestationUnavailable)?;
+            let compact_input = RosterCompactTerminalMemberSigningInputV2 {
+                binding: compact_binding.clone(),
+                member: member.clone(),
+            };
+            let signer_input =
+                FencedMutationRosterCompactTerminalMemberSigningInputV2::from_store(&compact_input);
+            signer_input.signing_digest()?;
+            let signature = tokio::time::timeout(
+                PROVIDER_EFFECT_DEADLINE,
+                self.attestor.sign_compact_terminal(&signer_input),
+            )
+            .await
+            .map_err(|_| ExecutorError::AttestationUnavailable)??;
+            self.validate_terminal_signing_state(registration, proof)?;
+            compact_parts.push(RosterCompactTerminalMemberProofPartsV2 {
+                member,
+                provider_certificate: proof.provider_certificate.clone(),
+                provider_signature: proof.provider_signature,
+                signature,
+            });
+        }
+        if compact_parts.len() != proofs.len() {
+            return Err(ExecutorError::AttestationUnavailable);
+        }
+        let compact_evidence = RosterCompactTerminalEvidenceV2::issue_from_signed_parts(
+            &frozen.root,
+            frozen.certificate,
+            &compact_binding,
+            compact_parts,
+        )
+        .map_err(|_| ExecutorError::AttestationUnavailable)?;
+        self.local_authority
+            .linearize_current(&registration.authority_permit, || {
+                let mut local = registration
+                    .local
+                    .lock()
+                    .map_err(|_| ExecutorError::OutcomeUnknown)?;
+                if !matches!(local.terminal, LocalTerminalState::StatusOnly)
+                    || !proofs
+                        .iter()
+                        .all(|proof| retained_conclusive_matches(&local, proof))
+                {
+                    return Err(ExecutorError::AuthorityRejected);
+                }
+                local.terminal = LocalTerminalState::Prepared;
+                Ok(())
+            })?;
+        Ok(PreparedTerminal {
+            registration: registration.backend_registration(),
+            body: body.with_v2_evidence(compact_evidence),
+        })
+    }
+
     fn validate_terminal_signing_state(
         &self,
         registration: &Registration,
@@ -4042,7 +4406,13 @@ where
         if prepared.registration != registration.backend_registration() {
             return Err(ExecutorError::InvalidTerminal);
         }
-        prepared.body.bundle()?;
+        if registration.admission().profile() == super::canonical::Profile::v1() {
+            prepared.body.bundle()?;
+        } else if registration.admission().profile() == super::canonical::Profile::v2() {
+            prepared.body.compact_evidence_v2()?;
+        } else {
+            return Err(ExecutorError::AttestationUnavailable);
+        }
         self.diagnostics
             .increment(DiagnosticsCounter::TerminalStatusCalls);
         match self
@@ -4052,6 +4422,7 @@ where
                 admission: registration.admission(),
                 authority: registration.authority(),
                 body: &prepared.body,
+                admission_provenance: registration.admission_provenance.as_ref(),
             })
             .await
             .map_err(|_| ExecutorError::BackendUnavailable)?
@@ -4071,14 +4442,14 @@ where
                 history_epoch,
                 tombstone,
             } => {
-                let status = tombstone
-                    .validate_admission(history_epoch, registration.admission())
+                tombstone
+                    .validate_for_terminal(
+                        history_epoch,
+                        registration.admission(),
+                        prepared.body.phase(),
+                        prepared.body.commitment(),
+                    )
                     .map_err(|_| ExecutorError::TerminalConflict)?;
-                if status.phase() != prepared.body.phase()
-                    || status.terminal_body_commitment() != prepared.body.commitment()
-                {
-                    return Err(ExecutorError::TerminalConflict);
-                }
                 Ok(TerminalStatusResult::Compacted)
             }
             TerminalStatusDecision::Admitted => Ok(TerminalStatusResult::Admitted),
@@ -4095,9 +4466,16 @@ where
         if prepared.registration != registration.backend_registration() {
             return Err(ExecutorError::InvalidTerminal);
         }
-        // A missing proof bundle is a local construction failure, never a
-        // reason to invoke terminal status or the terminal mutation backend.
-        prepared.body.bundle()?;
+        // Missing profile-matched evidence is a local construction failure,
+        // never a reason to invoke terminal status or the terminal mutation
+        // backend.  `/4` cannot fall back to a V1 proof bundle.
+        if registration.admission().profile() == super::canonical::Profile::v1() {
+            prepared.body.bundle()?;
+        } else if registration.admission().profile() == super::canonical::Profile::v2() {
+            prepared.body.compact_evidence_v2()?;
+        } else {
+            return Err(ExecutorError::AttestationUnavailable);
+        }
         self.local_authority
             .linearize_current(&registration.authority_permit, || {
                 let mut local = registration
@@ -4122,6 +4500,7 @@ where
                 admission: registration.admission(),
                 authority: registration.authority(),
                 body: &prepared.body,
+                admission_provenance: registration.admission_provenance.as_ref(),
             })
             .await;
         self.diagnostics.record_latency(
@@ -4169,20 +4548,18 @@ where
                 history_epoch,
                 tombstone,
             } => {
-                let status = tombstone
-                    .validate_admission(history_epoch, registration.admission())
+                tombstone
+                    .validate_for_terminal(
+                        history_epoch,
+                        registration.admission(),
+                        prepared.body.phase(),
+                        prepared.body.commitment(),
+                    )
                     .map_err(|_| {
                         self.diagnostics
                             .increment(DiagnosticsCounter::TerminalizeConflict);
                         ExecutorError::TerminalConflict
                     })?;
-                if status.phase() != prepared.body.phase()
-                    || status.terminal_body_commitment() != prepared.body.commitment()
-                {
-                    self.diagnostics
-                        .increment(DiagnosticsCounter::TerminalizeConflict);
-                    return Err(ExecutorError::TerminalConflict);
-                }
                 self.diagnostics
                     .increment(DiagnosticsCounter::TerminalPayloadCompacted);
                 Err(ExecutorError::TerminalPayloadCompacted)
@@ -4310,8 +4687,6 @@ where
         let diagnostics = self.diagnostics.clone();
         let frozen_provider_topology = freeze_executor_attestation(
             self.attestor.as_ref(),
-            registration.admission(),
-            registration.admission_provenance()?,
             self.topology_attestation_root_identity
                 .ok_or(ExecutorError::AttestationUnavailable)?,
             self.topology_configuration_identity
@@ -4797,7 +5172,7 @@ fn provider_receipt_challenge<P>(
         .binding_key(request_id.history_epoch())
         .map_err(|_| ExecutorError::InvalidProviderResponse)?;
     let input = RosterProviderReceiptSigningInputV1 {
-        profile: opc_session_store::fenced_mutation_roster::Profile::v1(),
+        profile: store_roster_profile(task.admission.profile()),
         configuration_identity: task.expected_configuration_identity,
         certificate_subject_identity_commitment: [1; 32],
         certificate_role: RosterAttestationCertificateRoleV1::Provider,
@@ -4863,7 +5238,7 @@ fn verify_provider_observation<P>(
         .binding_key(request_id.history_epoch())
         .map_err(|_| ExecutorError::InvalidProviderResponse)?;
     let input = RosterProviderReceiptSigningInputV1 {
-        profile: opc_session_store::fenced_mutation_roster::Profile::v1(),
+        profile: store_roster_profile(task.admission.profile()),
         configuration_identity: task.expected_configuration_identity,
         certificate_subject_identity_commitment: receipt.certificate.subject_identity_commitment,
         certificate_role: RosterAttestationCertificateRoleV1::Provider,
@@ -5129,10 +5504,75 @@ fn terminal_attestation_signing_input(
         .binding_key(request_id.history_epoch())
         .map_err(|_| ExecutorError::InvalidTerminal)?;
     Ok(RosterTerminalAttestationSigningInputV1 {
-        profile: opc_session_store::fenced_mutation_roster::Profile::v1(),
+        profile: store_roster_profile(registration.admission().profile()),
         configuration_identity: certificate.configuration_identity,
         certificate_subject_identity_commitment: certificate.subject_identity_commitment,
         certificate_role: RosterAttestationCertificateRoleV1::Executor,
+        binding: binding.to_bytes(),
+        registration_handle: handle,
+        registration_request_id: request_id.to_bytes(),
+        registration_terminal_slot: *terminal_slot.as_bytes(),
+        roster_id: *registration.admission().roster_id().as_bytes(),
+        admission_commitment: registration.admission().body_commitment(),
+        terminal_phase: match body.phase() {
+            Phase::Established => opc_session_store::fenced_mutation_roster::Phase::Established,
+            Phase::Aborted => opc_session_store::fenced_mutation_roster::Phase::Aborted,
+        },
+        terminal_body_commitment: body.commitment(),
+        ordinal: member.ordinal(),
+        member_operation_id: *member.operation_id().as_bytes(),
+        descriptor: member.descriptor().to_vec(),
+        descriptor_commitment: stable_descriptor_commitment(member.descriptor()),
+        expected_member_version: member.expected_version(),
+        admission_generation: registration.admission().expected_generation().get(),
+        authority_scope: authority.scope().digest(),
+        authority_ingress_scope: authority.ingress_scope().digest(),
+        authority_key_canonical: session_key_canonical_digest_input(authority.key()),
+        authority_owner: authority.owner().as_str().as_bytes().to_vec(),
+        authority_fence: authority.fence().get(),
+        authority_credential_id: authority.credential_id(),
+        authority_generation: authority.generation().get(),
+        authority_acquired_at: authority.acquired_at(),
+        authority_expires_at: authority.expires_at(),
+        proof_epoch: proof.proof_epoch,
+        provider_operation: attested_operation(proof.operation),
+        outcome: attested_outcome(proof.outcome),
+        evidence: proof.evidence.clone(),
+    })
+}
+
+fn terminal_attestation_signing_input_v2(
+    registration: &Registration,
+    body: &TerminalBody,
+    proof: &AppliedProof,
+    certificate: &RosterAttestationLeafCertificatePartsV1,
+    admission_provenance: &RosterProfileV2CompactAdmissionProvenanceV1,
+) -> Result<RosterProfileV2TerminalAttestationSigningInputV1, ExecutorError> {
+    if registration.admission().profile() != super::canonical::Profile::v2()
+        || certificate.role != RosterAttestationCertificateRoleV1::Executor
+        || certificate.scope != registration.authority().ingress_scope().digest()
+    {
+        return Err(ExecutorError::AttestationUnavailable);
+    }
+    let member = registration
+        .admission()
+        .members()
+        .get(proof.ordinal as usize)
+        .ok_or(ExecutorError::InvalidTerminal)?;
+    let (handle, request_id, terminal_slot) = registration.backend_registration().consensus_parts();
+    let authority = registration.authority();
+    let binding = registration
+        .admission()
+        .binding_key(request_id.history_epoch())
+        .map_err(|_| ExecutorError::InvalidTerminal)?;
+    Ok(RosterProfileV2TerminalAttestationSigningInputV1 {
+        profile: StoreRosterProfile::v2(),
+        configuration_identity: certificate.configuration_identity,
+        certificate_subject_identity_commitment: certificate.subject_identity_commitment,
+        certificate_role: RosterAttestationCertificateRoleV1::Executor,
+        admission_provenance_commitment: admission_provenance
+            .commitment()
+            .map_err(|_| ExecutorError::AttestationUnavailable)?,
         binding: binding.to_bytes(),
         registration_handle: handle,
         registration_request_id: request_id.to_bytes(),
@@ -6365,7 +6805,7 @@ mod production_runtime_cut_matrix_tests {
             state.current_authority = Some(request.authority.clone());
             Ok(RegistrationDecision::FreshlyAdmittedWithProvenance(
                 registration,
-                admission_provenance,
+                RegistrationAdmissionProvenance::V1(admission_provenance),
             ))
         }
 
@@ -6397,7 +6837,9 @@ mod production_runtime_cut_matrix_tests {
                         Ok(RegistrationDecision::PollAdmittedWithProvenance {
                             registration,
                             admission: Arc::clone(admission),
-                            admission_provenance,
+                            admission_provenance: RegistrationAdmissionProvenance::V1(
+                                admission_provenance,
+                            ),
                         })
                     }
                 }
@@ -6444,7 +6886,7 @@ mod production_runtime_cut_matrix_tests {
                 Ok(RegistrationDecision::PollAdmittedWithProvenance {
                     registration,
                     admission,
-                    admission_provenance,
+                    admission_provenance: RegistrationAdmissionProvenance::V1(admission_provenance),
                 })
             }
         }
@@ -6512,7 +6954,7 @@ mod production_runtime_cut_matrix_tests {
                         .expect("validated compact terminal binding");
                 return Ok(TerminalizeDecision::Compacted {
                     history_epoch: committed.record().request_id().history_epoch(),
-                    tombstone,
+                    tombstone: ProfiledTerminalConflictTombstone::V1(tombstone),
                 });
             }
             state.committed = Some(committed.clone());
@@ -6788,14 +7230,12 @@ mod production_runtime_cut_matrix_tests {
             wrong_scope_request.admission().scope().digest(),
             "the runtime fixture deliberately carries a different private roster scope"
         );
-        let provenance = cut_compact_admission_provenance(
+        let _provenance = cut_compact_admission_provenance(
             wrong_scope_request.admission(),
             wrong_scope_request.authority(),
         );
         assert!(freeze_executor_attestation(
             &adapter,
-            wrong_scope_request.admission(),
-            &provenance,
             root.as_store().identity(),
             identity,
             wrong_scope_request.admission().scope(),
@@ -6821,7 +7261,7 @@ mod production_runtime_cut_matrix_tests {
     #[test]
     fn executor_attestation_binds_successor_topology_not_admission_provenance() {
         let predecessor = request_with_members(1);
-        let predecessor_provenance =
+        let _predecessor_provenance =
             cut_compact_admission_provenance(predecessor.admission(), predecessor.authority());
         let successor_scope = Scope::from_digest([0xD3; 32]);
         let successor = CutAttestor::new(successor_scope);
@@ -6829,8 +7269,6 @@ mod production_runtime_cut_matrix_tests {
 
         assert!(freeze_executor_attestation(
             successor.as_ref(),
-            predecessor.admission(),
-            &predecessor_provenance,
             CutAttestor::topology_root_identity(),
             current_identity,
             successor_scope,
@@ -6840,8 +7278,6 @@ mod production_runtime_cut_matrix_tests {
         let predecessor_certificate = CutAttestor::new(predecessor.admission().scope());
         assert!(freeze_executor_attestation(
             predecessor_certificate.as_ref(),
-            predecessor.admission(),
-            &predecessor_provenance,
             CutAttestor::topology_root_identity(),
             current_identity,
             successor_scope,
@@ -6860,8 +7296,6 @@ mod production_runtime_cut_matrix_tests {
         );
         assert!(freeze_executor_attestation(
             successor.as_ref(),
-            predecessor.admission(),
-            &predecessor_provenance,
             CutAttestor::topology_root_identity(),
             stale_identity,
             successor_scope,
