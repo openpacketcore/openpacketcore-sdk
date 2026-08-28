@@ -66,12 +66,12 @@ QUIESCENT_INTEGRATION_TESTS = (
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
     "persistent_three_voter_first_transition_has_one_leader_activation_proof",
     "persistent_three_voter_protected_roster_survives_real_os_process_loss",
-    "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
+    "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
 )
 OPTIMIZED_QUIESCENT_INTEGRATION_TESTS = frozenset(
     {
-        "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
+        "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
         "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
     }
 )
