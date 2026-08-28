@@ -8,6 +8,7 @@ on:
       - "crates/opc-ipsec-lb-ebpf-common/**"
       - "crates/opc-session-net/**"
       - ".github/workflows/ipsec-lb.yml"
+      - "ci/setup-fsverity-tmp.sh"
       - "scripts/build-ipsec-lb-ebpf.sh"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -20,6 +21,7 @@ on:
       - "crates/opc-ipsec-lb-ebpf-common/**"
       - "crates/opc-session-net/**"
       - ".github/workflows/ipsec-lb.yml"
+      - "ci/setup-fsverity-tmp.sh"
       - "scripts/build-ipsec-lb-ebpf.sh"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -48,6 +50,9 @@ jobs:
 
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
 
       - name: Check formatting
         run: cargo fmt --all --check

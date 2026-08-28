@@ -1631,6 +1631,8 @@ struct ConsensusSessionStoreInner {
     raft: SessionRaft,
     storage_shutdown: storage::ConsensusStorageShutdownObserver,
     terminal_recovery_handoff_consumer: storage::LiveTerminalRecoveryHandoffConsumer,
+    #[cfg(test)]
+    terminal_recovery_gate_checks: AtomicU64,
     raft_handler: SessionRaftRpcHandler,
     backend: SqliteSessionBackend,
     proactive_checkpoint_lane: Option<Arc<crate::sqlite::consensus::ProactiveCheckpointLane>>,
@@ -2941,6 +2943,8 @@ impl ConsensusSessionStore {
             raft,
             storage_shutdown,
             terminal_recovery_handoff_consumer,
+            #[cfg(test)]
+            terminal_recovery_gate_checks: AtomicU64::new(0),
             raft_handler,
             backend,
             proactive_checkpoint_lane,
@@ -3152,6 +3156,8 @@ impl ConsensusSessionStore {
             raft,
             storage_shutdown,
             terminal_recovery_handoff_consumer,
+            #[cfg(test)]
+            terminal_recovery_gate_checks: AtomicU64::new(0),
             raft_handler,
             backend,
             proactive_checkpoint_lane,
@@ -5367,6 +5373,10 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> OperatorRecoveryGate {
+        #[cfg(test)]
+        self.inner
+            .terminal_recovery_gate_checks
+            .fetch_add(1, Ordering::Relaxed);
         // Do not preflight through the backend's pathname-only terminal
         // classifier.  If recovery published S1 and a parent operator then
         // replaces configured D1 with D2, that preflight could resolve D2
@@ -5392,8 +5402,52 @@ impl ConsensusSessionStore {
         }
     }
 
-    /// Revalidate every durable application-traffic authority immediately
-    /// before an ordinary result or proposal crosses its acceptance boundary.
+    /// Revalidation after a response has already proved that the mutation
+    /// committed. Dynamic ingress performed its descriptor-bound recovery gate
+    /// before the first possible transmission, and the leader repeated that
+    /// gate immediately before proposal. Repeating the origin gate here could
+    /// exhaust the original deadline and misclassify a known commit as an
+    /// unknown outcome. Fixed durable authority remains a result boundary and
+    /// therefore retains its full revalidation.
+    async fn require_application_traffic_committed_reply_authority_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        // A committed Dynamic response is still returned only by an exact
+        // current member. This is deliberately the cheap scope check: the
+        // recovery workflow must drain the fleet before publishing Active,
+        // and a second terminal reconciliation cannot revoke a known commit.
+        self.require_application_traffic_intermediate_authority_before(deadline)
+            .await
+    }
+
+    /// Preserve Fixed's persistent authority checks at every historical
+    /// checkpoint while avoiding repeated Dynamic terminal-sidecar probes
+    /// inside one leader-owned proposal turn.
+    ///
+    /// Dynamic ingress performs a full recovery gate before transmission, and
+    /// `propose_on_local_leader` performs the full leader gate immediately
+    /// before enqueue. The topology operation guard spans the intermediate
+    /// checkpoints, so exact live membership is sufficient there. Pending
+    /// recovery may still exchange Raft/read-index traffic, while the final
+    /// gate prevents it from admitting an ordinary mutation.
+    async fn require_application_traffic_intermediate_authority_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum {
+            return self
+                .require_application_traffic_authority_before(deadline)
+                .await;
+        }
+        self.require_durable_fixed_quorum_admission_before(deadline)
+            .await
+    }
+
+    /// Revalidate every durable application-traffic authority before an
+    /// ordinary operation can first transmit or a leader proposal crosses its
+    /// acceptance boundary. A validated committed reply uses the narrower
+    /// result policy above so known effect is never converted into ambiguity.
     /// Operator Recovery uses a separate explicitly authorized path.
     async fn require_application_traffic_authority_before(
         &self,
@@ -6351,7 +6405,9 @@ impl ConsensusSessionStore {
                     if committed_response_matches_intent(&request.intent, &response) {
                         if !fixed_raw_v2_consumer_warm_route
                             && self
-                                .require_application_traffic_authority_before(deadline)
+                                .require_application_traffic_committed_reply_authority_before(
+                                    deadline,
+                                )
                                 .await
                                 .is_err()
                         {
@@ -6758,7 +6814,7 @@ impl ConsensusSessionStore {
             self.require_durable_fixed_quorum_admission_before(deadline)
                 .await
         } else {
-            self.require_application_traffic_authority_before(deadline)
+            self.require_application_traffic_intermediate_authority_before(deadline)
                 .await
         };
         if initial_authority.is_err() {
@@ -6863,7 +6919,7 @@ impl ConsensusSessionStore {
                         self.require_durable_fixed_quorum_admission_before(deadline)
                             .await
                     } else {
-                        self.require_application_traffic_authority_before(deadline)
+                        self.require_application_traffic_intermediate_authority_before(deadline)
                             .await
                     };
                     if authority.is_err() {
@@ -6961,7 +7017,7 @@ impl ConsensusSessionStore {
             self.require_durable_fixed_quorum_admission_before(deadline)
                 .await
         } else {
-            self.require_application_traffic_authority_before(deadline)
+            self.require_application_traffic_intermediate_authority_before(deadline)
                 .await
         };
         if authority.is_err() {
@@ -7207,7 +7263,7 @@ impl ConsensusSessionStore {
             && !allow_operator_recovery
             && fenced_transition_admission.is_none()
             && self
-                .require_application_traffic_authority_before(deadline)
+                .require_application_traffic_intermediate_authority_before(deadline)
                 .await
                 .is_err()
         {
@@ -12974,6 +13030,7 @@ mod membership_tests {
     };
     use crate::model::{FenceToken, Generation, SessionKeyType, StateClass, StateType};
     use crate::record::EncryptedSessionPayload;
+    use crate::sqlite::consensus::{ensure_operator_recovery_latch_sync, OperatorRecoveryLatch};
     use crate::topology::{
         QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
         ReplicaId, ReplicaTlsIdentity,
@@ -19933,6 +19990,191 @@ mod membership_tests {
         assert_eq!(
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_committed_reply_does_not_repeat_origin_terminal_gate() {
+        let directory = tempfile::tempdir().expect("dynamic forwarding boundary directory");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+                .expect("dynamic forwarding boundary backend"),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open dynamic forwarding boundary store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize dynamic forwarding boundary store");
+        store
+            .inner
+            .terminal_recovery_gate_checks
+            .store(0, Ordering::Relaxed);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        store
+            .require_application_traffic_authority_before(deadline)
+            .await
+            .expect("dynamic origin is recovery-clear before transmission");
+        assert_eq!(
+            store
+                .inner
+                .terminal_recovery_gate_checks
+                .load(Ordering::Relaxed),
+            1,
+            "origin ingress performs exactly one live terminal-recovery reconciliation"
+        );
+
+        store
+            .require_application_traffic_committed_reply_authority_before(deadline)
+            .await
+            .expect("known committed Dynamic reply needs no duplicate origin reconciliation");
+        assert_eq!(
+            store
+                .inner
+                .terminal_recovery_gate_checks
+                .load(Ordering::Relaxed),
+            1,
+            "a committed reply cannot spend the residual deadline on a duplicate origin gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_active_recovery_latch_rejects_before_any_proposal() {
+        let directory = tempfile::tempdir().expect("dynamic active-latch directory");
+        let database = directory.path().join("store.sqlite");
+        let topology = singleton_topology();
+        let identity = topology
+            .consensus_identity()
+            .expect("dynamic active-latch identity");
+        let store = ConsensusSessionStore::open(
+            topology,
+            SqliteSessionBackend::open(&database).expect("dynamic active-latch backend"),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open dynamic active-latch store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize dynamic active-latch store");
+
+        let before_log = store.inner.raft.metrics().borrow().last_log_index;
+        let before_sequence = store
+            .inner
+            .backend
+            .consensus_max_replication_sequence()
+            .await
+            .expect("read application sequence before active latch");
+        ensure_operator_recovery_latch_sync(
+            &database,
+            OperatorRecoveryLatch {
+                identity,
+                recovery_epoch: 1,
+                plan_digest: [0xA7; 32],
+                audit_pending: false,
+            },
+        )
+        .expect("publish active recovery latch");
+        reset_consumer_consensus_proposal_count();
+        store
+            .inner
+            .terminal_recovery_gate_checks
+            .store(0, Ordering::Relaxed);
+
+        let effect = store
+            .submit_request_effect_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::AdvanceLogicalTime,
+                Some(identity),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(
+            effect,
+            ConsensusSubmissionEffect::NotTransmitted(StoreError::BackendUnavailable(_))
+        ));
+        assert_eq!(
+            store
+                .inner
+                .terminal_recovery_gate_checks
+                .load(Ordering::Relaxed),
+            1,
+            "origin ingress performs one recovery reconciliation before transmission"
+        );
+        assert_eq!(
+            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
+            0,
+            "an Active origin recovery latch rejects before a Raft proposal"
+        );
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            before_log,
+            "an Active origin recovery latch cannot append a log entry"
+        );
+        assert_eq!(
+            store
+                .inner
+                .backend
+                .consensus_max_replication_sequence()
+                .await
+                .expect("read application sequence after active latch"),
+            before_sequence,
+            "an Active origin recovery latch cannot mutate application state"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_clear_submission_gates_origin_and_leader_once() {
+        let directory = tempfile::tempdir().expect("dynamic clear submission directory");
+        let topology = singleton_topology();
+        let identity = topology
+            .consensus_identity()
+            .expect("dynamic clear submission identity");
+        let store = ConsensusSessionStore::open(
+            topology,
+            SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+                .expect("dynamic clear submission backend"),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open dynamic clear submission store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize dynamic clear submission store");
+        reset_consumer_consensus_proposal_count();
+        store
+            .inner
+            .terminal_recovery_gate_checks
+            .store(0, Ordering::Relaxed);
+
+        let effect = store
+            .submit_request_effect_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::AdvanceLogicalTime,
+                Some(identity),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(effect, ConsensusSubmissionEffect::Committed(_)));
+        assert_eq!(
+            store
+                .inner
+                .terminal_recovery_gate_checks
+                .load(Ordering::Relaxed),
+            2,
+            "one clear Dynamic submission reconciles only origin ingress and leader acceptance"
+        );
+        assert_eq!(
+            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
+            1,
+            "one clear Dynamic submission creates exactly one Raft proposal"
         );
     }
 

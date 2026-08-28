@@ -147,29 +147,34 @@ enum SnapshotDirectoryValidationFailure {
 
 #[cfg(test)]
 fn snapshot_directory_validation_failures(
-) -> &'static std::sync::Mutex<Option<SnapshotDirectoryValidationFailure>> {
-    static FAILURE: std::sync::OnceLock<
-        std::sync::Mutex<Option<SnapshotDirectoryValidationFailure>>,
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, SnapshotDirectoryValidationFailure>> {
+    static FAILURES: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, SnapshotDirectoryValidationFailure>>,
     > = std::sync::OnceLock::new();
-    FAILURE.get_or_init(|| std::sync::Mutex::new(None))
+    FAILURES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(test)]
-fn inject_snapshot_directory_validation_failure(failure: SnapshotDirectoryValidationFailure) {
-    *snapshot_directory_validation_failures()
+fn inject_snapshot_directory_validation_failure(
+    snapshot_directory: PathBuf,
+    failure: SnapshotDirectoryValidationFailure,
+) {
+    snapshot_directory_validation_failures()
         .lock()
-        .expect("snapshot directory validation hook") = Some(failure);
+        .expect("snapshot directory validation hook")
+        .insert(snapshot_directory, failure);
 }
 
 #[cfg(test)]
 fn take_snapshot_directory_validation_failure(
+    snapshot_directory: &Path,
     expected: SnapshotDirectoryValidationFailure,
 ) -> bool {
-    let mut failure = snapshot_directory_validation_failures()
+    let mut failures = snapshot_directory_validation_failures()
         .lock()
         .expect("snapshot directory validation hook");
-    if *failure == Some(expected) {
-        *failure = None;
+    if failures.get(snapshot_directory) == Some(&expected) {
+        failures.remove(snapshot_directory);
         true
     } else {
         false
@@ -910,19 +915,24 @@ struct SnapshotArtifactCleanupTestHooks {
 
 #[cfg(test)]
 fn snapshot_artifact_cleanup_test_hooks(
-) -> &'static std::sync::Mutex<SnapshotArtifactCleanupTestHooks> {
-    static HOOKS: std::sync::OnceLock<std::sync::Mutex<SnapshotArtifactCleanupTestHooks>> =
-        std::sync::OnceLock::new();
-    HOOKS.get_or_init(|| std::sync::Mutex::new(SnapshotArtifactCleanupTestHooks::default()))
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, SnapshotArtifactCleanupTestHooks>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, SnapshotArtifactCleanupTestHooks>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(test)]
 fn take_snapshot_publication_cleanup_process_loss(
+    original: &Path,
     point: SnapshotPublicationCleanupCrashPoint,
 ) -> bool {
     let mut hooks = snapshot_artifact_cleanup_test_hooks()
         .lock()
         .expect("snapshot artifact cleanup test hooks");
+    let Some(hooks) = hooks.get_mut(original) else {
+        return false;
+    };
     if hooks.publication_process_loss == Some(point) {
         hooks.publication_process_loss = None;
         true
@@ -933,9 +943,10 @@ fn take_snapshot_publication_cleanup_process_loss(
 
 #[cfg(test)]
 fn simulated_snapshot_publication_process_loss(
+    original: &Path,
     point: SnapshotPublicationCleanupCrashPoint,
 ) -> io::Result<()> {
-    if take_snapshot_publication_cleanup_process_loss(point) {
+    if take_snapshot_publication_cleanup_process_loss(original, point) {
         Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "injected snapshot publication process loss",
@@ -947,11 +958,15 @@ fn simulated_snapshot_publication_process_loss(
 
 #[cfg(test)]
 fn take_snapshot_artifact_cleanup_hook(
+    original: &Path,
     after_rename: bool,
 ) -> (Option<SnapshotArtifactCleanupTestHook>, bool, bool) {
     let mut hooks = snapshot_artifact_cleanup_test_hooks()
         .lock()
         .expect("snapshot artifact cleanup test hooks");
+    let Some(hooks) = hooks.get_mut(original) else {
+        return (None, false, false);
+    };
     let hook = if after_rename {
         hooks.after_rename.take()
     } else {
@@ -966,7 +981,7 @@ fn take_snapshot_artifact_cleanup_hook(
 fn snapshot_artifact_cleanup_before_rename(original: &Path, tombstone: &Path) -> io::Result<()> {
     #[cfg(test)]
     {
-        let (hook, fail_before_rename, _) = take_snapshot_artifact_cleanup_hook(false);
+        let (hook, fail_before_rename, _) = take_snapshot_artifact_cleanup_hook(original, false);
         if let Some(hook) = hook {
             hook(original, tombstone);
         }
@@ -989,7 +1004,7 @@ fn sync_snapshot_artifact_cleanup_after_rename(
 ) -> io::Result<()> {
     #[cfg(test)]
     {
-        let (hook, _, fail_sync) = take_snapshot_artifact_cleanup_hook(true);
+        let (hook, _, fail_sync) = take_snapshot_artifact_cleanup_hook(original, true);
         if let Some(hook) = hook {
             hook(original, tombstone);
         }
@@ -1020,18 +1035,22 @@ fn sync_snapshot_artifact_cleanup_after_rename(
 /// private guard afterward; a replacement introduced here is reauthenticated
 /// under that guard and must fail closed.
 #[cfg(target_os = "linux")]
-fn snapshot_artifact_cleanup_after_final_identity_before_unlink(tombstone: &Path, guard: &Path) {
+fn snapshot_artifact_cleanup_after_final_identity_before_unlink(
+    original: &Path,
+    tombstone: &Path,
+    guard: &Path,
+) {
     #[cfg(test)]
     if let Some(hook) = snapshot_artifact_cleanup_test_hooks()
         .lock()
         .expect("snapshot artifact cleanup test hooks")
-        .post_final_identity_before_unlink
-        .take()
+        .get_mut(original)
+        .and_then(|hooks| hooks.post_final_identity_before_unlink.take())
     {
         hook(tombstone, guard);
     }
     #[cfg(not(test))]
-    let _ = (tombstone, guard);
+    let _ = (original, tombstone, guard);
 }
 
 /// A successful final guard rename is durable before unlink.  A crash/failure
@@ -1056,12 +1075,12 @@ fn sync_snapshot_artifact_cleanup_after_unlink_guard_rename(
             .and_then(sync_directory)?,
     }
     #[cfg(test)]
-    if std::mem::take(
-        &mut snapshot_artifact_cleanup_test_hooks()
-            .lock()
-            .expect("snapshot artifact cleanup test hooks")
-            .fail_post_unlink_guard_sync,
-    ) {
+    if snapshot_artifact_cleanup_test_hooks()
+        .lock()
+        .expect("snapshot artifact cleanup test hooks")
+        .get_mut(&cleanup.original)
+        .is_some_and(|hooks| std::mem::take(&mut hooks.fail_post_unlink_guard_sync))
+    {
         return Err(io::Error::other(
             "injected post-unlink-guard directory sync failure",
         ));
@@ -1446,6 +1465,7 @@ fn remove_identity_bound_snapshot_artifact(
         sync_snapshot_artifact_cleanup_after_rename(&cleanup.original, &tombstone, namespace)?;
         #[cfg(test)]
         simulated_snapshot_publication_process_loss(
+            &cleanup.original,
             SnapshotPublicationCleanupCrashPoint::AfterOldTombstoneSync,
         )?;
         let tombstone_file = match namespace {
@@ -1509,7 +1529,11 @@ fn remove_identity_bound_snapshot_artifact(
         #[cfg(target_os = "linux")]
         {
             let guard = snapshot_artifact_unlink_guard_path(&tombstone, expected)?;
-            snapshot_artifact_cleanup_after_final_identity_before_unlink(&tombstone, &guard);
+            snapshot_artifact_cleanup_after_final_identity_before_unlink(
+                &cleanup.original,
+                &tombstone,
+                &guard,
+            );
             #[cfg(unix)]
             {
                 match namespace {
@@ -1567,6 +1591,7 @@ fn remove_identity_bound_snapshot_artifact(
             sync_snapshot_artifact_cleanup_after_unlink_guard_rename(cleanup, namespace)?;
             #[cfg(test)]
             simulated_snapshot_publication_process_loss(
+                &cleanup.original,
                 SnapshotPublicationCleanupCrashPoint::AfterOldUnlinkGuardSync,
             )?;
 
@@ -3100,7 +3125,10 @@ async fn validate_and_clean_snapshot_directory(
             .map_err(|_| SessionConsensusStorageError::CorruptState)?
     };
     #[cfg(test)]
-    if take_snapshot_directory_validation_failure(SnapshotDirectoryValidationFailure::Current) {
+    if take_snapshot_directory_validation_failure(
+        &core.snapshot_dir,
+        SnapshotDirectoryValidationFailure::Current,
+    ) {
         return Err(SessionConsensusStorageError::BackendUnavailable);
     }
     // Open the current candidate through the retained namespace before any
@@ -3201,8 +3229,10 @@ async fn validate_and_clean_snapshot_directory(
     // publication cleanups must not permanently wedge reopening merely by
     // reaching the one-entry-over-capacity proof returned by `entries`.
     #[cfg(test)]
-    if take_snapshot_directory_validation_failure(SnapshotDirectoryValidationFailure::ReadDirectory)
-    {
+    if take_snapshot_directory_validation_failure(
+        &core.snapshot_dir,
+        SnapshotDirectoryValidationFailure::ReadDirectory,
+    ) {
         return Err(SessionConsensusStorageError::BackendUnavailable);
     }
     let namespace = Arc::clone(&lease.namespace);
@@ -3343,6 +3373,7 @@ async fn validate_and_clean_snapshot_directory(
     if removed || cleanup_failure_pending {
         #[cfg(test)]
         if take_snapshot_directory_validation_failure(
+            &core.snapshot_dir,
             SnapshotDirectoryValidationFailure::SyncDirectory,
         ) {
             return Err(SessionConsensusStorageError::BackendUnavailable);
@@ -6159,6 +6190,7 @@ async fn remove_old_snapshot(
             }
             #[cfg(test)]
             if take_snapshot_publication_cleanup_process_loss(
+                artifact.path(),
                 SnapshotPublicationCleanupCrashPoint::AfterMetadataBeforeOldRename,
             ) {
                 artifact.abandon_for_simulated_process_loss();
@@ -6745,6 +6777,7 @@ mod tests {
                 .expect("predecessor basename")
                 .to_string_lossy()
                 .into_owned();
+            let predecessor_path = first.snapshot.path().to_path_buf();
             drop(first);
             append_commit_and_apply(
                 &mut log_store,
@@ -6763,6 +6796,8 @@ mod tests {
             snapshot_artifact_cleanup_test_hooks()
                 .lock()
                 .expect("install build process-loss seam")
+                .entry(predecessor_path)
+                .or_default()
                 .publication_process_loss = Some(point);
             assert!(
                 state_machine
@@ -6921,6 +6956,11 @@ mod tests {
                     .expect("installed predecessor metadata exists")
                     .1
             };
+            let predecessor_path = target
+                ._snapshot_directory_lease
+                .namespace
+                .sqlite_child_path(std::ffi::OsStr::new(&predecessor_name))
+                .expect("predecessor artifact path");
             append_and_commit(
                 &mut target_log,
                 [source_successor_entry],
@@ -6943,6 +6983,8 @@ mod tests {
             snapshot_artifact_cleanup_test_hooks()
                 .lock()
                 .expect("install install process-loss seam")
+                .entry(predecessor_path)
+                .or_default()
                 .publication_process_loss = Some(point);
             assert!(
                 target
@@ -7010,7 +7052,7 @@ mod tests {
         std::fs::write(&tombstone, b"crash-after-rename")
             .expect("write canonical retained tombstone");
         sync_directory(&snapshots).expect("sync retained tombstone");
-        fail_snapshot_cleanup_post_rename_sync_for_test();
+        fail_snapshot_cleanup_post_rename_sync_for_test(&snapshots.join(&original));
 
         assert!(matches!(
             open(&backend, snapshots.clone(), identity(1), expected_members()).await,
@@ -7098,7 +7140,7 @@ mod tests {
 
         // A second crash at the retained-tombstone sync boundary must still
         // target that same name; it must not manufacture a nested tombstone.
-        fail_snapshot_cleanup_post_rename_sync_for_test();
+        fail_snapshot_cleanup_post_rename_sync_for_test(&snapshots.join(&original));
         assert!(matches!(
             open(&backend, snapshots.clone(), identity(1), expected_members()).await,
             Err(SessionConsensusStorageError::BackendUnavailable)
@@ -7207,11 +7249,12 @@ mod tests {
             let mut hooks = snapshot_artifact_cleanup_test_hooks()
                 .lock()
                 .expect("install cleanup hook");
-            hooks.before_rename = Some(Box::new(|original, _tombstone| {
-                let replacement = original.with_extension("replacement");
-                std::fs::write(&replacement, b"foreign-before-rename").expect("foreign bytes");
-                std::fs::rename(&replacement, original).expect("replace before rename");
-            }));
+            hooks.entry(path.clone()).or_default().before_rename =
+                Some(Box::new(|original, _tombstone| {
+                    let replacement = original.with_extension("replacement");
+                    std::fs::write(&replacement, b"foreign-before-rename").expect("foreign bytes");
+                    std::fs::rename(&replacement, original).expect("replace before rename");
+                }));
         }
 
         assert!(artifact.remove().await.is_err());
@@ -7243,6 +7286,8 @@ mod tests {
         snapshot_artifact_cleanup_test_hooks()
             .lock()
             .expect("install cleanup hook")
+            .entry(path.clone())
+            .or_default()
             .before_rename = Some(Box::new(|original, _| {
             std::fs::remove_file(original).expect("remove original before FIFO replacement");
             assert!(std::process::Command::new("mkfifo")
@@ -7279,6 +7324,8 @@ mod tests {
         snapshot_artifact_cleanup_test_hooks()
             .lock()
             .expect("install cleanup hook")
+            .entry(path.clone())
+            .or_default()
             .after_rename = Some(Box::new(|_, tombstone| {
             std::fs::remove_file(tombstone)
                 .expect("remove owned tombstone before FIFO replacement");
@@ -7318,10 +7365,12 @@ mod tests {
             let mut hooks = snapshot_artifact_cleanup_test_hooks()
                 .lock()
                 .expect("install cleanup hook");
-            hooks.before_rename = Some(Box::new(move |_original, tombstone| {
-                std::fs::write(tombstone, b"foreign-tombstone-collision").expect("collision bytes");
-                *collision.lock().expect("collision path") = Some(tombstone.to_path_buf());
-            }));
+            hooks.entry(path.clone()).or_default().before_rename =
+                Some(Box::new(move |_original, tombstone| {
+                    std::fs::write(tombstone, b"foreign-tombstone-collision")
+                        .expect("collision bytes");
+                    *collision.lock().expect("collision path") = Some(tombstone.to_path_buf());
+                }));
         }
 
         assert!(
@@ -7364,6 +7413,8 @@ mod tests {
         snapshot_artifact_cleanup_test_hooks()
             .lock()
             .expect("install cleanup hook")
+            .entry(path.clone())
+            .or_default()
             .fail_post_rename_sync = true;
 
         assert!(
@@ -7410,13 +7461,14 @@ mod tests {
             let mut hooks = snapshot_artifact_cleanup_test_hooks()
                 .lock()
                 .expect("install cleanup hook");
-            hooks.after_rename = Some(Box::new(|original, tombstone| {
-                let foreign_tombstone = tombstone.with_extension("foreign");
-                std::fs::write(&foreign_tombstone, b"foreign-tombstone")
-                    .expect("foreign tombstone");
-                std::fs::rename(&foreign_tombstone, tombstone).expect("replace tombstone");
-                std::fs::write(original, b"foreign-original").expect("occupy original");
-            }));
+            hooks.entry(path.clone()).or_default().after_rename =
+                Some(Box::new(|original, tombstone| {
+                    let foreign_tombstone = tombstone.with_extension("foreign");
+                    std::fs::write(&foreign_tombstone, b"foreign-tombstone")
+                        .expect("foreign tombstone");
+                    std::fs::rename(&foreign_tombstone, tombstone).expect("replace tombstone");
+                    std::fs::write(original, b"foreign-original").expect("occupy original");
+                }));
         }
 
         assert!(artifact.remove().await.is_err());
@@ -7465,6 +7517,8 @@ mod tests {
         snapshot_artifact_cleanup_test_hooks()
             .lock()
             .expect("install final identity seam hook")
+            .entry(path.clone())
+            .or_default()
             .post_final_identity_before_unlink = Some(Box::new(|tombstone, _guard| {
             std::fs::remove_file(tombstone).expect("remove authenticated tombstone");
             std::fs::write(tombstone, b"foreign-final-seam")
@@ -7519,6 +7573,8 @@ mod tests {
         snapshot_artifact_cleanup_test_hooks()
             .lock()
             .expect("inject post-final-guard failure")
+            .entry(path.clone())
+            .or_default()
             .fail_post_unlink_guard_sync = true;
 
         assert!(
@@ -12041,7 +12097,9 @@ mod tests {
         )
         .await
         .expect("retained receiver create cleanup storage");
-        fail_namespace_receiver_post_create_sync_for_test();
+        fail_namespace_receiver_post_create_sync_for_test(
+            &state_machine._snapshot_directory_lease.namespace,
+        );
         assert!(
             state_machine.begin_receiving_snapshot().await.is_err(),
             "the injected post-create sync error reaches the receiver caller"
@@ -12079,7 +12137,9 @@ mod tests {
         // reproducing the descriptor-pressure boundary that previously could
         // strand `incoming-*.part` entries until the thirty-third attempt.
         for attempt in 0..=SNAPSHOT_DIRECTORY_MAX_ENTRIES {
-            fail_namespace_receiver_post_create_setup_for_test();
+            fail_namespace_receiver_post_create_setup_for_test(
+                &state_machine._snapshot_directory_lease.namespace,
+            );
             assert!(
                 state_machine.begin_receiving_snapshot().await.is_err(),
                 "pre-clone failure {attempt} reaches the receiver caller"
@@ -12122,7 +12182,9 @@ mod tests {
         // or its identity cleanup owner. Repeating beyond the capacity bound
         // proves the emergency guard owns every failed child.
         for attempt in 0..=SNAPSHOT_DIRECTORY_MAX_ENTRIES {
-            fail_namespace_pinned_post_create_setup_for_test();
+            fail_namespace_pinned_post_create_setup_for_test(
+                &state_machine._snapshot_directory_lease.namespace,
+            );
             assert!(
                 state_machine
                     .get_snapshot_builder()
@@ -12174,7 +12236,7 @@ mod tests {
             let final_pin =
                 PinnedSqliteFile::create_new_in_namespace(Arc::clone(&namespace), &final_name)
                     .expect("create fallback final pin");
-            fail_namespace_vacuum_raw_pinned_post_create_setup_for_test();
+            fail_namespace_vacuum_raw_pinned_post_create_setup_for_test(&namespace);
             assert!(
                 create_vacuum_raw_snapshot_intermediate(Arc::clone(&namespace)).is_err(),
                 "fallback intermediate pre-pin failure {attempt} reaches its caller"
@@ -12637,7 +12699,7 @@ mod tests {
                 .core
                 .snapshot_cleanup_failed
                 .store(true, Ordering::Release);
-            inject_snapshot_directory_validation_failure(failure);
+            inject_snapshot_directory_validation_failure(snapshot_directory.clone(), failure);
             assert!(validate_and_clean_snapshot_directory(
                 &state_machine.core,
                 Some(&state_machine._snapshot_directory_lease),
@@ -12691,8 +12753,8 @@ mod tests {
         // The emergency O_EXCL owner unlinks the child, then its only
         // directory fsync fails. This leaves no entry to trigger ordinary
         // cleanup on the next admission, but must leave durable evidence.
-        fail_namespace_pinned_post_create_setup_for_test();
-        fail_retained_namespace_sync_for_test();
+        fail_namespace_pinned_post_create_setup_for_test(&namespace);
+        fail_retained_namespace_sync_for_test(&namespace);
         assert!(PinnedSqliteFile::create_new_in_namespace(
             Arc::clone(&namespace),
             std::ffi::OsStr::new("build-00000000-0000-4000-8000-000000000001.sqlite"),
@@ -12716,6 +12778,7 @@ mod tests {
         // can make the retained descriptor sync mandatory. A failure here
         // must preserve the latch and block terminal handoff.
         inject_snapshot_directory_validation_failure(
+            state_machine.core.snapshot_dir.as_ref().clone(),
             SnapshotDirectoryValidationFailure::SyncDirectory,
         );
         assert_eq!(
@@ -12977,7 +13040,10 @@ mod tests {
             std::fs::write(stale, b"terminal-handoff-cleanup-fixture")
                 .expect("write reclaimable staging fixture");
             core.snapshot_cleanup_failed.store(true, Ordering::Release);
-            inject_snapshot_directory_validation_failure(failure);
+            inject_snapshot_directory_validation_failure(
+                core.snapshot_dir.as_ref().clone(),
+                failure,
+            );
             assert_eq!(
                 Err(SessionConsensusStorageError::BackendUnavailable),
                 validate_and_clean_snapshot_directory(&core, Some(&lease)).await,
@@ -13029,7 +13095,10 @@ mod tests {
     async fn failed_public_open_restores_terminal_handoff_for_same_backend_retry() {
         let (_directory, backend, snapshots) = pending_terminal_backend_fixture().await;
         let _hook_lock = snapshot_artifact_cleanup_test_lock().lock().await;
-        inject_snapshot_directory_validation_failure(SnapshotDirectoryValidationFailure::Current);
+        inject_snapshot_directory_validation_failure(
+            snapshots.clone(),
+            SnapshotDirectoryValidationFailure::Current,
+        );
         assert!(matches!(
             open(&backend, snapshots.clone(), identity(1), expected_members()).await,
             Err(SessionConsensusStorageError::BackendUnavailable)
@@ -14165,13 +14234,14 @@ mod tests {
         // O_EXCL succeeds, the emergency owner unlinks the exact child, and
         // only D1's parent fsync fails. The global latch must retain this D1
         // capability even after every ordinary owner is dropped.
-        fail_namespace_pinned_post_create_setup_for_test();
-        fail_retained_namespace_sync_for_test();
+        fail_namespace_pinned_post_create_setup_for_test(&namespace);
+        fail_retained_namespace_sync_for_test(&namespace);
         assert!(PinnedSqliteFile::create_new_in_namespace(
             Arc::clone(&namespace),
             std::ffi::OsStr::new("build-00000000-0000-4000-8000-000000000001.sqlite"),
         )
         .is_err());
+        clear_retained_namespace_sync_observer_for_test(&namespace);
         drop(namespace);
         drop(log);
         drop(state_machine);
@@ -14186,7 +14256,6 @@ mod tests {
             "replacement must be a distinct directory incarnation"
         );
 
-        clear_retained_namespace_sync_observer_for_test();
         assert!(
             matches!(
                 open(&backend, snapshots.clone(), identity(1), expected_members()).await,
@@ -14196,7 +14265,7 @@ mod tests {
         );
         assert_eq!(
             vec![(d1.dev(), d1.ino())],
-            retained_namespace_sync_observer_for_test(),
+            retained_namespace_sync_observer_for_test(&snapshots),
             "acknowledgement fsync targets the detached original directory, never D2"
         );
         assert_eq!(
@@ -14258,6 +14327,8 @@ mod tests {
         snapshot_artifact_cleanup_test_hooks()
             .lock()
             .expect("inject pre-unlink failure")
+            .entry(artifact.path().to_path_buf())
+            .or_default()
             .fail_before_rename = true;
         assert!(
             artifact.remove().await.is_err(),
@@ -14292,7 +14363,7 @@ mod tests {
             "D2 does not exist before its new admission creates it"
         );
 
-        clear_retained_namespace_sync_observer_for_test();
+        clear_retained_namespace_sync_observer_for_test(&namespace);
         assert!(
             matches!(
                 open(&backend, snapshots.clone(), identity(1), expected_members()).await,
@@ -14314,7 +14385,7 @@ mod tests {
                 .count(),
             "D2 is never scanned, created in, or deleted from by D1 cleanup"
         );
-        let synced = retained_namespace_sync_observer_for_test();
+        let synced = retained_namespace_sync_observer_for_test(&snapshots);
         assert!(
             !synced.is_empty()
                 && synced

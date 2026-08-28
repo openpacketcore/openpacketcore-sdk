@@ -614,6 +614,7 @@ pub(crate) enum LiveTerminalRecoveryHandoffInstallOutcome {
 /// A terminal record deliberately remains unresolved here: its selected
 /// snapshot must be opened through the retained namespace and classified by
 /// the full handoff path before application traffic can proceed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveTerminalRecoveryHandoffProbe {
     Clear,
@@ -1552,6 +1553,7 @@ pub(crate) fn classify_operator_recovery_latch_with_connection_and_admitted_snap
 /// An absent sidecar is ready only for a database that has never entered
 /// operator recovery. A crash after a durable recovery transition must not
 /// turn sidecar removal or loss into ordinary application admission.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn ensure_absent_operator_recovery_latch_is_ready(connection: &Connection) -> io::Result<()> {
     let has_identity = table_exists(connection, "consensus_identity").map_err(db_error)?;
     let has_recovery = table_exists(connection, "consensus_operator_recovery").map_err(db_error)?;
@@ -1579,6 +1581,7 @@ fn ensure_absent_operator_recovery_latch_is_ready(connection: &Connection) -> io
 /// exact durable recovery state.  Treat a stale or substituted identity,
 /// epoch, or plan digest as corruption rather than letting it masquerade as
 /// an ordinary active recovery hold.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn active_latch_is_coherent_with_connection(
     connection: &Connection,
     latch: OperatorRecoveryLatch,
@@ -19976,6 +19979,53 @@ fn retained_log_id_at_sync(
     Ok(Some(log_id))
 }
 
+/// Read the exact retained Membership payload at one durable membership
+/// pointer. A matching numeric row or LogId is not enough to authorize
+/// replacement: the row must still carry the same membership value which the
+/// state machine persisted.
+fn retained_membership_at_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    target: &LogId<SessionConsensusNodeId>,
+) -> io::Result<Option<StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>>>
+{
+    let row = conn
+        .query_row(
+            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log WHERE log_index = ?1",
+            [checked_i64(target.index)?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some((epoch, term, stored_index, encoded)) = row else {
+        return Ok(None);
+    };
+    validate_epoch(epoch, identity)?;
+    let entry = decode_consensus_log_entry(&encoded)?;
+    validate_log_id(&entry.log_id)?;
+    if checked_u64(term)? != entry.log_id.leader_id.term
+        || checked_u64(stored_index)? != entry.log_id.index
+        || entry.log_id != *target
+    {
+        return Err(invalid_data(
+            "session consensus membership conflicts with retained log",
+        ));
+    }
+    let EntryPayload::Membership(payload) = entry.payload else {
+        return Err(invalid_data(
+            "session consensus membership lacks exact retained payload",
+        ));
+    };
+    Ok(Some(StoredMembership::new(Some(entry.log_id), payload)))
+}
+
 fn selected_snapshot_log_id_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -20310,6 +20360,166 @@ fn validate_exact_log_prefix_through_sync(
         if !witnesses.contains_key(&index) {
             return Err(invalid_data(
                 "session consensus durable log prefix contains a hole",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the one compacted interval which a portable snapshot install is
+/// allowed to replace without recreating its source log rows. The snapshot
+/// builder deliberately removes the source Raft rows and markers, while a
+/// follower may already retain an older logical floor after physically
+/// pruning that floor without ever receiving the later source rows. Once the
+/// incoming, attached image has been fully authenticated and its selected
+/// snapshot is published in this same transaction, that exact selected cut
+/// covers an entirely absent interval. If the local A<=C frontier retains the
+/// exact physical P+1..C prefix and C+1..S is entirely absent, that same
+/// selected cut covers only the absent tail; this is valid for both authority
+/// profiles after their respective pre-install audits. Any other retained row
+/// shape keeps the ordinary complete-prefix proof, so a corrupt, spliced, or
+/// gapped retained interval is never hidden by the incoming snapshot.
+fn validate_exact_log_prefix_after_portable_snapshot_install_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    _authority_profile: ConsensusAuthorityProfile,
+    preinstall_committed: Option<LogId<SessionConsensusNodeId>>,
+    preinstall_applied: Option<LogId<SessionConsensusNodeId>>,
+    target: &LogId<SessionConsensusNodeId>,
+    require_retained_target: bool,
+) -> io::Result<()> {
+    validate_log_id(target)?;
+    let selected_snapshot = selected_snapshot_log_id_sync(conn, identity)?;
+    let purged = read_purged_sync(conn, identity)?;
+    let (Some(snapshot), Some(floor)) = (selected_snapshot, purged) else {
+        return validate_exact_log_prefix_through_sync(
+            conn,
+            identity,
+            target,
+            require_retained_target,
+        );
+    };
+    if snapshot != *target || floor.index >= target.index {
+        return validate_exact_log_prefix_through_sync(
+            conn,
+            identity,
+            target,
+            require_retained_target,
+        );
+    }
+
+    let witnesses = validated_log_witnesses_through_sync(conn, identity, target)?;
+    if require_retained_target
+        && retained_log_id_at_sync(conn, identity, target.index)?.as_ref() != Some(target)
+    {
+        return Err(invalid_data(
+            "session consensus truncate boundary lacks exact retained log coverage",
+        ));
+    }
+    match witnesses.get(&target.index) {
+        Some(witness) if witness == target => {}
+        Some(_) => {
+            return Err(invalid_data(
+                "session consensus durable pointer conflicts with retained log",
+            ));
+        }
+        None => {
+            return Err(invalid_data(
+                "session consensus durable pointer lacks exact log coverage",
+            ));
+        }
+    }
+
+    let start = floor
+        .index
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
+    let has_retained_rows: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM consensus_log WHERE log_index >= ?1 AND log_index <= ?2 LIMIT 1)",
+            params![checked_i64(start)?, checked_i64(target.index)?],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if has_retained_rows {
+        // A complete physical P+1..S prefix remains the ordinary proof,
+        // including when the old local C=A=P and a later retained suffix is
+        // present.  Decide this from the exact row shape before considering
+        // the compacted-tail exception; once this shape is present, propagate
+        // every
+        // strict-prefix validation error instead of treating corruption as an
+        // absent snapshot-covered interval.
+        let target_end = target
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus log index is exhausted"))?;
+        let retained_through_target =
+            read_log_range_sync(conn, identity, start, Some(target_end), None)?;
+        if retained_through_target.last().map(|entry| entry.log_id) == Some(*target) {
+            return validate_exact_log_prefix_through_sync(
+                conn,
+                identity,
+                target,
+                require_retained_target,
+            );
+        }
+        // The exact P+1..C retained prefix followed by an entirely absent
+        // tail is also safe for FixedImmutable. Its pre-install audit has already
+        // bound the immutable identity, roster, bindings, membership payload,
+        // and every retained entry; the selected authenticated snapshot is
+        // then the exact witness for the absent suffix.  Keep this after the
+        // full-prefix shape above so a retained row through S, or any corrupt
+        // / gapped retained suffix, still takes the strict proof path.
+        let (Some(committed), Some(applied)) = (preinstall_committed, preinstall_applied) else {
+            return Err(invalid_data(
+                "session consensus portable snapshot retained tail lacks local pointers",
+            ));
+        };
+        ensure_log_id_not_after(
+            &floor,
+            &applied,
+            "session consensus portable snapshot retained tail regresses purge floor",
+        )?;
+        ensure_log_id_not_after(
+            &applied,
+            &committed,
+            "session consensus portable snapshot retained tail applied pointer exceeds committed frontier",
+        )?;
+        ensure_log_id_not_after(
+            &committed,
+            target,
+            "session consensus portable snapshot retained tail exceeds selected cut",
+        )?;
+        let retained_end = committed
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("session consensus retained tail index is exhausted"))?;
+        let retained = read_log_range_sync(conn, identity, start, Some(retained_end), None)?;
+        if retained.first().map(|entry| entry.log_id.index) != Some(start)
+            || retained.last().map(|entry| entry.log_id) != Some(committed)
+        {
+            return Err(invalid_data(
+                "session consensus portable snapshot retained tail lacks exact boundaries",
+            ));
+        }
+        ensure_log_id_not_after(
+            &floor,
+            &retained
+                .first()
+                .expect("retained tail exact boundaries require a first row")
+                .log_id,
+            "session consensus portable snapshot retained tail regresses purge floor",
+        )?;
+        let has_retained_suffix: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM consensus_log WHERE log_index > ?1 AND log_index <= ?2 LIMIT 1)",
+                params![checked_i64(committed.index)?, checked_i64(target.index)?],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if has_retained_suffix {
+            return Err(invalid_data(
+                "session consensus portable snapshot retained tail extends into absent suffix",
             ));
         }
     }
@@ -21109,6 +21319,118 @@ fn logical_purge_logs_in_tx(
     )?;
     validate_exact_log_prefix_through_sync(tx, identity, through, false)?;
     save_log_pointer(tx, "consensus_purged", identity, through)
+}
+
+/// Publish the exact logical floor for an already-validated portable snapshot.
+/// This remains install-only: ordinary Raft purges must always prove every
+/// index above their existing logical floor from retained local evidence.
+fn logical_purge_logs_after_portable_snapshot_install_in_tx(
+    tx: &Transaction<'_>,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    preinstall_committed: Option<LogId<SessionConsensusNodeId>>,
+    preinstall_applied: Option<LogId<SessionConsensusNodeId>>,
+    through: &LogId<SessionConsensusNodeId>,
+    _index: i64,
+) -> io::Result<()> {
+    if selected_snapshot_log_id_sync(tx, identity)? != Some(*through) {
+        return Err(invalid_data(
+            "session consensus portable snapshot purge lacks exact selected cut",
+        ));
+    }
+    if let Some(current) = read_purged_sync(tx, identity)? {
+        validate_exact_log_prefix_through_sync(tx, identity, &current, false)?;
+        if through.index < current.index {
+            ensure_log_id_not_after(
+                through,
+                &current,
+                "session consensus delayed purge lineage is invalid",
+            )?;
+            return Ok(());
+        }
+        if through.index == current.index && through != &current {
+            return Err(invalid_data("session consensus purged index regressed"));
+        }
+        if through == &current {
+            return Ok(());
+        }
+        ensure_log_id_not_after(
+            &current,
+            through,
+            "session consensus purged index regressed",
+        )?;
+    }
+    let applied = read_applied_sync(tx, identity)?
+        .ok_or_else(|| invalid_data("session consensus cannot purge unapplied logs"))?;
+    validate_exact_log_prefix_after_portable_snapshot_install_sync(
+        tx,
+        identity,
+        authority_profile,
+        preinstall_committed,
+        preinstall_applied,
+        &applied,
+        false,
+    )?;
+    ensure_log_id_not_after(
+        through,
+        &applied,
+        "session consensus cannot purge unapplied logs",
+    )?;
+    validate_exact_log_prefix_after_portable_snapshot_install_sync(
+        tx,
+        identity,
+        authority_profile,
+        preinstall_committed,
+        preinstall_applied,
+        through,
+        false,
+    )?;
+    save_log_pointer(tx, "consensus_purged", identity, through)
+}
+
+/// Advance the committed frontier to the authenticated portable snapshot cut
+/// while the follower's older purge marker still witnesses its prior
+/// committed frontier. The ordinary committed advance requires every
+/// intervening physical row, which a lagging follower legitimately never
+/// received. This install-only path accepts a wholly absent interval, or an
+/// exact local P+1..C prefix with A<=C followed by an absent tail, covered by
+/// the
+/// selected snapshot and preserves the exact proof of any previous committed
+/// pointer before replacing it.
+fn save_committed_after_portable_snapshot_install_in_tx(
+    tx: &Transaction<'_>,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    preinstall_committed: Option<LogId<SessionConsensusNodeId>>,
+    preinstall_applied: Option<LogId<SessionConsensusNodeId>>,
+    committed: &LogId<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    if selected_snapshot_log_id_sync(tx, identity)? != Some(*committed) {
+        return Err(invalid_data(
+            "session consensus portable snapshot commit lacks exact selected cut",
+        ));
+    }
+    if let Some(current) = read_committed_sync(tx, identity)? {
+        validate_exact_log_prefix_through_sync(tx, identity, &current, false)?;
+        ensure_log_id_not_after(
+            &current,
+            committed,
+            "session consensus committed index regressed",
+        )?;
+        if current.index == committed.index && current != *committed {
+            return Err(invalid_data("session consensus committed index regressed"));
+        }
+    }
+    validate_exact_log_prefix_after_portable_snapshot_install_sync(
+        tx,
+        identity,
+        authority_profile,
+        preinstall_committed,
+        preinstall_applied,
+        committed,
+        false,
+    )?;
+    save_log_pointer(tx, "consensus_committed", identity, committed)
 }
 
 pub(crate) fn purge_logs_with_authority_sync(
@@ -27721,6 +28043,45 @@ pub(crate) struct DurableMembershipLineage<'a> {
         &'a [StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>],
 }
 
+/// Prove the compacted applied-membership case after its retained row is gone.
+/// The caller has already read the persisted membership through the semantic
+/// membership-scope validator. A selected snapshot whose cut reaches that
+/// membership must still carry the exact payload. Only when the selected cut
+/// is older may the later full-LogId purge floor witness the applied
+/// membership's monotonic position; that floor alone is never payload proof.
+fn validate_compacted_persisted_membership_coverage(
+    membership: &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    membership_log: &LogId<SessionConsensusNodeId>,
+    purged: Option<&LogId<SessionConsensusNodeId>>,
+    snapshot: Option<&LogId<SessionConsensusNodeId>>,
+    snapshot_membership: Option<
+        &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
+    >,
+) -> io::Result<()> {
+    if let Some(snapshot) = snapshot.filter(|snapshot| snapshot.index >= membership_log.index) {
+        ensure_log_id_not_after(
+            membership_log,
+            snapshot,
+            "session consensus snapshot and membership conflict",
+        )?;
+        if snapshot_membership != Some(membership) {
+            return Err(invalid_data(
+                "session consensus compacted membership lacks exact snapshot coverage",
+            ));
+        }
+        return Ok(());
+    }
+
+    let purged = purged.ok_or_else(|| {
+        invalid_data("session consensus compacted membership lacks purge coverage")
+    })?;
+    ensure_log_id_not_after(
+        membership_log,
+        purged,
+        "session consensus purged pointer is before persisted membership",
+    )
+}
+
 pub(crate) fn validate_durable_log_pointer_lineage(
     committed: Option<&LogId<SessionConsensusNodeId>>,
     applied: Option<&LogId<SessionConsensusNodeId>>,
@@ -27946,10 +28307,14 @@ pub(crate) fn validate_durable_log_pointer_lineage(
                     "session consensus retained membership payload conflicts with persisted membership",
                 ));
             }
-        } else if membership.snapshot != Some(membership.persisted) {
-            return Err(invalid_data(
-                "session consensus compacted membership lacks exact snapshot coverage",
-            ));
+        } else {
+            validate_compacted_persisted_membership_coverage(
+                membership.persisted,
+                persisted_log,
+                purged,
+                snapshot,
+                membership.snapshot,
+            )?;
         }
     }
 
@@ -27973,10 +28338,10 @@ pub(crate) fn validate_durable_log_pointer_lineage(
     // `consensus_membership` is not merely any historically valid
     // membership. It is the applied state-machine authority, so it must
     // equal the newest membership transition which the durable applied
-    // frontier can prove. A snapshot may attest to a compacted transition,
-    // but a later retained membership always wins. Conversely, a snapshot
-    // may not advertise an old membership after a newer retained transition
-    // already exists below its own last log.
+    // frontier can prove. A retained row or selected snapshot provides exact
+    // payload evidence; the narrowly allowed, scope-validated purge-attested
+    // successor remains a candidate so an older selected snapshot cannot
+    // roll the applied authority back.
     let latest_retained_membership_at_or_before = |limit: &LogId<SessionConsensusNodeId>| {
         membership
             .retained
@@ -27997,20 +28362,11 @@ pub(crate) fn validate_durable_log_pointer_lineage(
                 .log_id()
                 .is_some_and(|log_id| log_id.index <= applied.index)
         });
-        let latest = match (retained_latest, snapshot_latest) {
-            (Some(retained), Some(snapshot))
-                if snapshot.log_id().is_some_and(|snapshot_log_id| {
-                    retained.log_id().is_some_and(|retained_log_id| {
-                        snapshot_log_id.index > retained_log_id.index
-                    })
-                }) =>
-            {
-                snapshot
-            }
-            (Some(retained), _) => retained,
-            (None, Some(snapshot)) => snapshot,
-            (None, None) => membership.persisted,
-        };
+        let latest = [Some(membership.persisted), retained_latest, snapshot_latest]
+            .into_iter()
+            .flatten()
+            .max_by_key(|stored| stored.log_id().map_or(0, |log_id| log_id.index))
+            .expect("persisted membership is always a latest-membership candidate");
         if latest != membership.persisted {
             return Err(invalid_data(
                 "session consensus persisted membership is not the latest applied membership",
@@ -28198,6 +28554,31 @@ fn validate_fixed_durable_state_sync(
     expected_members: &BTreeSet<SessionConsensusNodeId>,
 ) -> io::Result<()> {
     validate_fixed_live_durable_state_sync(conn, identity, expected_members)?;
+    // Dynamic scope validation permits its narrow purge-attested successor
+    // membership case. Fixed authority deliberately retains the historical
+    // exact-payload rule: once M is compacted, only selected snapshot M may
+    // attest it, even if a later purge marker is otherwise monotonic.
+    let membership = read_membership_sync(conn, identity)?;
+    if let Some(membership_log) = membership.log_id().as_ref() {
+        match retained_membership_at_sync(conn, identity, membership_log)? {
+            Some(retained) if retained != membership => {
+                return Err(invalid_data(
+                    "session consensus retained membership payload conflicts with persisted membership",
+                ));
+            }
+            Some(_) => {}
+            None if read_current_snapshot_sync(conn, identity)?
+                .as_ref()
+                .map(|(meta, _, _, _)| &meta.last_membership)
+                != Some(&membership) =>
+            {
+                return Err(invalid_data(
+                    "session consensus compacted membership lacks exact snapshot coverage",
+                ));
+            }
+            None => {}
+        }
+    }
     validate_retained_durable_log_sync(conn, identity, |entry| {
         validate_fixed_log_id(&entry.log_id)?;
         if fixed_profile_entry_changes_topology(entry, expected_members) {
@@ -28205,6 +28586,299 @@ fn validate_fixed_durable_state_sync(
         }
         Ok(())
     })
+}
+
+/// Prove the local log-store pointers which the portable image will replace.
+/// This intentionally does not require compacted membership-payload evidence:
+/// ordinary Raft purge may leave C=A=P at one exact marker after removing its
+/// physical membership row, and the incoming authenticated snapshot supplies
+/// that payload witness. Every replaced pointer must nevertheless have exact
+/// retained/marker coverage and preserve Raft ordering before any table copy.
+fn validate_snapshot_install_replaced_pointers_sync(
+    conn: &Transaction<'_>,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    incoming: Option<&LogId<SessionConsensusNodeId>>,
+) -> io::Result<()> {
+    let committed = read_committed_sync(conn, identity)?;
+    let applied = read_applied_sync(conn, identity)?;
+    let purged = read_purged_sync(conn, identity)?;
+    let current_snapshot = read_current_snapshot_sync(conn, identity)?;
+    let snapshot = current_snapshot
+        .as_ref()
+        .and_then(|(meta, _, _, _)| meta.last_log_id.as_ref());
+    let snapshot_membership = current_snapshot
+        .as_ref()
+        .map(|(meta, _, _, _)| &meta.last_membership);
+    let snapshot_membership_log =
+        snapshot_membership.and_then(|membership| membership.log_id().as_ref());
+    let membership = read_membership_sync(conn, identity)?;
+    let membership_log = membership.log_id().as_ref();
+    if let Some(floor) = purged.as_ref() {
+        // An exact selected snapshot covers interrupted physical cleanup at
+        // and below its own cut. Without that exact coverage, any remaining
+        // old-prefix debris must still be the contiguous suffix produced by
+        // the bounded prune lane; installation may not hide a partial gap.
+        if snapshot != Some(floor) {
+            validate_exact_log_prune_lineage_in_tx(conn, identity, floor)?;
+        }
+    }
+    if let Some(applied) = applied.as_ref() {
+        let committed = committed.as_ref().ok_or_else(|| {
+            invalid_data("session consensus applied pointer lacks committed state")
+        })?;
+        ensure_log_id_not_after(
+            applied,
+            committed,
+            "session consensus applied pointer is beyond committed state",
+        )?;
+    }
+    if let Some(purged) = purged.as_ref() {
+        let applied = applied
+            .as_ref()
+            .ok_or_else(|| invalid_data("session consensus purged pointer lacks applied state"))?;
+        ensure_log_id_not_after(
+            purged,
+            applied,
+            "session consensus purged pointer is beyond applied state",
+        )?;
+    }
+    if let Some(snapshot) = snapshot {
+        let applied = applied
+            .as_ref()
+            .ok_or_else(|| invalid_data("session consensus snapshot is beyond applied state"))?;
+        ensure_log_id_not_after(
+            snapshot,
+            applied,
+            "session consensus snapshot is beyond applied state",
+        )?;
+        let incoming = incoming.ok_or_else(|| {
+            invalid_data("session consensus snapshot regresses selected snapshot state")
+        })?;
+        ensure_log_id_not_after(
+            snapshot,
+            incoming,
+            "session consensus snapshot regresses selected snapshot state",
+        )?;
+    }
+    if let Some(snapshot_membership_log) = snapshot_membership_log {
+        let snapshot = snapshot.ok_or_else(|| {
+            invalid_data("session consensus snapshot membership lacks snapshot state")
+        })?;
+        ensure_log_id_not_after(
+            snapshot_membership_log,
+            snapshot,
+            "session consensus snapshot membership is beyond its last log",
+        )?;
+    } else if snapshot_membership.is_some_and(|membership| !is_pristine_membership(membership)) {
+        return Err(invalid_data(
+            "session consensus snapshot membership log identity is missing",
+        ));
+    }
+    if let Some(membership_log) = membership_log {
+        let applied = applied
+            .as_ref()
+            .ok_or_else(|| invalid_data("session consensus membership is beyond applied state"))?;
+        ensure_log_id_not_after(
+            membership_log,
+            applied,
+            "session consensus membership is beyond applied state",
+        )?;
+    } else if !is_pristine_membership(&membership) {
+        return Err(invalid_data(
+            "session consensus membership log identity is missing",
+        ));
+    }
+    let same_index_requires_exact = |left: Option<&LogId<SessionConsensusNodeId>>,
+                                     right: Option<&LogId<SessionConsensusNodeId>>,
+                                     message: &'static str| {
+        if let (Some(left), Some(right)) = (left, right) {
+            if left.index == right.index && left != right {
+                return Err(invalid_data(message));
+            }
+        }
+        Ok(())
+    };
+    for (left, right, message) in [
+        (
+            membership_log,
+            purged.as_ref(),
+            "session consensus purged pointer and membership conflict",
+        ),
+        (
+            membership_log,
+            snapshot,
+            "session consensus snapshot and membership conflict",
+        ),
+        (
+            membership_log,
+            snapshot_membership_log,
+            "session consensus persisted and snapshot membership conflict",
+        ),
+        (
+            snapshot_membership_log,
+            purged.as_ref(),
+            "session consensus purged pointer and snapshot membership conflict",
+        ),
+        (
+            snapshot_membership_log,
+            applied.as_ref(),
+            "session consensus applied pointer and snapshot membership conflict",
+        ),
+        (
+            snapshot_membership_log,
+            committed.as_ref(),
+            "session consensus committed pointer and snapshot membership conflict",
+        ),
+    ] {
+        same_index_requires_exact(left, right, message)?;
+    }
+    if let Some(membership_log) = membership_log {
+        if let Some(retained) = retained_membership_at_sync(conn, identity, membership_log)? {
+            if retained != membership {
+                return Err(invalid_data(
+                    "session consensus retained membership payload conflicts with persisted membership",
+                ));
+            }
+        } else if authority_profile == ConsensusAuthorityProfile::Dynamic {
+            validate_compacted_persisted_membership_coverage(
+                &membership,
+                membership_log,
+                purged.as_ref(),
+                snapshot,
+                snapshot_membership,
+            )?;
+        } else if snapshot_membership != Some(&membership) {
+            return Err(invalid_data(
+                "session consensus compacted membership lacks exact snapshot coverage",
+            ));
+        }
+    }
+    if let (Some(snapshot_membership_log), Some(snapshot_membership)) =
+        (snapshot_membership_log, snapshot_membership)
+    {
+        if let Some(retained) =
+            retained_membership_at_sync(conn, identity, snapshot_membership_log)?
+        {
+            if retained != *snapshot_membership {
+                return Err(invalid_data(
+                    "session consensus retained membership payload conflicts with snapshot membership",
+                ));
+            }
+        }
+    }
+    for pointer in [
+        purged.as_ref(),
+        applied.as_ref(),
+        committed.as_ref(),
+        snapshot,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_exact_log_prefix_through_sync(conn, identity, pointer, false)?;
+    }
+    if purged.is_none() && snapshot.is_none() {
+        for pointer in [applied.as_ref(), committed.as_ref()].into_iter().flatten() {
+            if retained_log_id_at_sync(conn, identity, pointer.index)?.as_ref() != Some(pointer) {
+                return Err(invalid_data(
+                    "session consensus uncompacted pointer lacks exact retained log coverage",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the complete physical suffix which will survive or be covered by
+/// an incoming portable snapshot. Existing rows may end before the incoming
+/// cut (the authenticated snapshot covers that missing tail), but they may
+/// never contain an internal gap, malformed entry, leader regression, or a
+/// different full LogId at the incoming cut. A selected local snapshot may be
+/// the predecessor only when the first retained row is exactly its successor.
+fn validate_snapshot_install_retained_rows_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    fixed_expected_members: &BTreeSet<SessionConsensusNodeId>,
+    incoming: Option<&LogId<SessionConsensusNodeId>>,
+) -> io::Result<()> {
+    let purged = read_purged_sync(conn, identity)?;
+    let current_snapshot = read_current_snapshot_sync(conn, identity)?;
+    let snapshot = current_snapshot
+        .as_ref()
+        .and_then(|(meta, _, _, _)| meta.last_log_id.as_ref());
+    let first_index: Option<i64> = conn
+        .query_row("SELECT MIN(log_index) FROM consensus_log", [], |row| {
+            row.get(0)
+        })
+        .map_err(db_error)?;
+    let first_index = first_index.map(checked_u64).transpose()?;
+    let snapshot_successor = snapshot
+        .map(|snapshot| {
+            snapshot
+                .index
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("session consensus snapshot index is exhausted"))
+        })
+        .transpose()?;
+    let start = if purged.is_none()
+        && snapshot_successor.is_some_and(|successor| first_index == Some(successor))
+    {
+        snapshot_successor.expect("selected snapshot successor was matched")
+    } else {
+        0
+    };
+    let entries = read_log_range_sync(conn, identity, start, None, None)?;
+    if start != 0 {
+        if let (Some(snapshot), Some(first)) = (snapshot, entries.first()) {
+            ensure_log_id_not_after(
+                snapshot,
+                &first.log_id,
+                "session consensus retained log regresses selected snapshot",
+            )?;
+        }
+    }
+    if incoming.is_none() && !entries.is_empty() {
+        return Err(invalid_data(
+            "session consensus pristine snapshot cannot replace retained logs",
+        ));
+    }
+    for entry in &entries {
+        if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+            validate_fixed_log_id(&entry.log_id)?;
+            if fixed_profile_entry_changes_topology(entry, fixed_expected_members) {
+                return Err(invalid_data("session consensus fixed log entry is invalid"));
+            }
+        }
+        if incoming.is_some_and(|incoming| {
+            entry.log_id.index == incoming.index && entry.log_id != *incoming
+        }) {
+            return Err(invalid_data(
+                "session consensus incoming snapshot conflicts with retained log",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Audit every local pointer and retained row after a portable snapshot
+/// replacement. Dynamic authority applies the ordinary durable-log decoder
+/// and lineage proof; fixed authority additionally rejects any entry outside
+/// its immutable topology. The published snapshot now supplies compacted
+/// membership evidence, so this binds every surviving physical suffix to the
+/// new selected snapshot and purge cut.
+fn validate_snapshot_install_retained_log_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    authority_profile: ConsensusAuthorityProfile,
+    fixed_expected_members: &BTreeSet<SessionConsensusNodeId>,
+) -> io::Result<()> {
+    if authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+        validate_fixed_durable_state_sync(conn, identity, fixed_expected_members)
+    } else {
+        validate_retained_durable_log_sync(conn, identity, |_| Ok(()))
+    }
 }
 
 /// Decode and bind every physically retained durable-log row above the
@@ -32438,6 +33112,21 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
         // validation and replacement even though deployment admission already
         // requires one writer per backing store.
         validate_snapshot_floor(&tx, identity, incoming_last_log_id)?;
+        validate_snapshot_install_replaced_pointers_sync(
+            &tx,
+            identity,
+            authority_profile,
+            incoming_last_log_id,
+        )?;
+        validate_snapshot_install_retained_rows_sync(
+            &tx,
+            identity,
+            authority_profile,
+            expected_members.unwrap_or(&expected_scope.current_members),
+            incoming_last_log_id,
+        )?;
+        let preinstall_committed = read_committed_sync(&tx, identity)?;
+        let preinstall_applied = read_applied_sync(&tx, identity)?;
         let local_monotonic_state = snapshot_monotonic_state_sync(&tx, identity)?;
         validate_protected_roster_state_sync(&tx, identity)
             .map_err(|_| invalid_data("session consensus protected roster state is invalid"))?;
@@ -32851,7 +33540,26 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
                 )?;
             }
             let (_, snapshot_index) = validate_log_id(snapshot_log_id)?;
-            logical_purge_logs_in_tx(&tx, identity, snapshot_log_id, snapshot_index)?;
+            // Advance committed while the follower's older purge marker still
+            // witnesses its prior frontier. Advancing purge first would erase
+            // that exact old-marker proof before the committed pointer moves.
+            save_committed_after_portable_snapshot_install_in_tx(
+                &tx,
+                identity,
+                authority_profile,
+                preinstall_committed,
+                preinstall_applied,
+                snapshot_log_id,
+            )?;
+            logical_purge_logs_after_portable_snapshot_install_in_tx(
+                &tx,
+                identity,
+                authority_profile,
+                preinstall_committed,
+                preinstall_applied,
+                snapshot_log_id,
+                snapshot_index,
+            )?;
             if read_purged_sync(&tx, identity)? != Some(*snapshot_log_id) {
                 return Err(invalid_data(
                     "session consensus snapshot purge floor is not exact",
@@ -32859,14 +33567,17 @@ pub(crate) fn install_snapshot_database_from_pinned_with_authority_sync(
             }
             // Openraft advances its in-memory committed frontier when it
             // accepts a full snapshot, but does not issue a separate
-            // `save_committed` command for that cut. Persist the same exact
-            // full LogId inside this replacement transaction so a process
-            // loss cannot leave the installed applied state ahead of the
-            // durable committed frontier. The selected snapshot and purge
-            // rows above are the exact compacted witnesses required by the
-            // ordinary committed-pointer validator.
-            save_committed_in_tx(&tx, identity, Some(*snapshot_log_id))?;
+            // `save_committed` command for that cut. The install-only advance
+            // above persists the same exact full LogId before publishing the
+            // new purge floor, so process loss cannot leave installed applied
+            // state ahead of the durable committed frontier.
         }
+        validate_snapshot_install_retained_log_sync(
+            &tx,
+            identity,
+            authority_profile,
+            expected_members.unwrap_or(&expected_scope.current_members),
+        )?;
         validate_existing_schema(&tx, identity)
             .map_err(|_| invalid_data("installed session consensus schema is invalid"))?;
         validate_fenced_transition_receipts_sync(&tx, identity)?;
@@ -50957,6 +51668,1349 @@ BEGIN IMMEDIATE;
                 .expect("target survives mismatched-certificate install"),
             recovery_before
         );
+    }
+
+    #[tokio::test]
+    async fn portable_snapshot_install_advances_an_old_purge_floor_without_intervening_rows() {
+        // This is a normal follower catch-up state: the source snapshot is a
+        // portable compacted image (and therefore contains no consensus_log
+        // or consensus_purged rows), while the target physically pruned its
+        // older durable floor and never received the following rows. The
+        // incoming selected snapshot is the authenticated exact witness for
+        // that wholly absent interval.
+        let directory = tempfile::tempdir().expect("portable snapshot directory");
+        let snapshot_path = directory.path().join("forward.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("portable snapshot source");
+        let entries = vec![
+            membership_entry(),
+            blank_entry(1),
+            blank_entry(2),
+            blank_entry(3),
+        ];
+        let (meta, byte_length) = {
+            let source_conn = source.conn.lock().await;
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("initialize source schema");
+            append_logs_sync(&source_conn, identity(), &entries).expect("append source logs");
+            save_committed_sync(&source_conn, identity(), Some(log_id(3)))
+                .expect("commit source snapshot cut");
+            apply_entries_sync(&source_conn, identity(), &source.caps, entries.clone())
+                .expect("apply source logs");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build portable source snapshot");
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "old-floor-no-intervening-rows".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("portable snapshot metadata")
+                    .len(),
+            )
+        };
+        let portable = Connection::open(&snapshot_path).expect("open portable snapshot");
+        assert_eq!(
+            portable
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count portable log rows"),
+            0,
+            "portable snapshots intentionally omit physical consensus logs"
+        );
+        assert_eq!(
+            portable
+                .query_row("SELECT COUNT(*) FROM consensus_purged", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count portable purge rows"),
+            0,
+            "portable snapshots intentionally omit the producer purge marker"
+        );
+        drop(portable);
+
+        let target = SqliteSessionBackend::in_memory().expect("old-floor target");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("initialize target schema");
+        let target_floor = vec![membership_entry()];
+        append_logs_sync(&target_conn, identity(), &target_floor).expect("append target floor");
+        save_committed_sync(&target_conn, identity(), Some(log_id(0)))
+            .expect("commit target floor");
+        apply_entries_sync(&target_conn, identity(), &target.caps, target_floor)
+            .expect("apply target floor");
+        set_test_purge_floor(&target_conn, &log_id(0));
+        target_conn
+            .execute("DELETE FROM consensus_log", [])
+            .expect("physically prune the old target floor");
+
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000702.opc",
+            [0x70; 32],
+            byte_length,
+        )
+        .expect("forward portable snapshot installs over an old empty physical interval");
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("installed purge floor"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("installed applied frontier"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("installed committed frontier"),
+            Some(log_id(3))
+        );
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000709.opc",
+            [0x79; 32],
+            byte_length,
+        )
+        .expect("reinstalling the same compacted snapshot is idempotent");
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("reinstalled purge floor"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("reinstalled applied frontier"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("reinstalled committed frontier"),
+            Some(log_id(3))
+        );
+
+        // The exception allows only a wholly absent interval or an exact
+        // P+1..C retained prefix followed by an absent tail. A retained row
+        // behind a hole remains a rejected local corruption, even though the
+        // selected snapshot has the same valid cut.
+        let gapped = SqliteSessionBackend::in_memory().expect("gapped target");
+        let gapped_conn = gapped.conn.lock().await;
+        initialize_schema(&gapped_conn, identity(), &expected_members())
+            .expect("initialize gapped target schema");
+        append_logs_sync(&gapped_conn, identity(), &entries).expect("append gapped target logs");
+        save_committed_sync(&gapped_conn, identity(), Some(log_id(0)))
+            .expect("commit gapped target floor");
+        apply_entries_sync(
+            &gapped_conn,
+            identity(),
+            &gapped.caps,
+            vec![membership_entry()],
+        )
+        .expect("apply gapped target floor");
+        set_test_purge_floor(&gapped_conn, &log_id(0));
+        gapped_conn
+            .execute("DELETE FROM consensus_log WHERE log_index != 2", [])
+            .expect("leave one gapped retained row");
+        let error = install_snapshot_database_sync(
+            &gapped_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000703.opc",
+            [0x71; 32],
+            byte_length,
+        )
+        .expect_err("a retained physical gap must still reject the snapshot install");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_purged_sync(&gapped_conn, identity()).expect("rejected floor remains exact"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_applied_sync(&gapped_conn, identity()).expect("rejected applied remains exact"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_committed_sync(&gapped_conn, identity())
+                .expect("rejected committed remains exact"),
+            Some(log_id(0))
+        );
+        assert!(read_current_snapshot_sync(&gapped_conn, identity())
+            .expect("rejected selected snapshot")
+            .is_none());
+
+        // Replacement must not erase a locally corrupt applied pointer before
+        // auditing it. The incoming cut is newer, but the old applied L2 has
+        // no exact retained or compacted coverage above committed/purged L0.
+        let uncovered_applied =
+            SqliteSessionBackend::in_memory().expect("uncovered-applied target");
+        let uncovered_applied_conn = uncovered_applied.conn.lock().await;
+        initialize_schema(&uncovered_applied_conn, identity(), &expected_members())
+            .expect("initialize uncovered-applied target");
+        append_logs_sync(&uncovered_applied_conn, identity(), &entries[..3])
+            .expect("append uncovered-applied target logs");
+        save_committed_sync(&uncovered_applied_conn, identity(), Some(log_id(0)))
+            .expect("commit uncovered-applied target floor");
+        apply_entries_sync(
+            &uncovered_applied_conn,
+            identity(),
+            &uncovered_applied.caps,
+            entries[..3].to_vec(),
+        )
+        .expect("advance uncovered local applied pointer");
+        set_test_purge_floor(&uncovered_applied_conn, &log_id(0));
+        uncovered_applied_conn
+            .execute("DELETE FROM consensus_log", [])
+            .expect("remove coverage for corrupt applied pointer");
+        let error = install_snapshot_database_sync(
+            &uncovered_applied_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000704.opc",
+            [0x72; 32],
+            byte_length,
+        )
+        .expect_err("incoming replacement must not erase an uncovered applied pointer");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_purged_sync(&uncovered_applied_conn, identity())
+                .expect("uncovered-applied purge rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_committed_sync(&uncovered_applied_conn, identity())
+                .expect("uncovered-applied committed rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_applied_sync(&uncovered_applied_conn, identity())
+                .expect("uncovered-applied pointer rollback"),
+            Some(log_id(2))
+        );
+        assert!(
+            read_current_snapshot_sync(&uncovered_applied_conn, identity())
+                .expect("uncovered-applied snapshot rollback")
+                .is_none()
+        );
+
+        // A corrupt selected-snapshot marker must not be silently erased by
+        // an otherwise forward install. Normal publication rejects a snapshot
+        // beyond applied state, so form the crash/corruption fixture directly:
+        // C=A=P=L0 while the selected marker claims L5. The incoming L3 cut
+        // extends all ordinary floor pointers, but it still regresses that
+        // replaced marker and must leave the entire target transaction exact.
+        let selected_ahead = SqliteSessionBackend::in_memory().expect("selected-ahead target");
+        let selected_ahead_conn = selected_ahead.conn.lock().await;
+        initialize_schema(&selected_ahead_conn, identity(), &expected_members())
+            .expect("initialize selected-ahead target");
+        let selected_ahead_floor = vec![membership_entry()];
+        append_logs_sync(&selected_ahead_conn, identity(), &selected_ahead_floor)
+            .expect("append selected-ahead floor");
+        save_committed_sync(&selected_ahead_conn, identity(), Some(log_id(0)))
+            .expect("commit selected-ahead floor");
+        apply_entries_sync(
+            &selected_ahead_conn,
+            identity(),
+            &selected_ahead.caps,
+            selected_ahead_floor,
+        )
+        .expect("apply selected-ahead floor");
+        set_test_purge_floor(&selected_ahead_conn, &log_id(0));
+        selected_ahead_conn
+            .execute("DELETE FROM consensus_log", [])
+            .expect("prune selected-ahead floor");
+        let corrupt_selected_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(5)),
+            last_membership: meta.last_membership.clone(),
+            snapshot_id: "selected-ahead-of-applied".into(),
+        };
+        selected_ahead_conn
+            .execute(
+                "INSERT INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                params![
+                    epoch_i64(identity()).expect("selected-ahead epoch"),
+                    encode_json(&corrupt_selected_meta).expect("encode selected-ahead marker"),
+                    "snapshot-00000000-0000-4000-8000-000000000705.opc",
+                    [0x75_u8; 32].as_slice(),
+                    1_i64,
+                ],
+            )
+            .expect("inject selected marker beyond applied state");
+        let error = install_snapshot_database_sync(
+            &selected_ahead_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000706.opc",
+            [0x76; 32],
+            byte_length,
+        )
+        .expect_err("incoming snapshot must not regress the replaced selected marker");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_purged_sync(&selected_ahead_conn, identity())
+                .expect("selected-ahead purge rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_committed_sync(&selected_ahead_conn, identity())
+                .expect("selected-ahead committed rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_applied_sync(&selected_ahead_conn, identity())
+                .expect("selected-ahead applied rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_current_snapshot_sync(&selected_ahead_conn, identity())
+                .expect("selected-ahead snapshot rollback")
+                .expect("selected-ahead marker remains selected")
+                .0,
+            corrupt_selected_meta
+        );
+
+        let suffix_entries = vec![
+            membership_entry(),
+            blank_entry(1),
+            blank_entry(2),
+            blank_entry(3),
+            blank_entry(4),
+            blank_entry(5),
+        ];
+
+        // A compatible contiguous suffix beyond the incoming cut remains
+        // usable. Rows covered by the selected snapshot are ignored only
+        // after proving their exact lineage; L4 and L5 remain above new P=L3.
+        let compatible_suffix =
+            SqliteSessionBackend::in_memory().expect("compatible-suffix target");
+        let compatible_suffix_conn = compatible_suffix.conn.lock().await;
+        initialize_schema(&compatible_suffix_conn, identity(), &expected_members())
+            .expect("initialize compatible-suffix target");
+        append_logs_sync(&compatible_suffix_conn, identity(), &suffix_entries)
+            .expect("append compatible retained suffix");
+        save_committed_sync(&compatible_suffix_conn, identity(), Some(log_id(0)))
+            .expect("commit compatible-suffix target floor");
+        apply_entries_sync(
+            &compatible_suffix_conn,
+            identity(),
+            &compatible_suffix.caps,
+            vec![membership_entry()],
+        )
+        .expect("apply compatible-suffix target floor");
+        set_test_purge_floor(&compatible_suffix_conn, &log_id(0));
+        compatible_suffix_conn
+            .execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .expect("physically prune compatible target floor");
+        install_snapshot_database_sync(
+            &compatible_suffix_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000705.opc",
+            [0x73; 32],
+            byte_length,
+        )
+        .expect("compatible retained suffix survives forward snapshot install");
+        assert_eq!(
+            read_purged_sync(&compatible_suffix_conn, identity())
+                .expect("compatible-suffix installed purge"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            last_log_sync(&compatible_suffix_conn, identity())
+                .expect("compatible-suffix retained head"),
+            Some(log_id(5))
+        );
+
+        // A row above the incoming cut cannot hide behind the install-only
+        // absent-interval exception. The pre-replacement audit sees that L5
+        // lacks L1..L4 and rejects before any selected snapshot is published.
+        let gapped_suffix = SqliteSessionBackend::in_memory().expect("gapped-suffix target");
+        let gapped_suffix_conn = gapped_suffix.conn.lock().await;
+        initialize_schema(&gapped_suffix_conn, identity(), &expected_members())
+            .expect("initialize gapped-suffix target");
+        append_logs_sync(&gapped_suffix_conn, identity(), &suffix_entries)
+            .expect("append gapped-suffix target logs");
+        save_committed_sync(&gapped_suffix_conn, identity(), Some(log_id(0)))
+            .expect("commit gapped-suffix target floor");
+        apply_entries_sync(
+            &gapped_suffix_conn,
+            identity(),
+            &gapped_suffix.caps,
+            vec![membership_entry()],
+        )
+        .expect("apply gapped-suffix target floor");
+        set_test_purge_floor(&gapped_suffix_conn, &log_id(0));
+        gapped_suffix_conn
+            .execute("DELETE FROM consensus_log WHERE log_index != 5", [])
+            .expect("leave lone retained row above incoming cut");
+        let error = install_snapshot_database_sync(
+            &gapped_suffix_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000706.opc",
+            [0x74; 32],
+            byte_length,
+        )
+        .expect_err("gapped retained suffix must reject before snapshot replacement");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_purged_sync(&gapped_suffix_conn, identity())
+                .expect("gapped-suffix purge rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_committed_sync(&gapped_suffix_conn, identity())
+                .expect("gapped-suffix committed rollback"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_applied_sync(&gapped_suffix_conn, identity())
+                .expect("gapped-suffix applied rollback"),
+            Some(log_id(0))
+        );
+        assert!(read_current_snapshot_sync(&gapped_suffix_conn, identity())
+            .expect("gapped-suffix snapshot rollback")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dynamic_portable_snapshot_install_accepts_purged_successor_membership_after_historical_snapshot(
+    ) {
+        // S0/M0 remains a truthful historical selected snapshot. The later
+        // M2 is applied before ordinary Raft purge P3 removes every physical
+        // row, so it is scope-validated applied authority rather than payload
+        // invented by the marker. An authenticated S5/M2 may replace this
+        // normal fully-pruned dynamic follower.
+        let directory = tempfile::tempdir().expect("successor-membership snapshot directory");
+        let snapshot_path = directory.path().join("successor-membership.sqlite");
+        let entries = vec![
+            membership_entry(),
+            blank_entry(1),
+            membership_entry_at(2, vec![expected_members()], expected_members()),
+            blank_entry(3),
+            blank_entry(4),
+            blank_entry(5),
+        ];
+        let source = SqliteSessionBackend::in_memory().expect("successor-membership source");
+        let (meta, byte_length, source_membership, source_scope) = {
+            let source_conn = source.conn.lock().await;
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("initialize successor-membership source");
+            append_logs_sync(&source_conn, identity(), &entries)
+                .expect("append successor-membership source logs");
+            save_committed_sync(&source_conn, identity(), Some(log_id(5)))
+                .expect("commit successor-membership source cut");
+            apply_entries_sync(&source_conn, identity(), &source.caps, entries.clone())
+                .expect("apply successor-membership source logs");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build authenticated S5/M2 portable snapshot");
+            assert_eq!(last_log_id, Some(log_id(5)));
+            assert_eq!(last_membership.log_id(), &Some(log_id(2)));
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "dynamic-purged-successor-membership".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("successor-membership snapshot metadata")
+                    .len(),
+                read_membership_sync(&source_conn, identity())
+                    .expect("read source successor membership"),
+                read_membership_scope_sync(&source_conn, identity())
+                    .expect("read source membership scope"),
+            )
+        };
+
+        let target = SqliteSessionBackend::in_memory().expect("historical-snapshot target");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("initialize historical-snapshot target");
+        append_logs_sync(&target_conn, identity(), &entries[..4])
+            .expect("append target through P3");
+        save_committed_sync(&target_conn, identity(), Some(log_id(0)))
+            .expect("commit historical S0/M0 cut");
+        apply_entries_sync(
+            &target_conn,
+            identity(),
+            &target.caps,
+            vec![entries[0].clone()],
+        )
+        .expect("apply historical M0");
+        let historical_membership =
+            read_membership_sync(&target_conn, identity()).expect("read historical M0");
+        let historical_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(0)),
+            last_membership: historical_membership.clone(),
+            snapshot_id: "historical-s0-m0".into(),
+        };
+        save_current_snapshot_sync(
+            &target_conn,
+            identity(),
+            &historical_meta,
+            "snapshot-00000000-0000-4000-8000-000000000702.opc",
+            [0x70; 32],
+            1,
+        )
+        .expect("persist historical S0/M0");
+        save_committed_sync(&target_conn, identity(), Some(log_id(3)))
+            .expect("advance target committed frontier to L3");
+        apply_entries_sync(
+            &target_conn,
+            identity(),
+            &target.caps,
+            entries[1..4].to_vec(),
+        )
+        .expect("apply target M2 and L3");
+        let successor_membership =
+            read_membership_sync(&target_conn, identity()).expect("read target M2");
+        assert_eq!(successor_membership.log_id(), &Some(log_id(2)));
+        assert_ne!(successor_membership, historical_membership);
+        purge_logs_sync(&target_conn, identity(), &log_id(3))
+            .expect("ordinary P3 removes the applied physical prefix");
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count fully purged target logs"),
+            0
+        );
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("target C"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("target A"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("target P"),
+            Some(log_id(3))
+        );
+        assert_eq!(
+            read_current_snapshot_sync(&target_conn, identity())
+                .expect("target historical snapshot")
+                .expect("target selected snapshot")
+                .0,
+            historical_meta
+        );
+        validate_retained_durable_log_sync(&target_conn, identity(), |_| Ok(()))
+            .expect("shared deep validation accepts purge-attested successor M2");
+
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000703.opc",
+            [0x71; 32],
+            byte_length,
+        )
+        .expect("authenticated S5/M2 installs over historical S0/M0 and P3");
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("installed C"),
+            Some(log_id(5))
+        );
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("installed A"),
+            Some(log_id(5))
+        );
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("installed P"),
+            Some(log_id(5))
+        );
+        let installed_snapshot = read_current_snapshot_sync(&target_conn, identity())
+            .expect("installed selected snapshot")
+            .expect("installed S5/M2");
+        assert_eq!(installed_snapshot.0, meta);
+        assert_eq!(
+            read_membership_sync(&target_conn, identity()).expect("installed M2"),
+            source_membership
+        );
+        assert_eq!(
+            read_membership_scope_sync(&target_conn, identity())
+                .expect("installed membership scope"),
+            source_scope
+        );
+        validate_retained_durable_log_sync(&target_conn, identity(), |_| Ok(()))
+            .expect("post-install deep audit accepts exact C/A/P/S and M2");
+    }
+
+    #[tokio::test]
+    async fn dynamic_portable_snapshot_install_rejects_unattested_or_snapshot_mismatched_purged_membership(
+    ) {
+        let directory = tempfile::tempdir().expect("membership coverage controls directory");
+        let snapshot_path = directory.path().join("membership-coverage.sqlite");
+        let entries = vec![
+            membership_entry(),
+            blank_entry(1),
+            membership_entry_at(2, vec![expected_members()], expected_members()),
+            blank_entry(3),
+            blank_entry(4),
+            blank_entry(5),
+        ];
+        let source = SqliteSessionBackend::in_memory().expect("membership coverage source");
+        let (meta, byte_length) = {
+            let source_conn = source.conn.lock().await;
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("initialize membership coverage source");
+            append_logs_sync(&source_conn, identity(), &entries)
+                .expect("append membership coverage source logs");
+            save_committed_sync(&source_conn, identity(), Some(log_id(5)))
+                .expect("commit membership coverage source");
+            apply_entries_sync(&source_conn, identity(), &source.caps, entries.clone())
+                .expect("apply membership coverage source");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build membership coverage source snapshot");
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "dynamic-membership-coverage-controls".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("membership coverage source metadata")
+                    .len(),
+            )
+        };
+
+        // P1 is before M2. Removing the rows anyway is corrupt local state,
+        // and neither deep validation nor incoming S5 may repair it by
+        // treating a too-old marker as membership payload evidence.
+        let insufficient = SqliteSessionBackend::in_memory().expect("insufficient-purge target");
+        let insufficient_conn = insufficient.conn.lock().await;
+        initialize_schema(&insufficient_conn, identity(), &expected_members())
+            .expect("initialize insufficient-purge target");
+        append_logs_sync(&insufficient_conn, identity(), &entries[..4])
+            .expect("append insufficient-purge target logs");
+        save_committed_sync(&insufficient_conn, identity(), Some(log_id(0)))
+            .expect("commit insufficient-purge M0");
+        apply_entries_sync(
+            &insufficient_conn,
+            identity(),
+            &insufficient.caps,
+            vec![entries[0].clone()],
+        )
+        .expect("apply insufficient-purge M0");
+        let historical_membership = read_membership_sync(&insufficient_conn, identity())
+            .expect("read insufficient-purge M0");
+        let historical_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(0)),
+            last_membership: historical_membership,
+            snapshot_id: "insufficient-purge-historical-s0-m0".into(),
+        };
+        save_current_snapshot_sync(
+            &insufficient_conn,
+            identity(),
+            &historical_meta,
+            "snapshot-00000000-0000-4000-8000-000000000704.opc",
+            [0x72; 32],
+            1,
+        )
+        .expect("persist insufficient-purge S0/M0");
+        save_committed_sync(&insufficient_conn, identity(), Some(log_id(3)))
+            .expect("advance insufficient-purge committed frontier");
+        apply_entries_sync(
+            &insufficient_conn,
+            identity(),
+            &insufficient.caps,
+            entries[1..4].to_vec(),
+        )
+        .expect("apply insufficient-purge M2 and L3");
+        set_test_purge_floor(&insufficient_conn, &log_id(1));
+        insufficient_conn
+            .execute("DELETE FROM consensus_log", [])
+            .expect("inject absent M2 without a covering purge");
+        assert!(
+            validate_retained_durable_log_sync(&insufficient_conn, identity(), |_| Ok(())).is_err()
+        );
+        let insufficient_before = (
+            read_committed_sync(&insufficient_conn, identity()).expect("insufficient C before"),
+            read_applied_sync(&insufficient_conn, identity()).expect("insufficient A before"),
+            read_purged_sync(&insufficient_conn, identity()).expect("insufficient P before"),
+            read_current_snapshot_sync(&insufficient_conn, identity())
+                .expect("insufficient S before"),
+            read_membership_sync(&insufficient_conn, identity()).expect("insufficient M before"),
+        );
+        assert!(install_snapshot_database_sync(
+            &insufficient_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000705.opc",
+            [0x73; 32],
+            byte_length,
+        )
+        .is_err());
+        assert_eq!(
+            (
+                read_committed_sync(&insufficient_conn, identity())
+                    .expect("insufficient C rollback"),
+                read_applied_sync(&insufficient_conn, identity()).expect("insufficient A rollback"),
+                read_purged_sync(&insufficient_conn, identity()).expect("insufficient P rollback"),
+                read_current_snapshot_sync(&insufficient_conn, identity())
+                    .expect("insufficient S rollback"),
+                read_membership_sync(&insufficient_conn, identity())
+                    .expect("insufficient M rollback"),
+            ),
+            insufficient_before
+        );
+
+        // S3 claims to cover M2 but carries M0. P3 is otherwise a valid
+        // full-LogId floor, yet cannot substitute for the selected snapshot's
+        // exact membership payload when that selected cut reaches M2.
+        let mismatched = SqliteSessionBackend::in_memory().expect("mismatched-snapshot target");
+        let mismatched_conn = mismatched.conn.lock().await;
+        initialize_schema(&mismatched_conn, identity(), &expected_members())
+            .expect("initialize mismatched-snapshot target");
+        append_logs_sync(&mismatched_conn, identity(), &entries[..4])
+            .expect("append mismatched-snapshot target logs");
+        save_committed_sync(&mismatched_conn, identity(), Some(log_id(0)))
+            .expect("commit mismatched-snapshot M0");
+        apply_entries_sync(
+            &mismatched_conn,
+            identity(),
+            &mismatched.caps,
+            vec![entries[0].clone()],
+        )
+        .expect("apply mismatched-snapshot M0");
+        let historical_membership = read_membership_sync(&mismatched_conn, identity())
+            .expect("read mismatched-snapshot M0");
+        save_committed_sync(&mismatched_conn, identity(), Some(log_id(3)))
+            .expect("advance mismatched-snapshot committed frontier");
+        apply_entries_sync(
+            &mismatched_conn,
+            identity(),
+            &mismatched.caps,
+            entries[1..4].to_vec(),
+        )
+        .expect("apply mismatched-snapshot M2 and L3");
+        let mismatched_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(3)),
+            last_membership: historical_membership,
+            snapshot_id: "mismatched-covering-s3-m0".into(),
+        };
+        save_current_snapshot_sync(
+            &mismatched_conn,
+            identity(),
+            &mismatched_meta,
+            "snapshot-00000000-0000-4000-8000-000000000706.opc",
+            [0x74; 32],
+            1,
+        )
+        .expect("persist selected S3 with mismatched M0 payload");
+        purge_logs_sync(&mismatched_conn, identity(), &log_id(3))
+            .expect("ordinary P3 removes mismatched-snapshot physical rows");
+        assert!(
+            validate_retained_durable_log_sync(&mismatched_conn, identity(), |_| Ok(())).is_err()
+        );
+        let mismatched_before = (
+            read_committed_sync(&mismatched_conn, identity()).expect("mismatched C before"),
+            read_applied_sync(&mismatched_conn, identity()).expect("mismatched A before"),
+            read_purged_sync(&mismatched_conn, identity()).expect("mismatched P before"),
+            read_current_snapshot_sync(&mismatched_conn, identity()).expect("mismatched S before"),
+            read_membership_sync(&mismatched_conn, identity()).expect("mismatched M before"),
+        );
+        assert!(install_snapshot_database_sync(
+            &mismatched_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000707.opc",
+            [0x75; 32],
+            byte_length,
+        )
+        .is_err());
+        assert_eq!(
+            (
+                read_committed_sync(&mismatched_conn, identity()).expect("mismatched C rollback"),
+                read_applied_sync(&mismatched_conn, identity()).expect("mismatched A rollback"),
+                read_purged_sync(&mismatched_conn, identity()).expect("mismatched P rollback"),
+                read_current_snapshot_sync(&mismatched_conn, identity())
+                    .expect("mismatched S rollback"),
+                read_membership_sync(&mismatched_conn, identity()).expect("mismatched M rollback"),
+            ),
+            mismatched_before
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_portable_snapshot_catches_up_with_applied_behind_committed_prefix() {
+        let directory = tempfile::tempdir().expect("dynamic catch-up snapshot directory");
+        let snapshot_path = directory.path().join("dynamic-catch-up.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("dynamic catch-up source");
+        let entries = vec![
+            membership_entry(),
+            blank_entry(1),
+            blank_entry(2),
+            blank_entry(3),
+            blank_entry(4),
+            blank_entry(5),
+        ];
+        let (meta, byte_length) = {
+            let source_conn = source.conn.lock().await;
+            initialize_schema(&source_conn, identity(), &expected_members())
+                .expect("initialize dynamic catch-up source");
+            append_logs_sync(&source_conn, identity(), &entries)
+                .expect("append dynamic source through S=L5");
+            save_committed_sync(&source_conn, identity(), Some(log_id(5)))
+                .expect("commit dynamic source S=L5");
+            apply_entries_sync(&source_conn, identity(), &source.caps, entries.clone())
+                .expect("apply dynamic source S=L5");
+            let (last_log_id, last_membership) =
+                build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
+                    .expect("build dynamic portable S=L5");
+            assert_eq!(last_log_id, Some(log_id(5)));
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "dynamic-applied-behind-committed-catch-up".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("dynamic portable snapshot metadata")
+                    .len(),
+            )
+        };
+
+        // OpenRaft can install a newer snapshot after C advances beyond the
+        // state-machine A frontier. L1..L2 remain an exact local P+1..C
+        // prefix, while the authenticated selected cut covers L3..L5.
+        let target_path = directory.path().join("dynamic-compacted-follower.sqlite");
+        let target = SqliteSessionBackend::open(&target_path).expect("dynamic compacted follower");
+        let target_conn = target.conn.lock().await;
+        initialize_schema(&target_conn, identity(), &expected_members())
+            .expect("initialize dynamic compacted follower");
+        append_logs_sync(&target_conn, identity(), &entries[..3])
+            .expect("append dynamic local P+1..C prefix");
+        save_committed_sync(&target_conn, identity(), Some(log_id(2)))
+            .expect("commit dynamic local C=L2");
+        apply_entries_sync(
+            &target_conn,
+            identity(),
+            &target.caps,
+            entries[..2].to_vec(),
+        )
+        .expect("apply dynamic local A=L1");
+        let predecessor_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(0)),
+            last_membership: stored_membership_at(0, vec![expected_members()], expected_members()),
+            snapshot_id: "dynamic-compacted-predecessor".into(),
+        };
+        save_current_snapshot_sync(
+            &target_conn,
+            identity(),
+            &predecessor_meta,
+            "snapshot-00000000-0000-4000-8000-00000000070b.opc",
+            [0x7b; 32],
+            1,
+        )
+        .expect("publish dynamic predecessor snapshot");
+        purge_logs_sync(&target_conn, identity(), &log_id(0))
+            .expect("purge dynamic predecessor floor");
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("dynamic A"),
+            Some(log_id(1))
+        );
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("dynamic C"),
+            Some(log_id(2))
+        );
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("dynamic P"),
+            Some(log_id(0))
+        );
+
+        install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-00000000070c.opc",
+            [0x7c; 32],
+            byte_length,
+        )
+        .expect("dynamic S=L5 installs over A=L1, C=L2 prefix");
+        for (name, pointer) in [
+            (
+                "committed",
+                read_committed_sync(&target_conn, identity()).expect("installed C"),
+            ),
+            (
+                "applied",
+                read_applied_sync(&target_conn, identity()).expect("installed A"),
+            ),
+            (
+                "purged",
+                read_purged_sync(&target_conn, identity()).expect("installed P"),
+            ),
+        ] {
+            assert_eq!(pointer, Some(log_id(5)), "installed dynamic {name} cut");
+        }
+        purge_logs_sync(&target_conn, identity(), &log_id(5))
+            .expect("queued dynamic successor purge");
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count queued dynamic purge rows"),
+            0
+        );
+        drop(target_conn);
+        drop(target);
+
+        let reopened = SqliteSessionBackend::open(&target_path).expect("reopen dynamic follower");
+        let reopened_conn = reopened.conn.lock().await;
+        initialize_schema(&reopened_conn, identity(), &expected_members())
+            .expect("reopen dynamic follower after queued purge");
+        for (name, pointer) in [
+            (
+                "committed",
+                read_committed_sync(&reopened_conn, identity()).expect("reopened C"),
+            ),
+            (
+                "applied",
+                read_applied_sync(&reopened_conn, identity()).expect("reopened A"),
+            ),
+            (
+                "purged",
+                read_purged_sync(&reopened_conn, identity()).expect("reopened P"),
+            ),
+        ] {
+            assert_eq!(pointer, Some(log_id(5)), "reopened dynamic {name} cut");
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_portable_snapshot_catches_up_a_previously_compacted_follower() {
+        let profile = ConsensusAuthorityProfile::FixedImmutable;
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        let directory = tempfile::tempdir().expect("fixed catch-up snapshot directory");
+        let snapshot_path = directory.path().join("fixed-catch-up.sqlite");
+        let source = SqliteSessionBackend::in_memory().expect("fixed catch-up source");
+        let source_entries = vec![
+            membership_entry_at(0, vec![members.clone()], members.clone()),
+            blank_entry(1),
+            blank_entry(2),
+            blank_entry(3),
+            blank_entry(4),
+            blank_entry(5),
+        ];
+        let (meta, byte_length) = {
+            let source_conn = source.conn.lock().await;
+            initialize_schema_with_profile(&source_conn, identity(), &members, profile)
+                .expect("initialize fixed catch-up source");
+            append_logs_with_authority_sync(
+                &source_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                &source_entries,
+            )
+            .expect("append fixed source through later snapshot cut");
+            save_committed_with_authority_sync(
+                &source_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                Some(log_id(5)),
+            )
+            .expect("commit fixed source snapshot cut");
+            apply_entries_with_authority_sync(
+                &source_conn,
+                identity(),
+                &source.caps,
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                source_entries.clone(),
+            )
+            .expect("apply fixed source snapshot cut");
+            let (last_log_id, last_membership) = build_snapshot_database_with_authority_sync(
+                &source_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                &snapshot_path,
+            )
+            .expect("build fixed portable catch-up snapshot");
+            assert_eq!(last_log_id, Some(log_id(5)));
+            (
+                opc_consensus::engine::SnapshotMeta {
+                    last_log_id,
+                    last_membership,
+                    snapshot_id: "fixed-predecessor-to-successor-catch-up".into(),
+                },
+                std::fs::metadata(&snapshot_path)
+                    .expect("fixed portable snapshot metadata")
+                    .len(),
+            )
+        };
+        let portable = Connection::open(&snapshot_path).expect("open fixed portable snapshot");
+        for table in [
+            "consensus_vote",
+            "consensus_committed",
+            "consensus_purged",
+            "consensus_log",
+            "consensus_snapshot",
+        ] {
+            assert_eq!(
+                portable
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap_or_else(|error| panic!("count portable {table}: {error}")),
+                0,
+                "portable fixed snapshot must omit producer {table} rows"
+            );
+        }
+        drop(portable);
+
+        // This follower was healthy at P=S_old=L0, A=L1, and C=L2, retaining
+        // exact L1..L2. It then misses L3..L5 before receiving authenticated
+        // S=L5. Membership M=L0 is compacted below P and is attested by the
+        // old selected snapshot rather than by a retained physical row.
+        let target_path = directory.path().join("fixed-compacted-follower.sqlite");
+        let target = SqliteSessionBackend::open(&target_path).expect("fixed compacted follower");
+        let target_conn = target.conn.lock().await;
+        initialize_schema_with_profile(&target_conn, identity(), &members, profile)
+            .expect("initialize fixed compacted follower");
+        let predecessor = source_entries[..3].to_vec();
+        append_logs_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &predecessor,
+        )
+        .expect("append fixed predecessor cut");
+        save_committed_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            Some(log_id(2)),
+        )
+        .expect("commit fixed predecessor cut");
+        apply_entries_with_authority_sync(
+            &target_conn,
+            identity(),
+            &target.caps,
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            predecessor[..2].to_vec(),
+        )
+        .expect("apply fixed predecessor cut");
+        let predecessor_meta = opc_consensus::engine::SnapshotMeta {
+            last_log_id: Some(log_id(0)),
+            last_membership: stored_membership_at(0, vec![members.clone()], members.clone()),
+            snapshot_id: "fixed-compacted-predecessor".into(),
+        };
+        save_current_snapshot_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &predecessor_meta,
+            "snapshot-00000000-0000-4000-8000-000000000707.opc",
+            [0x77; 32],
+            1,
+        )
+        .expect("publish fixed predecessor snapshot marker");
+        purge_logs_without_prune_lane_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &log_id(0),
+        )
+        .expect("complete predecessor physical purge");
+        assert_eq!(
+            read_committed_sync(&target_conn, identity()).expect("predecessor committed"),
+            Some(log_id(2))
+        );
+        assert_eq!(
+            read_applied_sync(&target_conn, identity()).expect("predecessor applied"),
+            Some(log_id(1))
+        );
+        assert_eq!(
+            read_purged_sync(&target_conn, identity()).expect("predecessor purged"),
+            Some(log_id(0))
+        );
+        assert_eq!(
+            read_current_snapshot_sync(&target_conn, identity())
+                .expect("predecessor selected snapshot")
+                .expect("predecessor snapshot remains selected")
+                .0
+                .last_log_id,
+            Some(log_id(0))
+        );
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count exact retained predecessor suffix"),
+            2
+        );
+        validate_fixed_durable_state_sync(&target_conn, identity(), &members)
+            .expect("predecessor fixed state is healthy");
+
+        install_snapshot_database_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            Some(&members),
+            Some(&bindings),
+            FIXED_TEST_PLACEMENT_POLICY,
+            &snapshot_path,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000000708.opc",
+            [0x78; 32],
+            byte_length,
+        )
+        .expect("fixed follower catches up from retained L1..L2 to snapshot S=L5");
+        for (name, pointer) in [
+            (
+                "committed",
+                read_committed_sync(&target_conn, identity()).expect("installed committed"),
+            ),
+            (
+                "applied",
+                read_applied_sync(&target_conn, identity()).expect("installed applied"),
+            ),
+            (
+                "purged",
+                read_purged_sync(&target_conn, identity()).expect("installed purged"),
+            ),
+        ] {
+            assert_eq!(pointer, Some(log_id(5)), "installed {name} cut");
+        }
+        assert_eq!(
+            read_current_snapshot_sync(&target_conn, identity())
+                .expect("installed selected snapshot")
+                .expect("successor snapshot remains selected")
+                .0
+                .last_log_id,
+            Some(log_id(5))
+        );
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count installed covered predecessor suffix"),
+            2
+        );
+        assert!(fixed_quorum_authority_is_exact_sync(
+            &target_conn,
+            identity(),
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY.expect("fixed placement policy"),
+            false,
+        )
+        .expect("installed fixed authority"));
+        validate_fixed_durable_state_sync(&target_conn, identity(), &members)
+            .expect("installed fixed state is deep-valid");
+
+        // OpenRaft queues this same-floor purge after state-machine install.
+        // It must remain idempotent and reclaim no authority evidence needed
+        // for a subsequent restart.
+        purge_logs_without_prune_lane_with_authority_sync(
+            &target_conn,
+            identity(),
+            profile,
+            &members,
+            &bindings,
+            FIXED_TEST_PLACEMENT_POLICY,
+            &log_id(5),
+        )
+        .expect("queued successor purge is idempotent");
+        assert_eq!(
+            target_conn
+                .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("queued purge reclaims covered predecessor suffix"),
+            0
+        );
+        validate_fixed_durable_state_sync(&target_conn, identity(), &members)
+            .expect("fixed state remains deep-valid after queued purge");
+        drop(target_conn);
+        drop(target);
+
+        let reopened = SqliteSessionBackend::open(&target_path).expect("reopen fixed follower");
+        let reopened_conn = reopened.conn.lock().await;
+        initialize_schema_with_profile(&reopened_conn, identity(), &members, profile)
+            .expect("fixed follower reopens after queued purge");
+        for (name, pointer) in [
+            (
+                "committed",
+                read_committed_sync(&reopened_conn, identity()).expect("reopened committed"),
+            ),
+            (
+                "applied",
+                read_applied_sync(&reopened_conn, identity()).expect("reopened applied"),
+            ),
+            (
+                "purged",
+                read_purged_sync(&reopened_conn, identity()).expect("reopened purged"),
+            ),
+        ] {
+            assert_eq!(pointer, Some(log_id(5)), "reopened {name} cut");
+        }
+        drop(reopened_conn);
+        drop(reopened);
+
+        // Neither the portable selected cut nor the Fixed pre-install audit
+        // may turn a corrupt retained suffix into the exact P+1..C prefix
+        // used above. Check an internal gap and a row above C; each must fail
+        // before the replacement transaction changes durable state.
+        for (case, delete_sql) in [
+            (
+                "gapped-l1-l3",
+                "DELETE FROM consensus_log WHERE log_index = 2",
+            ),
+            (
+                "suffix-above-c",
+                "DELETE FROM consensus_log WHERE log_index > 3",
+            ),
+        ] {
+            let corrupt_path = directory.path().join(format!("fixed-{case}.sqlite"));
+            let corrupt = SqliteSessionBackend::open(&corrupt_path)
+                .unwrap_or_else(|error| panic!("open {case} target: {error}"));
+            let corrupt_conn = corrupt.conn.lock().await;
+            initialize_schema_with_profile(&corrupt_conn, identity(), &members, profile)
+                .unwrap_or_else(|error| panic!("initialize {case} target: {error}"));
+            append_logs_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                &source_entries[..4],
+            )
+            .unwrap_or_else(|error| panic!("append {case} target: {error}"));
+            save_committed_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                Some(log_id(2)),
+            )
+            .unwrap_or_else(|error| panic!("commit {case} target: {error}"));
+            apply_entries_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                &corrupt.caps,
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                source_entries[..2].to_vec(),
+            )
+            .unwrap_or_else(|error| panic!("apply {case} target: {error}"));
+            save_current_snapshot_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                &predecessor_meta,
+                "snapshot-00000000-0000-4000-8000-000000000709.opc",
+                [0x79; 32],
+                1,
+            )
+            .unwrap_or_else(|error| panic!("publish {case} predecessor snapshot: {error}"));
+            purge_logs_without_prune_lane_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                profile,
+                &members,
+                &bindings,
+                FIXED_TEST_PLACEMENT_POLICY,
+                &log_id(0),
+            )
+            .unwrap_or_else(|error| panic!("purge {case} predecessor floor: {error}"));
+            corrupt_conn
+                .execute(delete_sql, [])
+                .unwrap_or_else(|error| panic!("inject {case} retained corruption: {error}"));
+            let before = (
+                read_committed_sync(&corrupt_conn, identity())
+                    .unwrap_or_else(|error| panic!("read {case} committed: {error}")),
+                read_applied_sync(&corrupt_conn, identity())
+                    .unwrap_or_else(|error| panic!("read {case} applied: {error}")),
+                read_purged_sync(&corrupt_conn, identity())
+                    .unwrap_or_else(|error| panic!("read {case} purged: {error}")),
+                read_current_snapshot_sync(&corrupt_conn, identity())
+                    .unwrap_or_else(|error| panic!("read {case} snapshot: {error}")),
+                read_membership_sync(&corrupt_conn, identity())
+                    .unwrap_or_else(|error| panic!("read {case} membership: {error}")),
+            );
+            let error = install_snapshot_database_with_authority_sync(
+                &corrupt_conn,
+                identity(),
+                profile,
+                Some(&members),
+                Some(&bindings),
+                FIXED_TEST_PLACEMENT_POLICY,
+                &snapshot_path,
+                &meta,
+                "snapshot-00000000-0000-4000-8000-00000000070a.opc",
+                [0x7a; 32],
+                byte_length,
+            )
+            .expect_err("corrupt fixed retained suffix must reject before replacement");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}");
+            assert_eq!(
+                (
+                    read_committed_sync(&corrupt_conn, identity())
+                        .unwrap_or_else(|error| panic!("read {case} committed rollback: {error}")),
+                    read_applied_sync(&corrupt_conn, identity())
+                        .unwrap_or_else(|error| panic!("read {case} applied rollback: {error}")),
+                    read_purged_sync(&corrupt_conn, identity())
+                        .unwrap_or_else(|error| panic!("read {case} purged rollback: {error}")),
+                    read_current_snapshot_sync(&corrupt_conn, identity())
+                        .unwrap_or_else(|error| panic!("read {case} snapshot rollback: {error}")),
+                    read_membership_sync(&corrupt_conn, identity())
+                        .unwrap_or_else(|error| panic!("read {case} membership rollback: {error}")),
+                ),
+                before,
+                "{case} snapshot install rolls back exact durable state"
+            );
+        }
     }
 
     #[tokio::test]

@@ -127,44 +127,68 @@ fn rename_in_directory(
 }
 
 #[cfg(test)]
-fn retained_namespace_sync_failure() -> &'static AtomicBool {
-    static FAIL: AtomicBool = AtomicBool::new(false);
-    &FAIL
+#[derive(Default)]
+struct RetainedNamespaceSyncTestHooks {
+    fail: bool,
+    #[cfg(target_os = "linux")]
+    observer: Option<RetainedNamespaceSyncObserver>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
-fn retained_namespace_sync_observer() -> &'static std::sync::Mutex<Vec<(u64, u64)>> {
-    static OBSERVED: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, u64)>>> =
-        std::sync::OnceLock::new();
-    OBSERVED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+struct RetainedNamespaceSyncObserver {
+    observed: Vec<(u64, u64)>,
+}
+
+#[cfg(test)]
+fn retained_namespace_sync_test_hooks(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, RetainedNamespaceSyncTestHooks>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, RetainedNamespaceSyncTestHooks>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 /// Fail one retained-dirfd fsync after any namespace mutation. This is scoped
 /// to tests so cleanup-latch admission can prove that an empty directory does
 /// not erase evidence of an earlier unflushed unlink.
 #[cfg(test)]
-pub(crate) fn fail_retained_namespace_sync_for_test() {
-    retained_namespace_sync_failure().store(true, Ordering::Release);
+pub(crate) fn fail_retained_namespace_sync_for_test(namespace: &RetainedSnapshotDirectory) {
+    retained_namespace_sync_test_hooks()
+        .lock()
+        .expect("retained namespace sync hooks")
+        .entry(namespace.cleanup_latch_identity().to_path_buf())
+        .or_default()
+        .fail = true;
 }
 
 /// Clear the test-only exact-directory fsync trace.
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) fn clear_retained_namespace_sync_observer_for_test() {
-    retained_namespace_sync_observer()
+pub(crate) fn clear_retained_namespace_sync_observer_for_test(
+    namespace: &RetainedSnapshotDirectory,
+) {
+    retained_namespace_sync_test_hooks()
         .lock()
-        .expect("retained namespace sync observer")
-        .clear();
+        .expect("retained namespace sync hooks")
+        .entry(namespace.cleanup_latch_identity().to_path_buf())
+        .or_default()
+        .observer = Some(RetainedNamespaceSyncObserver {
+        observed: Vec::new(),
+    });
 }
 
 /// Return `(st_dev, st_ino)` for every retained directory fsync issued after
 /// the last clear. This proves cleanup recovery syncs the exact detached D1,
 /// not a replacement D2 at the same logical configured path.
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) fn retained_namespace_sync_observer_for_test() -> Vec<(u64, u64)> {
-    retained_namespace_sync_observer()
+pub(crate) fn retained_namespace_sync_observer_for_test(
+    cleanup_latch_identity: &Path,
+) -> Vec<(u64, u64)> {
+    retained_namespace_sync_test_hooks()
         .lock()
-        .expect("retained namespace sync observer")
-        .clone()
+        .expect("retained namespace sync hooks")
+        .get(cleanup_latch_identity)
+        .and_then(|hooks| hooks.observer.as_ref())
+        .map_or_else(Vec::new, |observer| observer.observed.clone())
 }
 
 impl RetainedSnapshotDirectory {
@@ -494,16 +518,35 @@ impl RetainedSnapshotDirectory {
             use std::os::unix::fs::MetadataExt as _;
 
             let metadata = (**self.directory).metadata()?;
-            retained_namespace_sync_observer()
+            let identity = (metadata.dev(), metadata.ino());
+            let mut hooks = retained_namespace_sync_test_hooks()
                 .lock()
-                .expect("retained namespace sync observer")
-                .push((metadata.dev(), metadata.ino()));
+                .expect("retained namespace sync hooks");
+            let Some(hooks) = hooks.get_mut(self.cleanup_latch_identity()) else {
+                return (**self.directory).sync_all();
+            };
+            if let Some(observer) = &mut hooks.observer {
+                observer.observed.push(identity);
+            }
+            if std::mem::take(&mut hooks.fail) {
+                return Err(io::Error::other(
+                    "injected retained snapshot namespace sync failure",
+                ));
+            }
         }
-        #[cfg(test)]
-        if retained_namespace_sync_failure().swap(false, Ordering::AcqRel) {
-            return Err(io::Error::other(
-                "injected retained snapshot namespace sync failure",
-            ));
+        #[cfg(all(test, not(target_os = "linux")))]
+        {
+            let mut hooks = retained_namespace_sync_test_hooks()
+                .lock()
+                .expect("retained namespace sync hooks");
+            if hooks
+                .get_mut(self.cleanup_latch_identity())
+                .is_some_and(|hooks| std::mem::take(&mut hooks.fail))
+            {
+                return Err(io::Error::other(
+                    "injected retained snapshot namespace sync failure",
+                ));
+            }
         }
         (**self.directory).sync_all()
     }
@@ -1403,10 +1446,12 @@ pub(crate) fn latch_unpublished_snapshot_cleanup_failure_for_test(
 }
 
 #[cfg(test)]
-pub(crate) fn fail_snapshot_cleanup_post_rename_sync_for_test() {
+pub(crate) fn fail_snapshot_cleanup_post_rename_sync_for_test(original: &Path) {
     snapshot_cleanup_test_hooks()
         .lock()
         .expect("snapshot cleanup test hooks")
+        .entry(original.to_path_buf())
+        .or_default()
         .fail_post_rename_sync = true;
 }
 
@@ -1498,8 +1543,8 @@ impl PinnedSqliteFile {
         let file = namespace.create_new(name, true)?;
         let mut emergency = NewNamespaceChildGuard::new(Arc::clone(&namespace), name, None);
         #[cfg(test)]
-        if take_namespace_pinned_post_create_setup_failure()
-            || take_namespace_vacuum_raw_pinned_post_create_setup_failure(name)
+        if take_namespace_pinned_post_create_setup_failure(&namespace)
+            || take_namespace_vacuum_raw_pinned_post_create_setup_failure(&namespace, name)
         {
             return Err(io::Error::other(
                 "injected retained-namespace pinned post-create setup failure",
@@ -2495,19 +2540,44 @@ struct SnapshotCleanupGuard {
 // causal fault points both before cleanup-owner setup and after it is armed:
 // descriptor pressure must not strand an O_EXCL-created incoming artifact.
 #[cfg(test)]
-fn namespace_receiver_post_create_setup_failure() -> &'static AtomicBool {
-    static FAIL: AtomicBool = AtomicBool::new(false);
-    &FAIL
+#[derive(Default)]
+struct NamespacePostCreateTestFailures {
+    receiver_setup: bool,
+    pinned_setup: bool,
+    vacuum_raw_pinned_setup: bool,
+    receiver_sync: bool,
 }
 
 #[cfg(test)]
-pub(crate) fn fail_namespace_receiver_post_create_setup_for_test() {
-    namespace_receiver_post_create_setup_failure().store(true, Ordering::Release);
+fn namespace_post_create_test_failures(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, NamespacePostCreateTestFailures>> {
+    static FAILURES: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, NamespacePostCreateTestFailures>>,
+    > = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(test)]
-fn take_namespace_receiver_post_create_setup_failure() -> bool {
-    namespace_receiver_post_create_setup_failure().swap(false, Ordering::AcqRel)
+pub(crate) fn fail_namespace_receiver_post_create_setup_for_test(
+    namespace: &RetainedSnapshotDirectory,
+) {
+    namespace_post_create_test_failures()
+        .lock()
+        .expect("namespace post-create test failures")
+        .entry(namespace.cleanup_latch_identity().to_path_buf())
+        .or_default()
+        .receiver_setup = true;
+}
+
+#[cfg(test)]
+fn take_namespace_receiver_post_create_setup_failure(
+    namespace: &RetainedSnapshotDirectory,
+) -> bool {
+    namespace_post_create_test_failures()
+        .lock()
+        .expect("namespace post-create test failures")
+        .get_mut(namespace.cleanup_latch_identity())
+        .is_some_and(|failures| std::mem::take(&mut failures.receiver_setup))
 }
 
 // Pinned SQLite creation has the same O_EXCL-before-metadata boundary as the
@@ -2515,55 +2585,73 @@ fn take_namespace_receiver_post_create_setup_failure() -> bool {
 // final and intermediate SQLite children cannot leak under descriptor
 // pressure before their identity-pinned cleanup owner exists.
 #[cfg(test)]
-fn namespace_pinned_post_create_setup_failure() -> &'static AtomicBool {
-    static FAIL: AtomicBool = AtomicBool::new(false);
-    &FAIL
+pub(crate) fn fail_namespace_pinned_post_create_setup_for_test(
+    namespace: &RetainedSnapshotDirectory,
+) {
+    namespace_post_create_test_failures()
+        .lock()
+        .expect("namespace post-create test failures")
+        .entry(namespace.cleanup_latch_identity().to_path_buf())
+        .or_default()
+        .pinned_setup = true;
 }
 
 #[cfg(test)]
-pub(crate) fn fail_namespace_pinned_post_create_setup_for_test() {
-    namespace_pinned_post_create_setup_failure().store(true, Ordering::Release);
-}
-
-#[cfg(test)]
-fn take_namespace_pinned_post_create_setup_failure() -> bool {
-    namespace_pinned_post_create_setup_failure().swap(false, Ordering::AcqRel)
-}
-
-#[cfg(test)]
-fn namespace_vacuum_raw_pinned_post_create_setup_failure() -> &'static AtomicBool {
-    static FAIL: AtomicBool = AtomicBool::new(false);
-    &FAIL
+fn take_namespace_pinned_post_create_setup_failure(namespace: &RetainedSnapshotDirectory) -> bool {
+    namespace_post_create_test_failures()
+        .lock()
+        .expect("namespace post-create test failures")
+        .get_mut(namespace.cleanup_latch_identity())
+        .is_some_and(|failures| std::mem::take(&mut failures.pinned_setup))
 }
 
 /// Target the fallback builder's strict `vacuum-raw-*` intermediate after its
 /// final `build-*` pin was successfully armed.
 #[cfg(test)]
-pub(crate) fn fail_namespace_vacuum_raw_pinned_post_create_setup_for_test() {
-    namespace_vacuum_raw_pinned_post_create_setup_failure().store(true, Ordering::Release);
+pub(crate) fn fail_namespace_vacuum_raw_pinned_post_create_setup_for_test(
+    namespace: &RetainedSnapshotDirectory,
+) {
+    namespace_post_create_test_failures()
+        .lock()
+        .expect("namespace post-create test failures")
+        .entry(namespace.cleanup_latch_identity().to_path_buf())
+        .or_default()
+        .vacuum_raw_pinned_setup = true;
 }
 
 #[cfg(test)]
-fn take_namespace_vacuum_raw_pinned_post_create_setup_failure(name: &OsStr) -> bool {
+fn take_namespace_vacuum_raw_pinned_post_create_setup_failure(
+    namespace: &RetainedSnapshotDirectory,
+    name: &OsStr,
+) -> bool {
     name.to_str()
         .is_some_and(|name| name.starts_with("vacuum-raw-"))
-        && namespace_vacuum_raw_pinned_post_create_setup_failure().swap(false, Ordering::AcqRel)
+        && namespace_post_create_test_failures()
+            .lock()
+            .expect("namespace post-create test failures")
+            .get_mut(namespace.cleanup_latch_identity())
+            .is_some_and(|failures| std::mem::take(&mut failures.vacuum_raw_pinned_setup))
 }
 
 #[cfg(test)]
-fn namespace_receiver_post_create_sync_failure() -> &'static AtomicBool {
-    static FAIL: AtomicBool = AtomicBool::new(false);
-    &FAIL
+pub(crate) fn fail_namespace_receiver_post_create_sync_for_test(
+    namespace: &RetainedSnapshotDirectory,
+) {
+    namespace_post_create_test_failures()
+        .lock()
+        .expect("namespace post-create test failures")
+        .entry(namespace.cleanup_latch_identity().to_path_buf())
+        .or_default()
+        .receiver_sync = true;
 }
 
 #[cfg(test)]
-pub(crate) fn fail_namespace_receiver_post_create_sync_for_test() {
-    namespace_receiver_post_create_sync_failure().store(true, Ordering::Release);
-}
-
-#[cfg(test)]
-fn take_namespace_receiver_post_create_sync_failure() -> bool {
-    namespace_receiver_post_create_sync_failure().swap(false, Ordering::AcqRel)
+fn take_namespace_receiver_post_create_sync_failure(namespace: &RetainedSnapshotDirectory) -> bool {
+    namespace_post_create_test_failures()
+        .lock()
+        .expect("namespace post-create test failures")
+        .get_mut(namespace.cleanup_latch_identity())
+        .is_some_and(|failures| std::mem::take(&mut failures.receiver_sync))
 }
 
 impl SnapshotCleanupGuard {
@@ -2773,10 +2861,12 @@ struct SnapshotCleanupTestHooks {
 }
 
 #[cfg(test)]
-fn snapshot_cleanup_test_hooks() -> &'static std::sync::Mutex<SnapshotCleanupTestHooks> {
-    static HOOKS: std::sync::OnceLock<std::sync::Mutex<SnapshotCleanupTestHooks>> =
-        std::sync::OnceLock::new();
-    HOOKS.get_or_init(|| std::sync::Mutex::new(SnapshotCleanupTestHooks::default()))
+fn snapshot_cleanup_test_hooks(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, SnapshotCleanupTestHooks>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, SnapshotCleanupTestHooks>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(test)]
@@ -2786,10 +2876,16 @@ pub(crate) fn snapshot_cleanup_test_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 #[cfg(test)]
-fn take_snapshot_cleanup_hook(after_rename: bool) -> (Option<SnapshotCleanupTestHook>, bool) {
+fn take_snapshot_cleanup_hook(
+    original: &Path,
+    after_rename: bool,
+) -> (Option<SnapshotCleanupTestHook>, bool) {
     let mut hooks = snapshot_cleanup_test_hooks()
         .lock()
         .expect("snapshot cleanup test hooks");
+    let Some(hooks) = hooks.get_mut(original) else {
+        return (None, false);
+    };
     let hook = if after_rename {
         hooks.after_rename.take()
     } else {
@@ -2802,7 +2898,7 @@ fn take_snapshot_cleanup_hook(after_rename: bool) -> (Option<SnapshotCleanupTest
 #[cfg(target_os = "linux")]
 fn snapshot_cleanup_before_rename(original: &Path, tombstone: &Path) {
     #[cfg(test)]
-    if let (Some(hook), _) = take_snapshot_cleanup_hook(false) {
+    if let (Some(hook), _) = take_snapshot_cleanup_hook(original, false) {
         hook(original, tombstone);
     }
     #[cfg(not(test))]
@@ -2817,7 +2913,7 @@ fn sync_snapshot_cleanup_after_rename(
 ) -> io::Result<()> {
     #[cfg(test)]
     {
-        let (hook, fail_sync) = take_snapshot_cleanup_hook(true);
+        let (hook, fail_sync) = take_snapshot_cleanup_hook(original, true);
         if let Some(hook) = hook {
             hook(original, tombstone);
         }
@@ -2837,18 +2933,22 @@ fn sync_snapshot_cleanup_after_rename(
 /// private guard name, making the historical check-to-unlink race causal and
 /// deterministic without exposing a production interleaving point.
 #[cfg(target_os = "linux")]
-fn snapshot_cleanup_after_final_identity_before_unlink(tombstone: &Path, guard: &Path) {
+fn snapshot_cleanup_after_final_identity_before_unlink(
+    original: &Path,
+    tombstone: &Path,
+    guard: &Path,
+) {
     #[cfg(test)]
     if let Some(hook) = snapshot_cleanup_test_hooks()
         .lock()
         .expect("snapshot cleanup test hooks")
-        .post_final_identity_before_unlink
-        .take()
+        .get_mut(original)
+        .and_then(|hooks| hooks.post_final_identity_before_unlink.take())
     {
         hook(tombstone, guard);
     }
     #[cfg(not(test))]
-    let _ = (tombstone, guard);
+    let _ = (original, tombstone, guard);
 }
 
 /// Persist a successful final guard rename before unlinking.  A retry after a
@@ -2858,12 +2958,12 @@ fn snapshot_cleanup_after_final_identity_before_unlink(tombstone: &Path, guard: 
 fn sync_snapshot_cleanup_after_unlink_guard_rename(state: &SnapshotCleanupState) -> io::Result<()> {
     state.sync_parent()?;
     #[cfg(test)]
-    if std::mem::take(
-        &mut snapshot_cleanup_test_hooks()
-            .lock()
-            .expect("snapshot cleanup test hooks")
-            .fail_post_unlink_guard_sync,
-    ) {
+    if snapshot_cleanup_test_hooks()
+        .lock()
+        .expect("snapshot cleanup test hooks")
+        .get_mut(&state.original)
+        .is_some_and(|hooks| std::mem::take(&mut hooks.fail_post_unlink_guard_sync))
+    {
         return Err(io::Error::other(
             "injected post-unlink-guard directory sync failure",
         ));
@@ -3065,7 +3165,7 @@ fn remove_snapshot_cleanup_if_owned(
         drop(tombstone_file);
 
         let guard = snapshot_cleanup_unlink_guard_path(&tombstone, expected)?;
-        snapshot_cleanup_after_final_identity_before_unlink(&tombstone, &guard);
+        snapshot_cleanup_after_final_identity_before_unlink(&state.original, &tombstone, &guard);
         state.rename_noreplace(
             tombstone
                 .file_name()
@@ -3197,7 +3297,7 @@ impl SessionSnapshotFile {
                 cleanup_failed.clone(),
             );
             #[cfg(test)]
-            if take_namespace_receiver_post_create_setup_failure() {
+            if take_namespace_receiver_post_create_setup_failure(&create_namespace) {
                 return Err(io::Error::other(
                     "injected retained-namespace receiver post-create setup failure",
                 ));
@@ -3218,7 +3318,7 @@ impl SessionSnapshotFile {
             // name through all later sync/proc-path failures.
             emergency.disarm();
             #[cfg(test)]
-            if take_namespace_receiver_post_create_sync_failure() {
+            if take_namespace_receiver_post_create_sync_failure(&create_namespace) {
                 return Err(io::Error::other(
                     "injected retained-namespace receiver post-create sync failure",
                 ));
@@ -4250,10 +4350,13 @@ mod tests {
             let mut hooks = snapshot_cleanup_test_hooks()
                 .lock()
                 .expect("install cleanup hook");
-            *hooks = SnapshotCleanupTestHooks {
-                fail_post_rename_sync: true,
-                ..SnapshotCleanupTestHooks::default()
-            };
+            hooks.insert(
+                path.clone(),
+                SnapshotCleanupTestHooks {
+                    fail_post_rename_sync: true,
+                    ..SnapshotCleanupTestHooks::default()
+                },
+            );
         }
         let cleanup = snapshot.cleanup.as_mut().expect("cleanup guard");
         assert!(
@@ -4286,10 +4389,13 @@ mod tests {
             let mut hooks = snapshot_cleanup_test_hooks()
                 .lock()
                 .expect("install cleanup hook");
-            *hooks = SnapshotCleanupTestHooks {
-                fail_post_rename_sync: true,
-                ..SnapshotCleanupTestHooks::default()
-            };
+            hooks.insert(
+                path.clone(),
+                SnapshotCleanupTestHooks {
+                    fail_post_rename_sync: true,
+                    ..SnapshotCleanupTestHooks::default()
+                },
+            );
         }
 
         assert!(
@@ -4328,6 +4434,8 @@ mod tests {
         snapshot_cleanup_test_hooks()
             .lock()
             .expect("install cleanup hook")
+            .entry(path.clone())
+            .or_default()
             .before_rename = Some(Box::new(|original, _tombstone| {
             let replacement = original.with_extension("foreign");
             std::fs::write(&replacement, b"foreign-before-rename").expect("foreign bytes");
@@ -4351,6 +4459,8 @@ mod tests {
         snapshot_cleanup_test_hooks()
             .lock()
             .expect("install final identity seam hook")
+            .entry(path.clone())
+            .or_default()
             .post_final_identity_before_unlink = Some(Box::new(|tombstone, _guard| {
             std::fs::remove_file(tombstone).expect("remove authenticated tombstone");
             std::fs::write(tombstone, b"foreign-final-seam")
@@ -4398,6 +4508,8 @@ mod tests {
         snapshot_cleanup_test_hooks()
             .lock()
             .expect("install final guard failure")
+            .entry(path.clone())
+            .or_default()
             .fail_post_unlink_guard_sync = true;
 
         let cleanup = snapshot.cleanup.as_mut().expect("cleanup guard");

@@ -96,6 +96,10 @@ impl ScopedLoopbackPeer {
         *self.handler.write().await = Some(handler);
     }
 
+    async fn clear(&self) {
+        *self.handler.write().await = None;
+    }
+
     fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
     }
@@ -509,16 +513,6 @@ async fn open_fixed_cluster_with_paths(
     (directory, database_paths, stores, paths)
 }
 
-async fn open_fixed_cluster_in(
-    directory: &std::path::Path,
-    member_count: usize,
-    placement_policy: PlacementResiliencePolicy,
-) -> (Vec<PathBuf>, Vec<ConsensusSessionStore>) {
-    let (database_paths, stores, _) =
-        open_fixed_cluster_in_with_paths(directory, member_count, placement_policy).await;
-    (database_paths, stores)
-}
-
 async fn open_fixed_cluster_in_with_paths(
     directory: &std::path::Path,
     member_count: usize,
@@ -591,6 +585,20 @@ async fn open_fixed_cluster_in_with_paths(
         result.expect("initialize fixed cluster membership");
     }
     (database_paths, stores, paths)
+}
+
+async fn shutdown_fixed_cluster_for_reopen(
+    stores: &[ConsensusSessionStore],
+    paths: &BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
+) {
+    for path in paths.values() {
+        path.clear().await;
+    }
+    for result in
+        futures_util::future::join_all(stores.iter().map(ConsensusSessionStore::shutdown)).await
+    {
+        result.expect("fully drain fixed consensus engine before durable reopen");
+    }
 }
 
 fn successor_request(identity: ConsensusIdentity) -> SessionTopologyTransitionRequest {
@@ -966,12 +974,13 @@ async fn file_backed_fixed_five_voter_quorum_reaches_granted_authority() {
 
 #[tokio::test]
 async fn initialized_fixed_three_voter_cluster_reopens_with_durable_authority_and_rpc_readiness() {
-    let (directory, _database_paths, stores) =
-        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let (directory, _database_paths, stores, paths) =
+        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
     drop(stores);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(paths);
 
-    let (_database_paths, reopened) = open_fixed_cluster_in(
+    let (_database_paths, reopened, reopened_paths) = open_fixed_cluster_in_with_paths(
         directory.path(),
         3,
         PlacementResiliencePolicy::AllowReducedResilience,
@@ -989,6 +998,7 @@ async fn initialized_fixed_three_voter_cluster_reopens_with_durable_authority_an
             .is_granted(),
         "reopened fixed quorum RPC path must recover durable traffic authority"
     );
+    shutdown_fixed_cluster_for_reopen(&reopened, &reopened_paths).await;
 }
 
 #[tokio::test]
@@ -1003,8 +1013,11 @@ async fn fixed_durable_quorum_reopen_rejects_placement_policy_mismatch() {
             PlacementResiliencePolicy::RequireIndependentFailureDomains,
         ),
     ] {
-        let (directory, database_paths, stores) = open_fixed_cluster(3, initial).await;
+        let (directory, database_paths, stores, paths) =
+            open_fixed_cluster_with_paths(3, initial).await;
+        shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
         drop(stores);
+        drop(paths);
         let members = fixed_members(3);
         let topology = fixed_topology_for_local(0, members, reopened).expect("reopen topology");
         let error = ConsensusSessionStore::open_fixed_durable_quorum(
@@ -1837,6 +1850,10 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     )
     .await
     .expect("open fixed store");
+    fixed_store
+        .shutdown()
+        .await
+        .expect("drain fixed store before durable reopen");
     drop(fixed_store);
     let fixed_reopened = ConsensusSessionStore::open_fixed_durable_quorum(
         fixed.clone(),
@@ -1846,6 +1863,10 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     )
     .await
     .expect("reopen fixed store with its persisted authority profile");
+    fixed_reopened
+        .shutdown()
+        .await
+        .expect("drain reopened fixed store before profile mismatch probe");
     drop(fixed_reopened);
     let fixed_as_dynamic = ConsensusSessionStore::open(
         dynamic.clone(),
@@ -1867,6 +1888,10 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     )
     .await
     .expect("open dynamic store");
+    dynamic_store
+        .shutdown()
+        .await
+        .expect("drain dynamic store before profile mismatch probe");
     drop(dynamic_store);
     let dynamic_as_fixed = ConsensusSessionStore::open_fixed_durable_quorum(
         fixed.clone(),

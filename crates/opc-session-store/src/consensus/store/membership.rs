@@ -1432,6 +1432,8 @@ impl ConsensusSessionStore {
             raft,
             storage_shutdown,
             terminal_recovery_handoff_consumer,
+            #[cfg(test)]
+            terminal_recovery_gate_checks: AtomicU64::new(0),
             raft_handler,
             backend,
             proactive_checkpoint_lane,
