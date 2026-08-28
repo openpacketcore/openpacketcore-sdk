@@ -134,7 +134,22 @@ jobs:
             --quiet \
             -- \
             --test-threads=4 \
-            --skip protected_roster_ingress_has_two_mutations_and_read_only_status_paths
+            --exact \
+            --skip consensus::store::membership_tests::protected_roster_ingress_has_two_mutations_and_read_only_status_paths \
+            --skip sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch
+          # This exact 1,025-roster proof dominates the debug unit-test
+          # process and can exhaust the fixed job bound while unrelated tests
+          # occupy its worker threads. Preserve the full cardinality and run
+          # it once in the repository's optimized qualification profile.
+          CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo test --locked \
+            -p opc-session-store \
+            --lib \
+            --all-features \
+            --quiet \
+            -- \
+            --test-threads=1 \
+            --exact \
+            sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch
           # This proof deliberately binds a one-second attached-consensus
           # deadline. Run it exactly once outside the multi-minute SQLite
           # fixtures so host scheduling cannot turn a committed mutation into
