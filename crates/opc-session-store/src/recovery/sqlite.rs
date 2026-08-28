@@ -12,7 +12,7 @@ use opc_consensus::engine::LogId;
 use opc_types::Timestamp;
 use rusqlite::backup::Backup;
 use rusqlite::types::{Value, ValueRef};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use rusqlite::OpenFlags;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};

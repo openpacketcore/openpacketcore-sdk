@@ -1333,7 +1333,7 @@ pub(crate) fn probe_live_terminal_recovery_handoff_with_connection_sync(
         let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
         let probe = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
             Some(OperatorRecoveryLatchRecord::Active(latch)) => {
-                active_latch_is_coherent_with_connection(connection, *latch)?;
+                active_latch_is_coherent_with_admitted_connection(connection, *latch)?;
                 LiveTerminalRecoveryHandoffProbe::Active
             }
             Some(OperatorRecoveryLatchRecord::Terminal(_)) => {
@@ -1565,7 +1565,13 @@ fn ensure_absent_operator_recovery_latch_is_ready(connection: &Connection) -> io
     if has_identity {
         let identity = read_storage_identity_sync(connection)
             .map_err(|_| invalid_data("session operator recovery identity is unavailable"))?;
-        let recovery = read_operator_recovery_sync(connection, identity)?;
+        // A live Clear probe is an authority read, not a schema-migration
+        // boundary. Re-entering migration here would execute DDL and a
+        // singleton INSERT on every readiness/traffic check, contend with an
+        // independent prune writer, and turn SQLITE_BUSY into false
+        // corruption. Preserve the post-migration cardinality, identity,
+        // recovery, applied, and machine validation without any write.
+        let recovery = validate_current_operator_recovery_image_sync(connection, identity)?;
         if recovery.recovery_epoch != 0
             || recovery.last_plan_digest != [0; 32]
             || recovery.pending_epoch.is_some()
@@ -1586,6 +1592,31 @@ fn active_latch_is_coherent_with_connection(
     connection: &Connection,
     latch: OperatorRecoveryLatch,
 ) -> io::Result<()> {
+    active_latch_is_coherent_with_reader(connection, latch, true, read_operator_recovery_sync)
+}
+
+/// A live core has already admitted and migrated its schema. Its cheap Active
+/// probe must therefore retain the same strict semantic projection without
+/// re-entering a writer transaction on every readiness/traffic check.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn active_latch_is_coherent_with_admitted_connection(
+    connection: &Connection,
+    latch: OperatorRecoveryLatch,
+) -> io::Result<()> {
+    active_latch_is_coherent_with_reader(
+        connection,
+        latch,
+        false,
+        validate_current_operator_recovery_image_sync,
+    )
+}
+
+fn active_latch_is_coherent_with_reader(
+    connection: &Connection,
+    latch: OperatorRecoveryLatch,
+    allow_legacy_without_schema: bool,
+    read_recovery: fn(&Connection, SessionConsensusIdentity) -> io::Result<OperatorRecoveryState>,
+) -> io::Result<()> {
     let has_identity = table_exists(connection, "consensus_identity").map_err(db_error)?;
     let has_recovery = table_exists(connection, "consensus_operator_recovery").map_err(db_error)?;
     if has_identity != has_recovery {
@@ -1598,7 +1629,12 @@ fn active_latch_is_coherent_with_connection(
         // legacy database. With no current-schema authority to compare, that
         // pinned sidecar remains the closed readiness gate; standalone
         // traffic is still denied until recovery replaces the legacy image.
-        return Ok(());
+        if allow_legacy_without_schema {
+            return Ok(());
+        }
+        return Err(invalid_data(
+            "session operator recovery active schema is unavailable",
+        ));
     }
     let identity = read_storage_identity_sync(connection)
         .map_err(|_| invalid_data("session operator recovery active identity is unavailable"))?;
@@ -1607,7 +1643,7 @@ fn active_latch_is_coherent_with_connection(
             "session operator recovery active identity does not match",
         ));
     }
-    let recovery = read_operator_recovery_sync(connection, identity)?;
+    let recovery = read_recovery(connection, identity)?;
     let finalized_matches = recovery.recovery_epoch == latch.recovery_epoch
         && recovery.last_plan_digest == latch.plan_digest
         && recovery.pending_epoch.is_none()
@@ -15801,35 +15837,12 @@ fn ensure_operator_recovery_schema_inner_sync(
         params![epoch_i64(identity)?, [0_u8; 32].as_slice()],
     )
     .map_err(db_error)?;
-    let (stored_epoch, rows): (i64, i64) = conn
-        .query_row(
-            "SELECT configuration_epoch, (SELECT COUNT(*) FROM consensus_operator_recovery) FROM consensus_operator_recovery WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(db_error)?;
-    validate_epoch(stored_epoch, identity)?;
-    if rows != 1 {
-        return Err(invalid_data(
-            "session consensus operator recovery state is invalid",
-        ));
-    }
     // Keep the savepoint open until the post-migration image has passed the
     // same semantic reconstruction used by a normal reader.  In particular,
     // a syntactically valid predecessor must not leave an ALTER/backfill
     // behind when its recovery certificate, terminal outcome, applied floor,
     // machine state, or identity binding is contradictory.
-    if read_storage_identity_sync(conn)
-        .map_err(|_| invalid_data("session consensus recovery storage identity is invalid"))?
-        != identity
-    {
-        return Err(invalid_data(
-            "session consensus recovery storage identity differs",
-        ));
-    }
-    let _ = read_operator_recovery_after_schema_sync(conn, identity)?;
-    let _ = read_applied_sync(conn, identity)?;
-    let _ = read_machine_sync(conn, identity)?;
+    let _ = validate_current_operator_recovery_image_sync(conn, identity)?;
     Ok(())
 }
 
@@ -15850,6 +15863,47 @@ pub(crate) struct OperatorRecoveryState {
     pub(crate) finalize_entry_json: Option<Vec<u8>>,
     /// One-way durable protocol fence set by a verified V2 finalization.
     pub(crate) v2_activated: bool,
+}
+
+/// Validate a current recovery image without attempting schema repair.
+///
+/// This is the read-only equivalent of the semantic tail held inside the
+/// migration savepoint. It deliberately retains every cardinality and
+/// cross-table invariant from that tail so a cheap live classifier removes
+/// only migration writes, never durable-state validation.
+fn validate_current_operator_recovery_image_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> io::Result<OperatorRecoveryState> {
+    // Gate the exact released schema and bounded row projection before even
+    // counting a potentially forged table. The migration path performed this
+    // gate before its post-migration semantic tail; the live read must retain
+    // the same ordering without performing the migration itself.
+    let recovery = read_operator_recovery_after_schema_sync(conn, identity)?;
+    let (stored_epoch, rows): (i64, i64) = conn
+        .query_row(
+            "SELECT configuration_epoch, (SELECT COUNT(*) FROM consensus_operator_recovery) FROM consensus_operator_recovery WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db_error)?;
+    validate_epoch(stored_epoch, identity)?;
+    if rows != 1 {
+        return Err(invalid_data(
+            "session consensus operator recovery state is invalid",
+        ));
+    }
+    if read_storage_identity_sync(conn)
+        .map_err(|_| invalid_data("session consensus recovery storage identity is invalid"))?
+        != identity
+    {
+        return Err(invalid_data(
+            "session consensus recovery storage identity differs",
+        ));
+    }
+    let _ = read_applied_sync(conn, identity)?;
+    let _ = read_machine_sync(conn, identity)?;
+    Ok(recovery)
 }
 
 type StoredOperatorRecoveryRow = (
@@ -35044,6 +35098,501 @@ mod tests {
                 Err(error) => error,
             };
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_clear_probe_remains_read_only_while_primary_writer_is_active() {
+        let directory = tempfile::tempdir().expect("live clear probe directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open live clear backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize live clear core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let writer = Connection::open(&database).expect("open independent primary writer");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold primary writer transaction");
+        let connection = Connection::open(&database).expect("open live probe connection");
+
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("clear live probe is a read-only authority projection"),
+        );
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("release primary writer transaction");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_active_probe_remains_read_only_while_primary_writer_is_active() {
+        let directory = tempfile::tempdir().expect("live active probe directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let identity = identity();
+        let backend = SqliteSessionBackend::open(&database).expect("open live active backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity,
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize live active core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let connection = Connection::open(&database).expect("open live probe connection");
+        let latch = OperatorRecoveryLatch {
+            identity,
+            recovery_epoch: 1,
+            plan_digest: [0xC6; 32],
+            audit_pending: false,
+        };
+        mark_operator_recovery_pending_sync(
+            &connection,
+            identity,
+            latch.recovery_epoch,
+            latch.plan_digest,
+        )
+        .expect("mark active recovery pending");
+        ensure_operator_recovery_latch_sync(&database, latch)
+            .expect("publish matching active recovery sidecar");
+
+        let writer = Connection::open(&database).expect("open independent primary writer");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold primary writer transaction");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Active,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("active live probe is a read-only authority projection"),
+        );
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("release primary writer transaction");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_clear_probe_rejects_and_does_not_repair_a_missing_recovery_singleton() {
+        let directory = tempfile::tempdir().expect("missing recovery singleton directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open missing-row backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize missing-row core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let connection = Connection::open(&database).expect("open live probe connection");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("baseline missing-row fixture is clear"),
+        );
+        connection
+            .execute("DELETE FROM consensus_operator_recovery", [])
+            .expect("remove recovery singleton");
+
+        assert!(
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .is_err(),
+            "a missing durable recovery singleton must fail closed",
+        );
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_operator_recovery",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count recovery rows after failed probe");
+        assert_eq!(
+            0, rows,
+            "a read-only recovery probe must not self-heal corrupt durable state",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_clear_probe_retains_post_migration_integrity_checks() {
+        let directory = tempfile::tempdir().expect("live clear integrity directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open integrity backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize integrity core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let connection = Connection::open(&database).expect("open live probe connection");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("baseline integrity fixture is clear"),
+        );
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow extra recovery row fixture");
+        connection
+            .execute(
+                "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, recovery_v2_activated) SELECT 2, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, recovery_v2_activated FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+            )
+            .expect("inject extra recovery row");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore recovery constraints");
+        assert!(
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .is_err(),
+            "an extra durable recovery row must fail closed",
+        );
+        connection
+            .execute(
+                "DELETE FROM consensus_operator_recovery WHERE singleton = 2",
+                [],
+            )
+            .expect("remove extra recovery row");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("removing the extra row restores a clear projection"),
+        );
+
+        let machine_digest: Vec<u8> = connection
+            .query_row(
+                "SELECT last_digest FROM consensus_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read original machine digest");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow corrupt machine fixture");
+        connection
+            .execute(
+                "UPDATE consensus_machine SET last_digest = zeroblob(31) WHERE singleton = 1",
+                [],
+            )
+            .expect("inject corrupt machine digest");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore machine constraints");
+        assert!(
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .is_err(),
+            "a corrupt durable machine projection must fail closed",
+        );
+        connection
+            .execute(
+                "UPDATE consensus_machine SET last_digest = ?1 WHERE singleton = 1",
+                [machine_digest.as_slice()],
+            )
+            .expect("restore machine digest");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("restoring the machine projection restores Clear"),
+        );
+
+        connection
+            .execute(
+                "INSERT INTO consensus_applied (singleton, configuration_epoch, term, log_index, log_id_json) VALUES (1, ?1, 0, 0, X'00') ON CONFLICT(singleton) DO UPDATE SET log_id_json = excluded.log_id_json",
+                [epoch_i64(identity()).expect("encode identity epoch")],
+            )
+            .expect("inject malformed applied pointer");
+        assert!(
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .is_err(),
+            "a corrupt durable applied projection must fail closed",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_clear_probe_rejects_a_missing_sidecar_for_pending_recovery() {
+        let directory = tempfile::tempdir().expect("missing recovery sidecar directory");
+        let database = directory.path().join("sessions.sqlite");
+        let snapshot_dir = directory.path().join("snapshots");
+        let members = expected_members();
+        let backend = SqliteSessionBackend::open(&database).expect("open missing-sidecar backend");
+        let core = SqliteConsensusCore::initialize(
+            &backend,
+            snapshot_dir,
+            identity(),
+            members.clone(),
+            test_member_bindings(&members),
+            ConsensusAuthorityProfile::Dynamic,
+            None,
+        )
+        .await
+        .expect("initialize missing-sidecar core");
+        drop(core);
+        drop(backend);
+
+        if operator_recovery_file_incarnation(&File::open(&database).expect("open database"))
+            .is_err()
+        {
+            return;
+        }
+        let connection = Connection::open(&database).expect("open live probe connection");
+        assert_eq!(
+            LiveTerminalRecoveryHandoffProbe::Clear,
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .expect("baseline missing-sidecar fixture is clear"),
+        );
+        mark_operator_recovery_pending_sync(&connection, identity(), 1, [0xC7; 32])
+            .expect("mark durable recovery pending without a sidecar");
+        assert!(
+            read_operator_recovery_latch_record(&database)
+                .expect("read absent recovery sidecar")
+                .is_none(),
+            "the fixture must retain a missing recovery sidecar",
+        );
+
+        assert!(
+            probe_live_terminal_recovery_handoff_with_connection_sync(&database, &connection)
+                .is_err(),
+            "durable pending recovery without its sidecar must fail closed",
+        );
+        let recovery = read_operator_recovery_after_schema_sync(&connection, identity())
+            .expect("read durable pending recovery after failed probe");
+        assert_eq!(Some(1), recovery.pending_epoch);
+        assert_eq!(Some([0xC7; 32]), recovery.pending_plan_digest);
+    }
+
+    #[test]
+    fn read_only_current_recovery_validator_rejects_corruption_without_repair() {
+        let backend = SqliteSessionBackend::in_memory().expect("read-only validator backend");
+        let connection = backend.conn.blocking_lock();
+        let identity = identity();
+        initialize_schema(&connection, identity, &expected_members())
+            .expect("initialize read-only validator schema");
+        validate_current_operator_recovery_image_sync(&connection, identity)
+            .expect("baseline current recovery image");
+
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow extra recovery row fixture");
+        connection
+            .execute(
+                "INSERT INTO consensus_operator_recovery (singleton, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, recovery_v2_activated) SELECT 2, configuration_epoch, recovery_epoch, last_plan_digest, pending_epoch, pending_plan_digest, watch_cursor_invalidation_floor, finalize_log_id_json, finalize_entry_json, recovery_v2_activated FROM consensus_operator_recovery WHERE singleton = 1",
+                [],
+            )
+            .expect("inject extra recovery row");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore recovery constraints");
+        assert!(validate_current_operator_recovery_image_sync(&connection, identity).is_err());
+        assert_eq!(
+            2_i64,
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_operator_recovery",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count unrepaired recovery rows"),
+        );
+        connection
+            .execute(
+                "DELETE FROM consensus_operator_recovery WHERE singleton = 2",
+                [],
+            )
+            .expect("remove extra recovery row");
+        validate_current_operator_recovery_image_sync(&connection, identity)
+            .expect("recovery cardinality repair restores baseline");
+
+        let machine_digest: Vec<u8> = connection
+            .query_row(
+                "SELECT last_digest FROM consensus_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read original machine digest");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow corrupt machine fixture");
+        connection
+            .execute(
+                "UPDATE consensus_machine SET last_digest = zeroblob(31) WHERE singleton = 1",
+                [],
+            )
+            .expect("inject corrupt machine digest");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore machine constraints");
+        assert!(validate_current_operator_recovery_image_sync(&connection, identity).is_err());
+        assert_eq!(
+            31_i64,
+            connection
+                .query_row(
+                    "SELECT length(last_digest) FROM consensus_machine WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read unrepaired machine digest length"),
+        );
+        connection
+            .execute(
+                "UPDATE consensus_machine SET last_digest = ?1 WHERE singleton = 1",
+                [machine_digest.as_slice()],
+            )
+            .expect("restore machine digest");
+        validate_current_operator_recovery_image_sync(&connection, identity)
+            .expect("machine repair restores baseline");
+
+        connection
+            .execute(
+                "INSERT INTO consensus_applied (singleton, configuration_epoch, term, log_index, log_id_json) VALUES (1, ?1, 0, 0, X'00') ON CONFLICT(singleton) DO UPDATE SET log_id_json = excluded.log_id_json",
+                [epoch_i64(identity).expect("encode identity epoch")],
+            )
+            .expect("inject malformed applied pointer");
+        assert!(validate_current_operator_recovery_image_sync(&connection, identity).is_err());
+        assert_eq!(
+            vec![0_u8],
+            connection
+                .query_row(
+                    "SELECT log_id_json FROM consensus_applied WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .expect("read unrepaired applied pointer"),
+        );
+        connection
+            .execute("DELETE FROM consensus_applied", [])
+            .expect("remove malformed applied pointer");
+        validate_current_operator_recovery_image_sync(&connection, identity)
+            .expect("applied repair restores baseline");
+
+        connection
+            .execute("DELETE FROM consensus_operator_recovery", [])
+            .expect("remove recovery singleton");
+        assert!(validate_current_operator_recovery_image_sync(&connection, identity).is_err());
+        assert_eq!(
+            0_i64,
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_operator_recovery",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count unrepaired missing singleton"),
+        );
+    }
+
+    #[test]
+    fn admitted_active_classifier_rejects_schema_absence_but_pre_admission_retains_legacy_gate() {
+        let connection = Connection::open_in_memory().expect("empty active classifier database");
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xC8; 32],
+            audit_pending: false,
+        };
+        active_latch_is_coherent_with_connection(&connection, latch)
+            .expect("pre-admission Active sidecar remains a closed legacy gate");
+        assert!(
+            active_latch_is_coherent_with_admitted_connection(&connection, latch).is_err(),
+            "an admitted live core cannot treat missing current schema as coherent",
+        );
+    }
+
+    #[test]
+    fn active_classifier_split_preserves_exact_pre_fence_v2_migration() {
+        let backend = SqliteSessionBackend::in_memory().expect("active migration backend");
+        let connection = backend.conn.blocking_lock();
+        apply_valid_recovery_v2_finalization_fixture(&connection, &backend.caps);
+        replace_recovery_with_exact_pre_fence_fixture(&connection);
+        let latch = OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: 1,
+            plan_digest: [0xA1; 32],
+            audit_pending: false,
+        };
+
+        assert!(
+            active_latch_is_coherent_with_admitted_connection(&connection, latch).is_err(),
+            "a live admitted projection cannot silently migrate a pre-fence image",
+        );
+        assert!(
+            !operator_recovery_v2_activation_column_exists(&connection)
+                .expect("inspect untouched pre-fence schema"),
+            "the admitted read must leave the released predecessor untouched",
+        );
+
+        active_latch_is_coherent_with_connection(&connection, latch)
+            .expect("pre-admission classifier migrates the exact released predecessor");
+        assert_eq!(
+            1_i64,
+            connection
+                .query_row(
+                    "SELECT recovery_v2_activated FROM consensus_operator_recovery WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read migrated V2 activation marker"),
+        );
     }
 
     #[cfg(target_os = "linux")]

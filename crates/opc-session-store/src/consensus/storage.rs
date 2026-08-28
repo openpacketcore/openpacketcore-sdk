@@ -6459,7 +6459,6 @@ mod tests {
 
     use bytes::Bytes;
     use opc_consensus::engine::network::RaftNetworkFactory;
-    #[cfg(target_os = "linux")]
     use opc_consensus::engine::storage::RaftLogStorageExt;
     use opc_consensus::engine::storage::{RaftLogStorage, RaftStateMachine};
     use opc_consensus::engine::{CommittedLeaderId, EmptyNode, EntryPayload, RaftSnapshotBuilder};
