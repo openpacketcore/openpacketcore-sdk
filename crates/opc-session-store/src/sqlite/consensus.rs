@@ -3585,6 +3585,8 @@ struct ConsensusLogPruneTurnGateState {
     released: bool,
     preempted: bool,
     progress_preempted: bool,
+    hold_progress_preemption: bool,
+    progress_preemption_released: bool,
     progress_steps_before_preempt: usize,
     progress_steps_seen: usize,
     completed: bool,
@@ -3734,6 +3736,21 @@ impl ConsensusLogPruneTurnGate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.progress_preempted = true;
+        self.entered.notify_all();
+        while state.hold_progress_preemption && !state.progress_preemption_released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release_progress_preemption(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.progress_preemption_released = true;
         self.released.notify_all();
     }
 
@@ -3854,6 +3871,13 @@ impl ConsensusLogPruneTurnGateForTest {
         )
     }
 
+    fn install_before_authority_read_with_progress_handoff(directory: &Path) -> Self {
+        Self::install_at_with_progress_handoff(
+            directory,
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+        )
+    }
+
     pub(crate) fn install_mid_delete(directory: &Path) -> Self {
         Self::install_at(directory, ConsensusLogPruneTurnGatePoint::MidDelete)
     }
@@ -3867,6 +3891,21 @@ impl ConsensusLogPruneTurnGateForTest {
     }
 
     fn install_at(directory: &Path, point: ConsensusLogPruneTurnGatePoint) -> Self {
+        Self::install_at_inner(directory, point, false)
+    }
+
+    fn install_at_with_progress_handoff(
+        directory: &Path,
+        point: ConsensusLogPruneTurnGatePoint,
+    ) -> Self {
+        Self::install_at_inner(directory, point, true)
+    }
+
+    fn install_at_inner(
+        directory: &Path,
+        point: ConsensusLogPruneTurnGatePoint,
+        hold_progress_preemption: bool,
+    ) -> Self {
         let directory =
             std::fs::canonicalize(directory).expect("canonicalize prune gate directory");
         let gate = Arc::new(ConsensusLogPruneTurnGate {
@@ -3877,6 +3916,8 @@ impl ConsensusLogPruneTurnGateForTest {
                 released: false,
                 preempted: false,
                 progress_preempted: false,
+                hold_progress_preemption,
+                progress_preemption_released: false,
                 progress_steps_before_preempt: usize::from(
                     point == ConsensusLogPruneTurnGatePoint::MidDelete,
                 ) * 8,
@@ -3926,6 +3967,9 @@ impl ConsensusLogPruneTurnGateForTest {
 #[cfg(all(test, target_os = "linux"))]
 impl Drop for ConsensusLogPruneTurnGateForTest {
     fn drop(&mut self) {
+        // A failed assertion must also release the progress-callback handoff;
+        // otherwise the blocking SQLite worker can outlive the failed test.
+        self.gate.release_progress_preemption();
         self.release();
         consensus_log_prune_turn_gates()
             .lock()
@@ -3951,6 +3995,12 @@ impl Drop for ConsensusLogPrunePrimaryPreemption {
     }
 }
 
+#[derive(Clone)]
+struct ConsensusLogPruneActiveInterrupt {
+    handle: Arc<InterruptHandle>,
+    preemption_requested: Arc<AtomicBool>,
+}
+
 /// One descriptor-pinned, coalescing physical log-prune lane.  It is only
 /// installed for the fixed durable authority profile; the unsupported
 /// in-memory shape retains the historical synchronous delete path.
@@ -3964,10 +4014,11 @@ pub(crate) struct ConsensusLogPruneLane {
     /// permit through their transaction; the prune lane only try-acquires it
     /// so it can never queue ahead of a primary writer.
     turn_ownership: Arc<tokio::sync::Mutex<()>>,
-    /// Serializes cross-thread interrupt delivery with transaction cleanup so
-    /// a late sqlite3_interrupt cannot land inside the rollback it requested.
+    /// Serializes cross-thread interrupt delivery with complete turn cleanup
+    /// so a late sqlite3_interrupt cannot land inside rollback or escape into
+    /// the next turn after a successful commit.
     interrupt_delivery: Arc<Mutex<()>>,
-    active_interrupt: Mutex<Option<Arc<InterruptHandle>>>,
+    active_interrupt: Mutex<Option<ConsensusLogPruneActiveInterrupt>>,
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
     primary_writers: Arc<AtomicUsize>,
@@ -4083,11 +4134,18 @@ impl ConsensusLogPruneLane {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(interrupt) = active_interrupt {
+            // Retain exact active-turn provenance even if the waiting primary
+            // is cancelled before the secondary transaction returns. A real
+            // corruption which coincides with this preemption is rolled back
+            // and detected again by the next unpreempted strict validation.
+            interrupt
+                .preemption_requested
+                .store(true, Ordering::Release);
             #[cfg(all(test, target_os = "linux"))]
             if let Some(gate) = &self.turn_gate {
                 gate.notify_preemption();
             }
-            interrupt.interrupt();
+            interrupt.handle.interrupt();
         }
         drop(interrupt_delivery);
         // This local permit acknowledges that an interrupted prune turn has
@@ -4110,7 +4168,7 @@ impl ConsensusLogPruneLane {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         {
-            interrupt.interrupt();
+            interrupt.handle.interrupt();
         }
         drop(interrupt_delivery);
         let _ = self.stop.send(true);
@@ -4203,13 +4261,17 @@ async fn run_consensus_log_prune_lane(
             lane.signal();
             continue;
         }
-        let interrupt = Arc::new(connection.get_interrupt_handle());
+        let preemption_requested = Arc::new(AtomicBool::new(false));
+        let interrupt = ConsensusLogPruneActiveInterrupt {
+            handle: Arc::new(connection.get_interrupt_handle()),
+            preemption_requested: Arc::clone(&preemption_requested),
+        };
         let primary_writer_waiting = {
             let mut active_interrupt = lane
                 .active_interrupt
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *active_interrupt = Some(Arc::clone(&interrupt));
+            *active_interrupt = Some(interrupt);
             if lane.primary_writers.load(Ordering::Acquire) != 0 {
                 *active_interrupt = None;
                 true
@@ -4264,13 +4326,14 @@ async fn run_consensus_log_prune_lane(
                 ConsensusLogPruneTurnControl {
                     primary_writers: Arc::clone(&primary_writers),
                     interrupt_delivery: Arc::clone(&interrupt_delivery),
+                    preemption_requested: Arc::clone(&preemption_requested),
                     #[cfg(all(test, target_os = "linux"))]
                     turn_gate: turn_gate.clone(),
                 },
             );
             let result = match result {
                 Err(ConsensusLogPruneTurnError::Interrupted)
-                    if primary_writers.load(Ordering::Acquire) != 0 =>
+                    if preemption_requested.load(Ordering::Acquire) =>
                 {
                     Err(ConsensusLogPruneTurnError::PreemptedByPrimary)
                 }
@@ -4279,6 +4342,10 @@ async fn run_consensus_log_prune_lane(
             (connection, result)
         })
         .await;
+        let interrupt_cleanup = lane
+            .interrupt_delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         {
             let mut active_interrupt = lane
                 .active_interrupt
@@ -4321,6 +4388,7 @@ async fn run_consensus_log_prune_lane(
                 return;
             }
         };
+        drop(interrupt_cleanup);
         match turn {
             Ok(completion) => {
                 if let Some(diagnostics) = &lane.diagnostics {
@@ -4450,6 +4518,7 @@ async fn wait_consensus_log_prune_pacing(
 struct ConsensusLogPruneTurnControl {
     primary_writers: Arc<AtomicUsize>,
     interrupt_delivery: Arc<Mutex<()>>,
+    preemption_requested: Arc<AtomicBool>,
     #[cfg(all(test, target_os = "linux"))]
     turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
 }
@@ -4508,11 +4577,10 @@ fn prune_consensus_log_turn_sync(
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     control: ConsensusLogPruneTurnControl,
 ) -> Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError> {
-    let observed_preemption = Arc::new(AtomicBool::new(false));
     let progress = ConsensusLogPruneProgressGuard::install(
         conn,
         Arc::clone(&control.primary_writers),
-        Arc::clone(&observed_preemption),
+        Arc::clone(&control.preemption_requested),
         #[cfg(all(test, target_os = "linux"))]
         control.turn_gate.clone(),
     );
@@ -4657,8 +4725,7 @@ fn prune_consensus_log_turn_sync(
     };
     match result {
         Err(ConsensusLogPruneTurnError::Interrupted | ConsensusLogPruneTurnError::Permanent)
-            if observed_preemption.load(Ordering::Acquire)
-                && control.primary_writers.load(Ordering::Acquire) != 0 =>
+            if control.preemption_requested.load(Ordering::Acquire) =>
         {
             Err(ConsensusLogPruneTurnError::PreemptedByPrimary)
         }
@@ -36565,14 +36632,15 @@ mod tests {
 
         // The VFS registry is process-global.  Re-exec exactly this test so
         // no parallel unit test can observe its deliberate fault injection.
+        // Use the live Linux descriptor link rather than Cargo's replaceable
+        // target path: a concurrent linker may unlink that path while this
+        // long-running test binary remains executable through /proc.
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(
-                std::env::current_exe().expect("current unit-test executable"),
-            )
-            .args(["--exact", TEST_NAME])
-            .env(CHILD, "1")
-            .status()
-            .expect("run isolated temporary-path failure regression");
+            let status = std::process::Command::new("/proc/self/exe")
+                .args(["--exact", TEST_NAME])
+                .env(CHILD, "1")
+                .status()
+                .expect("run isolated temporary-path failure regression");
             assert!(status.success(), "isolated regression succeeds");
             return;
         }
@@ -40280,6 +40348,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn assert_consensus_log_prune_primary_preemption_at_production_window(
         point: ConsensusLogPruneTurnGatePoint,
+        cancel_primary_before_handoff: bool,
     ) {
         let directory = tempfile::tempdir().expect("prune preemption directory");
         let source_path = directory.path().join("prune-preemption.sqlite");
@@ -40352,6 +40421,12 @@ mod tests {
         );
         let diagnostics = Arc::new(ConsensusStoreDiagnosticCounters::default());
         let gate = match point {
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead
+                if cancel_primary_before_handoff =>
+            {
+                ConsensusLogPruneTurnGateForTest::
+                    install_before_authority_read_with_progress_handoff(directory.path())
+            }
             ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead => {
                 ConsensusLogPruneTurnGateForTest::install_before_authority_read(directory.path())
             }
@@ -40400,6 +40475,66 @@ mod tests {
         })
         .await
         .expect("primary priority interrupts the gated prune turn before handoff");
+        if cancel_primary_before_handoff {
+            // Enter a real authority-read VDBE while the primary claim is
+            // retained. Its interval-one progress callback records the exact
+            // turn-local preemption and parks before returning SQLITE_INTERRUPT.
+            gate.release();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !gate.progress_preempted() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("authority-read VDBE observes the waiting primary");
+            primary_guard.abort();
+            let primary_cancelled = match primary_guard.await {
+                Err(error) => error.is_cancelled(),
+                Ok(_) => false,
+            };
+            assert!(
+                primary_cancelled,
+                "the primary handoff task is cancelled before the prune turn returns"
+            );
+            assert_eq!(
+                lane.primary_writers_for_test(),
+                0,
+                "cancelling the waiting primary releases its priority claim"
+            );
+            gate.gate.release_progress_preemption();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let snapshot = diagnostics.snapshot();
+                    if snapshot.consensus_log_prune_drained_turns == 1
+                        || snapshot.consensus_log_prune_degraded
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled primary preemption retries and drains the intact prune backlog");
+            let snapshot = diagnostics.snapshot();
+            assert_eq!(
+                snapshot.consensus_log_prune_busy_retries, 1,
+                "one cancelled primary causes exactly one rolled-back prune retry; diagnostics={snapshot:?}"
+            );
+            assert!(
+                !snapshot.consensus_log_prune_degraded && !lane.is_degraded(),
+                "a cancelled primary cannot turn its exact interrupt into permanent degradation; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                primary
+                    .query_row("SELECT COUNT(*) FROM consensus_log", [], |row| row
+                        .get::<_, i64>(0))
+                    .expect("count drained rows after cancelled primary preemption"),
+                0,
+                "the retry drains the rolled-back physical backlog"
+            );
+            lane.shutdown().await;
+            return;
+        }
         gate.release();
         let primary_guard = primary_guard.await.expect("join primary prune handoff");
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -40481,6 +40616,7 @@ mod tests {
     async fn consensus_log_prune_preemption_closes_the_window_before_delete() {
         assert_consensus_log_prune_primary_preemption_at_production_window(
             ConsensusLogPruneTurnGatePoint::BeforeDelete,
+            false,
         )
         .await;
     }
@@ -40490,6 +40626,7 @@ mod tests {
     async fn consensus_log_prune_preemption_rolls_back_a_mid_delete_interrupt() {
         assert_consensus_log_prune_primary_preemption_at_production_window(
             ConsensusLogPruneTurnGatePoint::MidDelete,
+            false,
         )
         .await;
     }
@@ -40499,6 +40636,7 @@ mod tests {
     async fn consensus_log_prune_preemption_closes_the_window_before_purged_read() {
         assert_consensus_log_prune_primary_preemption_at_production_window(
             ConsensusLogPruneTurnGatePoint::BeforeReadPurged,
+            false,
         )
         .await;
     }
@@ -40508,6 +40646,7 @@ mod tests {
     async fn consensus_log_prune_preemption_closes_the_window_before_authority_read() {
         assert_consensus_log_prune_primary_preemption_at_production_window(
             ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+            false,
         )
         .await;
     }
@@ -40517,6 +40656,17 @@ mod tests {
     async fn consensus_log_prune_preemption_closes_the_window_before_commit() {
         assert_consensus_log_prune_primary_preemption_at_production_window(
             ConsensusLogPruneTurnGatePoint::BeforeCommit,
+            false,
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_log_prune_cancelled_primary_preemption_retries_without_degradation() {
+        assert_consensus_log_prune_primary_preemption_at_production_window(
+            ConsensusLogPruneTurnGatePoint::BeforeAuthorityRead,
+            true,
         )
         .await;
     }

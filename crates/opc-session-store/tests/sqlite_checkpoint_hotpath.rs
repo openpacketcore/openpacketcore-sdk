@@ -285,12 +285,12 @@ fn reset_proactive_checkpoint_cadence(stores: &[ConsensusSessionStore]) -> usize
     batch
 }
 
-async fn write_one_proactive_checkpoint_cadence_batch(
+async fn write_proactive_checkpoint_operations(
     stores: &[ConsensusSessionStore],
     leader: usize,
-    batch: usize,
+    operations: usize,
 ) {
-    for _ in 0..batch {
+    for _ in 0..operations {
         tokio::time::timeout(
             FIXED_QUORUM_OPERATION_TIMEOUT,
             stores[leader].max_replication_sequence(),
@@ -299,6 +299,14 @@ async fn write_one_proactive_checkpoint_cadence_batch(
         .expect("accepted response completes while filling checkpoint cadence")
         .expect("fixed-quorum response succeeds while filling checkpoint cadence");
     }
+}
+
+async fn write_one_proactive_checkpoint_cadence_batch(
+    stores: &[ConsensusSessionStore],
+    leader: usize,
+    batch: usize,
+) {
+    write_proactive_checkpoint_operations(stores, leader, batch).await;
 }
 
 async fn shutdown_fixed_quorum(stores: &[ConsensusSessionStore], peers: &[Arc<LoopbackPeer>]) {
@@ -395,11 +403,33 @@ async fn green_proactive_checkpoint_main_sync_does_not_block_accepted_fixed_quor
     }
     let attempts_before = checkpoint_attempts(&stores);
     let completions_before = checkpoint_completions(&stores);
+
+    // One committed logical-time operation produces the same three durable
+    // write signals on every voter: log append, committed-index advance, and
+    // state-machine apply. Establish the exact one-signal-before-expiry state
+    // before arming the two-second VFS observation. The observed window then
+    // contains only the threshold-crossing operation, not 64 serial consensus
+    // round trips whose admission time is unrelated to checkpoint behavior.
+    const DURABLE_WRITE_SIGNALS_PER_LOGICAL_TIME_OPERATION: usize = 3;
+    assert_eq!(
+        (cadence_batch - 1) % DURABLE_WRITE_SIGNALS_PER_LOGICAL_TIME_OPERATION,
+        0,
+        "the fixed cadence retains an exact logical-time prefill boundary"
+    );
+    let prefill_operations = (cadence_batch - 1) / DURABLE_WRITE_SIGNALS_PER_LOGICAL_TIME_OPERATION;
+    write_proactive_checkpoint_operations(&stores, leader, prefill_operations).await;
+    for store in &stores {
+        assert_eq!(
+            store.proactive_checkpoint_cadence_remaining_for_test(),
+            Some(1),
+            "each voter is exactly one durable write from proactive checkpoint admission"
+        );
+    }
+
     let mut main_sync = block_test_main_sync();
     let stores_for_response = stores.clone();
     let response = tokio::spawn(async move {
-        write_one_proactive_checkpoint_cadence_batch(&stores_for_response, leader, cadence_batch)
-            .await;
+        write_proactive_checkpoint_operations(&stores_for_response, leader, 1).await;
     });
 
     assert!(

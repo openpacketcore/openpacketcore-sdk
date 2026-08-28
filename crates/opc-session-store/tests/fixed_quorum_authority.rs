@@ -366,12 +366,17 @@ async fn fixed_durable_quorum_rejects_unsupported_platform_before_durable_initia
     let members = fixed_members(3);
     let topology = fixed_topology(members).expect("fixed topology admission");
     let directory = tempfile::tempdir().expect("fixed platform test directory");
-    let database_path = directory.path().join("voter.sqlite");
+    let snapshot_dir = directory.path().join("must-not-exist");
+    // A file-backed backend performs Linux-only recovery-latch admission
+    // before the public fixed-quorum platform guard. Use the ephemeral
+    // backend so this test reaches that public guard and still proves that
+    // unsupported construction creates no snapshot or durable Raft state.
+    let backend = SqliteSessionBackend::in_memory().expect("ephemeral backend");
 
     let result = ConsensusSessionStore::open_fixed_durable_quorum(
         topology.clone(),
-        SqliteSessionBackend::open(&database_path).expect("file-backed voter store"),
-        directory.path().join("snapshots"),
+        backend,
+        snapshot_dir.clone(),
         scoped_peers(&topology),
     )
     .await;
@@ -379,18 +384,9 @@ async fn fixed_durable_quorum_rejects_unsupported_platform_before_durable_initia
         result,
         Err(ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform)
     ));
-
-    let connection = rusqlite::Connection::open(database_path).expect("open voter database");
-    let durable_raft_rows: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("query durable raft schema");
-    assert_eq!(
-        durable_raft_rows, 0,
-        "unsupported fixed quorum must fail before durable Raft initialization"
+    assert!(
+        !snapshot_dir.exists(),
+        "unsupported fixed quorum must fail before snapshot initialization"
     );
 }
 
