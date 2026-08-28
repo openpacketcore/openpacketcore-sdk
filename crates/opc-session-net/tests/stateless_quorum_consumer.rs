@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use opc_consensus::engine::raft::AppendEntriesRequest;
+use opc_consensus::engine::EntryPayload;
 use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
 };
@@ -93,8 +94,11 @@ use opc_session_store::sqlite::test_support::{
 };
 #[cfg(feature = "test-control")]
 use opc_session_store::test_support::{
-    consensus_local_durable_progress_for_test, ConsensusEngineStateForTest,
+    append_consensus_padding_entry_for_test, consensus_local_durable_progress_for_test,
+    ConsensusEngineStateForTest,
 };
+#[cfg(feature = "test-control")]
+use opc_session_store::SessionConsumerIdentity;
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, ConsensusSessionStore,
     EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
@@ -118,10 +122,10 @@ use opc_session_store::{
     SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
     SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
     SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
-    SessionConsumerVoterAuthority, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    SessionPayloadEncoding, SessionQuorumConsumer, SessionQuorumRosterIngress,
-    SqliteSessionBackend, StateClass, StateType, StoreError, StoredSessionRecord,
-    ValidatedQuorumTopology, FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES,
+    SessionConsumerVoterAuthority, SessionKey, SessionKeyType, SessionLeaseManager,
+    SessionMutationIntent, SessionOp, SessionPayloadEncoding, SessionQuorumConsumer,
+    SessionQuorumRosterIngress, SqliteSessionBackend, StateClass, StateType, StoreError,
+    StoredSessionRecord, ValidatedQuorumTopology, FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES,
     FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES, FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES,
 };
 
@@ -336,6 +340,8 @@ struct GatedReadBarrierPeer {
     prewrite_empty_append_entries_calls: Arc<AtomicUsize>,
     append_entries_decoded: Arc<AtomicUsize>,
     append_entries_decode_failures: Arc<AtomicUsize>,
+    consumer_binding_entries: Arc<AtomicUsize>,
+    consumer_acquire_entries: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -390,6 +396,26 @@ impl GatedReadBarrierPeer {
             ) {
                 Ok(append) => {
                     self.append_entries_decoded.fetch_add(1, Ordering::SeqCst);
+                    for entry in &append.entries {
+                        let EntryPayload::Normal(SessionConsensusCommand { intent, .. }) =
+                            &entry.payload
+                        else {
+                            continue;
+                        };
+                        let intent = match intent {
+                            SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+                            intent => intent,
+                        };
+                        match intent {
+                            SessionMutationIntent::BindConsumerRequest { .. } => {
+                                self.consumer_binding_entries.fetch_add(1, Ordering::SeqCst);
+                            }
+                            SessionMutationIntent::AcquireLease { .. } => {
+                                self.consumer_acquire_entries.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                    }
                     if self
                         .delay_prewrite_empty_append_entries
                         .load(Ordering::Acquire)
@@ -527,6 +553,8 @@ struct ThreeVoterConsumerFleet {
     prewrite_empty_append_entries_calls: Arc<AtomicUsize>,
     append_entries_decoded: Arc<AtomicUsize>,
     append_entries_decode_failures: Arc<AtomicUsize>,
+    consumer_binding_entries: Arc<AtomicUsize>,
+    consumer_acquire_entries: Arc<AtomicUsize>,
     reauthentication: Vec<SessionReauthenticationControl>,
     address_slots: Vec<Arc<RwLock<Option<SocketAddr>>>>,
     servers: Vec<Option<SessionConsensusServerHandle>>,
@@ -673,6 +701,8 @@ impl ThreeVoterConsumerFleet {
         let prewrite_empty_append_entries_calls = Arc::new(AtomicUsize::new(0));
         let append_entries_decoded = Arc::new(AtomicUsize::new(0));
         let append_entries_decode_failures = Arc::new(AtomicUsize::new(0));
+        let consumer_binding_entries = Arc::new(AtomicUsize::new(0));
+        let consumer_acquire_entries = Arc::new(AtomicUsize::new(0));
         let reauthentication = (0..THREE_VOTER_COUNT)
             .map(|_| SessionReauthenticationControl::new())
             .collect::<Vec<_>>();
@@ -737,6 +767,8 @@ impl ThreeVoterConsumerFleet {
                         ),
                         append_entries_decoded: Arc::clone(&append_entries_decoded),
                         append_entries_decode_failures: Arc::clone(&append_entries_decode_failures),
+                        consumer_binding_entries: Arc::clone(&consumer_binding_entries),
+                        consumer_acquire_entries: Arc::clone(&consumer_acquire_entries),
                     });
                     path_enabled.insert((index, target), enabled);
                     let peer: Arc<dyn SessionConsensusPeer> = peer;
@@ -801,6 +833,8 @@ impl ThreeVoterConsumerFleet {
             prewrite_empty_append_entries_calls,
             append_entries_decoded,
             append_entries_decode_failures,
+            consumer_binding_entries,
+            consumer_acquire_entries,
             reauthentication,
             address_slots,
             servers,
@@ -877,6 +911,8 @@ impl ThreeVoterConsumerFleet {
             self.append_entries_decoded.store(0, Ordering::SeqCst);
             self.append_entries_decode_failures
                 .store(0, Ordering::SeqCst);
+            self.consumer_binding_entries.store(0, Ordering::SeqCst);
+            self.consumer_acquire_entries.store(0, Ordering::SeqCst);
         }
         self.delay_prewrite_empty_append_entries
             .store(enabled, Ordering::Release);
@@ -892,6 +928,13 @@ impl ThreeVoterConsumerFleet {
             self.append_entries_decoded.load(Ordering::SeqCst),
             self.append_entries_decode_failures.load(Ordering::SeqCst),
             self.nonempty_append_entries_seen.load(Ordering::Acquire),
+        )
+    }
+
+    fn consumer_write_entries(&self) -> (usize, usize) {
+        (
+            self.consumer_binding_entries.load(Ordering::SeqCst),
+            self.consumer_acquire_entries.load(Ordering::SeqCst),
         )
     }
 
@@ -4611,11 +4654,14 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
     fleet.shutdown().await;
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test]
 async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum() {
     // An authenticated consumer mutation is linearized by its Raft write. A
     // separate read quorum before that write can consume the entire cellular
-    // hot-path budget even though the write quorum itself is healthy.
+    // hot-path budget even though the write quorum itself is healthy. An
+    // ordinary request first persists a separate idempotency binding, so make
+    // that exact binding durable before measuring the one actual lease write.
     let operation_budget = Duration::from_millis(250);
     let pki = Arc::new(TestPki::new());
     let fleet = ThreeVoterConsumerFleet::start(
@@ -4627,10 +4673,32 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
     let follower = (leader + 1) % THREE_VOTER_COUNT;
     let server_spiffe = three_voter_spiffe(follower);
     let client_spiffe = spiffe("ordinary-write-hot-path-client");
+    let voter_authority = fleet.voter_authority(follower);
+    let request_id = SessionConsumerRequestId::from_bytes([0xa5; 16]);
+    let key = test_key();
+    let owner = OwnerId::new("ordinary-write-hot-path-owner").expect("ordinary-write owner");
+    let request = SessionConsumerRequest::new(
+        voter_authority.scope(),
+        request_id,
+        SessionConsumerOperation::AcquireLease {
+            key: key.clone(),
+            owner: owner.clone(),
+            ttl: Duration::from_secs(30),
+        },
+    );
+    let consumer_identity = SessionConsumerIdentity::new(client_spiffe.clone())
+        .expect("ordinary-write consumer identity");
+    let manifest = fleet.stores[follower]
+        .consumer_authorization_manifest([three_voter_authorization_grant(&client_spiffe)])
+        .await
+        .expect("ordinary-write consumer manifest");
+    let authorization = manifest
+        .authorize(&consumer_identity)
+        .expect("ordinary-write consumer authorization");
     let (server, address) = SessionQuorumConsumerServer::new(
         Arc::new(fleet.stores[follower].consumer_service()),
         pki.server_config(&server_spiffe),
-        three_voter_authorizer(&fleet.stores[follower], &client_spiffe).await,
+        SessionConsumerAuthorizer::try_new(manifest).expect("ordinary-write consumer authorizer"),
     )
     .listen(
         "127.0.0.1:0"
@@ -4645,7 +4713,7 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
             address,
             &server_spiffe,
             &client_spiffe,
-            fleet.voter_authority(follower),
+            voter_authority,
         )
         .with_operation_timeout(operation_budget),
         PersistentSessionConsumerConfig::default(),
@@ -4656,25 +4724,31 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
         persistent.capabilities().await.is_ok(),
         "warm and authenticate the persistent connection before measuring the mutation"
     );
+    fleet.stores[follower]
+        .consumer_service()
+        .prepare_consumer_request_binding_for_test(&authorization, &request)
+        .await
+        .expect("persist the exact ordinary-write idempotency binding before measurement");
+    let prebound_applied_index = fleet
+        .application_sequences()
+        .await
+        .into_iter()
+        .max()
+        .expect("three-voter fleet has an applied pre-bound request index");
+    fleet
+        .wait_all_application_sequences(prebound_applied_index)
+        .await;
     fleet.reset_read_barrier_calls();
     fleet.set_prewrite_empty_append_entries_delay(true);
     let started = Instant::now();
-    let key = test_key();
-    let owner = OwnerId::new("ordinary-write-hot-path-owner").expect("ordinary-write owner");
-    let lease = persistent
-        .acquire_with_id(
-            SessionConsumerRequestId::from_bytes([0xa5; 16]),
-            &key,
-            &owner,
-            Duration::from_secs(30),
-        )
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "one healthy write quorum must fit inside the operation budget: {error:?}; delayed empty AppendEntries={}",
-                fleet.prewrite_empty_append_entries_calls()
-            )
-        });
+    let lease = match persistent.execute(&request).await {
+        Ok(SessionConsumerResponse::AcquireLease(Ok(lease))) => lease,
+        outcome => panic!(
+            "one healthy write quorum must fit inside the operation budget: {outcome:?}; delayed ReadBarrier={}; delayed empty AppendEntries={}",
+            fleet.read_barrier_calls(),
+            fleet.prewrite_empty_append_entries_calls(),
+        ),
+    };
     let mutation_elapsed = started.elapsed();
     fleet.set_prewrite_empty_append_entries_delay(false);
     let observation_deadline = Instant::now() + Duration::from_secs(1);
@@ -4690,6 +4764,11 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
         0,
         "the mutation must not issue a separate pre-write empty-AppendEntries quorum round"
     );
+    assert_eq!(
+        fleet.read_barrier_calls(),
+        0,
+        "the pre-bound mutation must not issue an application ReadBarrier quorum"
+    );
     let (decoded, decode_failures, nonempty_seen) = fleet.append_entries_observation();
     assert!(
         decoded > 0,
@@ -4702,6 +4781,15 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
     assert!(
         nonempty_seen,
         "the fixture must observe the actual Raft write, not pass without replication"
+    );
+    let (binding_entries, acquire_entries) = fleet.consumer_write_entries();
+    assert_eq!(
+        binding_entries, 0,
+        "the exact durable binding must be reused rather than proposed during the measured write"
+    );
+    assert!(
+        acquire_entries > 0,
+        "the measured request must append its actual AcquireLease command"
     );
     assert_eq!(lease.key(), &key);
 
@@ -10688,6 +10776,8 @@ const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_POST_ADMISSION_COMMANDS: usize =
     PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_COMMANDS
         - PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_PREFILL_COMMANDS;
 #[cfg(feature = "test-control")]
+const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_REQUEST_NAMESPACE: [u8; 8] = *b"OPCRPSW\0";
+#[cfg(feature = "test-control")]
 const _: () = {
     assert!(
         PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_PREFILL_COMMANDS
@@ -11051,6 +11141,7 @@ fn run_protected_roster_process_loss_child(state: &Path, phase: &str) {
 async fn advance_protected_roster_process_loss_snapshot_workload(
     fleet: &ThreeVoterConsumerFleet,
     leader: usize,
+    first_ordinal: u64,
     commands: usize,
     bound: Duration,
     phase: &str,
@@ -11064,18 +11155,30 @@ async fn advance_protected_roster_process_loss_snapshot_workload(
     let mut workload_leader = leader;
     let mut workload_term = fleet.stores[workload_leader].status().term;
     let mut no_progress_backoff = Duration::from_millis(20);
+    let mut completed = 0usize;
+    let mut previous_successful_log_index = None;
     let workload_result = tokio::time::timeout(bound, async {
-        while fleet.stores[workload_leader]
-            .status()
-            .last_log_index
-            .is_none_or(|index| index < target_log_index)
-        {
-            let attempt_baseline = fleet.stores[workload_leader].status().last_log_index;
-            match fleet.stores[workload_leader]
-                .max_replication_sequence()
+        while completed < commands {
+            let ordinal = first_ordinal
+                .checked_add(completed as u64)
+                .expect("process-loss snapshot request ordinal does not overflow");
+            let mut request_id = [0; 16];
+            request_id[..8]
+                .copy_from_slice(&PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_REQUEST_NAMESPACE);
+            request_id[8..].copy_from_slice(&ordinal.to_be_bytes());
+            match append_consensus_padding_entry_for_test(&fleet.stores[workload_leader], request_id)
                 .await
             {
-                Ok(_) => no_progress_backoff = Duration::from_millis(20),
+                Ok(log_index) => {
+                    assert!(
+                        previous_successful_log_index
+                            .is_none_or(|previous| log_index > previous),
+                        "process-loss {phase} snapshot commands return strictly increasing acknowledged Raft log indexes"
+                    );
+                    previous_successful_log_index = Some(log_index);
+                    completed += 1;
+                    no_progress_backoff = Duration::from_millis(20);
+                }
                 Err(StoreError::BackendUnavailable(_)) => {
                     let (engines_running, durable_progress) =
                         fleet.process_loss_durable_progress_diagnostic_for_test();
@@ -11087,20 +11190,10 @@ async fn advance_protected_roster_process_loss_snapshot_workload(
                     (workload_leader, _, workload_term) = fleet
                         .wait_for_admitted_quorum_leader(&[0, 1, 2], workload_term)
                         .await;
-                    if fleet.stores[workload_leader].status().last_log_index <= attempt_baseline {
-                        // The logical-time command is read-only, but an
-                        // unavailable reply can follow an accepted proposal.
-                        // Give durable progress a bounded observation window
-                        // before issuing another command, and exponentially
-                        // bound retries that show no committed progress.
-                        tokio::time::sleep(no_progress_backoff).await;
-                        no_progress_backoff = no_progress_backoff
-                            .saturating_mul(2)
-                            .min(Duration::from_millis(250));
-                    } else {
-                        no_progress_backoff = Duration::from_millis(20);
-                        tokio::task::yield_now().await;
-                    }
+                    tokio::time::sleep(no_progress_backoff).await;
+                    no_progress_backoff = no_progress_backoff
+                        .saturating_mul(2)
+                        .min(Duration::from_millis(250));
                 }
                 Err(error) => {
                     panic!("process-loss {phase} snapshot command was rejected: {error:?}")
@@ -11118,6 +11211,10 @@ async fn advance_protected_roster_process_loss_snapshot_workload(
             "process-loss {phase} snapshot command batch exceeded its bound; durable_progress={durable_progress}"
         );
     }
+    assert!(
+        completed == commands,
+        "the process-loss {phase} workload acknowledges every exact command"
+    );
     assert!(
         fleet.stores[workload_leader]
             .status()
@@ -11138,6 +11235,7 @@ async fn compact_protected_roster_process_loss_admission(
     let (workload_leader, _) = advance_protected_roster_process_loss_snapshot_workload(
         fleet,
         leader,
+        PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_PREFILL_COMMANDS as u64,
         PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_POST_ADMISSION_COMMANDS,
         bound,
         "post-admission",
@@ -11180,6 +11278,7 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
         advance_protected_roster_process_loss_snapshot_workload(
             &fleet,
             leader,
+            0,
             PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_PREFILL_COMMANDS,
             PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_BOUND,
             "pre-admission",

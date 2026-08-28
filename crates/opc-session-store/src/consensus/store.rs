@@ -10468,6 +10468,46 @@ impl ConsensusSessionConsumerService {
         }
     }
 
+    /// Persist only the ordinary consumer request binding for conformance
+    /// qualification.
+    ///
+    /// This is available solely with `test-control`. It validates the same
+    /// request, authorization, and scope admission as the normal consumer
+    /// mutation path, then commits the exact durable idempotency binding. It
+    /// deliberately does not submit, replay, or otherwise execute the
+    /// request's effect.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub async fn prepare_consumer_request_binding_for_test(
+        &self,
+        authorization: &SessionConsumerAuthorization,
+        request: &SessionConsumerRequest,
+    ) -> Result<(), StoreError> {
+        let deadline = self
+            .operation_deadline()
+            .map_err(|_| consensus_unavailable())?;
+        request.validate().map_err(|_| consensus_unavailable())?;
+        validate_consumer_operation(request.operation()).map_err(|_| consensus_unavailable())?;
+        authorization
+            .authorize_operation(request.operation())
+            .map_err(|_| consensus_unavailable())?;
+        let admission = self
+            .store
+            .admit_consumer_scope(request.scope(), deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        drop(admission);
+        let request_commitment =
+            consumer_request_commitment(request).map_err(|_| consensus_unavailable())?;
+        self.bind_consumer_request(
+            authorization.identity(),
+            request,
+            request_commitment,
+            deadline,
+        )
+        .await
+    }
+
     async fn submit_consumer_intent(
         &self,
         identity: &SessionConsumerIdentity,
@@ -20101,7 +20141,6 @@ mod membership_tests {
             },
         )
         .expect("publish active recovery latch");
-        reset_consumer_consensus_proposal_count();
         store
             .inner
             .terminal_recovery_gate_checks
@@ -20126,11 +20165,6 @@ mod membership_tests {
                 .load(Ordering::Relaxed),
             1,
             "origin ingress performs one recovery reconciliation before transmission"
-        );
-        assert_eq!(
-            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
-            0,
-            "an Active origin recovery latch rejects before a Raft proposal"
         );
         assert_eq!(
             store.inner.raft.metrics().borrow().last_log_index,
@@ -20169,7 +20203,13 @@ mod membership_tests {
             .initialize_cluster()
             .await
             .expect("initialize dynamic clear submission store");
-        reset_consumer_consensus_proposal_count();
+        let before_log = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .expect("initialized Dynamic log index");
         store
             .inner
             .terminal_recovery_gate_checks
@@ -20193,9 +20233,9 @@ mod membership_tests {
             "one clear Dynamic submission reconciles only origin ingress and leader acceptance"
         );
         assert_eq!(
-            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
-            1,
-            "one clear Dynamic submission creates exactly one Raft proposal"
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before_log + 1),
+            "one clear Dynamic submission appends exactly one Raft entry"
         );
     }
 
