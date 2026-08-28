@@ -6166,16 +6166,17 @@ mod tests {
 
     fn concurrent_roster_create(stable_id: &str) -> ReplicationOp {
         let key = qualification_key(stable_id).expect("concurrent key");
+        let state_type =
+            opc_session_testkit::qualification::qualification_concurrent_state_type(stable_id)
+                .expect("history-derived concurrent state type");
         let record = StoredSessionRecord {
             key: key.clone(),
             generation: Generation::new(1),
             owner: OwnerId::new("concurrent-owner").expect("concurrent owner"),
             fence: opc_session_store::FenceToken::new(1),
             state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::new(format!(
-                "{QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX}roster-create"
-            ))
-            .expect("concurrent state type"),
+            state_type: StateType::new(state_type.as_str().to_owned())
+                .expect("validated concurrent state type"),
             expires_at: None,
             payload: EncryptedSessionPayload::new(b"concurrent-roster-create"),
         };
