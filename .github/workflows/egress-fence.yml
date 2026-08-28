@@ -136,7 +136,30 @@ jobs:
             --test-threads=4 \
             --exact \
             --skip consensus::store::membership_tests::protected_roster_ingress_has_two_mutations_and_read_only_status_paths \
-            --skip sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch
+            --skip sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch \
+            --skip lagging_replica_installs_compacted_snapshot_without_losing_committed_state \
+            --skip fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
+          # Snapshot installation owns process-wide test controls and durable
+          # voter state. Match the main CI shard by running these proofs in
+          # fresh, single-test processes outside the shared teardown queue.
+          cargo test --locked \
+            -p opc-session-store \
+            --all-features \
+            --quiet \
+            --test consensus_openraft \
+            -- \
+            --test-threads=1 \
+            --exact \
+            lagging_replica_installs_compacted_snapshot_without_losing_committed_state
+          cargo test --locked \
+            -p opc-session-store \
+            --all-features \
+            --quiet \
+            --test consensus_openraft \
+            -- \
+            --test-threads=1 \
+            --exact \
+            fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
           # This exact 1,025-roster proof dominates the debug unit-test
           # process and can exhaust the fixed job bound while unrelated tests
           # occupy its worker threads. Preserve the full cardinality and run
