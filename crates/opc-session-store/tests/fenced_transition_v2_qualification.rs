@@ -2049,7 +2049,7 @@ fn bounded_directory_measure(path: &Path) -> (u64, u64) {
                     openat(
                         directory,
                         name,
-                        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        qualification_nofollow_metadata_flags(),
                         Mode::empty(),
                     )
                     .expect("open qualification regular file without following links"),
@@ -2095,8 +2095,21 @@ fn directory_bytes(path: &Path) -> u64 {
     bounded_directory_measure(path).0
 }
 
+fn qualification_nofollow_metadata_flags() -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+
+    #[cfg(target_os = "linux")]
+    {
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    }
+}
+
 fn sqlite_database_family_bytes(path: &Path) -> u64 {
-    use rustix::fs::{fstat, openat, FileType, Mode, OFlags, CWD};
+    use rustix::fs::{fstat, openat, FileType, Mode, CWD};
 
     ["", "-wal", "-shm", "-journal"]
         .into_iter()
@@ -2107,7 +2120,7 @@ fn sqlite_database_family_bytes(path: &Path) -> u64 {
             match openat(
                 CWD,
                 &candidate,
-                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                qualification_nofollow_metadata_flags(),
                 Mode::empty(),
             ) {
                 Ok(descriptor) => {
@@ -2139,7 +2152,7 @@ fn sqlite_database_family_bytes(path: &Path) -> u64 {
 }
 
 fn sqlite_database_family_artifacts(path: &Path) -> u64 {
-    use rustix::fs::{fstat, openat, FileType, Mode, OFlags, CWD};
+    use rustix::fs::{fstat, openat, FileType, Mode, CWD};
 
     ["", "-wal", "-shm", "-journal"]
         .into_iter()
@@ -2150,7 +2163,7 @@ fn sqlite_database_family_artifacts(path: &Path) -> u64 {
             match openat(
                 CWD,
                 &candidate,
-                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                qualification_nofollow_metadata_flags(),
                 Mode::empty(),
             ) {
                 Ok(descriptor) => {
@@ -5378,12 +5391,32 @@ impl EvidenceArtifactIdentity {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn rustix_identity(stat: rustix::fs::Stat) -> EvidenceArtifactIdentity {
     EvidenceArtifactIdentity {
         device: stat.st_dev,
         inode: stat.st_ino,
         size: u64::try_from(stat.st_size).expect("evidence artifact size is nonnegative"),
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rustix_identity(stat: rustix::fs::Stat) -> EvidenceArtifactIdentity {
+    EvidenceArtifactIdentity {
+        device: u64::try_from(stat.st_dev).expect("evidence artifact device is nonnegative"),
+        inode: stat.st_ino,
+        size: u64::try_from(stat.st_size).expect("evidence artifact size is nonnegative"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn rustix_private_mode(stat: rustix::fs::Stat) -> u32 {
+    stat.st_mode & 0o777
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn rustix_private_mode(stat: rustix::fs::Stat) -> u32 {
+    (stat.st_mode & 0o777) as u32
 }
 
 fn pinned_parent_file(
@@ -5679,9 +5712,10 @@ fn validate_wrapper_lease_file(
         .map_err(|_| "stat trusted wrapper lease pathname without following links")?;
     for stat in [descriptor, pathname] {
         require_current_user_private_regular_file(stat, "trusted wrapper qualification lease")?;
-        if stat.st_dev != pin.device
-            || stat.st_ino != pin.inode
-            || stat.st_mode & 0o777 != pin.mode
+        let identity = rustix_identity(stat);
+        if identity.device != pin.device
+            || identity.inode != pin.inode
+            || rustix_private_mode(stat) != pin.mode
             || stat.st_uid != pin.uid
         {
             return Err("trusted wrapper lease descriptor or pathname identity changed");
@@ -5704,9 +5738,10 @@ fn open_trusted_wrapper_lease_procfd(pin: &WrapperLeasePin) -> Result<File, &'st
     use rustix::fs::fstat;
     let stat = fstat(&file).map_err(|_| "fstat trusted wrapper lease procfd")?;
     require_current_user_private_regular_file(stat, "trusted wrapper lease procfd")?;
-    if stat.st_dev as u64 != pin.device
-        || stat.st_ino as u64 != pin.inode
-        || stat.st_mode & 0o777 != pin.mode
+    let identity = rustix_identity(stat);
+    if identity.device != pin.device
+        || identity.inode != pin.inode
+        || rustix_private_mode(stat) != pin.mode
         || stat.st_uid != pin.uid
     {
         return Err("trusted wrapper lease procfd identity changed");
@@ -5751,7 +5786,10 @@ impl QualificationHostLease {
             parent_stat,
             "trusted wrapper qualification lease parent",
         )?;
-        if parent_stat.st_dev != self.parent_device || parent_stat.st_ino != self.parent_inode {
+        let parent_identity = rustix_identity(parent_stat);
+        if parent_identity.device != self.parent_device
+            || parent_identity.inode != self.parent_inode
+        {
             return Err("trusted wrapper lease parent descriptor identity changed");
         }
         validate_wrapper_lease_file(&self.parent, &self.lease_name, &self.lock, &pin)?;
@@ -10522,7 +10560,7 @@ fn existing_release_evidence_namespace_validation_is_read_only_and_strict() {
 
 #[test]
 fn bounded_nofollow_evidence_reads_reject_fifo_device_growth_and_oversize() {
-    use rustix::fs::{mkfifoat, Mode};
+    use nix::{sys::stat::Mode, unistd::mkfifoat};
 
     let root = tempfile::tempdir().expect("bounded evidence read root");
     let parent_path = root.path().join("parent");
@@ -10531,7 +10569,8 @@ fn bounded_nofollow_evidence_reads_reject_fifo_device_growth_and_oversize() {
     let parent = pinned_parent_file(&parent_path, parent_metadata.dev(), parent_metadata.ino())
         .expect("open bounded evidence parent");
 
-    mkfifoat(&parent, "candidate.fifo", Mode::RUSR | Mode::WUSR).expect("create bounded-read FIFO");
+    mkfifoat(&parent, "candidate.fifo", Mode::S_IRUSR | Mode::S_IWUSR)
+        .expect("create bounded-read FIFO");
     assert!(
         read_bounded_nofollow_regular_file(&parent, OsStr::new("candidate.fifo"), 16, "FIFO")
             .is_err(),
@@ -10596,7 +10635,8 @@ fn bounded_nofollow_evidence_reads_reject_fifo_device_growth_and_oversize() {
 
 #[test]
 fn private_lease_descriptor_rejects_a_fifo_and_a_shared_parent() {
-    use rustix::fs::{mkfifoat, openat, Mode, OFlags};
+    use nix::{sys::stat::Mode as NixMode, unistd::mkfifoat};
+    use rustix::fs::{openat, Mode, OFlags};
 
     let root = tempfile::tempdir().expect("private lease root");
     let parent_path = root.path().join("lease-parent");
@@ -10621,7 +10661,7 @@ fn private_lease_descriptor_rejects_a_fifo_and_a_shared_parent() {
         "private lease parent",
     )
     .expect("open private lease parent");
-    mkfifoat(&parent, "lease", Mode::RUSR | Mode::WUSR).expect("create lease FIFO");
+    mkfifoat(&parent, "lease", NixMode::S_IRUSR | NixMode::S_IWUSR).expect("create lease FIFO");
     let fifo = File::from(
         openat(
             &parent,

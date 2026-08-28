@@ -701,6 +701,7 @@ impl fmt::Debug for ForwardMutationReply {
 enum ConsensusPeerCallFailure {
     BeforeTransmission,
     AfterTransmission,
+    AuthenticatedRejection(SessionConsensusPeerError),
 }
 
 /// Proven placement of a mutation relative to the leader proposal boundary.
@@ -802,6 +803,13 @@ enum FencedTransitionV2CapabilityReply {
         profile_digest: [u8; 32],
     },
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencedTransitionV2CapabilityProbeOutcome {
+    Exact,
+    Unsupported,
+    Unavailable,
 }
 
 fn fenced_transition_v2_capability_probe_reply(
@@ -3814,29 +3822,38 @@ impl ConsensusSessionStore {
             .copied()
             .filter(|member| *member != self.inner.local_node_id)
             .map(|member| async move {
-                self.call_peer::<_, FencedTransitionV2CapabilityReply>(
-                    member,
-                    SessionConsensusRpcFamily::ReadBarrier,
-                    &FencedTransitionV2CapabilityProbe {
-                        schema_version: FENCED_TRANSITION_SCHEMA_V2,
-                        profile_digest,
-                    },
-                    deadline,
-                )
-                .await
-            });
-        if futures_util::future::join_all(probes)
-            .await
-            .into_iter()
-            .any(|reply| {
-                !matches!(
-                    reply,
+                match self
+                    .call_peer::<_, FencedTransitionV2CapabilityReply>(
+                        member,
+                        SessionConsensusRpcFamily::ReadBarrier,
+                        &FencedTransitionV2CapabilityProbe {
+                            schema_version: FENCED_TRANSITION_SCHEMA_V2,
+                            profile_digest,
+                        },
+                        deadline,
+                    )
+                    .await
+                {
                     Ok(FencedTransitionV2CapabilityReply::V2 {
                         profile_digest: received,
-                    }) if received == profile_digest
-                )
-            })
-        {
+                    }) if received == profile_digest => {
+                        FencedTransitionV2CapabilityProbeOutcome::Exact
+                    }
+                    Ok(FencedTransitionV2CapabilityReply::V2 { .. })
+                    | Ok(FencedTransitionV2CapabilityReply::Unsupported) => {
+                        FencedTransitionV2CapabilityProbeOutcome::Unsupported
+                    }
+                    Err(ConsensusPeerCallFailure::AuthenticatedRejection(
+                        SessionConsensusPeerError::Protocol,
+                    )) => FencedTransitionV2CapabilityProbeOutcome::Unsupported,
+                    Err(_) => FencedTransitionV2CapabilityProbeOutcome::Unavailable,
+                }
+            });
+        let outcomes = futures_util::future::join_all(probes).await;
+        if outcomes.contains(&FencedTransitionV2CapabilityProbeOutcome::Unavailable) {
+            return Err(consensus_unavailable());
+        }
+        if outcomes.contains(&FencedTransitionV2CapabilityProbeOutcome::Unsupported) {
             return Err(unsupported_fenced_transition_v2());
         }
         if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
@@ -6359,7 +6376,8 @@ impl ConsensusSessionStore {
                     .await
                 } {
                     Ok(reply) => reply,
-                    Err(ConsensusPeerCallFailure::AfterTransmission) => {
+                    Err(ConsensusPeerCallFailure::AfterTransmission)
+                    | Err(ConsensusPeerCallFailure::AuthenticatedRejection(_)) => {
                         // The peer abstraction cannot prove that a failed call
                         // stopped before delivery. Retrying this same durable
                         // request ID is safe; returning a generic unavailable
@@ -6524,7 +6542,8 @@ impl ConsensusSessionStore {
                     // The deterministic cluster-scope request ID makes a
                     // later startup retry idempotent, but this invocation
                     // does not replay after an ambiguous transmit boundary.
-                    Err(ConsensusPeerCallFailure::AfterTransmission) => {
+                    Err(ConsensusPeerCallFailure::AfterTransmission)
+                    | Err(ConsensusPeerCallFailure::AuthenticatedRejection(_)) => {
                         return Err(consensus_unavailable());
                     }
                     Err(ConsensusPeerCallFailure::BeforeTransmission) => {
@@ -6637,7 +6656,8 @@ impl ConsensusSessionStore {
                     .await
                 {
                     Ok(reply) => reply,
-                    Err(ConsensusPeerCallFailure::AfterTransmission) => {
+                    Err(ConsensusPeerCallFailure::AfterTransmission)
+                    | Err(ConsensusPeerCallFailure::AuthenticatedRejection(_)) => {
                         // A valid preflight may have committed only its logical
                         // time floor. Never run provider work without a
                         // definitive acknowledgement; an outer retry is safe.
@@ -7971,7 +7991,7 @@ impl ConsensusSessionStore {
             .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
         let payload = response
             .result
-            .map_err(|_| ConsensusPeerCallFailure::AfterTransmission)?;
+            .map_err(ConsensusPeerCallFailure::AuthenticatedRejection)?;
         decode_bounded(&payload).map_err(|_| ConsensusPeerCallFailure::AfterTransmission)
     }
 
@@ -8312,7 +8332,8 @@ impl ConsensusSessionStore {
             // the frozen cohort or retain a ticket/authority cache to make a
             // subsequent attempt appear safe.
             Err(ConsensusPeerCallFailure::BeforeTransmission)
-            | Err(ConsensusPeerCallFailure::AfterTransmission) => {
+            | Err(ConsensusPeerCallFailure::AfterTransmission)
+            | Err(ConsensusPeerCallFailure::AuthenticatedRejection(_)) => {
                 FencedTransitionV2StatusLogicalTimeTicketReply::Unavailable
             }
         }
