@@ -6275,8 +6275,7 @@ async fn authenticated_consumer_v2_recovers_journaled_protected_transition_after
 // multithreaded runtime so this remains the production topology rather than a
 // serial in-process approximation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal(
-) {
+async fn persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal() {
     let pki = Arc::new(TestPki::new());
     let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
         Arc::clone(&pki),
@@ -6321,20 +6320,10 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
     .await
     .expect("start maximum protected-roster listener");
 
-    // Establish the incumbent record through the public SessionBackend
-    // boundary. The protected roster is therefore a real checked successor,
-    // never a direct test insertion into SQLite or consensus state.
-    let setup_directory = tempfile::tempdir().expect("protected-roster journal directory");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(
-            setup_directory.path(),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .expect("private protected-roster journal directory");
-    }
+    // Acquire authority through the public SessionBackend boundary while
+    // deliberately leaving the authoritative session row absent. The roster
+    // admission itself must reserve that exact absence; a synthetic pre-seed
+    // would leave fresh product sessions unable to use this contract.
     let setup_provider = CountingKeyProvider::with_active_session_key();
     let setup_client = consumer_client(
         &pki,
@@ -6343,60 +6332,28 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
         &client_spiffe,
         voter_authority.clone(),
     );
-    let setup_physical: Arc<dyn SessionBackend> = Arc::new(
-        SessionConsumerFencedTransitionBackend::stateless(setup_client)
-            .expect("public stateless SessionBackend"),
-    );
-    let setup_outer: Arc<dyn SessionBackend> = Arc::new(
-        EncryptingSessionBackend::new(
-            setup_physical,
-            Arc::clone(&setup_provider),
-            "three-voter-protected-roster",
-        )
-        .with_fenced_transition_journal(Arc::new(
-            PreparedFencedTransitionJournal::create_new(
-                setup_directory.path().join("prepared.sqlite"),
-                PreparedFencedTransitionJournalKey::from_bytes([0x7a; 32]),
-            )
-            .expect("create protected-roster SessionBackend journal"),
-        )),
-    );
     let key = test_key();
     let owner = OwnerId::new("three-voter-roster-owner").expect("roster owner");
-    let setup_lease = FencedTransitionLease::acquire(
-        key.clone(),
-        owner.clone(),
-        FenceToken::new(0),
-        Duration::from_secs(60),
-    )
-    .expect("incumbent roster lease");
-    let setup = FencedTransitionRequest::new(
-        FencedTransitionRequestId::from_bytes([0xb1; 16]),
-        setup_lease.clone(),
-        FencedTransitionMutation::create(StoredSessionRecord {
-            key: key.clone(),
-            generation: Generation::new(1),
-            owner: owner.clone(),
-            fence: setup_lease
-                .committed_fence()
-                .expect("incumbent roster fence"),
-            state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::from_static("three-voter-roster-current"),
-            expires_at: None,
-            payload: EncryptedSessionPayload::new([0x51]),
-        }),
-    )
-    .expect("incumbent protected roster record");
-    let setup = setup_outer
-        .prepare_fenced_transition(setup)
+    let roster_lease = setup_client
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xb1; 16]),
+            key.clone(),
+            owner.clone(),
+            Duration::from_secs(60),
+        )
         .await
-        .expect("prepare incumbent through SessionBackend");
-    let setup = setup_outer
-        .fenced_transition(&setup)
-        .await
-        .expect("commit incumbent through SessionBackend");
-    let roster_lease = setup.lease().clone();
-    let roster_generation = setup.committed_generation();
+        .expect("fresh absent-record roster lease");
+    let roster_generation = Generation::new(1);
+    for store in &fleet.stores {
+        assert!(
+            store
+                .get(&key)
+                .await
+                .expect("fresh authoritative read")
+                .is_none(),
+            "lease acquisition must not pre-seed the protected business row"
+        );
+    }
     let sequence_before = fleet.application_sequences().await[leader];
     let log_before = fleet.stores[leader]
         .status()
@@ -6435,7 +6392,7 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
     let terminal_state_type = StateType::from_static("three-voter-roster-established");
     let mut expected_terminal = StoredSessionRecord {
         key: key.clone(),
-        generation: roster_generation.next().expect("terminal generation"),
+        generation: roster_generation,
         owner: owner.clone(),
         fence: roster_lease.fence(),
         state_class: StateClass::AuthoritativeSession,
