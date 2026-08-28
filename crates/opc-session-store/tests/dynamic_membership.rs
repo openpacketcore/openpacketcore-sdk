@@ -83,7 +83,6 @@ impl Clock for MutableClock {
 #[tokio::test]
 async fn public_dynamic_consensus_rejects_unsupported_platform_before_durable_initialization() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let database = directory.path().join("standalone.sqlite");
     let snapshot_dir = directory.path().join("must-not-exist");
     let descriptor = member(0);
     let cluster_id =
@@ -95,7 +94,11 @@ async fn public_dynamic_consensus_rejects_unsupported_platform_before_durable_in
         identity,
     )
     .expect("valid lab singleton");
-    let backend = SqliteSessionBackend::open(&database).expect("standalone backend");
+    // A file-backed backend itself performs Linux-only recovery-latch
+    // authority admission. This public unsupported-platform boundary must
+    // reach `ConsensusSessionStore::open` before any durable initialization,
+    // so use the ephemeral fixture accepted by that boundary instead.
+    let backend = SqliteSessionBackend::in_memory().expect("ephemeral backend");
 
     let result = ConsensusSessionStore::open(
         topology,
@@ -111,18 +114,6 @@ async fn public_dynamic_consensus_rejects_unsupported_platform_before_durable_in
     assert!(
         !snapshot_dir.exists(),
         "unsupported construction must not create a snapshot directory"
-    );
-    let conn = rusqlite::Connection::open(database).expect("inspect standalone database");
-    let consensus_identity_tables: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("inspect consensus schema");
-    assert_eq!(
-        consensus_identity_tables, 0,
-        "unsupported construction must not create consensus schema state"
     );
 }
 
