@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Create-only absent-predecessor protected roster — `opc-session-net`,
+  `opc-session-store`:** adds an independent Profile V2 for the case where the
+  authoritative session row must not exist before admission. The exact
+  persistent `opc-session-consumer/4` lane uses consumer revision 6 and
+  schema 2, requires unanimous explicit V2 activation on every fixed-durable
+  voter, and fails closed instead of downgrading to the frozen present-row
+  `/3` profile. Its first atomic `PollAdmitted` mutation authenticates the
+  exact tenant/scope/key/owner/current fence and reserves proven key absence;
+  its second and only other roster mutation either re-proves absence and
+  inserts the SDK-fixed generation-one checkpoint with an exact retained
+  `Established` receipt, or retains exact nonpublishing `Aborted` bytes while
+  leaving the key absent. Provider execution, status, adoption, reconciliation,
+  compensation, and publication remain outside consensus. Ambiguous writes
+  are status/adoption-only, `NotFound` is non-exclusionary, and only a direct
+  proven-`NotTransmitted` result permits an identical-byte retransmission.
+  The startup-owned
+  `from_fenced_mutation_roster_v2_stateless` /
+  `into_fenced_mutation_roster_v2_provider_adapter` composition retains one
+  bounded persistent pool and one provider set for an exact authority scope;
+  no per-call client or network setup is exposed. V2 has distinct canonical,
+  activation, admission, reservation, terminal, snapshot, and recovery
+  carriers, so no V1 object or certificate can authorize it.
+
+  Compatibility note: frozen V1 `/3` bytes, API behavior, schema 1, and durable
+  format 4 remain unchanged. Activating V2 advances that replica to durable
+  format 5. The new create-only consensus operation adds a public
+  `ReplicationOp` variant and advances the exact direct wire-schema revision
+  from 7 to 8, so exhaustive downstream matches must be updated and every
+  participant must use a coordinated drained stop/upgrade/start. Mixed
+  revision, mixed V2-capability, stale-activation, or prospective-learner
+  admission fails before topology or roster mutation.
 - **Bounded protected atomic fenced-mutation roster — `opc-session-net`,
   `opc-session-store`:** adds an opt-in revision-five persistent mTLS consumer
   profile for one immutable roster of up to eight generic opaque provider
