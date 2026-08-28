@@ -22,7 +22,10 @@ use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
 };
 #[cfg(feature = "test-control")]
-use opc_consensus::{DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROFILE};
+use opc_consensus::{
+    DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROFILE,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 #[cfg(feature = "test-control")]
 use opc_key::{
@@ -97,8 +100,6 @@ use opc_session_store::test_support::{
     append_consensus_padding_entry_for_test, consensus_local_durable_progress_for_test,
     ConsensusEngineStateForTest,
 };
-#[cfg(feature = "test-control")]
-use opc_session_store::SessionConsumerIdentity;
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, ConsensusSessionStore,
     EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
@@ -127,6 +128,12 @@ use opc_session_store::{
     SessionQuorumRosterIngress, SqliteSessionBackend, StateClass, StateType, StoreError,
     StoredSessionRecord, ValidatedQuorumTopology, FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES,
     FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES, FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES,
+};
+#[cfg(feature = "test-control")]
+use opc_session_store::{
+    SessionConsumerIdentity, SessionConsumerLeaseMutationOperation,
+    SessionConsumerLeaseMutationRequest, SessionConsumerLeaseMutationResult,
+    SessionConsumerLeaseMutationStatus,
 };
 
 use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
@@ -1520,6 +1527,7 @@ struct CommitThenLoseConsumerResponse {
     roster_ingress: Option<Arc<dyn SessionQuorumRosterIngress>>,
     lose_transition: AtomicBool,
     lose_status: AtomicBool,
+    lose_lease_acquire: AtomicBool,
     lose_roster_admission: AtomicBool,
     lose_roster_terminal: AtomicBool,
     transition_committed: tokio::sync::Notify,
@@ -1528,6 +1536,9 @@ struct CommitThenLoseConsumerResponse {
     roster_terminal_committed: tokio::sync::Notify,
     transition_calls: AtomicUsize,
     status_calls: AtomicUsize,
+    lease_acquire_calls: AtomicUsize,
+    lease_acquire_recorded_responses: AtomicUsize,
+    lease_status_calls: AtomicUsize,
     roster_admission_calls: AtomicUsize,
     roster_terminal_calls: AtomicUsize,
     roster_admission_recorded_responses: AtomicUsize,
@@ -1561,6 +1572,7 @@ impl CommitThenLoseConsumerResponse {
             roster_ingress: None,
             lose_transition: AtomicBool::new(true),
             lose_status: AtomicBool::new(false),
+            lose_lease_acquire: AtomicBool::new(false),
             lose_roster_admission: AtomicBool::new(false),
             lose_roster_terminal: AtomicBool::new(false),
             transition_committed: tokio::sync::Notify::new(),
@@ -1569,6 +1581,9 @@ impl CommitThenLoseConsumerResponse {
             roster_terminal_committed: tokio::sync::Notify::new(),
             transition_calls: AtomicUsize::new(0),
             status_calls: AtomicUsize::new(0),
+            lease_acquire_calls: AtomicUsize::new(0),
+            lease_acquire_recorded_responses: AtomicUsize::new(0),
+            lease_status_calls: AtomicUsize::new(0),
             roster_admission_calls: AtomicUsize::new(0),
             roster_terminal_calls: AtomicUsize::new(0),
             roster_admission_recorded_responses: AtomicUsize::new(0),
@@ -1601,6 +1616,7 @@ impl CommitThenLoseConsumerResponse {
             roster_ingress: None,
             lose_transition: AtomicBool::new(false),
             lose_status: AtomicBool::new(true),
+            lose_lease_acquire: AtomicBool::new(false),
             lose_roster_admission: AtomicBool::new(false),
             lose_roster_terminal: AtomicBool::new(false),
             transition_committed: tokio::sync::Notify::new(),
@@ -1609,6 +1625,9 @@ impl CommitThenLoseConsumerResponse {
             roster_terminal_committed: tokio::sync::Notify::new(),
             transition_calls: AtomicUsize::new(0),
             status_calls: AtomicUsize::new(0),
+            lease_acquire_calls: AtomicUsize::new(0),
+            lease_acquire_recorded_responses: AtomicUsize::new(0),
+            lease_status_calls: AtomicUsize::new(0),
             roster_admission_calls: AtomicUsize::new(0),
             roster_terminal_calls: AtomicUsize::new(0),
             roster_admission_recorded_responses: AtomicUsize::new(0),
@@ -1656,6 +1675,15 @@ impl CommitThenLoseConsumerResponse {
         Self::roster_loss(inner, roster_ingress, false, false)
     }
 
+    fn roster_passthrough_with_lost_lease_acquire(
+        inner: Arc<dyn SessionQuorumConsumer>,
+        roster_ingress: Arc<dyn SessionQuorumRosterIngress>,
+    ) -> Self {
+        let transport = Self::roster_loss(inner, roster_ingress, false, false);
+        transport.lose_lease_acquire.store(true, Ordering::SeqCst);
+        transport
+    }
+
     fn roster_loss(
         inner: Arc<dyn SessionQuorumConsumer>,
         roster_ingress: Arc<dyn SessionQuorumRosterIngress>,
@@ -1667,6 +1695,7 @@ impl CommitThenLoseConsumerResponse {
             roster_ingress: Some(roster_ingress),
             lose_transition: AtomicBool::new(false),
             lose_status: AtomicBool::new(false),
+            lose_lease_acquire: AtomicBool::new(false),
             lose_roster_admission: AtomicBool::new(lose_roster_admission),
             lose_roster_terminal: AtomicBool::new(lose_roster_terminal),
             transition_committed: tokio::sync::Notify::new(),
@@ -1675,6 +1704,9 @@ impl CommitThenLoseConsumerResponse {
             roster_terminal_committed: tokio::sync::Notify::new(),
             transition_calls: AtomicUsize::new(0),
             status_calls: AtomicUsize::new(0),
+            lease_acquire_calls: AtomicUsize::new(0),
+            lease_acquire_recorded_responses: AtomicUsize::new(0),
+            lease_status_calls: AtomicUsize::new(0),
             roster_admission_calls: AtomicUsize::new(0),
             roster_terminal_calls: AtomicUsize::new(0),
             roster_admission_recorded_responses: AtomicUsize::new(0),
@@ -1717,6 +1749,14 @@ impl SessionQuorumConsumer for CommitThenLoseConsumerResponse {
             request.operation(),
             SessionConsumerOperation::FencedTransitionStatus { .. }
         );
+        let lease_acquire = matches!(
+            request.operation(),
+            SessionConsumerOperation::AcquireLease { .. }
+        );
+        let lease_status = matches!(
+            request.operation(),
+            SessionConsumerOperation::LeaseMutationStatus { .. }
+        );
         let response = self.inner.execute(identity, request).await;
         if transition {
             self.transition_calls.fetch_add(1, Ordering::SeqCst);
@@ -1743,6 +1783,23 @@ impl SessionQuorumConsumer for CommitThenLoseConsumerResponse {
                 self.status_resolved.notify_waiters();
                 std::future::pending().await
             }
+        }
+        if lease_acquire {
+            self.lease_acquire_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(response, SessionConsumerResponse::AcquireLease(Ok(_))) {
+                self.lease_acquire_recorded_responses
+                    .fetch_add(1, Ordering::SeqCst);
+                if self
+                    .lose_lease_acquire
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    std::future::pending().await
+                }
+            }
+        }
+        if lease_status {
+            self.lease_status_calls.fetch_add(1, Ordering::SeqCst);
         }
         response
     }
@@ -10778,6 +10835,9 @@ const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_POST_ADMISSION_COMMANDS: usize =
 #[cfg(feature = "test-control")]
 const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_REQUEST_NAMESPACE: [u8; 8] = *b"OPCRPSW\0";
 #[cfg(feature = "test-control")]
+const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_MAX_IN_FLIGHT: usize =
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS / 2;
+#[cfg(feature = "test-control")]
 const _: () = {
     assert!(
         PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_PREFILL_COMMANDS
@@ -10786,6 +10846,11 @@ const _: () = {
     assert!(
         PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_COMMANDS
             > DURABLE_OPENRAFT_PROFILE.logs_per_snapshot as usize
+    );
+    assert!(PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_MAX_IN_FLIGHT > 0);
+    assert!(
+        PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_MAX_IN_FLIGHT
+            < DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS
     );
 };
 #[cfg(feature = "test-control")]
@@ -10949,6 +11014,101 @@ async fn wait_for_protected_roster_process_loss_lease_expiry(guard: &LeaseGuard,
     )
     .await
     .unwrap_or_else(|_| panic!("{phase} waits only for its prior held lease to expire"));
+}
+
+#[cfg(feature = "test-control")]
+async fn acquire_protected_roster_process_loss_successor(
+    client: &StatelessSessionConsumerClient,
+    request_id: SessionConsumerRequestId,
+    key: SessionKey,
+    owner: OwnerId,
+    ttl: Duration,
+    phase: &str,
+) -> LeaseGuard {
+    let retained = SessionConsumerLeaseMutationRequest::new(
+        request_id,
+        SessionConsumerLeaseMutationOperation::Acquire {
+            key: key.clone(),
+            owner: owner.clone(),
+            ttl,
+        },
+    );
+    match client.acquire_with_id(request_id, key, owner, ttl).await {
+        Ok(guard) => guard,
+        Err(SessionConsumerLeaseMutationError::NotTransmitted { cause }) => {
+            eprintln!(
+                "process-loss {phase} successor acquire failed; classification=not_transmitted; transport={cause:?}"
+            );
+            panic!("process-loss {phase} successor acquire was not transmitted");
+        }
+        Err(SessionConsumerLeaseMutationError::Lease(_)) => {
+            eprintln!(
+                "process-loss {phase} successor acquire failed; classification=confirmed_lease_error"
+            );
+            panic!("process-loss {phase} successor acquire returned a confirmed lease error");
+        }
+        Err(SessionConsumerLeaseMutationError::OutcomeUnknown {
+            request_id: uncertain_id,
+        }) => {
+            if uncertain_id != request_id {
+                eprintln!(
+                    "process-loss {phase} successor acquire failed; classification=outcome_unknown_id_mismatch"
+                );
+                panic!("process-loss {phase} outcome-unknown identity must remain exact");
+            }
+            eprintln!(
+                "process-loss {phase} successor acquire requires read-only receipt resolution; classification=outcome_unknown"
+            );
+            let resolution = tokio::time::timeout(
+                PROTECTED_ROSTER_PROCESS_LOSS_LEASE_EXPIRY_POLL_BOUND,
+                async {
+                    let mut backoff = PROTECTED_ROSTER_PROCESS_LOSS_CHILD_POLL_INTERVAL;
+                    loop {
+                        match client.lease_mutation_status(&retained).await {
+                            Ok(SessionConsumerLeaseMutationStatus::Recorded(result)) => {
+                                return match *result {
+                                    Ok(SessionConsumerLeaseMutationResult::Acquire(guard)) => {
+                                        Ok(guard)
+                                    }
+                                    Ok(_) => Err("recorded_operation_mismatch"),
+                                    Err(_) => Err("recorded_lease_error"),
+                                };
+                            }
+                            Ok(SessionConsumerLeaseMutationStatus::RequestConflict) => {
+                                return Err("request_conflict");
+                            }
+                            Ok(SessionConsumerLeaseMutationStatus::NotFound) | Err(_) => {}
+                            Ok(_) => return Err("unknown_status_variant"),
+                        }
+                        tokio::time::sleep(backoff).await;
+                        backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
+                    }
+                },
+            )
+            .await;
+            match resolution {
+                Ok(Ok(guard)) => guard,
+                Ok(Err(classification)) => {
+                    eprintln!(
+                        "process-loss {phase} successor acquire receipt failed closed; classification={classification}"
+                    );
+                    panic!("process-loss {phase} successor acquire receipt is not exact");
+                }
+                Err(_) => {
+                    eprintln!(
+                        "process-loss {phase} successor acquire receipt failed closed; classification=resolution_deadline"
+                    );
+                    panic!("process-loss {phase} successor acquire receipt remained ambiguous");
+                }
+            }
+        }
+        Err(_) => {
+            eprintln!(
+                "process-loss {phase} successor acquire failed; classification=unknown_error_variant"
+            );
+            panic!("process-loss {phase} successor acquire returned an unknown error variant");
+        }
+    }
 }
 
 #[cfg(feature = "test-control")]
@@ -11159,27 +11319,58 @@ async fn advance_protected_roster_process_loss_snapshot_workload(
     let mut previous_successful_log_index = None;
     let workload_result = tokio::time::timeout(bound, async {
         while completed < commands {
-            let ordinal = first_ordinal
-                .checked_add(completed as u64)
-                .expect("process-loss snapshot request ordinal does not overflow");
-            let mut request_id = [0; 16];
-            request_id[..8]
-                .copy_from_slice(&PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_REQUEST_NAMESPACE);
-            request_id[8..].copy_from_slice(&ordinal.to_be_bytes());
-            match append_consensus_padding_entry_for_test(&fleet.stores[workload_leader], request_id)
-                .await
-            {
-                Ok(log_index) => {
-                    assert!(
-                        previous_successful_log_index
-                            .is_none_or(|previous| log_index > previous),
-                        "process-loss {phase} snapshot commands return strictly increasing acknowledged Raft log indexes"
-                    );
-                    previous_successful_log_index = Some(log_index);
-                    completed += 1;
-                    no_progress_backoff = Duration::from_millis(20);
+            // Keep a small closed window of exact, independently durable
+            // commands in flight. This removes host-speed sensitivity from
+            // serial round trips without creating an unbounded proposal storm:
+            // every request in one window is resolved before the next opens.
+            let window_len = (commands - completed)
+                .min(PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_MAX_IN_FLIGHT);
+            let mut pending_offsets = (completed..completed + window_len).collect::<Vec<_>>();
+            let mut window_log_indexes = Vec::with_capacity(window_len);
+            while !pending_offsets.is_empty() {
+                let attempts = futures_util::future::join_all(pending_offsets.iter().map(
+                    |offset| {
+                        let ordinal = first_ordinal
+                            .checked_add(*offset as u64)
+                            .expect("process-loss snapshot request ordinal does not overflow");
+                        let mut request_id = [0; 16];
+                        request_id[..8].copy_from_slice(
+                            &PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_REQUEST_NAMESPACE,
+                        );
+                        request_id[8..].copy_from_slice(&ordinal.to_be_bytes());
+                        async move {
+                            (
+                                *offset,
+                                append_consensus_padding_entry_for_test(
+                                    &fleet.stores[workload_leader],
+                                    request_id,
+                                )
+                                .await,
+                            )
+                        }
+                    },
+                ))
+                .await;
+                let mut retry_offsets = Vec::new();
+                for (offset, result) in attempts {
+                    match result {
+                        Ok(log_index) => window_log_indexes.push(log_index),
+                        Err(StoreError::BackendUnavailable(_)) => retry_offsets.push(offset),
+                        Err(error) => {
+                            let classification = match error {
+                                StoreError::BackendOperationOutcomeUnavailable => {
+                                    "outcome_unknown"
+                                }
+                                _ => "confirmed_rejection",
+                            };
+                            eprintln!(
+                                "process-loss {phase} snapshot command failed closed; classification={classification}; completed={completed}; window_len={window_len}; offset={offset}"
+                            );
+                            panic!("process-loss {phase} snapshot command was rejected")
+                        }
+                    }
                 }
-                Err(StoreError::BackendUnavailable(_)) => {
+                if !retry_offsets.is_empty() {
                     let (engines_running, durable_progress) =
                         fleet.process_loss_durable_progress_diagnostic_for_test();
                     if !engines_running {
@@ -11187,6 +11378,9 @@ async fn advance_protected_roster_process_loss_snapshot_workload(
                             "process-loss {phase} snapshot maintenance retry fails closed because a voter engine stopped; durable_progress={durable_progress}"
                         );
                     }
+                    // Only a proven pre-transmission unavailability is
+                    // retried, with the same durable request ID. Ambiguous
+                    // outcomes remain typed differently and fail above.
                     (workload_leader, _, workload_term) = fleet
                         .wait_for_admitted_quorum_leader(&[0, 1, 2], workload_term)
                         .await;
@@ -11194,11 +11388,30 @@ async fn advance_protected_roster_process_loss_snapshot_workload(
                     no_progress_backoff = no_progress_backoff
                         .saturating_mul(2)
                         .min(Duration::from_millis(250));
+                } else {
+                    no_progress_backoff = Duration::from_millis(20);
                 }
-                Err(error) => {
-                    panic!("process-loss {phase} snapshot command was rejected: {error:?}")
-                }
+                pending_offsets = retry_offsets;
             }
+            window_log_indexes.sort_unstable();
+            assert_eq!(
+                window_log_indexes.len(),
+                window_len,
+                "process-loss {phase} snapshot window acknowledges every exact command"
+            );
+            for log_index in window_log_indexes {
+                // Sorting is only for proof: every returned index is the
+                // original acknowledged Raft index from its exact command.
+                // Distinct windows never overlap, so the complete sequence is
+                // strictly increasing without a process-global counter.
+                assert!(
+                    previous_successful_log_index
+                        .is_none_or(|previous| log_index > previous),
+                    "process-loss {phase} snapshot commands return strictly increasing acknowledged Raft log indexes"
+                );
+                previous_successful_log_index = Some(log_index);
+            }
+            completed += window_len;
         }
     })
     .await;
@@ -11639,6 +11852,10 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         &read_protected_roster_process_loss_state(&state.join("original-guard.json")),
     )
     .expect("decode original process-loss guard");
+    // Expire the authority held by the exited process before reconstructing
+    // the fleet. Every readiness, leader, manifest, and server observation
+    // below is therefore fresh at the successor mutation boundary.
+    wait_for_protected_roster_process_loss_lease_expiry(&original_guard, "phase two").await;
     let pki = Arc::new(TestPki::new());
     let fleet = ThreeVoterConsumerFleet::start_with_topology_in_directory(
         Arc::clone(&pki),
@@ -11667,10 +11884,12 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
     let ingress_signer: Arc<dyn RosterIngressSigner> = attestor.clone();
     let executor_attestor: Arc<dyn FencedMutationRosterExecutorAttestor> = attestor.clone();
     let service = Arc::new(fleet.stores[leader].consumer_service());
-    let transport = Arc::new(CommitThenLoseConsumerResponse::roster_passthrough(
-        service.clone(),
-        service,
-    ));
+    let transport = Arc::new(
+        CommitThenLoseConsumerResponse::roster_passthrough_with_lost_lease_acquire(
+            service.clone(),
+            service,
+        ),
+    );
     let (server, address) = SessionQuorumConsumerServer::new(
         transport.clone(),
         pki.server_config(&server_spiffe),
@@ -11701,21 +11920,36 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         &client_spiffe,
         fleet.voter_authority(leader),
     );
-    wait_for_protected_roster_process_loss_lease_expiry(&original_guard, "phase two").await;
     let current_fence_diagnostics_before = fleet
         .stores
         .iter()
         .map(ConsensusSessionStore::protected_roster_diagnostic_snapshot)
         .collect::<Vec<_>>();
-    let current_guard = lease_client
-        .acquire_with_id(
-            SessionConsumerRequestId::from_bytes([0xe7; 16]),
-            test_key(),
-            OwnerId::new("three-voter-process-loss-successor").expect("successor owner"),
-            PROTECTED_ROSTER_PROCESS_LOSS_LEASE_TTL,
-        )
-        .await
-        .expect("acquire higher current process-loss fence");
+    let current_guard = acquire_protected_roster_process_loss_successor(
+        &lease_client,
+        SessionConsumerRequestId::from_bytes([0xe7; 16]),
+        test_key(),
+        OwnerId::new("three-voter-process-loss-successor").expect("successor owner"),
+        PROTECTED_ROSTER_PROCESS_LOSS_LEASE_TTL,
+        "phase_two",
+    )
+    .await;
+    assert_eq!(
+        transport.lease_acquire_calls.load(Ordering::SeqCst),
+        1,
+        "phase two never replays the acquire after its committed response is withheld"
+    );
+    assert_eq!(
+        transport
+            .lease_acquire_recorded_responses
+            .load(Ordering::SeqCst),
+        1,
+        "phase two commits exactly one successful acquire result"
+    );
+    assert!(
+        transport.lease_status_calls.load(Ordering::SeqCst) >= 1,
+        "phase two resolves the unknown acquire only through read-only exact receipt status"
+    );
     let current_fence_applied_floor = fleet.stores[leader]
         .status()
         .applied_index
@@ -12087,6 +12321,10 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
     )
     .expect("decode phase-two process-loss guard");
 
+    // As in phase two, cross the process-owned authority expiry before any
+    // reopened readiness evidence can age while the prior lease is live.
+    wait_for_protected_roster_process_loss_lease_expiry(&phase_two_guard, "phase three").await;
+
     let pki = Arc::new(TestPki::new());
     let fleet = ThreeVoterConsumerFleet::start_with_topology_in_directory(
         Arc::clone(&pki),
@@ -12149,22 +12387,21 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
         &client_spiffe,
         fleet.voter_authority(leader),
     );
-    wait_for_protected_roster_process_loss_lease_expiry(&phase_two_guard, "phase three").await;
     let phase_three_diagnostics_before_fence = fleet
         .stores
         .iter()
         .map(ConsensusSessionStore::protected_roster_diagnostic_snapshot)
         .collect::<Vec<_>>();
-    let current_guard = lease_client
-        .acquire_with_id(
-            SessionConsumerRequestId::from_bytes([0xe9; 16]),
-            test_key(),
-            OwnerId::new("three-voter-process-loss-terminal-successor")
-                .expect("terminal successor owner"),
-            PROTECTED_ROSTER_PROCESS_LOSS_LEASE_TTL,
-        )
-        .await
-        .expect("acquire phase-three current process-loss fence");
+    let current_guard = acquire_protected_roster_process_loss_successor(
+        &lease_client,
+        SessionConsumerRequestId::from_bytes([0xe9; 16]),
+        test_key(),
+        OwnerId::new("three-voter-process-loss-terminal-successor")
+            .expect("terminal successor owner"),
+        PROTECTED_ROSTER_PROCESS_LOSS_LEASE_TTL,
+        "phase_three",
+    )
+    .await;
     let phase_three_fence_applied_floor = fleet.stores[leader]
         .status()
         .applied_index

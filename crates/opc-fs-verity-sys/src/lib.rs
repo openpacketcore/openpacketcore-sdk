@@ -715,6 +715,16 @@ mod platform {
         use std::os::unix::fs::MetadataExt as _;
         use std::path::PathBuf;
         use std::process::Command;
+        use std::sync::Mutex;
+
+        // `Command` may fork before close-on-exec closes the test process's
+        // other descriptors.  During that window a child can inherit a
+        // concurrently created writable qualification file and make the
+        // kernel correctly reject FS_IOC_ENABLE_VERITY with ETXTBSY.  Keep
+        // child-spawning fixtures disjoint from the exact no-open-writers
+        // enable qualification; this is test-process coordination, not an
+        // ioctl retry or a weaker errno classification.
+        static PROCESS_FD_INHERITANCE_QUALIFICATION_GATE: Mutex<()> = Mutex::new(());
 
         #[test]
         fn fixed_enable_argument_layout_and_profile_are_deterministic() {
@@ -1018,6 +1028,9 @@ mod platform {
 
         #[test]
         fn persistent_file_identity_survives_a_separate_bind_mount_when_supported() {
+            let _process_fd_gate = PROCESS_FD_INHERITANCE_QUALIFICATION_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let directory = tempfile::tempdir().expect("create remount qualification directory");
             let source = directory.path().join("source");
             let mounted = directory.path().join("mounted");
@@ -1172,6 +1185,9 @@ mod platform {
 
         #[test]
         fn persistent_file_identity_survives_a_separate_loop_image_remount() {
+            let _process_fd_gate = PROCESS_FD_INHERITANCE_QUALIFICATION_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // This qualification deliberately uses a wholly test-owned image
             // and mountpoint.  In particular it never mounts, unmounts, or
             // otherwise mutates the harness's prepared fs-verity filesystem.
@@ -1422,6 +1438,9 @@ mod platform {
 
         #[test]
         fn linux_ioctl_qualification_requires_ci_filesystem_to_seal() {
+            let _process_fd_gate = PROCESS_FD_INHERITANCE_QUALIFICATION_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut temporary = fs_verity_qualification_file();
             temporary
                 .write_all(b"fixed fs-verity qualification payload")
@@ -1494,6 +1513,9 @@ mod platform {
 
         #[test]
         fn linux_ioctl_qualification_rejects_nonstandard_profiles() {
+            let _process_fd_gate = PROCESS_FD_INHERITANCE_QUALIFICATION_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let salt = [0xa5_u8];
             let mut salted = EnableArg::fixed_profile();
             salted.salt_size = u32::try_from(salt.len()).expect("one-byte salt fits UAPI");
