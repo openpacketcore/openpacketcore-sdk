@@ -6727,12 +6727,8 @@ async fn persistent_three_voter_protected_roster_creates_absent_record_then_esta
             "lease acquisition must not pre-seed the protected business row"
         );
     }
-    let sequence_before = fleet.application_sequences().await[leader];
-    let log_before = fleet.stores[leader]
-        .status()
-        .last_log_index
-        .expect("protected-roster proposal baseline");
-    fleet.wait_all_application_sequences(sequence_before).await;
+    let lease_sequence = fleet.application_sequences().await[leader];
+    fleet.wait_all_application_sequences(lease_sequence).await;
 
     let persistent = protected_roster_v2_persistent_client(
         &pki,
@@ -6827,6 +6823,28 @@ async fn persistent_three_voter_protected_roster_creates_absent_record_then_esta
         protected_result.clone(),
     )
     .expect("maximum protected roster proposal");
+    // Maximum-size checkpoint construction is intentionally expensive and is
+    // outside the admission measurement. Refresh the same exact authority at
+    // the public boundary immediately before PollAdmit so a loaded test host
+    // cannot turn payload preparation time into a lease-expiry result. The
+    // renewal preserves the key, owner, and fence; the baseline below excludes
+    // that explicit setup mutation and still proves PollAdmit appends once.
+    let roster_lease = setup_client
+        .renew_with_id(
+            SessionConsumerRequestId::from_bytes([0xb3; 16]),
+            roster_lease,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("refresh exact roster lease immediately before admission");
+    assert_eq!(roster_lease.key(), &key);
+    assert_eq!(roster_lease.owner(), &owner);
+    assert_eq!(roster_lease.fence(), expected_terminal.fence);
+    let sequence_before = fleet.application_sequences().await[leader];
+    let log_before = fleet.stores[leader]
+        .status()
+        .last_log_index
+        .expect("protected-roster proposal baseline");
     let mut admission = roster_client
         .prepare_absent(roster_lease, proposal)
         .expect("prepare exact protected roster body");
@@ -6870,6 +6888,9 @@ async fn persistent_three_voter_protected_roster_creates_absent_record_then_esta
                         if attempt + 1 < PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
                             tokio::task::yield_now().await;
                         }
+                    }
+                    Err(RosterClientError::AuthorityRejected) => {
+                        panic!("exact maximum PollAdmit status authority was rejected")
                     }
                     Err(_) => {
                         panic!("exact maximum PollAdmit status readback rejected its bound request")
