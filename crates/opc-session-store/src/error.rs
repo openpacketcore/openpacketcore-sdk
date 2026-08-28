@@ -229,6 +229,11 @@ pub enum StoreError {
     /// from terminal retirement and from active-epoch capacity exhaustion.
     #[error("fenced transition history epoch is not active")]
     FencedTransitionHistoryEpochNotActive,
+    /// A protected roster owns the exact session-record pre-state, so only
+    /// that roster's terminal transaction may replace or delete it. This
+    /// fixed error carries no key, tenant, owner, or reservation metadata.
+    #[error("session record is reserved by a protected roster")]
+    SessionRecordReserved,
 }
 
 /// Error type for lease operations.
@@ -531,12 +536,32 @@ mod tests {
             LegacyStoreError684::RestoreScanResponseTooLarge { max_bytes: 2 }
         );
 
-        // This variant was appended after the published schema-v1 enum. It
-        // intentionally has no legacy counterpart: every preexisting ordinal
-        // above must continue to cross-decode unchanged.
-        let encoded = opc_consensus::encode_bounded(&StoreError::FencedTransitionStorageExhausted)
-            .expect("appended StoreError postcard encoding");
-        assert!(opc_consensus::decode_bounded::<LegacyStoreError684>(&encoded).is_err());
+        // These variants were appended after the published schema-v1 enum.
+        // They intentionally have no legacy counterpart: every preexisting
+        // ordinal above must continue to cross-decode unchanged.
+        for appended in [
+            StoreError::FencedTransitionStorageExhausted,
+            StoreError::SessionRecordReserved,
+        ] {
+            let encoded = opc_consensus::encode_bounded(&appended)
+                .expect("appended StoreError postcard encoding");
+            assert!(opc_consensus::decode_bounded::<LegacyStoreError684>(&encoded).is_err());
+            assert_eq!(
+                opc_consensus::decode_bounded::<StoreError>(&encoded)
+                    .expect("current StoreError round trip"),
+                appended
+            );
+        }
+    }
+
+    #[test]
+    fn session_record_reserved_error_is_fixed_and_redaction_safe() {
+        let error = StoreError::SessionRecordReserved;
+        assert_eq!(
+            error.to_string(),
+            "session record is reserved by a protected roster"
+        );
+        assert_eq!(format!("{error:?}"), "SessionRecordReserved");
     }
 
     #[test]

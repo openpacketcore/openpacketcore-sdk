@@ -8,11 +8,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{fmt, marker::PhantomData, time::Duration};
 
+use base64::Engine as _;
+use opc_consensus::{
+    ConsensusRpcFamily, CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES, CONSENSUS_SCHEMA_VERSION,
+};
 use opc_session_store::backend::{
-    CompareAndSet, CompareAndSetResult, ReplicationEntry, ReplicationLogRange, ReplicationOp,
-    ReplicationTxId, SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
-    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
-    MAX_REPLICATION_OPERATION_DEPTH,
+    CompareAndSet, CompareAndSetResult, ProtectedRosterEstablishedSuccessor, ReplicationEntry,
+    ReplicationLogRange, ReplicationOp, ReplicationTxId, SessionOp, SessionOpResult,
+    MAX_RECORD_EXPIRY_PREFLIGHTS, MAX_REPLICATION_LOG_PAGE_ENTRIES,
+    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
 };
 use opc_session_store::capability::BackendCapabilities;
 use opc_session_store::error::{LeaseError, StoreError};
@@ -30,7 +34,7 @@ use opc_session_store::{
 };
 use opc_types::Timestamp;
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -48,9 +52,9 @@ pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 8 * 1024;
 pub const MIN_NEGOTIATED_FRAME_SIZE: usize = 8 * 1024;
 /// Smallest encoded frame budget accepted by the consensus-only profile.
 ///
-/// A worst-case JSON byte-array representation of the shared 2 MiB opaque RPC
-/// ceiling consumes about 8 MiB. This bound leaves deterministic envelope
-/// headroom while remaining below the global per-frame ceiling.
+/// The ordinary private RPC and response retain the historical JSON byte-array
+/// representation. The roster-only request payload uses a compact canonical
+/// padded-base64 outer envelope under its separate revision-five profile.
 pub const MIN_SESSION_CONSENSUS_FRAME_SIZE: usize = 9 * 1024 * 1024;
 /// Largest post-bootstrap frame budget accepted by protocol v5.
 ///
@@ -89,10 +93,26 @@ pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/5";
 pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/2";
 /// Fixed revision of the consensus-only bootstrap and operation DTOs.
 ///
-/// Revision 4 makes every forwarded consumer operation carry an explicit
-/// internal-or-consumer scope marker. It therefore rejects revision-3 peers
-/// before they can omit that authorization boundary.
-pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 4;
+/// Revision 5 adds an exact application-semantics gate for outcome-digest v2.
+/// A peer that computes the former digest must never join a voter set that
+/// persists v2 receipts: equal Raft entries could otherwise produce different
+/// durable idempotency evidence on different voters.  The dedicated consensus
+/// bootstrap rejects the older revision before it can exchange Vote,
+/// AppendEntries, snapshot, or forwarded-mutation traffic.
+pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 5;
+
+/// Exact state-machine receipt and command-outcome semantics required for
+/// consensus application.
+///
+/// This is deliberately distinct from a consumer wire revision.  Outcome
+/// digest v2 is computed by every applying voter, so a rolling mixed-binary
+/// voter set is unsafe even when its consumer request DTOs are otherwise
+/// compatible. Revision 3 additionally binds the protected-roster established
+/// transition: every applying voter must deterministically enforce its
+/// expected record and owner/fence/credential/guard fields when selecting the
+/// successor. There is no fallback or negotiation: bootstrap requires this
+/// exact value before a connection can carry any consensus command.
+pub const SESSION_CONSENSUS_APPLICATION_REVISION: u16 = 3;
 
 /// Exact resource and semantic profile for consensus-only connections.
 ///
@@ -103,10 +123,19 @@ pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 4;
 pub struct SessionConsensusContractProfile {
     /// Revision of the dedicated consensus wire DTOs.
     pub wire_schema_revision: u16,
+    /// Revision of deterministic consensus command and receipt semantics.
+    pub application_revision: u16,
     /// Revision of the fixed transport and nested forwarded-operation errors.
     pub error_set_revision: u16,
-    /// Largest decoded private consensus payload accepted in either direction.
+    /// Largest decoded ordinary private consensus payload accepted in either
+    /// direction.
     pub max_rpc_payload_bytes: u32,
+    /// Largest decoded protected-roster request payload.
+    ///
+    /// Only the roster-forwarding family and a structurally singleton roster
+    /// AppendEntries request may use this ceiling. Responses and every other
+    /// RPC retain [`Self::max_rpc_payload_bytes`].
+    pub max_roster_rpc_payload_bytes: u32,
     /// Smallest negotiated encoded frame budget.
     pub min_frame_size: u32,
     /// Largest negotiated encoded frame budget.
@@ -117,10 +146,14 @@ impl SessionConsensusContractProfile {
     /// Whether this is the exact profile implemented by this SDK build.
     pub const fn is_current(self) -> bool {
         self.wire_schema_revision == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.wire_schema_revision
+            && self.application_revision
+                == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.application_revision
             && self.error_set_revision
                 == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision
             && self.max_rpc_payload_bytes
                 == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.max_rpc_payload_bytes
+            && self.max_roster_rpc_payload_bytes
+                == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.max_roster_rpc_payload_bytes
             && self.min_frame_size == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.min_frame_size
             && self.max_frame_size == CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.max_frame_size
     }
@@ -130,8 +163,10 @@ impl SessionConsensusContractProfile {
 pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractProfile =
     SessionConsensusContractProfile {
         wire_schema_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+        application_revision: SESSION_CONSENSUS_APPLICATION_REVISION,
         error_set_revision: 6,
         max_rpc_payload_bytes: SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES as u32,
+        max_roster_rpc_payload_bytes: CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES as u32,
         min_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE as u32,
         max_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
     };
@@ -241,6 +276,7 @@ pub const CURRENT_CONTRACT_PROFILE: ContractProfile = ContractProfile {
 
 const _: () = {
     assert!(SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES <= u32::MAX as usize);
+    assert!(CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES <= u32::MAX as usize);
     assert!(RESTORE_SCAN_MAX_PAGE_SIZE <= u32::MAX as usize);
     assert!(RESTORE_SCAN_MAX_WIRE_PAGE_PAYLOAD_BYTES <= u32::MAX as usize);
     assert!(opc_session_store::RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES <= u32::MAX as usize);
@@ -462,14 +498,267 @@ pub(crate) enum SessionConsensusBootstrapResponse {
     Rejected(SessionConsensusPeerError),
 }
 
-/// The only post-bootstrap request shape admitted on the consensus ALPN.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+const MAX_COMPACT_ROSTER_PAYLOAD_ENCODED_BYTES: usize =
+    CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES.div_ceil(3) * 4;
+
+const fn compact_roster_family(family: ConsensusRpcFamily) -> bool {
+    matches!(
+        family,
+        ConsensusRpcFamily::ForwardRosterMutation | ConsensusRpcFamily::AppendEntriesRoster
+    )
+}
+
+/// A protected-roster payload encoded with the canonical padded standard
+/// base64 alphabet. This revision-five-only representation avoids expanding
+/// each opaque byte into a JSON number and is bounded before decoded
+/// allocation.
+#[derive(Clone, PartialEq, Eq)]
+struct CompactRosterPayload(Vec<u8>);
+
+impl fmt::Debug for CompactRosterPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompactRosterPayload(<redacted>)")
+    }
+}
+
+impl Serialize for CompactRosterPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+    }
+}
+
+fn decode_compact_roster_payload(encoded: &str) -> Result<Vec<u8>, &'static str> {
+    // Check encoded input before any decoded allocation. STANDARD requires
+    // canonical padding and rejects invalid trailing bits.
+    if encoded.len() > MAX_COMPACT_ROSTER_PAYLOAD_ENCODED_BYTES || !encoded.len().is_multiple_of(4)
+    {
+        return Err("invalid compact roster payload");
+    }
+    let padding = match encoded.as_bytes() {
+        [] => 0,
+        bytes if bytes.ends_with(b"==") => 2,
+        bytes if bytes.ends_with(b"=") => 1,
+        _ => 0,
+    };
+    let decoded_len = encoded
+        .len()
+        .checked_div(4)
+        .and_then(|groups| groups.checked_mul(3))
+        .and_then(|len| len.checked_sub(padding))
+        .filter(|len| *len <= CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES)
+        .ok_or("invalid compact roster payload")?;
+    let expected_encoded_len = decoded_len
+        .checked_add(2)
+        .and_then(|len| len.checked_div(3))
+        .and_then(|groups| groups.checked_mul(4))
+        .ok_or("invalid compact roster payload")?;
+    if encoded.len() != expected_encoded_len {
+        return Err("invalid compact roster payload");
+    }
+    let mut payload = vec![0_u8; decoded_len];
+    let actual_len = base64::engine::general_purpose::STANDARD
+        .decode_slice(encoded.as_bytes(), payload.as_mut_slice())
+        .map_err(|_| "invalid compact roster payload")?;
+    if actual_len != decoded_len {
+        return Err("invalid compact roster payload");
+    }
+    Ok(payload)
+}
+
+impl<'de> Deserialize<'de> for CompactRosterPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CompactRosterPayloadVisitor;
+
+        impl Visitor<'_> for CompactRosterPayloadVisitor {
+            type Value = CompactRosterPayload;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded canonical padded base64 roster payload")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                decode_compact_roster_payload(value)
+                    .map(CompactRosterPayload)
+                    .map_err(E::custom)
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'_ str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(value)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+        }
+
+        deserializer.deserialize_str(CompactRosterPayloadVisitor)
+    }
+}
+
+/// The compact protected-roster portion of the revision-five outer request.
+#[derive(Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompactRosterWireRequest {
+    schema_version: u16,
+    identity: SessionConsensusIdentity,
+    sender: SessionConsensusNodeId,
+    family: ConsensusRpcFamily,
+    payload: CompactRosterPayload,
+}
+
+impl fmt::Debug for CompactRosterWireRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompactRosterWireRequest(<redacted>)")
+    }
+}
+
+impl CompactRosterWireRequest {
+    fn from_wire_request(
+        request: SessionConsensusWireRequest,
+    ) -> Result<Self, SessionConsensusPeerError> {
+        request.validate()?;
+        if !compact_roster_family(request.family) {
+            return Err(SessionConsensusPeerError::Protocol);
+        }
+        Ok(Self {
+            schema_version: request.schema_version,
+            identity: request.identity,
+            sender: request.sender,
+            family: request.family,
+            payload: CompactRosterPayload(request.payload),
+        })
+    }
+
+    fn into_wire_request(self) -> Result<SessionConsensusWireRequest, SessionConsensusPeerError> {
+        if self.schema_version != CONSENSUS_SCHEMA_VERSION || !compact_roster_family(self.family) {
+            return Err(SessionConsensusPeerError::Protocol);
+        }
+        let request = SessionConsensusWireRequest {
+            schema_version: self.schema_version,
+            identity: self.identity,
+            sender: self.sender,
+            family: self.family,
+            payload: self.payload.0,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactRosterWireRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            schema_version: u16,
+            identity: SessionConsensusIdentity,
+            sender: SessionConsensusNodeId,
+            family: ConsensusRpcFamily,
+            payload: CompactRosterPayload,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        if fields.schema_version != CONSENSUS_SCHEMA_VERSION
+            || !compact_roster_family(fields.family)
+        {
+            return Err(serde::de::Error::custom("invalid compact roster request"));
+        }
+        Ok(Self {
+            schema_version: fields.schema_version,
+            identity: fields.identity,
+            sender: fields.sender,
+            family: fields.family,
+            payload: fields.payload,
+        })
+    }
+}
+
+/// The only post-bootstrap request shapes admitted on the consensus ALPN.
+///
+/// `Call` is byte-compatible with ordinary traffic. `RosterCall` is accepted
+/// only for the two protected-roster families.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum SessionConsensusTransportRequest {
     Call {
         call_id: uuid::Uuid,
         request: SessionConsensusWireRequest,
     },
+    RosterCall {
+        call_id: uuid::Uuid,
+        request: CompactRosterWireRequest,
+    },
+}
+
+impl fmt::Debug for SessionConsensusTransportRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Call { .. } => {
+                formatter.write_str("SessionConsensusTransportRequest::Call(<redacted>)")
+            }
+            Self::RosterCall { .. } => {
+                formatter.write_str("SessionConsensusTransportRequest::RosterCall(<redacted>)")
+            }
+        }
+    }
+}
+
+impl SessionConsensusTransportRequest {
+    /// Select the compact revision-five representation only for roster-only
+    /// families. Invalid outbound envelopes are rejected rather than panicking.
+    pub(crate) fn from_wire_call(
+        call_id: uuid::Uuid,
+        request: SessionConsensusWireRequest,
+    ) -> Result<Self, SessionConsensusPeerError> {
+        if compact_roster_family(request.family) {
+            return CompactRosterWireRequest::from_wire_request(request)
+                .map(|request| Self::RosterCall { call_id, request });
+        }
+        request.validate()?;
+        Ok(Self::Call { call_id, request })
+    }
+
+    pub(crate) const fn call_id(&self) -> uuid::Uuid {
+        match self {
+            Self::Call { call_id, .. } | Self::RosterCall { call_id, .. } => *call_id,
+        }
+    }
+
+    /// Recover the validated consensus request after outer-envelope decoding.
+    pub(crate) fn into_wire_call(
+        self,
+    ) -> Result<(uuid::Uuid, SessionConsensusWireRequest), SessionConsensusPeerError> {
+        match self {
+            Self::Call { call_id, request } => {
+                if compact_roster_family(request.family) {
+                    return Err(SessionConsensusPeerError::Protocol);
+                }
+                request.validate()?;
+                Ok((call_id, request))
+            }
+            Self::RosterCall { call_id, request } => request
+                .into_wire_request()
+                .map(|request| (call_id, request)),
+        }
+    }
 }
 
 /// The only post-bootstrap response shape emitted on the consensus ALPN.
@@ -760,6 +1049,16 @@ fn validate_replication_payload_limit(
             Some(ReplicationOp::CompareAndSet { new_record, .. }) => {
                 validate_record_payload_limit(new_record, max)?;
             }
+            Some(ReplicationOp::ProtectedRosterEstablished {
+                expected_record,
+                successor,
+                ..
+            }) => {
+                validate_record_payload_limit(expected_record, max)?;
+                if let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor {
+                    validate_record_payload_limit(record, max)?;
+                }
+            }
             Some(ReplicationOp::Batch { ops }) => pending.push(ops.iter()),
             Some(
                 ReplicationOp::DeleteFenced { .. }
@@ -948,6 +1247,18 @@ fn validate_replication_retained_profile(
             | ReplicationOp::AcquireLease { key, .. }
             | ReplicationOp::RenewLease { key, .. }
             | ReplicationOp::ReleaseLease { key, .. } => validate_session_key_profile(key)?,
+            ReplicationOp::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                ..
+            } => {
+                validate_session_key_profile(key)?;
+                validate_record_profile(expected_record)?;
+                if let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor {
+                    validate_record_profile(record)?;
+                }
+            }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
         }
     }
@@ -1544,6 +1855,10 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             | StoreError::FencedTransitionStorageExhausted => {
                 Self::CapabilityNotSupported("unknown_capability")
             }
+            // Legacy protocol v5 has no protected-roster reservation error.
+            // Preserve the no-effect conflict semantics without revealing
+            // whether a protected roster exists for the named key.
+            StoreError::SessionRecordReserved => Self::CasConflict,
             StoreError::BackendOperationOutcomeUnavailable => {
                 Self::BackendOperationOutcomeUnavailable
             }
@@ -1822,6 +2137,16 @@ enum WireReplicationNodeRef<'a> {
         fence: &'a FenceToken,
         credential_id: u64,
     },
+    ProtectedRosterEstablished {
+        key: &'a SessionKey,
+        expected_record: &'a StoredSessionRecord,
+        successor: &'a ProtectedRosterEstablishedSuccessor,
+        owner: &'a OwnerId,
+        fence: &'a FenceToken,
+        credential_id: u64,
+        guard_acquired_at: &'a Timestamp,
+        guard_expires_at: &'a Timestamp,
+    },
     Batch {
         child_count: u16,
     },
@@ -1870,6 +2195,16 @@ enum WireReplicationNode {
         owner: OwnerId,
         fence: FenceToken,
         credential_id: u64,
+    },
+    ProtectedRosterEstablished {
+        key: SessionKey,
+        expected_record: StoredSessionRecord,
+        successor: ProtectedRosterEstablishedSuccessor,
+        owner: OwnerId,
+        fence: FenceToken,
+        credential_id: u64,
+        guard_acquired_at: Timestamp,
+        guard_expires_at: Timestamp,
     },
     Batch {
         child_count: u16,
@@ -1955,6 +2290,25 @@ impl WireReplicationNode {
                 owner,
                 fence,
                 credential_id,
+            },
+            Self::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor,
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
+            } => ReplicationOp::ProtectedRosterEstablished {
+                key,
+                expected_record,
+                successor: Box::new(successor),
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
             },
             Self::Batch { .. } => {
                 return Err(WireConversionError(
@@ -2125,6 +2479,25 @@ impl<'a> TryFrom<&'a ReplicationEntry> for WireReplicationEntryRef<'a> {
                     owner,
                     fence,
                     credential_id: *credential_id,
+                },
+                ReplicationOp::ProtectedRosterEstablished {
+                    key,
+                    expected_record,
+                    successor,
+                    owner,
+                    fence,
+                    credential_id,
+                    guard_acquired_at,
+                    guard_expires_at,
+                } => WireReplicationNodeRef::ProtectedRosterEstablished {
+                    key,
+                    expected_record,
+                    successor,
+                    owner,
+                    fence,
+                    credential_id: *credential_id,
+                    guard_acquired_at,
+                    guard_expires_at,
                 },
                 ReplicationOp::Batch { ops } => {
                     let child_count = u16::try_from(ops.len()).map_err(|_| {
@@ -3468,6 +3841,11 @@ pub(crate) struct FrameWriteProgress {
     /// authoritative only when no below-adapter counter is bound.
     accepted: AtomicBool,
     transport: Mutex<Option<TransportWriteObservation>>,
+    /// Optional synchronous poll-stack attribution used by the V2 consumer.
+    /// The lower transport sees a counter only while the framed Call writer
+    /// itself is polling the TLS writer. This deliberately does not count
+    /// TLS output generated by setup, reads, or unrelated control work.
+    poll_attribution: Mutex<Option<Arc<FrameWritePollAttribution>>>,
 }
 
 struct TransportWriteObservation {
@@ -3475,11 +3853,81 @@ struct TransportWriteObservation {
     baseline: u64,
 }
 
+/// Per-lane lower-transport attribution for one currently-polled frame.
+///
+/// The consumer installs a unique counter immediately around one synchronous
+/// TLS `poll_write` or `poll_flush`. Its TCP wrapper can then attribute an
+/// accepted ciphertext write to that exact Call without treating ambient TLS
+/// control output as request transmission.
+pub(crate) struct FrameWritePollAttribution {
+    current: Mutex<Option<Arc<AtomicU64>>>,
+}
+
+impl FrameWritePollAttribution {
+    pub(crate) const fn new() -> Self {
+        Self {
+            current: Mutex::new(None),
+        }
+    }
+
+    /// Record a lower-transport acceptance, if one Call writer is currently
+    /// synchronously responsible for this poll stack.
+    pub(crate) fn record_accepted_write(&self) {
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(counter) = current {
+            counter.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn install(self: &Arc<Self>, counter: Arc<AtomicU64>) -> FrameWritePollAttributionGuard {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // One physical V2 lane admits one in-flight Call. Replacing an
+        // installed counter here would silently attribute another Call's
+        // ciphertext, so fail closed by leaving the existing attribution in
+        // place only for the duration of its owner poll.
+        debug_assert!(current.is_none());
+        *current = Some(Arc::clone(&counter));
+        FrameWritePollAttributionGuard {
+            attribution: Arc::clone(self),
+            counter,
+        }
+    }
+}
+
+struct FrameWritePollAttributionGuard {
+    attribution: Arc<FrameWritePollAttribution>,
+    counter: Arc<AtomicU64>,
+}
+
+impl Drop for FrameWritePollAttributionGuard {
+    fn drop(&mut self) {
+        let mut current = self
+            .attribution
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current
+            .as_ref()
+            .is_some_and(|installed| Arc::ptr_eq(installed, &self.counter))
+        {
+            *current = None;
+        }
+    }
+}
+
 impl FrameWriteProgress {
     pub(crate) const fn new() -> Self {
         Self {
             accepted: AtomicBool::new(false),
             transport: Mutex::new(None),
+            poll_attribution: Mutex::new(None),
         }
     }
 
@@ -3500,6 +3948,44 @@ impl FrameWriteProgress {
             accepted_writes,
             baseline,
         });
+    }
+
+    /// Bind a fresh Call-local lower-TCP counter to an attributed TLS writer.
+    ///
+    /// Unlike [`Self::bind_transport_counter`], this does not observe a
+    /// lane-global counter. The lower wrapper can increment this counter only
+    /// while [`WriteProgress`] is actively polling the Call writer.
+    pub(crate) fn bind_poll_stack_attribution(&self, attribution: Arc<FrameWritePollAttribution>) {
+        if self.accepted_any() {
+            return;
+        }
+        let accepted_writes = Arc::new(AtomicU64::new(0));
+        *self
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TransportWriteObservation {
+            accepted_writes,
+            baseline: 0,
+        });
+        *self
+            .poll_attribution
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attribution);
+    }
+
+    fn install_poll_attribution(&self) -> Option<FrameWritePollAttributionGuard> {
+        let attribution = self
+            .poll_attribution
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let counter = self
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|observation| Arc::clone(&observation.accepted_writes))?;
+        Some(attribution.install(counter))
     }
 
     pub(crate) fn accepted_any(&self) -> bool {
@@ -3534,6 +4020,69 @@ struct WriteProgress<'a, W> {
     progress: &'a FrameWriteProgress,
 }
 
+/// A framed Call writer with an opt-in pre-acceptance boundary.
+///
+/// Until a lower transport has accepted attributable ciphertext, every write
+/// and flush poll refuses delegation at `pre_accept_deadline`. Once that
+/// exact boundary is crossed, [`FrameWriteProgress`] is absorbing and the
+/// same pinned frame is allowed to finish under the operation deadline.
+struct TwoPhaseWriteProgress<'a, W> {
+    writer: WriteProgress<'a, W>,
+    progress: &'a FrameWriteProgress,
+    pre_accept_deadline: tokio::time::Instant,
+}
+
+impl<W> TwoPhaseWriteProgress<'_, W>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    fn pre_acceptance_expired(&self) -> bool {
+        !self.progress.accepted_any() && tokio::time::Instant::now() >= self.pre_accept_deadline
+    }
+}
+
+impl<W> tokio::io::AsyncWrite for TwoPhaseWriteProgress<'_, W>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.pre_acceptance_expired() {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "pre-acceptance Call deadline elapsed",
+            )));
+        }
+        std::pin::Pin::new(&mut this.writer).poll_write(context, bytes)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.pre_acceptance_expired() {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "pre-acceptance Call deadline elapsed",
+            )));
+        }
+        std::pin::Pin::new(&mut this.writer).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.writer).poll_shutdown(context)
+    }
+}
+
 impl<W> tokio::io::AsyncWrite for WriteProgress<'_, W>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -3544,14 +4093,19 @@ where
         bytes: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        let attribution = this.progress.install_poll_attribution();
         match std::pin::Pin::new(&mut *this.writer).poll_write(context, bytes) {
             std::task::Poll::Ready(Ok(accepted)) => {
                 if accepted != 0 {
                     this.progress.accepted.store(true, Ordering::Release);
                 }
+                drop(attribution);
                 std::task::Poll::Ready(Ok(accepted))
             }
-            result => result,
+            result => {
+                drop(attribution);
+                result
+            }
         }
     }
 
@@ -3560,7 +4114,10 @@ where
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        std::pin::Pin::new(&mut *this.writer).poll_flush(context)
+        let attribution = this.progress.install_poll_attribution();
+        let result = std::pin::Pin::new(&mut *this.writer).poll_flush(context);
+        drop(attribution);
+        result
     }
 
     fn poll_shutdown(
@@ -3651,6 +4208,93 @@ where
         progress,
     )
     .await
+}
+
+/// Write one Call frame with a strict pre-acceptance boundary and a separate
+/// operation deadline.
+///
+/// Encoding and every zero-byte write/flush poll are bounded by
+/// `pre_accept_deadline`. A lower accepted ciphertext write latches the
+/// effect boundary, after which the original `operation_deadline` governs the
+/// already-pinned frame. This avoids racing an external cancellation against
+/// a partially written Call and leaves retry policy with the caller.
+pub(crate) async fn write_frame_bounded_until_two_phase_classified_with_progress<W, T>(
+    writer: &mut W,
+    frame: &T,
+    max_frame_size: usize,
+    pre_accept_deadline: tokio::time::Instant,
+    operation_deadline: tokio::time::Instant,
+    progress: &FrameWriteProgress,
+) -> Result<(), FrameWriteError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let pre_accept_deadline = pre_accept_deadline.min(operation_deadline);
+    let control = EncodingControl {
+        deadline: Some(pre_accept_deadline),
+        cancellation: &NEVER_CANCELLED,
+    };
+    let json = encode_frame_bounded(frame, max_frame_size, control)
+        .map_err(FrameWriteError::BeforeWrite)?;
+    control
+        .check()
+        .map_err(encoding_halt_protocol_error)
+        .map_err(FrameWriteError::BeforeWrite)?;
+    let len = u32::try_from(json.encoded_len)
+        .map_err(|_| ProtocolError::FrameTooLarge(json.encoded_len))
+        .map_err(FrameWriteError::BeforeWrite)?;
+    let mut writer = TwoPhaseWriteProgress {
+        writer: WriteProgress { writer, progress },
+        progress,
+        pre_accept_deadline,
+    };
+    let write = async {
+        writer
+            .write_all(&len.to_be_bytes())
+            .await
+            .map_err(ProtocolError::Io)?;
+        for chunk in &json.chunks {
+            writer
+                .write_all(chunk.initialized_bytes())
+                .await
+                .map_err(ProtocolError::Io)?;
+        }
+        writer.flush().await.map_err(ProtocolError::Io)
+    };
+    tokio::pin!(write);
+    loop {
+        let awaiting_pre_acceptance = !progress.accepted_any();
+        let active_deadline = if awaiting_pre_acceptance {
+            pre_accept_deadline
+        } else {
+            operation_deadline
+        };
+        tokio::select! {
+            biased;
+            result = &mut write => {
+                result.map_err(|error| progress.classify(error))?;
+                if tokio::time::Instant::now() >= operation_deadline {
+                    return Err(progress.classify(write_timeout_error()));
+                }
+                return Ok(());
+            }
+            _ = tokio::time::sleep_until(active_deadline) => {
+                // A lower TCP write can be accepted during the writer poll
+                // which preceded this timer wakeup, while the outer TLS poll
+                // still returns Pending. Re-check the absorbing boundary
+                // before treating a pre-acceptance timer as a zero-byte
+                // timeout; otherwise the stale timer races a proven Call
+                // ciphertext acceptance.
+                if !awaiting_pre_acceptance
+                    || !progress.accepted_any()
+                    || tokio::time::Instant::now() >= operation_deadline
+                {
+                    return Err(progress.classify(write_timeout_error()));
+                }
+            }
+        }
+    }
 }
 
 /// Cancellable counterpart to [`write_frame_bounded_until`].
@@ -4219,6 +4863,106 @@ mod tests {
     const OWNER_SENTINEL: &str = "peer-owner-sensitive-sentinel";
     const KEY_TYPE_SENTINEL: &str = "peer-key-type-sensitive-sentinel";
 
+    #[test]
+    fn compact_roster_payload_debug_is_fixed_and_redacted() {
+        let sentinel = b"protected-roster-sensitive-value";
+        let short = format!("{:?}", CompactRosterPayload(sentinel.to_vec()));
+        let long = format!("{:?}", CompactRosterPayload(vec![0xA5; 4_096]));
+
+        assert_eq!(short, "CompactRosterPayload(<redacted>)");
+        assert_eq!(short, long, "diagnostic width must not reveal payload size");
+        assert!(!short.contains("protected-roster-sensitive-value"));
+        assert!(!short.contains("165"), "byte values must remain redacted");
+    }
+
+    #[test]
+    fn compact_roster_outer_request_is_canonical_bounded_and_round_trips() {
+        let cluster = opc_consensus::ConsensusClusterId::new("compact-roster").expect("cluster");
+        let epoch = opc_consensus::ConsensusConfigurationEpoch::new(1).expect("epoch");
+        let identity = opc_consensus::ConsensusIdentity::new(
+            cluster,
+            opc_consensus::derive_configuration_id(cluster, epoch, &[[9; 32]]),
+            epoch,
+        );
+        let sender = opc_consensus::derive_node_id(cluster, b"replica-a").expect("node ID");
+        let request = SessionConsensusWireRequest::try_new(
+            identity,
+            sender,
+            ConsensusRpcFamily::ForwardRosterMutation,
+            vec![0x4d],
+        )
+        .expect("bounded roster request");
+        let mut invalid_outbound = request.clone();
+        invalid_outbound.schema_version = 0;
+        assert!(matches!(
+            SessionConsensusTransportRequest::from_wire_call(uuid::Uuid::nil(), invalid_outbound),
+            Err(SessionConsensusPeerError::Protocol)
+        ));
+        let frame =
+            SessionConsensusTransportRequest::from_wire_call(uuid::Uuid::nil(), request.clone())
+                .expect("compact roster call");
+        let encoded = serde_json::to_vec(&frame).expect("serialize compact roster call");
+        let encoded_value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("inspect compact roster call");
+        assert_eq!(
+            encoded_value["RosterCall"]["request"]["payload"],
+            serde_json::json!("TQ==")
+        );
+        let decoded: SessionConsensusTransportRequest =
+            serde_json::from_slice(&encoded).expect("decode compact roster call");
+        let (_, decoded_request) = decoded.into_wire_call().expect("validated roster request");
+        assert_eq!(decoded_request, request);
+
+        let mut malformed = encoded_value.clone();
+        malformed["RosterCall"]["request"]["payload"] = serde_json::json!("!Q==");
+        assert!(serde_json::from_value::<SessionConsensusTransportRequest>(malformed).is_err());
+
+        let mut noncanonical = encoded_value.clone();
+        noncanonical["RosterCall"]["request"]["payload"] = serde_json::json!("TR==");
+        assert!(serde_json::from_value::<SessionConsensusTransportRequest>(noncanonical).is_err());
+
+        let mut oversized = encoded_value.clone();
+        oversized["RosterCall"]["request"]["payload"] =
+            serde_json::json!("A".repeat(MAX_COMPACT_ROSTER_PAYLOAD_ENCODED_BYTES + 4));
+        assert!(serde_json::from_value::<SessionConsensusTransportRequest>(oversized).is_err());
+
+        let mut non_roster_family = encoded_value;
+        non_roster_family["RosterCall"]["request"]["family"] = serde_json::json!("Vote");
+        assert!(
+            serde_json::from_value::<SessionConsensusTransportRequest>(non_roster_family).is_err()
+        );
+
+        let legacy_roster_call = SessionConsensusTransportRequest::Call {
+            call_id: uuid::Uuid::nil(),
+            request,
+        };
+        assert!(matches!(
+            legacy_roster_call.into_wire_call(),
+            Err(SessionConsensusPeerError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn compact_roster_payload_enforces_exact_and_one_over_limits() {
+        assert_eq!(CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES, 2_253_338);
+        let exact = base64::engine::general_purpose::STANDARD
+            .encode(vec![u8::MAX; CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES]);
+        assert_eq!(exact.len(), MAX_COMPACT_ROSTER_PAYLOAD_ENCODED_BYTES);
+        assert_eq!(
+            decode_compact_roster_payload(&exact)
+                .expect("exact compact roster payload")
+                .len(),
+            CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES
+        );
+
+        let one_over = base64::engine::general_purpose::STANDARD.encode(vec![
+            u8::MAX;
+            CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES
+                + 1
+        ]);
+        assert!(decode_compact_roster_payload(&one_over).is_err());
+    }
+
     fn replace_json_string(
         value: &mut serde_json::Value,
         needle: &str,
@@ -4556,6 +5300,23 @@ mod tests {
         ensure_frame_fits(&request, MIN_SESSION_CONSENSUS_FRAME_SIZE)
             .expect("consensus minimum must fit the worst byte request");
 
+        let roster_request = SessionConsensusWireRequest::try_new(
+            identity,
+            sender,
+            opc_consensus::ConsensusRpcFamily::AppendEntriesRoster,
+            vec![u8::MAX; CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES],
+        )
+        .expect("maximum bounded roster request");
+        let roster_request =
+            SessionConsensusTransportRequest::from_wire_call(uuid::Uuid::nil(), roster_request)
+                .expect("maximum bounded roster outer request");
+        assert!(matches!(
+            roster_request,
+            SessionConsensusTransportRequest::RosterCall { .. }
+        ));
+        ensure_frame_fits(&roster_request, MIN_SESSION_CONSENSUS_FRAME_SIZE)
+            .expect("consensus minimum must fit the maximum roster outer request");
+
         let response = SessionConsensusTransportResponse::Call {
             call_id: uuid::Uuid::nil(),
             response: SessionConsensusWireResponse {
@@ -4566,14 +5327,43 @@ mod tests {
             .expect("consensus minimum must fit the worst byte response");
         assert!(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.is_current());
         assert_eq!(
+            CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.max_roster_rpc_payload_bytes,
+            2_253_338
+        );
+        assert_eq!(
             CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision,
             6
         );
         assert_eq!(SESSION_CONSENSUS_ALPN, b"opc-session-consensus/2");
-        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 4);
+        assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 5);
+        assert_eq!(SESSION_CONSENSUS_APPLICATION_REVISION, 3);
+        assert_eq!(
+            serde_json::to_value(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE)
+                .expect("consensus contract serializes"),
+            serde_json::json!({
+                "wire_schema_revision": 5,
+                "application_revision": 3,
+                "error_set_revision": 6,
+                "max_rpc_payload_bytes": SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
+                "max_roster_rpc_payload_bytes": CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES,
+                "min_frame_size": MIN_SESSION_CONSENSUS_FRAME_SIZE,
+                "max_frame_size": MAX_NEGOTIATED_FRAME_SIZE,
+            }),
+            "the bootstrap golden binds v2 outcome-digest and protected-roster established-transition semantics separately from consumer wire"
+        );
         let mut previous_error_set = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
-        previous_error_set.error_set_revision = 1;
-        assert!(!previous_error_set.is_current());
+        previous_error_set.error_set_revision =
+            CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.error_set_revision - 1;
+        assert!(
+            !previous_error_set.is_current(),
+            "the adjacent error-set revision 5 must not pass the exact consensus profile gate"
+        );
+        let mut previous_application = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
+        previous_application.application_revision = SESSION_CONSENSUS_APPLICATION_REVISION - 1;
+        assert!(
+            !previous_application.is_current(),
+            "the adjacent application revision 2 lacks the protected-roster established-transition semantics and must not pass the exact consensus profile gate"
+        );
         assert_eq!(
             CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.min_frame_size,
             MIN_SESSION_CONSENSUS_FRAME_SIZE as u32
@@ -5945,6 +6735,68 @@ mod tests {
         }
     }
 
+    /// Models a TLS writer that drains one ciphertext record to its lower
+    /// transport but keeps the outer plaintext write Pending. The drain must
+    /// count only when the Call writer has installed its poll-stack token.
+    struct LowerAcceptedThenPendingWriter {
+        attribution: Arc<FrameWritePollAttribution>,
+        lower_accepted: bool,
+    }
+
+    impl tokio::io::AsyncWrite for LowerAcceptedThenPendingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if !self.lower_accepted {
+                self.lower_accepted = true;
+                self.attribution.record_accepted_write();
+            }
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PendingWriteOnlyWriter;
+
+    impl tokio::io::AsyncWrite for PendingWriteOnlyWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
     async fn bounded_storage_and_counter_stop_cooperatively_with_distinct_errors() {
         let storage_cancellation = AtomicBool::new(false);
@@ -6073,6 +6925,81 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::TimedOut
         ));
         assert!(!writer.bytes.is_empty(), "the write boundary was crossed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_boundary_latches_lower_call_acceptance_before_pending_tls_poll() {
+        let attribution = Arc::new(FrameWritePollAttribution::new());
+        let progress = FrameWriteProgress::new();
+        progress.bind_poll_stack_attribution(Arc::clone(&attribution));
+        let mut writer = LowerAcceptedThenPendingWriter {
+            attribution,
+            lower_accepted: false,
+        };
+        let pre_accept_deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let operation_deadline = tokio::time::Instant::now() + Duration::from_millis(30);
+        let write = write_frame_bounded_until_two_phase_classified_with_progress(
+            &mut writer,
+            &Response::WatchStream,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            pre_accept_deadline,
+            operation_deadline,
+            &progress,
+        );
+        tokio::pin!(write);
+        assert!(futures_util::poll!(&mut write).is_pending());
+        assert!(
+            progress.accepted_any(),
+            "a lower ciphertext acceptance latches before the outer TLS poll completes"
+        );
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert!(
+            futures_util::poll!(&mut write).is_pending(),
+            "the expired pre-accept timer must not cancel an already accepted Call"
+        );
+
+        tokio::time::advance(Duration::from_millis(20)).await;
+        let error = write
+            .await
+            .expect_err("the accepted pending Call expires only at its operation deadline");
+        assert!(matches!(
+            error,
+            FrameWriteError::MayHaveWritten(ProtocolError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_boundary_rejects_a_zero_byte_pending_call() {
+        let progress = FrameWriteProgress::new();
+        let mut writer = PendingWriteOnlyWriter;
+        let pre_accept_deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let operation_deadline = tokio::time::Instant::now() + Duration::from_millis(30);
+        let write = write_frame_bounded_until_two_phase_classified_with_progress(
+            &mut writer,
+            &Response::WatchStream,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            pre_accept_deadline,
+            operation_deadline,
+            &progress,
+        );
+        tokio::pin!(write);
+        assert!(futures_util::poll!(&mut write).is_pending());
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let error = write
+            .await
+            .expect_err("a zero-byte Call cannot cross its pre-acceptance boundary");
+        assert!(matches!(
+            error,
+            FrameWriteError::BeforeWrite(ProtocolError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(
+            !progress.accepted_any(),
+            "zero-byte TLS polling never becomes a Call transmission"
+        );
     }
 
     #[tokio::test]

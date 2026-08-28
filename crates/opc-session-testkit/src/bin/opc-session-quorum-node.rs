@@ -17,7 +17,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 #[cfg(unix)]
@@ -31,23 +31,29 @@ use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_K
 use opc_redaction::metrics::{SecurityMetricsReader, METRICS};
 use opc_session_net::{
     ConnectionLifecyclePolicy, LocalReplicaBinding, RemoteAddrResolver, RemoteSessionConsensusPeer,
-    SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
-    SessionConsensusServer, SessionConsensusServerHandle, SessionConsumerAuthorizer,
-    SessionQuorumConsumerServer, SessionQuorumConsumerServerHandle, SessionReauthenticationControl,
-    SessionReplicationManifest,
+    RosterIngressSigner, RosterIngressSignerError, SessionClusterId, SessionConfigurationEpoch,
+    SessionConfigurationGeneration, SessionConsensusServer, SessionConsensusServerHandle,
+    SessionConsumerAuthorizer, SessionQuorumConsumerServer, SessionQuorumConsumerServerHandle,
+    SessionReauthenticationControl, SessionReplicationManifest,
+};
+use opc_session_store::fenced_mutation_roster::{
+    RosterAttestationLeafCertificateV1, RosterCompactAdmissionProvenanceSigningInputV2,
 };
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload,
     EncryptingSessionBackend, FenceToken, Generation, LeaseError, LeaseGuard, OwnerId,
-    QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
-    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, ReplicationEntry, ReplicationOp,
-    RestoreScanCursorProfile, RestoreScanRequest, RestoreScanScope, SessionBackend,
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerChange,
-    SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
-    SessionConsumerRequest, SessionConsumerResponse, SessionConsumerScope,
-    SessionConsumerStoreError, SessionConsumerV2Operation, SessionConsumerV2Request,
+    ProtectedRosterEstablishedSuccessor, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    ReplicationEntry, ReplicationOp, RestoreScanCursorProfile, RestoreScanRequest,
+    RestoreScanScope, RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+    RosterAttestationTrustRootV1, RosterIngressAttestationSigningInputV1,
+    RosterIngressAttestationV1, SessionBackend, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionConsumerAuthorization, SessionConsumerAuthorizationGrant, SessionConsumerChange,
+    SessionConsumerOperation, SessionConsumerRejection, SessionConsumerRequest,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerTenantNfScope, SessionConsumerV2Operation, SessionConsumerV2Request,
     SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
     SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
     StoreError, StoredSessionRecord, ValidatedQuorumTopology,
@@ -94,7 +100,10 @@ use opc_session_testkit::qualification_kubernetes::{
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder, TlsMaterialController,
 };
+use opc_types::Timestamp;
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+use p256::ecdsa::signature::hazmat::PrehashSigner;
+use p256::ecdsa::SigningKey;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 #[cfg(unix)]
@@ -106,10 +115,14 @@ use rustix::net::sockopt::socket_error;
 #[cfg(unix)]
 use rustix::net::{connect, socket, AddressFamily, SocketAddrUnix, SocketType};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
 const QUALIFICATION_TENANT: &str = "session-ha-qualification";
+/// The only application namespaces exercised by the qualification-only
+/// stateless-consumer scenario. Runtime configuration deliberately carries no
+/// consumer scope input, so this fixed test contract must remain exact.
+const QUALIFICATION_STATELESS_CONSUMER_TENANT: &str = "qualification-consumer";
 const QUALIFICATION_KEY_ID: &str = "session-ha-qualification-key-v1";
 const QUALIFICATION_STATE_TYPE: &str = "session-ha-qualification-state";
 const QUALIFICATION_TRAFFIC_STATE_TYPE: &str = "session-ha-qualification-traffic-state";
@@ -333,6 +346,8 @@ struct QualificationNode {
     consumer_server: Option<SessionQuorumConsumerServerHandle>,
     consumer_transport: Option<QualificationConsumerTransport>,
     consumer_delayed_response: Arc<AtomicBool>,
+    consumer_response_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
+    consumer_ambiguity_witness_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
     transport: QualificationTransportRuntime,
     leases: HashMap<String, QualificationLease>,
     next_lease_retention_sequence: u64,
@@ -345,6 +360,107 @@ struct QualificationNode {
         HashMap<QualificationConcurrentSubscriptionId, QualificationConcurrentWatchRuntime>,
     empty_vote_dispatches: Arc<AtomicU64>,
     rpc_gate: QualificationConsensusRpcGate,
+    roster_attestation_root: RosterAttestationTrustRootV1,
+    fixed_consensus_identity: SessionConsensusIdentity,
+}
+
+/// Test-harness-only issuer for the protected consumer ingress.  It is
+/// deliberately constructed from the same root and fixed quorum identity
+/// that opened this child process' durable store, so `/3` cannot be enabled
+/// as a synthetic side channel detached from the running quorum.
+struct QualificationRosterIngressSigner {
+    root: RosterAttestationTrustRootV1,
+    ingress_key: SigningKey,
+    ingress_certificate: RosterAttestationLeafCertificatePartsV1,
+}
+
+impl QualificationRosterIngressSigner {
+    fn root() -> Result<RosterAttestationTrustRootV1, NodeFailure> {
+        let root_key = SigningKey::from_bytes((&[0x31; 32]).into()).map_err(|_| NodeFailure)?;
+        let public_key = root_key.verifying_key().to_sec1_point(true);
+        let public_key = public_key.as_bytes().try_into().map_err(|_| NodeFailure)?;
+        RosterAttestationTrustRootV1::new([0xa1; 32], public_key).map_err(|_| NodeFailure)
+    }
+
+    fn new(
+        root: RosterAttestationTrustRootV1,
+        configuration_identity: SessionConsensusIdentity,
+        scope: SessionConsumerScope,
+    ) -> Result<Self, NodeFailure> {
+        let root_key = SigningKey::from_bytes((&[0x31; 32]).into()).map_err(|_| NodeFailure)?;
+        let ingress_key = SigningKey::from_bytes((&[0x32; 32]).into()).map_err(|_| NodeFailure)?;
+        let now = Timestamp::now_utc();
+        let not_before = now.add_seconds(-60).ok_or(NodeFailure)?;
+        let not_after = now.add_seconds(3_600).ok_or(NodeFailure)?;
+        let public_key = ingress_key.verifying_key().to_sec1_point(true);
+        let public_key = public_key.as_bytes().try_into().map_err(|_| NodeFailure)?;
+        let mut ingress_certificate = RosterAttestationLeafCertificatePartsV1 {
+            root_id: root.root_id(),
+            role: RosterAttestationCertificateRoleV1::TransportIngress,
+            configuration_identity,
+            scope: opc_session_store::consumer::session_consumer_roster_scope_commitment(scope),
+            subject_identity_commitment: [0x41; 32],
+            leaf_epoch: 1,
+            key_id: [0x51; 32],
+            not_before,
+            not_after,
+            public_key,
+            root_signature: [0; 64],
+        };
+        ingress_certificate.root_signature = Self::sign(
+            &root_key,
+            RosterAttestationLeafCertificateV1::signing_digest(&ingress_certificate)
+                .map_err(|_| NodeFailure)?,
+        )?;
+        Ok(Self {
+            root,
+            ingress_key,
+            ingress_certificate,
+        })
+    }
+
+    fn sign(key: &SigningKey, digest: [u8; 32]) -> Result<[u8; 64], NodeFailure> {
+        let signature: p256::ecdsa::Signature =
+            key.sign_prehash(&digest).map_err(|_| NodeFailure)?;
+        Ok(signature.normalize_s().to_bytes().into())
+    }
+
+    fn sign_ingress(&self, digest: [u8; 32]) -> Result<[u8; 64], RosterIngressSignerError> {
+        Self::sign(&self.ingress_key, digest).map_err(|_| RosterIngressSignerError)
+    }
+}
+
+#[async_trait::async_trait]
+impl RosterIngressSigner for QualificationRosterIngressSigner {
+    fn trust_root(&self) -> RosterAttestationTrustRootV1 {
+        self.root.clone()
+    }
+
+    async fn attest(
+        &self,
+        input: &RosterIngressAttestationSigningInputV1,
+    ) -> Result<RosterIngressAttestationV1, RosterIngressSignerError> {
+        RosterIngressAttestationV1::issue_from_signed_parts(
+            &self.root,
+            self.ingress_certificate.clone(),
+            input,
+            self.sign_ingress(input.digest().map_err(|_| RosterIngressSignerError)?)?,
+        )
+        .map_err(|_| RosterIngressSignerError)
+    }
+
+    fn compact_admission_certificate(
+        &self,
+    ) -> Result<RosterAttestationLeafCertificatePartsV1, RosterIngressSignerError> {
+        Ok(self.ingress_certificate.clone())
+    }
+
+    async fn sign_compact_admission(
+        &self,
+        input: &RosterCompactAdmissionProvenanceSigningInputV2,
+    ) -> Result<[u8; 64], RosterIngressSignerError> {
+        self.sign_ingress(input.digest().map_err(|_| RosterIngressSignerError)?)
+    }
 }
 
 struct QualificationConcurrentWatchRuntime {
@@ -365,13 +481,103 @@ struct QualificationTrafficRuntime {
 struct QualificationConsumerDelayedResponseService {
     inner: Arc<dyn SessionQuorumConsumer>,
     armed: Arc<AtomicBool>,
+    response_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
+    ambiguity_witness_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
+}
+
+/// Bounded post-execution hold gate for the four-lane persistent-V2 pressure
+/// seam. It is deliberately separate from the legacy one-shot response delay:
+/// the control plane can prove all four durable executions have entered the
+/// hold before it admits pressure, then release exactly those four responses.
+struct QualificationConsumerResponseHoldGate {
+    response_count: usize,
+    armed: AtomicUsize,
+    entered: AtomicUsize,
+    releases: AtomicUsize,
+    released: Notify,
+}
+
+impl QualificationConsumerResponseHoldGate {
+    fn new(response_count: usize) -> Self {
+        assert!(
+            response_count > 0,
+            "qualification response hold count is nonzero"
+        );
+        Self {
+            response_count,
+            armed: AtomicUsize::new(0),
+            entered: AtomicUsize::new(0),
+            releases: AtomicUsize::new(0),
+            released: Notify::new(),
+        }
+    }
+
+    fn arm(&self) -> bool {
+        self.armed
+            .compare_exchange(0, self.response_count, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            && self.entered.load(Ordering::SeqCst) == 0
+            && self.releases.load(Ordering::SeqCst) == 0
+    }
+
+    fn status(&self) -> (usize, usize) {
+        (
+            self.armed.load(Ordering::SeqCst),
+            self.entered.load(Ordering::SeqCst),
+        )
+    }
+
+    fn release(&self) -> bool {
+        if self.armed.load(Ordering::SeqCst) != 0
+            || self.entered.load(Ordering::SeqCst) != self.response_count
+            || self.releases.load(Ordering::SeqCst) != 0
+        {
+            return false;
+        }
+        self.releases.store(self.response_count, Ordering::SeqCst);
+        self.released.notify_waiters();
+        true
+    }
+
+    fn take_armed_response(&self) -> bool {
+        self.armed
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
+                armed.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    async fn hold_response(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        loop {
+            let notified = self.released.notified();
+            tokio::pin!(notified);
+            // Poll once before testing the token so a release in the narrow
+            // check-to-await window is retained by Notify rather than lost.
+            futures_util::future::poll_fn(|context| {
+                let _ = std::future::Future::poll(notified.as_mut(), context);
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if self
+                .releases
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |releases| {
+                    releases.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
     async fn execute(
         &self,
-        identity: &SessionConsumerIdentity,
+        authorization: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
         let lease_mutation = matches!(
@@ -380,7 +586,7 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
                 | SessionConsumerOperation::RenewLease { .. }
                 | SessionConsumerOperation::ReleaseLease { .. }
         );
-        let response = self.inner.execute(identity, request).await;
+        let response = self.inner.execute(authorization, request).await;
         if lease_mutation
             && matches!(
                 &response,
@@ -400,7 +606,7 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
 
     async fn execute_v2(
         &self,
-        identity: &SessionConsumerIdentity,
+        authorization: &SessionConsumerAuthorization,
         request: SessionConsumerV2Request,
     ) -> SessionConsumerV2Response {
         let mutation = matches!(
@@ -408,7 +614,7 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
             SessionConsumerV2Operation::FencedTransitionV2 { .. }
                 | SessionConsumerV2Operation::FencedTransitionV2Batch { .. }
         );
-        let response = self.inner.execute_v2(identity, request).await;
+        let response = self.inner.execute_v2(authorization, request).await;
         if mutation
             && matches!(
                 &response,
@@ -425,19 +631,33 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
             // server-side ambiguity result or bypasses durable execution.
             tokio::time::sleep(QUALIFICATION_DELAYED_CONSUMER_RESPONSE).await;
         }
+        if mutation && self.ambiguity_witness_hold_gate.take_armed_response() {
+            // This dedicated one-response gate keys the causal witness to a
+            // post-durability acknowledgement without consuming any of the
+            // four fixed pressure lanes.
+            self.ambiguity_witness_hold_gate.hold_response().await;
+        } else if mutation && self.response_hold_gate.take_armed_response() {
+            // The durable operation above has already completed. This hold
+            // only withholds its real response and records entry before the
+            // harness applies client-side queue pressure.
+            self.response_hold_gate.hold_response().await;
+        }
         response
     }
 
     async fn watch(
         &self,
-        identity: &SessionConsumerIdentity,
-        scope: SessionConsumerScope,
-        start_sequence: u64,
+        _authorization: &SessionConsumerAuthorization,
+        _scope: SessionConsumerScope,
+        _start_sequence: u64,
     ) -> Result<
         BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
         SessionConsumerRejection,
     > {
-        self.inner.watch(identity, scope, start_sequence).await
+        // The qualification stateless-consumer contract exercises request/
+        // response operations only. Do not turn its exact mutation grants
+        // into a subscription grant.
+        Err(SessionConsumerRejection::Unauthorized)
     }
 }
 
@@ -814,21 +1034,23 @@ impl QualificationNode {
                 ))
             })
             .collect::<Result<Vec<_>, NodeFailure>>()?;
+        let roster_attestation_root = QualificationRosterIngressSigner::root()?;
         let manifest = Arc::new(
-            SessionReplicationManifest::try_new_with_epoch(
+            SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
                 SessionClusterId::new(config.cluster_id.clone()).map_err(|_| NodeFailure)?,
                 SessionConfigurationGeneration::new(config.configuration_generation.clone())
                     .map_err(|_| NodeFailure)?,
                 SessionConfigurationEpoch::new(config.configuration_epoch)
                     .map_err(|_| NodeFailure)?,
                 descriptors.clone(),
+                Some(roster_attestation_root.clone()),
             )
             .map_err(|_| NodeFailure)?,
         );
         let local_replica = ReplicaId::new(config.members[config.node_index].replica_id.clone())
             .map_err(|_| NodeFailure)?;
         let local_binding = manifest
-            .bind_local(local_replica.clone())
+            .bind_fixed_durable_quorum_local(local_replica.clone())
             .map_err(|_| NodeFailure)?;
         let mut configured_voter_ids = config
             .members
@@ -843,17 +1065,21 @@ impl QualificationNode {
             })
             .collect::<Result<Vec<_>, _>>()?;
         configured_voter_ids.sort_unstable();
-        let topology = ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
-            local_replica,
-            descriptors,
-            manifest.consensus_identity(),
-        ))
+        let fixed_consensus_identity = manifest.fixed_durable_quorum_consensus_identity();
+        let topology = ValidatedQuorumTopology::try_from_fixed_durable_quorum(
+            QuorumTopologyConfig::new_consensus_with_roster_attestation_trust_root(
+                local_replica,
+                descriptors,
+                fixed_consensus_identity,
+                roster_attestation_root.clone(),
+            ),
+        )
         .map_err(|_| NodeFailure)?;
         let rpc_gate = QualificationConsensusRpcGate::available();
         let (peers, server_transport, transport) = prepare_transport(
             config,
             &local_binding,
-            manifest.consensus_identity(),
+            fixed_consensus_identity,
             rpc_gate.clone(),
         )
         .await
@@ -936,6 +1162,10 @@ impl QualificationNode {
             consumer_server: None,
             consumer_transport,
             consumer_delayed_response: Arc::new(AtomicBool::new(false)),
+            consumer_response_hold_gate: Arc::new(QualificationConsumerResponseHoldGate::new(4)),
+            consumer_ambiguity_witness_hold_gate: Arc::new(
+                QualificationConsumerResponseHoldGate::new(1),
+            ),
             transport,
             leases: HashMap::new(),
             next_lease_retention_sequence: 1,
@@ -948,6 +1178,8 @@ impl QualificationNode {
             concurrent_watches: HashMap::new(),
             empty_vote_dispatches,
             rpc_gate,
+            roster_attestation_root,
+            fixed_consensus_identity,
         })
     }
 
@@ -1002,6 +1234,84 @@ impl QualificationNode {
                 } else {
                     self.consumer_delayed_response.store(true, Ordering::SeqCst);
                     QualificationNodeReply::StatelessConsumerDelayedResponseArmed
+                }
+            }
+            QualificationNodeCommand::ArmStatelessConsumerResponseHolds => {
+                if self.consumer_server.is_none() || !self.consumer_response_hold_gate.arm() {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                } else {
+                    QualificationNodeReply::StatelessConsumerResponseHoldsArmed { responses: 4 }
+                }
+            }
+            QualificationNodeCommand::StatelessConsumerResponseHoldStatus => {
+                let (armed_responses, held_responses) = self.consumer_response_hold_gate.status();
+                QualificationNodeReply::StatelessConsumerResponseHoldStatus {
+                    armed_responses,
+                    held_responses,
+                }
+            }
+            QualificationNodeCommand::ReleaseStatelessConsumerResponseHolds => {
+                if self.consumer_response_hold_gate.release() {
+                    QualificationNodeReply::StatelessConsumerResponseHoldsReleased { responses: 4 }
+                } else {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                }
+            }
+            QualificationNodeCommand::ArmStatelessConsumerAmbiguityWitnessHold => {
+                if self.consumer_server.is_none()
+                    || !self.consumer_ambiguity_witness_hold_gate.arm()
+                {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                } else {
+                    QualificationNodeReply::StatelessConsumerAmbiguityWitnessHoldArmed
+                }
+            }
+            QualificationNodeCommand::StatelessConsumerAmbiguityWitnessHoldStatus => {
+                let (armed_responses, held_responses) =
+                    self.consumer_ambiguity_witness_hold_gate.status();
+                QualificationNodeReply::StatelessConsumerAmbiguityWitnessHoldStatus {
+                    armed_responses,
+                    held_responses,
+                }
+            }
+            QualificationNodeCommand::ReleaseStatelessConsumerAmbiguityWitnessHold => {
+                if self.consumer_ambiguity_witness_hold_gate.release() {
+                    QualificationNodeReply::StatelessConsumerAmbiguityWitnessHoldReleased
+                } else {
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    }
+                }
+            }
+            QualificationNodeCommand::StatelessConsumerAdmissionStatus => {
+                let Some(server) = self.consumer_server.as_ref() else {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    };
+                };
+                let snapshot = server.admission_snapshot();
+                let (Ok(active_connections), Ok(high_water_connections)) = (
+                    usize::try_from(snapshot.active_connections),
+                    usize::try_from(snapshot.high_water_connections),
+                ) else {
+                    return QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::InvalidRequest,
+                    };
+                };
+                QualificationNodeReply::StatelessConsumerAdmissionStatus {
+                    admission_limit: snapshot.admission_limit,
+                    active_connections,
+                    high_water_connections,
+                    admission_waits: snapshot.admission_waits,
+                    admission_rejections: snapshot.admission_rejections,
+                    samples: snapshot.samples,
+                    listener_available: snapshot.listener_available,
                 }
             }
             QualificationNodeCommand::SecurityMetrics => QualificationNodeReply::SecurityMetrics {
@@ -1233,15 +1543,6 @@ impl QualificationNode {
                 code: QualificationNodeErrorCode::InvalidRequest,
             };
         };
-        let manifest = match self.store.consumer_authorization_manifest().await {
-            Ok(manifest) => manifest,
-            Err(_) => {
-                return QualificationNodeReply::Error {
-                    code: QualificationNodeErrorCode::BackendUnavailable,
-                }
-            }
-        };
-        let scope = manifest.scope();
         let identities = match consumer_identities
             .into_iter()
             .map(SpiffeId::new)
@@ -1254,8 +1555,37 @@ impl QualificationNode {
                 }
             }
         };
-        let authorizer = match SessionConsumerAuthorizer::try_new(manifest, identities) {
+        let grants = match qualification_stateless_consumer_grants(identities) {
+            Ok(grants) => grants,
+            Err(()) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::InvalidRequest,
+                }
+            }
+        };
+        let manifest = match self.store.consumer_authorization_manifest(grants).await {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::BackendUnavailable,
+                }
+            }
+        };
+        let scope = manifest.scope();
+        let authorizer = match SessionConsumerAuthorizer::try_new(manifest) {
             Ok(authorizer) => authorizer,
+            Err(_) => {
+                return QualificationNodeReply::Error {
+                    code: QualificationNodeErrorCode::InvalidRequest,
+                }
+            }
+        };
+        let roster_signer = match QualificationRosterIngressSigner::new(
+            self.roster_attestation_root.clone(),
+            self.fixed_consensus_identity,
+            scope,
+        ) {
+            Ok(signer) => Arc::new(signer),
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::InvalidRequest,
@@ -1266,11 +1596,17 @@ impl QualificationNode {
             Arc::new(QualificationConsumerDelayedResponseService {
                 inner: Arc::new(self.store.consumer_service()),
                 armed: Arc::clone(&self.consumer_delayed_response),
+                response_hold_gate: Arc::clone(&self.consumer_response_hold_gate),
+                ambiguity_witness_hold_gate: Arc::clone(&self.consumer_ambiguity_witness_hold_gate),
             }),
             transport.server_config.clone(),
             authorizer,
         )
-        .with_max_connections(16)
+        .with_roster_ingress(Arc::new(self.store.consumer_service()), roster_signer)
+        // The release profile drives sixteen persistent V2 lanes to each
+        // listener. Keep a small, explicit four-slot server margin instead
+        // of treating that expected peak as an admission ceiling.
+        .with_max_connections(20)
         .with_connection_lifecycle(transport.lifecycle)
         .with_reauthentication_control(transport.reauthentication.clone());
         match listener
@@ -2570,6 +2906,30 @@ fn append_concurrent_watch_events(
                     record,
                 });
             }
+            ReplicationOp::ProtectedRosterEstablished {
+                expected_record,
+                successor,
+                ..
+            } => {
+                let record = match *successor {
+                    ProtectedRosterEstablishedSuccessor::Put { record } => Some(*record),
+                    ProtectedRosterEstablishedSuccessor::NoOp => Some(expected_record),
+                    ProtectedRosterEstablishedSuccessor::Delete => None,
+                };
+                let Some(record) = record else {
+                    continue;
+                };
+                let Some(record) = concurrent_record_snapshot(&record)? else {
+                    continue;
+                };
+                if events.len() >= QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS {
+                    return Err(());
+                }
+                events.push(QualificationConcurrentWatchEvent {
+                    journal_sequence: sequence,
+                    record,
+                });
+            }
             ReplicationOp::Batch { ops } => pending.extend(ops.into_iter().rev()),
             ReplicationOp::DeleteFenced { .. }
             | ReplicationOp::RefreshTtl { .. }
@@ -3628,6 +3988,24 @@ fn observe_applied_records(
                     watch_traffic_generations[node_index].store(generation, Ordering::Release);
                 }
             }
+            ReplicationOp::ProtectedRosterEstablished { key, successor, .. } => {
+                let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor else {
+                    continue;
+                };
+                count = count.saturating_add(1);
+                if let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                {
+                    if record.key != *key {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    let generation = record.generation.get();
+                    let previous = watch_traffic_generations[node_index].load(Ordering::Acquire);
+                    if previous.checked_add(1) != Some(generation) {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    watch_traffic_generations[node_index].store(generation, Ordering::Release);
+                }
+            }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
             ReplicationOp::DeleteFenced { .. }
             | ReplicationOp::RefreshTtl { .. }
@@ -3680,6 +4058,32 @@ fn reconcile_applied_traffic_records(
                 }
                 traffic_generations[node_index] = generation;
                 traffic_record_fences[node_index] = new_record.fence.get();
+            }
+            ReplicationOp::ProtectedRosterEstablished { key, successor, .. } => {
+                let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor else {
+                    continue;
+                };
+                let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                else {
+                    continue;
+                };
+                let generation = record.generation.get();
+                let expected_record = expected_traffic_record(
+                    key,
+                    seed,
+                    member_count,
+                    node_index,
+                    generation,
+                    record.fence.get(),
+                )?;
+                if record.fence.get() == 0
+                    || !traffic_record_is_exact(&expected_record, record)
+                    || traffic_generations[node_index].checked_add(1) != Some(generation)
+                {
+                    return Err(QualificationTrafficFailureCode::InvariantViolation);
+                }
+                traffic_generations[node_index] = generation;
+                traffic_record_fences[node_index] = record.fence.get();
             }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
             ReplicationOp::DeleteFenced { .. }
@@ -4074,6 +4478,37 @@ where
     for (handle, _) in released.into_iter().take(remove_count) {
         leases.remove(&handle);
     }
+}
+
+/// Build the exact, qualification-only grants for a validated command identity.
+///
+/// This child process is a test fixture and `QualificationNodeConfig` has no
+/// consumer scope field. The scopes are therefore the two fixed namespaces
+/// exercised by the stateless-consumer qualification workload; they are not
+/// derived from the SPIFFE text or from a request. Watches receive no separate
+/// authority from this helper.
+fn qualification_stateless_consumer_grants(
+    identities: Vec<SpiffeId>,
+) -> Result<Vec<SessionConsumerAuthorizationGrant>, ()> {
+    identities
+        .into_iter()
+        .map(|identity| {
+            SessionConsumerAuthorizationGrant::try_new(
+                identity,
+                [
+                    SessionConsumerTenantNfScope::new(
+                        TenantId::new(QUALIFICATION_STATELESS_CONSUMER_TENANT).map_err(|_| ())?,
+                        NetworkFunctionKind::smf(),
+                    ),
+                    SessionConsumerTenantNfScope::new(
+                        TenantId::new(QUALIFICATION_TENANT).map_err(|_| ())?,
+                        NetworkFunctionKind::smf(),
+                    ),
+                ],
+            )
+            .map_err(|_| ())
+        })
+        .collect()
 }
 
 fn qualification_key(stable_id: &str) -> Result<SessionKey, ()> {
@@ -5833,6 +6268,80 @@ mod tests {
         }
     }
 
+    fn reconciliation_roster_put(node_index: usize, generation: u64) -> ReplicationOp {
+        let key = qualification_traffic_key(node_index).expect("traffic key");
+        let previous_generation = generation.checked_sub(1).expect("previous generation");
+        let expected_record = expected_traffic_record(
+            &key,
+            qualification_traffic_seed(3).expect("traffic seed"),
+            3,
+            node_index,
+            previous_generation,
+            previous_generation.saturating_add(1),
+        )
+        .expect("expected traffic record");
+        let ReplicationOp::CompareAndSet { new_record, .. } =
+            reconciliation_cas(node_index, generation)
+        else {
+            unreachable!()
+        };
+        ReplicationOp::ProtectedRosterEstablished {
+            key,
+            expected_record,
+            successor: Box::new(ProtectedRosterEstablishedSuccessor::Put {
+                record: Box::new(new_record.clone()),
+            }),
+            owner: new_record.owner,
+            fence: new_record.fence,
+            credential_id: 1,
+            guard_acquired_at: opc_types::Timestamp::now_utc(),
+            guard_expires_at: opc_types::Timestamp::now_utc(),
+        }
+    }
+
+    #[test]
+    fn traffic_watch_and_reconciliation_project_roster_put_only() {
+        let keys = (0..3)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let operation = reconciliation_roster_put(0, 2);
+        let watched = [AtomicU64::new(1), AtomicU64::new(0), AtomicU64::new(0)];
+        assert_eq!(observe_applied_records(&operation, &keys, &watched), Ok(1));
+        assert_eq!(watched[0].load(Ordering::Acquire), 2);
+
+        let seed = qualification_traffic_seed(3).expect("traffic seed");
+        let mut generations = [1, 0, 0];
+        let mut fences = [2, 0, 0];
+        assert!(reconcile_applied_traffic_records(
+            &operation,
+            &keys,
+            &mut generations,
+            &mut fences,
+            seed,
+            3,
+        )
+        .is_ok());
+        assert_eq!(generations, [2, 0, 0]);
+        assert_eq!(fences, [3, 0, 0]);
+
+        for successor in [
+            ProtectedRosterEstablishedSuccessor::NoOp,
+            ProtectedRosterEstablishedSuccessor::Delete,
+        ] {
+            let mut non_write = operation.clone();
+            let ReplicationOp::ProtectedRosterEstablished {
+                successor: operation_successor,
+                ..
+            } = &mut non_write
+            else {
+                unreachable!()
+            };
+            **operation_successor = successor;
+            assert_eq!(observe_applied_records(&non_write, &keys, &watched), Ok(0));
+        }
+    }
+
     #[test]
     fn traffic_reconciliation_requires_strict_generations_and_exact_records() {
         let keys = (0..3)
@@ -5916,5 +6425,22 @@ mod tests {
         .is_ok());
         assert_eq!(generations, vec![0, 2, 0]);
         assert_eq!(fences, vec![0, 3, 0]);
+    }
+
+    #[tokio::test]
+    async fn delayed_response_hold_gate_release_after_waiter_registration_is_not_lost() {
+        let gate = Arc::new(QualificationConsumerResponseHoldGate::new(1));
+        assert!(gate.arm());
+        assert!(gate.take_armed_response());
+        let waiter_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiter_gate.hold_response().await });
+        while gate.status().1 != 1 {
+            tokio::task::yield_now().await;
+        }
+        assert!(gate.release());
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("a release after waiter registration wakes the held response")
+            .expect("held-response task completes");
     }
 }

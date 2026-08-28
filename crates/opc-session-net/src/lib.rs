@@ -34,6 +34,10 @@
 //! caller-visible sequence. Protocol-profile upgrades remain coordinated
 //! stop/upgrade/start operations; this lifecycle provides seamless credential
 //! rotation only after every participant already runs the same profile.
+//!
+//! ```compile_fail
+//! use opc_session_net::SessionConsumerPreparedCheckpointRouter;
+//! ```
 
 #![forbid(unsafe_code)]
 
@@ -42,6 +46,7 @@ pub mod client;
 pub mod consensus;
 pub mod consumer;
 pub mod error;
+mod fenced_mutation_roster;
 pub mod identity;
 mod lifecycle;
 pub mod membership;
@@ -61,14 +66,18 @@ pub use consensus::{
     SessionConsensusServerHandle,
 };
 pub use consumer::{
-    PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    PersistentSessionConsumerConfigError, PersistentSessionConsumerDiagnostics,
-    PersistentSessionConsumerExecuteError, PersistentSessionConsumerReadiness,
-    PersistentSessionConsumerShutdownReport, PersistentSessionConsumerV2Diagnostics,
-    PersistentSessionConsumerV2ExecuteError, SessionConsumerAuthorizationError,
+    session_consumer_payload_budget, PersistentSessionConsumerClient,
+    PersistentSessionConsumerConfig, PersistentSessionConsumerConfigError,
+    PersistentSessionConsumerDiagnostics, PersistentSessionConsumerExecuteError,
+    PersistentSessionConsumerReadiness, PersistentSessionConsumerShutdownReport,
+    PersistentSessionConsumerV2Diagnostics, PersistentSessionConsumerV2ExecuteError,
+    RosterIngressSigner, RosterIngressSignerError, SessionConsumerAuthorizationError,
     SessionConsumerAuthorizer, SessionConsumerClientError, SessionConsumerFencedTransitionBackend,
     SessionConsumerFencedTransitionBackendError, SessionConsumerFencedTransitionMutationError,
-    SessionConsumerLeaseMutationError, SessionConsumerMutationError, SessionQuorumConsumerServer,
+    SessionConsumerLeaseMutationError, SessionConsumerMutationError,
+    SessionConsumerPreparedCheckpointBackend, SessionConsumerPreparedCheckpointBackendError,
+    SessionConsumerPreparedCompareAndSet, SessionConsumerPreparedLeaseAcquire,
+    SessionQuorumConsumerServer, SessionQuorumConsumerServerAdmissionSnapshot,
     SessionQuorumConsumerServerHandle, StatelessSessionConsumerClient,
     DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
     DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
@@ -86,10 +95,53 @@ pub use consumer::{
     MAX_STATELESS_SESSION_CONSUMER_REQUEST_CONNECTIONS,
     MAX_STATELESS_SESSION_CONSUMER_WATCH_CONNECTIONS,
     PERSISTENT_SESSION_CONSUMER_MAINTENANCE_TASKS_PER_POOL, SESSION_QUORUM_CONSUMER_ALPN,
-    SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    SESSION_QUORUM_CONSUMER_CORRELATION_ID_BYTES, SESSION_QUORUM_CONSUMER_ROSTER_ALPN,
+    SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
     SESSION_QUORUM_CONSUMER_V2_ALPN, SESSION_QUORUM_CONSUMER_V2_TRANSPORT_REVISION,
 };
 pub use error::ProtocolError;
+pub use fenced_mutation_roster::{
+    fenced_mutation_roster_compact_terminal_member_signing_digest_v2,
+    fenced_mutation_roster_terminal_attestation_signing_digest_v1,
+    FencedMutationRosterAbortedTerminal, FencedMutationRosterActive,
+    FencedMutationRosterAdmissionInput, FencedMutationRosterAdmissionOutcome,
+    FencedMutationRosterAdmissionProposal, FencedMutationRosterAdmissionUnknown,
+    FencedMutationRosterAttestationTrustRootV1, FencedMutationRosterClient,
+    FencedMutationRosterClientError, FencedMutationRosterCompactTerminalMemberSigningInputV2,
+    FencedMutationRosterCompleteProofSet, FencedMutationRosterDiagnostics,
+    FencedMutationRosterEstablishedMutation, FencedMutationRosterEstablishedPublication,
+    FencedMutationRosterEstablishedPublicationCall,
+    FencedMutationRosterEstablishedPublicationProvider, FencedMutationRosterEstablishedTerminal,
+    FencedMutationRosterExecuteOutcome, FencedMutationRosterExecutorAttestor,
+    FencedMutationRosterExecutorAttestorAdapter, FencedMutationRosterExecutorCertificatePartsV1,
+    FencedMutationRosterExecutorError, FencedMutationRosterExecutorTerminalSigner,
+    FencedMutationRosterId, FencedMutationRosterMember, FencedMutationRosterMemberAdoption,
+    FencedMutationRosterMemberCall, FencedMutationRosterMemberDisposition,
+    FencedMutationRosterMemberOperationId, FencedMutationRosterMemberOrdinal,
+    FencedMutationRosterMemberPrepareOutcome, FencedMutationRosterMemberProof,
+    FencedMutationRosterMemberProvider, FencedMutationRosterMemberRecoveryOutcome,
+    FencedMutationRosterMemberRecoveryStatus, FencedMutationRosterPhase,
+    FencedMutationRosterPreparedTerminal, FencedMutationRosterProfile,
+    FencedMutationRosterProviderAdapter, FencedMutationRosterProviderAdapterDiagnostics,
+    FencedMutationRosterProviderCallOutcome, FencedMutationRosterProviderReceiptCapsule,
+    FencedMutationRosterProviderReceiptChallenge, FencedMutationRosterPublicationError,
+    FencedMutationRosterPublicationEvidence, FencedMutationRosterPublicationId,
+    FencedMutationRosterPublicationProviderOutcome, FencedMutationRosterReadyMember,
+    FencedMutationRosterRecoverableMember, FencedMutationRosterRecovered,
+    FencedMutationRosterRecoveryInput, FencedMutationRosterRecoveryOutcome,
+    FencedMutationRosterTerminal, FencedMutationRosterTerminalAttestationSigningInputV1,
+    FencedMutationRosterTerminalReceipt, FencedMutationRosterTerminalStatus,
+    FencedMutationRosterTerminalizationOutcome, ProtectedRosterTransportError,
+    FENCED_MUTATION_ROSTER_CONSUMER_ALPN, FENCED_MUTATION_ROSTER_CONSUMER_REVISION,
+    FENCED_MUTATION_ROSTER_FRESH_MEMBERS, FENCED_MUTATION_ROSTER_ID_BYTES,
+    FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES, FENCED_MUTATION_ROSTER_MAX_DESCRIPTOR_BYTES,
+    FENCED_MUTATION_ROSTER_MAX_HISTORY_EPOCH, FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS,
+    FENCED_MUTATION_ROSTER_MAX_MEMBERS, FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES,
+    FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED, FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES,
+    FENCED_MUTATION_ROSTER_MAX_STATUS_BYTES, FENCED_MUTATION_ROSTER_MEMBER_OPERATION_ID_BYTES,
+    FENCED_MUTATION_ROSTER_SCHEMA_V1, MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+    MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES, MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES,
+};
 pub use identity::{
     LocalReplicaBinding, RemoteReplicaBinding, SessionClusterId, SessionConfigurationEpoch,
     SessionConfigurationGeneration, SessionConfigurationId, SessionManifestError,
@@ -112,6 +164,7 @@ pub use opc_consensus::{
     ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusConfigurationId, ConsensusIdentity,
     ConsensusNodeId,
 };
+pub use opc_types::Timestamp;
 pub use protocol::{
     conservative_payload_budget, SessionConsensusContractProfile,
     CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, MAX_NEGOTIATED_FRAME_SIZE,

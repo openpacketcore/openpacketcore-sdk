@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::File;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,13 +25,22 @@ use rusqlite::{params, types::Value, Connection};
 use sha2::{Digest, Sha256};
 
 use super::sqlite::{
-    backup_and_reset_replica, prepare_test_workflow, seal_plan, RecoveryFailpoint, ResetInput,
+    backup_and_reset_replica, clear_pinned_inspection_path_swap_hooks,
+    clear_target_database_after_identity_admission_hook,
+    database_promotion_temporary_path_for_test, fail_next_promotion_after_rename,
+    inspect_replica_with_descriptor_snapshot_proof_for_test,
+    install_pinned_inspection_path_swap_hooks, install_target_backup_snapshot_directory_sync_hook,
+    install_target_database_after_identity_admission_hook, planned_fleet_inspection_count,
+    prepare_test_workflow_with_current_snapshot, promotion_cleanup_journals_are_empty_for_test,
+    reset_planned_fleet_inspection_count, seal_plan, snapshot_promotion_temporary_path_for_test,
+    RecoveryFailpoint, ResetInput,
 };
 use super::*;
 use crate::capability::BackendCapabilities;
+use crate::consensus::storage::ConsensusAuthorityProfile;
 use crate::consensus::{
     SessionConsensusClusterId, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
-    SessionRaftTypeConfig,
+    SessionRaftTypeConfig, SessionTopologyMemberBinding,
 };
 use crate::sqlite::consensus;
 use crate::topology::{
@@ -39,12 +49,13 @@ use crate::topology::{
 };
 use crate::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend,
-    Generation, OwnerId, ReplicationEntry, ReplicationOp, SessionBackend,
+    Generation, OwnerId, ReplicationEntry, ReplicationOp, SessionBackend, SessionConsensusCommand,
     SessionConsensusEntryDigest, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpcHandler,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
-    SessionLeaseManager, SqliteSessionBackend, StateClass, StateType, StoredSessionRecord,
-    SystemClock, FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_SCHEMA_V1,
+    SessionLeaseManager, SessionMutationIntent, SqliteSessionBackend, StateClass, StateType,
+    StoredSessionRecord, SystemClock, FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS,
+    FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_SCHEMA_V1,
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, REPLICATION_TX_ID_MAX_BYTES,
     SESSION_CONSENSUS_SCHEMA_VERSION,
 };
@@ -277,20 +288,66 @@ fn singleton_topology() -> (
     (topology, identity, node)
 }
 
+fn topology_member_bindings(
+    topology: &ValidatedQuorumTopology,
+) -> BTreeMap<SessionConsensusNodeId, SessionTopologyMemberBinding> {
+    const ENDPOINT_DOMAIN: &[u8] = b"openpacketcore/session-store/topology-endpoint-binding/v1\0";
+    const TLS_DOMAIN: &[u8] = b"openpacketcore/session-store/topology-tls-binding/v1\0";
+    const BACKING_DOMAIN: &[u8] = b"openpacketcore/session-store/topology-backing-binding/v1\0";
+
+    topology
+        .members()
+        .iter()
+        .filter_map(|descriptor| {
+            let node_id = topology.consensus_node_id(descriptor.replica_id())?;
+            let mut endpoint = Sha256::new();
+            endpoint.update(ENDPOINT_DOMAIN);
+            endpoint.update(Sha256::digest(descriptor.endpoint().host().as_bytes()));
+            endpoint.update(descriptor.endpoint().port().to_be_bytes());
+            let mut tls = Sha256::new();
+            tls.update(TLS_DOMAIN);
+            tls.update(Sha256::digest(
+                descriptor.tls_identity().as_str().as_bytes(),
+            ));
+            let mut backing = Sha256::new();
+            backing.update(BACKING_DOMAIN);
+            backing.update(descriptor.backing_identity().fingerprint());
+            Some((
+                node_id,
+                SessionTopologyMemberBinding::new(
+                    descriptor.configuration_fingerprint(),
+                    endpoint.finalize().into(),
+                    tls.finalize().into(),
+                    backing.finalize().into(),
+                ),
+            ))
+        })
+        .collect()
+}
+
 fn sealed_test_plan<A: RecoveryAuthorizer>(
     manager: &LegacyForkRecovery<A, CapturingAudit, CapturingObserver>,
     identity: SessionConsensusIdentity,
     node: SessionConsensusNodeId,
+    source: RecoveryReplicaEvidence,
 ) -> RecoveryPlan {
+    let source_token = source.replica_token;
+    let source_branch_digest = source.branch_digest;
+    let source_authority_profile = source.authority_profile;
+    let source_fixed_placement_policy = source.fixed_placement_policy;
+    let source_protected_roster_digest = source.protected_roster_digest;
     let body = RecoveryPlanBody {
         version: RECOVERY_PLAN_VERSION,
         identity,
         expected_members: BTreeSet::from([node]),
         basis: RecoveryDecisionBasis::VerifiedCommittedMajority,
-        evidence: Vec::new(),
-        source_token: RecoveryDigest::from_bytes([0x11; 32]),
-        target_tokens: vec![RecoveryDigest::from_bytes([0x22; 32])],
-        source_branch_digest: RecoveryDigest::from_bytes([0x33; 32]),
+        evidence: vec![source],
+        source_token,
+        target_tokens: vec![source_token],
+        source_branch_digest,
+        source_authority_profile,
+        source_fixed_placement_policy,
+        source_protected_roster_digest,
         next_recovery_epoch: 1,
         application_sequence_high_water: 0,
         watch_sequence_high_water: 0,
@@ -752,7 +809,7 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
             crate::sqlite::ops::read_restore_scan_state_sync(&target)
                 .expect("read recovered restore incarnation");
         restore_incarnations.insert((restore_epoch, *restore_key));
-        assert_eq!(objects.len(), 24);
+        assert_eq!(objects.len(), 33);
         assert!(objects.iter().any(|(kind, name)| {
             kind == "table" && name == "consensus_fenced_transition_receipts"
         }));
@@ -762,9 +819,31 @@ fn legacy_reset_requires_exact_confirmation_and_preserves_quarantine() {
         assert!(objects.iter().any(|(kind, name)| {
             kind == "index" && name == "consensus_fenced_transition_receipts_due"
         }));
+        for (kind, name) in [
+            ("table", "consensus_protected_roster_rows"),
+            ("table", "consensus_protected_roster_floors"),
+            ("table", "consensus_protected_roster_retirement_cursors"),
+            ("table", "consensus_protected_roster_witness"),
+            ("table", "consensus_protected_roster_business"),
+            ("table", "consensus_protected_roster_admissions"),
+            ("index", "consensus_protected_roster_reclaim_due"),
+            ("index", "consensus_protected_roster_partition_epoch"),
+            ("index", "consensus_protected_roster_terminal_sequence"),
+        ] {
+            assert!(objects.iter().any(
+                |(observed_kind, observed_name)| observed_kind == kind && observed_name == name
+            ));
+        }
         assert!(objects.iter().all(|(kind, name)| {
             kind == "table"
-                || (kind == "index" && name == "consensus_fenced_transition_receipts_due")
+                || (kind == "index"
+                    && matches!(
+                        name.as_str(),
+                        "consensus_fenced_transition_receipts_due"
+                            | "consensus_protected_roster_reclaim_due"
+                            | "consensus_protected_roster_partition_epoch"
+                            | "consensus_protected_roster_terminal_sequence"
+                    ))
         }));
     }
     assert_eq!(restore_incarnations.len(), replicas.len());
@@ -1579,6 +1658,117 @@ fn append_current_blank_checkpoint(
         .expect("checkpoint current blank checkpoint");
 }
 
+fn append_current_membership_checkpoint(
+    replica: &RecoveryReplica,
+    log_id: LogId<SessionConsensusNodeId>,
+    members: &BTreeSet<SessionConsensusNodeId>,
+) {
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    let entry: Entry<SessionRaftTypeConfig> = Entry {
+        log_id,
+        // Repeating a valid uniform membership is deliberately permitted by
+        // the ordinary scope validator. This lets the causal lineage tests
+        // distinguish stale authority from an invalid membership shape.
+        payload: EntryPayload::Membership(Membership::new(vec![members.clone()], members.clone())),
+    };
+    consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&entry))
+        .expect("append current membership checkpoint");
+    consensus::save_committed_sync(&conn, identity(), Some(log_id))
+        .expect("commit current membership checkpoint");
+    consensus::apply_entries_sync(
+        &conn,
+        identity(),
+        &BackendCapabilities::all_enabled(),
+        vec![entry],
+    )
+    .expect("apply current membership checkpoint");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint current membership checkpoint");
+}
+
+fn terminalize_current_replica_for_normal_backend_open(replica: &RecoveryReplica) {
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    let recovery = consensus::read_operator_recovery_sync(&conn, identity())
+        .expect("read finalized current recovery state");
+    assert!(
+        recovery.recovery_epoch > 0 && recovery.pending_epoch.is_none(),
+        "normal reopen fixture requires a finalized recovery epoch",
+    );
+    let latch = consensus::OperatorRecoveryLatch {
+        identity: identity(),
+        recovery_epoch: recovery.recovery_epoch,
+        plan_digest: recovery.last_plan_digest,
+        audit_pending: false,
+    };
+    let database_file = File::open(&replica.database_path).expect("open current database pin");
+    consensus::ensure_operator_recovery_latch_sync(&replica.database_path, latch)
+        .expect("publish current normal-reopen latch");
+    consensus::terminalize_operator_recovery_latch_sync(
+        &replica.database_path,
+        latch,
+        &database_file,
+        None,
+    )
+    .expect("terminalize current normal-reopen latch");
+}
+
+fn install_dynamic_current_snapshot_fixture(
+    replica: &RecoveryReplica,
+    last_log_id: LogId<SessionConsensusNodeId>,
+    file_name: &str,
+    snapshot_id: &str,
+    payload: &[u8],
+) -> Vec<u8> {
+    install_dynamic_current_snapshot_fixture_for_identity(
+        replica,
+        identity(),
+        last_log_id,
+        file_name,
+        snapshot_id,
+        payload,
+    )
+}
+
+fn install_dynamic_current_snapshot_fixture_for_identity(
+    replica: &RecoveryReplica,
+    storage_identity: SessionConsensusIdentity,
+    last_log_id: LogId<SessionConsensusNodeId>,
+    file_name: &str,
+    snapshot_id: &str,
+    payload: &[u8],
+) -> Vec<u8> {
+    let checksum: [u8; 32] = Sha256::digest(payload).into();
+    let mut bytes = payload.to_vec();
+    bytes.extend_from_slice(b"OPCSNP01");
+    bytes.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("snapshot payload length")
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(&checksum);
+    std::fs::write(replica.snapshot_directory.join(file_name), &bytes)
+        .expect("write current snapshot fixture");
+    let conn = Connection::open(&replica.database_path).expect("open current snapshot fixture");
+    let meta = opc_consensus::engine::SnapshotMeta {
+        last_log_id: Some(last_log_id),
+        last_membership: consensus::read_membership_sync(&conn, storage_identity)
+            .expect("read current snapshot membership"),
+        snapshot_id: snapshot_id.to_owned(),
+    };
+    consensus::save_current_snapshot_sync(
+        &conn,
+        storage_identity,
+        &meta,
+        file_name,
+        checksum,
+        u64::try_from(bytes.len()).expect("snapshot fixture length"),
+    )
+    .expect("persist current snapshot fixture metadata");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint current snapshot fixture");
+    bytes
+}
+
 fn install_current_purge_floor(conn: &Connection, floor: &LogId<SessionConsensusNodeId>) {
     conn.execute(
         "INSERT OR REPLACE INTO consensus_purged (singleton, configuration_epoch, term, log_index, log_id_json) VALUES (1, ?1, ?2, ?3, ?4)",
@@ -1630,7 +1820,20 @@ fn current_recovery_capacity_masks_retained_purged_prefix() {
     let leader = *members.iter().next().expect("member");
     let floor = LogId::new(CommittedLeaderId::new(1, leader), 0);
     claim_current_replica(&replica, &members, floor);
-    append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(1, leader), 1));
+    let applied = LogId::new(CommittedLeaderId::new(1, leader), 1);
+    append_current_blank_checkpoint(&replica, applied);
+    // A purge marker carries only a LogId.  The snapshot's exact
+    // last-membership payload is the needed durable attestation for the
+    // compacted membership row; otherwise this would be intentionally
+    // rejected as unauthenticated membership authority before capacity is
+    // considered.
+    install_dynamic_current_snapshot_fixture(
+        &replica,
+        applied,
+        "snapshot-00000000-0000-4000-8000-0000000000c8.opc",
+        "retained-purged-prefix-capacity",
+        b"purged-prefix membership attestation",
+    );
 
     let conn = Connection::open(&replica.database_path).expect("open current replica");
     install_current_purge_floor(&conn, &floor);
@@ -1699,6 +1902,807 @@ fn current_recovery_capacity_rejects_an_oversized_authoritative_suffix() {
         }),
         Err(RecoveryError::WorkLimitExceeded),
     );
+}
+
+#[test]
+fn current_dynamic_inspection_rejects_retained_log_gaps_and_term_regression() {
+    for case in ["missing-first", "missing-middle", "term-regression"] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let id = replica_id(&format!("dynamic-retained-{case}"));
+        let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+        let members = node_set(&[id]);
+        let leader = *members.iter().next().expect("leader");
+        claim_current_replica(
+            &replica,
+            &members,
+            LogId::new(CommittedLeaderId::new(3, leader), 0),
+        );
+        let second_term = if case == "term-regression" { 2 } else { 3 };
+        append_current_blank_checkpoint(
+            &replica,
+            LogId::new(CommittedLeaderId::new(second_term, leader), 1),
+        );
+        if case != "term-regression" {
+            append_current_blank_checkpoint(
+                &replica,
+                LogId::new(CommittedLeaderId::new(3, leader), 2),
+            );
+        }
+        let conn = Connection::open(&replica.database_path).expect("open current replica");
+        match case {
+            "missing-first" => {
+                conn.execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+                    .expect("remove first retained row");
+            }
+            "missing-middle" => {
+                conn.execute("DELETE FROM consensus_log WHERE log_index = 1", [])
+                    .expect("remove interior retained row");
+            }
+            "term-regression" => {}
+            _ => unreachable!("known retained-log corruption case"),
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint retained corruption");
+        drop(conn);
+
+        assert_eq!(
+            inspect_current_fixture(&replica, &members),
+            Err(RecoveryError::CorruptReplica),
+            "dynamic current recovery must reject {case}",
+        );
+    }
+}
+
+#[test]
+fn current_dynamic_inspection_rejects_spliced_or_uncovered_membership_log_ids() {
+    for corruption in [
+        "term-leader-splice",
+        "beyond-applied",
+        "retained-payload-splice",
+    ] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let id = replica_id(&format!("dynamic-membership-lineage-{corruption}"));
+        let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+        let members = node_set(&[id]);
+        let leader = *members.iter().next().expect("leader");
+        claim_current_replica(
+            &replica,
+            &members,
+            LogId::new(CommittedLeaderId::new(3, leader), 0),
+        );
+        let conn = Connection::open(&replica.database_path).expect("open current replica");
+        let membership =
+            consensus::read_membership_sync(&conn, identity()).expect("read persisted membership");
+        let original = membership.log_id().expect("current membership LogId");
+        let forged_log_id = match corruption {
+            "term-leader-splice" => LogId::new(
+                CommittedLeaderId::new(original.leader_id.term + 1, leader),
+                original.index,
+            ),
+            "beyond-applied" => LogId::new(
+                original.leader_id,
+                original.index.checked_add(1).expect("test log index"),
+            ),
+            "retained-payload-splice" => original,
+            _ => unreachable!("known membership lineage corruption"),
+        };
+        let forged_membership = if corruption == "retained-payload-splice" {
+            // Preserve the voter universe so membership-scope validation does
+            // not mask the lineage check. The stored joint configuration is
+            // nevertheless a distinct (and valid) membership payload.
+            Membership::new(vec![members.clone(), members.clone()], members.clone())
+        } else {
+            membership.membership().clone()
+        };
+        let forged =
+            opc_consensus::engine::StoredMembership::new(Some(forged_log_id), forged_membership);
+        conn.execute(
+            "UPDATE consensus_membership SET membership_json = ?1 WHERE singleton = 1",
+            [serde_json::to_vec(&forged).expect("encode forged membership")],
+        )
+        .expect("persist forged membership LogId");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint membership lineage corruption");
+        drop(conn);
+
+        assert_eq!(
+            inspect_current_fixture(&replica, &members),
+            Err(RecoveryError::CorruptReplica),
+            "offline inspection must reject membership {corruption}",
+        );
+    }
+}
+
+#[test]
+fn current_dynamic_inspection_requires_snapshot_membership_payload_to_match_retained_log() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let id = replica_id("dynamic-snapshot-membership-payload");
+    let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+    let members = node_set(&[id]);
+    let leader = *members.iter().next().expect("leader");
+    let membership_log = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    claim_current_replica(&replica, &members, membership_log);
+    install_dynamic_current_snapshot_fixture(
+        &replica,
+        membership_log,
+        "snapshot-00000000-0000-4000-8000-0000000000b1.opc",
+        "snapshot-membership-payload",
+        b"snapshot membership payload lineage",
+    );
+
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    let (encoded_meta, current_membership): (Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT meta_json, membership_json FROM consensus_snapshot JOIN consensus_membership ON consensus_membership.singleton = 1 WHERE consensus_snapshot.singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read snapshot and membership records");
+    let mut meta: opc_consensus::engine::SnapshotMeta<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    > = serde_json::from_slice(&encoded_meta).expect("decode snapshot metadata");
+    let persisted: opc_consensus::engine::StoredMembership<
+        SessionConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    > = serde_json::from_slice(&current_membership).expect("decode persisted membership");
+    meta.last_membership = opc_consensus::engine::StoredMembership::new(
+        Some(membership_log),
+        Membership::new(vec![members.clone(), members.clone()], members.clone()),
+    );
+    assert_ne!(meta.last_membership, persisted);
+    conn.execute(
+        "UPDATE consensus_snapshot SET meta_json = ?1 WHERE singleton = 1",
+        [serde_json::to_vec(&meta).expect("encode forged snapshot metadata")],
+    )
+    .expect("persist forged snapshot membership");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint forged snapshot membership");
+    drop(conn);
+
+    assert_eq!(
+        inspect_current_fixture(&replica, &members),
+        Err(RecoveryError::CorruptReplica),
+        "a retained membership row must bind the snapshot membership payload",
+    );
+}
+
+#[test]
+fn current_dynamic_inspection_accepts_compacted_membership_covered_by_snapshot() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let id = replica_id("dynamic-compacted-membership-snapshot");
+    let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+    let members = node_set(&[id]);
+    let leader = *members.iter().next().expect("leader");
+    let membership_log = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    let applied_log = LogId::new(CommittedLeaderId::new(3, leader), 1);
+    claim_current_replica(&replica, &members, membership_log);
+    append_current_blank_checkpoint(&replica, applied_log);
+    install_dynamic_current_snapshot_fixture(
+        &replica,
+        applied_log,
+        "snapshot-00000000-0000-4000-8000-0000000000b2.opc",
+        "compacted-membership-snapshot",
+        b"compacted membership snapshot",
+    );
+
+    let conn = Connection::open(&replica.database_path).expect("open compacted replica");
+    install_current_purge_floor(&conn, &applied_log);
+    conn.execute("DELETE FROM consensus_log WHERE log_index <= ?1", [1_i64])
+        .expect("remove snapshot-covered retained prefix");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint compacted membership fixture");
+    drop(conn);
+
+    inspect_current_fixture(&replica, &members)
+        .expect("snapshot last_membership covers compacted persisted membership");
+}
+
+#[test]
+fn current_dynamic_inspection_rejects_stale_latest_persisted_and_snapshot_membership() {
+    for corruption in ["persisted", "snapshot"] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let id = replica_id(&format!("dynamic-stale-latest-membership-{corruption}"));
+        let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+        let members = node_set(&[id]);
+        let leader = *members.iter().next().expect("leader");
+        let historical_log = LogId::new(CommittedLeaderId::new(3, leader), 0);
+        let latest_log = LogId::new(CommittedLeaderId::new(3, leader), 2);
+        claim_current_replica(&replica, &members, historical_log);
+        append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(3, leader), 1));
+        append_current_membership_checkpoint(&replica, latest_log, &members);
+        if corruption == "snapshot" {
+            install_dynamic_current_snapshot_fixture(
+                &replica,
+                latest_log,
+                "snapshot-00000000-0000-4000-8000-0000000000bf.opc",
+                "stale-latest-membership",
+                b"stale snapshot membership lineage",
+            );
+        }
+
+        let conn = Connection::open(&replica.database_path).expect("open current replica");
+        let historical = opc_consensus::engine::StoredMembership::new(
+            Some(historical_log),
+            Membership::new(vec![members.clone()], members.clone()),
+        );
+        let latest = consensus::read_membership_sync(&conn, identity())
+            .expect("read newest persisted membership");
+        assert_ne!(historical, latest, "M0 and M1 have distinct LogIds");
+        match corruption {
+            "persisted" => {
+                // This is still a valid historical membership under ordinary
+                // scope rules; retained lineage must reject it as stale.
+                conn.execute(
+                    "UPDATE consensus_membership SET membership_json = ?1 WHERE singleton = 1",
+                    [serde_json::to_vec(&historical).expect("encode stale membership")],
+                )
+                .expect("replace persisted membership with M0");
+            }
+            "snapshot" => {
+                let encoded_meta: Vec<u8> = conn
+                    .query_row(
+                        "SELECT meta_json FROM consensus_snapshot WHERE singleton = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read installed snapshot metadata");
+                let mut meta: opc_consensus::engine::SnapshotMeta<
+                    SessionConsensusNodeId,
+                    opc_consensus::engine::EmptyNode,
+                > = serde_json::from_slice(&encoded_meta).expect("decode snapshot metadata");
+                meta.last_membership = historical;
+                conn.execute(
+                    "UPDATE consensus_snapshot SET meta_json = ?1 WHERE singleton = 1",
+                    [serde_json::to_vec(&meta).expect("encode stale snapshot membership")],
+                )
+                .expect("replace snapshot membership with M0");
+            }
+            _ => unreachable!("known stale membership corruption"),
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint stale membership corruption");
+        drop(conn);
+
+        assert_eq!(
+            inspect_current_fixture(&replica, &members),
+            Err(RecoveryError::CorruptReplica),
+            "offline inspection must reject stale {corruption} membership authority",
+        );
+    }
+}
+
+#[test]
+fn current_dynamic_inspection_rejects_malformed_interior_retained_rows() {
+    // Exercise the recovery entry point rather than the shared range helper:
+    // the full inspection scan must decode and bind every physically retained
+    // row, not only its first/last indexes. The second case remains valid
+    // JSON but borrows a neighbouring entry's embedded LogId; the final case
+    // is a structurally valid normal command for a foreign consensus
+    // identity. Together they prove decoding, row-header and command binding
+    // are all applied to the interior suffix.
+    for corruption in [
+        "invalid-json",
+        "mismatched-embedded-log-id",
+        "foreign-command-identity",
+    ] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let id = replica_id(&format!("dynamic-malformed-interior-{corruption}"));
+        let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+        let members = node_set(&[id]);
+        let leader = *members.iter().next().expect("leader");
+        claim_current_replica(
+            &replica,
+            &members,
+            LogId::new(CommittedLeaderId::new(3, leader), 0),
+        );
+        append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(3, leader), 1));
+        append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(3, leader), 2));
+
+        let conn = Connection::open(&replica.database_path).expect("open current replica");
+        match corruption {
+            "invalid-json" => {
+                conn.execute(
+                    "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1",
+                    params![b"{malformed-retained-entry".to_vec()],
+                )
+                .expect("corrupt interior retained entry encoding");
+            }
+            "mismatched-embedded-log-id" => {
+                let neighbouring_entry: Vec<u8> = conn
+                    .query_row(
+                        "SELECT entry_json FROM consensus_log WHERE log_index = 0",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read neighbouring retained entry");
+                conn.execute(
+                    "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1",
+                    params![neighbouring_entry],
+                )
+                .expect("misbind interior retained entry header");
+            }
+            "foreign-command-identity" => {
+                let foreign_identity = SessionConsensusIdentity::new(
+                    identity().cluster_id(),
+                    SessionConsensusConfigurationId::from_bytes([0xA6; 32]),
+                    SessionConsensusConfigurationEpoch::new(7).expect("configuration epoch"),
+                );
+                let foreign_command = Entry::<SessionRaftTypeConfig> {
+                    log_id: LogId::new(CommittedLeaderId::new(3, leader), 1),
+                    payload: EntryPayload::Normal(SessionConsensusCommand {
+                        schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                        identity: foreign_identity,
+                        request_id: SessionConsensusRequestId::from_bytes([0xA7; 16]),
+                        logical_time: Timestamp::from_str("2026-08-01T00:00:00Z")
+                            .expect("logical timestamp"),
+                        intent: SessionMutationIntent::AdvanceLogicalTime,
+                    }),
+                };
+                conn.execute(
+                    "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = 1",
+                    params![serde_json::to_vec(&foreign_command).expect("encode foreign command")],
+                )
+                .expect("misbind interior retained command identity");
+            }
+            _ => unreachable!("known malformed retained-row case"),
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint malformed retained row");
+        drop(conn);
+
+        assert_eq!(
+            inspect_current_fixture(&replica, &members),
+            Err(RecoveryError::CorruptReplica),
+            "dynamic current recovery must reject {corruption}",
+        );
+    }
+}
+
+#[test]
+fn current_recovery_scans_retained_prefix_below_snapshot_and_accepts_snapshot_boundary() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let id = replica_id("retained-prefix-with-current-snapshot");
+    let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+    let members = node_set(&[id]);
+    let leader = *members.iter().next().expect("leader");
+    let first = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    claim_current_replica(&replica, &members, first);
+    append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(3, leader), 1));
+    append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(3, leader), 2));
+
+    // A current snapshot is allowed to account for an absent *initial*
+    // retained prefix, but it must not hide rows which still physically
+    // exist below that boundary.  Give the fixture a normal dynamic snapshot
+    // envelope without purging its 0..=2 log rows first.
+    let payload = b"current recovery retained snapshot boundary";
+    let checksum: [u8; 32] = Sha256::digest(payload).into();
+    let file_name = "snapshot-00000000-0000-4000-8000-0000000000a1.opc";
+    let mut snapshot = payload.to_vec();
+    snapshot.extend_from_slice(b"OPCSNP01");
+    snapshot.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("snapshot payload length")
+            .to_be_bytes(),
+    );
+    snapshot.extend_from_slice(&checksum);
+    std::fs::write(replica.snapshot_directory.join(file_name), &snapshot)
+        .expect("write current snapshot");
+
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    let meta = opc_consensus::engine::SnapshotMeta {
+        last_log_id: Some(LogId::new(CommittedLeaderId::new(3, leader), 2)),
+        last_membership: consensus::read_membership_sync(&conn, identity())
+            .expect("read current membership"),
+        snapshot_id: "retained-prefix-current-snapshot".to_owned(),
+    };
+    consensus::save_current_snapshot_sync(
+        &conn,
+        identity(),
+        &meta,
+        file_name,
+        checksum,
+        u64::try_from(snapshot.len()).expect("snapshot length"),
+    )
+    .expect("persist current snapshot metadata");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint current snapshot metadata");
+    drop(conn);
+
+    append_current_blank_checkpoint(&replica, LogId::new(CommittedLeaderId::new(3, leader), 3));
+
+    let conn = Connection::open(&replica.database_path).expect("open retained-prefix fixture");
+    consensus::read_log_range_for_recovery_sync(&conn, identity(), 0, None, Some(16))
+        .expect("all physical retained rows remain valid");
+    drop(conn);
+    inspect_current_fixture(&replica, &members)
+        .expect("physical retained prefix below snapshot remains fully inspectable");
+
+    // With no durable purge floor, the snapshot can justify precisely the
+    // omitted initial index.  It cannot justify an interior hole, which is
+    // covered by the gap test above.
+    let conn = Connection::open(&replica.database_path).expect("reopen current replica");
+    conn.execute("DELETE FROM consensus_log WHERE log_index <= 2", [])
+        .expect("remove snapshot-covered initial rows");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint snapshot-covered prefix removal");
+    drop(conn);
+    inspect_current_fixture(&replica, &members)
+        .expect("current snapshot covers exactly the omitted initial log row");
+
+    // The snapshot is also the immediate retained predecessor in this shape.
+    // A byte-valid row whose leader term regresses below that exact snapshot
+    // must not become authoritative just because there is no purge record.
+    let conn = Connection::open(&replica.database_path).expect("reopen snapshot boundary");
+    let regressed: Entry<SessionRaftTypeConfig> = Entry {
+        log_id: LogId::new(CommittedLeaderId::new(2, leader), 3),
+        payload: EntryPayload::Blank,
+    };
+    conn.execute(
+        "UPDATE consensus_log SET term = ?1, entry_json = ?2 WHERE log_index = 3",
+        params![
+            i64::try_from(regressed.log_id.leader_id.term).expect("test term"),
+            serde_json::to_vec(&regressed).expect("encode regressed row"),
+        ],
+    )
+    .expect("regress snapshot-boundary row term");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint regressed snapshot boundary");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&replica, &members),
+        Err(RecoveryError::CorruptReplica),
+        "the first snapshot-covered retained row must preserve leader order",
+    );
+}
+
+#[test]
+fn current_recovery_rejects_snapshot_ahead_of_applied_or_spliced_at_retained_index() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let id = replica_id("current-snapshot-lineage");
+    let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+    let members = node_set(&[id]);
+    let leader = *members.iter().next().expect("leader");
+    let retained = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    claim_current_replica(&replica, &members, retained);
+
+    let payload = b"current recovery snapshot lineage";
+    let checksum: [u8; 32] = Sha256::digest(payload).into();
+    let file_name = "snapshot-00000000-0000-4000-8000-0000000000a2.opc";
+    let mut snapshot = payload.to_vec();
+    snapshot.extend_from_slice(b"OPCSNP01");
+    snapshot.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("snapshot payload length")
+            .to_be_bytes(),
+    );
+    snapshot.extend_from_slice(&checksum);
+    std::fs::write(replica.snapshot_directory.join(file_name), &snapshot)
+        .expect("write current snapshot");
+
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    let membership = consensus::read_membership_sync(&conn, identity()).expect("read membership");
+    let valid_meta = opc_consensus::engine::SnapshotMeta {
+        last_log_id: Some(retained),
+        last_membership: membership.clone(),
+        snapshot_id: "current-snapshot-lineage".to_owned(),
+    };
+    consensus::save_current_snapshot_sync(
+        &conn,
+        identity(),
+        &valid_meta,
+        file_name,
+        checksum,
+        u64::try_from(snapshot.len()).expect("snapshot length"),
+    )
+    .expect("persist valid snapshot metadata");
+
+    let ahead = opc_consensus::engine::SnapshotMeta {
+        last_log_id: Some(LogId::new(CommittedLeaderId::new(3, leader), 1)),
+        last_membership: membership.clone(),
+        snapshot_id: "current-snapshot-lineage".to_owned(),
+    };
+    conn.execute(
+        "UPDATE consensus_snapshot SET meta_json = ?1 WHERE singleton = 1",
+        [serde_json::to_vec(&ahead).expect("encode ahead snapshot metadata")],
+    )
+    .expect("inject ahead snapshot metadata");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint ahead snapshot corruption");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&replica, &members),
+        Err(RecoveryError::CorruptReplica),
+        "a snapshot beyond the exact applied LogId cannot become recovery evidence"
+    );
+
+    let conn = Connection::open(&replica.database_path).expect("reopen current replica");
+    let spliced = LogId::new(CommittedLeaderId::new(4, leader), 0);
+    let spliced_meta = opc_consensus::engine::SnapshotMeta {
+        last_log_id: Some(spliced),
+        last_membership: membership,
+        snapshot_id: "current-snapshot-lineage".to_owned(),
+    };
+    conn.execute(
+        "UPDATE consensus_snapshot SET meta_json = ?1 WHERE singleton = 1",
+        [serde_json::to_vec(&spliced_meta).expect("encode spliced snapshot metadata")],
+    )
+    .expect("inject spliced snapshot metadata");
+    conn.execute(
+        "UPDATE consensus_committed SET term = ?1, log_index = ?2, log_id_json = ?3 WHERE singleton = 1",
+        params![
+            i64::try_from(spliced.leader_id.term).expect("test term fits SQLite"),
+            i64::try_from(spliced.index).expect("test index fits SQLite"),
+            serde_json::to_vec(&spliced).expect("encode spliced committed pointer"),
+        ],
+    )
+    .expect("inject forged committed pointer");
+    conn.execute(
+        "UPDATE consensus_applied SET term = ?1, log_index = ?2, log_id_json = ?3 WHERE singleton = 1",
+        params![
+            i64::try_from(spliced.leader_id.term).expect("test term fits SQLite"),
+            i64::try_from(spliced.index).expect("test index fits SQLite"),
+            serde_json::to_vec(&spliced).expect("encode spliced applied pointer"),
+        ],
+    )
+    .expect("align applied pointer with forged snapshot");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint snapshot splice corruption");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&replica, &members),
+        Err(RecoveryError::CorruptReplica),
+        "a physical retained row must equal the snapshot's complete LogId"
+    );
+}
+
+#[test]
+fn current_recovery_rejects_snapshot_purge_same_index_splice() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let id = replica_id("current-snapshot-purge-lineage");
+    let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+    let members = node_set(&[id]);
+    let leader = *members.iter().next().expect("leader");
+    let committed = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    claim_current_replica(&replica, &members, committed);
+
+    let payload = b"current recovery snapshot purge lineage";
+    let checksum: [u8; 32] = Sha256::digest(payload).into();
+    let file_name = "snapshot-00000000-0000-4000-8000-0000000000a3.opc";
+    let mut snapshot = payload.to_vec();
+    snapshot.extend_from_slice(b"OPCSNP01");
+    snapshot.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("snapshot payload length")
+            .to_be_bytes(),
+    );
+    snapshot.extend_from_slice(&checksum);
+    std::fs::write(replica.snapshot_directory.join(file_name), &snapshot)
+        .expect("write current snapshot");
+
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    let meta = opc_consensus::engine::SnapshotMeta {
+        last_log_id: Some(committed),
+        last_membership: consensus::read_membership_sync(&conn, identity())
+            .expect("read applied membership"),
+        snapshot_id: "current-snapshot-purge-lineage".to_owned(),
+    };
+    consensus::save_current_snapshot_sync(
+        &conn,
+        identity(),
+        &meta,
+        file_name,
+        checksum,
+        u64::try_from(snapshot.len()).expect("snapshot length"),
+    )
+    .expect("persist current snapshot metadata");
+    let forged_purge = LogId::new(CommittedLeaderId::new(4, leader), committed.index);
+    install_current_purge_floor(&conn, &forged_purge);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint snapshot/purge splice");
+    drop(conn);
+
+    assert_eq!(
+        inspect_current_fixture(&replica, &members),
+        Err(RecoveryError::CorruptReplica),
+        "offline recovery must reject a purge pointer that shares only the snapshot index",
+    );
+}
+
+#[test]
+fn compacted_finalization_lineage_rejects_lower_term_and_same_term_leader_forks() {
+    let members = node_set(&[
+        replica_id("compacted-finalization-certified-leader"),
+        replica_id("compacted-finalization-fork-leader"),
+    ]);
+    let certified_leader = *members.iter().next().expect("certified leader");
+    let fork_leader = *members.iter().nth(1).expect("fork leader");
+    let finalized = LogId::new(CommittedLeaderId::new(5, certified_leader), 10);
+
+    // Applied and committed progress on a later term remains a valid
+    // descendant of the certified finalization. It cannot make a separately
+    // persisted lower-term purge + snapshot lineage trustworthy.
+    let committed = LogId::new(CommittedLeaderId::new(6, fork_leader), 12);
+    let applied = LogId::new(CommittedLeaderId::new(6, fork_leader), 12);
+    assert!(super::sqlite::full_log_id_not_after(&finalized, &committed));
+    assert!(super::sqlite::full_log_id_not_after(&finalized, &applied));
+
+    let lower_term_purged = LogId::new(CommittedLeaderId::new(4, certified_leader), 11);
+    let lower_term_snapshot = LogId::new(CommittedLeaderId::new(4, certified_leader), 11);
+    assert_eq!(
+        super::sqlite::require_compacted_terminal_log_lineage(
+            &finalized,
+            Some(&lower_term_purged),
+            &lower_term_snapshot,
+        ),
+        Err(RecoveryError::BackupCorrupt),
+        "a term-5/index-10 finalization is not covered by term-4/index-11 compacted evidence",
+    );
+
+    let same_term_fork_purged = LogId::new(CommittedLeaderId::new(5, fork_leader), 11);
+    let same_term_fork_snapshot = LogId::new(CommittedLeaderId::new(5, fork_leader), 11);
+    assert_eq!(
+        super::sqlite::require_compacted_terminal_log_lineage(
+            &finalized,
+            Some(&same_term_fork_purged),
+            &same_term_fork_snapshot,
+        ),
+        Err(RecoveryError::BackupCorrupt),
+        "a same-term different-leader compacted branch is not finalization lineage",
+    );
+
+    let authentic_purged = LogId::new(CommittedLeaderId::new(5, certified_leader), 11);
+    let authentic_snapshot = LogId::new(CommittedLeaderId::new(6, fork_leader), 12);
+    assert_eq!(
+        super::sqlite::require_compacted_terminal_log_lineage(
+            &finalized,
+            Some(&authentic_purged),
+            &authentic_snapshot,
+        ),
+        Ok(()),
+        "same-leader same-term progress and later-term snapshot lineage are valid descendants",
+    );
+}
+
+#[test]
+fn current_recovery_rejects_marker_only_term_regression_after_purge() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let id = replica_id("current-marker-only-term-regression");
+    let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+    let members = node_set(&[id]);
+    let leader = *members.iter().next().expect("leader");
+    let original = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    claim_current_replica(&replica, &members, original);
+
+    let lower_term_marker = LogId::new(CommittedLeaderId::new(2, leader), 1);
+    let payload = b"current recovery marker-only term regression";
+    let checksum: [u8; 32] = Sha256::digest(payload).into();
+    let file_name = "snapshot-00000000-0000-4000-8000-0000000000a4.opc";
+    let mut snapshot = payload.to_vec();
+    snapshot.extend_from_slice(b"OPCSNP01");
+    snapshot.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("snapshot payload length")
+            .to_be_bytes(),
+    );
+    snapshot.extend_from_slice(&checksum);
+    std::fs::write(replica.snapshot_directory.join(file_name), &snapshot)
+        .expect("write current snapshot");
+
+    let conn = Connection::open(&replica.database_path).expect("open current replica");
+    let meta = opc_consensus::engine::SnapshotMeta {
+        last_log_id: Some(lower_term_marker),
+        last_membership: consensus::read_membership_sync(&conn, identity())
+            .expect("read applied membership"),
+        snapshot_id: "current-marker-only-term-regression".to_owned(),
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            i64::try_from(identity().configuration_epoch().get()).expect("epoch"),
+            serde_json::to_vec(&meta).expect("encode forged snapshot metadata"),
+            file_name,
+            checksum.to_vec(),
+            i64::try_from(snapshot.len()).expect("snapshot length"),
+        ],
+    )
+    .expect("install marker-only snapshot metadata");
+    for table in ["consensus_committed", "consensus_applied"] {
+        conn.execute(
+            &format!(
+                "UPDATE {table} SET term = ?1, log_index = ?2, log_id_json = ?3 WHERE singleton = 1"
+            ),
+            params![
+                i64::try_from(lower_term_marker.leader_id.term).expect("marker term"),
+                i64::try_from(lower_term_marker.index).expect("marker index"),
+                serde_json::to_vec(&lower_term_marker).expect("encode marker pointer"),
+            ],
+        )
+        .expect("replace durable marker pointer");
+    }
+    install_current_purge_floor(&conn, &original);
+    conn.execute("DELETE FROM consensus_log", [])
+        .expect("remove all retained rows between markers");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint marker-only lineage splice");
+    drop(conn);
+
+    assert_eq!(
+        inspect_current_fixture(&replica, &members),
+        Err(RecoveryError::CorruptReplica),
+        "offline recovery must order purge and marker-only snapshot lineage by complete Raft term",
+    );
+}
+
+#[test]
+fn current_inspection_requires_exact_applied_and_committed_log_lineage() {
+    for case in ["applied", "committed"] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let id = replica_id(&format!("pointer-lineage-{case}"));
+        let replica = create_legacy_replica(temp.path(), id.clone(), 3);
+        let members = node_set(&[id]);
+        let leader = *members.iter().next().expect("leader");
+        let first = LogId::new(CommittedLeaderId::new(3, leader), 0);
+        claim_current_replica(&replica, &members, first);
+        let second = LogId::new(CommittedLeaderId::new(3, leader), 1);
+        if case == "applied" {
+            append_current_blank_checkpoint(&replica, second);
+        } else {
+            let conn = Connection::open(&replica.database_path).expect("open current replica");
+            consensus::append_logs_sync(
+                &conn,
+                identity(),
+                &[Entry {
+                    log_id: second,
+                    payload: EntryPayload::Blank,
+                }],
+            )
+            .expect("append unapplied retained row");
+        }
+        let conn = Connection::open(&replica.database_path).expect("reopen current replica");
+        let forged = match case {
+            // Keep applied and committed equal so the old index-only floor
+            // predicate cannot reject before exact lineage is checked.
+            "applied" => LogId::new(CommittedLeaderId::new(4, leader), 1),
+            // Applied remains the authentic first row; a forged committed
+            // term at the later index satisfies ordering but has no exact row.
+            "committed" => LogId::new(CommittedLeaderId::new(4, leader), 1),
+            _ => unreachable!("known pointer lineage case"),
+        };
+        let encoded = serde_json::to_vec(&forged).expect("encode forged pointer");
+        let term = i64::try_from(forged.leader_id.term).expect("forged term");
+        let index = i64::try_from(forged.index).expect("forged index");
+        match case {
+            "applied" => {
+                for table in ["consensus_applied", "consensus_committed"] {
+                    conn.execute(
+                        &format!(
+                            "UPDATE {table} SET term = ?1, log_index = ?2, log_id_json = ?3 WHERE singleton = 1"
+                        ),
+                        params![term, index, &encoded],
+                    )
+                    .expect("forge matching applied/committed pointer");
+                }
+            }
+            "committed" => {
+                conn.execute(
+                    "UPDATE consensus_committed SET term = ?1, log_index = ?2, log_id_json = ?3 WHERE singleton = 1",
+                    params![term, index, &encoded],
+                )
+                .expect("forge committed pointer");
+            }
+            _ => unreachable!("known pointer lineage case"),
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint pointer corruption");
+        drop(conn);
+
+        assert_eq!(
+            inspect_current_fixture(&replica, &members),
+            Err(RecoveryError::CorruptReplica),
+            "inspection must require exact {case} pointer lineage",
+        );
+    }
 }
 
 fn current_receipt_inspection_fixture(
@@ -2009,6 +3013,10 @@ fn current_recovery_inspection_accepts_populated_v3_history_and_reopen_preserves
 
     let lifecycle_before = v3_history_lifecycle(&replica);
     let before = inspect_current_fixture(&replica, &members).expect("inspect V3 replica");
+    // The fixture models a prior completed recovery. Runtime reopens require
+    // its terminal tombstone; a missing sidecar is intentionally fail-closed
+    // and is not a valid historical normal-start shape.
+    terminalize_current_replica_for_normal_backend_open(&replica);
     drop(SqliteSessionBackend::open(&replica.database_path).expect("reopen V3 replica"));
     let after = inspect_current_fixture(&replica, &members).expect("reinspect V3 replica");
     assert_eq!(before.branch_digest(), after.branch_digest());
@@ -2506,7 +3514,16 @@ fn current_recovery_inspection_accepts_pre_ledger_replica() {
     let (replica, members) = current_receipt_inspection_fixture(temp.path());
     let conn = Connection::open(&replica.database_path).expect("open current replica");
     conn.execute_batch(
-        "DROP TABLE consensus_fenced_transition_receipts;
+        "DROP INDEX consensus_protected_roster_terminal_sequence;
+         DROP INDEX consensus_protected_roster_reclaim_due;
+         DROP INDEX consensus_protected_roster_partition_epoch;
+         DROP TABLE consensus_protected_roster_admissions;
+         DROP TABLE consensus_protected_roster_business;
+         DROP TABLE consensus_protected_roster_witness;
+         DROP TABLE consensus_protected_roster_retirement_cursors;
+         DROP TABLE consensus_protected_roster_floors;
+         DROP TABLE consensus_protected_roster_rows;
+         DROP TABLE consensus_fenced_transition_receipts;
          DROP TABLE consensus_fenced_transition_activation;
          ALTER TABLE consensus_identity
          DROP COLUMN fenced_transition_receipt_ledger_activated;
@@ -2523,6 +3540,296 @@ fn current_recovery_inspection_accepts_pre_ledger_replica() {
         limits: RecoveryLimits::default(),
     })
     .expect("read-only inspection accepts a pre-ledger replica");
+}
+
+fn activate_protected_roster_recovery_fixture(replica: &RecoveryReplica) {
+    let conn = Connection::open(&replica.database_path).expect("open protected roster fixture");
+    conn.execute(
+        "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
+        [i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 3],
+    )
+    .expect("activate protected roster format");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint protected roster activation");
+}
+
+#[test]
+fn current_recovery_roster_prepared_layout_is_rootless_predecessor_compatible() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (prepared, prepared_members) =
+        current_receipt_inspection_fixture(&temp.path().join("prepared"));
+    let prepared_before = inspect_current_fixture(&prepared, &prepared_members)
+        .expect("inspect empty prepared roster layout");
+
+    // This is the exact rootless predecessor: removing any one roster object
+    // or only one root column is intentionally not a compatibility form.
+    let (rootless, rootless_members) =
+        current_receipt_inspection_fixture(&temp.path().join("rootless"));
+    let conn = Connection::open(&rootless.database_path).expect("open rootless predecessor");
+    conn.execute_batch(
+        "DROP INDEX consensus_protected_roster_terminal_sequence;
+         DROP INDEX consensus_protected_roster_reclaim_due;
+         DROP INDEX consensus_protected_roster_partition_epoch;
+         DROP TABLE consensus_protected_roster_admissions;
+         DROP TABLE consensus_protected_roster_business;
+         DROP TABLE consensus_protected_roster_witness;
+         DROP TABLE consensus_protected_roster_retirement_cursors;
+         DROP TABLE consensus_protected_roster_floors;
+         DROP TABLE consensus_protected_roster_rows;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_algorithm_version;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_public_key;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_root_id;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("form exact rootless predecessor");
+    drop(conn);
+    let rootless_before = inspect_current_fixture(&rootless, &rootless_members)
+        .expect("inspect exact rootless predecessor");
+    assert_eq!(
+        prepared_before.branch_digest(),
+        rootless_before.branch_digest(),
+        "empty prepared and exact rootless roster layouts retain identical authority",
+    );
+
+    terminalize_current_replica_for_normal_backend_open(&prepared);
+    drop(SqliteSessionBackend::open(&prepared.database_path).expect("reopen prepared roster"));
+    let prepared_after =
+        inspect_current_fixture(&prepared, &prepared_members).expect("reinspect prepared roster");
+    assert_eq!(
+        prepared_before.branch_digest(),
+        prepared_after.branch_digest()
+    );
+
+    let (v3, v3_members) = current_receipt_inspection_fixture(&temp.path().join("v3-rootless"));
+    activate_v3_history_fixture(&v3, 1, 0, 0);
+    let conn = Connection::open(&v3.database_path).expect("open exact V3 predecessor");
+    conn.execute_batch(
+        "DROP INDEX consensus_protected_roster_terminal_sequence;
+         DROP INDEX consensus_protected_roster_reclaim_due;
+         DROP INDEX consensus_protected_roster_partition_epoch;
+         DROP TABLE consensus_protected_roster_admissions;
+         DROP TABLE consensus_protected_roster_business;
+         DROP TABLE consensus_protected_roster_witness;
+         DROP TABLE consensus_protected_roster_retirement_cursors;
+         DROP TABLE consensus_protected_roster_floors;
+         DROP TABLE consensus_protected_roster_rows;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_algorithm_version;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_public_key;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_root_id;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("form exact rootless pre-roster V3 fixture");
+    drop(conn);
+    inspect_current_fixture(&v3, &v3_members)
+        .expect("read-only recovery accepts the exact pre-roster V3 product");
+}
+
+#[test]
+fn current_recovery_accepts_exact_root_then_marker_pre_roster_upgrade() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(temp.path());
+    let expected = inspect_current_fixture(&replica, &members)
+        .expect("inspect equivalent empty prepared roster");
+    let conn = Connection::open(&replica.database_path).expect("open R2 upgrade fixture");
+    conn.execute_batch(
+        "DROP INDEX consensus_protected_roster_terminal_sequence;
+         DROP INDEX consensus_protected_roster_reclaim_due;
+         DROP INDEX consensus_protected_roster_partition_epoch;
+         DROP TABLE consensus_protected_roster_admissions;
+         DROP TABLE consensus_protected_roster_business;
+         DROP TABLE consensus_protected_roster_witness;
+         DROP TABLE consensus_protected_roster_retirement_cursors;
+         DROP TABLE consensus_protected_roster_floors;
+         DROP TABLE consensus_protected_roster_rows;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_algorithm_version;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_public_key;
+         ALTER TABLE consensus_identity DROP COLUMN roster_attestation_root_id;
+         ALTER TABLE consensus_identity DROP COLUMN fenced_transition_receipt_ledger_activated;
+         ALTER TABLE consensus_identity ADD COLUMN roster_attestation_root_id BLOB CHECK (
+             roster_attestation_root_id IS NULL OR length(roster_attestation_root_id) = 32
+         );
+         ALTER TABLE consensus_identity ADD COLUMN roster_attestation_public_key BLOB CHECK (
+             roster_attestation_public_key IS NULL OR length(roster_attestation_public_key) = 33
+         );
+         ALTER TABLE consensus_identity ADD COLUMN roster_attestation_algorithm_version INTEGER CHECK (
+             roster_attestation_algorithm_version IS NULL OR roster_attestation_algorithm_version = 1
+         );
+         ALTER TABLE consensus_identity ADD COLUMN fenced_transition_receipt_ledger_activated INTEGER NOT NULL DEFAULT 0 CHECK (
+             fenced_transition_receipt_ledger_activated IN (0, 1)
+         );
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("form exact roots-then-marker pre-roster upgrade");
+    drop(conn);
+
+    let observed = inspect_current_fixture(&replica, &members)
+        .expect("offline recovery accepts exact roots-then-marker upgrade");
+    assert_eq!(expected.branch_digest(), observed.branch_digest());
+    assert_eq!(
+        expected.logical_state_digest(),
+        observed.logical_state_digest()
+    );
+}
+
+#[test]
+fn current_recovery_accepts_only_the_activated_protected_roster_format() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (valid, valid_members) = current_receipt_inspection_fixture(&temp.path().join("valid"));
+    activate_protected_roster_recovery_fixture(&valid);
+    inspect_current_fixture(&valid, &valid_members).expect("format-four roster is recoverable");
+
+    let (missing_marker, missing_marker_members) =
+        current_receipt_inspection_fixture(&temp.path().join("missing-marker"));
+    activate_protected_roster_recovery_fixture(&missing_marker);
+    let conn =
+        Connection::open(&missing_marker.database_path).expect("open missing marker fixture");
+    conn.execute_batch(
+        "ALTER TABLE consensus_identity
+         DROP COLUMN fenced_transition_receipt_ledger_activated;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("remove required receipt marker");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&missing_marker, &missing_marker_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (partial_v2, partial_v2_members) =
+        current_receipt_inspection_fixture(&temp.path().join("partial-v2"));
+    activate_protected_roster_recovery_fixture(&partial_v2);
+    let conn = Connection::open(&partial_v2.database_path).expect("open partial V2 fixture");
+    conn.execute_batch(
+        "CREATE TABLE consensus_fenced_transition_v2_receipts (singleton INTEGER);
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("install partial V2 namespace");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&partial_v2, &partial_v2_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (future, future_members) = current_receipt_inspection_fixture(&temp.path().join("future"));
+    activate_protected_roster_recovery_fixture(&future);
+    let conn = Connection::open(&future.database_path).expect("open future format fixture");
+    conn.execute(
+        "UPDATE consensus_identity SET schema_version = ?1 WHERE singleton = 1",
+        [i64::from(SESSION_CONSENSUS_SCHEMA_VERSION) + 4],
+    )
+    .expect("write unknown roster format");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint unknown roster format");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&future, &future_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+}
+
+#[test]
+fn current_recovery_roster_namespace_and_preflight_fail_closed() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+
+    let (partial, partial_members) =
+        current_receipt_inspection_fixture(&temp.path().join("partial"));
+    let conn = Connection::open(&partial.database_path).expect("open partial roster fixture");
+    conn.execute_batch(
+        "DROP TABLE consensus_protected_roster_witness; PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("form partial roster namespace");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&partial, &partial_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (partial_root, partial_root_members) =
+        current_receipt_inspection_fixture(&temp.path().join("partial-root"));
+    let conn = Connection::open(&partial_root.database_path).expect("open partial root fixture");
+    conn.execute_batch(
+        "ALTER TABLE consensus_identity DROP COLUMN roster_attestation_algorithm_version;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("form partial roster trust-root identity");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&partial_root, &partial_root_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (corrupt, corrupt_members) =
+        current_receipt_inspection_fixture(&temp.path().join("corrupt"));
+    activate_protected_roster_recovery_fixture(&corrupt);
+    let conn = Connection::open(&corrupt.database_path).expect("open corrupt roster fixture");
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .expect("allow corrupt protected row");
+    conn.execute(
+        "INSERT INTO consensus_protected_roster_rows (binding, configuration_epoch, partition, history_epoch, state, terminalized_at, terminal_sequence, canonical_record) VALUES (zeroblob(120), (SELECT configuration_epoch FROM consensus_identity WHERE singleton=1), zeroblob(64), 1, 1, NULL, NULL, X'00')",
+        [],
+    )
+    .expect("insert corrupt protected row");
+    conn.execute_batch("PRAGMA ignore_check_constraints = OFF; PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint corrupt protected row");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&corrupt, &corrupt_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (oversized, oversized_members) =
+        current_receipt_inspection_fixture(&temp.path().join("oversized"));
+    activate_protected_roster_recovery_fixture(&oversized);
+    let conn = Connection::open(&oversized.database_path).expect("open oversized roster fixture");
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .expect("allow oversized protected value");
+    let (record_cap, _) = consensus::protected_roster_recovery_value_caps();
+    let oversized_record = record_cap
+        .checked_add(1)
+        .expect("canonical protected record cap has a successor");
+    conn.execute(
+        "INSERT INTO consensus_protected_roster_rows (binding, configuration_epoch, partition, history_epoch, state, terminalized_at, terminal_sequence, canonical_record) VALUES (zeroblob(120), (SELECT configuration_epoch FROM consensus_identity WHERE singleton=1), zeroblob(64), 1, 1, NULL, NULL, zeroblob(?1))",
+        [i64::try_from(oversized_record).expect("record cap fits SQLite integer")],
+    )
+    .expect("insert oversized protected record");
+    conn.execute_batch("PRAGMA ignore_check_constraints = OFF; PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint oversized protected record");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&oversized, &oversized_members),
+        Err(RecoveryError::CorruptReplica),
+    );
+
+    let (over_count, over_count_members) =
+        current_receipt_inspection_fixture(&temp.path().join("over-count"));
+    activate_protected_roster_recovery_fixture(&over_count);
+    let conn = Connection::open(&over_count.database_path).expect("open over-count roster fixture");
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")
+        .expect("disable fixture-only foreign keys");
+    let too_many_business_rows = FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS
+        .checked_add(1)
+        .expect("live protected business cap has a successor");
+    conn.execute_batch(&format!(
+        "WITH RECURSIVE sequence(value) AS (
+             VALUES(1)
+             UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < {too_many_business_rows}
+         )
+         INSERT INTO consensus_protected_roster_business (business_key, binding, configuration_epoch, generation, canonical_business)
+         SELECT CAST(printf('%032d', value) AS BLOB),
+                CAST(printf('%0120d', value) AS BLOB),
+                1,
+                1,
+                X'00'
+         FROM sequence;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    ))
+    .expect("insert one row over live protected business cap");
+    drop(conn);
+    assert_eq!(
+        inspect_current_fixture(&over_count, &over_count_members),
+        Err(RecoveryError::CorruptReplica),
+    );
 }
 
 #[test]
@@ -2564,6 +3871,10 @@ fn current_recovery_inspection_normalizes_exact_pre_acquisition_lease_schema() {
         })
         .expect("read-only inspection accepts exact pre-acquisition schema");
 
+        // This fixture models a completed operator recovery. Runtime reopening is
+        // therefore permitted only through its terminal recovery handoff, rather
+        // than through the planning-only absent-latch path used above.
+        terminalize_current_replica_for_normal_backend_open(&replica);
         drop(
             SqliteSessionBackend::open(&replica.database_path)
                 .expect("writable migration adds non-authoritative marker"),
@@ -2662,7 +3973,7 @@ fn planning_rejects_any_pending_recovery_workflow() {
     drop(conn);
 
     let manager = recovery(AllowRecovery);
-    assert_eq!(
+    assert!(matches!(
         manager.plan(
             &context(),
             identity(),
@@ -2674,7 +3985,7 @@ fn planning_rejects_any_pending_recovery_workflow() {
             RecoveryLimits::default(),
         ),
         Err(RecoveryError::RecoveryInProgress)
-    );
+    ));
 }
 
 #[test]
@@ -2748,7 +4059,7 @@ fn planning_rejects_untrusted_legacy_schema_objects() {
         )
         .expect("install hostile same-name restore schema");
     let manager = recovery(AllowRecovery);
-    assert_eq!(
+    assert!(matches!(
         manager.plan(
             &context(),
             identity(),
@@ -2760,7 +4071,7 @@ fn planning_rejects_untrusted_legacy_schema_objects() {
             RecoveryLimits::default(),
         ),
         Err(RecoveryError::CorruptReplica)
-    );
+    ));
 
     let temp = tempfile::tempdir().expect("current schema test root");
     let ids = [
@@ -2786,7 +4097,7 @@ fn planning_rejects_untrusted_legacy_schema_objects() {
         .execute_batch("CREATE VIEW hostile_current_view AS SELECT * FROM consensus_machine;")
         .expect("install current hostile view");
     let manager = recovery(AllowRecovery);
-    assert_eq!(
+    assert!(matches!(
         manager.plan(
             &context(),
             identity(),
@@ -2798,7 +4109,7 @@ fn planning_rejects_untrusted_legacy_schema_objects() {
             RecoveryLimits::default(),
         ),
         Err(RecoveryError::CorruptReplica)
-    );
+    ));
 }
 
 #[test]
@@ -3122,6 +4433,827 @@ async fn three_way_current_fork_requires_and_uses_majority_committed_checkpoint(
         .expect("read target recovery gate"));
 }
 
+#[test]
+fn current_recovery_rejects_divergent_retained_prefix_even_with_a_current_snapshot() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("retained-prefix-source"),
+        replica_id("retained-prefix-voter"),
+        replica_id("retained-prefix-target"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 7),
+        create_legacy_replica(temp.path(), ids[1].clone(), 7),
+        create_legacy_replica(temp.path(), ids[2].clone(), 7),
+    ];
+    let members = node_set(&ids);
+    let initial_leader = *members.iter().next().expect("initial leader");
+    let second_leader = *members.iter().nth(1).expect("second leader");
+    let third_leader = *members.iter().nth(2).expect("third leader");
+    let initial = LogId::new(CommittedLeaderId::new(1, initial_leader), 0);
+    for replica in &replicas {
+        claim_current_replica(replica, &members, initial);
+    }
+
+    // All copies finish with the same logical state.  Their retained blank
+    // prefixes are nonetheless distinct valid Raft histories.  Older branch
+    // hashing looked only at the final committed row and would let source and
+    // voter form a false majority here.
+    let source_prefix = LogId::new(CommittedLeaderId::new(2, second_leader), 1);
+    let voter_prefix = LogId::new(CommittedLeaderId::new(3, third_leader), 1);
+    let target_prefix = LogId::new(CommittedLeaderId::new(4, initial_leader), 1);
+    let shared_head = LogId::new(CommittedLeaderId::new(5, second_leader), 2);
+    let target_head = LogId::new(CommittedLeaderId::new(6, third_leader), 2);
+    append_current_blank_checkpoint(&replicas[0], source_prefix);
+    append_current_blank_checkpoint(&replicas[0], shared_head);
+    append_current_blank_checkpoint(&replicas[1], voter_prefix);
+    append_current_blank_checkpoint(&replicas[1], shared_head);
+    append_current_blank_checkpoint(&replicas[2], target_prefix);
+    append_current_blank_checkpoint(&replicas[2], target_head);
+
+    // A selected snapshot equal to a still-retained committed row is local
+    // compaction state, not a replacement for the retained prefix.  Removing
+    // it must leave the source's branch evidence unchanged.
+    let file_name = "snapshot-00000000-0000-4000-8000-0000000000c1.opc";
+    let payload = b"retained-prefix snapshot is not branch authority";
+    let checksum: [u8; 32] = Sha256::digest(payload).into();
+    let mut snapshot = payload.to_vec();
+    snapshot.extend_from_slice(b"OPCSNP01");
+    snapshot.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("snapshot payload length")
+            .to_be_bytes(),
+    );
+    snapshot.extend_from_slice(&checksum);
+    std::fs::write(replicas[0].snapshot_directory.join(file_name), &snapshot)
+        .expect("write source current snapshot");
+    let conn = Connection::open(&replicas[0].database_path).expect("open source replica");
+    let metadata = opc_consensus::engine::SnapshotMeta {
+        last_log_id: Some(shared_head),
+        last_membership: consensus::read_membership_sync(&conn, identity())
+            .expect("read source membership"),
+        snapshot_id: "retained-prefix-current-snapshot".to_owned(),
+    };
+    consensus::save_current_snapshot_sync(
+        &conn,
+        identity(),
+        &metadata,
+        file_name,
+        checksum,
+        u64::try_from(snapshot.len()).expect("snapshot length"),
+    )
+    .expect("persist source current snapshot metadata");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint source snapshot metadata");
+    drop(conn);
+
+    let manager = recovery(AllowRecovery);
+    let source_with_snapshot = inspect_replica(InspectionInput {
+        key: &manager.integrity_key,
+        replica: &replicas[0],
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("inspect source with current retained snapshot");
+    let conn = Connection::open(&replicas[0].database_path).expect("reopen source replica");
+    conn.execute("DELETE FROM consensus_snapshot", [])
+        .expect("remove non-authoritative source snapshot metadata");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint snapshot removal");
+    drop(conn);
+    std::fs::remove_file(replicas[0].snapshot_directory.join(file_name))
+        .expect("remove non-authoritative source snapshot");
+    let source_without_snapshot = inspect_replica(InspectionInput {
+        key: &manager.integrity_key,
+        replica: &replicas[0],
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("inspect source without local snapshot");
+    assert_eq!(
+        source_with_snapshot.branch_digest, source_without_snapshot.branch_digest,
+        "a current snapshot cannot hide retained prefix evidence"
+    );
+
+    let voter = inspect_replica(InspectionInput {
+        key: &manager.integrity_key,
+        replica: &replicas[1],
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("inspect divergent retained-prefix voter");
+    assert_eq!(
+        source_without_snapshot.logical_state_digest, voter.logical_state_digest,
+        "blank prefixes retain identical logical state"
+    );
+    assert_eq!(
+        source_without_snapshot.committed_index,
+        voter.committed_index
+    );
+    assert_ne!(
+        source_without_snapshot.branch_digest, voter.branch_digest,
+        "canonical retained prefixes must participate in majority equivalence"
+    );
+    assert!(
+        matches!(
+            manager.plan(
+                &context(),
+                identity(),
+                members,
+                &replicas,
+                &ids[0],
+                &ids[2..],
+                RecoveryDecisionBasis::VerifiedCommittedMajority,
+                RecoveryLimits::default(),
+            ),
+            Err(RecoveryError::InsufficientAuthority)
+        ),
+        "no source majority may be inferred from only the common final row"
+    );
+}
+
+#[test]
+fn current_recovery_does_not_copy_a_redundant_historical_source_snapshot() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("redundant-snapshot-source"),
+        replica_id("redundant-snapshot-voter"),
+        replica_id("redundant-snapshot-target"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 7),
+        create_legacy_replica(temp.path(), ids[1].clone(), 7),
+        create_legacy_replica(temp.path(), ids[2].clone(), 41),
+    ];
+    let manager = recovery(AllowRecovery);
+    let members = node_set(&ids);
+    let leader = *members.iter().next().expect("majority leader");
+    let retained_snapshot_log = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    let committed = LogId::new(CommittedLeaderId::new(3, leader), 1);
+    let fork = LogId::new(
+        CommittedLeaderId::new(4, *members.iter().nth(1).expect("fork leader")),
+        0,
+    );
+    for replica in &replicas[..2] {
+        claim_current_replica(replica, &members, retained_snapshot_log);
+        append_current_blank_checkpoint(replica, committed);
+    }
+    claim_current_replica(&replicas[2], &members, fork);
+    // `claim_current_replica` is a schema fixture and records the synthetic
+    // claim as an already-completed recovery. This case models an ordinary
+    // current-format cluster that has not itself undergone recovery: a
+    // missing sidecar is valid only with this exact zero recovery state.
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path).expect("open current fixture");
+        conn.execute(
+            "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = ?1, pending_epoch = NULL, pending_plan_digest = NULL WHERE singleton = 1",
+            params![[0_u8; 32].as_slice()],
+        )
+        .expect("restore never-recovered current fixture");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint never-recovered current fixture");
+    }
+
+    // The source alone selects a perfectly valid snapshot at log 0 while the
+    // exact committed log 1 is still retained on both majority voters.  The
+    // snapshot does not participate in their branch digest, so it must not
+    // become a fleet-wide recovery artifact merely because the source owns it.
+    let payload = b"redundant historical source snapshot";
+    let checksum: [u8; 32] = Sha256::digest(payload).into();
+    let file_name = "snapshot-00000000-0000-4000-8000-0000000000b3.opc";
+    let mut snapshot = payload.to_vec();
+    snapshot.extend_from_slice(b"OPCSNP01");
+    snapshot.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("snapshot payload length")
+            .to_be_bytes(),
+    );
+    snapshot.extend_from_slice(&checksum);
+    std::fs::write(replicas[0].snapshot_directory.join(file_name), &snapshot)
+        .expect("write redundant source snapshot");
+    let conn = Connection::open(&replicas[0].database_path).expect("open source replica");
+    let meta = opc_consensus::engine::SnapshotMeta {
+        last_log_id: Some(retained_snapshot_log),
+        last_membership: consensus::read_membership_sync(&conn, identity())
+            .expect("read source membership"),
+        snapshot_id: "redundant-source-snapshot".to_owned(),
+    };
+    // Normal publication refuses a snapshot behind committed/applied. This
+    // stopped-process fixture writes an otherwise valid historical selection
+    // directly so recovery proves it never republishes bytes that its branch
+    // digest does not cover.
+    conn.execute(
+        "INSERT INTO consensus_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            i64::try_from(identity().configuration_epoch().get()).expect("configuration epoch"),
+            serde_json::to_vec(&meta).expect("encode historical snapshot metadata"),
+            file_name,
+            checksum.as_slice(),
+            i64::try_from(snapshot.len()).expect("snapshot length fits SQLite"),
+        ],
+    )
+    .expect("inject valid historical source snapshot metadata");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint source snapshot metadata");
+    drop(conn);
+
+    let source_evidence = inspect_replica(InspectionInput {
+        key: &manager.integrity_key,
+        replica: &replicas[0],
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("inspect source with a source-local historical snapshot");
+    let voter_evidence = inspect_replica(InspectionInput {
+        key: &manager.integrity_key,
+        replica: &replicas[1],
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("inspect voter without the source-local snapshot");
+    assert_eq!(
+        source_evidence.branch_digest, voter_evidence.branch_digest,
+        "a snapshot below the physically retained commit is not branch evidence"
+    );
+    let target_evidence = inspect_replica(InspectionInput {
+        key: &manager.integrity_key,
+        replica: &replicas[2],
+        identity: identity(),
+        expected_members: &members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("inspect divergent target");
+    assert_eq!(source_evidence.committed_index, Some(committed.index));
+    assert_eq!(source_evidence.applied_index, Some(committed.index));
+    assert_eq!(voter_evidence.committed_index, Some(committed.index));
+    assert_eq!(voter_evidence.applied_index, Some(committed.index));
+    assert_ne!(target_evidence.branch_digest, source_evidence.branch_digest);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            members.clone(),
+            &replicas,
+            &ids[0],
+            &ids[2..],
+            RecoveryDecisionBasis::VerifiedCommittedMajority,
+            RecoveryLimits::default(),
+        )
+        .expect("physical committed majority accepts source-local snapshot");
+    let targets = replicas[2..].iter().collect::<Vec<_>>();
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &targets,
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: Some(RecoveryFailpoint::AfterBackup),
+        }),
+        Err(RecoveryError::InjectedFailure),
+        "the snapshot-bearing checkpoint must remain resumable before staging decides to omit it"
+    );
+    assert_eq!(
+        resume_execution_state(&manager.integrity_key, &plan, backup.path())
+            .expect("read source-local snapshot checkpoint workflow"),
+        RecoveryExecutionState::BackupVerified
+    );
+    manager
+        .execute(
+            &context(),
+            &plan,
+            &RecoveryConfirmation::verified(&plan),
+            &replicas,
+            backup.path(),
+            RecoveryLimits::default(),
+        )
+        .expect("recovery omits redundant source snapshot from staging");
+
+    let target = Connection::open(&replicas[2].database_path).expect("open recovered target");
+    assert!(
+        consensus::read_current_snapshot_sync(&target, identity())
+            .expect("read target selected snapshot")
+            .is_none(),
+        "the staged database must not select a snapshot not authenticated by the committed branch"
+    );
+    assert!(
+        !replicas[2].snapshot_directory.join(file_name).exists(),
+        "the target must not receive the source-local snapshot bytes"
+    );
+}
+
+#[test]
+fn current_recovery_carries_an_authoritative_snapshot_boundary_across_resume() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("snapshot-boundary-source"),
+        replica_id("snapshot-boundary-voter"),
+        replica_id("snapshot-boundary-target"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 7),
+        create_legacy_replica(temp.path(), ids[1].clone(), 7),
+        create_legacy_replica(temp.path(), ids[2].clone(), 41),
+    ];
+    let members = node_set(&ids);
+    let leader = *members.iter().next().expect("boundary leader");
+    let initial = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    let boundary = LogId::new(CommittedLeaderId::new(3, leader), 2);
+    let committed = LogId::new(CommittedLeaderId::new(3, leader), 3);
+    for replica in &replicas[..2] {
+        claim_current_replica(replica, &members, initial);
+        append_current_blank_checkpoint(replica, LogId::new(CommittedLeaderId::new(3, leader), 1));
+        append_current_blank_checkpoint(replica, boundary);
+        append_current_blank_checkpoint(replica, committed);
+    }
+    claim_current_replica(
+        &replicas[2],
+        &members,
+        LogId::new(
+            CommittedLeaderId::new(4, *members.iter().nth(1).expect("fork leader")),
+            0,
+        ),
+    );
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path).expect("open current fixture");
+        conn.execute(
+            "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = ?1, pending_epoch = NULL, pending_plan_digest = NULL WHERE singleton = 1",
+            params![[0_u8; 32].as_slice()],
+        )
+        .expect("restore never-recovered current fixture");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint never-recovered current fixture");
+    }
+
+    let file_name = "snapshot-00000000-0000-4000-8000-0000000000c1.opc";
+    let source_bytes = install_dynamic_current_snapshot_fixture(
+        &replicas[0],
+        boundary,
+        file_name,
+        "authoritative-snapshot-boundary",
+        b"authoritative no-purge boundary",
+    );
+    install_dynamic_current_snapshot_fixture(
+        &replicas[1],
+        boundary,
+        file_name,
+        "different-authoritative-snapshot-boundary",
+        b"different valid boundary bytes",
+    );
+    for replica in &replicas[..2] {
+        let conn = Connection::open(&replica.database_path).expect("open boundary fixture");
+        conn.execute("DELETE FROM consensus_log WHERE log_index <= 2", [])
+            .expect("remove snapshot-covered prefix");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint snapshot boundary fixture");
+    }
+
+    let manager = recovery(AllowRecovery);
+    assert!(
+        matches!(
+            manager.plan(
+                &context(),
+                identity(),
+                members.clone(),
+                &replicas,
+                &ids[0],
+                &ids[2..],
+                RecoveryDecisionBasis::VerifiedCommittedMajority,
+                RecoveryLimits::default(),
+            ),
+            Err(RecoveryError::InsufficientAuthority)
+        ),
+        "a different boundary snapshot cannot authenticate the same suffix"
+    );
+
+    // Restore byte-identical metadata and bytes: the two source voters now
+    // describe the same snapshot-boundary branch, not merely the same final
+    // retained log row.
+    install_dynamic_current_snapshot_fixture(
+        &replicas[1],
+        boundary,
+        file_name,
+        "authoritative-snapshot-boundary",
+        b"authoritative no-purge boundary",
+    );
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            members.clone(),
+            &replicas,
+            &ids[0],
+            &ids[2..],
+            RecoveryDecisionBasis::VerifiedCommittedMajority,
+            RecoveryLimits::default(),
+        )
+        .expect("exact snapshot-boundary majority");
+    let targets = replicas[2..].iter().collect::<Vec<_>>();
+    // Force the selected target leaf through `Present`: its arbitrary prior
+    // inode is authenticated in the workflow and must be removed only by the
+    // post-promotion cleanup reconciliation.
+    std::fs::write(
+        replicas[2].snapshot_directory.join(file_name),
+        b"displaced target snapshot",
+    )
+    .expect("seed displaced target snapshot");
+    let snapshot_temporary =
+        snapshot_promotion_temporary_path_for_test(&replicas[2], &plan, file_name)
+            .expect("derive exact snapshot promotion temporary");
+    let database_temporary = database_promotion_temporary_path_for_test(&replicas[2], &plan)
+        .expect("derive exact database promotion temporary");
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &targets,
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: Some(RecoveryFailpoint::AfterBackup),
+        }),
+        Err(RecoveryError::InjectedFailure)
+    );
+    assert_eq!(
+        resume_execution_state(&manager.integrity_key, &plan, backup.path())
+            .expect("read snapshot-boundary checkpoint workflow"),
+        RecoveryExecutionState::BackupVerified
+    );
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &targets,
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: Some(RecoveryFailpoint::AfterSnapshotPromotion),
+        }),
+        Err(RecoveryError::InjectedFailure),
+        "snapshot exchange leaves its exact displaced inode journaled before cleanup"
+    );
+    assert!(
+        snapshot_temporary.exists(),
+        "the snapshot journaled temporary exists before its resume cleanup"
+    );
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &targets,
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: Some(RecoveryFailpoint::AfterDatabasePromotion),
+        }),
+        Err(RecoveryError::InjectedFailure),
+        "snapshot resume cleanup must complete before the database exchange boundary"
+    );
+    assert!(
+        !snapshot_temporary.exists(),
+        "snapshot resume removes its exact journaled displaced inode"
+    );
+    assert!(
+        database_temporary.exists(),
+        "database exchange leaves its exact displaced inode journaled before cleanup"
+    );
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &targets,
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: None,
+        })
+        .expect("resume snapshot-boundary recovery"),
+        RecoveryExecutionState::AwaitingEpochCommit
+    );
+    assert!(
+        !database_temporary.exists(),
+        "database resume removes its exact journaled displaced inode"
+    );
+    assert!(
+        promotion_cleanup_journals_are_empty_for_test(
+            &manager.integrity_key,
+            &plan,
+            backup.path(),
+        )
+        .expect("read completed promotion workflow"),
+        "only a durable cleanup may clear the workflow promotion journals"
+    );
+    let target = Connection::open(&replicas[2].database_path).expect("open recovered target");
+    let selected = consensus::read_current_snapshot_sync(&target, identity())
+        .expect("read recovered snapshot")
+        .expect("snapshot boundary must remain selected");
+    assert_eq!(selected.0.last_log_id, Some(boundary));
+    assert_eq!(selected.1, file_name);
+    assert_eq!(
+        std::fs::read(replicas[2].snapshot_directory.join(file_name))
+            .expect("read copied target boundary snapshot"),
+        source_bytes
+    );
+    let rows = consensus::read_log_range_for_recovery_sync(&target, identity(), 3, None, Some(8))
+        .expect("read retained boundary suffix");
+    assert_eq!(rows.last().map(|entry| entry.log_id), Some(committed));
+}
+
+#[test]
+fn current_recovery_rejects_divergent_retained_prefix_below_a_committed_snapshot_fallback() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("snapshot-fallback-source"),
+        replica_id("snapshot-fallback-voter"),
+        replica_id("snapshot-fallback-target"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 7),
+        create_legacy_replica(temp.path(), ids[1].clone(), 7),
+        create_legacy_replica(temp.path(), ids[2].clone(), 41),
+    ];
+    let members = node_set(&ids);
+    let initial_leader = *members.iter().next().expect("initial leader");
+    let source_prefix_leader = initial_leader;
+    let voter_prefix_leader = *members.iter().nth(1).expect("voter prefix leader");
+    let committed_leader = *members.iter().nth(2).expect("committed leader");
+    let initial = LogId::new(CommittedLeaderId::new(1, initial_leader), 0);
+    let source_prefix = LogId::new(CommittedLeaderId::new(2, source_prefix_leader), 1);
+    // The single-term-leader profile serializes a leader as its term, so a
+    // distinct node at one term is not a distinct durable LogId. Use a term
+    // divergence to exercise the prefix hash with two valid, observable Raft
+    // histories that converge at the same later committed row.
+    let voter_prefix = LogId::new(CommittedLeaderId::new(3, voter_prefix_leader), 1);
+    let committed = LogId::new(CommittedLeaderId::new(4, committed_leader), 2);
+    claim_current_replica(&replicas[0], &members, initial);
+    append_current_blank_checkpoint(&replicas[0], source_prefix);
+    append_current_blank_checkpoint(&replicas[0], committed);
+    claim_current_replica(&replicas[1], &members, initial);
+    append_current_blank_checkpoint(&replicas[1], voter_prefix);
+    append_current_blank_checkpoint(&replicas[1], committed);
+    claim_current_replica(
+        &replicas[2],
+        &members,
+        LogId::new(CommittedLeaderId::new(5, committed_leader), 0),
+    );
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path).expect("open current fixture");
+        conn.execute(
+            "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = ?1, pending_epoch = NULL, pending_plan_digest = NULL WHERE singleton = 1",
+            params![[0_u8; 32].as_slice()],
+        )
+        .expect("restore never-recovered current fixture");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint never-recovered current fixture");
+    }
+    let file_name = "snapshot-00000000-0000-4000-8000-0000000000c2.opc";
+    for replica in &replicas[..2] {
+        install_dynamic_current_snapshot_fixture(
+            replica,
+            committed,
+            file_name,
+            "committed-snapshot-fallback",
+            b"exact shared committed fallback snapshot",
+        );
+        let conn = Connection::open(&replica.database_path).expect("open fallback fixture");
+        conn.execute("DELETE FROM consensus_log WHERE log_index = 2", [])
+            .expect("remove committed log row covered by snapshot");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint committed snapshot fallback fixture");
+    }
+
+    let manager = recovery(AllowRecovery);
+    let source = inspect_current_fixture(&replicas[0], &members)
+        .expect("inspect source committed-snapshot fallback");
+    let voter = inspect_current_fixture(&replicas[1], &members)
+        .expect("inspect voter committed-snapshot fallback");
+    assert_eq!(source.logical_state_digest, voter.logical_state_digest);
+    assert_ne!(
+        source.branch_digest, voter.branch_digest,
+        "the committed fallback hashes every still-retained prefix row"
+    );
+    assert!(
+        matches!(
+            manager.plan(
+                &context(),
+                identity(),
+                members,
+                &replicas,
+                &ids[0],
+                &ids[2..],
+                RecoveryDecisionBasis::VerifiedCommittedMajority,
+                RecoveryLimits::default(),
+            ),
+            Err(RecoveryError::InsufficientAuthority)
+        ),
+        "a shared snapshot at commit cannot hide divergent physical prefixes"
+    );
+}
+
+#[test]
+fn current_recovery_treats_snapshot_at_the_purge_floor_as_redundant() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("purge-snapshot-source"),
+        replica_id("purge-snapshot-voter"),
+        replica_id("purge-snapshot-target"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 7),
+        create_legacy_replica(temp.path(), ids[1].clone(), 7),
+        create_legacy_replica(temp.path(), ids[2].clone(), 41),
+    ];
+    let members = node_set(&ids);
+    let leader = *members.iter().next().expect("purge leader");
+    let purge_floor = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    let committed = LogId::new(CommittedLeaderId::new(4, leader), 1);
+    for replica in &replicas[..2] {
+        claim_current_replica(replica, &members, purge_floor);
+    }
+    claim_current_replica(
+        &replicas[2],
+        &members,
+        LogId::new(
+            CommittedLeaderId::new(5, *members.iter().nth(1).expect("fork leader")),
+            0,
+        ),
+    );
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path).expect("open current fixture");
+        conn.execute(
+            "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = ?1, pending_epoch = NULL, pending_plan_digest = NULL WHERE singleton = 1",
+            params![[0_u8; 32].as_slice()],
+        )
+        .expect("restore never-recovered current fixture");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint never-recovered current fixture");
+    }
+    let file_name = "snapshot-00000000-0000-4000-8000-0000000000c3.opc";
+    install_dynamic_current_snapshot_fixture(
+        &replicas[0],
+        purge_floor,
+        file_name,
+        "purge-floor-redundant-snapshot",
+        b"snapshot exactly at the durable purge floor",
+    );
+    for replica in &replicas[..2] {
+        // This physically retained membership attests the post-purge state;
+        // the source's selected snapshot can therefore remain a local,
+        // digest-neutral historical artifact.
+        append_current_membership_checkpoint(replica, committed, &members);
+        let conn = Connection::open(&replica.database_path).expect("open purge fixture");
+        install_current_purge_floor(&conn, &purge_floor);
+        conn.execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .expect("remove purged committed row");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint purge-floor fixture");
+    }
+    let manager = recovery(AllowRecovery);
+    let source = inspect_current_fixture(&replicas[0], &members).expect("inspect source");
+    let voter = inspect_current_fixture(&replicas[1], &members).expect("inspect voter");
+    assert_eq!(
+        source.branch_digest, voter.branch_digest,
+        "an exact purge marker owns the committed boundary before a selected snapshot"
+    );
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            members,
+            &replicas,
+            &ids[0],
+            &ids[2..],
+            RecoveryDecisionBasis::VerifiedCommittedMajority,
+            RecoveryLimits::default(),
+        )
+        .expect("purge-floor majority remains valid without a copied snapshot");
+    manager
+        .execute(
+            &context(),
+            &plan,
+            &RecoveryConfirmation::verified(&plan),
+            &replicas,
+            backup.path(),
+            RecoveryLimits::default(),
+        )
+        .expect("execute recovery with redundant purge-floor snapshot");
+    let target = Connection::open(&replicas[2].database_path).expect("open recovered target");
+    assert!(
+        consensus::read_current_snapshot_sync(&target, identity())
+            .expect("read recovered snapshot")
+            .is_none(),
+        "the selected source snapshot was redundant to the durable purge marker"
+    );
+}
+
+#[test]
+fn current_recovery_rejects_different_exact_purge_log_ids() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let ids = [
+        replica_id("purge-log-source"),
+        replica_id("purge-log-voter"),
+        replica_id("purge-log-target"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 7),
+        create_legacy_replica(temp.path(), ids[1].clone(), 7),
+        create_legacy_replica(temp.path(), ids[2].clone(), 41),
+    ];
+    let members = node_set(&ids);
+    let source_leader = *members.iter().next().expect("source purge leader");
+    let voter_leader = *members.iter().nth(1).expect("voter purge leader");
+    let committed_leader = *members.iter().nth(2).expect("committed leader");
+    let source_floor = LogId::new(CommittedLeaderId::new(1, source_leader), 0);
+    let voter_floor = LogId::new(CommittedLeaderId::new(2, voter_leader), 0);
+    let committed = LogId::new(CommittedLeaderId::new(3, committed_leader), 1);
+
+    claim_current_replica(&replicas[0], &members, source_floor);
+    append_current_blank_checkpoint(&replicas[0], committed);
+    claim_current_replica(&replicas[1], &members, voter_floor);
+    append_current_blank_checkpoint(&replicas[1], committed);
+    claim_current_replica(
+        &replicas[2],
+        &members,
+        LogId::new(CommittedLeaderId::new(4, committed_leader), 0),
+    );
+
+    for (index, (replica, floor)) in [(&replicas[0], source_floor), (&replicas[1], voter_floor)]
+        .into_iter()
+        .enumerate()
+    {
+        let snapshot_name = [
+            "snapshot-00000000-0000-4000-8000-0000000000c5.opc",
+            "snapshot-00000000-0000-4000-8000-0000000000c6.opc",
+        ][index];
+        install_dynamic_current_snapshot_fixture(
+            replica,
+            floor,
+            snapshot_name,
+            "purge-log-identity-snapshot",
+            b"snapshot authenticates the compacted membership payload",
+        );
+        let conn = Connection::open(&replica.database_path).expect("open purge fixture");
+        install_current_purge_floor(&conn, &floor);
+        conn.execute("DELETE FROM consensus_log WHERE log_index = 0", [])
+            .expect("remove physically purged floor");
+        conn.execute(
+            "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = ?1, pending_epoch = NULL, pending_plan_digest = NULL WHERE singleton = 1",
+            params![[0_u8; 32].as_slice()],
+        )
+        .expect("restore never-recovered current fixture");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint purge fixture");
+    }
+    let conn = Connection::open(&replicas[2].database_path).expect("open target fixture");
+    conn.execute(
+        "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = ?1, pending_epoch = NULL, pending_plan_digest = NULL WHERE singleton = 1",
+        params![[0_u8; 32].as_slice()],
+    )
+    .expect("restore never-recovered target fixture");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint target fixture");
+
+    let source = inspect_current_fixture(&replicas[0], &members).expect("inspect source");
+    let voter = inspect_current_fixture(&replicas[1], &members).expect("inspect voter");
+    assert_eq!(source.logical_state_digest, voter.logical_state_digest);
+    assert_ne!(
+        source.branch_digest, voter.branch_digest,
+        "the exact purge LogId is authenticated branch evidence, not only a suffix offset"
+    );
+
+    let manager = recovery(AllowRecovery);
+    assert!(
+        matches!(
+            manager.plan(
+                &context(),
+                identity(),
+                members,
+                &replicas,
+                &ids[0],
+                &ids[2..],
+                RecoveryDecisionBasis::VerifiedCommittedMajority,
+                RecoveryLimits::default(),
+            ),
+            Err(RecoveryError::InsufficientAuthority)
+        ),
+        "replicas with different exact purge identities cannot form an authenticated majority"
+    );
+}
+
 #[tokio::test]
 async fn activated_current_checkpoint_recovery_preserves_fenced_transition_evidence() {
     let temp = tempfile::tempdir().expect("temporary directory");
@@ -3269,6 +5401,7 @@ fn backup_and_snapshot_failpoints_resume_without_losing_quarantine() {
     for failpoint in [
         RecoveryFailpoint::AfterTargetBackupCopy,
         RecoveryFailpoint::AfterCheckpointCopy,
+        RecoveryFailpoint::AfterCheckpointCopyBeforeVerification,
         RecoveryFailpoint::AfterBackup,
         RecoveryFailpoint::AfterStagedCopy,
         RecoveryFailpoint::AfterSnapshotInstall,
@@ -3315,6 +5448,890 @@ fn backup_and_snapshot_failpoints_resume_without_losing_quarantine() {
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(restore_incarnations.len(), replicas.len());
+}
+
+/// Once `DatabaseInstalled` is MACed into the workflow, a retry must keep the
+/// execution lock's original database descriptor authoritative.  Replacing
+/// the public name with byte-identical B after that identity admission must
+/// fail at the post-predicate fence, not let B inherit A's workflow entry.
+#[cfg(target_os = "linux")]
+#[test]
+fn database_installed_retry_rejects_byte_identical_public_replacement_after_identity_admission() {
+    use std::os::fd::AsFd as _;
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("installed-pin-source-a"),
+        replica_id("installed-pin-target-b"),
+        replica_id("installed-pin-target-c"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 13),
+        create_legacy_replica(temp.path(), ids[1].clone(), 31),
+        create_legacy_replica(temp.path(), ids[2].clone(), 47),
+    ];
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("legacy plan");
+    let targets = replicas.iter().collect::<Vec<_>>();
+
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &targets,
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: Some(RecoveryFailpoint::AfterDatabaseInstall),
+        }),
+        Err(RecoveryError::InjectedFailure),
+        "leave the first installed target committed in the workflow"
+    );
+    assert_eq!(
+        resume_execution_state(&manager.integrity_key, &plan, backup.path())
+            .expect("read pre-swap workflow"),
+        RecoveryExecutionState::BackupVerified
+    );
+
+    let original = File::open(&replicas[0].database_path).expect("open installed inode A");
+    let identity_a = opc_fs_verity_sys::persistent_file_identity(original.as_fd())
+        .expect("persistent identity A");
+    let replacement = temp
+        .path()
+        .join("installed-byte-identical-replacement.sqlite");
+    std::fs::copy(&replicas[0].database_path, &replacement).expect("copy A into independent B");
+    let replacement_file = File::open(&replacement).expect("open replacement inode B");
+    let identity_b = opc_fs_verity_sys::persistent_file_identity(replacement_file.as_fd())
+        .expect("persistent identity B");
+    assert!(
+        identity_a != identity_b,
+        "the causal replacement must be byte-identical but persistently distinct"
+    );
+    drop(replacement_file);
+
+    let swapped = Arc::new(AtomicBool::new(false));
+    let swapped_hook = Arc::clone(&swapped);
+    let expected_target = replicas[0].database_path.clone();
+    install_target_database_after_identity_admission_hook(move |public_database| {
+        assert_eq!(public_database, expected_target);
+        std::fs::rename(&replacement, public_database)
+            .expect("replace public A with independently-created B");
+        swapped_hook.store(true, Ordering::SeqCst);
+    });
+    let result = backup_and_reset_replica(ResetInput {
+        key: &manager.integrity_key,
+        plan: &plan,
+        source: &replicas[0],
+        replicas: &replicas,
+        targets: &targets,
+        backup_root: backup.path(),
+        limits: RecoveryLimits::default(),
+        failpoint: None,
+    });
+    clear_target_database_after_identity_admission_hook();
+
+    assert!(
+        swapped.load(Ordering::SeqCst),
+        "identity-admission seam fired"
+    );
+    assert_eq!(
+        result,
+        Err(RecoveryError::BackupCorrupt),
+        "the retained A pin must reject public B before any workflow transition"
+    );
+    let public_b = File::open(&replicas[0].database_path).expect("open public replacement B");
+    assert!(
+        opc_fs_verity_sys::persistent_file_identity(public_b.as_fd())
+            .expect("persistent public B identity")
+            == identity_b,
+        "the public name remains B; rejection cannot depend on restoring A"
+    );
+    assert_eq!(
+        resume_execution_state(&manager.integrity_key, &plan, backup.path())
+            .expect("read rejected workflow"),
+        RecoveryExecutionState::BackupVerified,
+        "the rejected retry must not advance the workflow"
+    );
+}
+
+/// The final recovery predicates must read the same WAL snapshot as the
+/// evidence they refine. X is valid evidence with no F marker; after that
+/// inspection a writer commits Y that supplies the marker shape but drops the
+/// protected-roster witness. X and Y fail distinct complete predicates.
+#[test]
+fn pinned_inspection_keeps_terminal_predicate_on_the_x_wal_snapshot() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(temp.path());
+    inspect_current_fixture(&replica, &members).expect("X is semantically valid evidence");
+
+    let writer_ran = Arc::new(AtomicBool::new(false));
+    let writer_ran_hook = Arc::clone(&writer_ran);
+    install_pinned_inspection_path_swap_hooks(
+        |_| {},
+        move |database| {
+            let writer = Connection::open(database).expect("open concurrent WAL writer");
+            writer
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     UPDATE consensus_operator_recovery
+                     SET recovery_v2_activated = 1,
+                         finalize_log_id_json = X'31',
+                         finalize_entry_json = X'31'
+                     WHERE singleton = 1;
+                     DROP TABLE consensus_protected_roster_witness;
+                     COMMIT;",
+                )
+                .expect("commit Y marker/witness mutation into WAL");
+            writer_ran_hook.store(true, Ordering::SeqCst);
+        },
+    );
+    let observed_x = Arc::new(Mutex::new(None::<(bool, bool)>));
+    let observed_x_proof = Arc::clone(&observed_x);
+    let result = inspect_replica_with_descriptor_snapshot_proof_for_test(
+        InspectionInput {
+            key: &integrity_key(),
+            replica: &replica,
+            identity: identity(),
+            expected_members: &members,
+            limits: RecoveryLimits::default(),
+        },
+        move |_evidence, conn| {
+            let strict_f_marker: bool = conn
+                .query_row(
+                    "SELECT finalize_log_id_json IS NOT NULL AND finalize_entry_json IS NOT NULL
+                     FROM consensus_operator_recovery WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| RecoveryError::BackupCorrupt)?;
+            let protected_roster_witness: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_schema
+                         WHERE type = 'table' AND name = 'consensus_protected_roster_witness'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| RecoveryError::BackupCorrupt)?;
+            *observed_x_proof
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((strict_f_marker, protected_roster_witness));
+            if !strict_f_marker {
+                return Err(RecoveryError::BackupCorrupt);
+            }
+            if !protected_roster_witness {
+                return Err(RecoveryError::CorruptReplica);
+            }
+            Ok(())
+        },
+    );
+    clear_pinned_inspection_path_swap_hooks();
+
+    assert!(
+        writer_ran.load(Ordering::SeqCst),
+        "Y writer committed after X evidence"
+    );
+    assert_eq!(
+        result,
+        Err(RecoveryError::BackupCorrupt),
+        "the retained transaction must continue the X predicate and reject X for its absent F marker"
+    );
+    assert_eq!(
+        *observed_x
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        Some((false, true)),
+        "the proof closure observed X: no F marker, but an intact protected roster witness"
+    );
+
+    let y = Connection::open(&replica.database_path).expect("open committed Y");
+    let y_marker: bool = y
+        .query_row(
+            "SELECT finalize_log_id_json IS NOT NULL AND finalize_entry_json IS NOT NULL
+             FROM consensus_operator_recovery WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read Y marker");
+    let y_witness: bool = y
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'consensus_protected_roster_witness'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read Y witness absence");
+    assert_eq!(
+        (y_marker, y_witness),
+        (true, false),
+        "Y restores the F-marker shape but independently fails its protected-roster predicate"
+    );
+    drop(y);
+    assert_eq!(
+        inspect_current_fixture(&replica, &members),
+        Err(RecoveryError::CorruptReplica),
+        "a standalone inspection of Y rejects the dropped protected-roster witness"
+    );
+}
+
+#[test]
+fn target_backup_semantic_inspection_uses_the_held_copy_pin() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("pinned-inspection-source"),
+        replica_id("pinned-inspection-target-b"),
+        replica_id("pinned-inspection-target-c"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 13),
+        create_legacy_replica(temp.path(), ids[1].clone(), 31),
+        create_legacy_replica(temp.path(), ids[2].clone(), 47),
+    ];
+    let semantic_standin = create_legacy_replica(
+        temp.path(),
+        replica_id("pinned-inspection-semantic-standin"),
+        99,
+    );
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("legacy plan");
+
+    // `ensure_target_backup` has already copied and pinned A when this hook
+    // makes its pathname name the independently valid but semantically
+    // divergent B.  The after hook restores A before the mandatory path-to-pin
+    // fence.  A pathname-based inspection would bless B and return StalePlan;
+    // descriptor-backed inspection reads A and reaches the injected boundary.
+    let displaced = Arc::new(Mutex::new(None::<std::path::PathBuf>));
+    let hook_armed = Arc::new(AtomicBool::new(true));
+    let before_displaced = Arc::clone(&displaced);
+    let after_displaced = Arc::clone(&displaced);
+    let before_hook_armed = Arc::clone(&hook_armed);
+    let standin_database = semantic_standin.database_path.clone();
+    install_pinned_inspection_path_swap_hooks(
+        move |backup_database| {
+            if !before_hook_armed.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let original = backup_database.with_extension("pinned-inspection-original");
+            std::fs::rename(backup_database, &original).expect("detach pinned backup pathname");
+            std::fs::copy(&standin_database, backup_database)
+                .expect("substitute independently valid backup database");
+            *before_displaced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(original);
+        },
+        move |backup_database| {
+            let Some(original) = after_displaced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            else {
+                return;
+            };
+            std::fs::remove_file(backup_database).expect("remove stand-in backup database");
+            std::fs::rename(original, backup_database).expect("restore pinned backup pathname");
+        },
+    );
+    let targets = replicas.iter().collect::<Vec<_>>();
+    let result = backup_and_reset_replica(ResetInput {
+        key: &manager.integrity_key,
+        plan: &plan,
+        source: &replicas[0],
+        replicas: &replicas,
+        targets: &targets,
+        backup_root: backup.path(),
+        limits: RecoveryLimits::default(),
+        failpoint: Some(RecoveryFailpoint::AfterTargetBackupCopy),
+    });
+    clear_pinned_inspection_path_swap_hooks();
+    assert_eq!(
+        result,
+        Err(RecoveryError::InjectedFailure),
+        "semantic inspection must read the held copied inode, not the swapped pathname"
+    );
+    assert!(
+        displaced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none(),
+        "the pathname was restored before the exact-inode path fence"
+    );
+}
+
+#[test]
+fn checkpoint_semantic_inspection_uses_the_held_copy_pin() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("pinned-checkpoint-source"),
+        replica_id("pinned-checkpoint-target-b"),
+        replica_id("pinned-checkpoint-target-c"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 13),
+        create_legacy_replica(temp.path(), ids[1].clone(), 31),
+        create_legacy_replica(temp.path(), ids[2].clone(), 47),
+    ];
+    let semantic_standin = create_legacy_replica(
+        temp.path(),
+        replica_id("pinned-checkpoint-semantic-standin"),
+        99,
+    );
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("legacy plan");
+
+    // Target backups are inspected first. Leave those paths alone and swap
+    // only `checkpoint/source.sqlite`, after its copy is pinned and its SQLite
+    // connection has been opened. A former pathname inspection would observe
+    // B here and reject the selected source; descriptor inspection observes
+    // the copied source A, then the exact-inode fence sees A restored.
+    let displaced = Arc::new(Mutex::new(None::<std::path::PathBuf>));
+    let hook_armed = Arc::new(AtomicBool::new(true));
+    let before_displaced = Arc::clone(&displaced);
+    let after_displaced = Arc::clone(&displaced);
+    let checkpoint_hook_ran = Arc::new(AtomicBool::new(false));
+    let before_hook_ran = Arc::clone(&checkpoint_hook_ran);
+    let before_hook_armed = Arc::clone(&hook_armed);
+    let standin_database = semantic_standin.database_path.clone();
+    install_pinned_inspection_path_swap_hooks(
+        move |checkpoint_database| {
+            if checkpoint_database
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some("source.sqlite")
+            {
+                return;
+            }
+            if !before_hook_armed.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let original = checkpoint_database.with_extension("pinned-inspection-original");
+            std::fs::rename(checkpoint_database, &original)
+                .expect("detach pinned checkpoint pathname");
+            std::fs::copy(&standin_database, checkpoint_database)
+                .expect("substitute independently valid checkpoint database");
+            *before_displaced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(original);
+            before_hook_ran.store(true, Ordering::SeqCst);
+        },
+        move |checkpoint_database| {
+            if checkpoint_database
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some("source.sqlite")
+            {
+                return;
+            }
+            let Some(original) = after_displaced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            else {
+                return;
+            };
+            std::fs::remove_file(checkpoint_database).expect("remove stand-in checkpoint database");
+            std::fs::rename(original, checkpoint_database)
+                .expect("restore pinned checkpoint pathname");
+        },
+    );
+    let targets = replicas.iter().collect::<Vec<_>>();
+    let result = backup_and_reset_replica(ResetInput {
+        key: &manager.integrity_key,
+        plan: &plan,
+        source: &replicas[0],
+        replicas: &replicas,
+        targets: &targets,
+        backup_root: backup.path(),
+        limits: RecoveryLimits::default(),
+        failpoint: Some(RecoveryFailpoint::AfterCheckpointCopy),
+    });
+    clear_pinned_inspection_path_swap_hooks();
+    assert_eq!(
+        result,
+        Err(RecoveryError::InjectedFailure),
+        "checkpoint semantic inspection must read the held copied inode"
+    );
+    assert!(
+        checkpoint_hook_ran.load(Ordering::SeqCst),
+        "the checkpoint semantic inspection swap must actually execute"
+    );
+    assert!(
+        displaced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none(),
+        "the checkpoint pathname was restored before the exact-inode path fence"
+    );
+}
+
+#[test]
+fn checkpoint_copy_crash_before_verified_evidence_reproves_and_resumes() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let first_id = replica_id("checkpoint-crash-source-a");
+    let second_id = replica_id("checkpoint-crash-target-b");
+    let third_id = replica_id("checkpoint-crash-target-c");
+    let ids = [first_id.clone(), second_id.clone(), third_id.clone()];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), first_id.clone(), 13),
+        create_legacy_replica(temp.path(), second_id.clone(), 31),
+        create_legacy_replica(temp.path(), third_id.clone(), 47),
+    ];
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &first_id,
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("legacy plan");
+    let targets = replicas.iter().collect::<Vec<_>>();
+
+    reset_planned_fleet_inspection_count();
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &targets,
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: Some(RecoveryFailpoint::AfterCheckpointCopyBeforeVerification),
+        }),
+        Err(RecoveryError::InjectedFailure)
+    );
+    assert_eq!(
+        resume_execution_state(&manager.integrity_key, &plan, backup.path())
+            .expect("the copy-only workflow remains structurally readable"),
+        RecoveryExecutionState::Planned
+    );
+    assert_eq!(
+        planned_fleet_inspection_count(),
+        1,
+        "the first proof precedes the intentionally unpublished checkpoint evidence"
+    );
+
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &targets,
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: None,
+        })
+        .expect("resume copy-only checkpoint workflow"),
+        RecoveryExecutionState::AwaitingEpochCommit
+    );
+    assert!(
+        planned_fleet_inspection_count() >= 3,
+        "resume must prove the fleet before and after recreating the checkpoint"
+    );
+}
+
+#[test]
+fn snapshot_checkpoint_after_backup_crash_keeps_checkpoint_and_staging_shapes_distinct() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("snapshot-backup-crash-source"),
+        replica_id("snapshot-backup-crash-voter"),
+        replica_id("snapshot-backup-crash-target"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 7),
+        create_legacy_replica(temp.path(), ids[1].clone(), 7),
+        create_legacy_replica(temp.path(), ids[2].clone(), 41),
+    ];
+    let members = node_set(&ids);
+    let leader = *members.iter().next().expect("majority leader");
+    let source_log = LogId::new(CommittedLeaderId::new(3, leader), 0);
+    let target_log = LogId::new(
+        CommittedLeaderId::new(4, *members.iter().nth(1).expect("fork leader")),
+        0,
+    );
+    claim_current_replica(&replicas[0], &members, source_log);
+    claim_current_replica(&replicas[1], &members, source_log);
+    claim_current_replica(&replicas[2], &members, target_log);
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path).expect("open current fixture");
+        conn.execute(
+            "UPDATE consensus_operator_recovery SET recovery_epoch = 0, last_plan_digest = ?1, pending_epoch = NULL, pending_plan_digest = NULL WHERE singleton = 1",
+            params![[0_u8; 32].as_slice()],
+        )
+        .expect("restore never-recovered current fixture");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint never-recovered fixture");
+    }
+
+    let payload = b"snapshot-bearing checkpoint crash fixture";
+    let checksum: [u8; 32] = Sha256::digest(payload).into();
+    let file_name = "snapshot-00000000-0000-4000-8000-0000000000ca.opc";
+    let mut bytes = payload.to_vec();
+    bytes.extend_from_slice(b"OPCSNP01");
+    bytes.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("snapshot payload length")
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(&checksum);
+    std::fs::write(replicas[0].snapshot_directory.join(file_name), &bytes)
+        .expect("write source snapshot");
+    let conn = Connection::open(&replicas[0].database_path).expect("open source replica");
+    let meta = opc_consensus::engine::SnapshotMeta {
+        last_log_id: Some(source_log),
+        last_membership: consensus::read_membership_sync(&conn, identity())
+            .expect("read source membership"),
+        snapshot_id: "snapshot-backup-crash".to_owned(),
+    };
+    consensus::save_current_snapshot_sync(
+        &conn,
+        identity(),
+        &meta,
+        file_name,
+        checksum,
+        u64::try_from(bytes.len()).expect("snapshot length"),
+    )
+    .expect("persist source snapshot metadata");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint source snapshot metadata");
+    drop(conn);
+
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            members,
+            &replicas,
+            &ids[0],
+            &ids[2..],
+            RecoveryDecisionBasis::VerifiedCommittedMajority,
+            RecoveryLimits::default(),
+        )
+        .expect("snapshot-bearing current plan");
+    let targets = replicas[2..].iter().collect::<Vec<_>>();
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &targets,
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: Some(RecoveryFailpoint::AfterBackup),
+        }),
+        Err(RecoveryError::InjectedFailure)
+    );
+    assert_eq!(
+        resume_execution_state(&manager.integrity_key, &plan, backup.path())
+            .expect("snapshot-bearing backup record is structurally valid"),
+        RecoveryExecutionState::BackupVerified
+    );
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &targets,
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: None,
+        })
+        .expect("resume snapshot-bearing workflow"),
+        RecoveryExecutionState::AwaitingEpochCommit
+    );
+}
+
+#[test]
+fn target_backup_snapshot_directory_sync_precedes_verified_manifest() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let first_id = replica_id("backup-sync-source");
+    let second_id = replica_id("backup-sync-target");
+    let third_id = replica_id("backup-sync-third");
+    let ids = [first_id.clone(), second_id.clone(), third_id.clone()];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), first_id.clone(), 13),
+        create_legacy_replica(temp.path(), second_id.clone(), 31),
+        create_legacy_replica(temp.path(), third_id.clone(), 47),
+    ];
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &first_id,
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("legacy plan");
+
+    let observed_sync_boundary = Arc::new(AtomicBool::new(false));
+    let observed_by_hook = Arc::clone(&observed_sync_boundary);
+    install_target_backup_snapshot_directory_sync_hook(move |snapshot_directory| {
+        assert!(
+            snapshot_directory.is_dir(),
+            "nested snapshots directory exists"
+        );
+        assert!(
+            !snapshot_directory
+                .parent()
+                .expect("backup parent")
+                .join("backup-manifest.json")
+                .exists(),
+            "the manifest cannot precede nested snapshots directory durability"
+        );
+        observed_by_hook.store(true, Ordering::SeqCst);
+        true // deterministically model an fsync failure at this boundary.
+    });
+
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &replicas.iter().collect::<Vec<_>>(),
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: None,
+        }),
+        Err(RecoveryError::FileOperationFailed),
+        "a failed nested directory fsync must abort before verification"
+    );
+    assert!(
+        observed_sync_boundary.load(Ordering::SeqCst),
+        "the backup path exercised the nested directory sync boundary"
+    );
+
+    fn contains_backup_manifest(path: &Path) -> bool {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(_) => return false,
+        };
+        entries.filter_map(Result::ok).any(|entry| {
+            let path = entry.path();
+            path.file_name()
+                .is_some_and(|name| name == "backup-manifest.json")
+                || path.is_dir() && contains_backup_manifest(&path)
+        })
+    }
+
+    assert!(
+        !contains_backup_manifest(backup.path()),
+        "Verified evidence must never publish without a synced nested snapshot directory"
+    );
+    assert_eq!(
+        resume_execution_state(&manager.integrity_key, &plan, backup.path())
+            .expect("read interrupted workflow"),
+        RecoveryExecutionState::Planned,
+        "the outer workflow must remain before its verified transition"
+    );
+}
+
+#[test]
+fn database_promotion_resume_syncs_the_promoted_parent_before_installing() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let first_id = replica_id("rename-sync-source");
+    let second_id = replica_id("rename-sync-target");
+    let third_id = replica_id("rename-sync-third");
+    let ids = [first_id.clone(), second_id.clone(), third_id.clone()];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), first_id.clone(), 13),
+        create_legacy_replica(temp.path(), second_id.clone(), 31),
+        create_legacy_replica(temp.path(), third_id.clone(), 47),
+    ];
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &first_id,
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("legacy plan");
+    let database_temporary = database_promotion_temporary_path_for_test(&replicas[0], &plan)
+        .expect("derive exact database promotion temporary");
+
+    // This is intentionally earlier than AfterDatabaseInstall: it leaves the
+    // authenticated temporary identity in the workflow while the promoted
+    // target name exists but its parent has not been fsynced by this process.
+    fail_next_promotion_after_rename();
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &replicas.iter().collect::<Vec<_>>(),
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: None,
+        }),
+        Err(RecoveryError::InjectedFailure),
+        "test seam stopped between rename and parent-directory fsync"
+    );
+    assert!(
+        database_temporary.exists(),
+        "the pre-sync exchange retains its exact displaced database inode"
+    );
+
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &replicas.iter().collect::<Vec<_>>(),
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: None,
+        })
+        .expect("resume renamed target after syncing its parent"),
+        RecoveryExecutionState::AwaitingEpochCommit,
+        "resume must not treat a merely renamed target as installed until its parent is synced"
+    );
+    assert!(
+        !database_temporary.exists(),
+        "the completed database promotion must remove its exact displaced inode"
+    );
+    assert!(
+        promotion_cleanup_journals_are_empty_for_test(
+            &manager.integrity_key,
+            &plan,
+            backup.path(),
+        )
+        .expect("read resumed promotion workflow"),
+        "only a durable cleanup may clear the database promotion journal"
+    );
+}
+
+#[test]
+fn database_promotion_resume_rejects_a_same_byte_displaced_inode() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let first_id = replica_id("disposition-source");
+    let second_id = replica_id("disposition-target");
+    let third_id = replica_id("disposition-third");
+    let ids = [first_id.clone(), second_id.clone(), third_id.clone()];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), first_id.clone(), 13),
+        create_legacy_replica(temp.path(), second_id.clone(), 31),
+        create_legacy_replica(temp.path(), third_id.clone(), 47),
+    ];
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            node_set(&ids),
+            &replicas,
+            &first_id,
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("legacy plan");
+
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &replicas.iter().collect::<Vec<_>>(),
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: Some(RecoveryFailpoint::AfterDatabaseTemporaryPrepared),
+        }),
+        Err(RecoveryError::InjectedFailure),
+        "the prepared temporary and its destination disposition are journaled before exchange"
+    );
+    let replacement = temp.path().join("same-byte-database-replacement.sqlite");
+    std::fs::copy(&replicas[0].database_path, &replacement)
+        .expect("copy exact displaced database bytes");
+    std::fs::rename(&replacement, &replicas[0].database_path)
+        .expect("replace the journaled public database inode");
+
+    assert_eq!(
+        backup_and_reset_replica(ResetInput {
+            key: &manager.integrity_key,
+            plan: &plan,
+            source: &replicas[0],
+            replicas: &replicas,
+            targets: &replicas.iter().collect::<Vec<_>>(),
+            backup_root: backup.path(),
+            limits: RecoveryLimits::default(),
+            failpoint: None,
+        }),
+        Err(RecoveryError::BackupCorrupt),
+        "resume must reject a same-byte replacement instead of promoting over it"
+    );
+    assert_ne!(
+        resume_execution_state(&manager.integrity_key, &plan, backup.path())
+            .expect("read halted workflow"),
+        RecoveryExecutionState::AwaitingEpochCommit,
+        "the rejected retry must not advance the recovery workflow"
+    );
 }
 
 #[cfg(unix)]
@@ -3537,6 +6554,7 @@ async fn legacy_log_tail_is_quarantined_cleared_and_old_cursors_fail_closed() {
     assert_eq!(quarantined_rows, 1);
 }
 
+#[cfg(feature = "test-control")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign() {
     let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
@@ -3752,13 +6770,12 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
     {
         result.expect("initialize recovered campaign membership");
     }
-
     // Campaign finalization and readiness share one bounded window that admits
     // a split-vote resampling plus a complete profiled operation.
     let deadline = Instant::now() + RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT;
-    let report = loop {
+    let (finalized_index, report) = loop {
         let mut completed = None;
-        for store in &stores {
+        for (index, store) in stores.iter().enumerate() {
             match manager
                 .finalize(
                     &context(),
@@ -3771,7 +6788,7 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
                 .await
             {
                 Ok(report) => {
-                    completed = Some(report);
+                    completed = Some((index, report));
                     break;
                 }
                 Err(RecoveryError::ConsensusUnavailable) => {}
@@ -3789,6 +6806,415 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
     };
     assert_eq!(report.state(), RecoveryExecutionState::Rejoined);
 
+    // The one manager that returned has consumed only its own terminal
+    // handoff.  Observe the remaining sidecars directly through their exact
+    // database descriptors: do not call B/C readiness, because that public
+    // boundary would itself consume the pending handoff we need to prove.
+    let expected_latch = consensus::OperatorRecoveryLatch {
+        identity: campaign_identity,
+        recovery_epoch: plan.next_recovery_epoch(),
+        plan_digest: plan.plan_digest().as_bytes(),
+        audit_pending: false,
+    };
+    let latch_phase = |index: usize| {
+        let database = File::open(&replicas[index].database_path)
+            .expect("open campaign database descriptor for latch phase");
+        consensus::operator_recovery_latch_phase_sync(
+            &replicas[index].database_path,
+            expected_latch,
+            &database,
+            None,
+        )
+        .expect("classify descriptor-bound campaign latch")
+    };
+    for index in 0..replicas.len() {
+        assert_eq!(
+            latch_phase(index),
+            if index == finalized_index {
+                consensus::OperatorRecoveryLatchPhase::Consumed
+            } else {
+                consensus::OperatorRecoveryLatchPhase::PendingHandoff
+            },
+            "only the manager which returned may consume its handoff"
+        );
+    }
+    let finalized_conn =
+        Connection::open(&replicas[finalized_index].database_path).expect("open finalized voter");
+    let finalize_log_id =
+        consensus::read_operator_recovery_sync(&finalized_conn, campaign_identity)
+            .expect("read finalized campaign recovery state")
+            .finalize_log_id
+            .expect("read exact finalized campaign log ID");
+    drop(finalized_conn);
+
+    // A consumed live voter may now admit a real application operation.  Its
+    // pending peers must replicate and apply that ordinary command while
+    // remaining readiness-closed; the fleet classifier must therefore use
+    // the one historical proof regime only after this consumption boundary.
+    let post_recovery = EncryptingSessionBackend::new(
+        Arc::new(stores[finalized_index].clone()),
+        provider.clone(),
+        "legacy-recovery-campaign",
+    );
+    let post_recovery_key = SessionKey {
+        tenant: TenantId::from_static("tenant-a"),
+        nf_kind: NetworkFunctionKind::from_static("smf"),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from_static(b"legacy-post-recovery-canary")
+            .try_into()
+            .expect("valid post-recovery stable ID"),
+    };
+    let post_recovery_lease = post_recovery
+        .acquire(
+            &post_recovery_key,
+            OwnerId::new("legacy-post-recovery-owner").expect("post-recovery owner"),
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("acquire fresh post-recovery lease through consumed voter");
+    assert_eq!(
+        post_recovery
+            .compare_and_set(CompareAndSet {
+                key: post_recovery_key.clone(),
+                lease: post_recovery_lease.clone(),
+                expected_generation: None,
+                new_record: StoredSessionRecord {
+                    key: post_recovery_key.clone(),
+                    generation: Generation::new(1),
+                    owner: post_recovery_lease.owner().clone(),
+                    fence: post_recovery_lease.fence(),
+                    state_class: StateClass::AuthoritativeSession,
+                    state_type: StateType::new("legacy-post-recovery-context")
+                        .expect("post-recovery state type"),
+                    expires_at: None,
+                    payload: EncryptedSessionPayload::new(Bytes::from_static(
+                        b"legacy-post-recovery-plaintext-canary",
+                    )),
+                },
+            })
+            .await
+            .expect("commit post-recovery normal canary"),
+        CompareAndSetResult::Success
+    );
+    let source_canary = crate::sqlite::ops::get_raw_sync(
+        &Connection::open(&replicas[finalized_index].database_path)
+            .expect("open consumed voter durable canary"),
+        &post_recovery_key,
+    )
+    .expect("read consumed voter durable canary")
+    .expect("post-recovery canary on consumed voter");
+    assert_eq!(
+        post_recovery
+            .get(&post_recovery_key)
+            .await
+            .expect("decrypt consumed-voter post-recovery canary")
+            .expect("decrypted consumed-voter post-recovery canary")
+            .payload
+            .as_bytes(),
+        b"legacy-post-recovery-plaintext-canary"
+    );
+    let recovery_application_sequence = plan
+        .application_sequence_high_water()
+        .checked_add(1)
+        .expect("recovery application sequence");
+    for (index, replica) in replicas.iter().enumerate() {
+        if index == finalized_index {
+            continue;
+        }
+        loop {
+            let conn =
+                Connection::open(&replica.database_path).expect("open pending voter durable state");
+            let applied = consensus::read_applied_sync(&conn, campaign_identity)
+                .expect("read pending voter applied log");
+            let application_sequence: i64 = conn
+                .query_row(
+                    "SELECT application_sequence FROM consensus_machine WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read pending voter application sequence");
+            drop(conn);
+            let direct = crate::sqlite::ops::get_raw_sync(
+                &Connection::open(&replica.database_path)
+                    .expect("open pending voter raw durable canary"),
+                &post_recovery_key,
+            )
+            .expect("read pending voter durable canary directly");
+            if applied.is_some_and(|applied| applied.index > finalize_log_id.index)
+                && u64::try_from(application_sequence).ok() > Some(recovery_application_sequence)
+                && direct
+                    .as_ref()
+                    .is_some_and(|record| record == &source_canary)
+                && latch_phase(index) == consensus::OperatorRecoveryLatchPhase::PendingHandoff
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pending voter did not durably apply the post-recovery canary"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    // Capture the deterministic recovery certificate and outcome after every
+    // voter has applied the canary. Sequential B/C finalization retries must
+    // only consume their local handoffs, never issue another V2 proposal.
+    let recovery_request_id: [u8; 16] = plan.plan_digest().as_bytes()[..16]
+        .try_into()
+        .expect("recovery plan digest contains deterministic request ID");
+    let v2_evidence = replicas
+        .iter()
+        .map(|replica| {
+            let conn = Connection::open(&replica.database_path)
+                .expect("open voter for deterministic V2 evidence");
+            let certificate: (Vec<u8>, Vec<u8>) = conn
+                .query_row(
+                    "SELECT finalize_log_id_json, finalize_entry_json FROM consensus_operator_recovery WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read exact V2 certificate");
+            let outcome: (Vec<u8>, Vec<u8>) = conn
+                .query_row(
+                    "SELECT payload_digest, response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+                    [recovery_request_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read exact deterministic V2 outcome");
+            let outcome_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM consensus_request_outcomes WHERE request_id = ?1",
+                    [recovery_request_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("count deterministic V2 outcomes");
+            assert_eq!(outcome_count, 1, "exactly one V2 outcome per voter");
+            (certificate, outcome)
+        })
+        .collect::<Vec<_>>();
+
+    // Drive the production OpenRaft snapshot and purge paths on the one
+    // already-consumed voter while B/C remain PendingHandoff.  The exact V2
+    // certificate and request outcome must survive after the recovery marker
+    // itself is no longer physically retained, because B/C still need the
+    // fleet-level historical proof to consume their handoffs without a second
+    // V2 proposal.
+    crate::consensus::store::test_support::trigger_consensus_snapshot_for_test(
+        &stores[finalized_index],
+    )
+    .await
+    .expect("capture actual post-recovery OpenRaft snapshot");
+    let snapshot_deadline = Instant::now() + RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT;
+    loop {
+        match crate::consensus::store::test_support::trigger_consensus_log_purge_through_for_test(
+            &stores[finalized_index],
+            finalize_log_id.index,
+        )
+        .await
+        {
+            Ok(()) => break,
+            // `snapshot()` completes after scheduling the engine snapshot;
+            // wait only for that already-requested snapshot to reach local
+            // metrics before asking the engine to purge through it.
+            Err(error) if error == "test consensus purge is not covered by a local snapshot" => {
+                assert!(
+                    Instant::now() < snapshot_deadline,
+                    "actual post-recovery OpenRaft snapshot did not cover recovery finalization: {:?}",
+                    crate::consensus::store::test_support::consensus_local_durable_progress_for_test(
+                        &stores[finalized_index]
+                    )
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => panic!("trigger actual post-recovery OpenRaft purge: {error}"),
+        }
+    }
+    crate::consensus::store::test_support::wait_for_consensus_log_purge_beyond_for_test(
+        &stores[finalized_index],
+        finalize_log_id.index.saturating_sub(1),
+    )
+    .await
+    .expect("purge actual post-recovery OpenRaft log beyond recovery finalization");
+    let snapshot_purged_conn = Connection::open(&replicas[finalized_index].database_path)
+        .expect("open consumed voter after snapshot and purge");
+    let snapshot = consensus::read_current_snapshot_sync(&snapshot_purged_conn, campaign_identity)
+        .expect("read actual persisted snapshot metadata")
+        .expect("actual post-recovery snapshot metadata");
+    let snapshot_log_id = snapshot.0.last_log_id.expect("actual snapshot cut log ID");
+    assert!(
+        super::sqlite::full_log_id_not_after(&finalize_log_id, &snapshot_log_id),
+        "actual snapshot cut must be a full-LogId descendant of the recovery finalization"
+    );
+    let purged_log_id = consensus::read_purged_sync(&snapshot_purged_conn, campaign_identity)
+        .expect("read actual persisted purge floor")
+        .expect("actual post-recovery purge floor");
+    assert!(
+        super::sqlite::full_log_id_not_after(&finalize_log_id, &purged_log_id),
+        "actual purge must be a full-LogId descendant of the recovery finalization"
+    );
+    let marker_count: i64 = snapshot_purged_conn
+        .query_row(
+            "SELECT COUNT(*) FROM consensus_log WHERE log_index = ?1",
+            [i64::try_from(finalize_log_id.index).expect("finalize log index fits SQLite")],
+            |row| row.get(0),
+        )
+        .expect("count physically retained recovery marker");
+    assert_eq!(
+        marker_count, 0,
+        "actual purge must remove the historical recovery marker row"
+    );
+    let snapshot_certificate: (Vec<u8>, Vec<u8>) = snapshot_purged_conn
+        .query_row(
+            "SELECT finalize_log_id_json, finalize_entry_json FROM consensus_operator_recovery WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read V2 certificate after marker purge");
+    let snapshot_outcome: (Vec<u8>, Vec<u8>) = snapshot_purged_conn
+        .query_row(
+            "SELECT payload_digest, response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+        [recovery_request_id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read V2 outcome after marker purge");
+    let snapshot_outcome_count: i64 = snapshot_purged_conn
+        .query_row(
+            "SELECT COUNT(*) FROM consensus_request_outcomes WHERE request_id = ?1",
+            [recovery_request_id.as_slice()],
+            |row| row.get(0),
+        )
+        .expect("count V2 outcomes after marker purge");
+    assert_eq!(
+        (snapshot_certificate, snapshot_outcome),
+        v2_evidence[finalized_index],
+        "snapshot and purge must preserve the exact V2 certificate and outcome"
+    );
+    assert_eq!(
+        snapshot_outcome_count, 1,
+        "snapshot and purge must preserve exactly one V2 outcome"
+    );
+    drop(snapshot_purged_conn);
+
+    // A duplicated request ID could be absorbed by `consensus_request_outcomes`
+    // after a new log proposal has already been appended. Record the exact
+    // retained V2 rows on B/C, not only the singleton outcome, before and
+    // after each sequential handoff retry.
+    let retained_v2_log_entries = |replica: &RecoveryReplica| {
+        let conn = Connection::open(&replica.database_path)
+            .expect("open pending voter for exact retained V2 log evidence");
+        let mut statement = conn
+            .prepare("SELECT log_index, entry_json FROM consensus_log ORDER BY log_index ASC")
+            .expect("prepare retained consensus log scan");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .expect("scan retained consensus log rows");
+        let mut exact_v2 = Vec::new();
+        for row in rows {
+            let (index, encoded) = row.expect("decode retained consensus log row");
+            let entry: Entry<SessionRaftTypeConfig> =
+                serde_json::from_slice(&encoded).expect("decode retained consensus log entry");
+            if matches!(
+                entry.payload,
+                EntryPayload::Normal(SessionConsensusCommand {
+                    intent: SessionMutationIntent::FinalizeOperatorRecoveryV2(_),
+                    ..
+                })
+            ) {
+                exact_v2.push((index, encoded));
+            }
+        }
+        exact_v2
+    };
+    let request_outcome_count = |replica: &RecoveryReplica| {
+        let conn = Connection::open(&replica.database_path)
+            .expect("open pending voter for V2 outcome count");
+        conn.query_row(
+            "SELECT COUNT(*) FROM consensus_request_outcomes WHERE request_id = ?1",
+            [recovery_request_id.as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count deterministic V2 outcomes on pending voter")
+    };
+    let retained_v2_before_retries = replicas
+        .iter()
+        .map(retained_v2_log_entries)
+        .collect::<Vec<_>>();
+
+    for (index, store) in stores.iter().enumerate().take(replicas.len()) {
+        if index == finalized_index {
+            continue;
+        }
+        let exact_v2_before_retry = retained_v2_log_entries(&replicas[index]);
+        let outcome_count_before_retry = request_outcome_count(&replicas[index]);
+        assert_eq!(
+            exact_v2_before_retry, retained_v2_before_retries[index],
+            "B/C retained V2 evidence changed before its sequential retry"
+        );
+        assert_eq!(
+            outcome_count_before_retry, 1,
+            "B/C begins each sequential retry with exactly one V2 outcome"
+        );
+        assert_eq!(
+            manager
+                .finalize(
+                    &context(),
+                    store,
+                    &plan,
+                    &confirmation,
+                    &replicas,
+                    backup.path(),
+                )
+                .await
+                .expect("sequential pending-voter finalization retry")
+                .state(),
+            RecoveryExecutionState::Rejoined
+        );
+        assert_eq!(
+            latch_phase(index),
+            consensus::OperatorRecoveryLatchPhase::Consumed,
+            "sequential retry must consume only its own handoff"
+        );
+        assert_eq!(
+            retained_v2_log_entries(&replicas[index]),
+            exact_v2_before_retry,
+            "sequential retry must not append a second exact V2 log proposal"
+        );
+        assert_eq!(
+            request_outcome_count(&replicas[index]),
+            outcome_count_before_retry,
+            "request-ID dedup must not mask a second V2 proposal on sequential retry"
+        );
+    }
+    let v2_evidence_after = replicas
+        .iter()
+        .map(|replica| {
+            let conn = Connection::open(&replica.database_path)
+                .expect("open voter after sequential terminal retries");
+            let certificate: (Vec<u8>, Vec<u8>) = conn
+                .query_row(
+                    "SELECT finalize_log_id_json, finalize_entry_json FROM consensus_operator_recovery WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("re-read exact V2 certificate");
+            let outcome: (Vec<u8>, Vec<u8>) = conn
+                .query_row(
+                    "SELECT payload_digest, response_json FROM consensus_request_outcomes WHERE request_id = ?1",
+                    [recovery_request_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("re-read exact deterministic V2 outcome");
+            (certificate, outcome)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        v2_evidence_after, v2_evidence,
+        "terminal retries must preserve the one deterministic V2 certificate and outcome"
+    );
+
     for store in &stores {
         let report = loop {
             let report = store.probe_durable_readiness().await;
@@ -3797,16 +7223,34 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
             }
             assert!(
                 Instant::now() < deadline,
-                "campaign member did not clear recovery readiness fence"
+                "campaign member did not clear recovery readiness fence: {report:?}"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
         assert!(report.is_ready());
     }
+    for (index, replica) in replicas.iter().enumerate() {
+        assert_eq!(
+            latch_phase(index),
+            consensus::OperatorRecoveryLatchPhase::Consumed,
+            "every terminal handoff must be consumed before readiness is open"
+        );
+        let direct = crate::sqlite::ops::get_raw_sync(
+            &Connection::open(&replica.database_path)
+                .expect("open consumed voter raw durable canary"),
+            &post_recovery_key,
+        )
+        .expect("read consumed voter durable canary directly")
+        .expect("post-recovery canary on every consumed voter");
+        assert_eq!(
+            direct, source_canary,
+            "every consumed voter must retain the exact replicated canary row"
+        );
+    }
 
     let recovered = EncryptingSessionBackend::new(
         Arc::new(stores[0].clone()),
-        provider,
+        provider.clone(),
         "legacy-recovery-campaign",
     );
     let recovered_record = recovered
@@ -3890,6 +7334,340 @@ async fn recovered_legacy_voter_set_forms_openraft_and_finalizes_as_one_campaign
         })
         .collect::<Vec<_>>();
     assert_eq!(retried_inodes, finalized_inodes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_proof_without_a_consumed_voter_keeps_pending_suffix_strict() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("strict-terminal-replica-a"),
+        replica_id("strict-terminal-replica-b"),
+        replica_id("strict-terminal-replica-c"),
+    ];
+    let mut replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 11),
+        create_legacy_replica(temp.path(), ids[1].clone(), 23),
+        create_legacy_replica(temp.path(), ids[2].clone(), 37),
+    ];
+    let descriptors = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            QuorumReplicaDescriptor::new(
+                id.clone(),
+                ReplicaEndpoint::new(format!("strict-terminal-{index}.invalid"), 7443)
+                    .expect("strict terminal endpoint"),
+                ReplicaTlsIdentity::new(format!("spiffe://test/session/strict-terminal-{index}"))
+                    .expect("strict terminal TLS identity"),
+                ReplicaFailureDomain::new(format!("strict-terminal-zone-{index}"))
+                    .expect("strict terminal failure domain"),
+                ReplicaBackingIdentity::new(format!("strict-terminal-disk-{index}"))
+                    .expect("strict terminal backing identity"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let cluster =
+        SessionConsensusClusterId::new("strict-terminal-recovery-campaign").expect("cluster");
+    let epoch = SessionConsensusConfigurationEpoch::new(1).expect("epoch");
+    let configuration = opc_consensus::derive_configuration_id(
+        cluster,
+        epoch,
+        &descriptors
+            .iter()
+            .map(QuorumReplicaDescriptor::configuration_fingerprint)
+            .collect::<Vec<_>>(),
+    );
+    let campaign_identity = SessionConsensusIdentity::new(cluster, configuration, epoch);
+    for replica in &mut replicas {
+        replica.admitted_identity = campaign_identity;
+    }
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            campaign_identity,
+            node_set_for(campaign_identity, &ids),
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("strict-terminal whole-fleet plan");
+    let confirmation = RecoveryConfirmation::legacy(
+        &plan,
+        RecoveryConfirmation::required_legacy_acknowledgement(),
+    );
+    manager
+        .execute(
+            &context(),
+            &plan,
+            &confirmation,
+            &replicas,
+            backup.path(),
+            RecoveryLimits::default(),
+        )
+        .expect("install strict-terminal campaign checkpoint");
+
+    let topologies = ids
+        .iter()
+        .map(|id| {
+            ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                id.clone(),
+                descriptors.clone(),
+                campaign_identity,
+            ))
+            .expect("strict-terminal topology")
+        })
+        .collect::<Vec<_>>();
+    let node_ids = topologies
+        .iter()
+        .map(|topology| {
+            topology
+                .local_consensus_node_id()
+                .expect("strict-terminal node ID")
+        })
+        .collect::<Vec<_>>();
+    let mut paths = BTreeMap::new();
+    for source in 0..ids.len() {
+        for (target, node_id) in node_ids.iter().copied().enumerate() {
+            if source != target {
+                paths.insert(
+                    (source, target),
+                    Arc::new(RecoveryLoopbackPeer::new(node_id)),
+                );
+            }
+        }
+    }
+    let backends = replicas
+        .iter()
+        .map(|replica| {
+            SqliteSessionBackend::open(&replica.database_path)
+                .expect("strict-terminal campaign backend")
+        })
+        .collect::<Vec<_>>();
+    let mut stores = Vec::new();
+    for index in 0..ids.len() {
+        let peers = (0..ids.len())
+            .filter(|target| *target != index)
+            .map(|target| {
+                let peer: Arc<dyn SessionConsensusPeer> = paths
+                    .get(&(index, target))
+                    .expect("strict-terminal peer path")
+                    .clone();
+                (node_ids[target], peer)
+            })
+            .collect::<BTreeMap<_, _>>();
+        stores.push(
+            ConsensusSessionStore::open_with_clock(
+                topologies[index].clone(),
+                backends[index].clone(),
+                replicas[index].snapshot_directory.clone(),
+                peers,
+                Arc::new(SystemClock),
+                Duration::from_millis(750),
+            )
+            .await
+            .expect("open strict-terminal campaign node"),
+        );
+    }
+    for ((_, target), path) in &paths {
+        path.install(stores[*target].rpc_handler()).await;
+    }
+    for result in
+        futures_util::future::join_all(stores.iter().map(ConsensusSessionStore::initialize_cluster))
+            .await
+    {
+        result.expect("initialize strict-terminal campaign membership");
+    }
+
+    let deadline = Instant::now() + RECOVERY_CAMPAIGN_TRANSITION_TIMEOUT;
+    loop {
+        let mut interrupted = false;
+        for store in &stores {
+            match manager
+                .finalize_with_failpoint(
+                    &context(),
+                    store,
+                    &plan,
+                    &confirmation,
+                    &replicas,
+                    backup.path(),
+                    RecoveryFinalizeFailpoint::AfterTerminalizingSidecars(1),
+                )
+                .await
+            {
+                Err(RecoveryError::InjectedFailure) => {
+                    interrupted = true;
+                    break;
+                }
+                Err(RecoveryError::ConsensusUnavailable) => {}
+                result => panic!("unexpected strict-terminal initial result: {result:?}"),
+            }
+        }
+        if interrupted {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "strict-terminal campaign did not reach the publication failpoint"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let expected_latch = consensus::OperatorRecoveryLatch {
+        identity: campaign_identity,
+        recovery_epoch: plan.next_recovery_epoch(),
+        plan_digest: plan.plan_digest().as_bytes(),
+        audit_pending: false,
+    };
+    let latch_phase = |index: usize| {
+        let database = File::open(&replicas[index].database_path)
+            .expect("open strict-terminal descriptor for latch phase");
+        consensus::operator_recovery_latch_phase_sync(
+            &replicas[index].database_path,
+            expected_latch,
+            &database,
+            None,
+        )
+        .expect("classify strict-terminal descriptor-bound latch")
+    };
+    assert_eq!(
+        latch_phase(0),
+        consensus::OperatorRecoveryLatchPhase::PendingHandoff
+    );
+    assert_eq!(
+        latch_phase(1),
+        consensus::OperatorRecoveryLatchPhase::Active
+    );
+    assert_eq!(
+        latch_phase(2),
+        consensus::OperatorRecoveryLatchPhase::Active
+    );
+    assert_eq!(
+        resume_execution_state(&manager.integrity_key, &plan, backup.path())
+            .expect("read strict-terminal workflow"),
+        RecoveryExecutionState::Rejoined,
+        "the common terminal proof is durably recorded before publication"
+    );
+
+    // With proof + Pending/Active and no suffix, retry reaches the same
+    // publication seam again. This proves that the zero-Consumed fleet is
+    // strict but resumable, rather than being rejected merely because proof
+    // publication was interrupted.
+    assert_eq!(
+        manager
+            .finalize_with_failpoint(
+                &context(),
+                &stores[0],
+                &plan,
+                &confirmation,
+                &replicas,
+                backup.path(),
+                RecoveryFinalizeFailpoint::AfterTerminalizingSidecars(1),
+            )
+            .await,
+        Err(RecoveryError::InjectedFailure)
+    );
+    assert_eq!(
+        latch_phase(0),
+        consensus::OperatorRecoveryLatchPhase::PendingHandoff
+    );
+    assert_eq!(
+        latch_phase(1),
+        consensus::OperatorRecoveryLatchPhase::Active
+    );
+    assert_eq!(
+        latch_phase(2),
+        consensus::OperatorRecoveryLatchPhase::Active
+    );
+
+    // PendingHandoff is the closed public-ingress state. Do not probe it
+    // through a public store API here: that API deliberately owns terminal
+    // handoff consumption. Instead, bypass that boundary only through the
+    // internal state-machine seam to model a syntactically valid later Normal
+    // that a crash/corruption could leave on the pending replica. The exact
+    // V2 recovery proof must reject this strict suffix on finalization retry.
+    let pending_conn = Connection::open(&replicas[0].database_path)
+        .expect("open pending voter for internal Normal injection");
+    let finalize_log_id = consensus::read_operator_recovery_sync(&pending_conn, campaign_identity)
+        .expect("read pending voter recovery state")
+        .finalize_log_id
+        .expect("read pending voter finalization LogId");
+    let injected = Entry::<SessionRaftTypeConfig> {
+        log_id: LogId::new(
+            finalize_log_id.leader_id,
+            finalize_log_id.index.saturating_add(1),
+        ),
+        payload: EntryPayload::Normal(SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: campaign_identity,
+            request_id: SessionConsensusRequestId::from_bytes([0xC1; 16]),
+            logical_time: Timestamp::now_utc(),
+            intent: SessionMutationIntent::AdvanceLogicalTime,
+        }),
+    };
+    consensus::append_logs_sync(
+        &pending_conn,
+        campaign_identity,
+        std::slice::from_ref(&injected),
+    )
+    .expect("append syntactically valid pending-voter Normal");
+    consensus::apply_entries_sync(
+        &pending_conn,
+        campaign_identity,
+        &BackendCapabilities::all_enabled(),
+        vec![injected],
+    )
+    .expect("apply syntactically valid pending-voter Normal through internal seam");
+    drop(pending_conn);
+
+    assert_eq!(
+        manager
+            .finalize(
+                &context(),
+                &stores[0],
+                &plan,
+                &confirmation,
+                &replicas,
+                backup.path(),
+            )
+            .await,
+        Err(RecoveryError::BackupCorrupt)
+    );
+    assert_eq!(
+        latch_phase(0),
+        consensus::OperatorRecoveryLatchPhase::PendingHandoff,
+        "corrupt strict retry must not release the pending voter"
+    );
+    assert_eq!(
+        latch_phase(1),
+        consensus::OperatorRecoveryLatchPhase::Active,
+        "corrupt strict retry must not release the active voter"
+    );
+    assert_eq!(
+        latch_phase(2),
+        consensus::OperatorRecoveryLatchPhase::Active,
+        "corrupt strict retry must not release any active voter"
+    );
+    let recovery_request_id = plan.plan_digest().as_bytes()[..16].to_vec();
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path)
+            .expect("open strict-terminal voter after rejected retry");
+        let outcome_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_request_outcomes WHERE request_id = ?1",
+                [recovery_request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("count strict-terminal V2 outcomes");
+        assert_eq!(
+            outcome_count, 1,
+            "corrupt retry must not propose a second deterministic V2 command"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4008,24 +7786,49 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
     let database = temp.path().join("finalize.sqlite");
     let snapshots = temp.path().join("snapshots");
     let (topology, store_identity, node) = singleton_topology();
+    let recovery_replica = RecoveryReplica::from_topology(
+        &topology,
+        replica_id("recovery-finalize-singleton"),
+        database.clone(),
+        snapshots.clone(),
+    )
+    .expect("bind singleton recovery replica");
     let backend = SqliteSessionBackend::open(&database).expect("SQLite backend");
-    let store = ConsensusSessionStore::open(topology, backend, &snapshots, BTreeMap::new())
+    let store = ConsensusSessionStore::open(topology.clone(), backend, &snapshots, BTreeMap::new())
         .await
         .expect("open singleton store");
     store
         .initialize_cluster()
         .await
         .expect("initialize singleton cluster");
+    let snapshot_last_log = {
+        let conn = Connection::open(&database).expect("open initialized singleton database");
+        consensus::read_applied_sync(&conn, store_identity)
+            .expect("read initialized applied LogId")
+            .expect("initialized singleton has an applied membership LogId")
+    };
+    let snapshot_name = "snapshot-00000000-0000-4000-8000-00000000f1a1.opc";
+    let snapshot_bytes = install_dynamic_current_snapshot_fixture_for_identity(
+        &recovery_replica,
+        store_identity,
+        snapshot_last_log,
+        snapshot_name,
+        "recovery-finalize-terminal-snapshot",
+        b"recovery finalization terminal snapshot envelope",
+    );
     let manager = recovery(AllowRecovery);
-    let wrong_plan = sealed_test_plan(&manager, identity(), node);
+    let expected_members = BTreeSet::from([node]);
+    let source_evidence = inspect_replica(InspectionInput {
+        key: &manager.integrity_key,
+        replica: &recovery_replica,
+        identity: store_identity,
+        expected_members: &expected_members,
+        limits: RecoveryLimits::default(),
+    })
+    .expect("inspect singleton recovery replica");
+    let replicas = std::slice::from_ref(&recovery_replica);
+    let wrong_plan = sealed_test_plan(&manager, identity(), node, source_evidence.clone());
     let wrong_confirmation = RecoveryConfirmation::verified(&wrong_plan);
-    prepare_test_workflow(
-        &manager.integrity_key,
-        &wrong_plan,
-        backup.path(),
-        RecoveryExecutionState::AwaitingEpochCommit,
-    )
-    .expect("prepare wrong-cluster workflow");
     assert_eq!(
         manager
             .finalize(
@@ -4033,21 +7836,35 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
                 &store,
                 &wrong_plan,
                 &wrong_confirmation,
-                &[],
+                replicas,
                 backup.path(),
             )
             .await,
         Err(RecoveryError::WrongCluster)
     );
-    let plan = sealed_test_plan(&manager, store_identity, node);
+    let plan = sealed_test_plan(&manager, store_identity, node, source_evidence);
     let confirmation = RecoveryConfirmation::verified(&plan);
-    prepare_test_workflow(
+    // A unit fixture cannot elect a live Openraft leader after an offline
+    // replacement, so make the exact pending intent and descriptor-bound
+    // workflow durable directly.  The finalization path still pins, checks,
+    // commits, revalidates and terminalizes this real database.
+    let pending = Connection::open(&database).expect("open pending recovery database");
+    consensus::mark_operator_recovery_pending_sync(
+        &pending,
+        store_identity,
+        plan.next_recovery_epoch(),
+        plan.plan_digest().as_bytes(),
+    )
+    .expect("persist pending recovery intent");
+    drop(pending);
+    prepare_test_workflow_with_current_snapshot(
         &manager.integrity_key,
         &plan,
         backup.path(),
         RecoveryExecutionState::AwaitingEpochCommit,
+        &recovery_replica,
     )
-    .expect("prepare awaiting workflow");
+    .expect("prepare descriptor-bound awaiting workflow");
 
     assert_eq!(
         manager
@@ -4056,7 +7873,7 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
                 &store,
                 &plan,
                 &confirmation,
-                &[],
+                replicas,
                 backup.path(),
                 RecoveryFinalizeFailpoint::BeforeEpochCommit,
             )
@@ -4082,7 +7899,7 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
                 &store,
                 &plan,
                 &confirmation,
-                &[],
+                replicas,
                 backup.path(),
                 RecoveryFinalizeFailpoint::AfterEpochCommit,
             )
@@ -4110,7 +7927,7 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
                 &store,
                 &plan,
                 &confirmation,
-                &[],
+                replicas,
                 backup.path(),
                 RecoveryFinalizeFailpoint::BeforeRejoinBarrier,
             )
@@ -4130,7 +7947,7 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
                 &store,
                 &plan,
                 &confirmation,
-                &[],
+                replicas,
                 backup.path(),
                 RecoveryFinalizeFailpoint::AfterRejoinBarrier,
             )
@@ -4144,7 +7961,14 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
     );
 
     let completed = manager
-        .finalize(&context(), &store, &plan, &confirmation, &[], backup.path())
+        .finalize(
+            &context(),
+            &store,
+            &plan,
+            &confirmation,
+            replicas,
+            backup.path(),
+        )
         .await
         .expect("resume finalization to rejoin");
     assert_eq!(completed.state(), RecoveryExecutionState::Rejoined);
@@ -4152,5 +7976,54 @@ async fn finalization_failpoints_resume_before_after_epoch_and_rejoin() {
         resume_execution_state(&manager.integrity_key, &plan, backup.path())
             .expect("read completed workflow"),
         RecoveryExecutionState::Rejoined
+    );
+    drop(store);
+
+    // Successful local finalization has already consumed its durable terminal
+    // sidecar. The consumed tombstone intentionally has no snapshot locator:
+    // normal snapshot publication (and even a temporary selected-file change)
+    // cannot turn an idempotent local recovery retry back into Pending.
+    let snapshot_path = snapshots.join(snapshot_name);
+    std::fs::write(&snapshot_path, b"tampered terminal snapshot")
+        .expect("tamper selected terminal snapshot");
+    assert!(
+        SqliteSessionBackend::open(&database).is_ok(),
+        "a consumed terminal must not retain a mutable snapshot locator"
+    );
+    std::fs::write(&snapshot_path, &snapshot_bytes).expect("restore exact terminal snapshot");
+
+    // This is the production backend/core restart boundary after local
+    // consumption. It remains open without fabricating a second pending
+    // handoff; snapshot envelope handoff validation is exercised by the
+    // dedicated pending-terminal storage tests.
+    let reopened = SqliteSessionBackend::open(&database)
+        .expect("backend classifies the restored consumed terminal");
+    let core = consensus::SqliteConsensusCore::initialize(
+        &reopened,
+        snapshots.clone(),
+        store_identity,
+        expected_members,
+        topology_member_bindings(&topology),
+        ConsensusAuthorityProfile::Dynamic,
+        None,
+    )
+    .await
+    .expect("initialize core after consumed terminal");
+    assert!(
+        !core.terminal_recovery_handoff_pending_for_test(),
+        "a consumed terminal must not recreate a pending handoff"
+    );
+    drop(core);
+    drop(reopened);
+
+    // The terminal sidecar is bound to the descriptor finalization held.  A
+    // same-byte pathname replacement after the terminal transition must not
+    // inherit the removed-ready state on a later process restart.
+    let replacement = temp.path().join("finalize-replacement.sqlite");
+    std::fs::copy(&database, &replacement).expect("copy byte-identical replacement database");
+    std::fs::rename(&replacement, &database).expect("swap database after terminal latch write");
+    assert!(
+        SqliteSessionBackend::open(&database).is_err(),
+        "terminal latch must fail closed when its database pathname is substituted"
     );
 }

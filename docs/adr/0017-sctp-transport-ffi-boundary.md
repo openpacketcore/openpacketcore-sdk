@@ -104,8 +104,12 @@ an SCTP-terminating CNF is in scope:
    documented by an adjacent `SAFETY:` comment. The CI job runs this gate, so the
    exception cannot silently spread or become undocumented.
 4. **ABI safety.** Every C struct crossing the boundary has a struct-layout
-   (size/alignment/offset) test; the sys crate builds on Linux in CI and
-   compiles to a clean "unsupported platform" stub elsewhere.
+   (size/alignment/offset) test. Kernel-UAPI sys crates build on their admitted
+   targets in CI and fail explicitly elsewhere. In particular,
+   `opc-fs-verity-sys` exposes its descriptor API only on Unix: Linux provides
+   the reviewed ioctl implementation, non-Linux Unix targets compile an
+   explicit unsupported result, and non-Unix targets are outside this crate's
+   admitted platform surface.
 5. **This exception pattern does not reopen ADR 0013.** It authorizes FFI only
    to explicitly reviewed **trusted Linux kernel UAPI** boundaries such as SCTP
    socket/XFRM netlink calls and minimal helper calls that wrap those UAPIs. FFI

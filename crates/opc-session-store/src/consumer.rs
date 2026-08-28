@@ -7,30 +7,43 @@
 //! the typed request to a quorum-side implementation of
 //! [`SessionQuorumConsumer`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
+use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use crate::backend::ProtectedRosterEstablishedSuccessor;
 use crate::consensus::types::{
     validate_fenced_transition_v2_batch, MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_REQUEST_BYTES,
     MAX_SESSION_FENCED_TRANSITION_V2_BATCH_RESPONSE_BYTES,
 };
+use crate::fenced_mutation_roster::RosterAttestationTrustRootIdentityV1;
 use crate::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
-    FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
+    FenceToken, FencedTransitionObservation, FencedTransitionOutcome, FencedTransitionRequest,
     FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2Capability,
     FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2RequestId,
-    FencedTransitionV2Status, LeaseError, LeaseGuard, OwnerId, RecordExpiryPreflight,
-    RestoreScanPage, RestoreScanRequest, SessionConsensusIdentity, SessionConsensusRequestId,
-    SessionKey, SessionOp, SessionOpResult, StoreError, StoredSessionRecord,
-    FENCED_TRANSITION_REQUEST_ID_BYTES, FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
-    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    FencedTransitionV2Status, Generation, LeaseError, LeaseGuard, OwnerId, QuorumReplicaDescriptor,
+    RecordExpiryPreflight, RestoreScanPage, RestoreScanRequest, SessionConsensusIdentity,
+    SessionConsensusNodeId, SessionConsensusRequestId, SessionKey, SessionOp, SessionOpResult,
+    StoreError, StoredSessionRecord, Timestamp, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    FENCED_TRANSITION_V2_MAX_PAYLOAD_TOO_LARGE_ACTUAL_BYTES,
+    FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES, QUORUM_TOPOLOGY_MAX_MEMBERS,
 };
+
+#[cfg(test)]
+use crate::MAX_REPLICATION_OPERATIONS_PER_ENTRY;
 
 /// Maximum batch slots admitted by one consumer request.
 pub const MAX_SESSION_CONSUMER_BATCH_OPERATIONS: usize = 256;
@@ -66,6 +79,597 @@ pub const SESSION_CONSUMER_REQUEST_ID_BYTES: usize = 16;
 
 /// Maximum UTF-8 width of an authenticated consumer identity.
 pub const SESSION_CONSUMER_IDENTITY_MAX_BYTES: usize = 253;
+
+/// ALPN selected only by the protected fenced-mutation-roster consumer
+/// capability.
+///
+/// This is deliberately separate from the general consumer lane. A peer that
+/// did not opt into this ALPN cannot submit a roster capsule.
+pub const SESSION_CONSUMER_ROSTER_ALPN: &[u8] = b"opc-session-consumer/3";
+
+/// Wire revision required by [`SESSION_CONSUMER_ROSTER_ALPN`].
+pub const SESSION_CONSUMER_ROSTER_TRANSPORT_REVISION: u16 = 5;
+
+/// Largest byte-exact canonical admission capsule accepted by the consumer
+/// boundary. One admission remains one quorum mutation.
+pub const MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES: usize =
+    crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES;
+
+/// Largest byte-exact canonical terminal capsule accepted by the consumer
+/// boundary. This includes the committed-terminal receipt envelope.
+pub const MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES: usize =
+    crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES;
+
+/// Largest authenticated consumer JSON frame accepted for a complete
+/// protected-roster admission capsule and its consumer envelope.
+pub const MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES: usize =
+    MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES * 4 + 4 * 1024;
+
+/// Largest authenticated consumer JSON frame accepted for a complete
+/// protected-roster terminal capsule and its consumer envelope.
+pub const MAX_SESSION_CONSUMER_ROSTER_TERMINAL_FRAME_BYTES: usize =
+    MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES * 4 + 4 * 1024;
+
+/// Exact profile negotiated before a protected-roster consumer operation is
+/// admitted.
+///
+/// The roster profile is opaque at this boundary: consumers can compare it
+/// only as one fixed capability, never relax individual resource or semantic
+/// limits. Its frame fields apply only to the consumer envelope.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerRosterTransportProfile {
+    roster_profile: crate::fenced_mutation_roster::Profile,
+    admission_capsule_bytes: u32,
+    terminal_capsule_bytes: u32,
+    admission_frame_bytes: u32,
+    terminal_frame_bytes: u32,
+}
+
+impl SessionConsumerRosterTransportProfile {
+    /// Return the sole roster profile supported by this SDK build.
+    pub fn current() -> Self {
+        Self {
+            roster_profile: crate::fenced_mutation_roster::Profile::v1(),
+            admission_capsule_bytes: MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES as u32,
+            terminal_capsule_bytes: MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES as u32,
+            admission_frame_bytes: MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES as u32,
+            terminal_frame_bytes: MAX_SESSION_CONSUMER_ROSTER_TERMINAL_FRAME_BYTES as u32,
+        }
+    }
+
+    /// Return whether this is exactly the profile supported by this SDK build.
+    pub fn is_current(self) -> bool {
+        self == Self::current()
+    }
+
+    /// Return the exact frame budget required for a whole admission capsule.
+    pub const fn admission_frame_bytes(self) -> usize {
+        self.admission_frame_bytes as usize
+    }
+
+    /// Return the exact frame budget required for a whole terminal capsule.
+    pub const fn terminal_frame_bytes(self) -> usize {
+        self.terminal_frame_bytes as usize
+    }
+}
+
+impl fmt::Debug for SessionConsumerRosterTransportProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterTransportProfile(<redacted>)")
+    }
+}
+
+/// Redaction-safe invalid protected-roster capsule error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid protected roster capsule")]
+pub struct SessionConsumerRosterCapsuleError;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionConsumerRosterCapsuleWire {
+    bytes: Vec<u8>,
+}
+
+fn validate_session_consumer_roster_capsule(
+    bytes: &[u8],
+    maximum: usize,
+) -> Result<(), SessionConsumerRosterCapsuleError> {
+    if bytes.is_empty() || bytes.len() > maximum {
+        Err(SessionConsumerRosterCapsuleError)
+    } else {
+        Ok(())
+    }
+}
+
+/// Fixed-width canonical bytes of the durable protected-roster request
+/// identity.  Serde's built-in array implementation intentionally stops
+/// below this width, so preserve the bound with a tiny tuple codec instead of
+/// widening the identity to a caller-sized byte vector.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RosterCurrentAuthorityRequestIdBytes([u8; 56]);
+
+impl Serialize for RosterCurrentAuthorityRequestIdBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeTuple;
+
+        let mut tuple = serializer.serialize_tuple(self.0.len())?;
+        for byte in self.0 {
+            tuple.serialize_element(&byte)?;
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RosterCurrentAuthorityRequestIdBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BytesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BytesVisitor {
+            type Value = RosterCurrentAuthorityRequestIdBytes;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a fixed 56-byte roster request identity")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = [0; 56];
+                for byte in &mut bytes {
+                    *byte = sequence
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                }
+                if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(57, &self));
+                }
+                Ok(RosterCurrentAuthorityRequestIdBytes(bytes))
+            }
+        }
+
+        deserializer.deserialize_tuple(56, BytesVisitor)
+    }
+}
+
+/// Opaque canonical bytes for one protected-roster admission request or its
+/// admission/recovery response.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SessionConsumerRosterAdmissionCapsule {
+    bytes: Vec<u8>,
+}
+
+impl SessionConsumerRosterAdmissionCapsule {
+    /// Construct one bounded opaque admission capsule from canonical SDK bytes.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, SessionConsumerRosterCapsuleError> {
+        validate_session_consumer_roster_capsule(
+            &bytes,
+            MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES,
+        )?;
+        Ok(Self { bytes })
+    }
+
+    /// Return the bounded canonical byte length without exposing its contents.
+    pub const fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Return whether the canonical capsule is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Borrow the bounded opaque bytes for an SDK transport adapter.
+    #[doc(hidden)]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionConsumerRosterAdmissionCapsule {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = SessionConsumerRosterCapsuleWire::deserialize(deserializer)?;
+        Self::new(wire.bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Debug for SessionConsumerRosterAdmissionCapsule {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterAdmissionCapsule(<redacted>)")
+    }
+}
+
+/// Opaque canonical bytes for one protected-roster terminal request, terminal
+/// status, or terminal response.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SessionConsumerRosterTerminalCapsule {
+    bytes: Vec<u8>,
+}
+
+impl SessionConsumerRosterTerminalCapsule {
+    /// Construct one bounded opaque terminal capsule from canonical SDK bytes.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, SessionConsumerRosterCapsuleError> {
+        validate_session_consumer_roster_capsule(
+            &bytes,
+            MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES,
+        )?;
+        Ok(Self { bytes })
+    }
+
+    /// Return the bounded canonical byte length without exposing its contents.
+    pub const fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Return whether the canonical capsule is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Borrow the bounded opaque bytes for an SDK transport adapter.
+    #[doc(hidden)]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionConsumerRosterTerminalCapsule {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = SessionConsumerRosterCapsuleWire::deserialize(deserializer)?;
+        Self::new(wire.bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Debug for SessionConsumerRosterTerminalCapsule {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterTerminalCapsule(<redacted>)")
+    }
+}
+
+/// Authenticated, read-only current-publication-authority query carried only
+/// by the revision-five protected-roster consumer lane.
+///
+/// This is deliberately a query capsule rather than a caller-minted
+/// publication authority: the quorum resolves the retained admission and
+/// Established receipt, then compares every field with its own current
+/// authority under a linearizable read barrier.  Constructing this value
+/// therefore grants no authority and cannot make a publication eligible.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerRosterCurrentPublicationAuthorityCapsule {
+    scope: [u8; 32],
+    key: SessionKey,
+    roster_id: [u8; 16],
+    admission_commitment: [u8; 32],
+    terminal_body_commitment: [u8; 32],
+    receipt_commitment: [u8; 32],
+    logical_owner: OwnerId,
+    admission_fence: FenceToken,
+    registration_handle: [u8; 32],
+    registration_request_id: RosterCurrentAuthorityRequestIdBytes,
+    registration_terminal_slot: [u8; 32],
+    current_owner: OwnerId,
+    current_fence: FenceToken,
+    current_credential_id: u64,
+    current_generation: Generation,
+    current_lease_acquired_at: Timestamp,
+    current_lease_expires_at: Timestamp,
+}
+
+impl SessionConsumerRosterCurrentPublicationAuthorityCapsule {
+    /// Bind one complete, untrusted query to the identity claimed by the
+    /// publication adapter.  The dedicated quorum ingress validates it
+    /// against durable state before reporting success.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        scope: [u8; 32],
+        key: SessionKey,
+        roster_id: [u8; 16],
+        admission_commitment: [u8; 32],
+        terminal_body_commitment: [u8; 32],
+        receipt_commitment: [u8; 32],
+        logical_owner: OwnerId,
+        admission_fence: FenceToken,
+        registration_handle: [u8; 32],
+        registration_request_id: [u8; 56],
+        registration_terminal_slot: [u8; 32],
+        current_owner: OwnerId,
+        current_fence: FenceToken,
+        current_credential_id: u64,
+        current_generation: Generation,
+        current_lease_acquired_at: Timestamp,
+        current_lease_expires_at: Timestamp,
+    ) -> Result<Self, SessionConsumerRosterCapsuleError> {
+        let capsule = Self {
+            scope,
+            key,
+            roster_id,
+            admission_commitment,
+            terminal_body_commitment,
+            receipt_commitment,
+            logical_owner,
+            admission_fence,
+            registration_handle,
+            registration_request_id: RosterCurrentAuthorityRequestIdBytes(registration_request_id),
+            registration_terminal_slot,
+            current_owner,
+            current_fence,
+            current_credential_id,
+            current_generation,
+            current_lease_acquired_at,
+            current_lease_expires_at,
+        };
+        capsule.validate()?;
+        Ok(capsule)
+    }
+
+    fn validate(&self) -> Result<(), SessionConsumerRosterCapsuleError> {
+        (self.scope != [0; 32]
+            && self.roster_id != [0; 16]
+            && self.admission_commitment != [0; 32]
+            && self.terminal_body_commitment != [0; 32]
+            && self.receipt_commitment != [0; 32]
+            && self.admission_fence.get() != 0
+            && self.registration_handle != [0; 32]
+            && self.registration_request_id.0 != [0; 56]
+            && self.registration_terminal_slot != [0; 32]
+            && self.current_fence.get() != 0
+            && self.current_credential_id != 0
+            && self.current_generation.get() != 0
+            && self.current_lease_acquired_at < self.current_lease_expires_at)
+            .then_some(())
+            .ok_or(SessionConsumerRosterCapsuleError)
+    }
+
+    pub(crate) const fn scope(&self) -> [u8; 32] {
+        self.scope
+    }
+
+    pub(crate) fn key(&self) -> &SessionKey {
+        &self.key
+    }
+
+    pub(crate) const fn roster_id(&self) -> [u8; 16] {
+        self.roster_id
+    }
+
+    pub(crate) const fn admission_commitment(&self) -> [u8; 32] {
+        self.admission_commitment
+    }
+
+    pub(crate) const fn terminal_body_commitment(&self) -> [u8; 32] {
+        self.terminal_body_commitment
+    }
+
+    pub(crate) const fn receipt_commitment(&self) -> [u8; 32] {
+        self.receipt_commitment
+    }
+
+    pub(crate) fn logical_owner(&self) -> &OwnerId {
+        &self.logical_owner
+    }
+
+    pub(crate) const fn admission_fence(&self) -> FenceToken {
+        self.admission_fence
+    }
+
+    pub(crate) const fn registration_handle(&self) -> [u8; 32] {
+        self.registration_handle
+    }
+
+    pub(crate) const fn registration_request_id(&self) -> [u8; 56] {
+        self.registration_request_id.0
+    }
+
+    pub(crate) const fn registration_terminal_slot(&self) -> [u8; 32] {
+        self.registration_terminal_slot
+    }
+
+    pub(crate) fn current_owner(&self) -> &OwnerId {
+        &self.current_owner
+    }
+
+    pub(crate) const fn current_fence(&self) -> FenceToken {
+        self.current_fence
+    }
+
+    pub(crate) const fn current_credential_id(&self) -> u64 {
+        self.current_credential_id
+    }
+
+    pub(crate) const fn current_generation(&self) -> Generation {
+        self.current_generation
+    }
+
+    pub(crate) const fn current_lease_acquired_at(&self) -> Timestamp {
+        self.current_lease_acquired_at
+    }
+
+    pub(crate) const fn current_lease_expires_at(&self) -> Timestamp {
+        self.current_lease_expires_at
+    }
+}
+
+impl fmt::Debug for SessionConsumerRosterCurrentPublicationAuthorityCapsule {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterCurrentPublicationAuthorityCapsule(<redacted>)")
+    }
+}
+
+/// Closed, redaction-safe protected-roster consumer rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionConsumerRosterRejection {
+    /// The opaque capsule did not satisfy a fixed bound or canonical profile.
+    Malformed,
+    /// The authenticated caller or current durable authority was not eligible.
+    Authority,
+    /// The operation is only legal after recovering an ambiguous admission.
+    RecoveryRequired,
+    /// Admission found no exact protected business record.
+    RecordMissing,
+    /// Admission found a different protected business generation.
+    GenerationConflict,
+    /// Admission could not produce a checked successor generation.
+    GenerationExhausted,
+    /// A live admission already reserves the exact protected business key.
+    BusinessKeyReserved,
+    /// The proposed protected checkpoint cannot become the authoritative record.
+    InvalidProtectedCheckpoint,
+    /// Admission could not reserve its deterministic aggregate storage peak.
+    AggregateBytesFull,
+    /// Admission could not reserve a bounded live-roster slot.
+    LiveFull,
+    /// Admission could not reserve a bounded retained-history slot.
+    HistoryFull,
+    /// The exact stable roster identity is already bound to different canonical bytes.
+    Conflict,
+    /// A required roster profile/capability was absent or did not match exactly.
+    Capability,
+    /// The bounded quorum path could not dispatch the operation.
+    Unavailable,
+}
+
+/// Exact safe outcome of the sole admission mutation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerRosterAdmissionMutationResponse {
+    /// The exact admission result is available in an opaque bounded capsule.
+    Recorded(SessionConsumerRosterAdmissionCapsule),
+    /// No admission byte reached the quorum boundary.
+    NotTransmitted,
+    /// Admission may have committed; only admission status or recovery may follow.
+    OutcomeUnknown,
+    /// The request was rejected without exposing implementation details.
+    Rejected(SessionConsumerRosterRejection),
+}
+
+impl fmt::Debug for SessionConsumerRosterAdmissionMutationResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterAdmissionMutationResponse(<redacted>)")
+    }
+}
+
+/// Exact safe outcome of the sole terminal mutation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerRosterTerminalMutationResponse {
+    /// The exact terminal result is available in an opaque bounded capsule.
+    Recorded(SessionConsumerRosterTerminalCapsule),
+    /// No terminalization byte reached the quorum boundary.
+    NotTransmitted,
+    /// Terminalization may have committed; only terminal status may follow.
+    OutcomeUnknown,
+    /// The request was rejected without exposing implementation details.
+    Rejected(SessionConsumerRosterRejection),
+}
+
+impl fmt::Debug for SessionConsumerRosterTerminalMutationResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterTerminalMutationResponse(<redacted>)")
+    }
+}
+
+/// Bounded opaque result of a read-only admission or recovery operation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerRosterAdmissionReadResponse {
+    /// The exact read result is available in an opaque bounded capsule.
+    Recorded(SessionConsumerRosterAdmissionCapsule),
+    /// The request was rejected without exposing implementation details.
+    Rejected(SessionConsumerRosterRejection),
+}
+
+impl fmt::Debug for SessionConsumerRosterAdmissionReadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterAdmissionReadResponse(<redacted>)")
+    }
+}
+
+/// Bounded opaque result of a read-only terminal-status operation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerRosterTerminalReadResponse {
+    /// The exact read result is available in an opaque bounded capsule.
+    Recorded(SessionConsumerRosterTerminalCapsule),
+    /// The request was rejected without exposing implementation details.
+    Rejected(SessionConsumerRosterRejection),
+}
+
+impl fmt::Debug for SessionConsumerRosterTerminalReadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterTerminalReadResponse(<redacted>)")
+    }
+}
+
+/// Fixed redaction-safe result of a current-publication-authority read.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum SessionConsumerRosterCurrentPublicationAuthorityReadResponse {
+    /// The quorum linearized the read and found every exact field current.
+    Current,
+    /// The query did not match the current durable Established authority.
+    Rejected,
+}
+
+impl fmt::Debug for SessionConsumerRosterCurrentPublicationAuthorityReadResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .write_str("SessionConsumerRosterCurrentPublicationAuthorityReadResponse(<redacted>)")
+    }
+}
+
+/// Maximum distinct authenticated application consumers in one manifest.
+pub const MAX_SESSION_CONSUMER_AUTHORIZATION_IDENTITIES: usize = 256;
+/// Maximum tenant/NF grants retained for one authenticated consumer.
+pub const MAX_SESSION_CONSUMER_AUTHORIZATION_SCOPES_PER_IDENTITY: usize = 256;
+/// Maximum total identity-to-tenant/NF grant tuples in one manifest.
+pub const MAX_SESSION_CONSUMER_AUTHORIZATION_GRANT_TUPLES: usize = 4096;
+
+const SESSION_CONSUMER_ROSTER_IDENTITY_COMMITMENT_DOMAIN: &[u8] =
+    b"openpacketcore/session-consumer-roster/identity/v1\0";
+const SESSION_CONSUMER_ROSTER_COMMITMENT_DOMAIN: &[u8] =
+    b"openpacketcore/session-consumer-roster/commitment/v1\0";
+const SESSION_CONSUMER_TENANT_NF_COMMITMENT_DOMAIN: &[u8] =
+    b"openpacketcore/session-consumer-tenant-nf-scope/v1\0";
 
 /// Redaction-safe construction failure for [`SessionConsumerIdentity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -168,24 +772,173 @@ impl fmt::Debug for SessionConsumerScope {
     }
 }
 
-/// Store-issued, scope-bound manifest of currently admitted consensus-member
-/// identities. Its constructor is crate-private so a consumer listener cannot
-/// be configured with an invented or incomplete exclusion set.
-#[derive(Clone)]
-pub struct SessionConsumerAuthorizationManifest {
-    scope: SessionConsumerScope,
-    consensus_members: BTreeSet<SessionConsumerIdentity>,
+/// Fixed-width, domain-separated commitment to one admitted consumer roster.
+///
+/// The constructor remains internal to the store-issued authorization
+/// manifest. Its bytes are safe to retain or compare, but `Debug` deliberately
+/// omits them so topology material cannot enter diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionConsumerRosterCommitment([u8; 32]);
+
+impl SessionConsumerRosterCommitment {
+    /// Borrow the fixed-width commitment for equality checks or durable local
+    /// binding. This is a digest, never a raw topology value.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
-impl SessionConsumerAuthorizationManifest {
-    pub(crate) fn new(
+impl fmt::Debug for SessionConsumerRosterCommitment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterCommitment(<redacted>)")
+    }
+}
+
+/// One store-issued, node-keyed member of an admitted consumer roster.
+///
+/// The exact TLS/SPIFFE identity is retained solely so the existing consumer
+/// listener can exclude every voting identity. The paired roster commitment
+/// binds its domain-separated identity commitment to this non-zero node ID.
+/// There is intentionally no public constructor.
+#[derive(Clone)]
+pub struct SessionConsumerRosterMember {
+    node_id: SessionConsensusNodeId,
+    tls_identity: SessionConsumerIdentity,
+    identity_commitment: [u8; 32],
+}
+
+impl SessionConsumerRosterMember {
+    /// Canonical non-zero consensus node ID assigned to this member.
+    pub const fn node_id(&self) -> SessionConsensusNodeId {
+        self.node_id
+    }
+
+    /// Exact admitted TLS/SPIFFE identity for this consensus node.
+    ///
+    /// This is exposed only through a store-issued manifest so a consumer
+    /// listener can continue to reject quorum-member credentials.
+    pub fn tls_identity(&self) -> &str {
+        self.tls_identity.as_str()
+    }
+}
+
+impl fmt::Debug for SessionConsumerRosterMember {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterMember(<redacted>)")
+    }
+}
+
+/// Redaction-safe failure while converting exact topology descriptor bindings
+/// into a consumer roster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid session consumer roster")]
+pub enum SessionConsumerRosterError {
+    /// The topology has no consensus identity from which to bind a roster.
+    MissingConsensusIdentity,
+    /// The exact voter set was empty.
+    Empty,
+    /// The exact voter set exceeded the SDK's bounded maximum.
+    MemberCountTooLarge,
+    /// More than one descriptor named the same consensus node ID.
+    DuplicateNodeId,
+    /// More than one descriptor named the same TLS/SPIFFE identity.
+    DuplicateTlsIdentity,
+    /// A supplied or expected consensus node ID was invalid.
+    InvalidNodeId,
+    /// A supplied TLS/SPIFFE identity was invalid for the consumer boundary.
+    InvalidTlsIdentity,
+    /// Descriptors did not exactly cover the authoritative voter set.
+    ScopeMismatch,
+}
+
+/// Scope-bound canonical consensus-voter roster.
+///
+/// The public value can be obtained only from validated SDK topology or from a
+/// store-issued authorization manifest. Its private fields prevent product
+/// code from inventing a node mapping or roster commitment.
+#[derive(Clone)]
+pub struct SessionConsumerRoster {
+    scope: SessionConsumerScope,
+    consensus_members: BTreeMap<SessionConsensusNodeId, SessionConsumerRosterMember>,
+    roster_commitment: SessionConsumerRosterCommitment,
+    roster_attestation_root_identity: Option<RosterAttestationTrustRootIdentityV1>,
+}
+
+impl SessionConsumerRoster {
+    /// Construct one roster from the store's exact current voter IDs and
+    /// descriptors. `expected_members` is the current scope's authoritative
+    /// voter set; every supplied descriptor must correspond to it exactly.
+    ///
+    /// Raw node IDs are accepted only at this crate-private boundary so the
+    /// conversion rejects zero and non-portable ordinals before a roster member
+    /// can exist. The public roster always carries `SessionConsensusNodeId`.
+    pub(crate) fn try_new(
         scope: SessionConsumerScope,
-        consensus_members: BTreeSet<SessionConsumerIdentity>,
-    ) -> Self {
-        Self {
+        expected_members: &BTreeSet<SessionConsensusNodeId>,
+        descriptors: impl IntoIterator<Item = (u64, QuorumReplicaDescriptor)>,
+    ) -> Result<Self, SessionConsumerRosterError> {
+        Self::try_new_with_roster_attestation_root_identity(
+            scope,
+            expected_members,
+            descriptors,
+            None,
+        )
+    }
+
+    /// Construct a roster from validated topology while retaining only the
+    /// opaque identity of its protected-roster verifier root. This cannot
+    /// configure a root or expose its key; it merely lets the consumed
+    /// protected-roster client reject a caller-selected attestor root.
+    #[doc(hidden)]
+    pub(crate) fn try_new_with_roster_attestation_root_identity(
+        scope: SessionConsumerScope,
+        expected_members: &BTreeSet<SessionConsensusNodeId>,
+        descriptors: impl IntoIterator<Item = (u64, QuorumReplicaDescriptor)>,
+        roster_attestation_root_identity: Option<RosterAttestationTrustRootIdentityV1>,
+    ) -> Result<Self, SessionConsumerRosterError> {
+        validate_expected_roster_members(expected_members)?;
+
+        let mut consensus_members = BTreeMap::new();
+        let mut tls_identities = BTreeSet::new();
+        for (raw_node_id, descriptor) in descriptors {
+            let node_id = SessionConsensusNodeId::new(raw_node_id)
+                .map_err(|_| SessionConsumerRosterError::InvalidNodeId)?;
+            if consensus_members.contains_key(&node_id) {
+                return Err(SessionConsumerRosterError::DuplicateNodeId);
+            }
+            if !expected_members.contains(&node_id) {
+                return Err(SessionConsumerRosterError::ScopeMismatch);
+            }
+            let tls_identity = SessionConsumerIdentity::new(descriptor.tls_identity().as_str())
+                .map_err(|_| SessionConsumerRosterError::InvalidTlsIdentity)?;
+            if !tls_identities.insert(tls_identity.clone()) {
+                return Err(SessionConsumerRosterError::DuplicateTlsIdentity);
+            }
+            let identity_commitment = roster_identity_commitment(&tls_identity);
+            consensus_members.insert(
+                node_id,
+                SessionConsumerRosterMember {
+                    node_id,
+                    tls_identity,
+                    identity_commitment,
+                },
+            );
+        }
+
+        if consensus_members.len() != expected_members.len() {
+            return Err(SessionConsumerRosterError::ScopeMismatch);
+        }
+
+        let roster_commitment = SessionConsumerRosterCommitment(roster_commitment(
+            scope.consensus_identity(),
+            &consensus_members,
+        ));
+        Ok(Self {
             scope,
             consensus_members,
-        }
+            roster_commitment,
+            roster_attestation_root_identity,
+        })
     }
 
     /// Exact scope attested by the quorum store when this manifest was made.
@@ -193,12 +946,378 @@ impl SessionConsumerAuthorizationManifest {
         self.scope
     }
 
+    /// Fixed-width commitment to this exact scope and sorted node-to-identity
+    /// roster. Reordering the source descriptor map cannot change it.
+    pub const fn roster_commitment(&self) -> SessionConsumerRosterCommitment {
+        self.roster_commitment
+    }
+
+    /// Iterate the authoritative node-to-TLS/SPIFFE roster in ascending
+    /// canonical node-ID order without exposing a constructor that could
+    /// replace it.
+    pub fn consensus_members(&self) -> impl Iterator<Item = &SessionConsumerRosterMember> {
+        self.consensus_members.values()
+    }
+
     /// Iterate the authoritative member exclusion set without exposing a
     /// constructor that could replace it.
     pub fn consensus_member_identities(&self) -> impl Iterator<Item = &str> {
         self.consensus_members
-            .iter()
-            .map(SessionConsumerIdentity::as_str)
+            .values()
+            .map(SessionConsumerRosterMember::tls_identity)
+    }
+
+    /// Number of exact voters bound by this roster.
+    pub fn voter_count(&self) -> usize {
+        self.consensus_members.len()
+    }
+
+    /// Derive private-field authority for one exact roster member.
+    pub fn voter(&self, node_id: SessionConsensusNodeId) -> Option<SessionConsumerVoterAuthority> {
+        self.consensus_members
+            .get(&node_id)
+            .cloned()
+            .map(|member| SessionConsumerVoterAuthority {
+                scope: self.scope,
+                member,
+                voter_count: self.consensus_members.len(),
+                roster_commitment: self.roster_commitment,
+                roster_attestation_root_identity: self.roster_attestation_root_identity,
+            })
+    }
+
+    /// Bind explicit application grants to this already SDK-validated roster.
+    ///
+    /// This is the safe composition path for an SDK client that obtained this
+    /// roster from [`crate::ValidatedQuorumTopology`]. It cannot create or
+    /// alter the roster, its scope, or its voter-to-TLS identity bindings.
+    pub fn authorization_manifest(
+        self,
+        local_node_id: SessionConsensusNodeId,
+        grants: impl IntoIterator<Item = SessionConsumerAuthorizationGrant>,
+    ) -> Result<SessionConsumerAuthorizationManifest, SessionConsumerAuthorizationManifestError>
+    {
+        SessionConsumerAuthorizationManifest::try_new(local_node_id, self, grants)
+    }
+}
+
+impl fmt::Debug for SessionConsumerRoster {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionConsumerRoster")
+            .field("scope", &self.scope)
+            .field("consensus_member_count", &self.consensus_members.len())
+            .field("roster_commitment", &self.roster_commitment)
+            .finish()
+    }
+}
+
+/// Private-field authority for one exact server in a canonical roster.
+///
+/// Callers can inspect the fixed binding needed to configure transport, but
+/// cannot construct or substitute one from raw node or commitment bytes.
+#[derive(Clone)]
+pub struct SessionConsumerVoterAuthority {
+    scope: SessionConsumerScope,
+    member: SessionConsumerRosterMember,
+    voter_count: usize,
+    roster_commitment: SessionConsumerRosterCommitment,
+    roster_attestation_root_identity: Option<RosterAttestationTrustRootIdentityV1>,
+}
+
+impl SessionConsumerVoterAuthority {
+    /// Exact consensus scope shared by the voter roster.
+    pub const fn scope(&self) -> SessionConsumerScope {
+        self.scope
+    }
+
+    /// Exact SDK consensus node ID expected from this server.
+    pub const fn node_id(&self) -> SessionConsensusNodeId {
+        self.member.node_id
+    }
+
+    /// Exact configured TLS/SPIFFE identity for this server.
+    pub fn tls_identity(&self) -> &str {
+        self.member.tls_identity.as_str()
+    }
+
+    /// Exact voter count committed by the roster.
+    pub const fn voter_count(&self) -> usize {
+        self.voter_count
+    }
+
+    /// Exact canonical roster commitment expected from this server.
+    pub const fn roster_commitment(&self) -> SessionConsumerRosterCommitment {
+        self.roster_commitment
+    }
+
+    /// Return the topology-issued opaque verifier-root identity for the
+    /// protected-roster profile. `None` keeps the ordinary consumer usable
+    /// but makes protected-roster composition fail closed.
+    #[doc(hidden)]
+    pub const fn roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<RosterAttestationTrustRootIdentityV1> {
+        self.roster_attestation_root_identity
+    }
+}
+
+impl fmt::Debug for SessionConsumerVoterAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerVoterAuthority(<redacted>)")
+    }
+}
+
+/// Exact tenant and network-function namespace granted to one consumer.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionConsumerTenantNfScope {
+    tenant: TenantId,
+    nf_kind: NetworkFunctionKind,
+}
+
+impl SessionConsumerTenantNfScope {
+    /// Construct one explicit tenant/NF scope. Neither field is inferred from
+    /// SPIFFE, Kubernetes, a session key, or another deployment identity.
+    pub const fn new(tenant: TenantId, nf_kind: NetworkFunctionKind) -> Self {
+        Self { tenant, nf_kind }
+    }
+
+    /// Exact tenant named by this grant.
+    pub const fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// Exact network-function kind named by this grant.
+    pub const fn nf_kind(&self) -> &NetworkFunctionKind {
+        &self.nf_kind
+    }
+}
+
+impl fmt::Debug for SessionConsumerTenantNfScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerTenantNfScope(<redacted>)")
+    }
+}
+
+/// Invalid bounded grant construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionConsumerAuthorizationGrantError {
+    /// The exact SPIFFE identity was not valid for this consumer boundary.
+    #[error("invalid session consumer authorization grant identity")]
+    InvalidIdentity,
+    /// A grant must name at least one exact tenant/NF scope.
+    #[error("session consumer authorization grant has no scopes")]
+    EmptyScopes,
+    /// A grant exceeded the bounded scopes-per-identity limit.
+    #[error("session consumer authorization grant has too many scopes")]
+    TooManyScopes,
+    /// The input named one exact tenant/NF scope more than once.
+    #[error("session consumer authorization grant contains a duplicate scope")]
+    DuplicateScope,
+}
+
+/// Explicit SPIFFE-to-tenant/NF authorization grant.
+///
+/// The identity is parsed before construction and every grant contains a
+/// nonempty, bounded, duplicate-free scope set. Wildcards are not supported.
+#[derive(Clone)]
+pub struct SessionConsumerAuthorizationGrant {
+    consumer: SessionConsumerIdentity,
+    scopes: BTreeSet<SessionConsumerTenantNfScope>,
+}
+
+impl SessionConsumerAuthorizationGrant {
+    /// Construct one explicit bounded authorization grant.
+    pub fn try_new(
+        consumer: SpiffeId,
+        scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
+    ) -> Result<Self, SessionConsumerAuthorizationGrantError> {
+        let mut admitted_scopes = BTreeSet::new();
+        for scope in scopes {
+            if !admitted_scopes.insert(scope) {
+                return Err(SessionConsumerAuthorizationGrantError::DuplicateScope);
+            }
+            if admitted_scopes.len() > MAX_SESSION_CONSUMER_AUTHORIZATION_SCOPES_PER_IDENTITY {
+                return Err(SessionConsumerAuthorizationGrantError::TooManyScopes);
+            }
+        }
+        if admitted_scopes.is_empty() {
+            return Err(SessionConsumerAuthorizationGrantError::EmptyScopes);
+        }
+        let consumer = SessionConsumerIdentity::new(consumer.as_str().to_owned())
+            .map_err(|_| SessionConsumerAuthorizationGrantError::InvalidIdentity)?;
+        Ok(Self {
+            consumer,
+            scopes: admitted_scopes,
+        })
+    }
+}
+
+impl fmt::Debug for SessionConsumerAuthorizationGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerAuthorizationGrant(<redacted>)")
+    }
+}
+
+/// Invalid store-issued consumer authorization manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionConsumerAuthorizationManifestError {
+    /// The manifest local voter was not present in its exact roster.
+    #[error("session consumer authorization local voter is absent from the roster")]
+    LocalVoterMissing,
+    /// An application grant attempted to reuse a consensus voter identity.
+    #[error("session consumer authorization grant reuses a voter identity")]
+    VoterIdentity,
+    /// More than one grant named the same exact SPIFFE identity.
+    #[error("session consumer authorization manifest contains a duplicate identity")]
+    DuplicateIdentity,
+    /// The manifest exceeded its bounded identity limit.
+    #[error("session consumer authorization manifest has too many identities")]
+    TooManyIdentities,
+    /// The manifest exceeded its bounded total grant tuple limit.
+    #[error("session consumer authorization manifest has too many grant tuples")]
+    TooManyGrantTuples,
+    /// The manifest must contain at least one application consumer grant.
+    #[error("session consumer authorization manifest has no consumers")]
+    Empty,
+}
+
+/// Non-constructible authenticated consumer authority passed to the quorum
+/// service after mTLS authorization.
+#[derive(Clone)]
+pub struct SessionConsumerAuthorization {
+    identity: SessionConsumerIdentity,
+    allowed_scopes: Arc<BTreeSet<[u8; 32]>>,
+}
+
+impl fmt::Debug for SessionConsumerAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerAuthorization(<redacted>)")
+    }
+}
+
+/// Non-constructible, roster-specific authority derived from an authenticated
+/// consumer authorization.
+///
+/// This token carries only the authenticated identity and opaque exact
+/// tenant/NF grant commitments required to admit the decoded authority key of
+/// a protected-roster request. It is neither a general store authority nor a
+/// serializable transport credential.
+#[derive(Clone)]
+pub struct SessionConsumerRosterAuthorization {
+    identity: SessionConsumerIdentity,
+    allowed_scopes: Arc<BTreeSet<[u8; 32]>>,
+}
+
+impl fmt::Debug for SessionConsumerRosterAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRosterAuthorization(<redacted>)")
+    }
+}
+
+/// Store-issued local-voter manifest containing one canonical roster and a
+/// bounded explicit authorization map. It is never serialized.
+#[derive(Clone)]
+pub struct SessionConsumerAuthorizationManifest {
+    local_node_id: SessionConsensusNodeId,
+    roster: SessionConsumerRoster,
+    consumers: BTreeMap<SessionConsumerIdentity, Arc<BTreeSet<[u8; 32]>>>,
+}
+
+impl SessionConsumerAuthorizationManifest {
+    pub(crate) fn try_new(
+        local_node_id: SessionConsensusNodeId,
+        roster: SessionConsumerRoster,
+        grants: impl IntoIterator<Item = SessionConsumerAuthorizationGrant>,
+    ) -> Result<Self, SessionConsumerAuthorizationManifestError> {
+        if roster.voter(local_node_id).is_none() {
+            return Err(SessionConsumerAuthorizationManifestError::LocalVoterMissing);
+        }
+        let member_identities = roster
+            .consensus_member_identities()
+            .collect::<BTreeSet<_>>();
+        let mut consumers = BTreeMap::new();
+        let mut total_scopes = 0_usize;
+        for grant in grants {
+            if member_identities.contains(grant.consumer.as_str()) {
+                return Err(SessionConsumerAuthorizationManifestError::VoterIdentity);
+            }
+            if consumers.contains_key(&grant.consumer) {
+                return Err(SessionConsumerAuthorizationManifestError::DuplicateIdentity);
+            }
+            total_scopes = total_scopes
+                .checked_add(grant.scopes.len())
+                .ok_or(SessionConsumerAuthorizationManifestError::TooManyGrantTuples)?;
+            if consumers.len() >= MAX_SESSION_CONSUMER_AUTHORIZATION_IDENTITIES {
+                return Err(SessionConsumerAuthorizationManifestError::TooManyIdentities);
+            }
+            if total_scopes > MAX_SESSION_CONSUMER_AUTHORIZATION_GRANT_TUPLES {
+                return Err(SessionConsumerAuthorizationManifestError::TooManyGrantTuples);
+            }
+            let allowed_scopes = grant
+                .scopes
+                .iter()
+                .map(session_consumer_tenant_nf_commitment)
+                .collect::<BTreeSet<_>>();
+            consumers.insert(grant.consumer, Arc::new(allowed_scopes));
+        }
+        if consumers.is_empty() {
+            return Err(SessionConsumerAuthorizationManifestError::Empty);
+        }
+        Ok(Self {
+            local_node_id,
+            roster,
+            consumers,
+        })
+    }
+
+    /// Exact consensus scope authorized by this manifest.
+    pub const fn scope(&self) -> SessionConsumerScope {
+        self.roster.scope
+    }
+
+    /// Exact local server node ID bound by this manifest.
+    pub const fn local_node_id(&self) -> SessionConsensusNodeId {
+        self.local_node_id
+    }
+
+    /// Exact voter count bound by this manifest.
+    pub fn voter_count(&self) -> usize {
+        self.roster.voter_count()
+    }
+
+    /// Exact canonical roster commitment bound by this manifest.
+    pub const fn roster_commitment(&self) -> SessionConsumerRosterCommitment {
+        self.roster.roster_commitment
+    }
+
+    /// Iterate the exact consensus-member exclusion identities.
+    pub fn consensus_member_identities(&self) -> impl Iterator<Item = &str> {
+        self.roster.consensus_member_identities()
+    }
+
+    /// Iterate the exact canonical voter roster bound to this manifest.
+    pub fn consensus_members(&self) -> impl Iterator<Item = &SessionConsumerRosterMember> {
+        self.roster.consensus_members()
+    }
+
+    /// Resolve one already-authenticated configured consumer into a
+    /// non-constructible quorum-service authority token.
+    pub fn authorize(
+        &self,
+        identity: &SessionConsumerIdentity,
+    ) -> Result<SessionConsumerAuthorization, SessionConsumerRejection> {
+        let allowed_scopes = self
+            .consumers
+            .get(identity)
+            .cloned()
+            .ok_or(SessionConsumerRejection::Unauthorized)?;
+        Ok(SessionConsumerAuthorization {
+            identity: identity.clone(),
+            allowed_scopes,
+        })
     }
 }
 
@@ -206,10 +1325,78 @@ impl fmt::Debug for SessionConsumerAuthorizationManifest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionConsumerAuthorizationManifest")
-            .field("scope", &self.scope)
-            .field("consensus_member_count", &self.consensus_members.len())
+            .field("local_node_id", &"<redacted>")
+            .field("voter_count", &self.roster.voter_count())
+            .field("consumer_count", &self.consumers.len())
             .finish()
     }
+}
+
+fn session_consumer_tenant_nf_commitment(scope: &SessionConsumerTenantNfScope) -> [u8; 32] {
+    session_consumer_tenant_nf_fields_commitment(scope.tenant.as_str(), scope.nf_kind.as_str())
+}
+
+fn session_consumer_tenant_nf_fields_commitment(tenant: &str, nf_kind: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_CONSUMER_TENANT_NF_COMMITMENT_DOMAIN);
+    update_length_delimited(&mut hasher, tenant.as_bytes());
+    update_length_delimited(&mut hasher, nf_kind.as_bytes());
+    hasher.finalize().into()
+}
+
+fn validate_expected_roster_members(
+    expected_members: &BTreeSet<SessionConsensusNodeId>,
+) -> Result<(), SessionConsumerRosterError> {
+    if expected_members.is_empty() {
+        return Err(SessionConsumerRosterError::Empty);
+    }
+    if expected_members.len() > QUORUM_TOPOLOGY_MAX_MEMBERS {
+        return Err(SessionConsumerRosterError::MemberCountTooLarge);
+    }
+    if expected_members
+        .iter()
+        .any(|node_id| node_id.get() == 0 || node_id.get() > i64::MAX as u64)
+    {
+        return Err(SessionConsumerRosterError::InvalidNodeId);
+    }
+    Ok(())
+}
+
+fn roster_identity_commitment(identity: &SessionConsumerIdentity) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_CONSUMER_ROSTER_IDENTITY_COMMITMENT_DOMAIN);
+    update_length_delimited(&mut hasher, identity.as_str().as_bytes());
+    hasher.finalize().into()
+}
+
+fn roster_commitment(
+    scope: SessionConsensusIdentity,
+    consensus_members: &BTreeMap<SessionConsensusNodeId, SessionConsumerRosterMember>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_CONSUMER_ROSTER_COMMITMENT_DOMAIN);
+    update_length_delimited(&mut hasher, scope.cluster_id().as_bytes());
+    update_length_delimited(&mut hasher, scope.configuration_id().as_bytes());
+    update_length_delimited(
+        &mut hasher,
+        &scope.configuration_epoch().get().to_be_bytes(),
+    );
+    hasher.update(
+        u32::try_from(consensus_members.len())
+            .expect("consumer roster member count is bounded")
+            .to_be_bytes(),
+    );
+    for (node_id, member) in consensus_members {
+        hasher.update(node_id.get().to_be_bytes());
+        update_length_delimited(&mut hasher, &member.identity_commitment);
+    }
+    hasher.finalize().into()
+}
+
+fn update_length_delimited(hasher: &mut Sha256, value: &[u8]) {
+    let length = u32::try_from(value.len()).expect("consumer roster field length is bounded");
+    hasher.update(length.to_be_bytes());
+    hasher.update(value);
 }
 
 /// Typed operation admitted by the stateless consumer boundary.
@@ -290,6 +1477,15 @@ pub enum SessionConsumerOperation {
         /// Complete original lease request retained by the caller.
         request: Box<SessionConsumerLeaseMutationRequest>,
     },
+    /// Recover the exact durable outcome of one compare-and-set.
+    ///
+    /// This is a leader-linearizable, read-only operation. The complete
+    /// original request is retained by the caller's local affine handle;
+    /// it is never replayed or proposed by this status operation.
+    CompareAndSetStatus {
+        /// Complete original compare-and-set request retained by the caller.
+        request: Box<SessionConsumerCompareAndSetRequest>,
+    },
     /// Prove the exact atomic fenced-transition capability across the current
     /// admitted voter set.
     FencedTransitionCapability,
@@ -307,6 +1503,43 @@ pub enum SessionConsumerOperation {
     FencedTransitionStatus {
         /// Complete canonical transition body.
         request: Box<FencedTransitionRequest>,
+    },
+    /// Perform the only fresh protected-roster quorum mutation: immutable
+    /// admission. The opaque body is one canonical admission and is never
+    /// split across consumer or consensus mutations.
+    FencedMutationRosterPollAdmit {
+        /// Exact bounded opaque admission capsule.
+        request: Box<SessionConsumerRosterAdmissionCapsule>,
+    },
+    /// Read the exact original admission after ambiguity without submitting a
+    /// second admission mutation.
+    FencedMutationRosterAdmissionStatus {
+        /// Exact bounded opaque admission-status capsule.
+        request: Box<SessionConsumerRosterAdmissionCapsule>,
+    },
+    /// Recover a durable protected roster under current authority without a
+    /// quorum mutation.
+    FencedMutationRosterRecover {
+        /// Exact bounded opaque recovery capsule.
+        request: Box<SessionConsumerRosterAdmissionCapsule>,
+    },
+    /// Perform the only terminal protected-roster quorum mutation. The exact
+    /// body is one canonical terminalization and is never split.
+    FencedMutationRosterTerminalize {
+        /// Exact bounded opaque terminal capsule.
+        request: Box<SessionConsumerRosterTerminalCapsule>,
+    },
+    /// Read one exact prepared terminal body without a quorum mutation.
+    FencedMutationRosterTerminalStatus {
+        /// Exact bounded opaque terminal-status capsule.
+        request: Box<SessionConsumerRosterTerminalCapsule>,
+    },
+    /// Linearly read the complete current authority for one already
+    /// Established publication without proposing a consensus command.
+    FencedMutationRosterCurrentPublicationAuthority {
+        /// Complete untrusted query capsule; the quorum compares it with its
+        /// retained admission, receipt, and current authority.
+        request: Box<SessionConsumerRosterCurrentPublicationAuthorityCapsule>,
     },
     /// Release an existing lease.
     ReleaseLease {
@@ -330,11 +1563,22 @@ impl fmt::Debug for SessionConsumerOperation {
             Self::AcquireLease { .. } => "AcquireLease",
             Self::RenewLease { .. } => "RenewLease",
             Self::LeaseMutationStatus { .. } => "LeaseMutationStatus",
+            Self::CompareAndSetStatus { .. } => "CompareAndSetStatus",
             Self::ReleaseLease { .. } => "ReleaseLease",
             Self::FencedTransitionCapability => "FencedTransitionCapability",
             Self::ObserveFencedTransition { .. } => "ObserveFencedTransition",
             Self::FencedTransition { .. } => "FencedTransition",
             Self::FencedTransitionStatus { .. } => "FencedTransitionStatus",
+            Self::FencedMutationRosterPollAdmit { .. } => "FencedMutationRosterPollAdmit",
+            Self::FencedMutationRosterAdmissionStatus { .. } => {
+                "FencedMutationRosterAdmissionStatus"
+            }
+            Self::FencedMutationRosterRecover { .. } => "FencedMutationRosterRecover",
+            Self::FencedMutationRosterTerminalize { .. } => "FencedMutationRosterTerminalize",
+            Self::FencedMutationRosterTerminalStatus { .. } => "FencedMutationRosterTerminalStatus",
+            Self::FencedMutationRosterCurrentPublicationAuthority { .. } => {
+                "FencedMutationRosterCurrentPublicationAuthority"
+            }
         };
         formatter.write_str(name)
     }
@@ -373,11 +1617,26 @@ impl SessionConsumerOperation {
             Self::AcquireLease { ttl, .. } => crate::validate_session_ttl(*ttl)
                 .map_err(|_| SessionConsumerRejection::MalformedRequest),
             Self::LeaseMutationStatus { request } => request.validate(),
+            Self::CompareAndSetStatus { request } => request.validate(),
             Self::FencedTransition { request } | Self::FencedTransitionStatus { request } => {
                 request
                     .validate()
                     .map_err(|_| SessionConsumerRejection::MalformedRequest)
             }
+            Self::FencedMutationRosterPollAdmit { request }
+            | Self::FencedMutationRosterAdmissionStatus { request }
+            | Self::FencedMutationRosterRecover { request } => (!request.is_empty()
+                && request.len() <= MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES)
+                .then_some(())
+                .ok_or(SessionConsumerRejection::MalformedRequest),
+            Self::FencedMutationRosterTerminalize { request }
+            | Self::FencedMutationRosterTerminalStatus { request } => (!request.is_empty()
+                && request.len() <= MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES)
+                .then_some(())
+                .ok_or(SessionConsumerRejection::MalformedRequest),
+            Self::FencedMutationRosterCurrentPublicationAuthority { request } => request
+                .validate()
+                .map_err(|_| SessionConsumerRejection::MalformedRequest),
             Self::Capabilities
             | Self::Get { .. }
             | Self::Watch { .. }
@@ -425,6 +1684,14 @@ impl SessionConsumerRequest {
         &self.operation
     }
 
+    /// Consume the request after server-side validation and binding have
+    /// completed. This is crate-private so the consensus service can move one
+    /// maximum-sized CAS body directly into its single commit intent without
+    /// cloning it for validation or receipt bookkeeping.
+    pub(crate) fn into_operation(self) -> SessionConsumerOperation {
+        self.operation
+    }
+
     /// Validate the operation before dispatch.
     pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
         self.operation.validate()?;
@@ -440,8 +1707,70 @@ impl SessionConsumerRequest {
             {
                 Err(SessionConsumerRejection::MalformedRequest)
             }
+            SessionConsumerOperation::CompareAndSetStatus { request }
+                if request.request_id().as_bytes() != self.request_id.as_bytes() =>
+            {
+                Err(SessionConsumerRejection::MalformedRequest)
+            }
             _ => Ok(()),
         }
+    }
+}
+
+/// Complete original compare-and-set request used only for read-only exact
+/// consensus-outcome recovery.
+///
+/// The public request ID and immutable body are retained by the volatile
+/// local affine handle. This type has no execute operation and cannot mint a new
+/// request identity or replay the mutation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConsumerCompareAndSetRequest {
+    request_id: SessionConsumerRequestId,
+    operation: CompareAndSet,
+}
+
+impl SessionConsumerCompareAndSetRequest {
+    /// Construct one retained compare-and-set body from its caller-owned ID.
+    pub const fn new(request_id: SessionConsumerRequestId, operation: CompareAndSet) -> Self {
+        Self {
+            request_id,
+            operation,
+        }
+    }
+
+    /// Return the original caller-owned public request identity.
+    pub const fn request_id(&self) -> SessionConsumerRequestId {
+        self.request_id
+    }
+
+    /// Return the exact original compare-and-set body.
+    pub const fn operation(&self) -> &CompareAndSet {
+        &self.operation
+    }
+
+    /// Validate the retained body before it reaches the receipt lookup.
+    pub fn validate(&self) -> Result<(), SessionConsumerRejection> {
+        self.operation
+            .lease
+            .validate_profile()
+            .map_err(|_| SessionConsumerRejection::MalformedRequest)
+    }
+
+    pub(crate) fn into_original_consumer_request(
+        self,
+        scope: SessionConsumerScope,
+    ) -> SessionConsumerRequest {
+        let operation = SessionConsumerOperation::CompareAndSet {
+            op: Box::new(self.operation),
+        };
+        SessionConsumerRequest::new(scope, self.request_id, operation)
+    }
+}
+
+impl fmt::Debug for SessionConsumerCompareAndSetRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerCompareAndSetRequest(<redacted>)")
     }
 }
 
@@ -513,20 +1842,13 @@ impl SessionConsumerLeaseMutationOperation {
         }
     }
 
-    fn as_consumer_operation(&self) -> SessionConsumerOperation {
+    fn into_consumer_operation(self) -> SessionConsumerOperation {
         match self {
-            Self::Acquire { key, owner, ttl } => SessionConsumerOperation::AcquireLease {
-                key: key.clone(),
-                owner: owner.clone(),
-                ttl: *ttl,
-            },
-            Self::Renew { lease, ttl } => SessionConsumerOperation::RenewLease {
-                lease: lease.clone(),
-                ttl: *ttl,
-            },
-            Self::Release { lease } => SessionConsumerOperation::ReleaseLease {
-                lease: lease.clone(),
-            },
+            Self::Acquire { key, owner, ttl } => {
+                SessionConsumerOperation::AcquireLease { key, owner, ttl }
+            }
+            Self::Renew { lease, ttl } => SessionConsumerOperation::RenewLease { lease, ttl },
+            Self::Release { lease } => SessionConsumerOperation::ReleaseLease { lease },
         }
     }
 }
@@ -568,21 +1890,210 @@ impl SessionConsumerLeaseMutationRequest {
         self.operation.validate()
     }
 
-    pub(crate) fn original_consumer_request(
-        &self,
+    pub(crate) fn into_original_consumer_request(
+        self,
         scope: SessionConsumerScope,
     ) -> SessionConsumerRequest {
-        SessionConsumerRequest::new(
-            scope,
-            self.request_id,
-            self.operation.as_consumer_operation(),
-        )
+        let operation = self.operation.into_consumer_operation();
+        SessionConsumerRequest::new(scope, self.request_id, operation)
     }
 }
 
 impl fmt::Debug for SessionConsumerLeaseMutationRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SessionConsumerLeaseMutationRequest(<redacted>)")
+    }
+}
+
+impl SessionConsumerAuthorization {
+    /// Derive the least-authority token required by protected-roster ingress.
+    ///
+    /// Only a store-issued [`SessionConsumerAuthorization`] can mint this
+    /// token; an independently constructed [`SessionConsumerIdentity`] cannot
+    /// recover its grant commitments.
+    #[doc(hidden)]
+    pub fn roster_authorization(&self) -> SessionConsumerRosterAuthorization {
+        SessionConsumerRosterAuthorization {
+            identity: self.identity.clone(),
+            allowed_scopes: Arc::clone(&self.allowed_scopes),
+        }
+    }
+
+    /// Return the authenticated peer identity bound to this authority token.
+    ///
+    /// The dedicated protected-roster ingress uses this only to bind its
+    /// transport-issued attestation after the normal manifest authorization
+    /// and operation grant have already succeeded.
+    #[doc(hidden)]
+    pub fn identity(&self) -> &SessionConsumerIdentity {
+        &self.identity
+    }
+
+    fn permits_key(&self, key: &SessionKey) -> bool {
+        let commitment =
+            session_consumer_tenant_nf_fields_commitment(key.tenant.as_str(), key.nf_kind.as_str());
+        self.allowed_scopes.contains(&commitment)
+    }
+
+    fn permits_compare_and_set(&self, operation: &CompareAndSet) -> bool {
+        self.permits_key(&operation.key)
+            && self.permits_key(operation.lease.key())
+            && self.permits_key(&operation.new_record.key)
+    }
+
+    fn permits_session_op(&self, operation: &SessionOp) -> bool {
+        match operation {
+            SessionOp::Get { key } => self.permits_key(key),
+            SessionOp::CompareAndSet(operation) => self.permits_compare_and_set(operation),
+            SessionOp::DeleteFenced { lease } | SessionOp::RefreshTtl { lease, .. } => {
+                self.permits_key(lease.key())
+            }
+        }
+    }
+
+    fn permits_lease_mutation(&self, request: &SessionConsumerLeaseMutationRequest) -> bool {
+        match request.operation() {
+            SessionConsumerLeaseMutationOperation::Acquire { key, .. } => self.permits_key(key),
+            SessionConsumerLeaseMutationOperation::Renew { lease, .. }
+            | SessionConsumerLeaseMutationOperation::Release { lease } => {
+                self.permits_key(lease.key())
+            }
+        }
+    }
+
+    fn permits_fenced_transition(&self, request: &FencedTransitionRequest) -> bool {
+        self.permits_key(request.lease().key())
+            && request
+                .mutation()
+                .record()
+                .is_none_or(|record| self.permits_key(&record.key))
+    }
+
+    fn permits_fenced_transition_v2(&self, request: &FencedTransitionV2Request) -> bool {
+        self.permits_key(request.lease().key())
+            && request
+                .mutation()
+                .record()
+                .is_none_or(|record| self.permits_key(&record.key))
+    }
+
+    /// Check whether this already-authenticated authority grants one complete
+    /// validated operation.
+    ///
+    /// The authority is minted only by a store-issued manifest after the
+    /// transport has authenticated the consumer identity.  This method takes
+    /// no scope argument, so callers cannot substitute a caller-selected
+    /// cluster/configuration scope for the listener's separately validated
+    /// request scope.  Consumers of [`SessionQuorumConsumer`] must invoke it
+    /// before constructing any service execution or watch future.
+    pub fn authorize_operation(
+        &self,
+        operation: &SessionConsumerOperation,
+    ) -> Result<(), SessionConsumerRejection> {
+        let authorized = match operation {
+            SessionConsumerOperation::Capabilities
+            | SessionConsumerOperation::PreflightRecordExpiry { .. }
+            | SessionConsumerOperation::FencedTransitionCapability => true,
+            // A single global replication cursor exposes otherwise foreign
+            // tenants' mutation timing and ordering even when every change
+            // item is filtered. Scoped consumers therefore cannot subscribe
+            // until the protocol has an identity-and-scope-bound cursor.
+            SessionConsumerOperation::Watch { .. }
+            // The general consumer authorization token deliberately grants
+            // no opaque roster call. The `/3` listener separately requires
+            // mTLS identity and scope, a current root-matched ingress signer,
+            // and its exact attestation before the private ingress can look
+            // up or decode a capsule.
+            | SessionConsumerOperation::FencedMutationRosterPollAdmit { .. }
+            | SessionConsumerOperation::FencedMutationRosterAdmissionStatus { .. }
+            | SessionConsumerOperation::FencedMutationRosterRecover { .. }
+            | SessionConsumerOperation::FencedMutationRosterTerminalize { .. }
+            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. }
+            | SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority { .. } => {
+                false
+            }
+            SessionConsumerOperation::Get { key }
+            | SessionConsumerOperation::AcquireLease { key, .. }
+            | SessionConsumerOperation::ObserveFencedTransition { key } => self.permits_key(key),
+            SessionConsumerOperation::CompareAndSet { op } => self.permits_compare_and_set(op),
+            SessionConsumerOperation::DeleteFenced { lease }
+            | SessionConsumerOperation::RefreshTtl { lease, .. }
+            | SessionConsumerOperation::RenewLease { lease, .. }
+            | SessionConsumerOperation::ReleaseLease { lease } => self.permits_key(lease.key()),
+            SessionConsumerOperation::Batch { ops } => ops
+                .iter()
+                .all(|operation| self.permits_session_op(operation)),
+            SessionConsumerOperation::ScanRestoreRecords { request } => {
+                match (&request.scope.tenant, &request.scope.nf_kind) {
+                    (Some(tenant), Some(nf_kind)) => {
+                        self.allowed_scopes
+                            .contains(&session_consumer_tenant_nf_fields_commitment(
+                                tenant.as_str(),
+                                nf_kind.as_str(),
+                            ))
+                    }
+                    _ => false,
+                }
+            }
+            SessionConsumerOperation::LeaseMutationStatus { request } => {
+                self.permits_lease_mutation(request)
+            }
+            SessionConsumerOperation::CompareAndSetStatus { request } => {
+                self.permits_compare_and_set(request.operation())
+            }
+            SessionConsumerOperation::FencedTransition { request }
+            | SessionConsumerOperation::FencedTransitionStatus { request } => {
+                self.permits_fenced_transition(request)
+            }
+        };
+        authorized
+            .then_some(())
+            .ok_or(SessionConsumerRejection::Unauthorized)
+    }
+
+    /// Check whether this manifest-issued authority grants one complete V2
+    /// fenced-transition operation. V2 uses a distinct wire envelope, but it
+    /// never bypasses the same tenant/NF authority boundary as V1.
+    pub fn authorize_v2_operation(
+        &self,
+        operation: &SessionConsumerV2Operation,
+    ) -> Result<(), SessionConsumerRejection> {
+        let authorized = match operation {
+            SessionConsumerV2Operation::FencedTransitionV2Capability
+            | SessionConsumerV2Operation::FencedTransitionV2HistoryState => true,
+            SessionConsumerV2Operation::FencedTransitionV2 { request }
+            | SessionConsumerV2Operation::FencedTransitionV2Status { request } => {
+                self.permits_fenced_transition_v2(request)
+            }
+            SessionConsumerV2Operation::FencedTransitionV2Batch { requests } => requests
+                .iter()
+                .all(|request| self.permits_fenced_transition_v2(request)),
+        };
+        authorized
+            .then_some(())
+            .ok_or(SessionConsumerRejection::Unauthorized)
+    }
+}
+
+impl SessionConsumerRosterAuthorization {
+    /// Return the authenticated peer identity bound to this roster authority.
+    #[doc(hidden)]
+    pub fn identity(&self) -> &SessionConsumerIdentity {
+        &self.identity
+    }
+
+    /// Check whether the exact decoded roster authority key is granted.
+    ///
+    /// The token exposes only this membership decision and never its grant
+    /// commitments or an allowed-scope enumeration.
+    #[doc(hidden)]
+    pub fn authorize_session_key(&self, key: &SessionKey) -> Result<(), SessionConsumerRejection> {
+        let commitment =
+            session_consumer_tenant_nf_fields_commitment(key.tenant.as_str(), key.nf_kind.as_str());
+        self.allowed_scopes
+            .contains(&commitment)
+            .then_some(())
+            .ok_or(SessionConsumerRejection::Unauthorized)
     }
 }
 
@@ -597,7 +2108,7 @@ impl fmt::Debug for SessionConsumerRequest {
     }
 }
 
-/// Explicit revision-6-only operations for the V2 fenced-transition
+/// Explicit revision-5-only operations for the V2 fenced-transition
 /// contract.
 ///
 /// This is deliberately a distinct request family rather than variants on
@@ -692,7 +2203,7 @@ impl SessionConsumerV2Operation {
     }
 }
 
-/// One scope-bound revision-6 V2 consumer request.
+/// One scope-bound revision-5 V2 consumer request.
 ///
 /// V2 execute/status retain the full 56-byte V2 request identity outside the
 /// operation body as well as inside it. The duplicated value is intentional:
@@ -708,7 +2219,7 @@ pub struct SessionConsumerV2Request {
 }
 
 impl SessionConsumerV2Request {
-    /// Construct an exact revision-6 V2 request.
+    /// Construct an exact revision-5 V2 request.
     pub fn new(scope: SessionConsumerScope, operation: SessionConsumerV2Operation) -> Self {
         let request_id = operation.request_id();
         Self {
@@ -731,7 +2242,7 @@ impl SessionConsumerV2Request {
         self.request_id
     }
 
-    /// Typed revision-6-only operation.
+    /// Typed revision-5-only operation.
     pub const fn operation(&self) -> &SessionConsumerV2Operation {
         &self.operation
     }
@@ -793,6 +2304,8 @@ pub enum SessionConsumerStoreError {
     PayloadTooLarge,
     /// The backend rejected protected data.
     ProtectedDataRejected,
+    /// A protected roster exclusively owns the exact session-record pre-state.
+    SessionRecordReserved,
 }
 
 impl From<StoreError> for SessionConsumerStoreError {
@@ -835,6 +2348,7 @@ impl From<StoreError> for SessionConsumerStoreError {
             StoreError::LeaseHeld | StoreError::LeaseExpired => Self::LeaseUnavailable,
             StoreError::Crypto(_) | StoreError::Serialization(_) => Self::ProtectedDataRejected,
             StoreError::PayloadTooLarge { .. } => Self::PayloadTooLarge,
+            StoreError::SessionRecordReserved => Self::SessionRecordReserved,
             StoreError::InvalidRestoreScanRequest(_)
             | StoreError::InvalidRestoreScanResponse(_)
             | StoreError::RestoreScanPageTooLarge { .. } => Self::RestoreRejected,
@@ -874,6 +2388,7 @@ impl SessionConsumerStoreError {
             Self::ProtectedDataRejected => {
                 StoreError::Crypto("consumer protected data rejected".into())
             }
+            Self::SessionRecordReserved => StoreError::SessionRecordReserved,
         }
     }
 }
@@ -963,6 +2478,36 @@ pub enum SessionConsumerLeaseMutationStatus {
     RequestConflict,
     /// No matching receipt existed at the completed linearizable read barrier.
     NotFound,
+}
+
+/// Exact read-only receipt status for one prepared compare-and-set.
+///
+/// This projects the existing authoritative consensus outcome ledger. It is
+/// not a current-row observation and never replays or proposes the mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionConsumerCompareAndSetStatus {
+    /// The exact persisted success or deterministic compare-and-set failure.
+    Recorded(SessionConsumerCompareAndSetReceiptOutcome),
+    /// The public request identity is durably bound to another exact body.
+    RequestConflict,
+    /// No matching receipt existed at the completed linearizable read barrier.
+    NotFound,
+}
+
+/// Fixed, payload-free projection of a recorded compare-and-set receipt.
+///
+/// The consensus ledger may retain an internal `CompareAndSetResult`, but a
+/// receipt never serializes a current row or sealed payload back to a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionConsumerCompareAndSetReceiptOutcome {
+    /// The exact CAS applied.
+    Applied,
+    /// The exact CAS predicate conflicted.
+    Conflict,
+    /// The exact CAS was deterministically rejected.
+    Rejected(SessionConsumerStoreError),
 }
 
 /// Explicit classification for a request that might have crossed its effect
@@ -1485,6 +3030,7 @@ pub enum SessionConsumerChangeKind {
     LeaseReleased,
 }
 
+#[cfg(test)]
 pub(crate) fn session_consumer_change(
     entry: &crate::ReplicationEntry,
 ) -> Result<SessionConsumerChange, StoreError> {
@@ -1529,6 +3075,28 @@ pub(crate) fn session_consumer_change(
                 key: key.clone(),
                 kind: SessionConsumerChangeKind::LeaseReleased,
             }),
+            crate::ReplicationOp::ProtectedRosterEstablished { key, successor, .. } => {
+                // This journal variant is emitted only for an Established
+                // terminal after the SQLite replay adapter has compared the
+                // exact admission-reserved row under its current owner/fence
+                // guard. Its public watch projection must preserve that
+                // authoritative row effect without exposing the guard or any
+                // roster proof material. Aborted terminals and retained
+                // replays never construct this replication operation.
+                let kind = match &**successor {
+                    ProtectedRosterEstablishedSuccessor::Put { .. }
+                    | ProtectedRosterEstablishedSuccessor::NoOp => {
+                        SessionConsumerChangeKind::RecordWritten
+                    }
+                    ProtectedRosterEstablishedSuccessor::Delete => {
+                        SessionConsumerChangeKind::RecordDeleted
+                    }
+                };
+                Some(SessionConsumerChangeItem {
+                    key: key.clone(),
+                    kind,
+                })
+            }
             crate::ReplicationOp::Batch { ops } => {
                 pending.extend(ops.iter().rev());
                 None
@@ -1542,14 +3110,6 @@ pub(crate) fn session_consumer_change(
         sequence: entry.sequence,
         changes,
     })
-}
-
-pub(crate) fn session_consumer_change_encoded_bytes(
-    change: &SessionConsumerChange,
-) -> Result<usize, StoreError> {
-    serde_json::to_vec(change)
-        .map(|encoded| encoded.len().saturating_add(256))
-        .map_err(|_| StoreError::Serialization("consumer watch projection encoding failed".into()))
 }
 
 /// Closed rejection before an operation reaches the consensus state machine.
@@ -1621,6 +3181,8 @@ pub enum SessionConsumerResponse {
     ReleaseLease(Result<(), SessionConsumerLeaseError>),
     /// Exact read-only receipt status for an ordinary lease mutation.
     LeaseMutationStatus(Result<SessionConsumerLeaseMutationStatus, SessionConsumerStoreError>),
+    /// Exact read-only receipt status for a prepared compare-and-set.
+    CompareAndSetStatus(Result<SessionConsumerCompareAndSetStatus, SessionConsumerStoreError>),
     /// Exact unanimous atomic-transition capability result.
     FencedTransitionCapability(Result<AtomicFencedTransitionCapability, SessionConsumerStoreError>),
     /// Exact-key record and fence-floor observation.
@@ -1631,13 +3193,28 @@ pub enum SessionConsumerResponse {
     FencedTransitionStatus(
         Result<SessionConsumerFencedTransitionStatus, SessionConsumerStoreError>,
     ),
+    /// Outcome of the sole fresh protected-roster admission mutation.
+    FencedMutationRosterPollAdmit(SessionConsumerRosterAdmissionMutationResponse),
+    /// Read-only exact status of an original protected-roster admission.
+    FencedMutationRosterAdmissionStatus(SessionConsumerRosterAdmissionReadResponse),
+    /// Read-only protected-roster recovery under current authority.
+    FencedMutationRosterRecover(SessionConsumerRosterAdmissionReadResponse),
+    /// Outcome of the sole protected-roster terminal mutation.
+    FencedMutationRosterTerminalize(SessionConsumerRosterTerminalMutationResponse),
+    /// Read-only exact protected-roster terminal status.
+    FencedMutationRosterTerminalStatus(SessionConsumerRosterTerminalReadResponse),
+    /// Read-only exact backend-current authority for an Established
+    /// publication. This carries no authority or receipt bytes.
+    FencedMutationRosterCurrentPublicationAuthority(
+        SessionConsumerRosterCurrentPublicationAuthorityReadResponse,
+    ),
     /// A mutation outcome is ambiguous and must never be automatically replayed.
     OutcomeUnknown(SessionConsumerOutcomeUnknown),
     /// A request was rejected before dispatch.
     Rejected(SessionConsumerRejection),
 }
 
-/// Typed response carried only by the revision-6 V2 consumer lane.
+/// Typed response carried only by the revision-5 V2 consumer lane.
 ///
 /// This intentionally does not extend [`SessionConsumerResponse`]: adding a
 /// V2 response discriminator there would allow a revision-3 decoder to
@@ -1704,10 +3281,19 @@ impl fmt::Debug for SessionConsumerResponse {
             Self::RenewLease(_) => "RenewLease",
             Self::ReleaseLease(_) => "ReleaseLease",
             Self::LeaseMutationStatus(_) => "LeaseMutationStatus",
+            Self::CompareAndSetStatus(_) => "CompareAndSetStatus",
             Self::FencedTransitionCapability(_) => "FencedTransitionCapability",
             Self::ObserveFencedTransition(_) => "ObserveFencedTransition",
             Self::FencedTransition(_) => "FencedTransition",
             Self::FencedTransitionStatus(_) => "FencedTransitionStatus",
+            Self::FencedMutationRosterPollAdmit(_) => "FencedMutationRosterPollAdmit",
+            Self::FencedMutationRosterAdmissionStatus(_) => "FencedMutationRosterAdmissionStatus",
+            Self::FencedMutationRosterRecover(_) => "FencedMutationRosterRecover",
+            Self::FencedMutationRosterTerminalize(_) => "FencedMutationRosterTerminalize",
+            Self::FencedMutationRosterTerminalStatus(_) => "FencedMutationRosterTerminalStatus",
+            Self::FencedMutationRosterCurrentPublicationAuthority(_) => {
+                "FencedMutationRosterCurrentPublicationAuthority"
+            }
             Self::OutcomeUnknown(_) => "OutcomeUnknown",
             Self::Rejected(_) => "Rejected",
         };
@@ -1718,9 +3304,9 @@ impl fmt::Debug for SessionConsumerResponse {
 /// Quorum-side typed application service used by the dedicated consumer
 /// transport.
 ///
-/// Implementations must authenticate the supplied identity at their inbound
-/// boundary, reject a scope mismatch before backend work, and route mutations
-/// through the durable quorum leader path. This trait intentionally cannot
+/// Implementations must receive a store-manifest-issued authorization from
+/// their inbound boundary, reject a scope mismatch before backend work, and
+/// route mutations through the durable quorum leader path. This trait intentionally cannot
 /// express any consensus RPC, member/topology mutation, snapshot, or raw
 /// replication append/rebuild request.
 #[async_trait]
@@ -1728,11 +3314,11 @@ pub trait SessionQuorumConsumer: Send + Sync {
     /// Execute one authenticated, scope-bound consumer request.
     async fn execute(
         &self,
-        identity: &SessionConsumerIdentity,
+        authorization: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse;
 
-    /// Execute one authenticated revision-6 V2 request.
+    /// Execute one authenticated revision-5 V2 request.
     ///
     /// The default does no backend work and keeps an existing V1-only quorum
     /// implementation fail-closed on the new lane. Implementations that
@@ -1740,7 +3326,7 @@ pub trait SessionQuorumConsumer: Send + Sync {
     /// durable leader checks as [`Self::execute`].
     async fn execute_v2(
         &self,
-        _identity: &SessionConsumerIdentity,
+        _authorization: &SessionConsumerAuthorization,
         _request: SessionConsumerV2Request,
     ) -> SessionConsumerV2Response {
         SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
@@ -1749,13 +3335,140 @@ pub trait SessionQuorumConsumer: Send + Sync {
     /// Open a bounded committed-change watch after authenticated scope checks.
     async fn watch(
         &self,
-        identity: &SessionConsumerIdentity,
+        authorization: &SessionConsumerAuthorization,
         scope: SessionConsumerScope,
         start_sequence: u64,
     ) -> Result<
         BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
         SessionConsumerRejection,
     >;
+}
+
+/// Dedicated protected-roster ingress port.
+///
+/// Unlike [`SessionQuorumConsumer`], this port is usable only with a
+/// root-certified transport-ingress attestation for one exact roster request.
+/// The ordinary service must reject every roster operation before it decodes
+/// or looks up the opaque capsule.
+#[async_trait]
+pub trait SessionQuorumRosterIngress: Send + Sync {
+    /// Return the topology-provisioned verifier-root identity expected by this
+    /// ingress. The fail-closed default keeps legacy/custom implementations
+    /// source compatible but prevents them from enabling the protected lane.
+    fn expected_roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<crate::fenced_mutation_roster::RosterAttestationTrustRootIdentityV1> {
+        None
+    }
+
+    /// Prepare the exact compact-admission signer input after this ingress has
+    /// authenticated the V1 connection and decoded the exact PollAdmit body.
+    ///
+    /// This is deliberately a narrow pre-sign seam: it exposes commitments
+    /// and the already authenticated ingress input, never a store, raw
+    /// consensus authority, or an arbitrary signing preimage.  The default
+    /// keeps legacy ingress implementations fail-closed on the protected
+    /// compact-provenance profile.
+    fn prepare_compact_admission_provenance_input(
+        &self,
+        _authorization: &SessionConsumerRosterAuthorization,
+        _request: &SessionConsumerRequest,
+        _attestation: &crate::fenced_mutation_roster::RosterIngressAttestationV1,
+        _certificate_subject_identity_commitment: [u8; 32],
+    ) -> Result<
+        crate::fenced_mutation_roster::RosterCompactAdmissionProvenanceSigningInputV2,
+        SessionConsumerRosterRejection,
+    > {
+        Err(SessionConsumerRosterRejection::Capability)
+    }
+
+    /// Dispatch one already-authenticated revision-five protected-roster
+    /// request.
+    ///
+    /// Implementations must first verify the root-certified `attestation`,
+    /// then canonically decode the request capsule and call
+    /// [`SessionConsumerRosterAuthorization::authorize_session_key`] on its
+    /// exact decoded authority/admission key before any roster lookup or
+    /// consensus work. A cross-tenant or wrong-NF key must not be accepted.
+    async fn execute_roster_ingress(
+        &self,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: SessionConsumerRequest,
+        attestation: crate::fenced_mutation_roster::RosterIngressAttestationV1,
+        admission_provenance: Option<
+            crate::fenced_mutation_roster::RosterCompactAdmissionProvenanceV2,
+        >,
+    ) -> SessionConsumerResponse;
+}
+
+/// Derive the exact opaque commitment of an authenticated peer identity for a
+/// root-certified transport-ingress statement.
+#[doc(hidden)]
+pub fn session_consumer_identity_commitment(identity: &SessionConsumerIdentity) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/session-consumer/ingress-peer/v1\0");
+    digest.update(
+        u16::try_from(identity.as_str().len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    digest.update(identity.as_str().as_bytes());
+    digest.finalize().into()
+}
+
+/// Return the fixed protected-roster authority scope committed by the ingress
+/// certificate and statement for one consumer scope.
+#[doc(hidden)]
+pub fn session_consumer_roster_scope_commitment(scope: SessionConsumerScope) -> [u8; 32] {
+    crate::fenced_mutation_roster_transport::protected_roster_scope_from_consumer_scope(scope)
+        .digest()
+}
+
+/// Return the fixed operation tag and canonical opaque capsule digest for a
+/// protected-roster ingress statement.
+///
+/// This deliberately does not decode the capsule. The dedicated ingress
+/// service verifies the resulting statement before it hands exact bytes to
+/// the roster transport decoder.
+#[doc(hidden)]
+pub fn session_consumer_roster_ingress_operation(
+    operation: &SessionConsumerOperation,
+) -> Result<(u8, [u8; 32]), SessionConsumerRosterRejection> {
+    let (tag, capsule) = match operation {
+        SessionConsumerOperation::FencedMutationRosterPollAdmit { request } => {
+            (1_u8, request.canonical_bytes())
+        }
+        SessionConsumerOperation::FencedMutationRosterAdmissionStatus { request } => {
+            (2_u8, request.canonical_bytes())
+        }
+        SessionConsumerOperation::FencedMutationRosterRecover { request } => {
+            (3_u8, request.canonical_bytes())
+        }
+        SessionConsumerOperation::FencedMutationRosterTerminalize { request } => {
+            (4_u8, request.canonical_bytes())
+        }
+        SessionConsumerOperation::FencedMutationRosterTerminalStatus { request } => {
+            (5_u8, request.canonical_bytes())
+        }
+        SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority { request } => {
+            // This structured capsule is itself the canonical authenticated
+            // input to the dedicated revision-five ingress discriminator.
+            // Serialize only after its operation-level validation above.
+            let capsule = serde_json::to_vec(request.as_ref())
+                .map_err(|_| SessionConsumerRosterRejection::Malformed)?;
+            return Ok((
+                6_u8,
+                crate::fenced_mutation_roster::roster_ingress_capsule_commitment(6_u8, &capsule)
+                    .map_err(|_| SessionConsumerRosterRejection::Capability)?,
+            ));
+        }
+        _ => return Err(SessionConsumerRosterRejection::Capability),
+    };
+    let digest = crate::fenced_mutation_roster::roster_ingress_capsule_commitment(tag, capsule)
+        .map_err(|_| SessionConsumerRosterRejection::Capability)?;
+    Ok((tag, digest))
 }
 
 /// Convert an application batch result into its wire-safe counterpart.
@@ -1836,10 +3549,54 @@ pub(crate) fn consumer_request_commitment(
 
     let encoded =
         serde_json::to_vec(request).map_err(|_| SessionConsumerRejection::MalformedRequest)?;
+    #[cfg(test)]
+    {
+        let _ = CONSUMER_REQUEST_COMMITMENT_V2_TEST_COUNTERS.try_with(|counters| {
+            counters.record(encoded.len());
+        });
+    }
     let mut digest = Sha256::new();
-    digest.update(b"openpacketcore/session-consumer/request-commitment/v1\\0");
+    // Keep the ordinary request commitment domain at v2 after the removed
+    // prepared wire field changed the serialized shape. A reused legacy
+    // binding can therefore only conflict closed; no v1 interpretation is
+    // accepted.
+    digest.update(b"openpacketcore/session-consumer/request-commitment/v2\\0");
     digest.update(encoded);
     Ok(digest.finalize().into())
+}
+
+/// Test-only accounting for whole-request v2 commitment serialization. The
+/// task-local scope keeps allocation evidence isolated when the test runner
+/// executes unrelated consumer calls concurrently. The production path
+/// retains no metrics labels, request IDs, or payload copies.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ConsumerRequestCommitmentV2TestCounters {
+    serializations: AtomicUsize,
+    serialized_bytes: AtomicUsize,
+}
+
+#[cfg(test)]
+impl ConsumerRequestCommitmentV2TestCounters {
+    fn record(&self, encoded_bytes: usize) {
+        self.serializations.fetch_add(1, Ordering::Relaxed);
+        self.serialized_bytes
+            .fetch_add(encoded_bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn serializations(&self) -> usize {
+        self.serializations.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn serialized_bytes(&self) -> usize {
+        self.serialized_bytes.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static CONSUMER_REQUEST_COMMITMENT_V2_TEST_COUNTERS:
+        Arc<ConsumerRequestCommitmentV2TestCounters>;
 }
 
 /// Derive the operation-specific durable consensus request ID from an
@@ -1851,9 +3608,22 @@ pub fn derive_consumer_consensus_request_id(
     request: &SessionConsumerRequest,
     slot: u16,
 ) -> Result<SessionConsensusRequestId, SessionConsumerRejection> {
+    let commitment = consumer_request_commitment(request)?;
+    Ok(derive_consumer_consensus_request_id_from_commitment(
+        identity, commitment, slot,
+    ))
+}
+
+/// Derive an operation receipt ID from one already-authenticated full request
+/// commitment. Receipt lookup uses this to avoid serializing the retained body
+/// a second time after the service has validated it.
+pub(crate) fn derive_consumer_consensus_request_id_from_commitment(
+    identity: &SessionConsumerIdentity,
+    commitment: [u8; 32],
+    slot: u16,
+) -> SessionConsensusRequestId {
     use sha2::{Digest, Sha256};
 
-    let commitment = consumer_request_commitment(request)?;
     let mut digest = Sha256::new();
     digest.update(b"openpacketcore/session-consumer/operation-request-id/v2\\0");
     digest.update(
@@ -1867,7 +3637,7 @@ pub fn derive_consumer_consensus_request_id(
     let hash: [u8; 32] = digest.finalize().into();
     let mut request_bytes = [0_u8; SESSION_CONSUMER_REQUEST_ID_BYTES];
     request_bytes.copy_from_slice(&hash[..SESSION_CONSUMER_REQUEST_ID_BYTES]);
-    Ok(SessionConsensusRequestId::from_bytes(request_bytes))
+    SessionConsensusRequestId::from_bytes(request_bytes)
 }
 
 /// Rebuild a transition for the internal receipt ledger without exposing that
@@ -1930,25 +3700,51 @@ pub trait StatelessSessionConsumer: Send + Sync {}
 mod tests {
     use super::{
         derive_consumer_consensus_request_id, derive_consumer_fenced_transition_request,
-        SessionConsumerFencedTransitionError, SessionConsumerFencedTransitionStatus,
-        SessionConsumerIdentity, SessionConsumerOperation, SessionConsumerRejection,
-        SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerScope,
-        SessionConsumerStoreError, SessionConsumerV2FencedTransitionError,
-        SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation,
-        SessionConsumerV2Request, SessionConsumerV2Response,
+        SessionConsumerAuthorizationGrant, SessionConsumerAuthorizationGrantError,
+        SessionConsumerAuthorizationManifestError, SessionConsumerFencedTransitionError,
+        SessionConsumerFencedTransitionStatus, SessionConsumerIdentity, SessionConsumerOperation,
+        SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+        SessionConsumerRoster, SessionConsumerRosterError, SessionConsumerScope,
+        SessionConsumerStoreError, SessionConsumerTenantNfScope,
+        SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
+        SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+        SESSION_CONSUMER_IDENTITY_MAX_BYTES,
     };
     use crate::{
         AtomicFencedTransitionCapability, FenceToken, FencedTransitionLease,
         FencedTransitionMutation, FencedTransitionRequest, FencedTransitionRequestId,
         FencedTransitionStatus, FencedTransitionV2CallerNonce, FencedTransitionV2Capability,
         FencedTransitionV2HistoryEpoch, FencedTransitionV2Request, FencedTransitionV2Status,
-        Generation, OwnerId, SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
-        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionKey, SessionKeyType,
-        StableId, StoreError,
+        Generation, OwnerId, QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint,
+        ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest, RestoreScanScope,
+        SessionConsensusClusterId, SessionConsensusConfigurationEpoch,
+        SessionConsensusConfigurationId, SessionConsensusIdentity, SessionConsensusNodeId,
+        SessionKey, SessionKeyType, SessionOp, StableId, StoreError, QUORUM_TOPOLOGY_MAX_MEMBERS,
     };
     use bytes::Bytes;
-    use opc_types::{NetworkFunctionKind, TenantId};
+    use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+    use std::collections::BTreeSet;
     use std::time::Duration;
+
+    #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+    enum LegacySessionConsumerStoreError {
+        NotFound,
+        StaleFence,
+        CasConflict,
+        RequestConflict,
+        OutcomeUnavailable,
+        Unavailable,
+        InvalidInput,
+        CapabilityNotSupported,
+        WatchCatchUpRequired,
+        RestoreRejected,
+        RestoreCursorStale,
+        RestoreBudgetExceeded,
+        InvalidTtl,
+        LeaseUnavailable,
+        PayloadTooLarge,
+        ProtectedDataRejected,
+    }
 
     fn scope(configuration: u8, epoch: u64) -> SessionConsumerScope {
         SessionConsumerScope::new(SessionConsensusIdentity::new(
@@ -1956,6 +3752,387 @@ mod tests {
             SessionConsensusConfigurationId::from_bytes([configuration; 32]),
             SessionConsensusConfigurationEpoch::new(epoch).expect("non-zero configuration epoch"),
         ))
+    }
+
+    fn roster_scope(cluster: u8, configuration: u8, epoch: u64) -> SessionConsumerScope {
+        SessionConsumerScope::new(SessionConsensusIdentity::new(
+            SessionConsensusClusterId::from_bytes([cluster; 32]),
+            SessionConsensusConfigurationId::from_bytes([configuration; 32]),
+            SessionConsensusConfigurationEpoch::new(epoch).expect("non-zero configuration epoch"),
+        ))
+    }
+
+    fn roster_nodes(values: &[u64]) -> BTreeSet<SessionConsensusNodeId> {
+        values
+            .iter()
+            .copied()
+            .map(|value| SessionConsensusNodeId::new(value).expect("valid roster node ID"))
+            .collect()
+    }
+
+    fn roster_descriptor(node: u64, tls_identity: impl Into<String>) -> QuorumReplicaDescriptor {
+        QuorumReplicaDescriptor::new(
+            ReplicaId::new(format!("consumer-roster-node-{node}")).expect("replica ID"),
+            ReplicaEndpoint::new(format!("consumer-roster-node-{node}.test.invalid"), 7443)
+                .expect("endpoint"),
+            ReplicaTlsIdentity::new(tls_identity).expect("TLS identity"),
+            ReplicaFailureDomain::new(format!("consumer-roster-zone-{node}"))
+                .expect("failure domain"),
+            ReplicaBackingIdentity::new(format!("consumer-roster-backing-{node}"))
+                .expect("backing identity"),
+        )
+    }
+
+    fn roster_descriptors() -> Vec<(u64, QuorumReplicaDescriptor)> {
+        vec![
+            (
+                1,
+                roster_descriptor(1, "spiffe://test.invalid/consumer-roster/one"),
+            ),
+            (
+                2,
+                roster_descriptor(2, "spiffe://test.invalid/consumer-roster/two"),
+            ),
+        ]
+    }
+
+    fn authorization_fixture() -> (super::SessionConsumerAuthorization, SessionKey) {
+        let scope = roster_scope(9, 8, 7);
+        let node_id = SessionConsensusNodeId::new(1).expect("roster node");
+        let roster = SessionConsumerRoster::try_new(
+            scope,
+            &roster_nodes(&[1]),
+            vec![(
+                (node_id.get()),
+                roster_descriptor(1, "spiffe://test.invalid/consumer-roster/voter"),
+            )],
+        )
+        .expect("validated roster");
+        let identity = SessionConsumerIdentity::new(
+            "spiffe://test.invalid/tenant/tenant-a/ns/default/sa/app/nf/smf/instance/one",
+        )
+        .expect("consumer identity");
+        let grant = SessionConsumerAuthorizationGrant::try_new(
+            SpiffeId::new(identity.as_str()).expect("canonical SPIFFE ID"),
+            [SessionConsumerTenantNfScope::new(
+                TenantId::from_static("tenant-a"),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("consumer grant");
+        let manifest = roster
+            .authorization_manifest(node_id, [grant])
+            .expect("authorization manifest");
+        let key = SessionKey {
+            tenant: TenantId::from_static("tenant-a"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from_static(b"authorized-key")).expect("stable ID"),
+        };
+        (
+            manifest.authorize(&identity).expect("authorization token"),
+            key,
+        )
+    }
+
+    #[test]
+    fn explicit_grants_reject_duplicate_scopes_and_identities() {
+        let identity = SpiffeId::new(
+            "spiffe://test.invalid/tenant/tenant-a/ns/default/sa/app/nf/smf/instance/one",
+        )
+        .expect("canonical SPIFFE ID");
+        let scope = SessionConsumerTenantNfScope::new(
+            TenantId::from_static("tenant-a"),
+            NetworkFunctionKind::smf(),
+        );
+        assert!(matches!(
+            SessionConsumerAuthorizationGrant::try_new(identity.clone(), [scope.clone(), scope]),
+            Err(SessionConsumerAuthorizationGrantError::DuplicateScope)
+        ));
+
+        let roster_scope = roster_scope(9, 8, 7);
+        let node_id = SessionConsensusNodeId::new(1).expect("roster node");
+        let roster = SessionConsumerRoster::try_new(
+            roster_scope,
+            &roster_nodes(&[1]),
+            vec![(
+                1,
+                roster_descriptor(1, "spiffe://test.invalid/consumer-roster/voter"),
+            )],
+        )
+        .expect("validated roster");
+        let grant = || {
+            SessionConsumerAuthorizationGrant::try_new(
+                identity.clone(),
+                [SessionConsumerTenantNfScope::new(
+                    TenantId::from_static("tenant-a"),
+                    NetworkFunctionKind::smf(),
+                )],
+            )
+            .expect("grant")
+        };
+        assert!(matches!(
+            roster.authorization_manifest(node_id, [grant(), grant()]),
+            Err(SessionConsumerAuthorizationManifestError::DuplicateIdentity)
+        ));
+    }
+
+    #[test]
+    fn authorization_requires_exact_scope_and_denies_global_watch() {
+        let (authorization, key) = authorization_fixture();
+        let roster_authorization = authorization.roster_authorization();
+        let foreign = SessionKey {
+            tenant: TenantId::from_static("tenant-z"),
+            ..key.clone()
+        };
+        let wrong_nf = SessionKey {
+            nf_kind: NetworkFunctionKind::amf(),
+            ..key.clone()
+        };
+        assert_eq!(
+            roster_authorization.authorize_session_key(&key),
+            Ok(()),
+            "the narrow roster token admits its exact tenant/NF grant"
+        );
+        assert_eq!(
+            roster_authorization.authorize_session_key(&foreign),
+            Err(SessionConsumerRejection::Unauthorized),
+            "the narrow roster token rejects a foreign tenant"
+        );
+        assert_eq!(
+            roster_authorization.authorize_session_key(&wrong_nf),
+            Err(SessionConsumerRejection::Unauthorized),
+            "the narrow roster token rejects an ungranted NF"
+        );
+        assert_eq!(
+            format!("{roster_authorization:?}"),
+            "SessionConsumerRosterAuthorization(<redacted>)"
+        );
+        assert_eq!(
+            roster_authorization.identity(),
+            authorization.identity(),
+            "roster ingress can bind the same authenticated identity without grant enumeration"
+        );
+        assert_eq!(
+            authorization.authorize_operation(&SessionConsumerOperation::Get {
+                key: foreign.clone()
+            }),
+            Err(SessionConsumerRejection::Unauthorized),
+            "an ungranted third tenant is never inferred from the SPIFFE ID"
+        );
+        assert_eq!(
+            authorization.authorize_operation(&SessionConsumerOperation::Batch {
+                ops: vec![
+                    SessionOp::Get { key: key.clone() },
+                    SessionOp::Get {
+                        key: foreign.clone()
+                    }
+                ],
+            }),
+            Err(SessionConsumerRejection::Unauthorized),
+            "every bounded batch slot is checked before dispatch"
+        );
+        assert_eq!(
+            authorization.authorize_operation(&SessionConsumerOperation::ScanRestoreRecords {
+                request: RestoreScanRequest {
+                    scope: RestoreScanScope {
+                        tenant: Some(key.tenant.clone()),
+                        ..RestoreScanScope::all()
+                    },
+                    cursor: None,
+                    limit: 1,
+                },
+            }),
+            Err(SessionConsumerRejection::Unauthorized),
+            "restore requires both exact tenant and NF instead of a prefix filter"
+        );
+        assert!(authorization
+            .authorize_operation(&SessionConsumerOperation::ScanRestoreRecords {
+                request: RestoreScanRequest {
+                    scope: RestoreScanScope {
+                        tenant: Some(key.tenant.clone()),
+                        nf_kind: Some(key.nf_kind.clone()),
+                        ..RestoreScanScope::all()
+                    },
+                    cursor: None,
+                    limit: 1,
+                },
+            })
+            .is_ok());
+        assert_eq!(
+            authorization
+                .authorize_operation(&SessionConsumerOperation::Watch { start_sequence: 77 }),
+            Err(SessionConsumerRejection::Unauthorized),
+            "a global sequence would reveal foreign-tenant mutation timing even after item filtering"
+        );
+    }
+
+    #[test]
+    fn consumer_roster_is_sorted_and_commits_every_scope_and_member_component() {
+        let scope = roster_scope(1, 2, 3);
+        let expected_nodes = roster_nodes(&[1, 2]);
+        let roster = SessionConsumerRoster::try_new(
+            scope,
+            &expected_nodes,
+            vec![
+                (
+                    2,
+                    roster_descriptor(2, "spiffe://test.invalid/consumer-roster/two"),
+                ),
+                (
+                    1,
+                    roster_descriptor(1, "spiffe://test.invalid/consumer-roster/one"),
+                ),
+            ],
+        )
+        .expect("complete roster");
+        let reordered =
+            SessionConsumerRoster::try_new(scope, &expected_nodes, roster_descriptors())
+                .expect("reordered complete roster");
+
+        assert_eq!(
+            roster
+                .consensus_members()
+                .map(|member| (member.node_id().get(), member.tls_identity().to_owned()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "spiffe://test.invalid/consumer-roster/one".to_owned()),
+                (2, "spiffe://test.invalid/consumer-roster/two".to_owned()),
+            ]
+        );
+        assert_eq!(roster.roster_commitment(), reordered.roster_commitment());
+        let commitment = roster.roster_commitment();
+        for changed_scope in [
+            roster_scope(4, 2, 3),
+            roster_scope(1, 5, 3),
+            roster_scope(1, 2, 6),
+        ] {
+            assert_ne!(
+                commitment,
+                SessionConsumerRoster::try_new(
+                    changed_scope,
+                    &expected_nodes,
+                    roster_descriptors()
+                )
+                .expect("changed scope roster")
+                .roster_commitment()
+            );
+        }
+        assert_ne!(
+            commitment,
+            SessionConsumerRoster::try_new(
+                scope,
+                &expected_nodes,
+                vec![
+                    (
+                        1,
+                        roster_descriptor(1, "spiffe://test.invalid/consumer-roster/replaced")
+                    ),
+                    (
+                        2,
+                        roster_descriptor(2, "spiffe://test.invalid/consumer-roster/two")
+                    ),
+                ],
+            )
+            .expect("changed TLS roster")
+            .roster_commitment()
+        );
+        let changed_nodes = roster_nodes(&[1, 7]);
+        assert_ne!(
+            commitment,
+            SessionConsumerRoster::try_new(
+                scope,
+                &changed_nodes,
+                vec![
+                    (
+                        1,
+                        roster_descriptor(1, "spiffe://test.invalid/consumer-roster/one")
+                    ),
+                    (
+                        7,
+                        roster_descriptor(7, "spiffe://test.invalid/consumer-roster/two")
+                    ),
+                ],
+            )
+            .expect("changed node roster")
+            .roster_commitment()
+        );
+        assert!(!format!("{roster:?}").contains("consumer-roster/one"));
+        assert_eq!(
+            format!("{:?}", roster.roster_commitment()),
+            "SessionConsumerRosterCommitment(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn consumer_roster_rejects_invalid_duplicate_and_scope_mismatched_bindings() {
+        let scope = roster_scope(1, 2, 3);
+        let one_member = roster_nodes(&[1]);
+        let two_members = roster_nodes(&[1, 2]);
+        let valid = roster_descriptor(1, "spiffe://test.invalid/consumer-roster/one");
+
+        assert!(matches!(
+            SessionConsumerRoster::try_new(scope, &BTreeSet::new(), std::iter::empty()),
+            Err(SessionConsumerRosterError::Empty)
+        ));
+        let oversized_values = (1..=(QUORUM_TOPOLOGY_MAX_MEMBERS as u64 + 1)).collect::<Vec<_>>();
+        assert!(matches!(
+            SessionConsumerRoster::try_new(
+                scope,
+                &roster_nodes(&oversized_values),
+                std::iter::empty()
+            ),
+            Err(SessionConsumerRosterError::MemberCountTooLarge)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(
+                scope,
+                &one_member,
+                vec![
+                    (1, valid.clone()),
+                    (
+                        1,
+                        roster_descriptor(1, "spiffe://test.invalid/consumer-roster/other")
+                    ),
+                ],
+            ),
+            Err(SessionConsumerRosterError::DuplicateNodeId)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(
+                scope,
+                &two_members,
+                vec![(1, valid.clone()), (2, valid.clone())],
+            ),
+            Err(SessionConsumerRosterError::DuplicateTlsIdentity)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(scope, &one_member, vec![(0, valid.clone())]),
+            Err(SessionConsumerRosterError::InvalidNodeId)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(
+                scope,
+                &one_member,
+                vec![(i64::MAX as u64 + 1, valid.clone())],
+            ),
+            Err(SessionConsumerRosterError::InvalidNodeId)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(
+                scope,
+                &one_member,
+                vec![(
+                    1,
+                    roster_descriptor(1, "x".repeat(SESSION_CONSUMER_IDENTITY_MAX_BYTES + 1)),
+                )],
+            ),
+            Err(SessionConsumerRosterError::InvalidTlsIdentity)
+        ));
+        assert!(matches!(
+            SessionConsumerRoster::try_new(scope, &two_members, vec![(1, valid)]),
+            Err(SessionConsumerRosterError::ScopeMismatch)
+        ));
     }
 
     #[test]
@@ -2079,6 +4256,16 @@ mod tests {
         };
         fields.insert("unexpected".into(), serde_json::Value::Bool(true));
         assert!(serde_json::from_value::<SessionConsumerRequest>(root_unknown).is_err());
+
+        let mut legacy_prepared_authority = encoded.clone();
+        let serde_json::Value::Object(fields) = &mut legacy_prepared_authority else {
+            panic!("request is an object");
+        };
+        fields.insert("prepared_authority".into(), serde_json::Value::Bool(true));
+        assert!(
+            serde_json::from_value::<SessionConsumerRequest>(legacy_prepared_authority).is_err(),
+            "legacy prepared wire authority is an unknown field"
+        );
 
         let mut operation_unknown = encoded;
         let serde_json::Value::Object(fields) = &mut operation_unknown else {
@@ -2507,6 +4694,110 @@ mod tests {
                 .expect("V1 storage exhausted postcard encodes"),
             vec![5],
             "the frozen V1 StorageExhausted discriminant remains ordinal five"
+        );
+    }
+
+    #[test]
+    fn session_record_reserved_store_error_is_append_only_and_round_trips() {
+        let legacy_pairs = [
+            (
+                SessionConsumerStoreError::NotFound,
+                LegacySessionConsumerStoreError::NotFound,
+            ),
+            (
+                SessionConsumerStoreError::StaleFence,
+                LegacySessionConsumerStoreError::StaleFence,
+            ),
+            (
+                SessionConsumerStoreError::CasConflict,
+                LegacySessionConsumerStoreError::CasConflict,
+            ),
+            (
+                SessionConsumerStoreError::RequestConflict,
+                LegacySessionConsumerStoreError::RequestConflict,
+            ),
+            (
+                SessionConsumerStoreError::OutcomeUnavailable,
+                LegacySessionConsumerStoreError::OutcomeUnavailable,
+            ),
+            (
+                SessionConsumerStoreError::Unavailable,
+                LegacySessionConsumerStoreError::Unavailable,
+            ),
+            (
+                SessionConsumerStoreError::InvalidInput,
+                LegacySessionConsumerStoreError::InvalidInput,
+            ),
+            (
+                SessionConsumerStoreError::CapabilityNotSupported,
+                LegacySessionConsumerStoreError::CapabilityNotSupported,
+            ),
+            (
+                SessionConsumerStoreError::WatchCatchUpRequired,
+                LegacySessionConsumerStoreError::WatchCatchUpRequired,
+            ),
+            (
+                SessionConsumerStoreError::RestoreRejected,
+                LegacySessionConsumerStoreError::RestoreRejected,
+            ),
+            (
+                SessionConsumerStoreError::RestoreCursorStale,
+                LegacySessionConsumerStoreError::RestoreCursorStale,
+            ),
+            (
+                SessionConsumerStoreError::RestoreBudgetExceeded,
+                LegacySessionConsumerStoreError::RestoreBudgetExceeded,
+            ),
+            (
+                SessionConsumerStoreError::InvalidTtl,
+                LegacySessionConsumerStoreError::InvalidTtl,
+            ),
+            (
+                SessionConsumerStoreError::LeaseUnavailable,
+                LegacySessionConsumerStoreError::LeaseUnavailable,
+            ),
+            (
+                SessionConsumerStoreError::PayloadTooLarge,
+                LegacySessionConsumerStoreError::PayloadTooLarge,
+            ),
+            (
+                SessionConsumerStoreError::ProtectedDataRejected,
+                LegacySessionConsumerStoreError::ProtectedDataRejected,
+            ),
+        ];
+        for (current, legacy) in legacy_pairs {
+            let current_bytes =
+                opc_consensus::encode_bounded(&current).expect("current consumer error encoding");
+            let legacy_bytes =
+                opc_consensus::encode_bounded(&legacy).expect("legacy consumer error encoding");
+            assert_eq!(current_bytes, legacy_bytes, "legacy ordinal changed");
+            opc_consensus::decode_bounded::<LegacySessionConsumerStoreError>(&current_bytes)
+                .expect("legacy decode of current consumer error");
+            assert_eq!(
+                opc_consensus::decode_bounded::<SessionConsumerStoreError>(&legacy_bytes)
+                    .expect("current decode of legacy consumer error"),
+                current
+            );
+        }
+
+        let current = SessionConsumerStoreError::SessionRecordReserved;
+        let encoded =
+            opc_consensus::encode_bounded(&current).expect("appended consumer error encoding");
+        assert!(
+            opc_consensus::decode_bounded::<LegacySessionConsumerStoreError>(&encoded).is_err()
+        );
+        assert_eq!(
+            opc_consensus::decode_bounded::<SessionConsumerStoreError>(&encoded)
+                .expect("current consumer error round trip"),
+            current
+        );
+        assert_eq!(
+            SessionConsumerStoreError::from(StoreError::SessionRecordReserved),
+            current
+        );
+        assert_eq!(
+            current.into_store_error(),
+            StoreError::SessionRecordReserved
         );
     }
 }

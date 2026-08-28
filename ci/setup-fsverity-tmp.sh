@@ -25,3 +25,8 @@ sudo chown "$(id -u):$(id -g)" "${mountpoint}"
 # production kernel seal. A runner filesystem without the verity superblock
 # feature must not turn those tests into observational-hash coverage.
 printf 'TMPDIR=%s\n' "${mountpoint}" >> "${GITHUB_ENV}"
+# The fs-verity sys crate keeps a portable unit-test path for developer
+# machines. CI sets this marker only after mounting the dedicated ext4 image,
+# so its qualification test fails rather than skipping if that filesystem
+# cannot seal an artifact.
+printf '%s\n' 'OPC_FS_VERITY_QUALIFICATION=required' >> "${GITHUB_ENV}"

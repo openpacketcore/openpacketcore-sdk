@@ -17,17 +17,20 @@ use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use opc_consensus::engine::{EmptyNode, Membership, StoredMembership, Vote};
-use opc_consensus::{decode_bounded, encode_bounded, ConsensusCodecError};
+use opc_consensus::engine::{EmptyNode, EntryPayload, Membership, StoredMembership, Vote};
+use opc_consensus::{
+    decode_bounded, decode_roster_bounded, encode_bounded, encode_roster_bounded,
+    ConsensusCodecError,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use thiserror::Error;
 
 use super::{
-    SessionConsensusIdentity, SessionConsensusNodeId, SessionConsensusPeer,
-    SessionConsensusPeerError, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
-    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionRaft, SessionRaftTypeConfig,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
+    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionMutationIntent, SessionRaft, SessionRaftTypeConfig, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
 use crate::readiness::PlacementResiliencePolicy;
@@ -1002,13 +1005,20 @@ impl SessionRaftNetwork {
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<SessionConsensusNodeId>, EngineRpcError> {
         let entry_count = request.entries.len();
-        let payload = match encode_bounded(request) {
+        let roster_append = is_singleton_roster_append(request);
+        let payload = match if roster_append {
+            encode_roster_bounded(request)
+        } else {
+            encode_bounded(request)
+        } {
             Ok(payload) => payload,
             Err(ConsensusCodecError::TooLarge) => {
-                if let Some(entries_hint) = append_entries_split_hint(entry_count) {
-                    return Err(EngineRpcError::PayloadTooLarge(
-                        PayloadTooLarge::new_entries_hint(entries_hint),
-                    ));
+                if !roster_append {
+                    if let Some(entries_hint) = append_entries_split_hint(entry_count) {
+                        return Err(EngineRpcError::PayloadTooLarge(
+                            PayloadTooLarge::new_entries_hint(entries_hint),
+                        ));
+                    }
                 }
                 return Err(EngineRpcError::Unreachable(Unreachable::new(
                     &CodecTransportError(ConsensusCodecError::TooLarge),
@@ -1021,12 +1031,41 @@ impl SessionRaftNetwork {
             }
         };
         self.call(
-            SessionConsensusRpcFamily::AppendEntries,
+            if roster_append {
+                SessionConsensusRpcFamily::AppendEntriesRoster
+            } else {
+                SessionConsensusRpcFamily::AppendEntries
+            },
             opc_consensus::engine::RPCTypes::AppendEntries,
             payload,
             option,
         )
         .await
+    }
+}
+
+/// A roster-sized append envelope may carry exactly one normal protected-
+/// roster application command. Heartbeats and every other batching shape stay
+/// on ordinary AppendEntries so the relaxed payload ceiling is never generic.
+pub(crate) fn is_singleton_roster_append(
+    request: &AppendEntriesRequest<SessionRaftTypeConfig>,
+) -> bool {
+    match request.entries.as_slice() {
+        [entry] => match &entry.payload {
+            EntryPayload::Normal(SessionConsensusCommand { intent, .. }) => {
+                let intent = match intent {
+                    SessionMutationIntent::Authorized { mutation, .. } => mutation.as_ref(),
+                    intent => intent,
+                };
+                matches!(
+                    intent,
+                    SessionMutationIntent::RosterAdmission(_)
+                        | SessionMutationIntent::RosterTerminal(_)
+                )
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -1201,6 +1240,17 @@ impl SessionRaftRpcHandler {
                 };
                 encode_engine_result(&self.raft.append_entries(rpc).await)
             }
+            SessionConsensusRpcFamily::AppendEntriesRoster => {
+                let rpc = match decode_roster_and_bind_sender::<
+                    AppendEntriesRequest<SessionRaftTypeConfig>,
+                >(&request.payload, request.sender)
+                {
+                    Ok(rpc) if is_singleton_roster_append(&rpc) => rpc,
+                    Ok(_) => return rejected_response(SessionConsensusPeerError::Protocol),
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.append_entries(rpc).await)
+            }
             SessionConsensusRpcFamily::Vote => {
                 let rpc = match decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(
                     &request.payload,
@@ -1234,7 +1284,9 @@ impl SessionRaftRpcHandler {
                 }
                 encode_engine_result(&self.raft.install_snapshot(rpc).await)
             }
-            SessionConsensusRpcFamily::ForwardMutation | SessionConsensusRpcFamily::ReadBarrier => {
+            SessionConsensusRpcFamily::ForwardMutation
+            | SessionConsensusRpcFamily::ForwardRosterMutation
+            | SessionConsensusRpcFamily::ReadBarrier => {
                 return rejected_response(SessionConsensusPeerError::Rejected);
             }
             SessionConsensusRpcFamily::TopologyAdmissionBarrier => {
@@ -1298,6 +1350,7 @@ fn is_engine_rpc_family(family: SessionConsensusRpcFamily) -> bool {
         family,
         SessionConsensusRpcFamily::Vote
             | SessionConsensusRpcFamily::AppendEntries
+            | SessionConsensusRpcFamily::AppendEntriesRoster
             | SessionConsensusRpcFamily::InstallSnapshot
     )
 }
@@ -1332,6 +1385,21 @@ where
     T: DeserializeOwned + EngineRequestSender,
 {
     let request: T = decode_bounded(payload).map_err(|_| SessionConsensusPeerError::Protocol)?;
+    if request.vote().leader_id.voted_for() != Some(sender) {
+        return Err(SessionConsensusPeerError::ScopeMismatch);
+    }
+    Ok(request)
+}
+
+fn decode_roster_and_bind_sender<T>(
+    payload: &[u8],
+    sender: SessionConsensusNodeId,
+) -> Result<T, SessionConsensusPeerError>
+where
+    T: DeserializeOwned + EngineRequestSender,
+{
+    let request: T =
+        decode_roster_bounded(payload).map_err(|_| SessionConsensusPeerError::Protocol)?;
     if request.vote().leader_id.voted_for() != Some(sender) {
         return Err(SessionConsensusPeerError::ScopeMismatch);
     }
@@ -1373,7 +1441,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use opc_consensus::engine::storage::{RaftSnapshotBuilder, RaftStateMachine};
+    use opc_consensus::engine::storage::{
+        RaftLogStorage, RaftLogStorageExt, RaftSnapshotBuilder, RaftStateMachine,
+    };
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
     use opc_consensus::{durable_openraft_config, DurableOpenraftDomain};
     use opc_types::Timestamp;
@@ -1853,6 +1923,32 @@ mod tests {
             .expect("admit desired voting after joint proof");
     }
 
+    /// A follower that is about to be cut over by a final snapshot may already
+    /// retain that boundary locally, but must not apply it before the snapshot
+    /// replaces its state machine. Keep the test fixture at that honest Raft
+    /// frontier so the strict physical-prune proof has the exact floor row.
+    async fn append_uncommitted_uniform_entry(fixture: &RealFollowerFixture) {
+        let previous = LogId::new(CommittedLeaderId::new(1, fixture.leader), 5);
+        assert_append_success(
+            call_append_handler(
+                fixture,
+                fixture.current,
+                append_request(
+                    fixture,
+                    Some(previous),
+                    vec![membership_entry(
+                        fixture.leader,
+                        6,
+                        vec![fixture.desired_members.clone()],
+                        fixture.desired_members.clone(),
+                    )],
+                    Some(previous),
+                ),
+            )
+            .await,
+        );
+    }
+
     async fn wait_for_membership_writer(directory: &SessionRaftPeerDirectory) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
@@ -1985,6 +2081,7 @@ mod tests {
 
         let target = real_follower_fixture().await;
         apply_through_joint(&target).await;
+        append_uncommitted_uniform_entry(&target).await;
         let held_predecessor_rpc = target.directory.begin_engine_rpc().await;
         let final_chunk = InstallSnapshotRequest {
             vote: Vote::new_committed(1, target.leader),
@@ -2047,6 +2144,7 @@ mod tests {
 
         let cancelled = real_follower_fixture().await;
         apply_through_joint(&cancelled).await;
+        append_uncommitted_uniform_entry(&cancelled).await;
         let held_cancelled_predecessor = cancelled.directory.begin_engine_rpc().await;
         let cancelled_chunk = InstallSnapshotRequest {
             vote: Vote::new_committed(1, cancelled.leader),
@@ -2233,7 +2331,7 @@ mod tests {
         .expect("fixed follower network");
         let directory = network.peer_directory();
         let bindings = member_bindings(&members);
-        let (log_store, mut state_machine, storage_identity) =
+        let (mut log_store, mut state_machine, storage_identity) =
             storage::open_fixed_with_member_bindings(
                 &backend,
                 temp.path().join("snapshots"),
@@ -2246,13 +2344,17 @@ mod tests {
             .await
             .expect("fixed follower storage");
         if admitted {
+            let membership = membership_entry(leader, 0, vec![members.clone()], members.clone());
+            log_store
+                .blocking_append([membership.clone()])
+                .await
+                .expect("append exact fixed membership");
+            log_store
+                .save_committed(Some(membership.log_id))
+                .await
+                .expect("commit exact fixed membership");
             state_machine
-                .apply([membership_entry(
-                    leader,
-                    0,
-                    vec![members.clone()],
-                    members.clone(),
-                )])
+                .apply([membership])
                 .await
                 .expect("apply exact fixed membership");
         }
@@ -3574,10 +3676,16 @@ mod tests {
             SessionConsensusRpcFamily::AppendEntries
         ));
         assert!(is_engine_rpc_family(
+            SessionConsensusRpcFamily::AppendEntriesRoster
+        ));
+        assert!(is_engine_rpc_family(
             SessionConsensusRpcFamily::InstallSnapshot
         ));
         assert!(!is_engine_rpc_family(
             SessionConsensusRpcFamily::ForwardMutation
+        ));
+        assert!(!is_engine_rpc_family(
+            SessionConsensusRpcFamily::ForwardRosterMutation
         ));
         assert!(!is_engine_rpc_family(
             SessionConsensusRpcFamily::ReadBarrier

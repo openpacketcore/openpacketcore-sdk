@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpacketcore.dev/schemas/session-ha-persistent-consumer-head-evidence/v9",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_kind",
+    "experimental",
+    "qualification_complete",
+    "provenance",
+    "invocation",
+    "bindings",
+    "process_ledger",
+    "release_gate",
+    "lanes",
+    "members",
+    "authenticated_setup_successes",
+    "warm_reused_calls",
+    "fixed_labels_only",
+    "identifying_values_recorded"
+  ],
+  "properties": {
+    "schema_version": {"const": "opc-session-ha-persistent-consumer-head-evidence/v9"},
+    "evidence_kind": {"const": "persistent-consumer-executed-lanes"},
+    "experimental": {"const": true},
+    "qualification_complete": {"const": true},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "invocation": {"$ref": "#/$defs/invocation"},
+    "bindings": {"$ref": "#/$defs/bindings"},
+    "process_ledger": {"$ref": "#/$defs/process"},
+    "release_gate": {"$ref": "#/$defs/release_gate"},
+    "lanes": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {"$ref": "#/$defs/general_lane"},
+        {"$ref": "#/$defs/protected_roster_lane"}
+      ],
+      "items": false
+    },
+    "members": {"const": 3},
+    "authenticated_setup_successes": {"type": "integer", "minimum": 48, "maximum": 9007199254740991},
+    "warm_reused_calls": {"type": "integer", "minimum": 1000, "maximum": 9007199254740991},
+    "fixed_labels_only": {"const": true},
+    "identifying_values_recorded": {"const": false}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "absolute_path": {"type": "string", "pattern": "^/.*$", "minLength": 1, "maxLength": 4096},
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_revision", "source_tree", "source_tree_status", "source_worktree_sha256"],
+      "properties": {
+        "source_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "source_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "source_tree_status": {"const": "clean"},
+        "source_worktree_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "invocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "test_id",
+        "argv_sha256",
+        "run_id_sha256",
+        "cargo_executable_alias",
+        "cargo_executable",
+        "cargo_executable_sha256",
+        "cargo_executable_mode",
+        "canonical_cargo_argv",
+        "reproduction_command"
+      ],
+      "properties": {
+        "test_id": {"const": "three_process_projected_mtls_persistent_v2_batch_release_gate"},
+        "argv_sha256": {"$ref": "#/$defs/sha256"},
+        "run_id_sha256": {"$ref": "#/$defs/sha256"},
+        "cargo_executable_alias": {"$ref": "#/$defs/absolute_path"},
+        "cargo_executable": {"$ref": "#/$defs/absolute_path"},
+        "cargo_executable_sha256": {"$ref": "#/$defs/sha256"},
+        "cargo_executable_mode": {"type": "integer", "minimum": 1, "maximum": 4095},
+        "canonical_cargo_argv": {
+          "type": "array",
+          "minItems": 15,
+          "maxItems": 15,
+          "prefixItems": [
+            {"const": "cargo"},
+            {"const": "test"},
+            {"const": "--locked"},
+            {"const": "--release"},
+            {"const": "-p"},
+            {"const": "opc-session-testkit"},
+            {"const": "--test"},
+            {"const": "qualification_mtls_multiprocess"},
+            {"const": "--no-default-features"},
+            {"const": "three_process_projected_mtls_persistent_v2_batch_release_gate"},
+            {"const": "--"},
+            {"const": "--ignored"},
+            {"const": "--exact"},
+            {"const": "--test-threads=1"},
+            {"const": "--nocapture"}
+          ],
+          "items": false
+        },
+        "reproduction_command": {"type": "string", "minLength": 1, "maxLength": 16384}
+      }
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v9_schema_sha256",
+        "harness_sha256",
+        "child_sha256",
+        "executable_sha256",
+        "v1_canonical_sha256",
+        "cargo_target_directory",
+        "cargo_target_directory_sha256",
+        "evidence_root_directory",
+        "evidence_root_directory_sha256",
+        "pair_directory",
+        "pair_directory_sha256"
+      ],
+      "properties": {
+        "v9_schema_sha256": {"$ref": "#/$defs/sha256"},
+        "harness_sha256": {"$ref": "#/$defs/sha256"},
+        "child_sha256": {"$ref": "#/$defs/sha256"},
+        "executable_sha256": {"$ref": "#/$defs/sha256"},
+        "v1_canonical_sha256": {"$ref": "#/$defs/sha256"},
+        "cargo_target_directory": {"$ref": "#/$defs/absolute_path"},
+        "cargo_target_directory_sha256": {"$ref": "#/$defs/sha256"},
+        "evidence_root_directory": {"$ref": "#/$defs/absolute_path"},
+        "evidence_root_directory_sha256": {"$ref": "#/$defs/sha256"},
+        "pair_directory": {"$ref": "#/$defs/absolute_path"},
+        "pair_directory_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initial_processes", "unclean_process_losses", "restarted_processes", "observed_process_generations", "release_gate_process_generations"],
+      "properties": {
+        "initial_processes": {"const": 3},
+        "unclean_process_losses": {"const": 2},
+        "restarted_processes": {"const": 1},
+        "observed_process_generations": {"const": 4},
+        "release_gate_process_generations": {"type": "integer", "minimum": 4, "maximum": 255}
+      }
+    },
+    "release_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_rotation_executed", "old_credential_rejected", "new_credential_rejected", "fixed_capacity_reclaimed", "durable_status_cardinality", "post_outcome_unknown_mutation_dispatches"],
+      "properties": {
+        "credential_rotation_executed": {"const": true},
+        "old_credential_rejected": {"const": true},
+        "new_credential_rejected": {"const": true},
+        "fixed_capacity_reclaimed": {"const": true},
+        "durable_status_cardinality": {"const": 12},
+        "post_outcome_unknown_mutation_dispatches": {"const": 0}
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["positive_observations", "negative_boundary_rejections"],
+      "properties": {
+        "positive_observations": {"type": "integer", "minimum": 1, "maximum": 255},
+        "negative_boundary_rejections": {"type": "integer", "minimum": 1, "maximum": 255}
+      }
+    },
+    "protected_tenant_authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["positive_observations", "negative_boundary_rejections"],
+      "properties": {
+        "positive_observations": {"type": "integer", "minimum": 1, "maximum": 255},
+        "negative_boundary_rejections": {"const": 3}
+      }
+    },
+    "lane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lane", "transport_revision", "application_revision", "sdk_protocol_revision", "consumer_alpn", "executed", "admission_operations", "status_operations", "before_leader_loss_operations", "after_leader_loss_operations", "after_restart_operations", "after_voter_loss_operations", "tenant_authority", "scope_authority", "fence_authority"],
+      "properties": {
+        "lane": {"type": "string"},
+        "transport_revision": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "application_revision": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "sdk_protocol_revision": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "consumer_alpn": {"type": "string"},
+        "executed": {"const": true},
+        "admission_operations": {"type": "integer", "minimum": 1, "maximum": 255},
+        "status_operations": {"type": "integer", "minimum": 1, "maximum": 255},
+        "before_leader_loss_operations": {"type": "integer", "minimum": 1, "maximum": 255},
+        "after_leader_loss_operations": {"type": "integer", "minimum": 1, "maximum": 255},
+        "after_restart_operations": {"type": "integer", "minimum": 1, "maximum": 255},
+        "after_voter_loss_operations": {"type": "integer", "minimum": 1, "maximum": 255},
+        "tenant_authority": {"$ref": "#/$defs/authority"},
+        "scope_authority": {"$ref": "#/$defs/authority"},
+        "fence_authority": {"$ref": "#/$defs/authority"}
+      }
+    },
+    "general_lane": {
+      "allOf": [
+        {"$ref": "#/$defs/lane"},
+        {"properties": {"lane": {"const": "general"}, "transport_revision": {"const": 6}, "application_revision": {"const": 3}, "sdk_protocol_revision": {"const": 5}, "consumer_alpn": {"const": "opc-session-consumer/1"}}}
+      ]
+    },
+    "protected_roster_lane": {
+      "allOf": [
+        {"$ref": "#/$defs/lane"},
+        {"properties": {"lane": {"const": "protected_roster"}, "transport_revision": {"const": 5}, "application_revision": {"const": 3}, "sdk_protocol_revision": {"const": 5}, "consumer_alpn": {"const": "opc-session-consumer/3"}, "tenant_authority": {"$ref": "#/$defs/protected_tenant_authority"}}}
+      ]
+    }
+  }
+}

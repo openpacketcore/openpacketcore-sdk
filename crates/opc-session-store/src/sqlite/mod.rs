@@ -8,6 +8,7 @@
 //! backend operation fails closed; Openraft's internal state-machine adapter
 //! is the only mutation and read-authority path.
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "test-vfs")]
@@ -35,8 +36,7 @@ use crate::{
     model::{OwnerId, SessionKey},
     record::{SessionPayloadEncoding, StoredSessionRecord},
     replication_watch::{
-        prepare_consumer_watch_registration, prepare_watch_registration, watch_backlog_query_limit,
-        ConsumerReplicationWatcher, ReplicationWatcher,
+        prepare_watch_registration, watch_backlog_query_limit, ReplicationWatcher,
     },
     restore::{RestoreScanPage, RestoreScanRequest},
     ttl::{checked_session_deadline, validate_session_ttl, validate_stored_record_expiry_at},
@@ -44,9 +44,96 @@ use crate::{
 
 pub mod audit;
 pub(crate) mod consensus;
+
+/// Non-production consensus timing hooks for deterministic integration tests.
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub mod test_support {
+    pub use super::consensus::{
+        protected_roster_terminal_apply_timing_test_guard,
+        protected_roster_terminal_apply_timings_for_test,
+        reset_protected_roster_terminal_apply_timings_for_test,
+        ProtectedRosterTerminalApplyTimings,
+    };
+}
+
 pub(crate) mod lease;
 pub(crate) mod ops;
 pub(crate) mod replication;
+
+#[cfg(all(test, target_os = "linux"))]
+std::thread_local! {
+    static REGULAR_READ_OPEN_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn reset_regular_read_open_attempts_for_test() {
+    REGULAR_READ_OPEN_ATTEMPTS.with(|attempts| attempts.set(0));
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn regular_read_open_attempts_for_test() -> usize {
+    REGULAR_READ_OPEN_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+/// Open a regular file through a descriptor-stable nofollow gate.
+///
+/// Linux first opens `path` as `O_PATH|O_NOFOLLOW`, rejects non-regular
+/// objects with fstat, then opens `/proc/self/fd/<pin>` for read and compares
+/// the resulting descriptor to that held object.  This prevents a FIFO,
+/// device, socket, or pathname replacement from gaining a readable-open
+/// authority before the regular-file check has happened.
+pub(crate) fn open_regular_read_nofollow(path: &Path) -> std::io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let mut path_options = OpenOptions::new();
+        path_options.read(true);
+        path_options.custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let path_pin = path_options.open(path)?;
+        let pinned_metadata = path_pin.metadata()?;
+        if !pinned_metadata.is_file() {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+
+        let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", path_pin.as_raw_fd()));
+        let mut read_options = OpenOptions::new();
+        read_options.read(true);
+        // This procfs magic link is the held O_PATH descriptor, rather than
+        // an untrusted name. O_NOFOLLOW would reject the magic link itself;
+        // the fstat comparison below proves the returned reader is exact.
+        read_options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK);
+        #[cfg(test)]
+        REGULAR_READ_OPEN_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+        let file = read_options.open(descriptor_path)?;
+        let observed = file.metadata()?;
+        if !observed.is_file()
+            || observed.dev() != pinned_metadata.dev()
+            || observed.ino() != pinned_metadata.ino()
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        Ok(file)
+    }
+}
 
 const SQLITE_SESSION_MAX_VALUE_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
 // Consensus retains its existing value profile until #683 raises the shared
@@ -482,9 +569,12 @@ fn operator_recovery_latch_exists(conn: &Connection) -> Result<bool, StoreError>
     if database_path.is_empty() {
         return Ok(false);
     }
-    consensus::read_operator_recovery_latch_sync(Path::new(&database_path))
-        .map(|latch| latch.is_some())
-        .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))
+    consensus::classify_operator_recovery_latch_with_connection_sync(
+        Path::new(&database_path),
+        conn,
+    )
+    .map(|classification| classification.latch().is_some())
+    .map_err(|_| StoreError::BackendUnavailable("session store operation failed".into()))
 }
 
 fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
@@ -506,6 +596,12 @@ fn consensus_identity_exists(conn: &Connection) -> Result<bool, StoreError> {
 #[allow(clippy::type_complexity)]
 pub struct SqliteSessionBackend {
     conn: Arc<tokio::sync::Mutex<Connection>>,
+    // A recovered terminal snapshot stays pinned from the connection-aware
+    // latch classifier through the first consensus-core initialization.  That
+    // core alone consumes the pending terminal record after using this exact
+    // descriptor; clones share the one-shot handoff rather than reopening the
+    // selected pathname.
+    terminal_recovery_handoff: Arc<StdMutex<Option<consensus::OperatorRecoveryTerminalHandoff>>>,
     // File-backed consensus acceptance reads use fixed WAL reader lanes instead
     // of waiting behind Raft log/state-machine writes on `conn`. This is a
     // store-level resource shared by every clone, never a caller or subscriber
@@ -541,9 +637,6 @@ pub struct SqliteSessionBackend {
     #[cfg(test)]
     pub(crate) fixed_quorum_durable_check_count: Arc<AtomicUsize>,
     watchers: Arc<tokio::sync::Mutex<Vec<ReplicationWatcher>>>,
-    consumer_watchers: Arc<tokio::sync::Mutex<Vec<ConsumerReplicationWatcher>>>,
-    #[cfg(test)]
-    pub(crate) consumer_watch_projection_count: Arc<AtomicUsize>,
     #[cfg(test)]
     pub(crate) watch_registration_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -820,13 +913,26 @@ impl SqliteSessionBackend {
     fn finish_file_open(path: &Path, conn: Connection) -> Result<Self, StoreError> {
         let database_path = std::fs::canonicalize(path)
             .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
-        if let Some(latch) =
-            consensus::read_operator_recovery_latch_sync(&database_path).map_err(|_| {
-                StoreError::BackendUnavailable(
-                    "session operator recovery latch is unavailable".into(),
-                )
-            })?
-        {
+        let database_bytes = std::fs::metadata(&database_path)
+            .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?
+            .len();
+        if database_bytes > crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES {
+            return Err(StoreError::BackendUnavailable(
+                "SQLite database exceeds the fixed snapshot extent".into(),
+            ));
+        }
+        // Install before the auxiliary latch reader opens the file. An
+        // existing image that cannot accept the common writer guard is never
+        // examined as a normal SDK database.
+        install_consensus_snapshot_extent_guard(&conn)?;
+        let classification =
+            consensus::classify_operator_recovery_latch_with_connection_sync(&database_path, &conn)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery latch is unavailable".into(),
+                    )
+                })?;
+        if let Some(latch) = classification.latch() {
             opc_redaction::metrics::METRICS
                 .session_operator_recovery_required
                 .store(1, std::sync::atomic::Ordering::Relaxed);
@@ -840,7 +946,19 @@ impl SqliteSessionBackend {
                     std::sync::atomic::Ordering::Relaxed,
                 );
         }
-        Self::new_with_conn(conn, false, Some(database_path))
+        let backend = Self::new_with_conn(conn, false, Some(database_path))?;
+        if let Some(handoff) = classification.into_terminal_handoff() {
+            backend
+                .terminal_recovery_handoff
+                .lock()
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session operator recovery handoff is unavailable".into(),
+                    )
+                })?
+                .replace(handoff);
+        }
+        Ok(backend)
     }
 
     /// Read the primary writer's fixed automatic-checkpoint fallback in a test.
@@ -1048,6 +1166,7 @@ impl SqliteSessionBackend {
 
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            terminal_recovery_handoff: Arc::new(StdMutex::new(None)),
             consensus_acceptance_reader_pool,
             database_path: database_path.map(Arc::new),
             checkpoint_vfs_name: None,
@@ -1084,9 +1203,6 @@ impl SqliteSessionBackend {
             #[cfg(test)]
             fixed_quorum_durable_check_count: Arc::new(AtomicUsize::new(0)),
             watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            consumer_watchers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            #[cfg(test)]
-            consumer_watch_projection_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             watch_registration_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
@@ -1440,9 +1556,116 @@ impl SqliteSessionBackend {
         self.database_path.is_some()
     }
 
+    /// Duplicate the exact SQLite main-database descriptor for a snapshot
+    /// lease acquired before consensus-core construction.
+    ///
+    /// The returned descriptor is tied to SQLite's live VFS object, not a
+    /// fresh pathname open.  File-backed stores fail closed if SQLite reports
+    /// a moved main file or if the canonical name no longer resolves to that
+    /// same object. In-memory stores have no descriptor and return `None`.
+    pub(crate) async fn duplicate_main_file_descriptor_for_snapshot_lease(
+        &self,
+    ) -> std::io::Result<Option<File>> {
+        let Some(database_path) = self.database_path.as_ref() else {
+            return Ok(None);
+        };
+        let connection = self.conn.lock().await;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let unavailable = || {
+                std::io::Error::other(
+                    "SQLite main file descriptor is unavailable for snapshot lease",
+                )
+            };
+            if opc_sqlite_file_control_sys::main_file_has_moved(&connection)
+                .map_err(|_| unavailable())?
+            {
+                return Err(unavailable());
+            }
+            let descriptor = opc_sqlite_file_control_sys::main_file_descriptor(&connection)
+                .map_err(|_| unavailable())?;
+            let path_pin = open_regular_read_nofollow(database_path.as_ref())?;
+            let path_metadata = path_pin.metadata()?;
+            let descriptor_metadata = descriptor.metadata()?;
+            if path_metadata.dev() != descriptor_metadata.dev()
+                || path_metadata.ino() != descriptor_metadata.ino()
+                || opc_sqlite_file_control_sys::main_file_has_moved(&connection)
+                    .map_err(|_| unavailable())?
+            {
+                return Err(unavailable());
+            }
+            Ok(Some(descriptor))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = connection;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "SQLite main file descriptor is unavailable for snapshot lease",
+            ))
+        }
+    }
+
     /// Fixed-dimension observation shared by the consensus snapshot builder.
     pub(crate) fn snapshot_observation(&self) -> Arc<consensus::SnapshotBuildObservation> {
         Arc::clone(&self.consensus_snapshot_observation)
+    }
+
+    /// Transfer the exact terminal recovery descriptor handoff to the first
+    /// consensus-core initialization.  A poisoned handoff is fail-closed: it
+    /// leaves the durable pending terminal sidecar in place for a later
+    /// process rather than admitting normal traffic.
+    pub(crate) fn take_terminal_recovery_handoff(
+        &self,
+    ) -> Result<Option<consensus::OperatorRecoveryTerminalHandoff>, StoreError> {
+        self.terminal_recovery_handoff
+            .lock()
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session operator recovery handoff is unavailable".into(),
+                )
+            })
+            .map(|mut handoff| handoff.take())
+    }
+
+    /// Restore a terminal handoff after consensus-core initialization aborts
+    /// before storage has validated and consumed it.  The handoff owns the
+    /// same pinned descriptors and sidecar incarnation captured at backend
+    /// open; putting it back is therefore a retry, never a pathname reopen.
+    ///
+    /// A populated slot is an internal lifecycle violation.  Callers must
+    /// fail closed rather than replacing a concurrent handoff.
+    pub(crate) fn restore_terminal_recovery_handoff(
+        &self,
+        handoff: consensus::OperatorRecoveryTerminalHandoff,
+    ) -> Result<(), StoreError> {
+        let mut slot = self.terminal_recovery_handoff.lock().map_err(|_| {
+            StoreError::BackendUnavailable(
+                "session operator recovery handoff is unavailable".into(),
+            )
+        })?;
+        if slot.is_some() {
+            return Err(StoreError::BackendUnavailable(
+                "session operator recovery handoff restore is unavailable".into(),
+            ));
+        }
+        *slot = Some(handoff);
+        Ok(())
+    }
+
+    /// Shared one-shot handoff slot retained by a constructed consensus core
+    /// until storage has consumed the pending terminal record.  It is not a
+    /// way to inspect or manufacture a handoff: the core uses it solely to
+    /// restore its still-owned exact descriptor evidence if a later storage
+    /// initialization stage aborts.
+    pub(crate) fn terminal_recovery_handoff_restore_slot(
+        &self,
+    ) -> Arc<StdMutex<Option<consensus::OperatorRecoveryTerminalHandoff>>> {
+        Arc::clone(&self.terminal_recovery_handoff)
     }
 
     #[cfg(test)]
@@ -1535,7 +1758,10 @@ impl SqliteSessionBackend {
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let database_latch = database_path
                 .as_deref()
-                .map(|path| consensus::read_operator_recovery_latch_sync(path))
+                .map(|path| {
+                    consensus::classify_operator_recovery_latch_with_connection_sync(path, conn)
+                        .map(|classification| classification.latch())
+                })
                 .transpose()
                 .map_err(|_| {
                     StoreError::BackendUnavailable(
@@ -1623,7 +1849,10 @@ impl SqliteSessionBackend {
         self.run_consensus_acceptance_read_task(move |conn| {
             let database_latch = database_path
                 .as_deref()
-                .map(|path| consensus::read_operator_recovery_latch_sync(path))
+                .map(|path| {
+                    consensus::classify_operator_recovery_latch_with_connection_sync(path, conn)
+                        .map(|classification| classification.latch())
+                })
                 .transpose()
                 .map_err(|_| {
                     StoreError::BackendUnavailable(
@@ -1796,7 +2025,10 @@ impl SqliteSessionBackend {
         self.run_consensus_acceptance_read_task(move |conn| {
             let database_latch = database_path
                 .as_deref()
-                .map(|path| consensus::read_operator_recovery_latch_sync(path))
+                .map(|path| {
+                    consensus::classify_operator_recovery_latch_with_connection_sync(path, conn)
+                        .map(|classification| classification.latch())
+                })
                 .transpose()
                 .map_err(|_| {
                     StoreError::BackendUnavailable(
@@ -1914,6 +2146,135 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read one exact immutable protected-roster admission and the effective
+    /// authority time under one backend lock after a caller-owned linearizable
+    /// barrier. The current authority may be the original live lease or a
+    /// strictly higher-fence successor; this path never allocates a consensus
+    /// request or advances logical time.
+    pub(crate) async fn consensus_protected_roster_admission_status(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        admission: crate::fenced_mutation_roster::Admission,
+        current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_admission_status_sync(
+                conn,
+                identity,
+                &admission,
+                &current_authority,
+                logical_time,
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Recover one exact protected roster under a valid strictly newer fence,
+    /// with effective authority time and state selected under one backend
+    /// lock after a caller-owned linearizable barrier. Missing remains
+    /// ambiguous.
+    pub(crate) async fn consensus_protected_roster_recovery(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        recovery: crate::fenced_mutation_roster_executor::RecoveryRequest,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_recovery_sync(
+                conn,
+                identity,
+                &recovery,
+                logical_time,
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Read one exact terminal body and effective authority time under one
+    /// backend lock after a caller-owned linearizable barrier. No status read
+    /// can select a new terminal phase or body.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn consensus_protected_roster_terminal_status(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        binding: crate::fenced_mutation_roster::RequestBindingKey,
+        registration_parts: ([u8; 32], crate::fenced_mutation_roster::RequestId, [u8; 32]),
+        current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
+        terminal_body_commitment: [u8; 32],
+        terminal_evidence: crate::fenced_mutation_roster::RosterCompactTerminalEvidenceV2,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_terminal_status_sync(
+                conn,
+                identity,
+                binding,
+                consensus::ProtectedRosterTerminalStatusRequest {
+                    registration_parts,
+                    current_authority: &current_authority,
+                    terminal_body_commitment,
+                    terminal_evidence: &terminal_evidence,
+                    logical_time,
+                },
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Resolve one complete Established publication identity and current
+    /// authority under one SQLite read task after the caller's linearizable
+    /// barrier.  This is intentionally read-only: it neither proposes nor
+    /// retains a consumer receipt.
+    pub(crate) async fn consensus_protected_roster_current_publication_authority(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        request: crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<opc_types::Timestamp, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            consensus::read_protected_roster_current_publication_authority_sync(
+                conn,
+                identity,
+                &request,
+                logical_time,
+            )?;
+            Ok(logical_time)
+        })
+        .await
+    }
+
     /// Check the bounded V1 activation certificate after a caller-owned
     /// consensus barrier.  A missing or stale certificate is a normal
     /// unsupported state; storage failure remains unavailable.
@@ -1932,6 +2293,31 @@ impl SqliteSessionBackend {
             )
             .map_err(|_| {
                 StoreError::BackendUnavailable("fenced transition activation is unavailable".into())
+            })
+        })
+        .await
+    }
+
+    /// Check the exact immutable protected-roster profile certificate after a
+    /// caller-owned consensus barrier. A generic V1 certificate is not
+    /// sufficient for this capability.
+    pub(crate) async fn consensus_protected_roster_profile_activation_matches_scope(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        scope_identity: crate::consensus::SessionConsensusIdentity,
+        voters: std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::protected_roster_profile_activation_matches_scope_sync(
+                conn,
+                storage_identity,
+                scope_identity,
+                &voters,
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "protected roster profile activation is unavailable".into(),
+                )
             })
         })
         .await
@@ -2083,6 +2469,59 @@ impl SqliteSessionBackend {
             tx.commit()
                 .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
             Ok(status)
+        })
+        .await
+    }
+
+    /// Read one prepared consumer compare-and-set receipt after a
+    /// caller-owned leader-linearizable barrier. This is a read-only query of
+    /// the existing consensus outcome ledger; it opens no prepared-CAS
+    /// journal and performs no schema or migration work.
+    pub(crate) async fn consensus_consumer_compare_and_set_status(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        lookup: consensus::ConsumerCompareAndSetReceiptLookup,
+    ) -> Result<crate::consumer::SessionConsumerCompareAndSetStatus, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let status = consensus::read_consumer_compare_and_set_status_sync(
+                &tx,
+                storage_identity,
+                lookup,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(status)
+        })
+        .await
+    }
+
+    /// Check one exact consumer binding before the leader decides whether a
+    /// marker proposal is necessary. This is a point read of the outcome
+    /// ledger, not a receipt barrier, mutation, or consensus proposal.
+    pub(crate) async fn consensus_consumer_request_binding_lookup(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        authority_identity: crate::consensus::SessionConsensusIdentity,
+        binding_request_id: crate::consensus::SessionConsensusRequestId,
+        request_commitment: [u8; 32],
+    ) -> Result<consensus::ConsumerRequestBindingLookup, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            let lookup = consensus::read_consumer_request_binding_sync(
+                &tx,
+                storage_identity,
+                authority_identity,
+                binding_request_id,
+                request_commitment,
+            )?;
+            tx.commit()
+                .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+            Ok(lookup)
         })
         .await
     }
@@ -2304,6 +2743,7 @@ impl SqliteSessionBackend {
     /// Whether an offline operator reset is awaiting its Openraft-committed
     /// recovery epoch. A pending replica may exchange Raft traffic and rejoin,
     /// but must not admit ordinary session operations or advertise readiness.
+    #[cfg(test)]
     pub(crate) async fn consensus_operator_recovery_pending(
         &self,
         identity: crate::consensus::SessionConsensusIdentity,
@@ -2321,7 +2761,10 @@ impl SqliteSessionBackend {
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
             let database_latch = database_path
                 .as_deref()
-                .map(|path| consensus::read_operator_recovery_latch_sync(path))
+                .map(|path| {
+                    consensus::classify_operator_recovery_latch_with_connection_sync(path, conn)
+                        .map(|classification| classification.latch())
+                })
                 .transpose()
                 .map_err(|_| {
                     StoreError::BackendUnavailable(
@@ -2492,43 +2935,6 @@ impl SqliteSessionBackend {
         Ok(stream.boxed())
     }
 
-    /// Subscribe an authenticated consumer to redacted committed changes.
-    ///
-    /// The raw replication backlog is projected while the ordinary watch
-    /// registration lock is held, which closes the capture/register race.
-    /// Live consumers then receive only compact projection envelopes through
-    /// their own byte-bounded registry; no raw replay entry is cloned per
-    /// consumer connection.
-    pub(crate) async fn consensus_consumer_watch(
-        &self,
-        start_sequence: u64,
-    ) -> Result<
-        futures_util::stream::BoxStream<'static, Result<crate::SessionConsumerChange, StoreError>>,
-        StoreError,
-    > {
-        let cursor = ReplicationWatchCursor::new(start_sequence);
-        // The ordinary watcher mutex serializes raw append notification with
-        // backlog capture. Keep it while adding the projected subscriber so a
-        // committed entry can land in neither source.
-        let _raw_watchers = self.watchers.lock().await;
-        let existing = self
-            .consensus_get_replication_log(
-                cursor.first_sequence(),
-                watch_backlog_query_limit(cursor),
-            )
-            .await?;
-        #[cfg(test)]
-        self.pause_after_watch_backlog_capture().await?;
-        let (stream, watcher) = prepare_consumer_watch_registration(cursor, existing)?;
-        let mut consumer_watchers = self.consumer_watchers.lock().await;
-        consumer_watchers.retain(|watcher| !watcher.is_closed());
-        if let Some(watcher) = watcher {
-            consumer_watchers.push(watcher);
-        }
-        use futures_util::StreamExt;
-        Ok(stream.boxed())
-    }
-
     #[cfg(test)]
     async fn pause_after_watch_backlog_capture(&self) -> Result<(), StoreError> {
         self.watch_backlog_captured.store(true, Ordering::SeqCst);
@@ -2564,6 +2970,93 @@ fn consensus_value_cap_stays_below_unexpanded_transport_contract() {
         SQLITE_CONSENSUS_MAX_VALUE_BYTES
     );
     assert!(backend.consensus_capabilities().max_value_bytes < SQLITE_SESSION_MAX_VALUE_BYTES);
+}
+
+#[cfg(test)]
+#[test]
+fn snapshot_page_guard_uses_the_actual_sparse_sqlite_page_size() {
+    let conn = Connection::open_in_memory().expect("open SQLite fixture");
+    install_consensus_snapshot_extent_guard(&conn).expect("install physical snapshot guard");
+    let page_size: u64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+        .expect("read SQLite page size")
+        .try_into()
+        .expect("positive SQLite page size");
+    let maximum_pages: i64 = conn
+        .query_row("PRAGMA max_page_count", [], |row| row.get(0))
+        .expect("read SQLite page bound");
+    assert_eq!(
+        u64::try_from(maximum_pages).expect("positive SQLite page bound") * page_size,
+        crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES / page_size * page_size
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn file_backed_snapshot_guard_reopens_and_read_only_validation_preserves_identity() {
+    let directory = tempfile::tempdir().expect("create SQLite fixture directory");
+    let path = directory.path().join("session.sqlite");
+    let backend = SqliteSessionBackend::open(&path).expect("create file-backed SQLite backend");
+    drop(backend);
+
+    // Exercise the production file-backed reopen path before inspecting the
+    // independently observable SQLite setting below.
+    let reopened_backend =
+        SqliteSessionBackend::open(&path).expect("reopen file-backed SQLite backend");
+    drop(reopened_backend);
+
+    // Every normal file-backed reopen reinstalls the writer guard at the
+    // actual SQLite page size. The query-only handle uses the independent
+    // extent validation instead, which cannot mutate the database identity.
+    let reopened = Connection::open(&path).expect("reopen SQLite fixture");
+    install_consensus_snapshot_extent_guard(&reopened).expect("reinstall physical guard");
+    let page_size: u64 = reopened
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+        .expect("read SQLite page size")
+        .try_into()
+        .expect("positive SQLite page size");
+    let maximum_pages: i64 = reopened
+        .query_row("PRAGMA max_page_count", [], |row| row.get(0))
+        .expect("read SQLite page bound");
+    assert_eq!(
+        u64::try_from(maximum_pages).expect("positive SQLite page bound") * page_size,
+        crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES / page_size * page_size
+    );
+    drop(reopened);
+
+    let before = std::fs::metadata(&path).expect("read fixture identity");
+    let read_only = Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("open query-only SQLite fixture");
+    consensus::snapshot_database_extent_sync(&read_only)
+        .expect("query-only fixture is within the shared physical extent");
+    drop(read_only);
+    let after = std::fs::metadata(&path).expect("re-read fixture identity");
+    assert_eq!(before.len(), after.len());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn file_backed_open_rejects_a_sparse_file_beyond_the_common_extent() {
+    let directory = tempfile::tempdir().expect("create SQLite fixture directory");
+    let path = directory.path().join("oversized.sqlite");
+    let backend = SqliteSessionBackend::open(&path).expect("create file-backed SQLite backend");
+    drop(backend);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open sparse SQLite fixture");
+    file.set_len(crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES + 1)
+        .expect("extend sparse SQLite fixture without allocating it");
+    drop(file);
+    assert!(SqliteSessionBackend::open(&path).is_err());
 }
 
 #[cfg(test)]
@@ -2779,6 +3272,15 @@ fn apply_pragma_profile(
     conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MILLIS))
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
+    // This writer guard caps the shared physical SQLite image. Protected
+    // roster HistoryFull/RetentionExhausted remains protocol/logical
+    // accounting; arbitrary non-roster rows are governed only by this common
+    // extent. Read-only snapshot and recovery opens verify the same actual
+    // extent because they cannot safely install a write-like pragma.
+    if !in_memory {
+        install_consensus_snapshot_extent_guard(conn)?;
+    }
+
     if !in_memory && primary_write_connection {
         conn.pragma_update(
             None,
@@ -2817,6 +3319,11 @@ fn apply_pragma_profile(
     }
 
     Ok(())
+}
+
+fn install_consensus_snapshot_extent_guard(conn: &Connection) -> Result<(), StoreError> {
+    consensus::install_snapshot_database_extent_guard_sync(conn)
+        .map_err(|error| StoreError::BackendUnavailable(error.to_string()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2877,7 +3384,7 @@ impl SessionBackend for SqliteSessionBackend {
         let caps = self.caps;
         self.run_store_sqlite_task(SqliteStoreWorkKind::CompareAndSet, move |conn| {
             let tx = standalone_transaction(conn)?;
-            let result = ops::compare_and_set_sync(&tx, op, &caps, now)?;
+            let result = ops::compare_and_set_sync(&tx, &op, &caps, now)?;
             tx.commit()
                 .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
             Ok(result)
@@ -2952,7 +3459,7 @@ impl SessionBackend for SqliteSessionBackend {
                     SessionOp::CompareAndSet(cas) => {
                         let run_cas = || {
                             let tx = standalone_transaction(conn)?;
-                            let result = ops::compare_and_set_sync(&tx, cas, &caps, now)?;
+                            let result = ops::compare_and_set_sync(&tx, &cas, &caps, now)?;
                             tx.commit()
                                 .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
                             Ok(result)
@@ -4126,7 +4633,8 @@ mod consensus_readiness_deadline_tests {
     async fn readiness_recovery_and_barrier_share_one_complete_operation_deadline() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let snapshots = tempfile::tempdir().expect("snapshot directory");
-        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite backend");
+        let backend = SqliteSessionBackend::open(snapshots.path().join("sessions.sqlite"))
+            .expect("file-backed SQLite backend");
         let apply_gate = Arc::clone(&backend.consensus_apply_gate);
         let store = ConsensusSessionStore::open_with_operation_timeout(
             singleton_topology(),
@@ -4168,20 +4676,19 @@ mod consensus_readiness_deadline_tests {
         let held_connection = backend.conn.lock().await;
         let probe_store = store.clone();
         let probe_started = tokio::time::Instant::now();
-        let probe = tokio::spawn(async move { probe_store.probe_durable_readiness().await });
-        tokio::time::timeout(OPERATION_TIMEOUT, async {
-            while backend.operation_workers.available_permits() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("readiness recovery preflight waits on the held SQLite connection");
-        tokio::time::sleep(RECOVERY_PREFLIGHT_HOLD).await;
+        let mut probe = tokio::spawn(async move { probe_store.probe_durable_readiness().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut probe)
+                .await
+                .is_err(),
+            "readiness recovery preflight remains blocked on the held live consensus connection"
+        );
+        tokio::time::sleep_until(probe_started + RECOVERY_PREFLIGHT_HOLD).await;
         drop(held_connection);
 
         let report = tokio::time::timeout_at(
             probe_started + OPERATION_TIMEOUT + PROBE_ASSERTION_SLACK,
-            probe,
+            &mut probe,
         )
         .await
         .expect("readiness probe must not receive a second operation budget")
@@ -4194,6 +4701,10 @@ mod consensus_readiness_deadline_tests {
             .await
             .expect("mutation task settles after apply resumes")
             .expect("mutation task");
+        store
+            .shutdown()
+            .await
+            .expect("shutdown consensus singleton");
     }
 }
 

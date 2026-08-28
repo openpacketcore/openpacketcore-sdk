@@ -437,15 +437,18 @@ visible unless a separate approved storage layer protects them.
 boundary. `StatelessSessionConsumerClient` remains a public,
 source-compatible production/compatibility fresh-authentication typed
 least-authority surface required by #649, #688, and #691; it is neither hidden,
-deprecated, nor test-only. `PersistentSessionConsumerClient` remains the
-required warm fixed-pool primitive for #695/ePDG latency, so production
-deployments requiring warm reuse should use it. It retains the
-`opc-session-consumer/1` ALPN and now uses exact consumer transport revision 5.
-There is no fallback, dual mode, or
-mixed-revision path: clients and listeners must be drained and cut over
-coordinately. Revision-5 private JSON DTO bytes are canonical; reordered or
-otherwise noncanonical encodings, aliases, omissions, and unknown fields fail
-closed. This boundary remains separate from consensus and the quarantined
+deprecated, nor test-only. `PersistentSessionConsumerClient` is a bounded SDK
+fixed-pool primitive; it does not establish an ePDG deployment, latency, or
+production-SLO claim. General consumer ingress uses `opc-session-consumer/1`
+revision 6, ordinary fenced ingress uses `opc-session-consumer/2` revision 5,
+and opted-in protected-roster ingress uses `opc-session-consumer/3` revision
+5. A roster-enabled listener deliberately advertises all three concurrently;
+there is no coordinated no-coexistence cutover claim. Voter-to-voter traffic is
+separately `opc-session-consensus/2` revision 5. Revision-6 private JSON DTO
+bytes, including the complete
+sequence-plus-nonce correlation envelope, are canonical; reordered or otherwise
+noncanonical encodings, aliases, omissions, and unknown fields fail closed. This
+boundary remains separate from consensus and the quarantined
 legacy backend protocol; it exposes no `RemoteSessionBackend`, consensus,
 replication, snapshot, rebuild, membership, or admin API. Revision 4 retains
 #696's generic one-record atomic fenced-transition capability, observation,
@@ -503,11 +506,12 @@ lane retires after at most 4,096 calls and permits only one in-flight call. This
 is required for cancellation, pre-staged/late-response isolation, and exact
 write-position ambiguity. The fair request pool defaults
 to four connections (at most 16 configured), with 64 pending calls by default,
-256 absolutely, and a 250 ms queue wait/age limit. Two default watch slots (at
-most 16 configured) are separate from request capacity. An establishment is
+256 absolutely, and a 250 ms queue wait/age limit. Two reserved Watch transport
+slots (at most 16 configured) are separate from request capacity, but the typed
+tenant/NF consumer Watch does not acquire them. An establishment is
 limited to 1,500 ms and at most two pre-write attempts; resolution happens only
 on establishment/re-establishment. One pool-wide gate serializes every cold
-request, watch, and rolling-prewarm setup after bounded physical admission.
+request and rolling-prewarm setup after bounded physical admission.
 Setup failures and proven cached-lane losses publish one shared exponential
 backoff plus at most 25 ms jitter; the
 first floor is 50 ms by default and all waits are clipped to their logical
@@ -526,18 +530,23 @@ range, identity, or digest bytes to callers or diagnostics.
 Task cardinality does not scale with lanes, subscribers, or records. A rejected
 same-epoch publication does not retire a healthy lane.
 
-Each stateless clone lineage shares fail-fast physical-admission caps of 16
-request and 16 watch connections. A permit is acquired before resolve/TCP and
-held for the physical connection lifetime, including by a persistent client
-derived from that lineage. Independent stateless constructors create
-independent logical clients, just as independent persistent constructors do.
+Each stateless clone lineage has family-specific fail-fast request admission:
+general `/1` and an opted-in protected-roster `/3` clone share 16 `/1`-family
+connections, while ordinary fenced `/2` has an independent 16. This bounds the
+lineage at 32 request connections without allowing either family to starve the
+other. Ordinary persistent `/1` and `/2` share aggregate width and may reclaim
+an idle opposite-protocol lane. A protected `/3` pool is a distinct opted-in
+profile; it cannot relabel an ordinary retained lane and does not admit
+ordinary `/1` or `/2` operations. The retained 16 Watch transport permits are
+not admitted by typed tenant/NF consumer calls:
+`open_watch` rejects locally with stable `Unsupported` before resolution or
+cursor exposure. Independent stateless constructors create independent logical
+clients, just as independent persistent constructors do.
 
 The complete operation timeout is validated as greater than zero and no greater
 than 10 seconds. The configured idle bound (at most 5 seconds) caps every
-active partial frame on client bootstrap, unary, and watch reads without being
-reset by partial bytes; a no-byte healthy watch may remain quiet. Saturated,
-canceled, and rotated watch retirement never blocks while holding the watch
-lease. Each discarded checked-out request lane has exactly one
+active partial frame on client bootstrap and unary reads without being reset by
+partial bytes. Each discarded checked-out request lane has exactly one
 reconnect/replacement accounting outcome. Concurrent shutdown calls advance a
 monotonic phase only (running, draining, then forced) and cannot regress it.
 
@@ -553,7 +562,7 @@ phase, pool wait, active/maximum/idle, reuse/reconnect,
 queue/in-flight/oldest-age, and bounded outcome class); they exclude endpoints,
 identities, scopes, credentials, keys, payloads, request/correlation IDs,
 owners, and fences. Readiness deliberately becomes false while a request lane
-is leased; isolated watch slots are non-gating. Performance evidence is
+is leased; reserved Watch transport slots are non-gating. Performance evidence is
 synthetic only and makes no ePDG production-SLO claim. Its warm accept/reuse
 checks gate only the synthetic transport method; elapsed samples are
 non-gating. The revision-2 persistent-consumer qualification contract is v7;
@@ -744,10 +753,12 @@ redundantly presented root bounds the deadline, while a root present only in a
 trust bundle is not independently scanned. Production SVID chains should omit
 the trust anchor. #163 retires retained connections on coherent material-epoch
 or explicit reauthentication changes, ends transport waits and releases
-connection slots by the hard deadline, and reconnects watches from the exact
-delivered cursor. Root removal is a trust-anchor cutover and material change,
-not an expiry deadline. A bounded supervised mutation may still finish later;
-its outcome remains typed ambiguous and must not be automatically retried.
+connection slots by the hard deadline. The consumer Watch API does not admit
+the global replication cursor for tenant/NF-scoped grants, so it makes no
+production reconnect claim until an identity-and-scope-bound cursor exists.
+Root removal is a trust-anchor cutover and material change, not an expiry
+deadline. A bounded supervised mutation may still finish later; its outcome
+remains typed ambiguous and must not be automatically retried.
 
 Short-lived SVID expiry is the bounded same-issuer
 credential-compromise/revocation response. Rotation and reauthentication do
@@ -938,7 +949,9 @@ implement a second quorum algorithm.
   config TCP deadline or credential path.
 
 The observed-leader evidence closes only that foundation gap. The profile
-remains `experimental` and `qualification_complete = false`. A single-host
+remains `experimental`; an external exact-head V9 record is
+`qualification_complete:true` only after its complete gate succeeds and all
+strict artifacts validate. This document records no such result. A single-host
 three- and five-process component core now exercises atomic projected-SVID
 trust/leaf/intermediate/root rotation and rollback with production lifecycle
 defaults, affected-path reauthentication, all-path fleet cutovers, durable
@@ -949,3 +962,40 @@ or independent release evidence. Broader crash-point/partition/restart and expir
 concurrent batch/watch/restore histories, drain/reconnect deadlines, resource
 limits, soak, production payload-key operation, supported platforms, and signed
 candidate-release evidence remain under #164/#143 and related gates.
+
+The closed V9 contract uses schema digest
+`sha256:8e0f1bd7ff65b5cc9f39a2576568d39ba846a4311cc39a3d458763f4bb6eaf5c`.
+It binds canonical absolute producer Cargo-target and external evidence-root
+paths, the root-derived pair directory, and domain-separated commitments for
+those raw paths. It separately binds the exact normalized absolute Cargo
+invocation alias, canonical backing executable path, and backing-content
+SHA-256 and executable mode. The alias (for example a rustup-managed
+`.../cargo` spelling), not the backing path, is `argv[0]` followed by 14
+canonical tail arguments; the normalized recorded vector has 15 elements
+beginning `cargo`, and the POSIX-escaped environment-prefixed reproduction
+command executes that alias. Bound paths reject control
+characters and NUL; standard POSIX single-quote escaping is covered only by its
+exact regression and is not a general shell-injection claim.
+The V1/V9 pair still has only `batch-release-gate-v1.json` and
+`persistent-consumer-v9.json`. Its symmetric pair run-ID uses the v3 domain,
+canonical V1, existing provenance/invocation fields, and canonical full V9
+claims preimage with only `run_id_sha256` replaced by `sha256:` plus 64 zeroes;
+it does not hash final self-containing V9 bytes. The command digest orders
+backing path, alias, backing-content SHA-256, u16-BE executable mode, then
+argv. Run-ID v3 retains its pre-existing 16 provenance bindings, ending alias,
+backing path, backing-content SHA-256, `cargo_profile`, and `opt_level`; it
+then binds u16-BE mode before the existing
+V1/V9/argv/recipe/canonical-V1/claims-preimage material. The wrapper consumes
+it with a fresh, distinct target.
+Python retains the exact nofollow private lease inode via
+`/proc/<wrapper-pid>/fd/<fd>` for the direct child without raw-FD inheritance;
+Rust opens/locks that procfd inode and revalidates procfd, parent, name, and
+path before mkdir, publication, and completion, closing the A-to-B split-lock
+seam. This remains synthetic SDK evidence, not an execution/completion claim
+or an ePDG production claim.
+
+After each loss/restart, the protected `/3` pool is rebound to a
+readiness-proven live leader. Its foreign-tenant bracket is exactly three
+per-voter non-oracular `Unavailable` observations. Only `NotFound` and backend
+`Unavailable` receipt status are retryable; typed rejection and durable
+negative receipt outcomes are terminal for the retained request body.

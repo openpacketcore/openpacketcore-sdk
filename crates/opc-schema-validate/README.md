@@ -29,18 +29,19 @@ Supported validation keywords include:
 
 - `type` for single JSON types.
 - `required`, `properties`, and `additionalProperties`.
-- `items` with a single item schema and `minItems`.
-- `minLength`, inclusive `minimum`/`maximum`, `const`, `enum`, `oneOf`, and
-  `anyOf`.
+- Local `$ref`, `allOf`, `oneOf`, and `anyOf` composition.
+- `items` with a single item schema, `prefixItems`, `minItems`, `maxItems`,
+  and `uniqueItems`.
+- `minLength`, `maxLength`, `pattern`, inclusive `minimum`/`maximum`, `const`,
+  and `enum`.
 - `format` through the caller-supplied callback.
 - Annotation keywords such as `$comment`, `$id`, `$schema`, `$defs`, `default`,
-  `definitions`, `deprecated`, `description`, `examples`, `readOnly`, `title`,
-  and `writeOnly`.
+  `deprecated`, `description`, `examples`, `readOnly`, `title`, and `writeOnly`.
 
-Unsupported keywords fail closed, including `$ref`, `allOf`, `not`,
-`if`/`then`/`else`, `multipleOf`, `uniqueItems`, `patternProperties`,
-`contains`, dependencies/dependent keywords, `propertyNames`, tuple-item
-keywords, `maxLength`, `pattern`, `maxItems`, and exclusive bounds.
+Unsupported keywords fail closed, including remote `$ref`, `not`,
+`if`/`then`/`else`, `multipleOf`, `patternProperties`, `contains`,
+dependencies/dependent keywords, `propertyNames`, legacy tuple-item keywords,
+and exclusive bounds.
 
 ## Relationships
 
@@ -51,7 +52,16 @@ keywords, `maxLength`, `pattern`, `maxItems`, and exclusive bounds.
 
 - Safe Rust only.
 - Array-of-types JSON Schema syntax is not implemented.
-- There is no remote reference resolution.
+- The entire schema tree, including unused `$defs` and every composition branch,
+  is shape-preflighted before an instance is examined.
+- Only acyclic local JSON Pointer references are resolved; remote, unresolved,
+  and cyclic references fail closed.
+- To bound resource use, schemas are limited to 16,384 nodes and 128 levels;
+  complete-tree preflight and validation are each limited to 65,536 operations.
+  `required` and `enum` each accept at most 4,096 entries and 1 MiB of content
+  across a schema. `uniqueItems` accepts at most 4,096 elements and 1 MiB of
+  serialized JSON across one validation. Numeric JSON values are compared by
+  mathematical value, including integer/float spellings such as `1` and `1.0`.
 - This crate should not be substituted for a full JSON Schema validator outside
   the SDK-owned schema subset.
 

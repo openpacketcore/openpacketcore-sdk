@@ -4,26 +4,529 @@
 //! machine atomically promote a fully received snapshot without buffering it
 //! in process memory. Diagnostics deliberately do not expose the path.
 
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::io::{Read as _, Seek as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use sha2::Digest as _;
-#[cfg(test)]
-use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsFd as _, AsRawFd as _, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt as _;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use crate::fenced_mutation_roster::PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES;
+
+#[cfg(target_os = "linux")]
+pub(crate) type RetainedSnapshotDatabaseFlock = Arc<nix::fcntl::Flock<std::fs::File>>;
+
+#[cfg(target_os = "linux")]
+pub(crate) type RetainedSnapshotNamespaceSocket = Arc<OwnedFd>;
+
+#[cfg(target_os = "linux")]
+type RetainedSnapshotRecoveryFence = (
+    RetainedSnapshotDatabaseFlock,
+    RetainedSnapshotNamespaceSocket,
+);
+
+/// A capability for one admitted snapshot directory.
+///
+/// Snapshot namespace operations must use this descriptor, not the configured
+/// pathname. The canonical spelling is retained only as a stable logical
+/// identity for diagnostics and terminal handoff matching; the immutable
+/// configured absolute spelling is separately retained as the
+/// cleanup-failure latch key. In
+/// particular, a rename of the configured directory after admission cannot
+/// redirect an `openat`, `renameat2`, `unlinkat`, scan, or directory fsync
+/// issued through this object.
+///
+/// Admission requires an effective-UID-owned directory with no group/world
+/// write bits (`mode & 0o022 == 0`); SDK-created leaves are `0700`, while an
+/// existing `0755` directory is also admitted.  This is a dedicated
+/// SDK-only namespace: cooperating SDK instances under that effective UID
+/// serialize through the namespace lease.  Root/capability holders and
+/// noncooperating same-UID processes (including one holding a writable alias)
+/// are outside this integrity model. Unix offers no unlink-by-descriptor
+/// primitive, so a dirfd alone cannot close a malicious child replacement by
+/// an excluded actor between an identity check and `unlinkat`.
+#[derive(Debug)]
+pub(crate) struct RetainedSnapshotDirectory {
+    logical_directory: PathBuf,
+    cleanup_latch_identity: PathBuf,
+    #[cfg(target_os = "linux")]
+    // This is captured from the same descriptor that owns `directory`; it is
+    // never sampled again through a pathname.  A queued cleanup failure can
+    // safely share this authority with a subsequent recovery attempt only
+    // when the newly admitted descriptor names this exact directory inode.
+    directory_identity: (u64, u64),
+    #[cfg(target_os = "linux")]
+    // A retained directory flock must not make the namespace permanently
+    // unrecoverable after a failed cleanup, but it also must not become a
+    // general reentrant lock.  Bind the one durable SQLite main-file identity
+    // that is allowed to reuse this queued authority during recovery.
+    trusted_database_identity: std::sync::Mutex<Option<(u64, u64)>>,
+    #[cfg(target_os = "linux")]
+    // This is the actual cross-process fence for the durable SQLite owner.
+    // It shares one open-file-description lock with the lease, and remains
+    // live while a queued D1 cleanup authority exists.  A same-key D1->D2
+    // recovery may borrow this exact Arc; any other process still sees the
+    // kernel flock rather than a process-local cleanup registry.
+    trusted_database_lock: std::sync::Mutex<Option<RetainedSnapshotDatabaseFlock>>,
+    #[cfg(target_os = "linux")]
+    // The abstract configured-key socket is the second half of the lease
+    // fence. Retaining it with D1 blocks a fresh process from changing only
+    // the configured namespace while D1 cleanup remains outstanding.
+    trusted_namespace_socket: std::sync::Mutex<Option<RetainedSnapshotNamespaceSocket>>,
+    #[cfg(unix)]
+    // `Flock` is deliberately owned by the retained namespace capability.
+    // A queued cleanup failure retains this `Arc`, so a cooperative opener of
+    // a detached D1 cannot obtain its directory lease while validation is
+    // still responsible for D1's exact cleanup and durability boundary.
+    directory: Arc<nix::fcntl::Flock<std::fs::File>>,
+}
+
+#[cfg(test)]
+fn retained_namespace_sync_failure() -> &'static AtomicBool {
+    static FAIL: AtomicBool = AtomicBool::new(false);
+    &FAIL
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn retained_namespace_sync_observer() -> &'static std::sync::Mutex<Vec<(u64, u64)>> {
+    static OBSERVED: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, u64)>>> =
+        std::sync::OnceLock::new();
+    OBSERVED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Fail one retained-dirfd fsync after any namespace mutation. This is scoped
+/// to tests so cleanup-latch admission can prove that an empty directory does
+/// not erase evidence of an earlier unflushed unlink.
+#[cfg(test)]
+pub(crate) fn fail_retained_namespace_sync_for_test() {
+    retained_namespace_sync_failure().store(true, Ordering::Release);
+}
+
+/// Clear the test-only exact-directory fsync trace.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn clear_retained_namespace_sync_observer_for_test() {
+    retained_namespace_sync_observer()
+        .lock()
+        .expect("retained namespace sync observer")
+        .clear();
+}
+
+/// Return `(st_dev, st_ino)` for every retained directory fsync issued after
+/// the last clear. This proves cleanup recovery syncs the exact detached D1,
+/// not a replacement D2 at the same logical configured path.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn retained_namespace_sync_observer_for_test() -> Vec<(u64, u64)> {
+    retained_namespace_sync_observer()
+        .lock()
+        .expect("retained namespace sync observer")
+        .clone()
+}
+
+impl RetainedSnapshotDirectory {
+    /// Bind a verified directory descriptor to its stable logical spelling.
+    #[cfg(unix)]
+    pub(crate) fn from_directory_file(
+        logical_directory: PathBuf,
+        cleanup_latch_identity: PathBuf,
+        directory: std::fs::File,
+    ) -> io::Result<Self> {
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot namespace descriptor is not a directory",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let directory_identity = (metadata.st_dev(), metadata.st_ino());
+        let directory =
+            nix::fcntl::Flock::lock(directory, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .map_err(|(_, error)| io::Error::from(error))?;
+        Ok(Self {
+            logical_directory,
+            cleanup_latch_identity,
+            #[cfg(target_os = "linux")]
+            directory_identity,
+            #[cfg(target_os = "linux")]
+            trusted_database_identity: std::sync::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            trusted_database_lock: std::sync::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            trusted_namespace_socket: std::sync::Mutex::new(None),
+            directory: Arc::new(directory),
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn from_directory_file(
+        _logical_directory: PathBuf,
+        _cleanup_latch_identity: PathBuf,
+        _directory: std::fs::File,
+    ) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "snapshot namespace descriptor requires Unix",
+        ))
+    }
+
+    /// Return the sole accepted representation of a child name.
+    pub(crate) fn basename<'a>(&self, name: &'a OsStr) -> io::Result<&'a OsStr> {
+        let mut components = Path::new(name).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(component)), None) if component == name => Ok(name),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot namespace child must be one basename",
+            )),
+        }
+    }
+
+    /// A stable logical child spelling; never use this for namespace I/O.
+    pub(crate) fn logical_child(&self, name: &OsStr) -> io::Result<PathBuf> {
+        Ok(self.logical_directory.join(self.basename(name)?))
+    }
+
+    /// Immutable normalized configured spelling used solely to find pending
+    /// cleanup failures across a parent-symlink retarget. Unlike the logical
+    /// canonical path, this remains identical when `/x/link` moves from D1's
+    /// parent to D2's parent between process incarnations.
+    pub(crate) fn cleanup_latch_identity(&self) -> &Path {
+        &self.cleanup_latch_identity
+    }
+
+    /// Return the directory identity captured from the retained descriptor.
+    /// This is only used to make a queued cleanup authority reentrant for its
+    /// exact original namespace, never as a pathname replacement check.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn directory_identity(&self) -> (u64, u64) {
+        self.directory_identity
+    }
+
+    /// Bind the sole durable SQLite backend that may reenter a queued cleanup
+    /// authority for this directory. A different backend must still contend
+    /// on the retained directory flock rather than borrowing it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn bind_trusted_database_identity(&self, identity: (u64, u64)) -> io::Result<()> {
+        let mut trusted = self
+            .trusted_database_identity
+            .lock()
+            .map_err(|_| io::Error::other("snapshot namespace owner lock poisoned"))?;
+        match *trusted {
+            Some(existing) if existing != identity => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "snapshot namespace cleanup authority belongs to another database",
+            )),
+            Some(_) => Ok(()),
+            None => {
+                *trusted = Some(identity);
+                Ok(())
+            }
+        }
+    }
+
+    /// Attach the kernel-owned database flock to this namespace capability.
+    /// The lease and queued cleanup generation share this one `Arc`, so the
+    /// database remains fenced across processes until the exact cleanup is
+    /// acknowledged.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn install_trusted_database_lock(
+        &self,
+        identity: (u64, u64),
+        lock: RetainedSnapshotDatabaseFlock,
+    ) -> io::Result<()> {
+        self.bind_trusted_database_identity(identity)?;
+        let mut trusted_lock = self
+            .trusted_database_lock
+            .lock()
+            .map_err(|_| io::Error::other("snapshot namespace database lock poisoned"))?;
+        match trusted_lock.as_ref() {
+            Some(existing) if Arc::ptr_eq(existing, &lock) => Ok(()),
+            Some(_) => Err(io::Error::other(
+                "snapshot namespace already has another database flock",
+            )),
+            None => {
+                *trusted_lock = Some(lock);
+                Ok(())
+            }
+        }
+    }
+
+    /// Attach the immutable configured-key socket to the retained capability.
+    /// Same-process recovery shares this Arc; a fresh process can only
+    /// observe the already-bound kernel socket.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn install_trusted_namespace_socket(
+        &self,
+        socket: RetainedSnapshotNamespaceSocket,
+    ) -> io::Result<()> {
+        let mut trusted_socket = self
+            .trusted_namespace_socket
+            .lock()
+            .map_err(|_| io::Error::other("snapshot namespace socket lock poisoned"))?;
+        match trusted_socket.as_ref() {
+            Some(existing) if Arc::ptr_eq(existing, &socket) => Ok(()),
+            Some(_) => Err(io::Error::other(
+                "snapshot namespace already has another configured-key socket",
+            )),
+            None => {
+                *trusted_socket = Some(socket);
+                Ok(())
+            }
+        }
+    }
+
+    /// Clone the pre-existing database fence only when it belongs to the
+    /// durable owner whose descriptor was just admitted. This is deliberately
+    /// an in-process sharing operation; other processes cannot obtain this
+    /// Arc and continue to contend on the kernel flock.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn trusted_database_lock_for_identity(
+        &self,
+        identity: (u64, u64),
+    ) -> io::Result<Option<RetainedSnapshotDatabaseFlock>> {
+        if !self.has_trusted_database_identity(identity)? {
+            return Ok(None);
+        }
+        self.trusted_database_lock
+            .lock()
+            .map_err(|_| io::Error::other("snapshot namespace database lock poisoned"))
+            .map(|trusted_lock| trusted_lock.clone())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn trusted_namespace_socket_for_identity(
+        &self,
+        identity: (u64, u64),
+    ) -> io::Result<Option<RetainedSnapshotNamespaceSocket>> {
+        if !self.has_trusted_database_identity(identity)? {
+            return Ok(None);
+        }
+        self.trusted_namespace_socket
+            .lock()
+            .map_err(|_| io::Error::other("snapshot namespace socket lock poisoned"))
+            .map(|trusted_socket| trusted_socket.clone())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn trusted_recovery_fence_for_identity(
+        &self,
+        identity: (u64, u64),
+    ) -> io::Result<Option<RetainedSnapshotRecoveryFence>> {
+        let Some(database_lock) = self.trusted_database_lock_for_identity(identity)? else {
+            return Ok(None);
+        };
+        let socket = self
+            .trusted_namespace_socket_for_identity(identity)?
+            .ok_or_else(|| io::Error::other("queued snapshot cleanup authority lost its socket"))?;
+        Ok(Some((database_lock, socket)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn matches_trusted_recovery_owner(
+        &self,
+        directory_identity: (u64, u64),
+        database_identity: (u64, u64),
+    ) -> io::Result<bool> {
+        Ok(self.directory_identity() == directory_identity
+            && self.has_trusted_database_identity(database_identity)?)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn has_trusted_database_identity(&self, database_identity: (u64, u64)) -> io::Result<bool> {
+        let trusted = self
+            .trusted_database_identity
+            .lock()
+            .map_err(|_| io::Error::other("snapshot namespace owner lock poisoned"))?;
+        Ok(*trusted == Some(database_identity))
+    }
+
+    /// A verified descriptor-anchored spelling for pathname-only SQLite APIs.
+    ///
+    /// No durable value may retain this spelling: it includes a process-local
+    /// fd number. General namespace I/O should use the fd-relative methods
+    /// below instead.
+    #[cfg(unix)]
+    pub(crate) fn sqlite_child_path(&self, name: &OsStr) -> io::Result<PathBuf> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let name = self.basename(name)?;
+        let proc_directory =
+            PathBuf::from("/proc/self/fd").join((**self.directory).as_raw_fd().to_string());
+        let held = (**self.directory).metadata()?;
+        let resolved = std::fs::metadata(&proc_directory)?;
+        if !resolved.is_dir() || held.dev() != resolved.dev() || held.ino() != resolved.ino() {
+            return Err(io::Error::other(
+                "snapshot namespace proc descriptor does not resolve to retained directory",
+            ));
+        }
+        Ok(proc_directory.join(name))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn sqlite_child_path(&self, _name: &OsStr) -> io::Result<PathBuf> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "snapshot namespace descriptor requires Unix",
+        ))
+    }
+
+    fn open_child_with(
+        &self,
+        name: &OsStr,
+        flags: nix::fcntl::OFlag,
+        mode: nix::sys::stat::Mode,
+    ) -> io::Result<std::fs::File> {
+        use nix::fcntl::openat;
+
+        let name = self.basename(name)?;
+        // `basename` accepts exactly one normal component. With no slash,
+        // dot, dot-dot, or magic-link component available, openat relative
+        // to the retained dirfd is already RESOLVE_BENEATH-equivalent while
+        // retaining compatibility with pre-openat2 Linux kernels.
+        openat(
+            &**self.directory,
+            Path::new(name),
+            flags
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC
+                | nix::fcntl::OFlag::O_NONBLOCK,
+            mode,
+        )
+        .map(std::fs::File::from)
+        .map_err(io::Error::from)
+    }
+
+    /// Open an existing regular candidate without following a link or waiting
+    /// on a hostile special-file replacement.
+    pub(crate) fn open_read(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        self.open_child_with(
+            name,
+            nix::fcntl::OFlag::O_RDONLY,
+            nix::sys::stat::Mode::empty(),
+        )
+    }
+
+    /// Create a brand-new private regular child through the retained dirfd.
+    pub(crate) fn create_new(&self, name: &OsStr, _read: bool) -> io::Result<std::fs::File> {
+        self.open_child_with(
+            name,
+            nix::fcntl::OFlag::O_CREAT | nix::fcntl::OFlag::O_EXCL | nix::fcntl::OFlag::O_RDWR,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn rename_noreplace(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        let from = self.basename(from)?;
+        let to = self.basename(to)?;
+        nix::fcntl::renameat2(
+            &**self.directory,
+            from,
+            &**self.directory,
+            to,
+            nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+        )
+        .map_err(io::Error::from)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn unlink(&self, name: &OsStr) -> io::Result<()> {
+        let name = self.basename(name)?;
+        nix::unistd::unlinkat(
+            &**self.directory,
+            name,
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .map_err(io::Error::from)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let metadata = (**self.directory).metadata()?;
+            retained_namespace_sync_observer()
+                .lock()
+                .expect("retained namespace sync observer")
+                .push((metadata.dev(), metadata.ino()));
+        }
+        #[cfg(test)]
+        if retained_namespace_sync_failure().swap(false, Ordering::AcqRel) {
+            return Err(io::Error::other(
+                "injected retained snapshot namespace sync failure",
+            ));
+        }
+        (**self.directory).sync_all()
+    }
+
+    /// Enumerate at most `limit + 1` child basenames through a duplicate of
+    /// the retained fd.  The extra entry lets callers reject over-capacity
+    /// namespaces without allowing an untrusted pre-existing directory to
+    /// force an unbounded allocation or scan.
+    #[cfg(unix)]
+    pub(crate) fn entries(&self, limit: usize) -> io::Result<Vec<OsString>> {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let duplicate = (**self.directory).try_clone()?;
+        let directory = rustix::fs::Dir::read_from(duplicate).map_err(io::Error::from)?;
+        let mut entries = Vec::with_capacity(limit.saturating_add(1));
+        for entry in directory {
+            let entry = entry.map_err(io::Error::from)?;
+            let name = OsString::from_vec(entry.file_name().to_bytes().to_vec());
+            if name == "." || name == ".." {
+                continue;
+            }
+            entries.push(name);
+            if entries.len() > limit {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+}
+
+/// SQLite backup reports page counts as a signed 32-bit integer, while SQLite
+/// accepts a 512-byte page.  This is the one physical database payload ceiling
+/// enforced by every SDK writer through `max_page_count`, and independently
+/// checked by snapshot, transport, and recovery readers.  It bounds the whole
+/// SQLite image--roster blobs, authoritative session rows, schema, indexes,
+/// freelist, WAL-derived backup, and arbitrary non-roster rows--rather than
+/// treating the roster's logical charge budget as a file-size quota.  The
+/// final 512 bytes make the minimum-page representation fit the backup API's
+/// `i32::MAX` page-count limit exactly.
+const SNAPSHOT_MIN_PAGE_BYTES: u64 = 512;
+const SNAPSHOT_MAX_BACKUP_PAGES: u64 = i32::MAX as u64;
+pub(crate) const SNAPSHOT_DATABASE_MAX_BYTES: u64 =
+    SNAPSHOT_MAX_BACKUP_PAGES * SNAPSHOT_MIN_PAGE_BYTES;
 /// Maximum payload bytes admitted in one consensus snapshot envelope.
-pub(crate) const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub(crate) const SNAPSHOT_MAX_BYTES: u64 = SNAPSHOT_DATABASE_MAX_BYTES;
+/// Fixed authenticated footer appended after an otherwise complete SQLite
+/// payload.  The envelope has its own bound because it is a different file
+/// from the database image.
+pub(crate) const SNAPSHOT_ENVELOPE_FOOTER_BYTES: u64 = 8 + 8 + 32;
+/// Maximum complete snapshot file accepted by transport and offline recovery.
+pub(crate) const SNAPSHOT_ENVELOPE_MAX_BYTES: u64 =
+    SNAPSHOT_DATABASE_MAX_BYTES + SNAPSHOT_ENVELOPE_FOOTER_BYTES;
+const _: () =
+    assert!(SNAPSHOT_DATABASE_MAX_BYTES == SNAPSHOT_MAX_BACKUP_PAGES * SNAPSHOT_MIN_PAGE_BYTES);
+const _: () = assert!(
+    SNAPSHOT_DATABASE_MAX_BYTES
+        == PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES * 4 - SNAPSHOT_MIN_PAGE_BYTES
+);
 /// Maximum bytes retained while checking an idempotent receiver replay.
 const SNAPSHOT_REPLAY_VERIFY_BYTES: usize = 64 * 1024;
 
@@ -148,6 +651,10 @@ pub(crate) struct FileIdentity;
 #[allow(dead_code)]
 pub(crate) struct PinnedSqliteFile {
     file: std::fs::File,
+    /// Descriptor namespace/name used for every post-admission identity
+    /// re-open. `path` remains a SQLite-only spelling where an API cannot
+    /// accept an fd.
+    namespace: Option<(Arc<RetainedSnapshotDirectory>, OsString)>,
     path: PathBuf,
     identity: FileIdentity,
     immutable_generation: Option<ImmutableFileGeneration>,
@@ -386,9 +893,10 @@ fn block_fixed_prepublication_scan(path: &Path) {
 /// never removed.
 pub(crate) struct UnpublishedSnapshotArtifact {
     path: PathBuf,
+    cleanup: SnapshotCleanupState,
     identity: FileIdentity,
     sqlite_sidecars: bool,
-    sidecars: Vec<(PathBuf, FileIdentity)>,
+    sidecars: Vec<(SnapshotCleanupState, FileIdentity)>,
     armed: bool,
 }
 
@@ -407,8 +915,91 @@ impl UnpublishedSnapshotArtifact {
         sqlite_sidecars: bool,
     ) -> io::Result<Self> {
         Ok(Self {
+            cleanup: SnapshotCleanupState::new(path.clone()),
             path,
             identity: file_identity(metadata)?,
+            sqlite_sidecars,
+            sidecars: Vec::new(),
+            armed: true,
+        })
+    }
+
+    /// Bind an SDK-created child to the retained snapshot directory. The
+    /// operational path is only for pathname-only SQLite calls; Drop cleanup
+    /// stays fd-relative through `cleanup`.
+    pub(crate) fn from_file_in_namespace(
+        file: &std::fs::File,
+        namespace: Arc<RetainedSnapshotDirectory>,
+        name: &OsStr,
+        sqlite_sidecars: bool,
+    ) -> io::Result<Self> {
+        let path = namespace.logical_child(name)?;
+        Ok(Self {
+            cleanup: SnapshotCleanupState::in_namespace(namespace, name)?,
+            path,
+            identity: file_identity(&file.metadata()?)?,
+            sqlite_sidecars,
+            sidecars: Vec::new(),
+            armed: true,
+        })
+    }
+
+    /// Reconstruct an interrupted tombstone using the retained directory
+    /// descriptor. Recovery keeps the durable/latch spelling logical while
+    /// every retry stays in the original namespace.
+    pub(crate) fn from_existing_tombstone_in_namespace(
+        namespace: Arc<RetainedSnapshotDirectory>,
+        tombstone_name: &OsStr,
+        original_name: &OsStr,
+        metadata: &std::fs::Metadata,
+        sqlite_sidecars: bool,
+    ) -> io::Result<Self> {
+        let tombstone = namespace.logical_child(tombstone_name)?;
+        let mut cleanup =
+            SnapshotCleanupState::in_namespace(Arc::clone(&namespace), original_name)?;
+        cleanup.location = SnapshotCleanupLocation::Tombstone(tombstone.clone());
+        Ok(Self {
+            path: tombstone,
+            cleanup,
+            identity: file_identity(metadata)?,
+            sqlite_sidecars,
+            sidecars: Vec::new(),
+            armed: true,
+        })
+    }
+
+    /// Reconstruct a durable final-unlink guard after a process stopped after
+    /// its guard rename but before `unlinkat`.  The guard basename carries the
+    /// admitted inode identity, so a syntactically similar foreign name cannot
+    /// be promoted into a deletion target during restart recovery.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_existing_unlink_guard_in_namespace(
+        namespace: Arc<RetainedSnapshotDirectory>,
+        guard_name: &OsStr,
+        tombstone_name: &OsStr,
+        original_name: &OsStr,
+        metadata: &std::fs::Metadata,
+        sqlite_sidecars: bool,
+    ) -> io::Result<Self> {
+        let identity = file_identity(metadata)?;
+        if !snapshot_cleanup_unlink_guard_name_authenticates(guard_name, identity) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "snapshot unlink guard identity does not match its inode",
+            ));
+        }
+        let guard = namespace.logical_child(guard_name)?;
+        let tombstone = namespace.logical_child(tombstone_name)?;
+        let mut cleanup =
+            SnapshotCleanupState::in_namespace(Arc::clone(&namespace), original_name)?;
+        cleanup.location = SnapshotCleanupLocation::UnlinkGuard { guard, tombstone };
+        Ok(Self {
+            path: cleanup
+                .active_path()
+                .expect("unlink guard is an active cleanup location")
+                .to_path_buf(),
+            cleanup,
+            identity,
             sqlite_sidecars,
             sidecars: Vec::new(),
             armed: true,
@@ -419,8 +1010,20 @@ impl UnpublishedSnapshotArtifact {
         self.armed = false;
     }
 
+    #[cfg(test)]
     pub(crate) fn rebind_path(&mut self, path: PathBuf) {
-        self.path = path;
+        self.path = path.clone();
+        self.cleanup.rebind(path);
+    }
+
+    pub(crate) fn rebind_in_namespace(
+        &mut self,
+        namespace: Arc<RetainedSnapshotDirectory>,
+        name: &OsStr,
+    ) -> io::Result<()> {
+        self.path = namespace.logical_child(name)?;
+        self.cleanup = SnapshotCleanupState::in_namespace(namespace, name)?;
+        Ok(())
     }
 
     fn capture_sidecars(&mut self) {
@@ -432,32 +1035,322 @@ impl UnpublishedSnapshotArtifact {
             let mut sidecar = self.path.as_os_str().to_os_string();
             sidecar.push(suffix);
             let sidecar = PathBuf::from(sidecar);
-            let Ok(metadata) = std::fs::symlink_metadata(&sidecar) else {
-                continue;
+            let (metadata, cleanup) = match &self.cleanup.namespace {
+                Some(namespace) => {
+                    let Some(name) = sidecar.file_name() else {
+                        continue;
+                    };
+                    let Ok(file) = namespace.open_read(name) else {
+                        continue;
+                    };
+                    let Ok(metadata) = file.metadata() else {
+                        continue;
+                    };
+                    let Ok(cleanup) =
+                        SnapshotCleanupState::in_namespace(Arc::clone(namespace), name)
+                    else {
+                        continue;
+                    };
+                    (metadata, cleanup)
+                }
+                None => {
+                    let Ok(metadata) = std::fs::symlink_metadata(&sidecar) else {
+                        continue;
+                    };
+                    (metadata, SnapshotCleanupState::new(sidecar.clone()))
+                }
             };
             if !metadata.is_file() {
                 continue;
             }
             if let Ok(identity) = file_identity(&metadata) {
-                self.sidecars.push((sidecar, identity));
+                self.sidecars.push((cleanup, identity));
             }
         }
     }
 
-    fn remove_if_owned(&self, path: &Path, identity: FileIdentity) {
-        let Ok(metadata) = std::fs::symlink_metadata(path) else {
-            return;
-        };
-        if !metadata.is_file() {
-            return;
-        }
-        let Ok(observed) = file_identity(&metadata) else {
-            return;
-        };
-        if same_file_object(observed, identity) {
-            let _ = std::fs::remove_file(path);
+    fn remove_if_owned(
+        cleanup: &mut SnapshotCleanupState,
+        identity: FileIdentity,
+    ) -> io::Result<bool> {
+        remove_snapshot_cleanup_if_owned(cleanup, identity)
+    }
+}
+
+/// One failed retained-directory durability boundary. The `Arc` is the
+/// authority that actually performed the unlink/rename; retaining it keeps a
+/// parent-path replacement from making a later validator acknowledge D1 after
+/// fsyncing an attacker/operator-provided D2 at the same logical path.
+#[derive(Clone)]
+pub(crate) struct RetainedSnapshotCleanupFailure {
+    generation: u64,
+    namespace: Arc<RetainedSnapshotDirectory>,
+}
+
+impl RetainedSnapshotCleanupFailure {
+    pub(crate) fn namespace(&self) -> &Arc<RetainedSnapshotDirectory> {
+        &self.namespace
+    }
+}
+
+#[derive(Default)]
+struct SnapshotCleanupFailureGenerations {
+    next_generation: u64,
+    pending: Vec<RetainedSnapshotCleanupFailure>,
+}
+
+fn unpublished_snapshot_cleanup_failures(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, SnapshotCleanupFailureGenerations>> {
+    static FAILURES: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, SnapshotCleanupFailureGenerations>>,
+    > = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Issue a durable-cleanup failure generation for the exact admitted
+/// directory capability that performed the mutation. A validator snapshots
+/// these capabilities before fsync and acknowledges only the individual
+/// generation whose retained fd it actually synced.
+pub(crate) fn record_unpublished_snapshot_cleanup_failure_in_namespace(
+    namespace: Arc<RetainedSnapshotDirectory>,
+) {
+    if let Ok(mut failures) = unpublished_snapshot_cleanup_failures().lock() {
+        let latch_identity = namespace.cleanup_latch_identity().to_path_buf();
+        let state = failures.entry(latch_identity).or_default();
+        state.next_generation = state.next_generation.saturating_add(1);
+        state.pending.push(RetainedSnapshotCleanupFailure {
+            generation: state.next_generation,
+            namespace,
+        });
+    }
+}
+
+fn record_unpublished_snapshot_cleanup_failure_for_state(state: &SnapshotCleanupState) {
+    // Every production snapshot artifact is namespace-bound. Legacy path-only
+    // helpers are test-only compatibility paths and cannot safely establish a
+    // retained-dirfd durability authority, so they intentionally do not
+    // publish a global latch under a pathname that a parent replacement could
+    // later redirect.
+    if let Some(namespace) = &state.namespace {
+        record_unpublished_snapshot_cleanup_failure_in_namespace(Arc::clone(namespace));
+    }
+}
+
+/// Immediate ownership of a just-created retained-namespace child.
+///
+/// This deliberately has no fallible setup after `O_EXCL` has succeeded: a
+/// metadata query, descriptor clone, cleanup-state construction, or worker
+/// cancellation may all fail under descriptor pressure.  Until the
+/// identity-pinned cleanup owner is fully installed, Drop removes this exact
+/// basename through the retained directory fd and makes the cleanup latch
+/// durable if either unlink or its directory fsync fails.
+struct NewNamespaceChildGuard {
+    namespace: Arc<RetainedSnapshotDirectory>,
+    name: OsString,
+    cleanup_failed: Option<Arc<AtomicBool>>,
+    armed: bool,
+}
+
+impl NewNamespaceChildGuard {
+    fn new(
+        namespace: Arc<RetainedSnapshotDirectory>,
+        name: &OsStr,
+        cleanup_failed: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        Self {
+            namespace,
+            name: name.to_os_string(),
+            cleanup_failed,
+            armed: true,
         }
     }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn record_failure(&self) {
+        // `create_new` already validated this single basename.  Keep the
+        // generation bound to its retained D1 descriptor, never merely to a
+        // logical path or process-local `/proc/self/fd` spelling. Issue it
+        // before the legacy boolean hint so validation cannot observe/clear
+        // the latter before it has a concrete fsync generation to
+        // acknowledge.
+        record_unpublished_snapshot_cleanup_failure_in_namespace(Arc::clone(&self.namespace));
+        if let Some(cleanup_failed) = &self.cleanup_failed {
+            cleanup_failed.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for NewNamespaceChildGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.namespace.unlink(&self.name) {
+            Ok(()) => {
+                if self.namespace.sync().is_err() {
+                    self.record_failure();
+                }
+            }
+            // No entry remains to consume capacity. This can only happen if
+            // an excluded actor mutated the private namespace, or a later
+            // owner took over after this guard was disarmed.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => self.record_failure(),
+        }
+    }
+}
+
+/// Snapshot each unacknowledged cleanup failure for one immutable configured
+/// latch identity. The caller must fsync every returned retained fd before
+/// acknowledging it.
+pub(crate) fn pending_unpublished_snapshot_cleanup_failures(
+    directory: &Path,
+) -> io::Result<Vec<RetainedSnapshotCleanupFailure>> {
+    let failures = unpublished_snapshot_cleanup_failures()
+        .lock()
+        .map_err(|_| io::Error::other("snapshot cleanup failure registry poisoned"))?;
+    Ok(failures
+        .get(directory)
+        .map_or_else(Vec::new, |state| state.pending.clone()))
+}
+
+/// The outcome of looking up a queued cleanup authority during lease
+/// admission. A database with any outstanding cleanup must not silently move
+/// to another configured directory: only its exact original directory can
+/// reenter and drain the retained authority.
+#[cfg(target_os = "linux")]
+pub(crate) enum PendingSnapshotNamespaceRecoveryAuthority {
+    Exact(Arc<RetainedSnapshotDirectory>),
+    /// The immutable configured key still names the caller's namespace, but
+    /// the directory inode was replaced after D1's cleanup failed. Admit a
+    /// fresh D2 dirfd and share D1's database fence so validation can reclaim
+    /// and fsync D1 without letting another process take the same database.
+    ReplacementAtSameConfiguredKey {
+        database_lock: RetainedSnapshotDatabaseFlock,
+        namespace_socket: RetainedSnapshotNamespaceSocket,
+    },
+    OtherPendingDirectory,
+    None,
+}
+
+/// Reuse a queued cleanup authority only for the exact directory inode and
+/// durable SQLite owner that originally issued it.  This gives a restarted
+/// owner a way to drain its own retained directory flock after an interrupted
+/// cleanup, while a different directory incarnation or database remains
+/// excluded by that flock.
+#[cfg(target_os = "linux")]
+pub(crate) fn pending_snapshot_namespace_recovery_authority(
+    cleanup_latch_identity: &Path,
+    directory_identity: (u64, u64),
+    database_identity: (u64, u64),
+) -> io::Result<PendingSnapshotNamespaceRecoveryAuthority> {
+    let failures = unpublished_snapshot_cleanup_failures()
+        .lock()
+        .map_err(|_| io::Error::other("snapshot cleanup failure registry poisoned"))?;
+    if let Some(state) = failures.get(cleanup_latch_identity) {
+        for failure in &state.pending {
+            if failure
+                .namespace
+                .matches_trusted_recovery_owner(directory_identity, database_identity)?
+            {
+                return Ok(PendingSnapshotNamespaceRecoveryAuthority::Exact(
+                    Arc::clone(&failure.namespace),
+                ));
+            }
+        }
+        for failure in &state.pending {
+            if failure
+                .namespace
+                .has_trusted_database_identity(database_identity)?
+            {
+                let (database_lock, namespace_socket) = failure
+                    .namespace
+                    .trusted_recovery_fence_for_identity(database_identity)?
+                    .ok_or_else(|| {
+                        io::Error::other("queued snapshot cleanup authority lost its lease fence")
+                    })?;
+                return Ok(
+                    PendingSnapshotNamespaceRecoveryAuthority::ReplacementAtSameConfiguredKey {
+                        database_lock,
+                        namespace_socket,
+                    },
+                );
+            }
+        }
+        if !state.pending.is_empty() {
+            // Another durable owner has unacknowledged cleanup for this
+            // immutable configured key. Do not make a fresh namespace
+            // authority out of that owner's outstanding evidence.
+            return Ok(PendingSnapshotNamespaceRecoveryAuthority::OtherPendingDirectory);
+        }
+    }
+    for state in failures.values() {
+        for failure in &state.pending {
+            if failure
+                .namespace
+                .has_trusted_database_identity(database_identity)?
+            {
+                return Ok(PendingSnapshotNamespaceRecoveryAuthority::OtherPendingDirectory);
+            }
+        }
+    }
+    Ok(PendingSnapshotNamespaceRecoveryAuthority::None)
+}
+
+/// Acknowledge exactly the generation whose retained directory fd the caller
+/// fsynced. A concurrent later failure, or one associated with another D1
+/// incarnation at the same logical path, cannot be consumed by this call.
+pub(crate) fn acknowledge_unpublished_snapshot_cleanup_failure(
+    directory: &Path,
+    failure: &RetainedSnapshotCleanupFailure,
+) -> bool {
+    unpublished_snapshot_cleanup_failures()
+        .lock()
+        .map(|mut failures| {
+            let Some(state) = failures.get_mut(directory) else {
+                return false;
+            };
+            let Some(position) = state.pending.iter().position(|pending| {
+                pending.generation == failure.generation
+                    && Arc::ptr_eq(&pending.namespace, &failure.namespace)
+            }) else {
+                return false;
+            };
+            state.pending.remove(position);
+            let remove_directory = state.pending.is_empty();
+            if remove_directory {
+                failures.remove(directory);
+            }
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// Observe a dropped-artifact cleanup failure without consuming its one-shot
+/// recovery latch.  Admission must not erase evidence before current-snapshot
+/// and directory validation have completed successfully.
+pub(crate) fn has_unpublished_snapshot_cleanup_failure(directory: &Path) -> bool {
+    pending_unpublished_snapshot_cleanup_failures(directory)
+        .map(|failures| !failures.is_empty())
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+pub(crate) fn latch_unpublished_snapshot_cleanup_failure_for_test(
+    namespace: Arc<RetainedSnapshotDirectory>,
+) {
+    record_unpublished_snapshot_cleanup_failure_in_namespace(namespace);
+}
+
+#[cfg(test)]
+pub(crate) fn fail_snapshot_cleanup_post_rename_sync_for_test() {
+    snapshot_cleanup_test_hooks()
+        .lock()
+        .expect("snapshot cleanup test hooks")
+        .fail_post_rename_sync = true;
 }
 
 impl Drop for UnpublishedSnapshotArtifact {
@@ -465,11 +1358,48 @@ impl Drop for UnpublishedSnapshotArtifact {
         if !self.armed {
             return;
         }
-        self.remove_if_owned(&self.path, self.identity);
-        for (sidecar, identity) in &self.sidecars {
-            self.remove_if_owned(sidecar, *identity);
+        let mut removed = match Self::remove_if_owned(&mut self.cleanup, self.identity) {
+            Ok(removed) => removed,
+            Err(_) => {
+                record_unpublished_snapshot_cleanup_failure_for_state(&self.cleanup);
+                false
+            }
+        };
+        for (sidecar, identity) in &mut self.sidecars {
+            // Sidecars have no long-lived guard after this Drop.  Their
+            // state still follows the same rename-to-tombstone protocol so a
+            // post-rename failure is never redirected to a replacement.
+            match Self::remove_if_owned(sidecar, *identity) {
+                Ok(sidecar_removed) => removed |= sidecar_removed,
+                Err(_) => record_unpublished_snapshot_cleanup_failure_for_state(sidecar),
+            }
+        }
+        if removed && self.cleanup.sync_parent().is_err() {
+            record_unpublished_snapshot_cleanup_failure_for_state(&self.cleanup);
         }
     }
+}
+
+/// Create a fresh unnamed-output artifact with cleanup ownership transferred
+/// atomically from the immediate post-`O_EXCL` guard to the identity-pinned
+/// unpublished-artifact guard.  Callers must use this instead of creating a
+/// namespace child and then doing fallible setup themselves.
+pub(crate) fn create_unpublished_snapshot_file_in_namespace(
+    namespace: Arc<RetainedSnapshotDirectory>,
+    name: &OsStr,
+    read: bool,
+    sqlite_sidecars: bool,
+) -> io::Result<(std::fs::File, UnpublishedSnapshotArtifact)> {
+    let file = namespace.create_new(name, read)?;
+    let mut emergency = NewNamespaceChildGuard::new(Arc::clone(&namespace), name, None);
+    let cleanup = UnpublishedSnapshotArtifact::from_file_in_namespace(
+        &file,
+        namespace,
+        name,
+        sqlite_sidecars,
+    )?;
+    emergency.disarm();
+    Ok((file, cleanup))
 }
 
 #[allow(dead_code)]
@@ -481,6 +1411,7 @@ impl PinnedSqliteFile {
         let identity = file_identity(&metadata)?;
         Ok(Self {
             file,
+            namespace: None,
             path,
             identity,
             immutable_generation: None,
@@ -495,6 +1426,47 @@ impl PinnedSqliteFile {
         pinned.cleanup = Some(UnpublishedSnapshotArtifact::from_file(
             &pinned.file,
             pinned.path.clone(),
+            true,
+        )?);
+        Ok(pinned)
+    }
+
+    /// Create and pin a new retained-namespace database.  An infallible
+    /// emergency cleanup owner is installed immediately after O_EXCL before
+    /// this constructor performs metadata/proc-path work.
+    pub(crate) fn create_new_in_namespace(
+        namespace: Arc<RetainedSnapshotDirectory>,
+        name: &OsStr,
+    ) -> io::Result<Self> {
+        let file = namespace.create_new(name, true)?;
+        let mut emergency = NewNamespaceChildGuard::new(Arc::clone(&namespace), name, None);
+        #[cfg(test)]
+        if take_namespace_pinned_post_create_setup_failure()
+            || take_namespace_vacuum_raw_pinned_post_create_setup_failure(name)
+        {
+            return Err(io::Error::other(
+                "injected retained-namespace pinned post-create setup failure",
+            ));
+        }
+        let pinned = Self::from_new_file_in_namespace(file, namespace, name)?;
+        emergency.disarm();
+        Ok(pinned)
+    }
+
+    /// Retained-dirfd constructor used only while
+    /// [`Self::create_new_in_namespace`] holds the immediate cleanup guard.
+    fn from_new_file_in_namespace(
+        file: std::fs::File,
+        namespace: Arc<RetainedSnapshotDirectory>,
+        name: &OsStr,
+    ) -> io::Result<Self> {
+        let path = namespace.sqlite_child_path(name)?;
+        let mut pinned = Self::from_file(file, path)?;
+        pinned.namespace = Some((Arc::clone(&namespace), name.to_os_string()));
+        pinned.cleanup = Some(UnpublishedSnapshotArtifact::from_file_in_namespace(
+            &pinned.file,
+            namespace,
+            name,
             true,
         )?);
         Ok(pinned)
@@ -527,6 +1499,7 @@ impl PinnedSqliteFile {
         }
         Ok(Self {
             file,
+            namespace: self.namespace.clone(),
             path: self.path.clone(),
             identity: self.identity,
             immutable_generation: self.immutable_generation,
@@ -556,11 +1529,91 @@ impl PinnedSqliteFile {
         }
     }
 
+    /// Move an already-created artifact's exact cleanup state onto the
+    /// retained namespace after a pathname-only SQLite API created it through
+    /// `/proc/self/fd/<dirfd>/<basename>`.
+    pub(crate) fn bind_cleanup_to_namespace(
+        &mut self,
+        namespace: Arc<RetainedSnapshotDirectory>,
+        name: &OsStr,
+    ) -> io::Result<()> {
+        let cleanup = self
+            .cleanup
+            .as_mut()
+            .ok_or_else(|| invalid_data("snapshot artifact has no cleanup authority to bind"))?;
+        cleanup.rebind_in_namespace(namespace, name)
+    }
+
     /// Refresh the expected content identity after SQLite has written through
     /// this same descriptor. Cleanup ownership remains attached to the inode.
     pub(crate) fn refresh_identity(mut self) -> io::Result<Self> {
         self.identity = file_identity(&self.file.metadata()?)?;
         Ok(self)
+    }
+
+    /// Open a read-only, no-follow descriptor for this exact writer inode
+    /// before the writer is closed.  The pathname is used only to acquire the
+    /// new descriptor; the identity comparison is the authority for the
+    /// handoff.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pin_readonly_from_writer(&self) -> io::Result<Self> {
+        self.verify_identity()?;
+        let file = match &self.namespace {
+            Some((namespace, name)) => namespace.open_read(name)?,
+            None => readonly_nofollow(&self.path)?,
+        };
+        let mut pinned = Self::from_file(file, self.path.clone())?;
+        pinned.namespace = self.namespace.clone();
+        if pinned.identity != self.identity {
+            return Err(invalid_data(
+                "fixed snapshot changed while acquiring its read-only pin",
+            ));
+        }
+        pinned.verify_linked_identity()?;
+        if !pinned.path_matches_identity(&self.path)? {
+            return Err(invalid_data(
+                "fixed snapshot path changed while acquiring its read-only pin",
+            ));
+        }
+        Ok(pinned)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn pin_readonly_from_writer(&self) -> io::Result<Self> {
+        let _ = self;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fixed snapshot sealing is unavailable",
+        ))
+    }
+
+    /// Update the diagnostic pathname after an atomic rename. The held
+    /// descriptor identity remains the authorization primitive.
+    pub(crate) fn rebind_path(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+
+    /// Update both the SQLite-only path spelling and retained namespace name
+    /// after an fd-relative atomic rename.
+    pub(crate) fn rebind_in_namespace(
+        &mut self,
+        namespace: Arc<RetainedSnapshotDirectory>,
+        name: &OsStr,
+    ) -> io::Result<()> {
+        self.path = namespace.sqlite_child_path(name)?;
+        self.namespace = Some((namespace, name.to_os_string()));
+        Ok(())
+    }
+
+    /// Durably sync the parent namespace after SQLite has populated this
+    /// pinned artifact. Namespace-created files must never reopen a logical
+    /// parent path here: the retained directory descriptor remains the only
+    /// operational authority after admission.
+    pub(crate) fn sync_parent_directory(&self) -> io::Result<()> {
+        match &self.namespace {
+            Some((namespace, _)) => namespace.sync(),
+            None => sync_snapshot_parent_directory(&self.path),
+        }
     }
 
     /// Record the exact identities of any SQLite sidecars created for this
@@ -569,6 +1622,48 @@ impl PinnedSqliteFile {
         if let Some(cleanup) = self.cleanup.as_mut() {
             cleanup.capture_sidecars();
         }
+    }
+
+    /// Sum SQLite sidecars without re-resolving an admitted namespace through
+    /// its process-local `/proc` spelling. Existing sidecars are regular
+    /// files opened with the retained dirfd; absent sidecars contribute zero.
+    /// The legacy path-only branch remains for isolated non-namespace tests.
+    pub(crate) fn sidecar_bytes(&self) -> io::Result<u64> {
+        let mut total = 0_u64;
+        match &self.namespace {
+            Some((namespace, name)) => {
+                for suffix in ["-journal", "-wal", "-shm"] {
+                    let mut sidecar = name.clone();
+                    sidecar.push(suffix);
+                    let file = match namespace.open_read(&sidecar) {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error),
+                    };
+                    let metadata = file.metadata()?;
+                    ensure_regular_file(&metadata)?;
+                    total = total.checked_add(metadata.len()).ok_or_else(|| {
+                        invalid_data("session consensus SQLite sidecar length overflow")
+                    })?;
+                }
+            }
+            None => {
+                for suffix in ["-journal", "-wal", "-shm"] {
+                    let mut sidecar = self.path.as_os_str().to_os_string();
+                    sidecar.push(suffix);
+                    let metadata = match std::fs::symlink_metadata(&sidecar) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error),
+                    };
+                    ensure_regular_file(&metadata)?;
+                    total = total.checked_add(metadata.len()).ok_or_else(|| {
+                        invalid_data("session consensus SQLite sidecar length overflow")
+                    })?;
+                }
+            }
+        }
+        Ok(total)
     }
 
     /// Revalidate that the held handle itself has not changed identity.
@@ -597,16 +1692,33 @@ impl PinnedSqliteFile {
         if !pinned.path_matches_identity(path)? {
             return Err(invalid_data("fixed snapshot path changed before sealing"));
         }
-        let digest = opc_fs_verity_sys::enable_fixed_profile(pinned.file.as_fd())
+        pinned.seal_fixed()?;
+        Ok(pinned)
+    }
+
+    /// Enable the fixed profile on this already-open, identity-checked
+    /// descriptor. Callers that hand off from a writer must use this instead
+    /// of reopening the pathname after closing that writer.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn seal_fixed(&mut self) -> io::Result<()> {
+        let digest = opc_fs_verity_sys::enable_fixed_profile(self.file.as_fd())
             .map_err(fs_verity_enable_error)?;
-        let metadata = pinned.file.metadata()?;
-        pinned.immutable_generation = Some(ImmutableFileGeneration {
+        let metadata = self.file.metadata()?;
+        self.immutable_generation = Some(ImmutableFileGeneration {
             length: metadata.len(),
             digest,
             change_time: linux_file_change_time(&metadata),
         });
-        pinned.verify_immutable_generation()?;
-        Ok(pinned)
+        self.verify_immutable_generation()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn seal_fixed(&mut self) -> io::Result<()> {
+        let _ = self;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fixed snapshot sealing is unavailable",
+        ))
     }
 
     /// Reopen a final fixed artifact and require an existing fixed fs-verity
@@ -622,8 +1734,57 @@ impl PinnedSqliteFile {
                 "fixed snapshot path changed before measurement",
             ));
         }
-        let digest =
-            opc_fs_verity_sys::measure(pinned.file.as_fd()).map_err(fs_verity_measure_error)?;
+        let digest = opc_fs_verity_sys::measure_exact_profile(pinned.file.as_fd())
+            .map_err(fs_verity_measure_error)?;
+        let metadata = pinned.file.metadata()?;
+        pinned.immutable_generation = Some(ImmutableFileGeneration {
+            length: metadata.len(),
+            digest,
+            change_time: linux_file_change_time(&metadata),
+        });
+        pinned.verify_immutable_generation()?;
+        Ok(pinned)
+    }
+
+    /// Bind an already-authoritative recovery descriptor to the exact fixed
+    /// fs-verity generation without reopening its pathname.  Terminal
+    /// recovery uses this for the descriptor it authenticated before normal
+    /// snapshot startup is allowed to observe the public name.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_file_and_measure_fixed(
+        file: std::fs::File,
+        path: PathBuf,
+    ) -> io::Result<Self> {
+        let mut pinned = Self::from_file(file, path)?;
+        pinned.verify_linked_identity()?;
+        let digest = opc_fs_verity_sys::measure_exact_profile(pinned.file.as_fd())
+            .map_err(fs_verity_measure_error)?;
+        let metadata = pinned.file.metadata()?;
+        pinned.immutable_generation = Some(ImmutableFileGeneration {
+            length: metadata.len(),
+            digest,
+            change_time: linux_file_change_time(&metadata),
+        });
+        pinned.verify_immutable_generation()?;
+        Ok(pinned)
+    }
+
+    /// Retained-namespace variant of [`Self::from_file_and_measure_fixed`].
+    /// The supplied descriptor and all later identity fences remain relative
+    /// to `namespace`; `/proc/self/fd` is retained only as a path spelling for
+    /// SQLite APIs and diagnostics.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_file_and_measure_fixed_in_namespace(
+        file: std::fs::File,
+        namespace: Arc<RetainedSnapshotDirectory>,
+        name: &OsStr,
+    ) -> io::Result<Self> {
+        let path = namespace.sqlite_child_path(name)?;
+        let mut pinned = Self::from_file(file, path)?;
+        pinned.namespace = Some((namespace, name.to_os_string()));
+        pinned.verify_linked_identity()?;
+        let digest = opc_fs_verity_sys::measure_exact_profile(pinned.file.as_fd())
+            .map_err(fs_verity_measure_error)?;
         let metadata = pinned.file.metadata()?;
         pinned.immutable_generation = Some(ImmutableFileGeneration {
             length: metadata.len(),
@@ -644,6 +1805,29 @@ impl PinnedSqliteFile {
 
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn reopen_and_measure_fixed(_path: &Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fixed snapshot sealing is unavailable",
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn from_file_and_measure_fixed(
+        _file: std::fs::File,
+        _path: PathBuf,
+    ) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fixed snapshot sealing is unavailable",
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn from_file_and_measure_fixed_in_namespace(
+        _file: std::fs::File,
+        _namespace: Arc<RetainedSnapshotDirectory>,
+        _name: &OsStr,
+    ) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "fixed snapshot sealing is unavailable",
@@ -872,13 +2056,117 @@ impl PinnedSqliteFile {
                 "session consensus snapshot changed during verification",
             ));
         }
-        // The envelope hash is validation only. Fixed callers bind and
-        // remeasure the kernel fs-verity generation separately; this method
-        // remains a bounded envelope validator for Dynamic corruption checks.
+        // The envelope hash is validation only. If this descriptor already
+        // carries a fixed-profile seal, bind the post-scan generation to that
+        // same kernel digest. This deliberately permits the authorized rename
+        // between sealing the staging name and scanning the published name to
+        // advance `ctime`, while rejecting a different seal, length, inode, or
+        // pathname. Dynamic callers retain userspace corruption detection and
+        // never acquire immutable authority here.
+        if let Some(sealed_generation) = self.immutable_generation {
+            if sealed_generation.length != total_length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session consensus snapshot immutable length is inconsistent",
+                ));
+            }
+            let rebound_digest = fixed_verity_measurement(&self.file)?;
+            if rebound_digest != sealed_generation.digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pinned SQLite file immutable generation changed",
+                ));
+            }
+            let rebound_metadata = self.file.metadata()?;
+            if rebound_metadata.len() != total_length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session consensus snapshot changed during verification",
+                ));
+            }
+            #[cfg(target_os = "linux")]
+            if linux_file_change_time(&rebound_metadata) != bound_change_time {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session consensus snapshot changed during verification",
+                ));
+            }
+            self.verify_linked_identity()?;
+            if !self.path_matches_identity(path)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pinned SQLite file path was replaced",
+                ));
+            }
+            self.immutable_generation = Some(ImmutableFileGeneration {
+                length: total_length,
+                digest: rebound_digest,
+                #[cfg(target_os = "linux")]
+                change_time: bound_change_time,
+            });
+        }
         Ok(ImmutableSnapshotEnvelope {
             payload_length,
             total_length,
         })
+    }
+
+    /// Read the self-describing footer from this already-sealed descriptor so
+    /// a receiver can establish its expected checksum and length without
+    /// consulting a second, mutable source descriptor.  This is intentionally
+    /// only the small footer read: callers must immediately perform the full
+    /// bounded validation with
+    /// [`Self::verify_snapshot_envelope_and_bind_immutable_generation`].
+    pub(crate) fn snapshot_envelope_footer_from_pinned_descriptor(
+        &self,
+        path: &Path,
+        footer_magic: &[u8; 8],
+        footer_bytes: u64,
+        maximum_payload_bytes: u64,
+    ) -> io::Result<([u8; 32], u64)> {
+        self.verify_immutable_generation()?;
+        if !self.path_matches_identity(path)? {
+            return Err(invalid_data("pinned SQLite file path was replaced"));
+        }
+        if footer_bytes != 48 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot footer size is invalid",
+            ));
+        }
+        let total_length = self.file.metadata()?.len();
+        if total_length <= footer_bytes
+            || total_length > maximum_payload_bytes.saturating_add(footer_bytes)
+        {
+            return Err(invalid_data("session consensus snapshot size is invalid"));
+        }
+        let mut reader = self.file.try_clone()?;
+        reader.seek(io::SeekFrom::End(-i64::try_from(footer_bytes).map_err(
+            |_| invalid_data("session consensus snapshot footer size is invalid"),
+        )?))?;
+        let mut footer = [0_u8; 48];
+        reader.read_exact(&mut footer)?;
+        if &footer[..8] != footer_magic {
+            return Err(invalid_data("session consensus snapshot magic is invalid"));
+        }
+        let encoded_length: [u8; 8] = footer[8..16]
+            .try_into()
+            .map_err(|_| invalid_data("snapshot footer length is invalid"))?;
+        let payload_length = u64::from_be_bytes(encoded_length);
+        if payload_length == 0
+            || payload_length > maximum_payload_bytes
+            || payload_length.checked_add(footer_bytes) != Some(total_length)
+        {
+            return Err(invalid_data("session consensus snapshot length is invalid"));
+        }
+        let checksum: [u8; 32] = footer[16..]
+            .try_into()
+            .map_err(|_| invalid_data("snapshot footer checksum is invalid"))?;
+        self.verify_immutable_generation()?;
+        if !self.path_matches_identity(path)? {
+            return Err(invalid_data("pinned SQLite file path was replaced"));
+        }
+        Ok((checksum, total_length))
     }
 
     /// Recheck the constant-time authority needed between a completed
@@ -985,11 +2273,26 @@ impl PinnedSqliteFile {
         ))
     }
 
-    /// Compare a pathname with the pinned identity for diagnostics or cleanup.
+    /// Compare a pathname with the pinned identity through a fresh
+    /// `O_NOFOLLOW | O_NONBLOCK` descriptor.
     ///
-    /// This follows the path at the time of comparison and is intentionally
-    /// not an authorization primitive.
+    /// The re-open makes this suitable for final authorization checks: a
+    /// symlink cannot be substituted for a same-inode path while the identity
+    /// comparison is in progress.
     pub(crate) fn path_matches_identity(&self, path: &Path) -> io::Result<bool> {
+        if let Some((namespace, name)) = &self.namespace {
+            if path.file_name() != Some(name.as_os_str()) {
+                return Ok(false);
+            }
+            let metadata = namespace.open_read(name)?.metadata()?;
+            if !metadata.is_file() {
+                return Ok(false);
+            }
+            return Ok(file_identity(&metadata)? == self.identity);
+        }
+        #[cfg(target_os = "linux")]
+        let metadata = readonly_nofollow(path)?.metadata()?;
+        #[cfg(not(target_os = "linux"))]
         let metadata = std::fs::metadata(path)?;
         if !metadata.is_file() {
             return Ok(false);
@@ -1005,19 +2308,24 @@ impl PinnedSqliteFile {
 }
 
 #[cfg(target_os = "linux")]
-fn readonly_nofollow(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn readonly_nofollow(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let mut options = std::fs::OpenOptions::new();
     options
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     options.open(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn readonly_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 #[cfg(target_os = "linux")]
 fn fixed_verity_measurement(file: &std::fs::File) -> io::Result<[u8; 32]> {
-    opc_fs_verity_sys::measure(file.as_fd()).map_err(fs_verity_measure_error)
+    opc_fs_verity_sys::measure_exact_profile(file.as_fd()).map_err(fs_verity_measure_error)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1033,7 +2341,20 @@ fn invalid_data(message: &'static str) -> io::Error {
 }
 
 fn fs_verity_enable_error(error: opc_fs_verity_sys::Error) -> io::Error {
-    let kind = match error {
+    // Preserve only the kernel errno for operator qualification.  The
+    // descriptor-only fs-verity API never contains a pathname or contents,
+    // while collapsing this to a generic Unsupported error made a valid
+    // qualification mount indistinguishable from a descriptor-lifetime bug.
+    let diagnostic = match &error {
+        opc_fs_verity_sys::Error::Enable(error) => {
+            format!("enable errno={:?}", error.raw_os_error())
+        }
+        opc_fs_verity_sys::Error::Measure(error) => {
+            format!("post-enable measurement errno={:?}", error.raw_os_error())
+        }
+        other => format!("{other}"),
+    };
+    let kind = match &error {
         opc_fs_verity_sys::Error::Unsupported
         | opc_fs_verity_sys::Error::UnsupportedProfile { .. } => io::ErrorKind::Unsupported,
         opc_fs_verity_sys::Error::Enable(error) => {
@@ -1051,7 +2372,10 @@ fn fs_verity_enable_error(error: opc_fs_verity_sys::Error) -> io::Error {
         opc_fs_verity_sys::Error::Measure(_) => io::ErrorKind::InvalidData,
         _ => io::ErrorKind::InvalidData,
     };
-    io::Error::new(kind, "fixed snapshot sealing is unavailable")
+    io::Error::new(
+        kind,
+        format!("fixed snapshot sealing is unavailable ({diagnostic})"),
+    )
 }
 
 fn fs_verity_measure_error(_error: opc_fs_verity_sys::Error) -> io::Error {
@@ -1080,6 +2404,10 @@ pub(crate) struct SessionSnapshotFile {
     // Kept by a receiving artifact so cloned state-machine handles cannot
     // retain more than one unvalidated snapshot stream for one core.
     _receive_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    // The snapshot namespace authority outlives state-machine/log wrappers
+    // while a receiver is still writable.  It is intentionally opaque here:
+    // transport owns no policy, it merely retains the admission capability.
+    _namespace_lease: Option<Arc<dyn Send + Sync>>,
     seek_in_flight: bool,
     replay: Option<SnapshotReplayRead>,
     io_poisoned: bool,
@@ -1095,56 +2423,126 @@ struct SnapshotReplayRead {
 }
 
 struct SnapshotCleanupGuard {
-    path: PathBuf,
+    state: Arc<std::sync::Mutex<SnapshotCleanupState>>,
     identity: FileIdentity,
+    // Keeps the authenticated inode alive even after SessionSnapshotFile's
+    // Tokio descriptor is dropped before this field's Drop runs.
+    _pin: std::fs::File,
     armed: bool,
     cleanup_failed: Option<Arc<AtomicBool>>,
 }
 
+// The retained-dirfd receiver creates the inode on a blocking worker. Keep
+// causal fault points both before cleanup-owner setup and after it is armed:
+// descriptor pressure must not strand an O_EXCL-created incoming artifact.
+#[cfg(test)]
+fn namespace_receiver_post_create_setup_failure() -> &'static AtomicBool {
+    static FAIL: AtomicBool = AtomicBool::new(false);
+    &FAIL
+}
+
+#[cfg(test)]
+pub(crate) fn fail_namespace_receiver_post_create_setup_for_test() {
+    namespace_receiver_post_create_setup_failure().store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+fn take_namespace_receiver_post_create_setup_failure() -> bool {
+    namespace_receiver_post_create_setup_failure().swap(false, Ordering::AcqRel)
+}
+
+// Pinned SQLite creation has the same O_EXCL-before-metadata boundary as the
+// receiver. Build/VACUUM tests use this distinct point to prove both the
+// final and intermediate SQLite children cannot leak under descriptor
+// pressure before their identity-pinned cleanup owner exists.
+#[cfg(test)]
+fn namespace_pinned_post_create_setup_failure() -> &'static AtomicBool {
+    static FAIL: AtomicBool = AtomicBool::new(false);
+    &FAIL
+}
+
+#[cfg(test)]
+pub(crate) fn fail_namespace_pinned_post_create_setup_for_test() {
+    namespace_pinned_post_create_setup_failure().store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+fn take_namespace_pinned_post_create_setup_failure() -> bool {
+    namespace_pinned_post_create_setup_failure().swap(false, Ordering::AcqRel)
+}
+
+#[cfg(test)]
+fn namespace_vacuum_raw_pinned_post_create_setup_failure() -> &'static AtomicBool {
+    static FAIL: AtomicBool = AtomicBool::new(false);
+    &FAIL
+}
+
+/// Target the fallback builder's strict `vacuum-raw-*` intermediate after its
+/// final `build-*` pin was successfully armed.
+#[cfg(test)]
+pub(crate) fn fail_namespace_vacuum_raw_pinned_post_create_setup_for_test() {
+    namespace_vacuum_raw_pinned_post_create_setup_failure().store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+fn take_namespace_vacuum_raw_pinned_post_create_setup_failure(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with("vacuum-raw-"))
+        && namespace_vacuum_raw_pinned_post_create_setup_failure().swap(false, Ordering::AcqRel)
+}
+
+#[cfg(test)]
+fn namespace_receiver_post_create_sync_failure() -> &'static AtomicBool {
+    static FAIL: AtomicBool = AtomicBool::new(false);
+    &FAIL
+}
+
+#[cfg(test)]
+pub(crate) fn fail_namespace_receiver_post_create_sync_for_test() {
+    namespace_receiver_post_create_sync_failure().store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+fn take_namespace_receiver_post_create_sync_failure() -> bool {
+    namespace_receiver_post_create_sync_failure().swap(false, Ordering::AcqRel)
+}
+
 impl SnapshotCleanupGuard {
+    fn record_failure(&self) {
+        // Publish the monotonic directory generation before the legacy
+        // atomic hint. Validation snapshots/acknowledges generations, so a
+        // failure concurrent with its fsync cannot be erased by a bool swap.
+        if let Ok(state) = self.state.lock() {
+            record_unpublished_snapshot_cleanup_failure_for_state(&state);
+        }
+        if let Some(cleanup_failed) = &self.cleanup_failed {
+            cleanup_failed.store(true, Ordering::Release);
+        }
+    }
+
     async fn remove(&mut self) -> io::Result<()> {
         if !self.armed {
             return Ok(());
         }
-        let metadata = match tokio::fs::symlink_metadata(&self.path).await {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.armed = false;
-                return Ok(());
+        match tokio::task::spawn_blocking({
+            let state = Arc::clone(&self.state);
+            let identity = self.identity;
+            move || {
+                let mut state = state
+                    .lock()
+                    .map_err(|_| io::Error::other("snapshot cleanup state lock poisoned"))?;
+                remove_snapshot_cleanup_if_owned(&mut state, identity)
             }
-            Err(error) => {
-                if let Some(cleanup_failed) = &self.cleanup_failed {
-                    cleanup_failed.store(true, Ordering::Release);
-                }
-                return Err(error);
-            }
-        };
-        let identity = match file_identity(&metadata) {
-            Ok(identity) => identity,
-            Err(error) => {
-                if let Some(cleanup_failed) = &self.cleanup_failed {
-                    cleanup_failed.store(true, Ordering::Release);
-                }
-                return Err(error);
-            }
-        };
-        if !metadata.is_file() || !same_file_object(identity, self.identity) {
-            self.armed = false;
-            return Ok(());
-        }
-        match tokio::fs::remove_file(&self.path).await {
-            Ok(()) => {
-                self.armed = false;
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        })
+        .await
+        .map_err(|_| io::Error::other("snapshot cleanup worker failed"))?
+        {
+            Ok(true) | Ok(false) => {
                 self.armed = false;
                 Ok(())
             }
             Err(error) => {
-                if let Some(cleanup_failed) = &self.cleanup_failed {
-                    cleanup_failed.store(true, Ordering::Release);
-                }
+                self.record_failure();
                 Err(error)
             }
         }
@@ -1156,38 +2554,505 @@ impl Drop for SnapshotCleanupGuard {
         if !self.armed {
             return;
         }
-        let metadata = match std::fs::symlink_metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(_) => {
-                if let Some(cleanup_failed) = &self.cleanup_failed {
-                    cleanup_failed.store(true, Ordering::Release);
-                }
-                return;
-            }
-        };
-        let identity = match file_identity(&metadata) {
-            Ok(identity) => identity,
-            Err(_) => {
-                if let Some(cleanup_failed) = &self.cleanup_failed {
-                    cleanup_failed.store(true, Ordering::Release);
-                }
-                return;
-            }
-        };
-        if !metadata.is_file() || !same_file_object(identity, self.identity) {
-            return;
+        let result = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("snapshot cleanup state lock poisoned"))
+            .and_then(|mut state| remove_snapshot_cleanup_if_owned(&mut state, self.identity));
+        if result.is_err() {
+            self.record_failure();
         }
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => {
-                if let Some(cleanup_failed) = &self.cleanup_failed {
-                    cleanup_failed.store(true, Ordering::Release);
-                }
+    }
+}
+
+fn sync_snapshot_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot artifact has no parent directory",
+        )
+    })?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+/// The pathname presently owned by cleanup.  A successful rename changes
+/// this state before any fallible durability or identity step, which keeps
+/// every retry and Drop attempt pinned to the exact tombstone rather than the
+/// now-vacant public name.
+enum SnapshotCleanupLocation {
+    Original,
+    Tombstone(PathBuf),
+    // The exact tombstone has been moved to this private basename after a
+    // descriptor identity check.  Retain both spellings so a failed guard
+    // authentication can restore only into the now-vacant tombstone name.
+    UnlinkGuard { guard: PathBuf, tombstone: PathBuf },
+    Unlinked,
+}
+
+struct SnapshotCleanupState {
+    original: PathBuf,
+    namespace: Option<Arc<RetainedSnapshotDirectory>>,
+    location: SnapshotCleanupLocation,
+}
+
+impl SnapshotCleanupState {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            original: path,
+            namespace: None,
+            location: SnapshotCleanupLocation::Original,
+        }
+    }
+
+    fn in_namespace(namespace: Arc<RetainedSnapshotDirectory>, name: &OsStr) -> io::Result<Self> {
+        Ok(Self {
+            original: namespace.logical_child(name)?,
+            namespace: Some(namespace),
+            location: SnapshotCleanupLocation::Original,
+        })
+    }
+
+    #[cfg(test)]
+    fn rebind(&mut self, path: PathBuf) {
+        self.original = path;
+        self.namespace = None;
+        self.location = SnapshotCleanupLocation::Original;
+    }
+
+    fn active_path(&self) -> Option<&Path> {
+        match &self.location {
+            SnapshotCleanupLocation::Original => Some(&self.original),
+            SnapshotCleanupLocation::Tombstone(path) => Some(path),
+            SnapshotCleanupLocation::UnlinkGuard { guard, .. } => Some(guard),
+            SnapshotCleanupLocation::Unlinked => None,
+        }
+    }
+
+    fn tombstone_path(&self) -> Option<&Path> {
+        match &self.location {
+            SnapshotCleanupLocation::Tombstone(path) => Some(path),
+            SnapshotCleanupLocation::UnlinkGuard { tombstone, .. } => Some(tombstone),
+            SnapshotCleanupLocation::Original | SnapshotCleanupLocation::Unlinked => None,
+        }
+    }
+
+    fn active_name(&self) -> io::Result<&OsStr> {
+        self.active_path()
+            .and_then(Path::file_name)
+            .ok_or_else(|| invalid_data("snapshot cleanup artifact has no basename"))
+    }
+
+    fn sync_parent(&self) -> io::Result<()> {
+        match &self.namespace {
+            Some(namespace) => namespace.sync(),
+            None => sync_snapshot_parent_directory(&self.original),
+        }
+    }
+
+    fn open_active(&self) -> io::Result<std::fs::File> {
+        match &self.namespace {
+            Some(namespace) => namespace.open_read(self.active_name()?),
+            None => readonly_nofollow(
+                self.active_path()
+                    .ok_or_else(|| invalid_data("snapshot cleanup artifact is unlinked"))?,
+            ),
+        }
+    }
+
+    fn rename_noreplace(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        match &self.namespace {
+            Some(namespace) => namespace.rename_noreplace(from, to),
+            None => {
+                let parent = self
+                    .original
+                    .parent()
+                    .ok_or_else(|| invalid_data("snapshot artifact has no parent"))?;
+                let directory = std::fs::File::open(parent)?;
+                nix::fcntl::renameat2(
+                    &directory,
+                    from,
+                    &directory,
+                    to,
+                    nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+                )
+                .map_err(io::Error::from)
             }
         }
     }
+
+    fn unlink_active(&self) -> io::Result<()> {
+        match &self.namespace {
+            Some(namespace) => namespace.unlink(self.active_name()?),
+            None => std::fs::remove_file(
+                self.active_path()
+                    .ok_or_else(|| invalid_data("snapshot cleanup artifact is unlinked"))?,
+            ),
+        }
+    }
+}
+
+// The cleanup race is deliberately testable at the two causal boundaries.
+// Production has no callback between identity authentication and rename, or
+// between the durable rename state transition and its directory sync.
+#[cfg(test)]
+type SnapshotCleanupTestHook = Box<dyn FnOnce(&Path, &Path) + Send>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct SnapshotCleanupTestHooks {
+    before_rename: Option<SnapshotCleanupTestHook>,
+    after_rename: Option<SnapshotCleanupTestHook>,
+    post_final_identity_before_unlink: Option<SnapshotCleanupTestHook>,
+    fail_post_rename_sync: bool,
+    fail_post_unlink_guard_sync: bool,
+}
+
+#[cfg(test)]
+fn snapshot_cleanup_test_hooks() -> &'static std::sync::Mutex<SnapshotCleanupTestHooks> {
+    static HOOKS: std::sync::OnceLock<std::sync::Mutex<SnapshotCleanupTestHooks>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(SnapshotCleanupTestHooks::default()))
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_cleanup_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+fn take_snapshot_cleanup_hook(after_rename: bool) -> (Option<SnapshotCleanupTestHook>, bool) {
+    let mut hooks = snapshot_cleanup_test_hooks()
+        .lock()
+        .expect("snapshot cleanup test hooks");
+    let hook = if after_rename {
+        hooks.after_rename.take()
+    } else {
+        hooks.before_rename.take()
+    };
+    let fail_sync = after_rename && std::mem::take(&mut hooks.fail_post_rename_sync);
+    (hook, fail_sync)
+}
+
+fn snapshot_cleanup_before_rename(original: &Path, tombstone: &Path) {
+    #[cfg(test)]
+    if let (Some(hook), _) = take_snapshot_cleanup_hook(false) {
+        hook(original, tombstone);
+    }
+    #[cfg(not(test))]
+    let _ = (original, tombstone);
+}
+
+fn sync_snapshot_cleanup_after_rename(
+    state: &SnapshotCleanupState,
+    original: &Path,
+    tombstone: &Path,
+) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let (hook, fail_sync) = take_snapshot_cleanup_hook(true);
+        if let Some(hook) = hook {
+            hook(original, tombstone);
+        }
+        if fail_sync {
+            return Err(io::Error::other(
+                "injected post-rename directory sync failure",
+            ));
+        }
+    }
+    #[cfg(not(test))]
+    let _ = (original, tombstone);
+    state.sync_parent()
+}
+
+/// The final identity check is intentionally exposed only in tests.  The
+/// callback runs before the authenticated tombstone is captured under its
+/// private guard name, making the historical check-to-unlink race causal and
+/// deterministic without exposing a production interleaving point.
+fn snapshot_cleanup_after_final_identity_before_unlink(tombstone: &Path, guard: &Path) {
+    #[cfg(test)]
+    if let Some(hook) = snapshot_cleanup_test_hooks()
+        .lock()
+        .expect("snapshot cleanup test hooks")
+        .post_final_identity_before_unlink
+        .take()
+    {
+        hook(tombstone, guard);
+    }
+    #[cfg(not(test))]
+    let _ = (tombstone, guard);
+}
+
+/// Persist a successful final guard rename before unlinking.  A retry after a
+/// crash or a returned error therefore targets this exact bounded guard name,
+/// never the original public or tombstone spelling.
+fn sync_snapshot_cleanup_after_unlink_guard_rename(state: &SnapshotCleanupState) -> io::Result<()> {
+    state.sync_parent()?;
+    #[cfg(test)]
+    if std::mem::take(
+        &mut snapshot_cleanup_test_hooks()
+            .lock()
+            .expect("snapshot cleanup test hooks")
+            .fail_post_unlink_guard_sync,
+    ) {
+        return Err(io::Error::other(
+            "injected post-unlink-guard directory sync failure",
+        ));
+    }
+    Ok(())
+}
+
+/// Build the one bounded final-unlink guard basename.  The source tombstone
+/// already has the canonical operation UUID; the fixed-width `(st_dev,
+/// st_ino)` suffix binds this second state transition to the exact admitted
+/// regular file without adding another retry-generated artifact name.
+#[cfg(target_os = "linux")]
+fn snapshot_cleanup_unlink_guard_path(
+    tombstone: &Path,
+    identity: FileIdentity,
+) -> io::Result<PathBuf> {
+    let parent = tombstone
+        .parent()
+        .ok_or_else(|| invalid_data("snapshot tombstone has no parent"))?;
+    let name = tombstone
+        .file_name()
+        .ok_or_else(|| invalid_data("snapshot tombstone has no name"))?;
+    let mut guard_name = name.to_os_string();
+    guard_name.push(format!(
+        ".opc-unlink-guard-{:016x}-{:016x}",
+        identity.device, identity.inode
+    ));
+    Ok(parent.join(guard_name))
+}
+
+/// Return whether an unlink guard's fixed-width identity suffix authenticates
+/// the exact inode currently named by it.  The storage restart scanner first
+/// applies its stricter production-name grammar, then calls this helper.
+#[cfg(target_os = "linux")]
+pub(crate) fn snapshot_cleanup_unlink_guard_name_authenticates_metadata(
+    guard_name: &OsStr,
+    metadata: &std::fs::Metadata,
+) -> io::Result<bool> {
+    Ok(metadata.is_file()
+        && snapshot_cleanup_unlink_guard_name_authenticates(guard_name, file_identity(metadata)?))
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_cleanup_unlink_guard_name_authenticates(
+    guard_name: &OsStr,
+    identity: FileIdentity,
+) -> bool {
+    let Some(guard_name) = guard_name.to_str() else {
+        return false;
+    };
+    let Some((_tombstone, encoded_identity)) = guard_name.rsplit_once(".opc-unlink-guard-") else {
+        return false;
+    };
+    let Some((device, inode)) = encoded_identity.split_once('-') else {
+        return false;
+    };
+    parse_fixed_lower_hex_u64(device) == Some(identity.device)
+        && parse_fixed_lower_hex_u64(inode) == Some(identity.inode)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_fixed_lower_hex_u64(token: &str) -> Option<u64> {
+    (token.len() == 16
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| u64::from_str_radix(token, 16).ok())
+    .flatten()
+}
+
+/// Restore a post-rename artifact only into a vacant original name.  This is
+/// intentionally `RENAME_NOREPLACE`: an occupant at the original name is
+/// foreign, even if it looks like one of our staging names.
+#[cfg(target_os = "linux")]
+fn restore_snapshot_tombstone(
+    state: &mut SnapshotCleanupState,
+    tombstone: &Path,
+) -> io::Result<()> {
+    match state.rename_noreplace(
+        tombstone
+            .file_name()
+            .ok_or_else(|| invalid_data("snapshot tombstone has no name"))?,
+        state
+            .original
+            .file_name()
+            .ok_or_else(|| invalid_data("snapshot artifact has no name"))?,
+    ) {
+        Ok(()) => {
+            state.location = SnapshotCleanupLocation::Original;
+            state.sync_parent()
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Restore a rejected final guard only into its exact vacant tombstone name.
+/// `RENAME_NOREPLACE` preserves both foreign names if another writer occupied
+/// the tombstone while the guard was being authenticated.
+#[cfg(target_os = "linux")]
+fn restore_snapshot_unlink_guard(
+    state: &mut SnapshotCleanupState,
+    guard: &Path,
+    tombstone: &Path,
+) -> io::Result<()> {
+    state.rename_noreplace(
+        guard
+            .file_name()
+            .ok_or_else(|| invalid_data("snapshot unlink guard has no name"))?,
+        tombstone
+            .file_name()
+            .ok_or_else(|| invalid_data("snapshot tombstone has no name"))?,
+    )?;
+    state.location = SnapshotCleanupLocation::Tombstone(tombstone.to_path_buf());
+    state.sync_parent()
+}
+
+/// Descriptor-authenticated cleanup state machine.  It deliberately holds a
+/// tombstone state across directory-sync, reopen, identity and unlink errors;
+/// retries can therefore never act on a same-name replacement at `original`.
+#[cfg(target_os = "linux")]
+fn remove_snapshot_cleanup_if_owned(
+    state: &mut SnapshotCleanupState,
+    expected: FileIdentity,
+) -> io::Result<bool> {
+    if matches!(state.location, SnapshotCleanupLocation::Unlinked) {
+        state.sync_parent()?;
+        return Ok(false);
+    }
+    let file = match state.open_active() {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A tombstone can have been removed by a prior successful unlink
+            // whose directory sync failed.  Retrying that sync is the only
+            // safe recovery action.
+            if matches!(
+                state.location,
+                SnapshotCleanupLocation::Tombstone(_) | SnapshotCleanupLocation::UnlinkGuard { .. }
+            ) {
+                state.location = SnapshotCleanupLocation::Unlinked;
+                state.sync_parent()?;
+            }
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || !same_file_object(file_identity(&metadata)?, expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "snapshot cleanup path was replaced",
+        ));
+    }
+    let name = state
+        .original
+        .file_name()
+        .ok_or_else(|| invalid_data("snapshot artifact has no name"))?;
+    if matches!(state.location, SnapshotCleanupLocation::Original) {
+        let parent = state
+            .original
+            .parent()
+            .ok_or_else(|| invalid_data("snapshot artifact has no parent"))?;
+        let tombstone = parent.join(format!(
+            ".{}.opc-cleanup-{}",
+            name.to_string_lossy(),
+            uuid::Uuid::new_v4()
+        ));
+        snapshot_cleanup_before_rename(&state.original, &tombstone);
+        state.rename_noreplace(
+            name,
+            tombstone
+                .file_name()
+                .ok_or_else(|| invalid_data("snapshot tombstone has no name"))?,
+        )?;
+        // This assignment is deliberately immediately after rename.  Do not
+        // put a fallible operation between them.
+        state.location = SnapshotCleanupLocation::Tombstone(tombstone);
+    }
+    if !matches!(state.location, SnapshotCleanupLocation::UnlinkGuard { .. }) {
+        let tombstone = state
+            .tombstone_path()
+            .expect("rename establishes a tombstone")
+            .to_path_buf();
+        sync_snapshot_cleanup_after_rename(state, &state.original, &tombstone)?;
+        let tombstone_file = state.open_active()?;
+        let tombstone_metadata = tombstone_file.metadata()?;
+        if !tombstone_metadata.is_file()
+            || !same_file_object(file_identity(&tombstone_metadata)?, expected)
+        {
+            drop(tombstone_file);
+            // The precheck-to-rename race may have moved a foreign replacement.
+            // Put it back only if the public name remains vacant; otherwise both
+            // foreign inodes survive and the guard remains on the tombstone.
+            let _ = restore_snapshot_tombstone(state, &tombstone);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "snapshot cleanup artifact changed during rename",
+            ));
+        }
+        drop(tombstone_file);
+
+        let guard = snapshot_cleanup_unlink_guard_path(&tombstone, expected)?;
+        snapshot_cleanup_after_final_identity_before_unlink(&tombstone, &guard);
+        state.rename_noreplace(
+            tombstone
+                .file_name()
+                .ok_or_else(|| invalid_data("snapshot tombstone has no name"))?,
+            guard
+                .file_name()
+                .ok_or_else(|| invalid_data("snapshot unlink guard has no name"))?,
+        )?;
+        // No fallible operation may occur between the guard rename and this
+        // assignment: replay must never reopen the public/tombstone spelling.
+        state.location = SnapshotCleanupLocation::UnlinkGuard {
+            guard: guard.clone(),
+            tombstone,
+        };
+        sync_snapshot_cleanup_after_unlink_guard_rename(state)?;
+
+        let guard_file = state.open_active()?;
+        let guard_metadata = guard_file.metadata()?;
+        if !guard_metadata.is_file() || !same_file_object(file_identity(&guard_metadata)?, expected)
+        {
+            drop(guard_file);
+            let (guard, tombstone) = match &state.location {
+                SnapshotCleanupLocation::UnlinkGuard { guard, tombstone } => {
+                    (guard.clone(), tombstone.clone())
+                }
+                _ => unreachable!("guard rename established unlink guard state"),
+            };
+            let _ = restore_snapshot_unlink_guard(state, &guard, &tombstone);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "snapshot cleanup artifact changed during final unlink guard rename",
+            ));
+        }
+        drop(guard_file);
+    } else {
+        // A previous guard rename may have succeeded before its directory sync
+        // or unlink.  Do not generate a nested guard; make this exact retained
+        // guard durable and replay it in place.
+        sync_snapshot_cleanup_after_unlink_guard_rename(state)?;
+    }
+    drop(file);
+    state.unlink_active()?;
+    state.location = SnapshotCleanupLocation::Unlinked;
+    state.sync_parent()?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_snapshot_cleanup_if_owned(
+    _state: &mut SnapshotCleanupState,
+    _expected: FileIdentity,
+) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "snapshot identity-bound cleanup requires Linux",
+    ))
 }
 
 #[allow(dead_code)]
@@ -1241,6 +3106,68 @@ impl SessionSnapshotFile {
         }
     }
 
+    /// Create a receiver staging file through the retained snapshot dirfd.
+    /// `path()` remains a descriptor-anchored SQLite/path diagnostic spelling,
+    /// while cancellation cleanup uses the namespace capability directly.
+    pub(crate) async fn create_with_cleanup_bounded_in_namespace(
+        namespace: Arc<RetainedSnapshotDirectory>,
+        name: OsString,
+        cleanup_failed: Option<Arc<AtomicBool>>,
+        received_maximum: u64,
+        receive_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> io::Result<Self> {
+        let create_namespace = Arc::clone(&namespace);
+        let create_name = name.clone();
+        let (file, path, cleanup) = tokio::task::spawn_blocking(move || {
+            let file = create_namespace.create_new(&create_name, true)?;
+            // This guard is intentionally first after O_EXCL. Metadata,
+            // try_clone and cleanup-state setup can all fail with EMFILE.
+            let mut emergency = NewNamespaceChildGuard::new(
+                Arc::clone(&create_namespace),
+                &create_name,
+                cleanup_failed.clone(),
+            );
+            #[cfg(test)]
+            if take_namespace_receiver_post_create_setup_failure() {
+                return Err(io::Error::other(
+                    "injected retained-namespace receiver post-create setup failure",
+                ));
+            }
+            let identity = file_identity(&file.metadata()?)?;
+            let cleanup_pin = file.try_clone()?;
+            let cleanup = SnapshotCleanupGuard {
+                state: Arc::new(std::sync::Mutex::new(SnapshotCleanupState::in_namespace(
+                    Arc::clone(&create_namespace),
+                    &create_name,
+                )?)),
+                identity,
+                _pin: cleanup_pin,
+                armed: true,
+                cleanup_failed: cleanup_failed.clone(),
+            };
+            // From this point the identity-pinned cleanup guard owns the
+            // name through all later sync/proc-path failures.
+            emergency.disarm();
+            #[cfg(test)]
+            if take_namespace_receiver_post_create_sync_failure() {
+                return Err(io::Error::other(
+                    "injected retained-namespace receiver post-create sync failure",
+                ));
+            }
+            create_namespace.sync()?;
+            let path = create_namespace.sqlite_child_path(&create_name)?;
+            Ok::<_, io::Error>((file, path, cleanup))
+        })
+        .await
+        .map_err(|_| io::Error::other("snapshot receiver create worker failed"))??;
+        let mut snapshot = Self::from_file(tokio::fs::File::from_std(file), path).await?;
+        snapshot.cleanup = Some(cleanup);
+        snapshot.received_maximum = received_maximum;
+        snapshot._receive_admission = receive_admission;
+        snapshot.receiving = true;
+        Ok(snapshot)
+    }
+
     async fn create_with_cleanup_bounded_inner(
         path: PathBuf,
         cleanup_failed: Option<Arc<AtomicBool>>,
@@ -1250,16 +3177,21 @@ impl SessionSnapshotFile {
     ) -> io::Result<Self> {
         reject_symlink(&path).await?;
         let (file, mut cleanup) = create_new_snapshot_file(&path)?;
+        sync_snapshot_parent_directory(&path)?;
         #[cfg(test)]
         if let Some(after_create) = after_create {
             after_create.block_if_armed().await;
         }
         let identity = file_identity(&file.metadata()?)?;
+        let cleanup_pin = file.try_clone()?;
         let mut snapshot = Self::from_file(tokio::fs::File::from_std(file), path).await?;
         cleanup.disarm();
         snapshot.cleanup = Some(SnapshotCleanupGuard {
-            path: snapshot.path.clone(),
+            state: Arc::new(std::sync::Mutex::new(SnapshotCleanupState::new(
+                snapshot.path.clone(),
+            ))),
             identity,
+            _pin: cleanup_pin,
             armed: true,
             cleanup_failed,
         });
@@ -1293,6 +3225,7 @@ impl SessionSnapshotFile {
             receiving: false,
             receive_limit_exceeded: false,
             _receive_admission: None,
+            _namespace_lease: None,
             seek_in_flight: false,
             replay: None,
             io_poisoned: false,
@@ -1307,6 +3240,17 @@ impl SessionSnapshotFile {
     /// SDK-controlled path associated with this handle.
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Keep a caller-owned namespace admission alive for the lifetime of a
+    /// mutable receiving descriptor.  This must be attached only after the
+    /// descriptor was created successfully, so a failed create has no guard
+    /// to clean up or latch.
+    pub(crate) fn retain_namespace_lease<T>(&mut self, lease: Arc<T>)
+    where
+        T: Send + Sync + 'static,
+    {
+        self._namespace_lease = Some(lease);
     }
 
     /// Borrow the held Tokio file without reopening its path.
@@ -1849,9 +3793,93 @@ mod tests {
     use super::PinnedSqliteFile;
     #[cfg(target_os = "linux")]
     use super::{fs_verity_enable_error, PinnedSqliteFile, UnpublishedSnapshotArtifact};
-    use super::{SessionSnapshotFile, SnapshotArtifactGate, SnapshotReplayRead};
+    use super::{
+        snapshot_cleanup_test_hooks, SessionSnapshotFile, SnapshotArtifactGate,
+        SnapshotCleanupTestHooks, SnapshotReplayRead, SNAPSHOT_DATABASE_MAX_BYTES,
+        SNAPSHOT_ENVELOPE_FOOTER_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES, SNAPSHOT_MAX_BACKUP_PAGES,
+        SNAPSHOT_MAX_BYTES, SNAPSHOT_MIN_PAGE_BYTES,
+    };
+    use crate::fenced_mutation_roster::{
+        MAX_ADMISSION_CODEC_BYTES, MAX_BUSINESS_SESSION_HEADER_BYTES, MAX_CHECKPOINT_BYTES,
+        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_LIVE_ROSTERS,
+        MAX_RESERVED_AND_RETAINED, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
+        MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES, MAX_ROSTER_INGRESS_ATTESTATION_BYTES,
+        MAX_TOMBSTONE_CODEC_BYTES, PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES,
+    };
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt as _, AsyncSeek as _, AsyncSeekExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn physical_snapshot_ceiling_covers_the_frozen_roster_ledger_without_overflow() {
+        // One canonical row contains the bounded admission (including plan
+        // and member descriptors), terminal/result, tombstone, provenance,
+        // proof/evidence, ingress, and reserved authoritative business body.
+        // The SQL primary-key/index values are small next to this body and the
+        // common page cap below remains the final authority for all SQLite
+        // pages, including arbitrary non-roster tables.
+        let maximum_canonical_row = u64::try_from(
+            MAX_ADMISSION_CODEC_BYTES
+                + MAX_COMMITTED_TERMINAL_CODEC_BYTES
+                + MAX_TOMBSTONE_CODEC_BYTES
+                + MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES
+                + MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES
+                + MAX_EXECUTOR_PROOF_BUNDLE_BYTES
+                + 2 * MAX_ROSTER_INGRESS_ATTESTATION_BYTES
+                + MAX_CHECKPOINT_BYTES
+                + MAX_BUSINESS_SESSION_HEADER_BYTES
+                + 512,
+        )
+        .expect("frozen canonical-row bound fits u64");
+        let maximum_canonical_ledger = maximum_canonical_row
+            .checked_mul(MAX_RESERVED_AND_RETAINED as u64)
+            .expect("frozen canonical ledger fits u64");
+        let maximum_live_business_rows =
+            u64::try_from(MAX_CHECKPOINT_BYTES + MAX_BUSINESS_SESSION_HEADER_BYTES)
+                .expect("frozen business-row bound fits u64")
+                .checked_mul(MAX_LIVE_ROSTERS as u64)
+                .expect("frozen business rows fit u64");
+        let roster_row_values = 120_u64 + 64 + 16;
+        let history_floor_values = 64_u64 + 128;
+        let retirement_cursor_values = 64_u64 + 256;
+        let admission_values = 120_u64 + 32 + 16 + 16 + 128 + 30 + 30 + 4 * 8;
+        let roster_side_values = (roster_row_values
+            + history_floor_values
+            + retirement_cursor_values
+            + admission_values)
+            .checked_mul(MAX_RESERVED_AND_RETAINED as u64)
+            .and_then(|values| values.checked_add(maximum_live_business_rows))
+            .and_then(|values| values.checked_add(1_024))
+            .expect("frozen roster side values fit u64");
+        assert_eq!(
+            SNAPSHOT_DATABASE_MAX_BYTES,
+            PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES * 4 - SNAPSHOT_MIN_PAGE_BYTES
+        );
+        assert_eq!(
+            SNAPSHOT_DATABASE_MAX_BYTES,
+            SNAPSHOT_MAX_BACKUP_PAGES * SNAPSHOT_MIN_PAGE_BYTES
+        );
+        assert_eq!(SNAPSHOT_MAX_BYTES, SNAPSHOT_DATABASE_MAX_BYTES);
+        assert_eq!(
+            SNAPSHOT_ENVELOPE_MAX_BYTES,
+            SNAPSHOT_DATABASE_MAX_BYTES + SNAPSHOT_ENVELOPE_FOOTER_BYTES
+        );
+        let maximum_roster_sqlite_content = maximum_canonical_ledger
+            .checked_add(roster_side_values)
+            .expect("frozen roster SQLite content fits u64");
+        let sqlite_page_index_and_freelist_slack = SNAPSHOT_DATABASE_MAX_BYTES
+            .checked_sub(maximum_roster_sqlite_content)
+            .expect("the full frozen roster field envelope fits the physical page cap");
+        // The field envelope above intentionally permits every row to take
+        // every individual maximum even where the authenticated 256 GiB
+        // logical witness would reject that combination. The remaining
+        // physical slack is therefore available for SQLite pages, table and
+        // index cells, schema, freelist, and any bounded non-roster contents
+        // that share this database under the same max-page policy.
+        assert!(
+            sqlite_page_index_and_freelist_slack >= PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES,
+            "the physical cap leaves an additional logical-ledger-sized SQLite-layout slack"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -2148,6 +4176,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_snapshot_cleanup_retries_its_exact_tombstone_after_sync_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _hook_lock = super::snapshot_cleanup_test_lock().lock().await;
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        {
+            let mut hooks = snapshot_cleanup_test_hooks()
+                .lock()
+                .expect("install cleanup hook");
+            *hooks = SnapshotCleanupTestHooks {
+                fail_post_rename_sync: true,
+                ..SnapshotCleanupTestHooks::default()
+            };
+        }
+        let cleanup = snapshot.cleanup.as_mut().expect("cleanup guard");
+        assert!(
+            cleanup.remove().await.is_err(),
+            "injected sync failure surfaces"
+        );
+        assert!(!path.exists(), "public path remains vacant after rename");
+        let tombstone = std::fs::read_dir(directory.path())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .next()
+            .expect("exact tombstone retained");
+        assert!(tombstone
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains(".opc-cleanup-")));
+        cleanup.remove().await?;
+        assert!(std::fs::read_dir(directory.path())?.next().is_none());
+        drop(snapshot);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropped_snapshot_cleanup_retries_tombstone_without_touching_public_replacement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _hook_lock = super::snapshot_cleanup_test_lock().lock().await;
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        {
+            let mut hooks = snapshot_cleanup_test_hooks()
+                .lock()
+                .expect("install cleanup hook");
+            *hooks = SnapshotCleanupTestHooks {
+                fail_post_rename_sync: true,
+                ..SnapshotCleanupTestHooks::default()
+            };
+        }
+
+        assert!(
+            snapshot
+                .cleanup
+                .as_mut()
+                .expect("cleanup guard")
+                .remove()
+                .await
+                .is_err(),
+            "the injected post-rename durability failure leaves the guard armed"
+        );
+        assert!(!path.exists(), "rename leaves the public name vacant");
+        std::fs::write(&path, b"foreign-public-replacement")?;
+
+        // `Drop` is the retry path reached after a cancelled caller. It must
+        // continue from the exact tombstone state rather than reopening this
+        // now-occupied public spelling.
+        drop(snapshot);
+        assert_eq!(std::fs::read(&path)?, b"foreign-public-replacement");
+        assert_eq!(
+            1,
+            std::fs::read_dir(directory.path())?.count(),
+            "only the foreign public replacement survives the tombstone retry"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropped_snapshot_cleanup_restores_pre_rename_foreign_replacement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _hook_lock = super::snapshot_cleanup_test_lock().lock().await;
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        snapshot_cleanup_test_hooks()
+            .lock()
+            .expect("install cleanup hook")
+            .before_rename = Some(Box::new(|original, _tombstone| {
+            let replacement = original.with_extension("foreign");
+            std::fs::write(&replacement, b"foreign-before-rename").expect("foreign bytes");
+            std::fs::rename(&replacement, original).expect("replace original");
+        }));
+        drop(snapshot);
+        assert_eq!(std::fs::read(&path)?, b"foreign-before-rename");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn final_identity_unlink_seam_preserves_replacement_and_unrelated_child(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _hook_lock = super::snapshot_cleanup_test_lock().lock().await;
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let unrelated = directory.path().join("unrelated-survivor");
+        std::fs::write(&unrelated, b"unrelated")?;
+        let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        snapshot_cleanup_test_hooks()
+            .lock()
+            .expect("install final identity seam hook")
+            .post_final_identity_before_unlink = Some(Box::new(|tombstone, _guard| {
+            std::fs::remove_file(tombstone).expect("remove authenticated tombstone");
+            std::fs::write(tombstone, b"foreign-final-seam")
+                .expect("replace tombstone at final identity seam");
+        }));
+
+        assert!(
+            snapshot
+                .cleanup
+                .as_mut()
+                .expect("cleanup guard")
+                .remove()
+                .await
+                .is_err(),
+            "a replacement after final identity must fail closed"
+        );
+        assert!(
+            !path.exists(),
+            "the public name remains vacant after cleanup rename"
+        );
+        let foreign = std::fs::read_dir(directory.path())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|entry| entry != &unrelated)
+            .expect("foreign replacement survives under its tombstone name");
+        assert_eq!(std::fs::read(&foreign)?, b"foreign-final-seam");
+        assert_eq!(std::fs::read(&unrelated)?, b"unrelated");
+
+        // Drop replays the retained tombstone state but cannot re-authorize
+        // either foreign inode.
+        drop(snapshot);
+        assert_eq!(std::fs::read(&foreign)?, b"foreign-final-seam");
+        assert_eq!(std::fs::read(&unrelated)?, b"unrelated");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn post_unlink_guard_failure_replays_the_exact_guard_without_nesting(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _hook_lock = super::snapshot_cleanup_test_lock().lock().await;
+        let directory = tempdir()?;
+        let path = directory.path().join("incoming.part");
+        let mut snapshot = SessionSnapshotFile::create(path.clone()).await?;
+        snapshot_cleanup_test_hooks()
+            .lock()
+            .expect("install final guard failure")
+            .fail_post_unlink_guard_sync = true;
+
+        let cleanup = snapshot.cleanup.as_mut().expect("cleanup guard");
+        assert!(
+            cleanup.remove().await.is_err(),
+            "a failure after durable guard rename remains replayable"
+        );
+        let guards = std::fs::read_dir(directory.path())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(".opc-unlink-guard-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(guards.len(), 1, "one exact final guard is retained");
+        assert_eq!(
+            guards[0]
+                .file_name()
+                .expect("guard basename")
+                .to_string_lossy()
+                .matches(".opc-unlink-guard-")
+                .count(),
+            1,
+            "replay never nests final guards"
+        );
+
+        cleanup.remove().await?;
+        assert!(std::fs::read_dir(directory.path())?.next().is_none());
+        drop(snapshot);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rejects_non_regular_files() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let path = directory.path().join("directory");
@@ -2244,6 +4465,32 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readonly_nofollow_rejects_fifo_without_blocking() -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let directory = tempdir()?;
+        let path = directory.path().join("snapshot-fifo");
+        assert!(Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(&path)
+            .status()?
+            .success());
+
+        let started = Instant::now();
+        let file = super::readonly_nofollow(&path)?;
+        let error = match PinnedSqliteFile::from_file(file, path) {
+            Ok(_) => return Err("FIFO was pinned as a snapshot".into()),
+            Err(error) => error,
+        };
+        assert_eq!(io::ErrorKind::InvalidInput, error.kind());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        Ok(())
     }
 
     #[test]

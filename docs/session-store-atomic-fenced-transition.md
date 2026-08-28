@@ -666,9 +666,10 @@ ID, infer an unknown outcome from local intent, continue writes under an
 uncertain lease, or derive a next mutation until they have an authoritative
 observation.
 A post-retention history must likewise be re-derived from current authoritative
-state under a fresh ID; the old transition is never revived. The consumer-wire
-revision-5 V1 contract preserves every V1 status distinction. The distinct V2
-consumer ALPN uses wire revision 6 and preserves every V2 status distinction,
+state under a fresh ID; the old transition is never revived. The general `/1`
+consumer contract uses wire revision 6 and preserves every general status
+distinction. The distinct V2 `/2` consumer ALPN uses wire revision 5 and
+preserves every V2 status distinction,
 including `EpochNotActive` and `StorageExhausted` inside `Recorded`,
 through a closed wire-safe enum. Frozen legacy session-net v5 maps this result
 fail-closed as an unknown capability; no v5 wire enum changes and that protocol
@@ -729,17 +730,19 @@ timestamps, topology endpoints, or local storage details.
 
 ## Deliberate boundary
 
-This remains generic SDK semantics. The consumer transport revision-5 V1
+This remains generic SDK semantics. The general `/1` transport revision-6
 surface retains #695's capability, observation, execution, ambiguity, and
 exact-status contract over both the one-shot and bounded persistent
 least-authority mTLS clients. Its public transition ID is the frozen 16-byte V1
 ID. V2 does not extend that wire shape: it uses the separate ALPN `/2`
-revision-6 lane documented above, including V2's full 56-byte identity and
-V2-specific status set. Neither lane exposes a generic backend, replication,
+revision-5 lane documented above, including V2's full 56-byte identity and
+V2-specific status set. The protected-roster `/3` lane is also revision 5, but
+is roster-only under its tenant/scope/fence authority; `/2` neither counts nor
+reclaims its lanes. None of the lanes exposes a generic backend, replication,
 membership, snapshot, rebuild, or administrative authority. Product/ePDG
 composition and workflow semantics remain outside this SDK operation.
 
-For the V1 revision-5 consumer surface, the public request ID is byte-identical
+For the general `/1` revision-6 consumer surface, the public request ID is byte-identical
 to the nested 16-byte V1 transition ID. The internal V1 receipt ID is
 domain-separated by the authenticated consumer identity, stable cluster
 identity, and public ID; it excludes the body and changing configuration epoch.

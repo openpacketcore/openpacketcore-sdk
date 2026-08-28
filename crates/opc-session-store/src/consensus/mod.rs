@@ -16,14 +16,19 @@ pub use network::{
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
-pub(crate) use store::OperatorRecoveryCommitError;
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub use store::test_support;
 pub use store::{
     validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
     ConsensusSessionStore, ConsensusSessionStoreOpenError, ConsensusStoreDiagnosticSnapshot,
-    SessionConsensusStatus, SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
+    ProtectedRosterConsensusDiagnosticSnapshot, SessionConsensusStatus,
+    SessionConsensusStorageAnchor, SessionTopologyCandidateBootstrap,
     SessionTopologyTransitionPeers, SessionTopologyTransportAdmission,
     SessionTopologyTransportAdmissionError, DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+    PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS,
 };
+pub(crate) use store::{OperatorRecoveryCommitError, OperatorRecoveryCommitRequest};
 
 pub use types::{
     SessionConsensusClusterId, SessionConsensusCommand, SessionConsensusConfigurationEpoch,

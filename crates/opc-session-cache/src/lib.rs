@@ -490,6 +490,12 @@ impl SessionCache {
                     debug!("Invalidating key from cache (ReleaseLease): {:?}", key);
                     lock.remove(&key);
                 }
+                ReplicationOp::ProtectedRosterEstablished { key, .. } => {
+                    debug!(
+                        "Invalidating cache entry from protected-roster Established replication"
+                    );
+                    lock.remove(&key);
+                }
                 ReplicationOp::Batch { ops } => pending.extend(ops),
             }
         }
@@ -685,6 +691,7 @@ fn collect_replication_op_keys(op: &ReplicationOp, keys: &mut Vec<SessionKey>) {
             | ReplicationOp::ReleaseLease { key, .. } => {
                 keys.push(key.clone());
             }
+            ReplicationOp::ProtectedRosterEstablished { key, .. } => keys.push(key.clone()),
             ReplicationOp::Batch { ops } => pending.extend(ops),
         }
     }
@@ -734,6 +741,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::RestoreScanResponseTooLarge { .. } => "restore_scan_response_too_large",
         StoreError::RestoreScanCursorStale => "restore_scan_cursor_stale",
         StoreError::RestoreScanWorkBudgetExceeded => "restore_scan_work_budget_exceeded",
+        StoreError::SessionRecordReserved => "session_record_reserved",
     }
 }
 
@@ -745,9 +753,9 @@ mod tests {
     use futures_util::{stream, StreamExt};
     use opc_session_store::{
         validate_replication_page_owned, Clock, EncryptedSessionPayload, FakeSessionBackend,
-        FenceToken, Generation, OwnerId, SessionKeyType, SessionLeaseManager, StateClass,
-        StateType, MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
-        MAX_SESSION_TTL,
+        FenceToken, Generation, OwnerId, ProtectedRosterEstablishedSuccessor, SessionKeyType,
+        SessionLeaseManager, StateClass, StateType, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+        MAX_REPLICATION_OPERATION_DEPTH, MAX_SESSION_TTL,
     };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
     use std::sync::atomic::Ordering;
@@ -967,6 +975,17 @@ mod tests {
         }
     }
 
+    fn unrelated_test_key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::new("tenant-b").expect("tenant"),
+            nf_kind: NetworkFunctionKind::from_static("amf"),
+            key_type: SessionKeyType::SubscriberContext,
+            stable_id: Bytes::copy_from_slice(b"unrelated-cache-key")
+                .try_into()
+                .expect("valid stable ID"),
+        }
+    }
+
     fn test_record(key: SessionKey, generation: u64) -> StoredSessionRecord {
         StoredSessionRecord {
             key,
@@ -1017,6 +1036,22 @@ mod tests {
         }
     }
 
+    fn protected_roster_established_op(
+        key: SessionKey,
+        successor: ProtectedRosterEstablishedSuccessor,
+    ) -> ReplicationOp {
+        ReplicationOp::ProtectedRosterEstablished {
+            expected_record: test_record(key.clone(), 1),
+            key,
+            successor: Box::new(successor),
+            owner: OwnerId::new("owner-a").expect("owner"),
+            fence: FenceToken::new(2),
+            credential_id: 2,
+            guard_acquired_at: Timestamp::now_utc(),
+            guard_expires_at: Timestamp::now_utc(),
+        }
+    }
+
     fn operation_tree_at_depth(depth: usize, key: SessionKey) -> ReplicationOp {
         let mut op = delete_op(key);
         for _ in 1..depth {
@@ -1061,6 +1096,71 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("watch loop did not become ready");
+    }
+
+    #[test]
+    fn protected_roster_established_successors_invalidate_only_bound_watch_key() {
+        let target_key = test_key();
+        let unrelated_key = unrelated_test_key();
+        let target_record = test_record(target_key.clone(), 1);
+        let unrelated_record = test_record(unrelated_key.clone(), 1);
+
+        for successor in [
+            ProtectedRosterEstablishedSuccessor::Put {
+                record: Box::new(test_record(target_key.clone(), 2)),
+            },
+            ProtectedRosterEstablishedSuccessor::Delete,
+            ProtectedRosterEstablishedSuccessor::NoOp,
+        ] {
+            let mut entries = HashMap::from([
+                (target_key.clone(), target_record.clone()),
+                (unrelated_key.clone(), unrelated_record.clone()),
+            ]);
+
+            SessionCache::apply_invalidation_op(
+                &mut entries,
+                protected_roster_established_op(target_key.clone(), successor),
+            );
+
+            assert!(!entries.contains_key(&target_key));
+            assert_eq!(entries.get(&unrelated_key), Some(&unrelated_record));
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_roster_established_successors_invalidate_only_bound_replication_key() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend);
+        let target_key = test_key();
+        let unrelated_key = unrelated_test_key();
+        let target_record = test_record(target_key.clone(), 1);
+        let unrelated_record = test_record(unrelated_key.clone(), 1);
+
+        for successor in [
+            ProtectedRosterEstablishedSuccessor::Put {
+                record: Box::new(test_record(target_key.clone(), 2)),
+            },
+            ProtectedRosterEstablishedSuccessor::Delete,
+            ProtectedRosterEstablishedSuccessor::NoOp,
+        ] {
+            {
+                let mut entries = cache.cache.write().await;
+                entries.clear();
+                entries.insert(target_key.clone(), target_record.clone());
+                entries.insert(unrelated_key.clone(), unrelated_record.clone());
+            }
+
+            cache
+                .invalidate_replication_op(&protected_roster_established_op(
+                    target_key.clone(),
+                    successor,
+                ))
+                .await;
+
+            let entries = cache.cache.read().await;
+            assert!(!entries.contains_key(&target_key));
+            assert_eq!(entries.get(&unrelated_key), Some(&unrelated_record));
+        }
     }
 
     #[tokio::test]

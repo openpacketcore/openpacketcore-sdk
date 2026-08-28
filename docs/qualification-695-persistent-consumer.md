@@ -6,18 +6,24 @@ claim completion of the downstream ePDG #181 production SLO.
 
 The persistent revision-2 qualification contract is recorded in v7. The
 published v6 profile remains the unchanged revision-1 contract. This evidence
-qualifies `PersistentSessionConsumerClient` as the required warm fixed-pool
-primitive for #695/ePDG latency. Production deployments requiring warm reuse
-should use it. `StatelessSessionConsumerClient` remains a public,
+exercises `PersistentSessionConsumerClient` as a warm fixed-pool primitive; it
+does not qualify #695 production latency. `StatelessSessionConsumerClient`
+remains a public,
 source-compatible production/compatibility fresh-authentication typed
 least-authority surface required by #649, #688, and #691; it is neither hidden,
 deprecated, nor test-only.
 
-A stateless clone lineage shares fail-fast physical-admission caps of 16 request
-connections and 16 watch connections. Permits are acquired before resolve/TCP
-and held for the physical connection lifetime, including by persistent clients
-derived from the same lineage. Independent stateless constructors define
-independent logical clients, as independent persistent constructors do.
+A stateless clone lineage has family-specific fail-fast caps: 16 `/1`-family
+permits shared by general `/1` and an opted-in protected-roster `/3` clone, and
+an independent 16 ordinary-fenced `/2` permits (32 request permits in total),
+plus a separate 16-watch cap. Ordinary persistent `/1` and `/2` pools share one
+aggregate width and may reclaim an idle opposite-protocol lane. A protected
+`/3` pool is constructed from the opted-in roster stateless profile, cannot
+relabel an ordinary retained lane, and admits only protected-roster operations;
+it does not enable ordinary `/1` or `/2` operations. Typed tenant/NF
+`open_watch` remains locally `Unsupported` before resolution, TCP, TLS, or
+cursor exposure. Independent stateless constructors define independent logical
+clients, as independent persistent constructors do.
 
 ## Current-main successor audit (2026-08-22)
 
@@ -47,14 +53,13 @@ superseded_setup_drops_losing_io_before_releasing_reconnect_lane
   required serialized admission only after the losing I/O future was destroyed
 ```
 
-The causal correction is consumer transport revision 5. It retains the
-tenant-scoped mTLS/SPIFFE/ALPN/Hello authority and all fixed resource bounds,
-while adding five generic guarantees:
+The causal correction retains tenant-scoped mTLS/SPIFFE/ALPN/Hello authority
+and all fixed resource bounds, while adding five generic guarantees:
 
 - explicit prewarm rolls every configured lane through a fresh
   resolver/TCP/TLS/Hello exchange and preserves refreshed plus unprocessed
   healthy lanes after a partial failure;
-- all cold request, watch, and prewarm setups in one pool share one serialized
+- all cold request and prewarm setups in one pool share one serialized
   recovery lane and one coalesced exponential backoff deadline for failed setup
   or proven cached-lane loss;
 - a newer credential/material epoch cancels the stale serialized
@@ -70,14 +75,59 @@ while adding five generic guarantees:
   lower write, while adapter-only plaintext buffering over zero lower writes
   remains exactly `NotTransmitted`.
 
-The tracked v8 exact-head evidence schema now binds transport revision 5. It
-continues to require `experimental=true` and
-`qualification_complete=false`; it is a structural wire-binding schema, not a
-production qualification certificate. No new latency samples were collected
-for this successor, no shared-host latency gate was launched, and no cluster or
-ePDG state was changed. The bounded raw distribution below remains the earlier
-historical synthetic loopback observation and is not used as closure evidence
-or as a production/ePDG SLO claim.
+The frozen v8 exact-head schema binds the historical general `/1` transport
+revision 5, digest
+`sha256:5e3becf5094f3e222b94799e0fb7b6b77c3398aeabae743fc65b409c4cd4adfd`.
+The current v9 schema binds `/1` transport revision 6 and application revision
+3, digest
+`sha256:8e0f1bd7ff65b5cc9f39a2576568d39ba846a4311cc39a3d458763f4bb6eaf5c`.
+The ordinary fenced `/2` wire remains revision 5 and the protected-roster `/3`
+wire is independently revision 5; general `/1` is revision 6. When roster
+support is enabled, the listener deliberately advertises all three consumer
+ALPNs concurrently: `opc-session-consumer/1`, `/2`, and `/3`. This is not a
+coordinated no-coexistence cutover. Voter-to-voter consensus remains
+`opc-session-consensus/2` at revision 5.
+
+V9 is an exact-head evidence schema, not a latency, ePDG, or production-SLO
+claim. A generated V9 record is `experimental:true`; it is
+`qualification_complete:true` only after the complete external gate has
+succeeded and all strict artifacts validate. This document records the
+procedure, not a preclaimed result.
+
+The closed V9 contract binds more than source provenance and artifact digests.
+It records the canonical absolute testkit `CARGO_TARGET_DIR`, the canonical
+absolute external V9 evidence root, and the pair directory derived from that
+root; each raw path has its own domain-separated commitment. It separately
+records the exact normalized absolute Cargo invocation alias (for example, a
+rustup-managed `.../cargo`), the canonical backing executable path resolved
+from that alias, and a SHA-256 commitment to that backing file's content. The
+alias, not the backing path, is the process `argv[0]`, followed by the 14
+canonical tail arguments. The normalized recorded vector has exactly 15
+elements and begins `cargo`; the POSIX-escaped, environment-prefixed
+reproduction command executes the alias. The V1/V9 pair keeps the unchanged
+two exact leaves, `batch-release-gate-v1.json` and
+`persistent-consumer-v9.json`.
+
+Its symmetric pair run-ID uses domain
+`opc-session-ha-persistent-consumer-v9-pair-run/v3\0`. It binds canonical V1,
+the existing provenance/invocation fields, and a canonical full V9 claims
+preimage in which only `invocation.run_id_sha256` is replaced with
+`sha256:` plus 64 zeroes. It therefore does not hash the final,
+self-containing V9 bytes. The command digest orders backing path, alias,
+backing-content SHA-256, executable mode as unsigned 16-bit big-endian, then
+argv. Run-ID v3 first retains its pre-existing 16 provenance bindings, ending
+alias, backing path, backing-content SHA-256, `cargo_profile`, and `opt_level`;
+it then binds the u16-BE executable mode, followed by the existing
+V1/V9/argv/recipe/canonical-V1/claims-preimage material. Neither leaf can be
+transferred to a different qualifying pair.
+
+The `/3` pool is rebound to a readiness-proven live quorum leader after each
+recorded loss and restart. Its foreign-tenant bracket requires exactly three
+endpoint/authority observations, one from every voter, each returning the
+non-oracular typed `Unavailable`. For retained receipt recovery, only
+`NotFound` and backend `Unavailable` remain retryable; a typed rejection,
+authorization/scope/protocol failure, or durable negative receipt is terminal
+for that exact request body.
 
 The current-main successor's bounded GREEN gates were run with all
 `opc-session-net` features on 2026-08-22:
@@ -97,11 +147,142 @@ cargo test -p opc-session-testkit --all-features --test qualification_profile
 The focused transport fixtures bind one serialized recovery probe across 12
 callers, coalesced bounded backoff, zero-time stale-epoch setup cancellation,
 rolling fresh prewarm, production mTLS/SPIFFE/ALPN/Hello admission, exact
-composite correlation, below-TLS write classification, watch/request
-cancellation, and fixed request/watch/physical-admission bounds. They are
+composite correlation, below-TLS write classification, request cancellation,
+and fixed request/physical-admission bounds. They are
 correctness evidence;
 they do not replace the still-required production three-voter network latency
 qualification.
+
+## External exact-head release procedure
+
+This is a local SDK qualification procedure, never an ePDG execution or a
+latency/SLO claim. Use one clean, signed, committed exact-HEAD checkout. Before
+starting, verify the release signature with the approved keyring, require no
+`MERGE_HEAD`, and require empty staged, modified, untracked, ignored, and
+submodule state. The wrapper captures this one strict provenance before build
+and rechecks it before publication; the V1/V9 pair and store artifact must
+bind that same exact provenance rather than mixed qualifying runs.
+
+The host must remain quiet from lease acquisition through evidence completion:
+there may be functional tests elsewhere, but no competing Cargo or `rustc` job
+may run while this release/latency gate runs. The fixed Git, build, and release
+deadlines are correctness boundaries, not latency relaxations. Do not increase
+them or use a busy-host observation as a performance claim.
+
+Prepare absolute canonical external paths on a private, external
+fs-verity-capable filesystem. The SDK worktree, actual linked-worktree gitdir,
+common gitdir, testkit Cargo target, wrapper Cargo target, V9 evidence root,
+fs-verity work root, attestation namespace, store-evidence namespace, and
+lease leaf must be pairwise disjoint; the V9 pair child is contained only by
+its V9 evidence root. The testkit target must already exist as a canonical
+external `CARGO_TARGET_DIR`. The wrapper target, attestation namespace, and
+store-evidence namespace must each be absent. Provision an owner-private
+external V9 root (mode `0700`) whose
+`session-ha-persistent-consumer-v9` child is absent; it will become the exact
+two-leaf pair. The fs-verity work root is external as well. Creating `target/`,
+evidence, a lease, fs-verity data, or logs inside the source tree poisons the
+clean-source gate.
+
+First produce the V9 pair in that owner-private root. The environment prefixes
+are part of the invocation environment, not Cargo argv; retain the following
+Cargo arguments exactly:
+
+```text
+CARGO_TARGET_DIR=/external/testkit-target OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY=/external/testkit-v9-root cargo test --locked --release -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_persistent_v2_batch_release_gate -- --ignored --exact --test-threads=1 --nocapture
+```
+
+Here `cargo` is the illustrative command token; an actual closed record binds
+and replays its exact absolute Cargo invocation alias as `argv[0]`.
+
+Only a complete gate publishes the no-clobber
+`/external/testkit-v9-root/session-ha-persistent-consumer-v9` namespace with
+exactly `persistent-consumer-v9.json` and `batch-release-gate-v1.json`. Its
+compact V2 record and V9 record are accepted only after typed and full-schema
+validation of canonical bytes. V9 is `experimental:true` and is
+`qualification_complete:true` only after this full gate. The pair is the
+external prerequisite for the wrapper; it is never inferred from stdout,
+stderr, or an `eprintln!` line.
+
+The V9 record's reproduction field is stricter than the display recipe: it is
+the POSIX-escaped command with `CARGO=<absolute-cargo-alias>`, the canonical
+target and evidence-root environment prefixes, and that same absolute Cargo
+alias followed by the 14 canonical tail arguments; its normalized recorded
+vector has 15 elements beginning `cargo`. It does not execute the canonical
+backing path. The rendering uses
+standard POSIX single-quote escaping, while every bound path rejects control
+characters and NUL. Consumers recompute it rather than accepting a look-alike
+shell command. This documents only the exact quoting regression; it makes no
+general shell-injection claim.
+
+Then run only this released recipe, with an absolute trusted Cargo invocation
+alias (the illustrative placeholder below is the executable to invoke, not a
+claim that its canonical backing path is invoked):
+
+```text
+/usr/bin/python3 ci/sdk702-release-attest.py --cargo /absolute/trusted/cargo --target-dir /absent/external/wrapper-target --attestation-namespace /absent/external/attestation --evidence /absent/external/store-evidence --process-loss-evidence /external/testkit-v9-root/session-ha-persistent-consumer-v9/persistent-consumer-v9.json --lease /external/lease/sdk702.lock
+```
+
+The wrapper consumes that exact V1/V9 pair while creating and pinning a fresh
+external wrapper target distinct from the producer's testkit target. It sets
+its canonical absolute `CARGO_TARGET_DIR` to that target, builds the exact
+release test there, writes a create-new fsynced build attestation, and executes
+the pinned test descriptor directly. It deliberately handles libtest
+`--nocapture` itself;
+there is no obsolete Cargo-output or `eprintln!` extraction path. The store
+gate atomically create-new writes and fsyncs canonical V1 evidence plus its
+accepted marker in the absent external evidence namespace only after all
+assertions, graceful shutdown, provenance rechecks, and typed/schema/canonical
+validation; only then is its `qualification_complete:true` meaningful. Preserve
+its generated artifacts, wrapper output, raw logs, SHA-256 digests, and exit
+status without clobbering any existing path.
+
+The lease is also a pinned-inode contract, not a pathname lock. The Python
+wrapper retains the exact nofollow private lease inode through
+`/proc/<wrapper-pid>/fd/<fd>` for the direct test child's lifetime, without
+passing the raw descriptor to that child. Rust opens and exclusively locks that
+exact procfd inode, then revalidates the procfd, parent, name, and canonical
+path before evidence-namespace `mkdir`, before publication, and at completion.
+Those checks close the A-to-B replacement/split-lock seam; they do not grant
+authority over unrelated processes or files.
+
+Validate the generated store artifact with the strict existing-artifact
+validator, not an ad-hoc parser:
+
+```text
+OPC_QUAL_EVIDENCE_VALIDATE=/absolute/external/store-evidence CARGO_TARGET_DIR=/absolute/external/wrapper-target cargo test --locked -p opc-session-store --release --test fenced_transition_v2_qualification -- --ignored --exact validate_existing_release_evidence_artifact --nocapture
+```
+
+Its separately causal ambiguity witness is acknowledged after durable execution
+and held past that caller's bounded deadline before pressure starts. The batch
+therefore records five held/released responses in all (one causal and four
+pressure), twelve status-only ambiguous IDs, and the pressure arithmetic of
+four held lanes, sixty-four queued callers, and the typed sixty-ninth
+rejection.
+
+The batch record separates normal listener headroom from its bounded capacity
+probe: all three listeners prove a seventeenth projected-mTLS/Hello status
+connection while the sixteen normal lanes stay open. One named listener then
+fills the remaining three admissions (high-water exactly 20), records exactly
+zero admission waits and one typed twenty-first rejection from process-local
+listener counters, and closes every probe back to sixteen active normal lanes.
+Immediately before and after that probe, every retained normal lane performs a
+status read and its pool setup/reconnect/active/idle counters are unchanged;
+this rules out eviction or replacement. The capacity-phase high-water is
+therefore not misreported as ordinary headroom.
+
+Snapshot cleanup/restart evidence has an explicitly limited threat model:
+the snapshot directory is a private SDK-owned namespace with cooperative SDK
+writers only. Within that contract, the retained descriptor, serialized
+namespace lease, bounded survivor capacity, and reclaim behavior support the
+claimed cleanup/restart bounds. They do not protect against arbitrary same-UID
+namespace forgery, exact-grammar but non-admitted files, or substitution after
+final pathname/identity authentication. Do not extend the bounded-capacity or
+reclaim claim beyond that cooperative namespace contract.
+
+The historical protocol count above predates the #719 global-cursor
+contraction. It is not current Watch evidence: those wire fixtures are
+quarantined until an identity-and-scope-bound cursor exists, and the exact
+current Watch commands and assertions are listed below.
 
 Paused-clock lifecycle regressions additionally require a cached lane to remain
 reusable before its stable directed authenticated-edge material deadline and to
@@ -119,8 +300,8 @@ The measurement was recorded at `2026-08-17T04:58:12Z` on Fedora Linux 44,
 Linux 7.1.8 x86-64, an AMD EPYC 9335 host with 128 online logical CPUs, Rust
 1.97.1, and Cargo 1.97.1. The shared host was not isolated or CPU-pinned. The
 test used an unoptimized Cargo test build, an in-process loopback TLS server and
-counting TCP proxy, a fixed three-lane request pool, and one isolated watch
-slot. It prewarmed all three authenticated lanes, then timed 16 sequential
+counting TCP proxy and a fixed three-lane request pool. It prewarmed all three
+authenticated lanes, then timed 16 sequential
 typed `capabilities` calls with `Instant` at the caller. Connection setup and
 prewarm time are intentionally excluded from the per-call samples.
 
@@ -182,23 +363,25 @@ Exact correlation matching was restored, after which the command passed and
 the poisoned lane was replaced with correlation 1 on a new authenticated
 connection.
 
-### Persistent-watch continuity fix coverage
+### Persistent-watch transport coverage
 
-The retained `persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoint_loss`
-fixture holds the first watch stream until its resolver has been switched to a
-replacement endpoint, then proves delivery of sequence 1 followed by exactly
-sequence 2 through a fresh resolver/TLS/Hello path. Its companion
-`persistent_watch_reconnects_after_authenticated_rotation` proves the same
-1-to-2 boundary after client reauthentication retires an otherwise healthy
-watch connection. Removing the persistent reader's reconnect path makes either
-fixture terminate after sequence 1; accepting a duplicate, gap, wrong
-correlation, unknown frame, or partial frame is intentionally not a recovery
-path and remains fail-closed. The focused restored command is:
+The old reconnect fixtures are not production consumer-watch qualification and
+must not be invoked as green Watch evidence: the current consumer API rejects
+`open_watch` with typed `Unsupported`, because its only cursor is global and
+filtering it would reveal foreign tenant/NF activity through sequence movement
+and timing. The evidence-producing contract commands are:
 
 ```text
-opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_transport persistent_watch_reconnects_at_the_exact_delivered_cursor_after_endpoint_loss -- --exact --test-threads=1
-opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_transport persistent_watch_reconnects_after_authenticated_rotation -- --exact --test-threads=1
+cargo test --locked -p opc-session-net --all-features --test persistent_consumer_transport typed_consumer_watch_is_rejected_before_resolution_or_global_cursor_exposure -- --exact
+cargo test --locked -p opc-session-store --all-features --lib consumer::tests::authorization_requires_exact_scope_and_denies_global_watch -- --exact
+cargo test --locked -p opc-session-store --all-features --test fixed_quorum_authority fixed_scoped_consumer_watch_is_rejected_before_stream_admission -- --exact
 ```
+
+The first asserts both typed rejection forms plus zero resolver, TCP, TLS,
+Hello, service, and Watch admission activity. The latter two assert exact grant
+scope and the fail-closed service-side rejection, including cross-tenant and
+cross-scope attempts. A future production Watch requires an
+identity-and-scope-bound cursor protocol and fresh reconnect evidence.
 
 ### Admission, cursor, and idle-replacement regressions
 
@@ -213,14 +396,9 @@ queues one caller, starts repeated late callers, releases the held lane, and
 requires the already queued request to dispatch first.  Replacing the queued
 acquisition with a `try_acquire` path makes that assertion fail.
 
-The public watch cursor is inclusive and 1-based.  The consumer normalizes a
-zero cursor once, before its first wire request, to sequence 1; every reconnect
-then starts at the exact next undelivered sequence.  The test fixture no longer
-rewrites its emitted sequence to a caller-provided zero value, and retained
-`persistent_watch_zero_cursor_normalizes_to_the_first_committed_sequence`
-requires `open_watch(0)` to yield sequence 1.  Removing that boundary
-normalization makes the reader fail closed on a sequence gap rather than
-silently accepting a synthetic sequence zero.
+The retained cursor normalization and reconnect fixtures are protocol harness
+coverage only. No production tenant/NF-scoped consumer may open that global
+cursor until a scope-bound cursor contract exists.
 
 `expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call` uses a
 normal bounded server idle lifetime and waits for the client's own idle reaper
@@ -231,5 +409,12 @@ on 2026-08-17; elapsed time is only a fixture guard, not a widened production
 timeout or an SLO claim:
 
 ```text
-opc-heavy cargo test --locked -p opc-session-net --test persistent_consumer_boundaries expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call -- --exact --test-threads=1
+cargo test --locked -p opc-session-net --test persistent_consumer_boundaries expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call -- --exact --test-threads=1
 ```
+
+### Downstream handoff
+
+The only downstream ePDG handoff is the externally recorded SDK provenance,
+attestation, V9 pair, and accepted store evidence for independent downstream
+review. It does not authorize an ePDG call path, configuration, cluster
+operation, readiness decision, timeout change, or performance/SLO claim.

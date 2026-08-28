@@ -807,6 +807,24 @@ Automatic current-format reconciliation is supplied by #128. Pre-#127
 persisted forks use #129's full-fleet, backup-before-mutation procedure and
 remain readiness-fenced until Openraft commits the recovery epoch.
 
+The Linux snapshot namespace is a cooperative-service-UID trust boundary. The
+adapter MUST retain an `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK`
+directory descriptor at admission, require `fstat` ownership by the effective
+UID and `mode & 022 == 0`, and reject an insecure pre-existing directory. A
+missing namespace MUST be created `0700`; SDK snapshot files MUST be created
+`0600`. Post-admission namespace operations MUST be directory-FD-relative so a
+parent-path replacement cannot redirect accepted work. Durable snapshot rows
+name logical basenames, not a mutable parent path.
+
+Supported writers are cooperative SDK processes under one dedicated service
+UID, serialized by the snapshot/database leases. Operators MUST use a private
+parent directory, must not share that UID with untrusted workloads, and MUST
+fail closed on owner or mode mismatch. POSIX ACL group-class masks MUST not
+restore group-class write authority. This contract excludes `root`,
+`CAP_DAC_OVERRIDE`, `CAP_FOWNER`, non-cooperating same-eUID actors, and
+writable aliases of the retained directory. It does not claim universal
+unlink-by-FD semantics or privileged-attacker resistance.
+
 `probe_durable_readiness` MUST use the same bounded authority path as an
 authoritative read: discover or follow the current leader, execute Openraft's
 linearizable-read barrier against the admitted voting configuration, and wait
@@ -897,6 +915,11 @@ unsupported filesystem or an unsealed fixed-profile artifact before it can be
 accepted as durable state. The dynamic profile remains available without this
 fixed artifact requirement, but MUST retain its bounded corruption detection
 and fail closed on invalid snapshot evidence.
+This is not an online migration: an existing pre-fixed or unsealed
+metadata-referenced artifact is not auto-sealed, auto-repaired, or accepted on
+open. Operators MUST preserve it and use the reviewed offline
+reseed/recovery/migration procedure before reopening; a startup retry,
+metadata edit, or byte-identical replacement does not cross this boundary.
 Fixed membership does not authorize dynamic membership transitions, a second
 consensus engine, a controller feed, or a new packet-core protocol path.
 `try_from_fixed_durable_quorum_with_authenticated_placement` may additionally
@@ -1439,12 +1462,13 @@ replication append, or rebuild request. The consensus ALPN and legacy
 `opc-session-net/5` ALPN MUST NOT be multiplexed as equivalent authority on one
 production listener.
 
-The exact consensus contract profile MUST use transport/wire-schema revision 4
-and error-set revision 6. Revision 4 makes the forwarded consumer scope
-explicit, so a peer cannot silently downgrade a consumer-scoped operation to
-an internal call; error revision 6 binds that semantic boundary into the
-exact profile. Revision 3/error revision 5 or older MUST fail before engine
-dispatch.
+The exact consensus contract profile MUST use transport/wire-schema revision 5,
+application revision 3, and error-set revision 6. The revision-5 transport
+profile retains the explicit forwarded consumer scope, so a peer cannot
+silently downgrade a consumer-scoped operation to an internal call; application
+revision 3 binds outcome-digest v2, and error revision 6 binds that semantic
+boundary into the exact profile. Any other transport, application, or error-set
+revision MUST fail before engine dispatch.
 Operators MUST drain traffic and writers, stop every consensus member, upgrade
 the full membership together, verify exact-profile handshakes, and only then
 restore traffic. Mixed-profile rolling operation is unsupported.
@@ -1618,30 +1642,30 @@ umbrella until that fleet evidence passes.
 
 `StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
 `SessionQuorumConsumerServer` provide the typed least-authority
-application-consumer boundary. They MUST use mutual TLS and the dedicated
-`opc-session-consumer/1` ALPN with transport revision 5 for the existing V1
-operation family. The additive V2 epoch-fenced-transition family MUST use only
-the distinct `opc-session-consumer/2` ALPN with transport revision 6. These are
-separate exact protocols from both `opc-session-consensus/2` and the
-quarantined `opc-session-net/5` compatibility protocol. A V2 client MUST NOT
-fall back to V1, and a lane authenticated for either ALPN MUST NOT carry or be
-reused for the other's Hello or request envelope. A listener MAY offer both
-exact ALPNs, but only as independently authenticated, independently decoded
-lanes; it MUST NOT negotiate a common revision or treat either as equivalent
-consumer authority. The server MUST reject every V2 revision other than 6
-before dispatch; a V1-only peer therefore also fails before V2 dispatch.
+application-consumer boundary. They MUST use mutual TLS and three independent
+exact lanes: the general `opc-session-consumer/1` ALPN at transport revision 6,
+the epoch-fenced V2 `opc-session-consumer/2` ALPN at transport revision 5, and
+the protected-roster `opc-session-consumer/3` ALPN at transport revision 5.
+These are separate exact protocols from both `opc-session-consensus/2` and the
+quarantined `opc-session-net/5` compatibility protocol. `/2` MUST NOT fall back
+to `/1`, and a lane authenticated for one ALPN MUST NOT carry or be reused for
+another lane's Hello or request envelope. When protected-roster ingress is
+enabled, the listener advertises `/3` before `/2` and `/1`; each client offers
+exactly one ALPN. `/3` admits only its protected roster operation set under its
+tenant/scope/fence authority, and `/2` MUST NOT count or reclaim `/3` lanes.
+The server MUST reject every `/2` Hello revision other than 5 before dispatch.
 
-V1 revision 5 does not interoperate with revisions 1, 2, 3, or 4. Because this
-SDK is unreleased, a V1 revision cutover MUST drain consumer clients and
-listeners; fallback, V1 dual-mode, and mixed-revision V1 operation are
-unsupported. Deployment MUST provision revision-6 V2 listener support,
-V2-capable store authority, and the required protected-wrapper V2 journal before
-enabling an explicit V2 client call. V1 traffic may continue on its revision-5
-ALPN while V2 is introduced or drained, but that coexistence is not fallback,
-dual-mode wire negotiation, or mixed-revision operation of one request family.
-Removal of V2 requires draining V2 callers first. Revision-5 V1 and revision-6
-V2 private JSON DTO bytes are canonical; reordered or otherwise noncanonical
-encodings, aliases, omissions, and unknown fields MUST fail closed.
+General revision 6 does not interoperate with older general revisions. Because
+this SDK is unreleased, a general-lane revision cutover MUST drain consumer
+clients and listeners; fallback, general-lane dual mode, and mixed-revision
+operation are unsupported. Deployment MUST provision revision-5 `/2` listener
+support, V2-capable store authority, and the required protected-wrapper V2
+journal before enabling an explicit V2 client call. `/1`, `/2`, and `/3`
+coexist only as independently authenticated and decoded lanes, never as common
+or dual-revision authority. Removing either additive lane requires draining its
+callers first. General revision-6 and V2 revision-5 private JSON DTO bytes are
+canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
+and unknown fields MUST fail closed.
 
 `StatelessSessionConsumerClient` remains a public, source-compatible
 production/compatibility fresh-authentication typed least-authority surface
@@ -1727,29 +1751,31 @@ rejecting the activated image.
 
 Each V2 request connection carries a connection-local, nonzero `u32` sequence
 that increases monotonically and never wraps, paired with a fresh full-width
-128-bit OS-CSPRNG nonce and a domain-separated commitment to the exact canonical
-request bytes and operation phase. The server admits only the exact next
-sequence and the client accepts only the exact composite response tuple. A V2
-lane retires after at most 4,096 sequential calls. There is
+128-bit OS-CSPRNG nonce and the fixed 32-byte request commitment. The
+commitment is SHA-256 of `opc-session-consumer-v2-call-phase`, the big-endian
+`/2` revision 5, and the exact serialized V2 request bytes. The server admits
+only the exact next sequence and the client accepts only the exact composite
+response tuple. A V2 lane retires after at most 4,096 sequential calls. There is
 exactly one in-flight call per connection, with no multiplexing. This is
 structural: it isolates cancellation and pre-staged/late responses and removes
 write-position ambiguity.
 
-Revision 6 validates the HelloAck request-frame ceiling independently from the
-client's response-frame capacity: any nonzero request ceiling through the fixed
-16 MiB maximum is valid, and the exact bounded encoder MUST reject an
-oversized Call before writing its length prefix. The response-frame capacity
-retains the larger fixed minimum required by bounded batch responses.
+The `/2` HelloAck request-frame ceiling is independent from the client's
+response-frame capacity: any nonzero request ceiling through the fixed 16 MiB
+maximum is valid, and the exact bounded encoder MUST reject an oversized Call
+before writing its length prefix. The response-frame capacity retains the
+larger fixed minimum required by bounded batch responses.
 
 The client uses a
 fixed, fair pool of four request connections by default (at most 16 when
 configured), with 64 pending calls by default and a hard maximum of 256. A
-pending call may wait or age for at most 250 ms. Watches use two separate slots
-by default (at most 16 when configured), never consuming request-pool capacity.
+pending call may wait or age for at most 250 ms. The retained Watch transport
+uses two reserved slots by default (at most 16 when configured), but typed
+tenant/NF consumer Watch does not acquire them while its cursor is global.
 
 `PersistentSessionConsumerClient` has an ALPN-specific V2 idle pool while V1
 and V2 share one configured request width, pending queue, and prewarm gate.
-`prewarm_v2` establishes revision-6 lanes within that aggregate width without
+`prewarm_v2` establishes revision-5 lanes within that aggregate width without
 dispatching an operation, `execute_v2` dispatches only on a V2 lane, and
 `v2_diagnostics` reports only V2 redaction-safe pool state. V1 and V2 idle
 sockets and authenticated Hello exchanges are never cross-reused; their
@@ -1791,11 +1817,9 @@ frame bound.
 
 The complete operation timeout MUST validate strictly greater than zero and no
 greater than 10 seconds. The configured idle timeout is at most 5 seconds and
-caps every active partial frame on all client bootstrap, unary, and watch reads;
-partial bytes do not reset that bound. A healthy watch with no bytes in flight
-may remain quiet. Retirement of a saturated, canceled, or rotated watch MUST
-NOT block while holding its watch lease. Each discarded checked-out request lane
-MUST have exactly one reconnect/replacement accounting outcome. Under concurrent
+caps every active partial frame on all client bootstrap and unary reads; partial
+bytes do not reset that bound. Each discarded checked-out request lane MUST have
+exactly one reconnect/replacement accounting outcome. Under concurrent
 shutdown callers, phase progression is monotonic from running to draining to
 forced and MUST NOT regress.
 
@@ -1805,16 +1829,16 @@ is at most 30 seconds, and material-rotation jitter is at most 30 seconds. A
 consumer shutdown drains for at most 5 seconds. An establishment attempt has a
 1,500 ms setup limit and a call makes at most two pre-write establishment
 attempts. Resolution occurs only for establishment or re-establishment, never
-for a reused connection. Every cold request, watch, and rolling-prewarm setup
-MUST enter one pool-wide recovery lane after bounded physical admission. One
+for a reused connection. Every cold request and rolling-prewarm setup MUST enter
+one pool-wide recovery lane after bounded physical admission. One
 failed setup or proven cached-lane loss publishes the shared exponential
 lifecycle backoff floor (50 ms by default) plus at most 25 ms jitter, clipped to
 each logical deadline;
 concurrent waiters MUST NOT start independent resolver/TCP/TLS/Hello attempts.
 Reauthentication, material
 changes, certificate expiry, idle retirement, cancellation, malformed frames,
-EOF, or an uncertain stream position terminate the connection/watch and release
-its transport task slot; they do not create another request on that connection.
+EOF, or an uncertain stream position terminate the connection and release its
+transport task slot; they do not create another request on that connection.
 "Material changes" here means an accepted material-epoch change. It MUST
 schedule each already-admitted lane at a stable directed authenticated-edge
 deadline no later than the configured rotation-jitter maximum; admitted work
@@ -1826,8 +1850,8 @@ jitter exception. TLS MUST expose only the single fixed-domain, fixed-range
 consumer jitter duration needed by session-net. It MUST NOT expose a comparable
 edge-key object, caller-selected digest range, identity, or digest bytes to
 callers or session-net diagnostics. A rejected publication
-that retains the admitted epoch MUST NOT interrupt an active frame or healthy
-watch. Each logical request pool MUST use exactly one maintenance task to
+that retains the admitted epoch MUST NOT interrupt an active frame. Each
+logical request pool MUST use exactly one maintenance task to
 remove cached lanes autonomously at the earliest idle/lifecycle deadline.
 Maintenance task/table cardinality MUST NOT scale with lanes, subscribers, or
 records.
@@ -1890,7 +1914,8 @@ every configured request lane and preserve refreshed plus unprocessed healthy
 capacity after a partial failure. Prewarm and readiness may prove authenticated
 consumer transport capacity only;
 they never prove quorum or product readiness. Readiness deliberately becomes
-false while a request lane is leased; isolated watch slots are non-gating.
+false while a request lane is leased; reserved Watch transport slots are
+non-gating.
 Diagnostics are fixed and
 nonidentifying: setup phase, pool wait, active/maximum/idle counts,
 reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They
@@ -1908,18 +1933,19 @@ or record-scaled maintenance state is introduced.
 The v7 qualification profile remains the revision-2 persistent-transport
 inventory and records its connection, frame, request/response, watch, task,
 and lifecycle limits beside the consensus profile. The published v6 profile
-remains the unchanged revision-1 contract. V1 revision 5 retains those bounded
-transport properties, the revision-3 generic #696 family, and revision-4 exact
-retained status recovery for ordinary leases. V2 revision 6 adds the full-width
-attempt tuple and exact request/phase commitment while retaining exact below-TLS
-write observation, rolling fresh prewarm, and pool-wide cold-setup serialization.
-The live v8 exact-head schema remains
+remains the unchanged revision-1 contract. General `/1` revision 6 retains the
+bounded transport properties, the revision-3 generic #696 family, and
+revision-4 exact retained status recovery for ordinary leases. V2 `/2`
+revision 5 retains its fixed full-width attempt tuple, exact request commitment,
+exact below-TLS write observation, rolling fresh prewarm, and pool-wide
+cold-setup serialization. Protected-roster `/3` remains an isolated revision-5
+roster-only lane. The live v8 exact-head schema remains
 experimental and fixes `qualification_complete=false`. No profile or evidence
 records consumer identity or scope material. Synthetic warm accept/reuse checks
 gate only their transport method; elapsed samples are non-gating and are not an
 SLO.
 
-V2 is an additive protocol family; it neither changes the V1 revision-5 wire
+V2 is an additive protocol family; it neither changes the V1 revision-6 wire
 enum nor upgrades a V1 request. Its exact capability, history, execution, and
 status outcomes remain on the separate ALPN and V2 identity described above.
 
