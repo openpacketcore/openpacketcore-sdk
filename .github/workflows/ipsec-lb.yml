@@ -69,7 +69,9 @@ jobs:
           )
           optimized_roster_contracts=(
             persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal
+            persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart
             persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal
+            persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running
             persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart
           )
           timing_contracts=("${ordinary_timing_contracts[@]}" "${optimized_roster_contracts[@]}")
