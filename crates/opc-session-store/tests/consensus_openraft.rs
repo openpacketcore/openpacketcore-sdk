@@ -5192,6 +5192,66 @@ async fn protected_roster_profile_activation_requires_every_voter_to_be_availabl
 }
 
 #[tokio::test]
+async fn fenced_transition_v2_current_voter_probe_treats_unavailable_as_transient_before_proposal()
+{
+    let cluster = TestCluster::start().await;
+    let (leader, _, _) = cluster.observed_leader();
+    let unavailable_voter = (leader + 1) % MEMBER_COUNT;
+    let store = &cluster.stores[leader];
+    let key = session_key(b"fenced-transition-v2-current-voter-unavailable");
+    let observation = store
+        .observe_fenced_transition(&key)
+        .await
+        .expect("observe V2 key before unavailable current-voter probe");
+    let (request, _) = fenced_v2_acquire_create_request(
+        key,
+        owner("fenced-transition-v2-current-voter-unavailable-owner"),
+        observation.current_fence(),
+        [0x71; 16],
+        b"sealed-fenced-transition-v2-current-voter-unavailable",
+    );
+    let applications_before = replication_logs(&cluster).await;
+    let leader_log_before = store.status().last_log_index;
+
+    // One remaining remote voter can still satisfy the ordinary read quorum,
+    // but V2 activation requires an exact reply from every current voter. A
+    // failed authenticated transport path is unavailable, not affirmative
+    // evidence that the peer implements a different immutable profile.
+    cluster
+        .paths
+        .get(&(leader, unavailable_voter))
+        .expect("leader outbound peer path")
+        .set_enabled(false);
+    assert!(matches!(
+        store.fenced_transition_v2(request.clone()).await,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(
+        store.status().last_log_index,
+        leader_log_before,
+        "a transient V2 probe failure appends neither an activation nor a mutation"
+    );
+    cluster
+        .paths
+        .get(&(leader, unavailable_voter))
+        .expect("leader outbound peer path")
+        .set_enabled(true);
+    cluster
+        .wait_all_ready(RECOVERY_TIMEOUT)
+        .await
+        .expect("all voters reconverge after the transient V2 probe failure");
+    assert_eq!(
+        replication_logs(&cluster).await,
+        applications_before,
+        "a transient V2 probe failure creates neither an activation nor a mutation application"
+    );
+    assert!(matches!(
+        store.fenced_transition_v2_status(&request).await,
+        Ok(FencedTransitionV2Status::NotFound)
+    ));
+}
+
+#[tokio::test]
 async fn fenced_transition_v2_current_voter_probe_fails_closed_then_activates_on_exact_replies() {
     let cluster = TestCluster::start().await;
     let (leader, _, _) = cluster.observed_leader();

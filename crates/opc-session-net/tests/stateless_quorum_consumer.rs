@@ -17,11 +17,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use opc_consensus::engine::raft::AppendEntriesRequest;
-#[cfg(feature = "test-control")]
-use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
 use opc_consensus::{
     derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusIdentity,
 };
+#[cfg(feature = "test-control")]
+use opc_consensus::{DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROFILE};
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 #[cfg(feature = "test-control")]
 use opc_key::{
@@ -2147,14 +2147,7 @@ async fn three_voter_authorizer(
     client_spiffe: &str,
 ) -> SessionConsumerAuthorizer {
     let manifest = store
-        .consumer_authorization_manifest([SessionConsumerAuthorizationGrant::try_new(
-            SpiffeId::new(client_spiffe).expect("three-voter client SPIFFE"),
-            [SessionConsumerTenantNfScope::new(
-                TenantId::new("consumer-test").expect("tenant"),
-                NetworkFunctionKind::smf(),
-            )],
-        )
-        .expect("three-voter explicit consumer grant")])
+        .consumer_authorization_manifest([three_voter_authorization_grant(client_spiffe)])
         .await
         .unwrap_or_else(|error| {
             panic!(
@@ -2164,6 +2157,75 @@ async fn three_voter_authorizer(
             )
         });
     SessionConsumerAuthorizer::try_new(manifest).expect("three-voter consumer authorizer")
+}
+
+fn three_voter_authorization_grant(client_spiffe: &str) -> SessionConsumerAuthorizationGrant {
+    SessionConsumerAuthorizationGrant::try_new(
+        SpiffeId::new(client_spiffe).expect("three-voter client SPIFFE"),
+        [SessionConsumerTenantNfScope::new(
+            TenantId::new("consumer-test").expect("tenant"),
+            NetworkFunctionKind::smf(),
+        )],
+    )
+    .expect("three-voter explicit consumer grant")
+}
+
+#[cfg(feature = "test-control")]
+async fn three_voter_authorizer_after_full_restart(
+    fleet: &ThreeVoterConsumerFleet,
+    voter: usize,
+    client_spiffe: &str,
+    minimum_term: u64,
+) -> SessionConsumerAuthorizer {
+    fleet
+        .wait_for_admitted_quorum_leader(&[0, 1, 2], minimum_term)
+        .await;
+    let store = &fleet.stores[voter];
+    let attempts = AtomicUsize::new(0);
+    let manifest = tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
+        let mut backoff = Duration::from_millis(20);
+        loop {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            match store
+                .consumer_authorization_manifest([three_voter_authorization_grant(client_spiffe)])
+                .await
+            {
+                Ok(manifest) => return manifest,
+                Err(StoreError::BackendUnavailable(_)) => {
+                    let (engines_running, durable_progress) =
+                        fleet.process_loss_durable_progress_diagnostic_for_test();
+                    assert!(
+                        engines_running,
+                        "post-restart application-authority readiness requires running engines; durable_progress={durable_progress}"
+                    );
+                    // Manifest construction is read-only. Exponential backoff
+                    // bounds exact-authority probes and cannot replay a roster
+                    // mutation or create a consensus-proposal storm.
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff
+                        .saturating_mul(2)
+                        .min(Duration::from_millis(250));
+                }
+                Err(error) => panic!(
+                    "post-restart three-voter consumer manifest failed conclusively: {error:?}; status={:?}; diagnostics={:?}",
+                    store.status(),
+                    store.diagnostic_snapshot(),
+                ),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let (_, durable_progress) = fleet.process_loss_durable_progress_diagnostic_for_test();
+        panic!(
+            "post-restart three-voter consumer manifest did not become ready after {} bounded read-only attempts; status={:?}; diagnostics={:?}; durable_progress={durable_progress}",
+            attempts.load(Ordering::SeqCst),
+            store.status(),
+            store.diagnostic_snapshot(),
+        )
+    });
+    SessionConsumerAuthorizer::try_new(manifest)
+        .expect("post-restart three-voter consumer authorizer")
 }
 
 async fn admitted_store_and_authorizer(
@@ -9263,7 +9325,8 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
     drop(lease_transport);
     let fleet = fleet.restart_all().await;
 
-    let (restart_leader, _, _) = fleet.wait_for_observed_leader().await;
+    let (restart_leader, _, restart_term) =
+        fleet.wait_for_admitted_quorum_leader(&[0, 1, 2], 0).await;
     let restart_voter = (restart_leader + 1) % THREE_VOTER_COUNT;
     let restart_server_spiffe = three_voter_spiffe(restart_voter);
     let restart_service = Arc::new(fleet.stores[restart_voter].consumer_service());
@@ -9274,7 +9337,13 @@ async fn persistent_three_voter_protected_roster_aborted_exact_bytes_survive_sna
     let (restart_server, restart_address) = SessionQuorumConsumerServer::new(
         restart_transport.clone(),
         pki.server_config(&restart_server_spiffe),
-        three_voter_authorizer(&fleet.stores[restart_voter], &client_spiffe).await,
+        three_voter_authorizer_after_full_restart(
+            &fleet,
+            restart_voter,
+            &client_spiffe,
+            restart_term,
+        )
+        .await,
     )
     .with_roster_ingress(restart_transport.clone(), ingress_signer)
     .listen(
@@ -10611,6 +10680,25 @@ fn install_protected_roster_process_loss_child_panic_hook() {
 #[cfg(feature = "test-control")]
 const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_BOUND: Duration = Duration::from_secs(5 * 60);
 #[cfg(feature = "test-control")]
+const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_COMMANDS: usize = 4_300;
+#[cfg(feature = "test-control")]
+const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_PREFILL_COMMANDS: usize = 2_000;
+#[cfg(feature = "test-control")]
+const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_POST_ADMISSION_COMMANDS: usize =
+    PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_COMMANDS
+        - PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_PREFILL_COMMANDS;
+#[cfg(feature = "test-control")]
+const _: () = {
+    assert!(
+        PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_PREFILL_COMMANDS
+            < DURABLE_OPENRAFT_PROFILE.logs_per_snapshot as usize
+    );
+    assert!(
+        PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_COMMANDS
+            > DURABLE_OPENRAFT_PROFILE.logs_per_snapshot as usize
+    );
+};
+#[cfg(feature = "test-control")]
 const PROTECTED_ROSTER_PROCESS_LOSS_LEASE_TTL: Duration = Duration::from_secs(60);
 #[cfg(feature = "test-control")]
 const PROTECTED_ROSTER_PROCESS_LOSS_LEASE_EXPIRY_SCHEDULING_SLACK: Duration =
@@ -10960,42 +11048,62 @@ fn run_protected_roster_process_loss_child(state: &Path, phase: &str) {
 }
 
 #[cfg(feature = "test-control")]
-async fn compact_protected_roster_process_loss_admission(
+async fn advance_protected_roster_process_loss_snapshot_workload(
     fleet: &ThreeVoterConsumerFleet,
     leader: usize,
-    admitted_log_index: u64,
-) {
-    const SNAPSHOT_COMMANDS: usize = 4_300;
-
-    let target_log_index = admitted_log_index + SNAPSHOT_COMMANDS as u64;
+    commands: usize,
+    bound: Duration,
+    phase: &str,
+) -> (usize, Duration) {
+    let workload_started = Instant::now();
+    let baseline_log_index = fleet.stores[leader]
+        .status()
+        .last_log_index
+        .expect("process-loss snapshot workload has a durable baseline");
+    let target_log_index = baseline_log_index + commands as u64;
     let mut workload_leader = leader;
     let mut workload_term = fleet.stores[workload_leader].status().term;
-    let workload_result = tokio::time::timeout(PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_BOUND, async {
+    let mut no_progress_backoff = Duration::from_millis(20);
+    let workload_result = tokio::time::timeout(bound, async {
         while fleet.stores[workload_leader]
             .status()
             .last_log_index
             .is_none_or(|index| index < target_log_index)
         {
+            let attempt_baseline = fleet.stores[workload_leader].status().last_log_index;
             match fleet.stores[workload_leader]
                 .max_replication_sequence()
                 .await
             {
-                Ok(_) => {}
+                Ok(_) => no_progress_backoff = Duration::from_millis(20),
                 Err(StoreError::BackendUnavailable(_)) => {
                     let (engines_running, durable_progress) =
                         fleet.process_loss_durable_progress_diagnostic_for_test();
                     if !engines_running {
                         panic!(
-                            "process-loss snapshot maintenance retry fails closed because a voter engine stopped; durable_progress={durable_progress}"
+                            "process-loss {phase} snapshot maintenance retry fails closed because a voter engine stopped; durable_progress={durable_progress}"
                         );
                     }
                     (workload_leader, _, workload_term) = fleet
                         .wait_for_admitted_quorum_leader(&[0, 1, 2], workload_term)
                         .await;
-                    tokio::task::yield_now().await;
+                    if fleet.stores[workload_leader].status().last_log_index <= attempt_baseline {
+                        // The logical-time command is read-only, but an
+                        // unavailable reply can follow an accepted proposal.
+                        // Give durable progress a bounded observation window
+                        // before issuing another command, and exponentially
+                        // bound retries that show no committed progress.
+                        tokio::time::sleep(no_progress_backoff).await;
+                        no_progress_backoff = no_progress_backoff
+                            .saturating_mul(2)
+                            .min(Duration::from_millis(250));
+                    } else {
+                        no_progress_backoff = Duration::from_millis(20);
+                        tokio::task::yield_now().await;
+                    }
                 }
                 Err(error) => {
-                    panic!("process-loss snapshot command was rejected: {error:?}")
+                    panic!("process-loss {phase} snapshot command was rejected: {error:?}")
                 }
             }
         }
@@ -11003,8 +11111,11 @@ async fn compact_protected_roster_process_loss_admission(
     .await;
     if workload_result.is_err() {
         let (_, durable_progress) = fleet.process_loss_durable_progress_diagnostic_for_test();
+        eprintln!(
+            "process-loss {phase} snapshot workload exceeded its bound; baseline_log_index={baseline_log_index}; target_log_index={target_log_index}; durable_progress={durable_progress}"
+        );
         panic!(
-            "process-loss snapshot command batch exceeded its bound; durable_progress={durable_progress}"
+            "process-loss {phase} snapshot command batch exceeded its bound; durable_progress={durable_progress}"
         );
     }
     assert!(
@@ -11012,8 +11123,30 @@ async fn compact_protected_roster_process_loss_admission(
             .status()
             .last_log_index
             .is_some_and(|index| index >= target_log_index),
-        "the process-loss workload crosses the production snapshot-log threshold"
+        "the process-loss {phase} workload reaches its exact durable log target"
     );
+    (workload_leader, workload_started.elapsed())
+}
+
+#[cfg(feature = "test-control")]
+async fn compact_protected_roster_process_loss_admission(
+    fleet: &ThreeVoterConsumerFleet,
+    leader: usize,
+    admitted_log_index: u64,
+    bound: Duration,
+) {
+    let (workload_leader, _) = advance_protected_roster_process_loss_snapshot_workload(
+        fleet,
+        leader,
+        PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_POST_ADMISSION_COMMANDS,
+        bound,
+        "post-admission",
+    )
+    .await;
+    let target_log_index = fleet.stores[workload_leader]
+        .status()
+        .last_log_index
+        .expect("process-loss post-admission workload has a durable target");
     fleet.wait_all_application_sequences(target_log_index).await;
     wait_for_protected_roster_snapshot_coverage(
         fleet,
@@ -11043,6 +11176,18 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
     )
     .await;
     let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    let (leader, snapshot_prefill_elapsed) =
+        advance_protected_roster_process_loss_snapshot_workload(
+            &fleet,
+            leader,
+            PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_PREFILL_COMMANDS,
+            PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_BOUND,
+            "pre-admission",
+        )
+        .await;
+    let snapshot_post_admission_bound = PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_BOUND
+        .checked_sub(snapshot_prefill_elapsed)
+        .expect("process-loss prefill leaves time for post-admission snapshot commands");
     fleet.stores[leader]
         .activate_protected_roster_profile()
         .await
@@ -11313,7 +11458,13 @@ async fn protected_roster_process_loss_phase_one(state: &Path) {
     );
     assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 0);
     assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
-    compact_protected_roster_process_loss_admission(&fleet, leader, admitted_log_index).await;
+    compact_protected_roster_process_loss_admission(
+        &fleet,
+        leader,
+        admitted_log_index,
+        snapshot_post_admission_bound,
+    )
+    .await;
     let phase_one_terminal_mutations = transport
         .roster_terminal_recorded_responses
         .load(Ordering::SeqCst);
@@ -11404,10 +11555,12 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
     // the only post-open writes below are one current-fence acquisition and
     // the one retained roster terminalization.
     fleet.wait_all_ready().await;
-    let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    let (leader, _, reopen_term) = fleet.wait_for_admitted_quorum_leader(&[0, 1, 2], 0).await;
     let server_spiffe = three_voter_spiffe(leader);
     let client_spiffe = spiffe("three-voter-process-loss-client");
-    let authorizer = three_voter_authorizer(&fleet.stores[leader], &client_spiffe).await;
+    let authorizer =
+        three_voter_authorizer_after_full_restart(&fleet, leader, &client_spiffe, reopen_term)
+            .await;
     let attestor = ProductionRosterAttestationIssuer::new(
         fleet.consensus_identity(leader),
         authorizer.scope(),
@@ -11850,10 +12003,12 @@ async fn protected_roster_process_loss_phase_three(state: &Path) {
     // only durable consumer write is the higher current-fence acquisition;
     // recovery and publication remain read-only/provider-local respectively.
     fleet.wait_all_ready().await;
-    let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    let (leader, _, reopen_term) = fleet.wait_for_admitted_quorum_leader(&[0, 1, 2], 0).await;
     let server_spiffe = three_voter_spiffe(leader);
     let client_spiffe = spiffe("three-voter-process-loss-client");
-    let authorizer = three_voter_authorizer(&fleet.stores[leader], &client_spiffe).await;
+    let authorizer =
+        three_voter_authorizer_after_full_restart(&fleet, leader, &client_spiffe, reopen_term)
+            .await;
     let attestor = ProductionRosterAttestationIssuer::new(
         fleet.consensus_identity(leader),
         authorizer.scope(),

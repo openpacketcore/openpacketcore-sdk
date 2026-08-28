@@ -10313,11 +10313,14 @@ mod tests {
     #[tokio::test]
     async fn fixed_snapshot_install_seals_the_extracted_database_and_envelope() {
         let source_directory = FixedRawReadStoreFixture::new();
-        let (_, mut source, _) = open_fixed_raw_read_store(&source_directory).await;
-        source
-            .apply([fixed_initial_membership_entry()])
-            .await
-            .expect("apply fixed source membership");
+        let (mut source_log, mut source, _) = open_fixed_raw_read_store(&source_directory).await;
+        append_commit_and_apply(
+            &mut source_log,
+            &mut source,
+            [fixed_initial_membership_entry()],
+            "fixed source membership",
+        )
+        .await;
         let mut builder = source.get_snapshot_builder().await;
         let mut built = builder
             .build_snapshot()
@@ -10325,11 +10328,14 @@ mod tests {
             .expect("build fixed source snapshot");
 
         let target_directory = FixedRawReadStoreFixture::new();
-        let (_, mut target, _) = open_fixed_raw_read_store(&target_directory).await;
-        target
-            .apply([fixed_initial_membership_entry()])
-            .await
-            .expect("apply fixed target membership");
+        let (mut target_log, mut target, _) = open_fixed_raw_read_store(&target_directory).await;
+        append_commit_and_apply(
+            &mut target_log,
+            &mut target,
+            [fixed_initial_membership_entry()],
+            "fixed target membership",
+        )
+        .await;
         let mut receiving = target
             .begin_receiving_snapshot()
             .await
@@ -10385,11 +10391,14 @@ mod tests {
 
         async fn run(foreign_entries: usize) -> bool {
             let source_dir = FixedRawReadStoreFixture::new();
-            let (_, mut source, _) = open_fixed_raw_read_store(&source_dir).await;
-            source
-                .apply([fixed_initial_membership_entry()])
-                .await
-                .expect("fixed capacity source membership");
+            let (mut source_log, mut source, _) = open_fixed_raw_read_store(&source_dir).await;
+            append_commit_and_apply(
+                &mut source_log,
+                &mut source,
+                [fixed_initial_membership_entry()],
+                "fixed capacity source membership",
+            )
+            .await;
             let mut builder = source.get_snapshot_builder().await;
             let mut built = builder
                 .build_snapshot()
@@ -10397,11 +10406,14 @@ mod tests {
                 .expect("fixed capacity source snapshot");
 
             let target_dir = FixedRawReadStoreFixture::new();
-            let (_, mut target, _) = open_fixed_raw_read_store(&target_dir).await;
-            target
-                .apply([fixed_initial_membership_entry()])
-                .await
-                .expect("fixed capacity target membership");
+            let (mut target_log, mut target, _) = open_fixed_raw_read_store(&target_dir).await;
+            append_commit_and_apply(
+                &mut target_log,
+                &mut target,
+                [fixed_initial_membership_entry()],
+                "fixed capacity target membership",
+            )
+            .await;
             for index in 0..foreign_entries {
                 std::fs::write(
                     target.core.snapshot_dir.join(format!("foreign-{index}")),
@@ -10445,11 +10457,14 @@ mod tests {
         use std::io::{Seek as _, Write as _};
 
         let source_directory = FixedRawReadStoreFixture::new();
-        let (_, mut source, _) = open_fixed_raw_read_store(&source_directory).await;
-        source
-            .apply([fixed_initial_membership_entry()])
-            .await
-            .expect("apply fixed source membership A");
+        let (mut source_log, mut source, _) = open_fixed_raw_read_store(&source_directory).await;
+        append_commit_and_apply(
+            &mut source_log,
+            &mut source,
+            [fixed_initial_membership_entry()],
+            "fixed source membership A",
+        )
+        .await;
         let mut first_builder = source.get_snapshot_builder().await;
         let mut first = first_builder
             .build_snapshot()
@@ -10467,10 +10482,13 @@ mod tests {
             .await
             .expect("read fixed source snapshot A");
 
-        source
-            .apply([blank_entry(1)])
-            .await
-            .expect("advance fixed source to snapshot B");
+        append_commit_and_apply(
+            &mut source_log,
+            &mut source,
+            [blank_entry(1)],
+            "fixed source snapshot B",
+        )
+        .await;
         let mut second_builder = source.get_snapshot_builder().await;
         let mut second = second_builder
             .build_snapshot()
@@ -10494,11 +10512,14 @@ mod tests {
         );
 
         let target_directory = FixedRawReadStoreFixture::new();
-        let (_, mut target, _) = open_fixed_raw_read_store(&target_directory).await;
-        target
-            .apply([fixed_initial_membership_entry()])
-            .await
-            .expect("apply fixed target membership");
+        let (mut target_log, mut target, _) = open_fixed_raw_read_store(&target_directory).await;
+        append_commit_and_apply(
+            &mut target_log,
+            &mut target,
+            [fixed_initial_membership_entry()],
+            "fixed target membership",
+        )
+        .await;
         let mut receiving = target
             .begin_receiving_snapshot()
             .await
@@ -11158,13 +11179,16 @@ mod tests {
     #[tokio::test]
     async fn fixed_snapshot_install_publishes_applied_frontier_before_concurrent_purge() {
         let source_directory = FixedRawReadStoreFixture::new();
-        let (_, mut source, _) = open_fixed_raw_read_store(&source_directory).await;
+        let (mut source_log, mut source, _) = open_fixed_raw_read_store(&source_directory).await;
         let membership = fixed_initial_membership_entry();
         let command = blank_entry(1);
-        source
-            .apply([membership.clone(), command.clone()])
-            .await
-            .expect("apply fixed source snapshot cut");
+        append_commit_and_apply(
+            &mut source_log,
+            &mut source,
+            [membership.clone(), command.clone()],
+            "fixed source snapshot cut",
+        )
+        .await;
         let mut built = source
             .get_snapshot_builder()
             .await
@@ -11174,14 +11198,13 @@ mod tests {
 
         let target_directory = FixedRawReadStoreFixture::new();
         let (mut log_store, mut target, _) = open_fixed_raw_read_store(&target_directory).await;
-        target
-            .apply([membership.clone()])
-            .await
-            .expect("apply fixed target predecessor");
-        log_store
-            .blocking_append([membership])
-            .await
-            .expect("append the only retained fixed target predecessor");
+        append_commit_and_apply(
+            &mut log_store,
+            &mut target,
+            [membership],
+            "fixed target predecessor",
+        )
+        .await;
         let mut receiving = target
             .begin_receiving_snapshot()
             .await

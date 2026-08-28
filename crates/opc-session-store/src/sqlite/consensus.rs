@@ -42208,13 +42208,15 @@ mod tests {
         let source_conn = source.conn.blocking_lock();
         initialize_schema(&source_conn, identity(), &expected_members())
             .expect("initialize source schema");
-        apply_entries_sync(
-            &source_conn,
-            identity(),
-            &source.caps,
-            vec![membership_entry()],
-        )
-        .expect("apply source membership");
+        let source_prefix = std::iter::once(membership_entry())
+            .chain((1..=8).map(blank_entry))
+            .collect::<Vec<_>>();
+        append_logs_sync(&source_conn, identity(), &source_prefix)
+            .expect("append source protected-roster prefix");
+        save_committed_sync(&source_conn, identity(), Some(log_id(8)))
+            .expect("commit source protected-roster prefix");
+        apply_entries_sync(&source_conn, identity(), &source.caps, source_prefix)
+            .expect("apply source protected-roster prefix");
         activate_protected_roster_schema_sync(&source_conn).expect("activate source roster");
         write_retirement_fixture_record(&source_conn, &retained, retained_at);
         write_retirement_fixture_floor(&source_conn, retained.binding());
@@ -42225,7 +42227,6 @@ mod tests {
                 [],
             )
             .expect("advance source roster sequence horizon");
-        set_applied_index_for_test(&source_conn, identity(), 8);
         let (last_log_id, last_membership) =
             build_snapshot_database_sync(&source_conn, identity(), &snapshot_path)
                 .expect("build protected-roster snapshot");
@@ -42235,13 +42236,15 @@ mod tests {
         let target_conn = target.conn.blocking_lock();
         initialize_schema(&target_conn, identity(), &expected_members())
             .expect("initialize target schema");
-        apply_entries_sync(
-            &target_conn,
-            identity(),
-            &target.caps,
-            vec![membership_entry()],
-        )
-        .expect("apply target membership");
+        let target_prefix = std::iter::once(membership_entry())
+            .chain((1..=8).map(blank_entry))
+            .collect::<Vec<_>>();
+        append_logs_sync(&target_conn, identity(), &target_prefix)
+            .expect("append target protected-roster prefix");
+        save_committed_sync(&target_conn, identity(), Some(log_id(8)))
+            .expect("commit target protected-roster prefix");
+        apply_entries_sync(&target_conn, identity(), &target.caps, target_prefix)
+            .expect("apply target protected-roster prefix");
         activate_protected_roster_schema_sync(&target_conn).expect("activate target roster");
         write_retirement_fixture_record(&target_conn, &retained, retained_at);
         write_retirement_fixture_floor(&target_conn, retained.binding());
@@ -42252,7 +42255,6 @@ mod tests {
                 [],
             )
             .expect("advance target roster sequence horizon");
-        set_applied_index_for_test(&target_conn, identity(), 8);
         target_conn
             .execute_batch("PRAGMA foreign_keys = ON")
             .expect("enable foreign keys");
