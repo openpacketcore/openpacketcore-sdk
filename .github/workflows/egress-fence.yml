@@ -133,7 +133,21 @@ jobs:
             --all-features \
             --quiet \
             -- \
-            --test-threads=4
+            --test-threads=4 \
+            --skip protected_roster_ingress_has_two_mutations_and_read_only_status_paths
+          # This proof deliberately binds a one-second attached-consensus
+          # deadline. Run it exactly once outside the multi-minute SQLite
+          # fixtures so host scheduling cannot turn a committed mutation into
+          # a detached response while preserving the production deadline.
+          cargo test --locked \
+            -p opc-session-store \
+            --lib \
+            --all-features \
+            --quiet \
+            -- \
+            --test-threads=1 \
+            --exact \
+            consensus::store::membership_tests::protected_roster_ingress_has_two_mutations_and_read_only_status_paths
           cargo test --locked \
             -p opc-session-testkit \
             --test qualification_profile \
