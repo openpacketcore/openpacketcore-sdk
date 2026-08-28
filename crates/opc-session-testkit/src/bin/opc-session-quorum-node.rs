@@ -56,7 +56,7 @@ use opc_session_store::{
     SessionConsumerTenantNfScope, SessionConsumerV2Operation, SessionConsumerV2Request,
     SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
     SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
-    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    StoreError, StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_key_bytes_sha256, qualification_owner_sha256, qualification_state_type_sha256,
@@ -265,6 +265,10 @@ impl std::fmt::Debug for QualificationGatedConsensusPeer {
 impl SessionConsensusPeer for QualificationGatedConsensusPeer {
     fn node_id(&self) -> SessionConsensusNodeId {
         self.inner.node_id()
+    }
+
+    fn scope_identity(&self) -> Option<SessionConsensusIdentity> {
+        self.inner.scope_identity()
     }
 
     async fn call(
@@ -1088,11 +1092,12 @@ impl QualificationNode {
         let backend = SqliteSessionBackend::open(&config.database_path)
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Sqlite))?;
         let store = Arc::new(
-            ConsensusSessionStore::open_with_operation_timeout(
+            ConsensusSessionStore::open_fixed_durable_quorum_with_clock(
                 topology,
                 backend,
                 &config.snapshot_directory,
                 peers,
+                Arc::new(SystemClock),
                 Duration::from_millis(config.operation_timeout_millis),
             )
             .await

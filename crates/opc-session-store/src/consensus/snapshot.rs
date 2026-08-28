@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+#[cfg(target_os = "linux")]
+use rustix::fs::{renameat_with, RenameFlags};
 use sha2::Digest as _;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd, RawFd};
@@ -90,6 +92,38 @@ pub(crate) struct RetainedSnapshotDirectory {
     // a detached D1 cannot obtain its directory lease while validation is
     // still responsible for D1's exact cleanup and durability boundary.
     directory: Arc<nix::fcntl::Flock<std::fs::File>>,
+}
+
+/// Rename a child within one retained directory without replacing an existing
+/// destination. Linux's `renameat2` is required because `renameat` cannot
+/// preserve the no-replace invariant against a concurrent creator.
+#[cfg(target_os = "linux")]
+pub(crate) fn rename_noreplace_in_directory(
+    directory: &std::fs::File,
+    from: &OsStr,
+    to: &OsStr,
+) -> io::Result<()> {
+    rename_in_directory(directory, from, to, RenameFlags::NOREPLACE)
+}
+
+/// Exchange two children within one retained directory.
+#[cfg(target_os = "linux")]
+pub(crate) fn rename_exchange_in_directory(
+    directory: &std::fs::File,
+    from: &OsStr,
+    to: &OsStr,
+) -> io::Result<()> {
+    rename_in_directory(directory, from, to, RenameFlags::EXCHANGE)
+}
+
+#[cfg(target_os = "linux")]
+fn rename_in_directory(
+    directory: &std::fs::File,
+    from: &OsStr,
+    to: &OsStr,
+    flags: RenameFlags,
+) -> io::Result<()> {
+    renameat_with(directory, from, directory, to, flags).map_err(io::Error::from)
 }
 
 #[cfg(test)]
@@ -427,18 +461,19 @@ impl RetainedSnapshotDirectory {
         )
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn rename_noreplace(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
         let from = self.basename(from)?;
         let to = self.basename(to)?;
-        nix::fcntl::renameat2(
-            &**self.directory,
-            from,
-            &**self.directory,
-            to,
-            nix::fcntl::RenameFlags::RENAME_NOREPLACE,
-        )
-        .map_err(io::Error::from)
+        rename_noreplace_in_directory(&self.directory, from, to)
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    pub(crate) fn rename_noreplace(&self, _from: &OsStr, _to: &OsStr) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "identity-bound snapshot rename requires Linux renameat2",
+        ))
     }
 
     #[cfg(unix)]
@@ -2659,6 +2694,7 @@ impl SnapshotCleanupState {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn rename_noreplace(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
         match &self.namespace {
             Some(namespace) => namespace.rename_noreplace(from, to),
@@ -2668,16 +2704,17 @@ impl SnapshotCleanupState {
                     .parent()
                     .ok_or_else(|| invalid_data("snapshot artifact has no parent"))?;
                 let directory = std::fs::File::open(parent)?;
-                nix::fcntl::renameat2(
-                    &directory,
-                    from,
-                    &directory,
-                    to,
-                    nix::fcntl::RenameFlags::RENAME_NOREPLACE,
-                )
-                .map_err(io::Error::from)
+                rename_noreplace_in_directory(&directory, from, to)
             }
         }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn rename_noreplace(&self, _from: &OsStr, _to: &OsStr) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "identity-bound snapshot rename requires Linux renameat2",
+        ))
     }
 
     fn unlink_active(&self) -> io::Result<()> {

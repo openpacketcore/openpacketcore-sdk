@@ -10692,15 +10692,16 @@ fn wrapper_lease_procfd_contract_child() {
             );
             let final_leaf = artifact.canonical_namespace.join(&artifact.leaf);
             let replacement = pin.lease_path.clone();
+            let before_rename = || {
+                std::fs::remove_file(&replacement)
+                    .expect("remove A pathname immediately before publication");
+                std::fs::write(&replacement, b"B")
+                    .expect("install B pathname immediately before publication");
+                std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
+                    .expect("make replacement B private");
+            };
             let seams = ReleaseEvidenceWriterSeams {
-                before_rename: Some(&|| {
-                    std::fs::remove_file(&replacement)
-                        .expect("remove A pathname immediately before publication");
-                    std::fs::write(&replacement, b"B")
-                        .expect("install B pathname immediately before publication");
-                    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600))
-                        .expect("make replacement B private");
-                }),
+                before_rename: Some(&before_rename),
                 ..ReleaseEvidenceWriterSeams::default()
             };
             assert!(

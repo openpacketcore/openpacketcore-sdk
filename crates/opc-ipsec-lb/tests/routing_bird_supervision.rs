@@ -22,6 +22,7 @@ const HELPER: &str = env!("CARGO_BIN_EXE_opc-bird-supervisor");
 
 struct Fixture {
     root: PathBuf,
+    socket_root: Option<PathBuf>,
     socket: PathBuf,
     pid_file: PathBuf,
     ready_file: PathBuf,
@@ -44,7 +45,8 @@ impl Fixture {
             std::fs::Permissions::from_mode(0o700),
         )
         .unwrap();
-        let socket = root.join("bird.ctl");
+        let socket_root = create_short_socket_root(id);
+        let socket = socket_root.join("bird.ctl");
         let pid_file = root.join("bird.pid.observed");
         let ready_file = root.join("parent.ready");
         let bird_config = root.join("bird.conf");
@@ -65,6 +67,7 @@ impl Fixture {
         std::fs::set_permissions(&bird_wrapper, permissions).unwrap();
         Self {
             root,
+            socket_root: Some(socket_root),
             socket,
             pid_file,
             ready_file,
@@ -109,7 +112,30 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+        if let Some(socket_root) = &self.socket_root {
+            let _ = std::fs::remove_dir_all(socket_root);
+        }
     }
+}
+
+fn create_short_socket_root(id: u64) -> PathBuf {
+    // `temp_dir()` may be intentionally long (for example in fs-verity CI),
+    // while `sockaddr_un.sun_path` is bounded.  `/tmp` is a stable, short
+    // location on the Linux-only test platform; create_dir makes each owner-
+    // private directory collision-safe without relying on TMPDIR.
+    for attempt in 0..128 {
+        let root =
+            PathBuf::from("/tmp").join(format!("opc-bird-{}-{id}-{attempt}", std::process::id()));
+        match std::fs::create_dir(&root) {
+            Ok(()) => {
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+                return root;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create short BIRD socket test directory: {error}"),
+        }
+    }
+    panic!("exhausted short BIRD socket test directory names");
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -211,7 +237,8 @@ fn supervised_parent_entrypoint() {
         .unwrap();
     runtime.block_on(async move {
         let fixture = Fixture {
-            socket: root.join("bird.ctl"),
+            socket_root: None,
+            socket: PathBuf::from(std::env::var_os("OPC_PARENT_SOCKET").unwrap()),
             pid_file: root.join("bird.pid.observed"),
             ready_file: root.join("parent.ready"),
             bird_wrapper: root.join("fake-bird"),
@@ -506,6 +533,7 @@ async fn abrupt_service_process_death_kills_bird_without_drop() {
         .arg("supervised_parent_entrypoint")
         .arg("--nocapture")
         .env("OPC_PARENT_ROOT", &fixture.root)
+        .env("OPC_PARENT_SOCKET", &fixture.socket)
         .status()
         .unwrap();
     assert!(!status.success(), "parent harness must die by SIGKILL");

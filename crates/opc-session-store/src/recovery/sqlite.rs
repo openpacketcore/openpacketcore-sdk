@@ -5,12 +5,16 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use crate::consensus::snapshot::{rename_exchange_in_directory, rename_noreplace_in_directory};
 use hmac::Mac;
 use opc_consensus::engine::LogId;
 use opc_types::Timestamp;
 use rusqlite::backup::Backup;
 use rusqlite::types::{Value, ValueRef};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+#[cfg(target_os = "linux")]
+use rusqlite::OpenFlags;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -159,6 +163,11 @@ std::thread_local! {
     };
     static PINNED_SQLITE_SEMANTIC_OPEN_COUNT: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
+    };
+    // Models a same-inode WAL writer between the former separate legacy
+    // predecessor prepass and the descriptor-bound classification proof.
+    static LEGACY_CLASSIFICATION_BEFORE_PROOF_HOOK: std::cell::RefCell<Option<OnceHook>> = const {
+        std::cell::RefCell::new(None)
     };
 }
 
@@ -352,6 +361,22 @@ fn reset_pinned_sqlite_semantic_open_count_for_test() {
 #[cfg(test)]
 fn pinned_sqlite_semantic_open_count_for_test() -> usize {
     PINNED_SQLITE_SEMANTIC_OPEN_COUNT.with(std::cell::Cell::get)
+}
+
+/// Install the causal legacy-classification seam used to prove that no
+/// predecessor prepass can be combined with a later semantic WAL snapshot.
+#[cfg(test)]
+pub(super) fn install_legacy_classification_before_proof_hook(hook: impl FnOnce() + 'static) {
+    LEGACY_CLASSIFICATION_BEFORE_PROOF_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_legacy_classification_before_proof_hook() {
+    if let Some(hook) =
+        LEGACY_CLASSIFICATION_BEFORE_PROOF_HOOK.with(|slot| slot.borrow_mut().take())
+    {
+        hook();
+    }
 }
 
 /// Test seam for the nested target-backup snapshot directory durability
@@ -6478,7 +6503,7 @@ fn promote_pinned_file(
 /// old destination remains reachable at `temporary` and is compared to its
 /// held descriptor before the workflow can advance.  An absent destination
 /// uses `RENAME_NOREPLACE`, so a late appearance is never overwritten.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn conditional_promote_pinned_file(
     file: &PinnedSnapshotFile,
     temporary: &Path,
@@ -6486,8 +6511,6 @@ fn conditional_promote_pinned_file(
     parent: &Path,
     destination: PromotionDestination<'_>,
 ) -> Result<(), RecoveryError> {
-    use nix::fcntl::{renameat2, RenameFlags};
-
     let directory = File::open(parent).map_err(|_| RecoveryError::FileOperationFailed)?;
     let temporary_name = temporary
         .file_name()
@@ -6496,39 +6519,23 @@ fn conditional_promote_pinned_file(
         .file_name()
         .ok_or(RecoveryError::FileOperationFailed)?;
     match destination {
-        PromotionDestination::Absent => renameat2(
-            &directory,
-            temporary_name,
-            &directory,
-            promoted_name,
-            RenameFlags::RENAME_NOREPLACE,
-        )
-        .map_err(|_| RecoveryError::SourceChanged),
+        PromotionDestination::Absent => {
+            rename_noreplace_in_directory(&directory, temporary_name, promoted_name)
+                .map_err(|_| RecoveryError::SourceChanged)
+        }
         PromotionDestination::Present(expected) => {
             expected
                 .verify_path_identity(promoted)
                 .map_err(|_| RecoveryError::SourceChanged)?;
-            renameat2(
-                &directory,
-                temporary_name,
-                &directory,
-                promoted_name,
-                RenameFlags::RENAME_EXCHANGE,
-            )
-            .map_err(|_| RecoveryError::FileOperationFailed)?;
+            rename_exchange_in_directory(&directory, temporary_name, promoted_name)
+                .map_err(|_| RecoveryError::FileOperationFailed)?;
             if expected.verify_path_identity(temporary).is_err() {
                 // The exchange retained the unexpected object at
                 // `temporary`.  Best-effort rollback preserves it at the
                 // public destination rather than reporting an error after
                 // silently installing our recovery copy over a replacement.
                 if file.verify_path_identity(promoted).is_ok() {
-                    let _ = renameat2(
-                        &directory,
-                        temporary_name,
-                        &directory,
-                        promoted_name,
-                        RenameFlags::RENAME_EXCHANGE,
-                    );
+                    let _ = rename_exchange_in_directory(&directory, temporary_name, promoted_name);
                 }
                 return Err(RecoveryError::SourceChanged);
             }
@@ -6537,7 +6544,7 @@ fn conditional_promote_pinned_file(
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn conditional_promote_pinned_file(
     _file: &PinnedSnapshotFile,
     _temporary: &Path,
@@ -9551,8 +9558,10 @@ pub(super) fn legacy_finalization_predecessor(
         // The bootstrap predecessor exists only before the first V2 entry.
         // On every resume after proposal/application, current evidence has a
         // V2 suffix and therefore must be proved against this sealed capsule,
-        // not recaptured as though it were still bootstrap-only.
-        reprove_legacy_bootstrap_membership_capsule(key, plan, pins, sealed)?;
+        // not recaptured as though it were still bootstrap-only.  Do not
+        // inspect it here in a separate transaction: each later classifier
+        // proof checks this capsule inside the same WAL snapshot as its
+        // installed/finalized predicate.
         pins.legacy_predecessor = Some(sealed.clone());
         return Ok(Some(sealed.clone()));
     }
@@ -9566,17 +9575,31 @@ pub(super) fn legacy_finalization_predecessor(
     Ok(Some(observed))
 }
 
-/// A sealed legacy capsule must not become a one-time inspection result.  At
-/// every later finalize entry, use the held database descriptors to re-read
-/// the exact baseline Membership payload and compare its canonical digest.
-/// This intentionally proves physical payload identity, not merely the
-/// structurally equivalent membership scope it produces.
-fn reprove_legacy_bootstrap_membership_capsule(
-    key: &RecoveryIntegrityKey,
+/// Result of checking a sealed legacy predecessor in a descriptor-bound WAL
+/// snapshot.  Physical retention is the normal case.  A missing predecessor
+/// is admissible only after this same snapshot has authenticated the complete
+/// historical V2 terminal effect through the sealed terminal proof.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LegacyBootstrapMembershipProof {
+    Retained,
+    AuthenticatedPostTerminalCompaction,
+}
+
+/// Check the exact physical authority recorded in a sealed legacy capsule on
+/// the transaction that is about to classify the installed/finalized state.
+/// In particular, do not move this check to a prepass: another same-inode WAL
+/// writer could otherwise replace the baseline between the physical and
+/// semantic proofs.  The returned compaction exception has already proved the
+/// terminal certificate, outcome, purge, and snapshot lineage on `conn`.
+fn verify_legacy_bootstrap_membership_capsule_in_snapshot(
     plan: &RecoveryPlan,
-    pins: &mut FinalizationPins<'_>,
     predecessor: &FinalizationPredecessorCapsule,
-) -> Result<(), RecoveryError> {
+    terminal_proof: Option<&RecoveryTerminalProofV1>,
+    evidence: &RecoveryReplicaEvidence,
+    conn: &Connection,
+    limits: RecoveryLimits,
+    phase: FinalizedRecoveryV2ProofPhase,
+) -> Result<LegacyBootstrapMembershipProof, RecoveryError> {
     let legacy_bootstrap = predecessor
         .legacy_bootstrap_membership
         .as_ref()
@@ -9594,57 +9617,57 @@ fn reprove_legacy_bootstrap_membership_capsule(
                 })
         })
         .ok_or(RecoveryError::BackupCorrupt)?;
-    for pin in &mut pins.latches {
-        if pinned_file_identity(key, &pin.database)? != pin.database_identity {
+    let predecessor_kind = consensus::operator_recovery_v2_predecessor_kind_sync(
+        conn,
+        plan.body.identity,
+        &predecessor.baseline_log_id,
+    )
+    .map_err(|_| RecoveryError::BackupCorrupt)?;
+    let predecessor_matches = match predecessor_kind {
+        consensus::OperatorRecoveryV2PredecessorKind::RetainedMembership(observed) => {
+            predecessor.bootstrap_membership_digest == Some(RecoveryDigest::from_bytes(observed))
+        }
+        consensus::OperatorRecoveryV2PredecessorKind::RetainedNonMembership => {
+            predecessor.bootstrap_membership_digest.is_none()
+        }
+        consensus::OperatorRecoveryV2PredecessorKind::NotRetained => false,
+    };
+    if matches!(
+        predecessor_kind,
+        consensus::OperatorRecoveryV2PredecessorKind::NotRetained
+    ) {
+        // Physical predecessor absence is not a generic retry exception.  It
+        // is available only after terminal release, and only when this exact
+        // SQLite snapshot proves the sealed historical V2 effect that binds
+        // the capsule to its certificate, outcome, purge, and snapshot.
+        if !matches!(phase, FinalizedRecoveryV2ProofPhase::PostTerminalHistorical) {
             return Err(RecoveryError::BackupCorrupt);
         }
-        pin.database
-            .verify_path_identity(&pin.database_path)
-            .map_err(|_| RecoveryError::BackupCorrupt)?;
-        let conn = open_read_only_pinned(&pin.database)?;
-        let predecessor_kind = consensus::operator_recovery_v2_predecessor_kind_sync(
-            &conn,
-            plan.body.identity,
-            &predecessor.baseline_log_id,
-        )
-        .map_err(|_| RecoveryError::BackupCorrupt)?;
-        let predecessor_matches = match predecessor_kind {
-            consensus::OperatorRecoveryV2PredecessorKind::RetainedMembership(observed) => {
-                predecessor.bootstrap_membership_digest
-                    == Some(RecoveryDigest::from_bytes(observed))
-            }
-            consensus::OperatorRecoveryV2PredecessorKind::RetainedNonMembership => {
-                predecessor.bootstrap_membership_digest.is_none()
-            }
-            consensus::OperatorRecoveryV2PredecessorKind::NotRetained => false,
-        };
-        // Once the durable terminal proof has been sealed, the one consumed
-        // replica may legitimately compact the legacy baseline.  Defer that
-        // replica to the historical V2 proof below, which binds the exact
-        // predecessor capsule to the durable certificate, outcome, purge,
-        // and selected-snapshot lineage.  Before that proof exists, a
-        // missing physical predecessor remains fatal.
-        let compacted_after_terminal_proof = matches!(
-            predecessor_kind,
-            consensus::OperatorRecoveryV2PredecessorKind::NotRetained
-        ) && pins.terminal_proof.is_some();
-        if !predecessor_matches && !compacted_after_terminal_proof {
-            return Err(RecoveryError::BackupCorrupt);
-        }
-        if compacted_after_terminal_proof {
-            continue;
-        }
-        let observed = consensus::operator_recovery_v2_bootstrap_membership_digest_sync(
-            &conn,
-            plan.body.identity,
-            &legacy_bootstrap.log_id,
-        )
-        .map_err(|_| RecoveryError::BackupCorrupt)?;
-        if RecoveryDigest::from_bytes(observed) != legacy_bootstrap.digest {
-            return Err(RecoveryError::BackupCorrupt);
-        }
+        let terminal_proof = terminal_proof.ok_or(RecoveryError::BackupCorrupt)?;
+        verify_exact_finalized_recovery_v2(
+            plan,
+            evidence,
+            conn,
+            limits,
+            phase,
+            Some(predecessor),
+            Some(terminal_proof),
+        )?;
+        return Ok(LegacyBootstrapMembershipProof::AuthenticatedPostTerminalCompaction);
     }
-    Ok(())
+    if !predecessor_matches {
+        return Err(RecoveryError::BackupCorrupt);
+    }
+    let observed = consensus::operator_recovery_v2_bootstrap_membership_digest_sync(
+        conn,
+        plan.body.identity,
+        &legacy_bootstrap.log_id,
+    )
+    .map_err(|_| RecoveryError::BackupCorrupt)?;
+    if RecoveryDigest::from_bytes(observed) != legacy_bootstrap.digest {
+        return Err(RecoveryError::BackupCorrupt);
+    }
+    Ok(LegacyBootstrapMembershipProof::Retained)
 }
 
 fn capture_legacy_bootstrap_predecessor(
@@ -9879,13 +9902,8 @@ fn classify_finalization_pins_with_phase(
     pins: &mut FinalizationPins<'_>,
     limits: RecoveryLimits,
 ) -> Result<FinalizationTransitionState, RecoveryError> {
-    if let Some(predecessor) = pins.legacy_predecessor.as_ref().cloned() {
-        // Proposal and every later revalidation remain bound to the exact
-        // bootstrap payload captured in the fsynced capsule.  Do this before
-        // classifying installed/finalized state so a structurally equivalent
-        // Membership rewrite cannot cross the proposal boundary.
-        reprove_legacy_bootstrap_membership_capsule(key, plan, pins, &predecessor)?;
-    }
+    #[cfg(test)]
+    run_legacy_classification_before_proof_hook();
     let legacy_predecessor = pins.legacy_predecessor.clone();
     let terminal_proof = pins.terminal_proof.clone();
     // Take the raw descriptor-bound fleet observation before any semantic
@@ -9951,6 +9969,22 @@ fn classify_finalization_pins_with_phase(
                 &latch.database,
                 latch.snapshot.as_mut(),
                 |evidence, conn| {
+                    if let Some(predecessor) = legacy_predecessor.as_ref() {
+                        match verify_legacy_bootstrap_membership_capsule_in_snapshot(
+                            plan,
+                            predecessor,
+                            terminal_proof.as_ref(),
+                            evidence,
+                            conn,
+                            limits,
+                            fleet_phase,
+                        )? {
+                            LegacyBootstrapMembershipProof::Retained => {}
+                            LegacyBootstrapMembershipProof::AuthenticatedPostTerminalCompaction => {
+                                return Ok(FinalizationReplicaProof::Finalized);
+                            }
+                        }
+                    }
                     if verify_exact_finalized_recovery_v2(
                         plan,
                         evidence,
@@ -10039,6 +10073,22 @@ fn classify_finalization_pins_with_phase(
             &target.database,
             target.snapshot.as_mut(),
             |evidence, conn| {
+                if let Some(predecessor) = legacy_predecessor.as_ref() {
+                    match verify_legacy_bootstrap_membership_capsule_in_snapshot(
+                        plan,
+                        predecessor,
+                        terminal_proof.as_ref(),
+                        evidence,
+                        conn,
+                        limits,
+                        fleet_phase,
+                    )? {
+                        LegacyBootstrapMembershipProof::Retained => {}
+                        LegacyBootstrapMembershipProof::AuthenticatedPostTerminalCompaction => {
+                            return Ok(FinalizationReplicaProof::Finalized);
+                        }
+                    }
+                }
                 if verify_exact_finalized_recovery_v2(
                     plan,
                     evidence,

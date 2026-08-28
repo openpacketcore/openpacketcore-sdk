@@ -309,7 +309,7 @@ mod platform {
     // the UAPI macro and keeps this wrapper correct for every Linux target
     // libc supports.  linux-raw-sys exposes `fsuuid2` but, at the workspace
     // header baseline, not this new ioctl number on every target.
-    const FS_IOC_GETFSUUID: libc::c_ulong = libc::_IOR::<FilesystemUuid>(0x15, 0);
+    const FS_IOC_GETFSUUID: libc::Ioctl = libc::_IOR::<FilesystemUuid>(0x15, 0);
 
     impl FilesystemUuid {
         const fn requested() -> Self {
@@ -471,7 +471,7 @@ mod platform {
         let result = unsafe {
             libc::ioctl(
                 fd.as_raw_fd(),
-                libc::c_ulong::from(linux_raw_sys::ioctl::FS_IOC_ENABLE_VERITY),
+                linux_raw_sys::ioctl::FS_IOC_ENABLE_VERITY as libc::Ioctl,
                 std::ptr::from_ref(enable),
             )
         };
@@ -489,7 +489,7 @@ mod platform {
         let result = unsafe {
             libc::ioctl(
                 fd.as_raw_fd(),
-                libc::c_ulong::from(linux_raw_sys::ioctl::FS_IOC_MEASURE_VERITY),
+                linux_raw_sys::ioctl::FS_IOC_MEASURE_VERITY as libc::Ioctl,
                 std::ptr::addr_of_mut!(digest),
             )
         };
@@ -651,7 +651,7 @@ mod platform {
         let result = unsafe {
             libc::ioctl(
                 fd.as_raw_fd(),
-                libc::c_ulong::from(linux_raw_sys::ioctl::FS_IOC_READ_VERITY_METADATA),
+                linux_raw_sys::ioctl::FS_IOC_READ_VERITY_METADATA as libc::Ioctl,
                 std::ptr::addr_of_mut!(argument),
             )
         };

@@ -25,15 +25,16 @@ use rusqlite::{params, types::Value, Connection};
 use sha2::{Digest, Sha256};
 
 use super::sqlite::{
-    backup_and_reset_replica, clear_pinned_inspection_path_swap_hooks,
-    clear_target_database_after_identity_admission_hook,
+    acquire_finalization_pins, backup_and_reset_replica, classify_finalization_pins,
+    clear_pinned_inspection_path_swap_hooks, clear_target_database_after_identity_admission_hook,
     database_promotion_temporary_path_for_test, fail_next_promotion_after_rename,
     inspect_replica_with_descriptor_snapshot_proof_for_test,
-    install_pinned_inspection_path_swap_hooks, install_target_backup_snapshot_directory_sync_hook,
-    install_target_database_after_identity_admission_hook, planned_fleet_inspection_count,
-    prepare_test_workflow_with_current_snapshot, promotion_cleanup_journals_are_empty_for_test,
-    reset_planned_fleet_inspection_count, seal_plan, snapshot_promotion_temporary_path_for_test,
-    RecoveryFailpoint, ResetInput,
+    install_legacy_classification_before_proof_hook, install_pinned_inspection_path_swap_hooks,
+    install_target_backup_snapshot_directory_sync_hook,
+    install_target_database_after_identity_admission_hook, legacy_finalization_predecessor,
+    planned_fleet_inspection_count, prepare_test_workflow_with_current_snapshot,
+    promotion_cleanup_journals_are_empty_for_test, reset_planned_fleet_inspection_count, seal_plan,
+    snapshot_promotion_temporary_path_for_test, RecoveryFailpoint, ResetInput,
 };
 use super::*;
 use crate::capability::BackendCapabilities;
@@ -5688,6 +5689,209 @@ fn pinned_inspection_keeps_terminal_predicate_on_the_x_wal_snapshot() {
         inspect_current_fixture(&replica, &members),
         Err(RecoveryError::CorruptReplica),
         "a standalone inspection of Y rejects the dropped protected-roster witness"
+    );
+}
+
+/// The legacy capsule is captured from X.  Before classification can start, a
+/// same-inode WAL writer installs Y with a canonical-but-different baseline
+/// Membership while retaining the same resulting membership scope and all
+/// installed-state evidence.  Classification must reject Y rather than
+/// combining X's physical authority with Y's semantic predicate.
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_finalization_classification_rejects_x_to_y_bootstrap_membership_rewrite() {
+    use std::os::fd::AsFd as _;
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let backup = private_tempdir();
+    let ids = [
+        replica_id("legacy-classification-wal-a"),
+        replica_id("legacy-classification-wal-b"),
+        replica_id("legacy-classification-wal-c"),
+    ];
+    let replicas = vec![
+        create_legacy_replica(temp.path(), ids[0].clone(), 17),
+        create_legacy_replica(temp.path(), ids[1].clone(), 31),
+        create_legacy_replica(temp.path(), ids[2].clone(), 47),
+    ];
+    let expected_members = node_set(&ids);
+    let manager = recovery(AllowRecovery);
+    let plan = manager
+        .plan(
+            &context(),
+            identity(),
+            expected_members.clone(),
+            &replicas,
+            &ids[0],
+            &ids,
+            RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+            RecoveryLimits::default(),
+        )
+        .expect("legacy classification plan");
+    let confirmation = RecoveryConfirmation::legacy(
+        &plan,
+        RecoveryConfirmation::required_legacy_acknowledgement(),
+    );
+    assert_eq!(
+        manager
+            .execute(
+                &context(),
+                &plan,
+                &confirmation,
+                &replicas,
+                backup.path(),
+                RecoveryLimits::default(),
+            )
+            .expect("install legacy classification fixture")
+            .state(),
+        RecoveryExecutionState::AwaitingEpochCommit
+    );
+    // A live OpenRaft cluster would establish this shared initial Membership
+    // before finalization. This unit fixture has no live election, so create
+    // its exact installed baseline directly on every already-reset target.
+    let baseline_log_id = LogId::new(
+        CommittedLeaderId::new(
+            1,
+            *expected_members
+                .iter()
+                .next()
+                .expect("legacy classification leader"),
+        ),
+        0,
+    );
+    let baseline = Entry::<SessionRaftTypeConfig> {
+        log_id: baseline_log_id,
+        payload: EntryPayload::Membership(Membership::new(
+            vec![expected_members.clone()],
+            expected_members.clone(),
+        )),
+    };
+    for replica in &replicas {
+        let conn = Connection::open(&replica.database_path).expect("open installed legacy target");
+        consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&baseline))
+            .expect("append installed baseline Membership");
+        consensus::save_committed_sync(&conn, identity(), Some(baseline_log_id))
+            .expect("commit installed baseline Membership");
+        consensus::apply_entries_sync(
+            &conn,
+            identity(),
+            &BackendCapabilities::all_enabled(),
+            vec![baseline.clone()],
+        )
+        .expect("apply installed baseline Membership");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint installed baseline Membership");
+    }
+
+    let mut pins = acquire_finalization_pins(
+        &manager.integrity_key,
+        &plan,
+        &replicas,
+        backup.path(),
+        RecoveryLimits::default(),
+    )
+    .expect("pin installed legacy target");
+    let predecessor = legacy_finalization_predecessor(
+        &manager.integrity_key,
+        &plan,
+        &mut pins,
+        backup.path(),
+        RecoveryLimits::default(),
+    )
+    .expect("capture exact legacy predecessor")
+    .expect("legacy plan captures predecessor");
+    let legacy_bootstrap = predecessor
+        .legacy_bootstrap_membership
+        .as_ref()
+        .expect("captured legacy Membership");
+    let baseline_digest = legacy_bootstrap.digest;
+    let baseline_log_id = legacy_bootstrap.log_id;
+    assert_eq!(
+        classify_finalization_pins(
+            &manager.integrity_key,
+            &plan,
+            &mut pins,
+            RecoveryLimits::default(),
+        ),
+        Ok(FinalizationTransitionState::AllInstalled),
+        "X is a complete installed-state classification before the causal WAL rewrite"
+    );
+    let database = replicas[0].database_path.clone();
+    let database_before = File::open(&database).expect("open X database descriptor");
+    let inode_before = opc_fs_verity_sys::persistent_file_identity(database_before.as_fd())
+        .expect("read X persistent database identity");
+    drop(database_before);
+
+    let writer_ran = Arc::new(AtomicBool::new(false));
+    let writer_ran_hook = Arc::clone(&writer_ran);
+    install_legacy_classification_before_proof_hook(move || {
+        let writer = Connection::open(&database).expect("open same-inode Y WAL writer");
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE;")
+            .expect("begin Y WAL transaction");
+        let rewritten = Entry::<SessionRaftTypeConfig> {
+            log_id: baseline_log_id,
+            // The duplicate uniform configuration is semantically equivalent
+            // to X for the current scope, but its canonical Membership bytes
+            // deliberately produce a different authenticated digest.
+            payload: EntryPayload::Membership(Membership::new(
+                vec![expected_members.clone(), expected_members.clone()],
+                expected_members.clone(),
+            )),
+        };
+        writer
+            .execute(
+                "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+                params![
+                    serde_json::to_vec(&rewritten).expect("encode rewritten Y Membership"),
+                    i64::try_from(baseline_log_id.index).expect("baseline log index"),
+                ],
+            )
+            .expect("replace exact baseline Membership in Y");
+        writer
+            .execute_batch("COMMIT;")
+            .expect("commit Y WAL rewrite");
+        writer_ran_hook.store(true, Ordering::SeqCst);
+    });
+
+    assert_eq!(
+        classify_finalization_pins(
+            &manager.integrity_key,
+            &plan,
+            &mut pins,
+            RecoveryLimits::default(),
+        ),
+        Err(RecoveryError::BackupCorrupt),
+        "one classifier snapshot must reject Y's replacement baseline"
+    );
+    assert!(writer_ran.load(Ordering::SeqCst), "causal Y writer ran");
+
+    let database_after = File::open(&replicas[0].database_path).expect("open Y database");
+    assert_eq!(
+        opc_fs_verity_sys::persistent_file_identity(database_after.as_fd())
+            .expect("read Y persistent database identity"),
+        inode_before,
+        "the adversary wrote the pinned inode through WAL rather than replacing its pathname"
+    );
+    drop(database_after);
+    let y = Connection::open(&replicas[0].database_path).expect("open Y database connection");
+    let y_digest = consensus::operator_recovery_v2_bootstrap_membership_digest_sync(
+        &y,
+        identity(),
+        &baseline_log_id,
+    )
+    .expect("read Y Membership digest");
+    assert_ne!(
+        RecoveryDigest::from_bytes(y_digest),
+        baseline_digest,
+        "Y retains a valid membership scope but changes the exact capsule payload"
+    );
+    drop(y);
+    assert_eq!(
+        resume_execution_state(&manager.integrity_key, &plan, backup.path())
+            .expect("read rejected legacy workflow"),
+        RecoveryExecutionState::AwaitingEpochCommit,
+        "rejected classification cannot advance the workflow"
     );
 }
 

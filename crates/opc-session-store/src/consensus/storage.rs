@@ -23,6 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::raft_adapter::{SessionRaftAdapterError, SessionRaftPeerDirectory};
 #[cfg(target_os = "linux")]
+use super::snapshot::rename_noreplace_in_directory;
+#[cfg(target_os = "linux")]
 use super::snapshot::snapshot_cleanup_unlink_guard_name_authenticates_metadata;
 use super::snapshot::{
     acknowledge_unpublished_snapshot_cleanup_failure,
@@ -289,7 +291,7 @@ async fn wait_snapshot_database_lease_admission_barrier() {
 /// shared with queued cleanup authority, so a detached D1 continues to block
 /// a fresh process from publishing D2 under either the same key or the same
 /// durable database before D1 is acknowledged.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn bind_snapshot_directory_socket(configured_path: &Path) -> io::Result<Arc<std::os::fd::OwnedFd>> {
     use nix::sys::socket::{bind, socket, AddressFamily, SockFlag, SockType, UnixAddr};
     use std::os::fd::AsRawFd as _;
@@ -309,6 +311,16 @@ fn bind_snapshot_directory_socket(configured_path: &Path) -> io::Result<Arc<std:
     let address = UnixAddr::new_abstract(&name).map_err(io::Error::from)?;
     bind(socket.as_raw_fd(), &address).map_err(io::Error::from)?;
     Ok(Arc::new(socket))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bind_snapshot_directory_socket(
+    _configured_path: &Path,
+) -> io::Result<Arc<std::os::fd::OwnedFd>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "session consensus snapshot directory lease requires Linux abstract Unix sockets",
+    ))
 }
 
 async fn acquire_snapshot_directory_lease(
@@ -517,37 +529,43 @@ async fn acquire_snapshot_directory_lease(
     let mut database_leases = snapshot_database_leases()
         .lock()
         .map_err(|_| io::Error::other("snapshot database lease lock poisoned"))?;
-    if database_leases
-        .get(&database_identity)
-        .and_then(std::sync::Weak::upgrade)
-        .is_some()
+    #[cfg(target_os = "linux")]
     {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "session consensus database already owns a snapshot namespace",
-        ));
-    }
-    let lock = match lease
-        .namespace
-        .trusted_database_lock_for_identity((database_identity.device, database_identity.inode))?
-    {
-        Some(lock) => lock,
-        None => {
-            let lock = Arc::new(
-                nix::fcntl::Flock::lock(database_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-                    .map_err(|(_, error)| io::Error::from(error))?,
-            );
-            lease.namespace.install_trusted_database_lock(
-                (database_identity.device, database_identity.inode),
-                Arc::clone(&lock),
-            )?;
-            lock
+        if database_leases
+            .get(&database_identity)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "session consensus database already owns a snapshot namespace",
+            ));
         }
-    };
-    Arc::get_mut(&mut lease)
-        .expect("database lease is unshared before registry insertion")
-        ._database_lock = Some(lock);
-    database_leases.insert(database_identity, Arc::downgrade(&lease));
+        let lock = match lease.namespace.trusted_database_lock_for_identity((
+            database_identity.device,
+            database_identity.inode,
+        ))? {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(
+                    nix::fcntl::Flock::lock(
+                        database_file,
+                        nix::fcntl::FlockArg::LockExclusiveNonblock,
+                    )
+                    .map_err(|(_, error)| io::Error::from(error))?,
+                );
+                lease.namespace.install_trusted_database_lock(
+                    (database_identity.device, database_identity.inode),
+                    Arc::clone(&lock),
+                )?;
+                lock
+            }
+        };
+        Arc::get_mut(&mut lease)
+            .expect("database lease is unshared before registry insertion")
+            ._database_lock = Some(lock);
+        database_leases.insert(database_identity, Arc::downgrade(&lease));
+    }
 
     #[cfg(all(unix, not(target_os = "linux")))]
     let lease = {
@@ -1211,10 +1229,8 @@ fn remove_identity_bound_snapshot_artifact(
             uuid::Uuid::new_v4()
         ));
         snapshot_artifact_cleanup_before_rename(&cleanup.original, &tombstone)?;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
-            use nix::fcntl::{renameat2, RenameFlags};
-
             if let Some(namespace) = namespace {
                 namespace.rename_noreplace(
                     file_name,
@@ -1227,29 +1243,26 @@ fn remove_identity_bound_snapshot_artifact(
                 )?;
             } else {
                 let directory = std::fs::File::open(parent)?;
-                renameat2(
+                rename_noreplace_in_directory(
                     &directory,
                     file_name,
-                    &directory,
                     tombstone.file_name().ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "snapshot tombstone has no name",
                         )
                     })?,
-                    RenameFlags::RENAME_NOREPLACE,
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
+            // No fallible operation may occur between rename and this
+            // transition: retries and Drop must target the exact tombstone.
+            cleanup.location = SnapshotArtifactCleanupLocation::Tombstone(tombstone);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "identity-bound snapshot cleanup requires Unix",
+            "identity-bound snapshot cleanup requires Linux renameat2",
         ));
-        // No fallible operation may occur between rename and this transition:
-        // retries and Drop must target the exact tombstone.
-        cleanup.location = SnapshotArtifactCleanupLocation::Tombstone(tombstone);
     }
     if !matches!(
         cleanup.location,
@@ -1275,10 +1288,8 @@ fn remove_identity_bound_snapshot_artifact(
         };
         if snapshot_artifact_identity(&tombstone_file.metadata()?)? != expected {
             drop(tombstone_file);
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             {
-                use nix::fcntl::{renameat2, RenameFlags};
-
                 let restored = match namespace {
                     Some(namespace) => namespace
                         .rename_noreplace(
@@ -1299,7 +1310,7 @@ fn remove_identity_bound_snapshot_artifact(
                             )
                         })?;
                         let directory = std::fs::File::open(parent)?;
-                        renameat2(
+                        rename_noreplace_in_directory(
                             &directory,
                             tombstone.file_name().ok_or_else(|| {
                                 io::Error::new(
@@ -1307,9 +1318,7 @@ fn remove_identity_bound_snapshot_artifact(
                                     "snapshot tombstone has no name",
                                 )
                             })?,
-                            &directory,
                             file_name,
-                            RenameFlags::RENAME_NOREPLACE,
                         )
                         .is_ok()
                     }
