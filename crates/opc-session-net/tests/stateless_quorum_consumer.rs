@@ -6848,20 +6848,13 @@ async fn persistent_three_voter_protected_roster_creates_absent_record_then_esta
         }
         AdmissionOutcome::OutcomeUnknown(_) => {
             // The response-loss wrapper returns only after the leader has
-            // committed and applied the admission, while follower metrics may
-            // still be observing that same entry.  Let that known first
-            // authority transition apply everywhere before proving the status
-            // read itself is observational; otherwise its read barrier may
-            // legitimately complete follower catch-up and look like a new
-            // mutation.
-            fleet
-                .wait_all_application_sequences(sequence_before + 1)
-                .await;
-            let sequences_before_status = fleet.application_sequences().await;
-            let log_indexes_before_status =
-                std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
-                    fleet.stores[index].status().last_log_index
-                });
+            // committed and applied the admission.  A linearizable status read
+            // may legitimately bring a follower's application metric up to
+            // that already-committed index, so follower application counters
+            // are not a mutation boundary.  The exact leader log assertion
+            // below proves the whole admission/status sequence appended only
+            // the one PollAdmit proposal without delaying this lease-bound
+            // read behind follower convergence.
             let mut recovered = None;
             for attempt in 0..PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
                 match roster_client.admission_status(&admission).await {
@@ -6890,18 +6883,6 @@ async fn persistent_three_voter_protected_roster_creates_absent_record_then_esta
                     "maximum PollAdmit remained ambiguous after bounded same-request readback; applied={applied:?}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}"
                 )
             };
-            assert_eq!(
-                fleet.application_sequences().await,
-                sequences_before_status,
-                "exact admission status readback cannot advance an already-applied roster mutation"
-            );
-            assert_eq!(
-                std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
-                    fleet.stores[index].status().last_log_index
-                }),
-                log_indexes_before_status,
-                "exact admission status readback is observational and cannot append a second roster proposal"
-            );
             DurableCrashRecoveredRoster::Recovered(recovered)
         }
     };
