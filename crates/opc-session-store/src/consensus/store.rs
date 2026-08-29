@@ -2183,9 +2183,17 @@ impl Drop for RaftShutdownHoldForTest {
 /// preserves the production proposal-admission lifetime while making the
 /// caller-visible receiver result deterministic.
 #[cfg(test)]
-#[derive(Clone, Copy)]
+#[derive(Default)]
+struct AcceptedClientWriteReceiverHoldForTest {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 enum AcceptedClientWriteReceiverTestOutcome {
     ForwardToLeader,
+    HoldUntilReleased(Arc<AcceptedClientWriteReceiverHoldForTest>),
 }
 
 /// One bounded status response awaiting a shared exact-scope acceptance read.
@@ -7903,9 +7911,8 @@ impl ConsensusSessionStore {
                 ForwardMutationReply::NotLeader { leader } => {
                     ForwardMutationReply::NotLeader { leader }
                 }
-                ForwardMutationReply::Unavailable | ForwardMutationReply::OutcomeUnknown => {
-                    ForwardMutationReply::Unavailable
-                }
+                ForwardMutationReply::Unavailable => ForwardMutationReply::Unavailable,
+                ForwardMutationReply::OutcomeUnknown => ForwardMutationReply::OutcomeUnknown,
                 ForwardMutationReply::RecordExpiryPreflight(_)
                 | ForwardMutationReply::FencedTransitionActivation(_) => {
                     ForwardMutationReply::Unavailable
@@ -8095,22 +8102,14 @@ impl ConsensusSessionStore {
                 }
             };
         #[cfg(test)]
-        let accepted_receiver_test_error = self
+        let accepted_receiver_test_outcome = self
             .inner
             .accepted_receiver_test_outcomes
             .lock()
             .expect("accepted receiver test outcomes lock")
-            .pop_front()
-            .map(|outcome| match outcome {
-                AcceptedClientWriteReceiverTestOutcome::ForwardToLeader => {
-                    ClientWriteError::ForwardToLeader(
-                        opc_consensus::engine::error::ForwardToLeader::new(
-                            self.inner.local_node_id,
-                            EmptyNode::new(),
-                        ),
-                    )
-                }
-            });
+            .pop_front();
+        #[cfg(test)]
+        let accepted_receiver_test_local_node_id = self.inner.local_node_id;
         // A detached supervisor owns the proposal permit until Openraft
         // resolves the receiver, so caller cancellation, peer EOF, or a
         // response deadline cannot admit an unbounded queue of detached
@@ -8118,29 +8117,46 @@ impl ConsensusSessionStore {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             #[cfg(test)]
-            if let Some(error) = accepted_receiver_test_error {
-                // The test replaces only the receiver's observable result.
-                // Keep the actual accepted receiver supervised exactly as in
-                // production, including its proposal-admission lifetime.
-                let injected_observation = roster_response_observation.clone();
-                tokio::spawn(async move {
-                    if matches!(response.await, Ok(Ok(_))) {
-                        if let Some((diagnostics, terminal, started)) = injected_observation {
-                            diagnostics.observe_protected_roster_proposal_to_applied_response(
-                                terminal,
-                                false,
-                                started.elapsed(),
-                            );
-                        }
+            if let Some(outcome) = accepted_receiver_test_outcome {
+                match outcome {
+                    AcceptedClientWriteReceiverTestOutcome::ForwardToLeader => {
+                        let error = ClientWriteError::ForwardToLeader(
+                            opc_consensus::engine::error::ForwardToLeader::new(
+                                accepted_receiver_test_local_node_id,
+                                EmptyNode::new(),
+                            ),
+                        );
+                        // The test replaces only the receiver's observable
+                        // result. Keep the actual accepted receiver supervised
+                        // exactly as in production, including its
+                        // proposal-admission lifetime.
+                        let injected_observation = roster_response_observation.clone();
+                        tokio::spawn(async move {
+                            if matches!(response.await, Ok(Ok(_))) {
+                                if let Some((diagnostics, terminal, started)) = injected_observation
+                                {
+                                    diagnostics
+                                        .observe_protected_roster_proposal_to_applied_response(
+                                            terminal,
+                                            false,
+                                            started.elapsed(),
+                                        );
+                                }
+                            }
+                            drop(proposal_permit);
+                            drop(operation_guard);
+                        });
+                        let _ = completion_tx.send(client_write_receiver_error_reply(
+                            error,
+                            reroute_receiver_forward_to_leader,
+                        ));
+                        return;
                     }
-                    drop(proposal_permit);
-                    drop(operation_guard);
-                });
-                let _ = completion_tx.send(client_write_receiver_error_reply(
-                    error,
-                    reroute_receiver_forward_to_leader,
-                ));
-                return;
+                    AcceptedClientWriteReceiverTestOutcome::HoldUntilReleased(hold) => {
+                        hold.entered.notify_one();
+                        hold.release.notified().await;
+                    }
+                }
             }
             let (reply, applied_observation) = match response.await {
                 Err(_) => (ForwardMutationReply::OutcomeUnknown, None),
@@ -9654,9 +9670,12 @@ fn mutation_requires_exact_status_resolution(request: &ForwardMutationRequest) -
         || matches!(
             &request.intent,
             SessionMutationIntent::FencedTransition(_)
+                | SessionMutationIntent::ActivateFencedTransition { .. }
                 | SessionMutationIntent::PreflightFencedTransitionCapability
                 | SessionMutationIntent::PreflightProtectedRosterProfile
+                | SessionMutationIntent::PreflightProtectedRosterProfileV2
                 | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
+                | SessionMutationIntent::ActivateProtectedRosterProfileV2 { .. }
                 | SessionMutationIntent::FencedTransitionV2(_)
                 | SessionMutationIntent::FencedTransitionV2Batch(_)
                 | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
@@ -17526,6 +17545,29 @@ mod membership_tests {
         );
     }
 
+    fn v1_test_request(request_id: u8) -> FencedTransitionRequest {
+        let key = SessionKey {
+            tenant: TenantId::new("accepted-v1-transition").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"accepted-v1-transition")
+                .try_into()
+                .expect("stable ID"),
+        };
+        FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([request_id; 16]),
+            FencedTransitionLease::acquire(
+                key,
+                OwnerId::new("accepted-v1-transition-owner").expect("owner"),
+                FenceToken::new(0),
+                Duration::from_secs(60),
+            )
+            .expect("lease action"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("V1 transition request")
+    }
+
     fn v2_test_request(epoch: u64) -> FencedTransitionV2Request {
         let key = SessionKey {
             tenant: TenantId::new("fenced-v2-request-binding").expect("tenant"),
@@ -17574,16 +17616,34 @@ mod membership_tests {
     }
 
     #[test]
-    fn roster_mutations_require_exact_status_resolution_without_consumer_scope() {
+    fn protected_mutations_require_exact_status_resolution_without_consumer_scope() {
         let admission = roster_response_admission();
         let authority = roster_response_authority(&admission);
-        let mutations = [
+        let profile_v2 = crate::fenced_mutation_roster::Profile::v2();
+        let mutations = vec![
             SessionMutationIntent::RosterAdmission(Box::new(
                 roster_response_production_admission_command(admission.clone(), authority.clone()),
             )),
             SessionMutationIntent::RosterTerminal(Box::new(roster_response_terminal_command(
                 &admission, authority,
             ))),
+            SessionMutationIntent::PreflightProtectedRosterProfileV2,
+            SessionMutationIntent::ActivateFencedTransition {
+                request: Box::new(v1_test_request(0x53)),
+                scope_identity: singleton_topology()
+                    .consensus_identity()
+                    .expect("singleton consensus identity"),
+                voter_set_digest: [0x40; 32],
+            },
+            SessionMutationIntent::ActivateProtectedRosterProfileV2 {
+                schema_version: profile_v2.schema(),
+                consumer_revision: profile_v2.consumer_revision(),
+                scope_identity: singleton_topology()
+                    .consensus_identity()
+                    .expect("singleton consensus identity"),
+                voter_set_digest: [0x41; 32],
+                profile_digest: profile_v2.digest(),
+            },
         ];
 
         for intent in mutations {
@@ -17594,7 +17654,7 @@ mod membership_tests {
             };
             assert!(
                 mutation_requires_exact_status_resolution(&request),
-                "protected roster mutations must not reroute after transport ambiguity"
+                "protected mutations must not reroute after transport ambiguity"
             );
         }
     }
@@ -17752,6 +17812,228 @@ mod membership_tests {
             Some(before + 1),
             "the accepted batch receiver error cannot reroute or repropose"
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_receiver_unknown_is_terminal_for_first_v1_transition() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("accepted V1 transition directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("accepted V1 transition backend");
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open accepted V1 transition store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize accepted V1 transition store");
+
+        let request = v1_test_request(0x54);
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        store.inject_accepted_client_write_receiver_outcome(
+            AcceptedClientWriteReceiverTestOutcome::ForwardToLeader,
+        );
+        assert_eq!(
+            store.fenced_transition(request.clone()).await,
+            Err(StoreError::FencedTransitionOutcomeUnknown),
+            "an accepted first V1 transition is ambiguous and must never be rerouted in-invocation"
+        );
+        wait_for_log_index_after(&store, before, "accepted first V1 transition proposal").await;
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "the accepted first V1 transition must append exactly once"
+        );
+        assert!(matches!(
+            store.fenced_transition_status(&request).await,
+            Ok(FencedTransitionStatus::Recorded(result))
+                if result.as_ref() == &Err(StoreError::CasConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_receiver_unknown_is_terminal_for_all_capability_activations() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("activation receiver effect directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("activation receiver effect backend");
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open activation receiver effect store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize activation receiver effect store");
+
+        for (label, activation) in [
+            (
+                "fenced transition V1",
+                CapabilityActivationKind::FencedTransitionV1,
+            ),
+            (
+                "protected roster V1",
+                CapabilityActivationKind::ProtectedRosterV1,
+            ),
+            (
+                "protected roster V2",
+                CapabilityActivationKind::ProtectedRosterV2,
+            ),
+        ] {
+            let before = store
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_log_index
+                .unwrap_or(0);
+            store.inject_accepted_client_write_receiver_outcome(
+                AcceptedClientWriteReceiverTestOutcome::ForwardToLeader,
+            );
+            let result = match activation {
+                CapabilityActivationKind::FencedTransitionV1 => {
+                    store.activate_fenced_transition_capability().await
+                }
+                CapabilityActivationKind::ProtectedRosterV1 => {
+                    store.activate_protected_roster_profile().await
+                }
+                CapabilityActivationKind::ProtectedRosterV2 => {
+                    store.activate_protected_roster_profile_v2().await
+                }
+            };
+            wait_for_log_index_after(&store, before, "accepted activation receiver proposal").await;
+            assert_eq!(
+                store.inner.raft.metrics().borrow().last_log_index,
+                Some(before + 1),
+                "{label} must append exactly one proposal after an accepted receiver becomes ambiguous"
+            );
+            assert_eq!(
+                result,
+                Err(consensus_unavailable()),
+                "{label} must terminate this invocation after an accepted receiver becomes ambiguous"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_receiver_deadline_is_terminal_for_all_capability_activations() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("deadline activation receiver directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("deadline activation receiver backend");
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open deadline activation receiver store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize deadline activation receiver store");
+
+        for (label, activation) in [
+            (
+                "fenced transition V1",
+                CapabilityActivationKind::FencedTransitionV1,
+            ),
+            (
+                "protected roster V1",
+                CapabilityActivationKind::ProtectedRosterV1,
+            ),
+            (
+                "protected roster V2",
+                CapabilityActivationKind::ProtectedRosterV2,
+            ),
+        ] {
+            let before = store
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_log_index
+                .unwrap_or(0);
+            let hold = Arc::new(AcceptedClientWriteReceiverHoldForTest::default());
+            store.inject_accepted_client_write_receiver_outcome(
+                AcceptedClientWriteReceiverTestOutcome::HoldUntilReleased(Arc::clone(&hold)),
+            );
+            let entered = hold.entered.notified();
+            tokio::pin!(entered);
+            let activation_call = async {
+                match activation {
+                    CapabilityActivationKind::FencedTransitionV1 => {
+                        store.activate_fenced_transition_capability().await
+                    }
+                    CapabilityActivationKind::ProtectedRosterV1 => {
+                        store.activate_protected_roster_profile().await
+                    }
+                    CapabilityActivationKind::ProtectedRosterV2 => {
+                        store.activate_protected_roster_profile_v2().await
+                    }
+                }
+            };
+            tokio::pin!(activation_call);
+            tokio::select! {
+                () = &mut entered => {}
+                result = &mut activation_call => {
+                    panic!("{label} completed before reaching the accepted receiver hold: {result:?}");
+                }
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut activation_call).await;
+            hold.release.notify_one();
+            assert_eq!(
+                result.unwrap_or_else(|_| panic!("{label} did not honor its caller deadline")),
+                Err(consensus_unavailable()),
+                "{label} must classify a passed post-acceptance deadline as terminal ambiguity"
+            );
+            wait_for_log_index_after(&store, before, "deadline activation receiver proposal").await;
+            assert_eq!(
+                store.inner.raft.metrics().borrow().last_log_index,
+                Some(before + 1),
+                "{label} must append exactly once across the passed receiver deadline"
+            );
+
+            let resolved = match activation {
+                CapabilityActivationKind::FencedTransitionV1 => {
+                    store.activate_fenced_transition_capability().await
+                }
+                CapabilityActivationKind::ProtectedRosterV1 => {
+                    store.activate_protected_roster_profile().await
+                }
+                CapabilityActivationKind::ProtectedRosterV2 => {
+                    store.activate_protected_roster_profile_v2().await
+                }
+            };
+            assert_eq!(resolved, Ok(()), "{label} exact durable status resolves");
+            assert_eq!(
+                store.inner.raft.metrics().borrow().last_log_index,
+                Some(before + 1),
+                "{label} status resolution must not propose again"
+            );
+        }
     }
 
     #[tokio::test]
