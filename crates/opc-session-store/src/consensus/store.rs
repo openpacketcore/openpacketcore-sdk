@@ -6627,6 +6627,23 @@ impl ConsensusSessionStore {
             {
                 return ConsensusSubmissionEffect::NotTransmitted(error);
             }
+            // A fixed replica's durable recovery latch is local authority.
+            // Before this replica can forward an ordinary mutation, bind its
+            // initial authority observation to a fresh quorum barrier and
+            // re-read that latch. Otherwise a latch published while route
+            // discovery/read-index is in flight could leave the remote leader
+            // free to propose on this replica's behalf.
+            if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum {
+                if self.linearizable_barrier_before(deadline).await.is_err() {
+                    return ConsensusSubmissionEffect::NotTransmitted(consensus_unavailable());
+                }
+                if let Err(error) = self
+                    .require_application_traffic_authority_before(deadline)
+                    .await
+                {
+                    return ConsensusSubmissionEffect::NotTransmitted(error);
+                }
+            }
         }
         let request = ForwardMutationRequest {
             request_id,
@@ -14693,6 +14710,12 @@ impl SessionLeaseManager for ConsensusSessionStore {
 
 #[cfg(test)]
 mod membership_tests {
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    use std::fs;
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    use std::os::fd::AsRawFd;
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    use std::os::unix::fs::PermissionsExt;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -15828,6 +15851,40 @@ mod membership_tests {
                 })
             })
             .collect()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    #[tokio::test]
+    async fn fixed_store_admits_an_inherited_procfd_snapshot_leaf() {
+        let workspace = tempfile::tempdir().expect("create procfd snapshot workspace");
+        let snapshots = workspace.path().join("snapshots");
+        fs::create_dir(&snapshots).expect("create private procfd snapshot leaf");
+        fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o700))
+            .expect("make procfd snapshot leaf owner-private");
+        let snapshot_fd = nix::fcntl::open(
+            &snapshots,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .expect("open no-follow inherited snapshot leaf");
+        let snapshot_path = PathBuf::from(format!("/proc/self/fd/{}/", snapshot_fd.as_raw_fd()));
+        let topology = fixed_shutdown_topology();
+        let store = ConsensusSessionStore::open_fixed_durable_quorum(
+            topology.clone(),
+            SqliteSessionBackend::open(workspace.path().join("store.sqlite"))
+                .expect("open procfd fixed-store backend"),
+            snapshot_path,
+            unavailable_fixed_shutdown_peers(&topology),
+        )
+        .await
+        .expect("full fixed-store admission through inherited procfd snapshot leaf");
+        store
+            .shutdown()
+            .await
+            .expect("shutdown procfd fixed-store admission");
     }
 
     #[cfg(all(target_os = "linux", feature = "test-vfs"))]

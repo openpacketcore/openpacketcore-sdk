@@ -3249,9 +3249,10 @@ impl PinnedV9SnapshotNamespace {
 
 /// One fixed V9 snapshot leaf. The parent retains this descriptor for the
 /// whole campaign and lends it to the corresponding child only across exec.
-/// All later child store admission starts from `/proc/self/fd/<n>/.`, never
-/// from the JSON pathname. The final dot preserves store-side O_NOFOLLOW while
-/// traversing the pinned descriptor as an intermediate component.
+/// All later child store admission starts from `/proc/self/fd/<n>/`, never
+/// from the JSON pathname. The trailing separator preserves store-side
+/// O_NOFOLLOW while traversing the pinned descriptor as an intermediate
+/// component, including after the store normalizes the absolute spelling.
 struct PinnedV9SnapshotLeaf {
     path: PathBuf,
     descriptor: OwnedFd,
@@ -11481,7 +11482,7 @@ fn v9_snapshot_campaign_and_leaf_are_private_and_descriptor_pinned_across_replac
     );
     let restarted = open(
         PathBuf::from(format!(
-            "/proc/self/fd/{}/.",
+            "/proc/self/fd/{}/",
             leaf.inherited_descriptor().as_raw_fd()
         )),
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,

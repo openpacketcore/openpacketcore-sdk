@@ -14303,6 +14303,34 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn snapshot_directory_lease_admits_a_procfd_pinned_directory() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = tempfile::tempdir().expect("create procfd snapshot workspace");
+        let snapshots = workspace.path().join("snapshots");
+        std::fs::create_dir(&snapshots).expect("create procfd snapshot leaf");
+        std::fs::set_permissions(&snapshots, std::fs::Permissions::from_mode(0o700))
+            .expect("make procfd snapshot leaf private");
+        let snapshot_fd = nix::fcntl::open(
+            &snapshots,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .expect("open pinned procfd snapshot leaf");
+        let procfd_path = PathBuf::from(format!("/proc/self/fd/{}/", snapshot_fd.as_raw_fd()));
+        let backend = SqliteSessionBackend::open(workspace.path().join("sessions.sqlite"))
+            .expect("open procfd snapshot backend");
+        acquire_snapshot_directory_lease(&backend, &procfd_path)
+            .await
+            .expect("admit inherited procfd snapshot leaf through the complete lease path");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn retained_namespace_owner_receives_and_builds_in_detached_directory_after_replacement()
     {
         let directory = tempfile::tempdir().expect("replaced namespace directory");

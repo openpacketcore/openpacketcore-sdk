@@ -5208,13 +5208,14 @@ fn pinned_v9_snapshot_leaf_directory(
     {
         return Err(NodeFailure);
     }
-    // Store admission keeps O_NOFOLLOW.  On Linux that rejects the procfs
-    // magic link itself, so make `.` the final component: the descriptor magic
-    // link is traversed as an intermediate component and the final directory
-    // is still the exact inherited object. Its own retained namespace
-    // descriptor then remains the sole authority for every snapshot child
-    // operation.
-    Ok(descriptor_path.join("."))
+    // Store admission keeps O_NOFOLLOW. On Linux that rejects the procfs
+    // magic link when it is final, so retain a trailing separator: it makes
+    // the descriptor magic link an intermediate component while preserving
+    // the exact inherited directory object. Unlike a terminal `/.`, this
+    // spelling survives `std::path::absolute` inside full store admission.
+    // Its retained namespace descriptor then remains the sole authority for
+    // every snapshot child operation.
+    Ok(PathBuf::from(format!("/proc/self/fd/{raw_fd}/")))
 }
 
 #[cfg(not(unix))]
@@ -6108,7 +6109,7 @@ mod tests {
         assert_eq!(
             pinned_v9_snapshot_leaf_directory(&leaf, &root)
                 .expect("accept descriptor-pinned private direct child"),
-            PathBuf::from(format!("/proc/self/fd/{}/.", leaf_fd.as_raw_fd()))
+            PathBuf::from(format!("/proc/self/fd/{}/", leaf_fd.as_raw_fd()))
         );
 
         // The old descriptor remains live across this same-UID pathname swap;
@@ -6124,7 +6125,7 @@ mod tests {
             "a same-UID leaf replacement between validation and store use must fail closed"
         );
         let restarted = open(
-            PathBuf::from(format!("/proc/self/fd/{}/.", leaf_fd.as_raw_fd())),
+            PathBuf::from(format!("/proc/self/fd/{}/", leaf_fd.as_raw_fd())),
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
