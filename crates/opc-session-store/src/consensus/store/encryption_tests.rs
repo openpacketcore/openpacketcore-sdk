@@ -20,8 +20,8 @@ use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
 use super::{ConsensusSessionStore, SessionConsensusStatus};
 use crate::backend::{
-    CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, RemoteSealingSessionBackend,
-    SessionBackend, SessionOp,
+    CompareAndSet, CompareAndSetResult, EncryptingSessionBackend, RecordExpiryPreflight,
+    RemoteSealingSessionBackend, SessionBackend, SessionOp,
 };
 use crate::consensus::{
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
@@ -41,6 +41,7 @@ use crate::model::{
 };
 use crate::record::{EncryptedSessionPayload, SessionPayloadEncoding, StoredSessionRecord};
 use crate::restore::RestoreScanRequest;
+use crate::sqlite::consensus::{ensure_operator_recovery_latch_sync, OperatorRecoveryLatch};
 use crate::sqlite::SqliteSessionBackend;
 use crate::topology::{
     QuorumReplicaDescriptor, QuorumTopologyConfig, ReplicaBackingIdentity, ReplicaEndpoint,
@@ -1292,6 +1293,206 @@ impl RemoteRotationCluster {
                 .expect("shut down remote rotation member after retiring ingress");
         }
     }
+}
+
+fn finite_remote_forward_preflight() -> RecordExpiryPreflight {
+    let expires_at = Timestamp::from_offset_datetime(
+        Timestamp::now_utc()
+            .as_offset_datetime()
+            .checked_add(time::Duration::seconds(30))
+            .expect("finite preflight expiry"),
+    );
+    RecordExpiryPreflight::from_record(&StoredSessionRecord {
+        key: key(b"remote-forward-recovery-preflight"),
+        generation: Generation::new(1),
+        owner: OwnerId::new("remote-forward-recovery-owner").expect("owner"),
+        fence: FenceToken::new(1),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: StateType::from_static("remote-forward-recovery"),
+        expires_at: Some(expires_at),
+        payload: EncryptedSessionPayload::new(b"preflight-only"),
+    })
+}
+
+#[tokio::test]
+async fn capability_activation_follower_recovery_after_route_discovery_is_not_transmitted() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let cluster = RemoteRotationCluster::start().await;
+    let leader = cluster.current_leader();
+    let follower = (0..REMOTE_ROTATION_MEMBER_COUNT)
+        .find(|member| *member != leader)
+        .expect("three-member cluster has a follower");
+    let follower_store = cluster.stores[follower].clone();
+    let leader_store = cluster.stores[leader].clone();
+    let log_before = leader_store.inner.raft.metrics().borrow().last_log_index;
+    follower_store
+        .inner
+        .terminal_recovery_gate_checks
+        .store(0, Ordering::SeqCst);
+    follower_store
+        .inner
+        .remote_forward_attempts
+        .store(0, Ordering::SeqCst);
+    let hold = follower_store.hold_remote_forward_before_authority_for_test();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let submission = tokio::spawn({
+        let follower_store = follower_store.clone();
+        async move {
+            follower_store
+                .activate_fenced_transition_capability_before(deadline)
+                .await
+        }
+    });
+
+    hold.gate.wait_until_entered().await;
+    assert_eq!(
+        follower_store
+            .inner
+            .remote_forward_attempts
+            .load(Ordering::SeqCst),
+        0,
+        "the test hold is before the follower's first remote mutation attempt"
+    );
+    ensure_operator_recovery_latch_sync(
+        &cluster
+            .directory
+            .path()
+            .join(format!("node-{follower}.sqlite")),
+        OperatorRecoveryLatch {
+            identity: follower_store.inner.storage_identity,
+            recovery_epoch: 1,
+            plan_digest: [0xC1; 32],
+            audit_pending: false,
+        },
+    )
+    .expect("assert follower recovery latch after route discovery");
+    drop(hold);
+
+    assert!(matches!(
+        submission.await.expect("activation task"),
+        Err(crate::StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(
+        follower_store
+            .inner
+            .remote_forward_attempts
+            .load(Ordering::SeqCst),
+        0,
+        "a recovery-latched follower must not transmit capability activation"
+    );
+    assert_eq!(
+        leader_store.inner.raft.metrics().borrow().last_log_index,
+        log_before,
+        "the healthy leader receives no activation effect"
+    );
+    assert_eq!(
+        follower_store
+            .inner
+            .terminal_recovery_gate_checks
+            .load(Ordering::SeqCst),
+        2,
+        "activation performs its initial and just-in-time source recovery checks"
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn finite_expiry_preflight_follower_recovery_after_route_discovery_is_not_transmitted() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let cluster = RemoteRotationCluster::start().await;
+    let leader = cluster.current_leader();
+    let follower = (0..REMOTE_ROTATION_MEMBER_COUNT)
+        .find(|member| *member != leader)
+        .expect("three-member cluster has a follower");
+    let follower_store = cluster.stores[follower].clone();
+    let leader_store = cluster.stores[leader].clone();
+    let log_before = leader_store.inner.raft.metrics().borrow().last_log_index;
+    let logical_time_before = leader_store
+        .inner
+        .backend
+        .consensus_logical_time(leader_store.inner.storage_identity)
+        .await
+        .expect("leader logical time before preflight");
+    follower_store
+        .inner
+        .terminal_recovery_gate_checks
+        .store(0, Ordering::SeqCst);
+    follower_store
+        .inner
+        .remote_forward_attempts
+        .store(0, Ordering::SeqCst);
+    let hold = follower_store.hold_remote_forward_before_authority_for_test();
+    let preflight = finite_remote_forward_preflight();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let submission = tokio::spawn({
+        let follower_store = follower_store.clone();
+        async move {
+            follower_store
+                .preflight_record_expiry_before(&[preflight], None, deadline)
+                .await
+        }
+    });
+
+    hold.gate.wait_until_entered().await;
+    assert_eq!(
+        follower_store
+            .inner
+            .remote_forward_attempts
+            .load(Ordering::SeqCst),
+        0,
+        "the test hold is before the follower's first expiry-preflight attempt"
+    );
+    ensure_operator_recovery_latch_sync(
+        &cluster
+            .directory
+            .path()
+            .join(format!("node-{follower}.sqlite")),
+        OperatorRecoveryLatch {
+            identity: follower_store.inner.storage_identity,
+            recovery_epoch: 1,
+            plan_digest: [0xE1; 32],
+            audit_pending: false,
+        },
+    )
+    .expect("assert follower recovery latch after route discovery");
+    drop(hold);
+
+    assert!(matches!(
+        submission.await.expect("preflight task"),
+        Err(crate::StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(
+        follower_store
+            .inner
+            .remote_forward_attempts
+            .load(Ordering::SeqCst),
+        0,
+        "a recovery-latched follower must not transmit expiry preflight"
+    );
+    assert_eq!(
+        leader_store.inner.raft.metrics().borrow().last_log_index,
+        log_before,
+        "the healthy leader receives no AdvanceLogicalTime proposal"
+    );
+    assert_eq!(
+        leader_store
+            .inner
+            .backend
+            .consensus_logical_time(leader_store.inner.storage_identity)
+            .await
+            .expect("leader logical time after preflight"),
+        logical_time_before,
+        "the healthy leader records no logical-time preflight effect"
+    );
+    assert_eq!(
+        follower_store
+            .inner
+            .terminal_recovery_gate_checks
+            .load(Ordering::SeqCst),
+        2,
+        "finite preflight performs its initial and just-in-time source recovery checks"
+    );
+    cluster.shutdown().await;
 }
 
 struct CountingRemoteSealProvider {

@@ -1792,6 +1792,10 @@ struct ConsensusSessionStoreInner {
     terminal_recovery_handoff_consumer: storage::LiveTerminalRecoveryHandoffConsumer,
     #[cfg(test)]
     terminal_recovery_gate_checks: AtomicU64,
+    #[cfg(test)]
+    remote_forward_authority_gate: Arc<RemoteForwardAuthorityGate>,
+    #[cfg(test)]
+    remote_forward_attempts: AtomicU64,
     raft_handler: SessionRaftRpcHandler,
     backend: SqliteSessionBackend,
     proactive_checkpoint_lane: Option<Arc<crate::sqlite::consensus::ProactiveCheckpointLane>>,
@@ -1905,6 +1909,112 @@ async fn await_consensus_session_store_shutdown(
                 }
             }
         }
+    }
+}
+
+/// Test-only causal seam at the authority revalidation which immediately
+/// precedes a remote forwarded mutation. It makes recovery-latch races
+/// reproducible without changing production scheduling or transport.
+#[cfg(test)]
+struct RemoteForwardAuthorityGate {
+    state: Mutex<RemoteForwardAuthorityGateState>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RemoteForwardAuthorityGateState {
+    armed: bool,
+    entered: bool,
+}
+
+#[cfg(test)]
+impl RemoteForwardAuthorityGate {
+    fn new() -> Self {
+        let (release, _) = tokio::sync::watch::channel(true);
+        Self {
+            state: Mutex::new(RemoteForwardAuthorityGateState::default()),
+            entered: tokio::sync::Notify::new(),
+            release,
+        }
+    }
+
+    fn arm(self: &Arc<Self>) -> RemoteForwardAuthorityHoldForTest {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !state.armed,
+            "only one remote-forward authority hold may be armed"
+        );
+        state.armed = true;
+        state.entered = false;
+        self.release.send_replace(false);
+        RemoteForwardAuthorityHoldForTest {
+            gate: Arc::clone(self),
+        }
+    }
+
+    async fn wait_before_authority(&self) {
+        let mut release = self.release.subscribe();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.armed {
+                return;
+            }
+            state.entered = true;
+            self.entered.notify_waiters();
+        }
+        while !*release.borrow() {
+            if release.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        loop {
+            let notified = self.entered.notified();
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entered
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.armed = false;
+        self.release.send_replace(true);
+    }
+}
+
+/// RAII release for a test-only remote forwarding authority hold.
+#[cfg(test)]
+struct RemoteForwardAuthorityHoldForTest {
+    gate: Arc<RemoteForwardAuthorityGate>,
+}
+
+#[cfg(test)]
+impl Drop for RemoteForwardAuthorityHoldForTest {
+    fn drop(&mut self) {
+        self.gate.release();
     }
 }
 
@@ -3116,6 +3226,10 @@ impl ConsensusSessionStore {
             terminal_recovery_handoff_consumer,
             #[cfg(test)]
             terminal_recovery_gate_checks: AtomicU64::new(0),
+            #[cfg(test)]
+            remote_forward_authority_gate: Arc::new(RemoteForwardAuthorityGate::new()),
+            #[cfg(test)]
+            remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
             proactive_checkpoint_lane,
@@ -3329,6 +3443,10 @@ impl ConsensusSessionStore {
             terminal_recovery_handoff_consumer,
             #[cfg(test)]
             terminal_recovery_gate_checks: AtomicU64::new(0),
+            #[cfg(test)]
+            remote_forward_authority_gate: Arc::new(RemoteForwardAuthorityGate::new()),
+            #[cfg(test)]
+            remote_forward_attempts: AtomicU64::new(0),
             raft_handler,
             backend,
             proactive_checkpoint_lane,
@@ -3419,6 +3537,13 @@ impl ConsensusSessionStore {
     #[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
     fn hold_raft_shutdown_before_core_for_test(&self) -> RaftShutdownHoldForTest {
         install_raft_shutdown_gate_for_test(&self.inner)
+    }
+
+    /// Hold a test-only forwarding turn after it has selected a remote leader
+    /// and before it revalidates source-replica authority for transmission.
+    #[cfg(test)]
+    fn hold_remote_forward_before_authority_for_test(&self) -> RemoteForwardAuthorityHoldForTest {
+        self.inner.remote_forward_authority_gate.arm()
     }
 
     /// Reset the fixed proactive-checkpoint write cadence for an isolated VFS
@@ -6848,6 +6973,20 @@ impl ConsensusSessionStore {
                 Some(leader) => leader,
                 None => self.wait_for_known_leader(deadline).await?,
             };
+            // Recovery authority is replica-local. Route discovery and every
+            // route-refresh retry can await long enough for this follower to
+            // enter recovery, so prove authority again at the remote
+            // transmission boundary. A failed check is necessarily before
+            // this activation request reaches a peer.
+            if leader != self.inner.local_node_id {
+                #[cfg(test)]
+                self.inner
+                    .remote_forward_authority_gate
+                    .wait_before_authority()
+                    .await;
+                self.require_application_traffic_authority_before(deadline)
+                    .await?;
+            }
             let reply = if leader == self.inner.local_node_id {
                 self.apply_on_local_leader(request.clone(), self.inner.local_node_id, deadline)
                     .await
@@ -6966,6 +7105,19 @@ impl ConsensusSessionStore {
                 Some(leader) => leader,
                 None => self.wait_for_known_leader(deadline).await?,
             };
+            // As with ordinary mutation forwarding, recovery authority must
+            // be revalidated after each selected or refreshed remote route
+            // and immediately before the preflight can transmit an
+            // effectful logical-time proposal to the leader.
+            if leader != self.inner.local_node_id {
+                #[cfg(test)]
+                self.inner
+                    .remote_forward_authority_gate
+                    .wait_before_authority()
+                    .await;
+                self.require_application_traffic_authority_before(deadline)
+                    .await?;
+            }
             let reply = if leader == self.inner.local_node_id {
                 let ForwardRequest::RecordExpiryPreflight {
                     preflights,
@@ -8356,6 +8508,12 @@ impl ConsensusSessionStore {
         Req: Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
     {
+        #[cfg(test)]
+        if family == SessionConsensusRpcFamily::ForwardMutation {
+            self.inner
+                .remote_forward_attempts
+                .fetch_add(1, Ordering::SeqCst);
+        }
         // Roster-sized envelopes require a structural proof supplied by the
         // dedicated forwarding path below. Generic callers must never widen
         // an arbitrary application request to the roster payload ceiling.
