@@ -7345,5 +7345,20 @@ mod tests {
             .await
             .expect("a release after waiter registration wakes the held response")
             .expect("held-response task completes");
+        assert_eq!(gate.status(), (0, 0));
+
+        assert!(gate.arm());
+        assert!(gate.take_armed_response());
+        let waiter_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiter_gate.hold_response().await });
+        while gate.status().1 != 1 {
+            tokio::task::yield_now().await;
+        }
+        assert!(gate.release());
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("a second release wakes the re-armed response hold")
+            .expect("re-armed held-response task completes");
+        assert_eq!(gate.status(), (0, 0));
     }
 }
