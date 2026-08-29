@@ -2424,7 +2424,7 @@ fencing.
   unrelated survivor explicit/material-epoch retirement counters unchanged,
   and settles all lifecycle drains plus survivor availability episodes before
   the next traffic baseline. The schedule-bound
-  `member-scoped-reauth-settled-baseline/v3` checkpoint starts its 86-second
+  `member-scoped-reauth-settled-baseline/v4` checkpoint starts its 86-second
   absolute bound and 60-second two-stage server tail at the atomic
   projected-data rename, then requires a final 2.5-second outbound-ledger quiet
   tail. A prepublication common-key pulse and conservative 13-second
@@ -2432,9 +2432,11 @@ fencing.
   and bound that pulse's worst-case actual event gap to 26 seconds. An
   independent 26-second checkpoint requires every active key on every observer
   and cannot be reset by a faster key.
-  Each survivor may record at most one interruption/recovery pair while the
-  expired member rejoins; it must settle inside the 26-second SLO, and a second
-  or late episode fails closed. Fault-era new-attempt and reconnect deltas
+  Each survivor may record at most one availability episode while the expired
+  member rejoins. Consecutive typed retry outcomes inside that episode remain
+  separately bounded by the unchanged eight-outcome ceiling; all must settle
+  inside the 26-second SLO, and a second or late episode fails closed.
+  Fault-era new-attempt and reconnect deltas
   retain a fixed 85/161 per-node bound: ordinary 24/40, fifteen five-second
   refresh rounds over four/eight incident paths, and one scheduled
   post-hard-expiry survivor-to-expired network-negative attempt per involved

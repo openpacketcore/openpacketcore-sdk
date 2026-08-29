@@ -986,7 +986,7 @@ other survivors' explicit and local-material-epoch retirement counters must
 remain unchanged. All lifecycle drains and every still-live survivor
 availability episode must be settled before the next traffic baseline, then
 all-voter readiness and canary progress complete without restarting that
-process. Schedule profile `member-scoped-reauth-settled-baseline/v3` makes that
+process. Schedule profile `member-scoped-reauth-settled-baseline/v4` makes that
 boundary explicit: the atomic projected-data rename starts the 86-second
 fail-safe and 60-second two-stage server tail, while a final 2.5-second quiet
 interval covers cold connect plus maximum reconnect backoff. A prepublication
@@ -994,10 +994,11 @@ common-key pulse and 13-second observation checkpoints require one active key
 to advance on every survivor observer and conservatively bound that pulse's
 worst-case actual event gap to 26 seconds. An independent 26-second checkpoint
 requires every active key on every observer and cannot be reset by a faster key.
-Availability counters
-may advance by at most one interruption/recovery pair per survivor while the
-expired member rejoins; the pair must settle inside the 26-second SLO, and a
-second or late episode fails closed. Fault-era new-attempt and reconnect deltas
+Availability evidence may advance by at most one episode per survivor while
+the expired member rejoins. Consecutive typed retry outcomes inside that
+episode remain separately bounded by the unchanged eight-outcome ceiling; all
+must settle inside the 26-second SLO, and a second or late episode fails
+closed. Fault-era new-attempt and reconnect deltas
 remain within the fixed 85/161 per-node bound: ordinary 24/40, fifteen
 five-second refresh rounds over four/eight incident paths, and one scheduled
 post-hard-expiry survivor-to-expired network-negative attempt per involved

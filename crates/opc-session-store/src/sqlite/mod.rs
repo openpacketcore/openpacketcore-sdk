@@ -768,6 +768,20 @@ impl ConsensusAcceptanceReaderPool {
             .ok_or(SqliteWorkerFailure::Admission)
     }
 
+    /// Try one synchronous checkout for status/scope accessors which cannot
+    /// await the bounded worker path. Both the execution permit and concrete
+    /// reader must be available now; contention remains a fail-closed false
+    /// result rather than falling back to the primary writer or cached state.
+    fn try_checkout(self: &Arc<Self>) -> Option<ConsensusAcceptanceReaderLease> {
+        let worker_permit = Arc::clone(&self.workers).try_acquire_owned().ok()?;
+        let reader = self.receiver.try_lock().ok()?.try_recv().ok()?;
+        Some(ConsensusAcceptanceReaderLease::new(
+            Arc::clone(self),
+            reader,
+            worker_permit,
+        ))
+    }
+
     fn connection_is_usable(&self, conn: &Connection) -> bool {
         #[cfg(test)]
         if self.retire_next_reader.swap(false, Ordering::AcqRel) {
@@ -881,6 +895,76 @@ fn install_sqlite_operation_progress_handler(
         Some(move || cancellation.load(Ordering::Acquire) || std::time::Instant::now() >= deadline),
     );
     SqliteOperationProgressGuard(conn)
+}
+
+fn fixed_quorum_application_traffic_authority_is_exact_sync(
+    database_path: Option<&Path>,
+    conn: &Connection,
+    identity: crate::consensus::SessionConsensusIdentity,
+    expected_members: &std::collections::BTreeSet<crate::consensus::SessionConsensusNodeId>,
+    expected_bindings: &std::collections::BTreeMap<
+        crate::consensus::SessionConsensusNodeId,
+        crate::consensus::SessionTopologyMemberBinding,
+    >,
+    expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
+) -> Result<bool, StoreError> {
+    // This deferred transaction is the one per-call visibility boundary for
+    // every database-resident authority fact. The descriptor-bound sidecar
+    // classifier runs while that fresh transaction is open, and neither result
+    // is cached. A dropped error path rolls back; success explicitly commits
+    // before the primary SQLite operation completes.
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+    let database_latch = database_path
+        .map(|path| {
+            consensus::classify_operator_recovery_latch_with_connection_sync(path, &tx)
+                .map(|classification| classification.latch())
+        })
+        .transpose()
+        .map_err(|_| {
+            StoreError::BackendUnavailable("session operator recovery latch is unavailable".into())
+        })?
+        .flatten();
+    if let Some(latch) = database_latch {
+        if latch.identity != identity {
+            return Err(StoreError::BackendUnavailable(
+                "session operator recovery latch identity does not match".into(),
+            ));
+        }
+        opc_redaction::metrics::METRICS
+            .session_operator_recovery_required
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        opc_redaction::metrics::METRICS
+            .session_operator_recovery_epoch
+            .fetch_max(latch.recovery_epoch, std::sync::atomic::Ordering::Relaxed);
+        if latch.audit_pending {
+            opc_redaction::metrics::METRICS
+                .session_operator_recovery_audit_pending
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let fixed_authority_is_exact = consensus::fixed_quorum_authority_is_exact_sync(
+        &tx,
+        identity,
+        expected_members,
+        expected_bindings,
+        expected_placement_policy,
+        false,
+    )
+    .map_err(|_| {
+        StoreError::BackendUnavailable("session fixed-quorum authority is unavailable".into())
+    })?;
+    let recovery_pending = consensus::validate_current_operator_recovery_image_sync(&tx, identity)
+        .map(|state| state.pending_epoch.is_some())
+        .map_err(|_| {
+            StoreError::BackendUnavailable("session operator recovery state is unavailable".into())
+        })?;
+    let authority_is_exact =
+        fixed_authority_is_exact && !recovery_pending && database_latch.is_none();
+    tx.commit()
+        .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
+    Ok(authority_is_exact)
 }
 
 impl SqliteSessionBackend {
@@ -1714,8 +1798,10 @@ impl SqliteSessionBackend {
     }
 
     /// Synchronously test a fixed-quorum authority record without waiting for
-    /// a concurrent SQLite operation. Callers must treat lock contention or a
-    /// malformed durable record as revoked authority.
+    /// a concurrent SQLite operation. File-backed stores use one immediately
+    /// available fixed reader lane and a fresh transaction, so primary-writer
+    /// ownership is not misclassified as revoked authority. Exhausted reader
+    /// capacity or malformed/unavailable durable state still fails closed.
     pub(crate) fn fixed_quorum_authority_is_exact_now(
         &self,
         identity: crate::consensus::SessionConsensusIdentity,
@@ -1726,6 +1812,29 @@ impl SqliteSessionBackend {
         >,
         expected_placement_policy: crate::readiness::PlacementResiliencePolicy,
     ) -> bool {
+        if let Some(pool) = &self.consensus_acceptance_reader_pool {
+            let Some(lease) = pool.try_checkout() else {
+                return false;
+            };
+            let exact = lease.connection().is_some_and(|conn| {
+                let Ok(tx) = conn.unchecked_transaction() else {
+                    return false;
+                };
+                let exact = consensus::fixed_quorum_authority_is_exact_sync(
+                    &tx,
+                    identity,
+                    expected_members,
+                    expected_bindings,
+                    expected_placement_policy,
+                    false,
+                )
+                .unwrap_or(false);
+                let committed = tx.commit().is_ok();
+                exact && committed
+            });
+            lease.complete();
+            return exact;
+        }
         self.conn.try_lock().is_ok_and(|conn| {
             consensus::fixed_quorum_authority_is_exact_sync(
                 &conn,
@@ -1796,58 +1905,14 @@ impl SqliteSessionBackend {
         }
         let database_path = self.database_path.clone();
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
-            let database_latch = database_path
-                .as_deref()
-                .map(|path| {
-                    consensus::classify_operator_recovery_latch_with_connection_sync(path, conn)
-                        .map(|classification| classification.latch())
-                })
-                .transpose()
-                .map_err(|_| {
-                    StoreError::BackendUnavailable(
-                        "session operator recovery latch is unavailable".into(),
-                    )
-                })?
-                .flatten();
-            if let Some(latch) = database_latch {
-                if latch.identity != identity {
-                    return Err(StoreError::BackendUnavailable(
-                        "session operator recovery latch identity does not match".into(),
-                    ));
-                }
-                opc_redaction::metrics::METRICS
-                    .session_operator_recovery_required
-                    .store(1, std::sync::atomic::Ordering::Relaxed);
-                opc_redaction::metrics::METRICS
-                    .session_operator_recovery_epoch
-                    .fetch_max(latch.recovery_epoch, std::sync::atomic::Ordering::Relaxed);
-                if latch.audit_pending {
-                    opc_redaction::metrics::METRICS
-                        .session_operator_recovery_audit_pending
-                        .store(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            let fixed_authority_is_exact = consensus::fixed_quorum_authority_is_exact_sync(
+            fixed_quorum_application_traffic_authority_is_exact_sync(
+                database_path.as_deref().map(PathBuf::as_path),
                 conn,
                 identity,
                 &expected_members,
                 &expected_bindings,
                 expected_placement_policy,
-                false,
             )
-            .map_err(|_| {
-                StoreError::BackendUnavailable(
-                    "session fixed-quorum authority is unavailable".into(),
-                )
-            })?;
-            let recovery_pending = consensus::read_operator_recovery_sync(conn, identity)
-                .map(|state| state.pending_epoch.is_some())
-                .map_err(|_| {
-                    StoreError::BackendUnavailable(
-                        "session operator recovery state is unavailable".into(),
-                    )
-                })?;
-            Ok(fixed_authority_is_exact && !recovery_pending && database_latch.is_none())
         })
         .await
     }
@@ -1943,13 +2008,14 @@ impl SqliteSessionBackend {
                     "session fixed-quorum authority is unavailable".into(),
                 )
             })?;
-            let recovery_pending = consensus::read_operator_recovery_sync(&tx, storage_identity)
-                .map(|state| state.pending_epoch.is_some())
-                .map_err(|_| {
-                    StoreError::BackendUnavailable(
-                        "session operator recovery state is unavailable".into(),
-                    )
-                })?;
+            let recovery_pending =
+                consensus::validate_current_operator_recovery_image_sync(&tx, storage_identity)
+                    .map(|state| state.pending_epoch.is_some())
+                    .map_err(|_| {
+                        StoreError::BackendUnavailable(
+                            "session operator recovery state is unavailable".into(),
+                        )
+                    })?;
             if !fixed_authority_is_exact || recovery_pending {
                 return Err(StoreError::BackendUnavailable(
                     "session application traffic authority is unavailable".into(),
@@ -2119,13 +2185,14 @@ impl SqliteSessionBackend {
                     "session fixed-quorum authority is unavailable".into(),
                 )
             })?;
-            let recovery_pending = consensus::read_operator_recovery_sync(&tx, storage_identity)
-                .map(|state| state.pending_epoch.is_some())
-                .map_err(|_| {
-                    StoreError::BackendUnavailable(
-                        "session operator recovery state is unavailable".into(),
-                    )
-                })?;
+            let recovery_pending =
+                consensus::validate_current_operator_recovery_image_sync(&tx, storage_identity)
+                    .map(|state| state.pending_epoch.is_some())
+                    .map_err(|_| {
+                        StoreError::BackendUnavailable(
+                            "session operator recovery state is unavailable".into(),
+                        )
+                    })?;
             if !fixed_authority_is_exact || recovery_pending {
                 return Err(StoreError::BackendUnavailable(
                     "session application traffic authority is unavailable".into(),

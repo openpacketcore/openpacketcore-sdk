@@ -785,6 +785,11 @@ struct QualificationTrafficObservation {
     linearizable_reads: AtomicU64,
     lease_renewals: AtomicU64,
     lease_reacquisitions: AtomicU64,
+    /// Even values delimit coherent availability snapshots; a writer holds an
+    /// odd value while it advances the related counters. The mutation task is
+    /// the sole writer, while status commands may read concurrently.
+    availability_snapshot_version: AtomicU64,
+    availability_interruption_episodes: AtomicU64,
     availability_interruptions: AtomicU64,
     availability_recoveries: AtomicU64,
     max_consecutive_availability_interruptions: AtomicU64,
@@ -802,6 +807,14 @@ struct QualificationTrafficObservation {
     watch_reconciliations: AtomicU64,
     watch_reconciled_sequence: AtomicU64,
     watch_traffic_generations: Vec<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QualificationTrafficAvailabilitySnapshot {
+    interruption_episodes: u64,
+    interruptions: u64,
+    recoveries: u64,
+    max_consecutive_interruptions: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -898,6 +911,8 @@ impl QualificationTrafficObservation {
             linearizable_reads: AtomicU64::new(0),
             lease_renewals: AtomicU64::new(0),
             lease_reacquisitions: AtomicU64::new(0),
+            availability_snapshot_version: AtomicU64::new(0),
+            availability_interruption_episodes: AtomicU64::new(0),
             availability_interruptions: AtomicU64::new(0),
             availability_recoveries: AtomicU64::new(0),
             max_consecutive_availability_interruptions: AtomicU64::new(0),
@@ -951,27 +966,54 @@ impl QualificationTrafficObservation {
     }
 
     fn record_availability_interruption(&self, consecutive: &mut u64) -> bool {
-        if self
+        let prior_version = self
+            .availability_snapshot_version
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            prior_version % 2,
+            0,
+            "availability writer must be exclusive"
+        );
+        let recorded = self
             .availability_interruptions
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1).filter(|next| {
                     *next <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
                 })
             })
-            .is_err()
-        {
-            return false;
+            .is_ok();
+        if recorded && *consecutive == 0 {
+            self.availability_interruption_episodes
+                .fetch_add(1, Ordering::AcqRel);
         }
-        *consecutive = consecutive.saturating_add(1);
-        let _ = self
-            .max_consecutive_availability_interruptions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.max(*consecutive))
-            });
-        true
+        if recorded {
+            *consecutive = consecutive.saturating_add(1);
+            let _ = self
+                .max_consecutive_availability_interruptions
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.max(*consecutive))
+                });
+        }
+        let prior_version = self
+            .availability_snapshot_version
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            prior_version % 2,
+            1,
+            "availability writer must publish once"
+        );
+        recorded
     }
 
     fn record_availability_recovery(&self, consecutive: &mut u64) {
+        let prior_version = self
+            .availability_snapshot_version
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            prior_version % 2,
+            0,
+            "availability writer must be exclusive"
+        );
         let recovered = *consecutive;
         let _ = self.availability_recoveries.fetch_update(
             Ordering::AcqRel,
@@ -979,6 +1021,38 @@ impl QualificationTrafficObservation {
             |value| Some(value.saturating_add(recovered)),
         );
         *consecutive = 0;
+        let prior_version = self
+            .availability_snapshot_version
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            prior_version % 2,
+            1,
+            "availability writer must publish once"
+        );
+    }
+
+    fn availability_snapshot(&self) -> QualificationTrafficAvailabilitySnapshot {
+        loop {
+            let before = self.availability_snapshot_version.load(Ordering::Acquire);
+            if before % 2 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let snapshot = QualificationTrafficAvailabilitySnapshot {
+                interruption_episodes: self
+                    .availability_interruption_episodes
+                    .load(Ordering::Acquire),
+                interruptions: self.availability_interruptions.load(Ordering::Acquire),
+                recoveries: self.availability_recoveries.load(Ordering::Acquire),
+                max_consecutive_interruptions: self
+                    .max_consecutive_availability_interruptions
+                    .load(Ordering::Acquire),
+            };
+            let after = self.availability_snapshot_version.load(Ordering::Acquire);
+            if before == after {
+                return snapshot;
+            }
+        }
     }
 }
 
@@ -1131,7 +1205,7 @@ impl QualificationNode {
         config: &QualificationNodeConfig,
         listener: TcpListener,
     ) -> Result<Self, NodeFailure> {
-        secure_qualification_paths(config)?;
+        let snapshot_directory = secure_qualification_paths(config)?;
         config
             .validate_bind_addr(listener.local_addr().map_err(|_| NodeFailure)?)
             .map_err(|_| NodeFailure)?;
@@ -1209,7 +1283,7 @@ impl QualificationNode {
             ConsensusSessionStore::open_fixed_durable_quorum_with_clock(
                 topology,
                 backend,
-                &config.snapshot_directory,
+                &snapshot_directory,
                 peers,
                 Arc::new(SystemClock),
                 Duration::from_millis(config.operation_timeout_millis),
@@ -2219,6 +2293,7 @@ impl QualificationNode {
         } else {
             QualificationTrafficState::Stopped
         };
+        let availability = traffic.observation.availability_snapshot();
         QualificationNodeReply::TrafficStatus {
             status: QualificationTrafficStatus {
                 state,
@@ -2239,18 +2314,11 @@ impl QualificationNode {
                     .observation
                     .lease_reacquisitions
                     .load(Ordering::Acquire),
-                availability_interruptions: traffic
-                    .observation
-                    .availability_interruptions
-                    .load(Ordering::Acquire),
-                availability_recoveries: traffic
-                    .observation
-                    .availability_recoveries
-                    .load(Ordering::Acquire),
-                max_consecutive_availability_interruptions: traffic
-                    .observation
-                    .max_consecutive_availability_interruptions
-                    .load(Ordering::Acquire),
+                availability_interruption_episodes: availability.interruption_episodes,
+                availability_interruptions: availability.interruptions,
+                availability_recoveries: availability.recoveries,
+                max_consecutive_availability_interruptions: availability
+                    .max_consecutive_interruptions,
                 complete_restore_scans: traffic
                     .observation
                     .complete_restore_scans
@@ -3312,10 +3380,11 @@ async fn reconcile_traffic_known_authority(
                     QualificationTrafficFailureStage::Get,
                     &error,
                 );
-                if !traffic_failure_is_recoverable(failure)
-                    || !observation
-                        .record_availability_interruption(consecutive_availability_interruptions)
-                {
+                let recoverable = traffic_failure_is_recoverable(failure);
+                let recorded = recoverable
+                    && observation
+                        .record_availability_interruption(consecutive_availability_interruptions);
+                if !recorded {
                     return Err(failure);
                 }
                 if !wait_for_traffic_recovery_retry(deadline).await {
@@ -5064,6 +5133,10 @@ fn load_config(path: &Path) -> Result<QualificationNodeConfig, NodeFailure> {
 
 const FS_VERITY_QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
 const FS_VERITY_SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+/// Parent-only descriptor transport for the closed V9 configuration.  This
+/// does not admit a JSON field or a caller-selected store path: the harness
+/// supplies one inherited directory descriptor for this exact node leaf.
+const V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV: &str = "OPC_QUALIFICATION_V9_SNAPSHOT_DIRECTORY_FD";
 
 #[cfg(unix)]
 fn canonical_private_directory(path: &Path) -> Result<PathBuf, NodeFailure> {
@@ -5100,28 +5173,53 @@ fn canonical_private_directory_with_identity(
 }
 
 #[cfg(unix)]
-fn canonical_private_snapshot_leaf(
-    path: &Path,
+fn pinned_v9_snapshot_leaf_directory(
+    snapshot_directory: &Path,
     snapshot_root: &Path,
 ) -> Result<PathBuf, NodeFailure> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| NodeFailure)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.permissions().mode() & 0o7777 != 0o700
+    let raw_fd = env::var_os(V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV)
+        .and_then(|raw| raw.into_string().ok())
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .filter(|fd| *fd >= 0)
+        .ok_or(NodeFailure)?;
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{raw_fd}"));
+    // Opening our own procfs descriptor duplicates the inherited capability;
+    // it does not resolve the configured V9 pathname. The original inherited
+    // descriptor remains open for the process lifetime and pins this object
+    // through store initialization.
+    let descriptor = File::open(&descriptor_path).map_err(|_| NodeFailure)?;
+    let descriptor_metadata = fstat(&descriptor).map_err(|_| NodeFailure)?;
+    if !FileType::from_raw_mode(descriptor_metadata.st_mode).is_dir()
+        || descriptor_metadata.st_uid != rustix::process::geteuid().as_raw()
+        || Mode::from_raw_mode(descriptor_metadata.st_mode).bits() & 0o7777 != 0o700
     {
         return Err(NodeFailure);
     }
-    let canonical = fs::canonicalize(path).map_err(|_| NodeFailure)?;
-    if canonical.parent() != Some(snapshot_root) {
+    let canonical = fs::canonicalize(&descriptor_path).map_err(|_| NodeFailure)?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|_| NodeFailure)?;
+    if canonical != snapshot_directory
+        || canonical.parent() != Some(snapshot_root)
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+        || metadata.dev() != descriptor_metadata.st_dev as u64
+        || metadata.ino() != descriptor_metadata.st_ino as u64
+    {
         return Err(NodeFailure);
     }
-    Ok(canonical)
+    // Store admission keeps O_NOFOLLOW.  On Linux that rejects the procfs
+    // magic link itself, so make `.` the final component: the descriptor magic
+    // link is traversed as an intermediate component and the final directory
+    // is still the exact inherited object. Its own retained namespace
+    // descriptor then remains the sole authority for every snapshot child
+    // operation.
+    Ok(descriptor_path.join("."))
 }
 
 #[cfg(not(unix))]
-fn canonical_private_snapshot_leaf(
-    _path: &Path,
+fn pinned_v9_snapshot_leaf_directory(
+    _snapshot_directory: &Path,
     _snapshot_root: &Path,
 ) -> Result<PathBuf, NodeFailure> {
     Err(NodeFailure)
@@ -5155,7 +5253,7 @@ fn configured_fs_verity_snapshot_root() -> Result<PathBuf, NodeFailure> {
     Ok(canonical)
 }
 
-fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<(), NodeFailure> {
+fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<PathBuf, NodeFailure> {
     let workspace = fs::canonicalize(&config.workspace_directory).map_err(|_| NodeFailure)?;
     if workspace.parent().is_none() {
         return Err(NodeFailure);
@@ -5207,11 +5305,12 @@ fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<(), No
         }
         None => workspace.clone(),
     };
-    let _snapshots = if config.snapshot_root_directory.is_some() {
-        // The release harness creates this one leaf before the child starts.
-        // Do not create through an attacker-controlled pathname here: require
-        // a real, private direct child before canonicalization.
-        canonical_private_snapshot_leaf(&config.snapshot_directory, &snapshot_root)?
+    let snapshots = if config.snapshot_root_directory.is_some() {
+        // The release harness creates and pins this one leaf before the child
+        // starts.  A pathname-only validation would be TOCTOU: same-UID
+        // rename/swap can replace it before ConsensusSessionStore acquires
+        // its own retained namespace descriptor.
+        pinned_v9_snapshot_leaf_directory(&config.snapshot_directory, &snapshot_root)?
     } else {
         fs::create_dir_all(&config.snapshot_directory).map_err(|_| NodeFailure)?;
         let snapshots = fs::canonicalize(&config.snapshot_directory).map_err(|_| NodeFailure)?;
@@ -5232,7 +5331,7 @@ fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<(), No
             return Err(NodeFailure);
         }
     }
-    Ok(())
+    Ok(snapshots)
 }
 
 struct NodeArguments {
@@ -5938,7 +6037,30 @@ mod tests {
     #[cfg(unix)]
     use std::io::Cursor;
     #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::sync::{Mutex, OnceLock};
+
+    #[cfg(unix)]
+    fn v9_snapshot_directory_fd_environment_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    struct V9SnapshotDirectoryFdEnvironmentRestore(Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl Drop for V9SnapshotDirectoryFdEnvironmentRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => env::set_var(V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV, value),
+                None => env::remove_var(V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV),
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -5957,7 +6079,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn external_snapshot_leaf_rejects_a_direct_child_symlink_before_use() {
+    fn external_snapshot_leaf_descriptor_rejects_same_uid_swap_and_pins_restart() {
+        let _environment = v9_snapshot_directory_fd_environment_lock()
+            .lock()
+            .expect("serialize V9 snapshot descriptor environment");
         let workspace = tempfile::tempdir().expect("create snapshot-leaf workspace");
         let root = workspace.path().join("campaign");
         fs::create_dir(&root).expect("create campaign root");
@@ -5967,20 +6092,48 @@ mod tests {
         fs::create_dir(&leaf).expect("create snapshot leaf");
         fs::set_permissions(&leaf, Permissions::from_mode(0o700))
             .expect("make snapshot leaf private");
+        let leaf_fd = open(
+            &leaf,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open no-follow snapshot leaf descriptor");
+        let original = fstat(&leaf_fd).expect("fstat pinned snapshot leaf");
+        let previous = env::var_os(V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV);
+        let _restore = V9SnapshotDirectoryFdEnvironmentRestore(previous);
+        env::set_var(
+            V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV,
+            leaf_fd.as_raw_fd().to_string(),
+        );
         assert_eq!(
-            canonical_private_snapshot_leaf(&leaf, &root).expect("accept private direct child"),
-            leaf
+            pinned_v9_snapshot_leaf_directory(&leaf, &root)
+                .expect("accept descriptor-pinned private direct child"),
+            PathBuf::from(format!("/proc/self/fd/{}/.", leaf_fd.as_raw_fd()))
         );
 
-        let redirect = root.join("redirect");
-        fs::create_dir(&redirect).expect("create redirect target");
-        fs::set_permissions(&redirect, Permissions::from_mode(0o700))
-            .expect("make redirect target private");
-        let linked_leaf = root.join("node-1");
-        symlink(&redirect, &linked_leaf).expect("create hostile direct-child symlink");
+        // The old descriptor remains live across this same-UID pathname swap;
+        // a restarted child that receives it can only reopen the original
+        // leaf, while validation rejects the new configured pathname.
+        let detached_leaf = root.join("node-0-detached");
+        fs::rename(&leaf, &detached_leaf).expect("detach initially validated leaf");
+        fs::create_dir(&leaf).expect("create same-name replacement leaf");
+        fs::set_permissions(&leaf, Permissions::from_mode(0o700))
+            .expect("make replacement leaf private");
         assert!(
-            canonical_private_snapshot_leaf(&linked_leaf, &root).is_err(),
-            "a direct child symlink must fail before snapshot initialization"
+            pinned_v9_snapshot_leaf_directory(&leaf, &root).is_err(),
+            "a same-UID leaf replacement between validation and store use must fail closed"
+        );
+        let restarted = open(
+            PathBuf::from(format!("/proc/self/fd/{}/.", leaf_fd.as_raw_fd())),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("store-style no-follow admission reopens the inherited original leaf descriptor");
+        let restarted_metadata = fstat(&restarted).expect("fstat restarted snapshot leaf");
+        assert_eq!(
+            (restarted_metadata.st_dev, restarted_metadata.st_ino),
+            (original.st_dev, original.st_ino),
+            "restart must retain the exact original snapshot leaf identity"
         );
     }
 
@@ -6395,6 +6548,12 @@ mod tests {
         for expected in 1..=QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE {
             assert!(observation.record_availability_interruption(&mut consecutive));
             assert_eq!(consecutive, expected);
+            assert_eq!(
+                observation
+                    .availability_interruption_episodes
+                    .load(Ordering::Acquire),
+                1
+            );
         }
         assert!(!observation.record_availability_interruption(&mut consecutive));
         assert_eq!(
@@ -6414,6 +6573,25 @@ mod tests {
         assert_eq!(
             observation.availability_recoveries.load(Ordering::Acquire),
             QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+        );
+
+        let observation = QualificationTrafficObservation::new(0, 3);
+        let mut consecutive = 0;
+        assert!(observation.record_availability_interruption(&mut consecutive));
+        assert!(observation.record_availability_interruption(&mut consecutive));
+        observation.record_availability_recovery(&mut consecutive);
+        assert!(observation.record_availability_interruption(&mut consecutive));
+        assert_eq!(
+            observation
+                .availability_interruption_episodes
+                .load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(
+            observation
+                .availability_interruptions
+                .load(Ordering::Acquire),
+            3
         );
     }
 

@@ -98,12 +98,13 @@ use opc_session_testkit::qualification::{
     SessionMtlsBatchReleaseGateResourceGenerationV1,
     SessionMtlsBatchReleaseGateServerQueueDepthScopeV1, SessionMtlsCandidateCampaign,
     SessionMtlsCandidateEvidenceV2, SessionMtlsCandidateSourceTreeStatus,
-    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
-    QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS, QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS,
-    QUALIFICATION_FAULT_PATH_REFRESH_MILLIS, QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS,
-    QUALIFICATION_INBOUND_CONNECTION_SLOTS, QUALIFICATION_MAX_CONFIG_BYTES,
-    QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE, QUALIFICATION_NODE_SCHEMA_VERSION,
-    QUALIFICATION_OPERATION_TIMEOUT_MILLIS, QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
+    QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS,
+    QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER, QUALIFICATION_FAULT_EXPIRY_VALIDITY_MILLIS,
+    QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_FAULT_PATH_REFRESH_MILLIS,
+    QUALIFICATION_FAULT_TRAFFIC_STOP_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
+    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_IN_FLIGHT_PROPOSALS_PER_OPENRAFT_NODE,
+    QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    QUALIFICATION_PERSISTENT_CONSUMER_MIN_WARM_SAMPLES_V7,
     QUALIFICATION_RESOLVER_BACKOFF_LOWER_BOUNDS_MILLIS, QUALIFICATION_RESOLVER_PROOF_MILLIS,
     QUALIFICATION_RESOURCE_FD_MISC_ALLOWANCE, QUALIFICATION_RESOURCE_FINAL_FD_ALLOWANCE,
     QUALIFICATION_RESOURCE_SAMPLE_MILLIS, QUALIFICATION_RESOURCE_SETTLED_RSS_GROWTH_KIB,
@@ -157,6 +158,8 @@ use rustix::fs::{
     fchmod, fstat, fsync, mkdirat, open, openat, renameat_with, unlinkat, AtFlags, FileType, Mode,
     OFlags, RenameFlags,
 };
+use rustix::io::{fcntl_setfd, FdFlags};
+use rustix::process::umask;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::sync::{oneshot, watch};
@@ -167,6 +170,10 @@ const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis,
 );
+/// An inherited, close-on-exec-cleared descriptor is the only capability a
+/// V9 child may use for its external snapshot leaf.  The JSON remains closed:
+/// this process-local transport carries no new configuration surface.
+const V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV: &str = "OPC_QUALIFICATION_V9_SNAPSHOT_DIRECTORY_FD";
 // Functional recovery bound for the stateless-consumer fault detector. This
 // is deliberately not the profile's 30-second production-evidence threshold:
 // the pinned engine may retain one leader lease, defer one smaller-log
@@ -881,6 +888,7 @@ fn traffic_mutator_counters_advanced(
         && after.last_generation > before.last_generation
         && after.last_record_fence > before.last_record_fence
         && (after.mutation_resume_generation != 0 || after.availability_interruptions >= 1)
+        && after.availability_interruption_episodes >= before.availability_interruption_episodes
         && after.availability_interruptions >= before.availability_interruptions
         && after.availability_recoveries >= before.availability_recoveries
         && after.max_consecutive_availability_interruptions
@@ -917,12 +925,19 @@ fn traffic_live_mutator_counters_are_consistent(status: &QualificationTrafficSta
             .all(|stages| stages[0] >= stages[1])
         && status.availability_interruptions
             <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+        && status.availability_interruption_episodes <= status.availability_interruptions
         && status.availability_recoveries <= status.availability_interruptions
         && status.max_consecutive_availability_interruptions <= status.availability_interruptions
         && ((status.availability_interruptions == 0
+            && status.availability_interruption_episodes == 0
             && status.max_consecutive_availability_interruptions == 0)
             || (status.availability_interruptions > 0
+                && status.availability_interruption_episodes > 0
                 && status.max_consecutive_availability_interruptions > 0))
+        && status
+            .availability_interruption_episodes
+            .checked_mul(status.max_consecutive_availability_interruptions)
+            .is_some_and(|capacity| capacity >= status.availability_interruptions)
         && traffic_failure_fields_are_coherent(status)
 }
 
@@ -983,6 +998,49 @@ fn member_incident_directed_paths(member_count: usize, member: usize) -> Vec<(us
         .collect()
 }
 
+fn member_recovery_directed_paths(member_count: usize, member: usize) -> Vec<(usize, usize)> {
+    assert!(member < member_count);
+    // Recover every survivor's outbound lane before exercising the recovered
+    // member's outbound lanes. Live survivor traffic shares those exact
+    // consensus pools, so leaving a later survivor behind the recovered
+    // member's unrelated paths can consume the bounded availability budget
+    // while its remote-retirement probe remains intentionally gated.
+    (0..member_count)
+        .filter(|source| *source != member)
+        .map(|source| (source, member))
+        .chain(
+            (0..member_count)
+                .filter(|target| *target != member)
+                .map(|target| (member, target)),
+        )
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCommandWaveStage {
+    Dispatch,
+    Collect,
+}
+
+/// Perform the dispatch half of a pending-command wave before collecting any
+/// reply. This prevents one early command's retry or follow-on workload check
+/// from delaying the first command to another independent child process.
+fn for_each_pending_command_in_wave(
+    pending: &[bool],
+    mut visit: impl FnMut(usize, PendingCommandWaveStage),
+) {
+    for (node_index, pending) in pending.iter().enumerate() {
+        if *pending {
+            visit(node_index, PendingCommandWaveStage::Dispatch);
+        }
+    }
+    for (node_index, pending) in pending.iter().enumerate() {
+        if *pending {
+            visit(node_index, PendingCommandWaveStage::Collect);
+        }
+    }
+}
+
 fn unrelated_survivor_reauthentication_retirements_are_unchanged(
     before: &[QualificationConnectionLifecycleMetrics],
     after: &[QualificationConnectionLifecycleMetrics],
@@ -1036,6 +1094,7 @@ fn traffic_nonmutator_counters_unchanged(
         && after.mutation_resume_record_fence == before.mutation_resume_record_fence
         && after.last_generation == before.last_generation
         && after.last_record_fence == before.last_record_fence
+        && after.availability_interruption_episodes == before.availability_interruption_episodes
         && after.availability_interruptions == before.availability_interruptions
         && after.availability_recoveries == before.availability_recoveries
         && after.max_consecutive_availability_interruptions
@@ -1056,6 +1115,12 @@ fn subset_traffic_availability_within_recovery_budget(
             let Some(after) = indexed_traffic_status(after, *node_index) else {
                 return false;
             };
+            if !traffic_live_mutator_counters_are_consistent(before)
+                || !traffic_live_mutator_counters_are_consistent(after)
+                || !traffic_availability_recovery_is_resolved(before)
+            {
+                return false;
+            }
             let Some(interruptions) = after
                 .availability_interruptions
                 .checked_sub(before.availability_interruptions)
@@ -1068,13 +1133,22 @@ fn subset_traffic_availability_within_recovery_budget(
             else {
                 return false;
             };
+            let Some(episodes) = after
+                .availability_interruption_episodes
+                .checked_sub(before.availability_interruption_episodes)
+            else {
+                return false;
+            };
             let expected_maximum = if interruptions == 0 {
                 before.max_consecutive_availability_interruptions
             } else {
-                before.max_consecutive_availability_interruptions.max(1)
+                before
+                    .max_consecutive_availability_interruptions
+                    .max(interruptions)
             };
-            interruptions
+            episodes
                 <= QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+                && (episodes == 0) == (interruptions == 0)
                 && recoveries <= interruptions
                 && after.max_consecutive_availability_interruptions == expected_maximum
         })
@@ -1105,7 +1179,9 @@ fn subset_traffic_availability_counters_equal(
             indexed_traffic_status(before, *node_index)
                 .zip(indexed_traffic_status(after, *node_index))
                 .is_some_and(|(before, after)| {
-                    after.availability_interruptions == before.availability_interruptions
+                    after.availability_interruption_episodes
+                        == before.availability_interruption_episodes
+                        && after.availability_interruptions == before.availability_interruptions
                         && after.availability_recoveries == before.availability_recoveries
                         && after.max_consecutive_availability_interruptions
                             == before.max_consecutive_availability_interruptions
@@ -1151,6 +1227,7 @@ fn recovery_traffic_status_is_monotonic(
         && traffic_failure_fields_are_coherent(after)
         && traffic_availability_recovery_is_resolved(after)
         && after.seed == before.seed
+        && after.availability_interruption_episodes >= before.availability_interruption_episodes
         && after.availability_interruptions >= before.availability_interruptions
         && after.availability_recoveries >= before.availability_recoveries
         && after.max_consecutive_availability_interruptions
@@ -1300,6 +1377,9 @@ fn assert_completed_traffic_cycles(status: &QualificationTrafficStatus) {
     assert_eq!(status.lease_reacquisitions, status.mutation_cycles);
     assert!(traffic_availability_recovery_is_resolved(status));
     assert!(status.mutation_resume_generation != 0 || status.availability_interruptions >= 1);
+    assert!(
+        status.mutation_resume_generation != 0 || status.availability_interruption_episodes >= 1
+    );
     assert!(
         status.availability_interruptions
             <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
@@ -1881,11 +1961,50 @@ fn deadline_allows_completion(now: Instant, deadline: Instant) -> bool {
     now <= deadline
 }
 
+/// Sleep for at most one retry period without crossing the caller's absolute
+/// deadline.  Callers use the `false` result to fail before issuing another
+/// command, rather than allowing a fixed retry sleep to consume unbounded
+/// observation time after the operation budget has expired.
+fn sleep_until_deadline(deadline: Instant, retry_period: Duration) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    thread::sleep(remaining.min(retry_period));
+    !deadline.saturating_duration_since(Instant::now()).is_zero()
+}
+
 fn deadline_admits_complete_operation(now: Instant, deadline: Instant) -> bool {
     now.checked_add(Duration::from_millis(
         QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
     ))
     .is_some_and(|operation_deadline| operation_deadline <= deadline)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryTrafficCommandPlan {
+    RefreshProgress,
+    DispatchBy(Instant),
+}
+
+// Reserve the fixed concurrent-control delivery bound for the passive traffic
+// observation that follows a command. The command itself must still fit its
+// existing full operation timeout, so it cannot consume a rolling checkpoint
+// and leave no time to observe the survivor traffic it perturbed.
+fn recovery_traffic_command_plan(
+    now: Instant,
+    rolling_deadline: Instant,
+) -> RecoveryTrafficCommandPlan {
+    let observation_headroom =
+        Duration::from_millis(QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS);
+    let Some(command_deadline) = rolling_deadline.checked_sub(observation_headroom) else {
+        return RecoveryTrafficCommandPlan::RefreshProgress;
+    };
+    if deadline_admits_complete_operation(now, command_deadline) {
+        RecoveryTrafficCommandPlan::DispatchBy(command_deadline)
+    } else {
+        RecoveryTrafficCommandPlan::RefreshProgress
+    }
 }
 
 fn deadline_admits_complete_restart_readiness_round(now: Instant, deadline: Instant) -> bool {
@@ -2463,6 +2582,17 @@ enum ChildStderrDiagnostic {
     Redacted,
 }
 
+/// Receive one child reply using the supplied absolute deadline.  Keeping the
+/// deadline conversion at this one boundary makes the directed-handshake and
+/// status/lifecycle callers testable without a wall-clock race: a withheld
+/// reply with an expired deadline has a zero receive budget.
+fn receive_qualification_reply_until<T>(
+    replies: &Receiver<T>,
+    deadline: Instant,
+) -> Result<T, RecvTimeoutError> {
+    replies.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+}
+
 struct ChildNode {
     child: Child,
     stdin: Option<BufWriter<ChildStdin>>,
@@ -2475,12 +2605,18 @@ struct ChildNode {
 }
 
 impl ChildNode {
-    fn spawn(config: &Path, node_index: usize, stderr: &Path) -> (Self, SocketAddr) {
+    fn spawn(
+        config: &Path,
+        node_index: usize,
+        stderr: &Path,
+        snapshot_leaf: Option<&PinnedV9SnapshotLeaf>,
+    ) -> (Self, SocketAddr) {
         Self::spawn_bound(
             config,
             node_index,
             stderr,
             "127.0.0.1:0".parse().expect("loopback qualification bind"),
+            snapshot_leaf,
         )
     }
 
@@ -2489,6 +2625,7 @@ impl ChildNode {
         node_index: usize,
         stderr_path: &Path,
         bind_addr: SocketAddr,
+        snapshot_leaf: Option<&PinnedV9SnapshotLeaf>,
     ) -> (Self, SocketAddr) {
         Self::spawn_bound_until(
             config,
@@ -2496,6 +2633,7 @@ impl ChildNode {
             stderr_path,
             bind_addr,
             Instant::now() + CHILD_TIMEOUT,
+            snapshot_leaf,
         )
     }
 
@@ -2505,6 +2643,7 @@ impl ChildNode {
         stderr_path: &Path,
         bind_addr: SocketAddr,
         deadline: Instant,
+        snapshot_leaf: Option<&PinnedV9SnapshotLeaf>,
     ) -> (Self, SocketAddr) {
         let stderr = OpenOptions::new()
             .create(true)
@@ -2512,7 +2651,8 @@ impl ChildNode {
             .mode(0o600)
             .open(stderr_path)
             .expect("open qualification stderr");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_opc-session-quorum-node"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_opc-session-quorum-node"));
+        command
             .arg("--config")
             .arg(config)
             .arg("--node-index")
@@ -2521,9 +2661,25 @@ impl ChildNode {
             .arg(bind_addr.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("spawn mTLS qualification node");
+            .stderr(Stdio::from(stderr));
+        if let Some(leaf) = snapshot_leaf {
+            // Only this one descriptor loses CLOEXEC while this exact child
+            // is spawned.  The parent immediately restores CLOEXEC, keeps
+            // the owned descriptor for restart, and never exports a pathname
+            // capability to the child.
+            fcntl_setfd(leaf.inherited_descriptor(), FdFlags::empty())
+                .expect("make V9 snapshot leaf descriptor inheritable");
+            command.env(
+                V9_PINNED_SNAPSHOT_DIRECTORY_FD_ENV,
+                leaf.inherited_descriptor().as_raw_fd().to_string(),
+            );
+        }
+        let child_result = command.spawn();
+        if let Some(leaf) = snapshot_leaf {
+            fcntl_setfd(leaf.inherited_descriptor(), FdFlags::CLOEXEC)
+                .expect("restore V9 snapshot leaf descriptor close-on-exec");
+        }
+        let mut child = child_result.expect("spawn mTLS qualification node");
         let stdin = child.stdin.take().expect("qualification child stdin");
         let stdout = child.stdout.take().expect("qualification child stdout");
         let (sender, replies) = mpsc::sync_channel(32);
@@ -2598,14 +2754,21 @@ impl ChildNode {
     }
 
     fn receive_until(&mut self, deadline: Instant) -> QualificationNodeReply {
-        self.receive_with_timeout(deadline.saturating_duration_since(Instant::now()))
+        self.receive_result(receive_qualification_reply_until(&self.replies, deadline))
     }
 
     fn receive_with_timeout(&mut self, timeout: Duration) -> QualificationNodeReply {
+        self.receive_result(self.replies.recv_timeout(timeout))
+    }
+
+    fn receive_result(
+        &mut self,
+        result: Result<ReaderMessage, RecvTimeoutError>,
+    ) -> QualificationNodeReply {
         let pending = self
             .pending
             .expect("qualification child response requested without a pending command");
-        match self.replies.recv_timeout(timeout) {
+        match result {
             Ok(ReaderMessage::Reply(reply)) => {
                 self.pending = None;
                 *reply
@@ -2974,6 +3137,10 @@ struct Fleet {
     // The immutable snapshot namespace has a distinct lifecycle from mutable
     // workspace files, but must survive until every child has stopped.
     _snapshot_namespace: Option<PinnedV9SnapshotNamespace>,
+    // One descriptor-pinned snapshot leaf per logical voter.  A replacement
+    // process inherits only its own leaf descriptor, so restart cannot turn a
+    // prior pathname validation into authority over a same-UID replacement.
+    _snapshot_leaves: Vec<PinnedV9SnapshotLeaf>,
     config_paths: Vec<PathBuf>,
     stderr_paths: Vec<PathBuf>,
     projected_roots: Vec<PathBuf>,
@@ -3049,6 +3216,122 @@ impl PinnedV9SnapshotNamespace {
         }
         Ok(())
     }
+
+    fn create_leaf(&self, node_index: usize) -> io::Result<PinnedV9SnapshotLeaf> {
+        self.verify()?;
+        let name = format!("node-{node_index}");
+        mkdirat(&self.descriptor, name.as_str(), Mode::from_raw_mode(0o700))?;
+        let descriptor = openat(
+            &self.descriptor,
+            name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let metadata = fstat(&descriptor)?;
+        if !FileType::from_raw_mode(metadata.st_mode).is_dir()
+            || metadata.st_uid != rustix::process::geteuid().as_raw()
+            || Mode::from_raw_mode(metadata.st_mode).bits() & 0o7777 != 0o700
+        {
+            return Err(io::Error::other(
+                "V9 fs-verity snapshot leaf was not created owner-private",
+            ));
+        }
+        let leaf = PinnedV9SnapshotLeaf {
+            path: self.path().join(name),
+            descriptor,
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino as u64,
+        };
+        leaf.verify(self)?;
+        Ok(leaf)
+    }
+}
+
+/// One fixed V9 snapshot leaf. The parent retains this descriptor for the
+/// whole campaign and lends it to the corresponding child only across exec.
+/// All later child store admission starts from `/proc/self/fd/<n>/.`, never
+/// from the JSON pathname. The final dot preserves store-side O_NOFOLLOW while
+/// traversing the pinned descriptor as an intermediate component.
+struct PinnedV9SnapshotLeaf {
+    path: PathBuf,
+    descriptor: OwnedFd,
+    device: u64,
+    inode: u64,
+}
+
+impl PinnedV9SnapshotLeaf {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn verify(&self, namespace: &PinnedV9SnapshotNamespace) -> io::Result<()> {
+        namespace.verify()?;
+        let descriptor = fstat(&self.descriptor)?;
+        let metadata = fs::symlink_metadata(self.path())?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o7777 != 0o700
+            || descriptor.st_dev as u64 != self.device
+            || descriptor.st_ino as u64 != self.inode
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || fs::canonicalize(self.path())? != self.path
+            || self.path.parent() != Some(namespace.path())
+        {
+            return Err(io::Error::other(
+                "V9 fs-verity snapshot leaf identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn inherited_descriptor(&self) -> &OwnedFd {
+        &self.descriptor
+    }
+}
+
+fn create_v9_snapshot_campaign_directory(
+    base_descriptor: &OwnedFd,
+) -> io::Result<(String, OwnedFd)> {
+    for _ in 0..32 {
+        let mut entropy = [0_u8; 16];
+        File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+        let sequence = CANDIDATE_STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            "opc-v9-snapshots-{:032x}-{}-{sequence}",
+            u128::from_be_bytes(entropy),
+            std::process::id(),
+        );
+        match mkdirat(base_descriptor, name.as_str(), Mode::from_raw_mode(0o700)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+        let descriptor = openat(
+            base_descriptor,
+            name.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let metadata = fstat(&descriptor)?;
+        if FileType::from_raw_mode(metadata.st_mode).is_dir()
+            && metadata.st_uid == rustix::process::geteuid().as_raw()
+            && Mode::from_raw_mode(metadata.st_mode).bits() & 0o7777 == 0o700
+        {
+            return Ok((name, descriptor));
+        }
+        // This object was created by our descriptor-relative mkdirat call,
+        // but it may have been renamed or replaced before inspection.  Do not
+        // clean through a pathname that could now name an attacker object.
+        return Err(io::Error::other(
+            "V9 fs-verity snapshot campaign was not created owner-private",
+        ));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "V9 fs-verity snapshot campaign namespace is exhausted",
+    ))
 }
 
 fn stateless_consumer_voter_topology_for_configuration(
@@ -3186,24 +3469,15 @@ impl Fleet {
         let base_metadata = fstat(&base_descriptor).expect("fstat fs-verity snapshot root");
         assert_eq!(base_metadata.st_dev as u64, root.device);
         assert_eq!(base_metadata.st_ino as u64, root.inode);
-        let namespace = tempfile::Builder::new()
-            .prefix("opc-v9-snapshots-")
-            .tempdir_in(&root.directory)
-            .expect("create private V9 fs-verity snapshot namespace");
-        let namespace_name = namespace
-            .path()
-            .file_name()
-            .expect("fresh V9 fs-verity namespace direct name");
-        let descriptor = openat(
-            &base_descriptor,
-            namespace_name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .expect("open no-follow V9 fs-verity snapshot namespace");
+        // Create the campaign through the pinned configured-root descriptor.
+        // `mkdirat(..., 0700)` avoids tempfile's path reopen and its former
+        // transient umask mode; opening the direct child with NOFOLLOW binds
+        // the descriptor before it is ever named in child configuration.
+        let (namespace_name, descriptor) = create_v9_snapshot_campaign_directory(&base_descriptor)
+            .expect("create descriptor-pinned private V9 fs-verity snapshot namespace");
         let descriptor_metadata =
             fstat(&descriptor).expect("fstat V9 fs-verity snapshot namespace");
-        let namespace = namespace.keep();
+        let namespace = root.directory.join(namespace_name);
         let metadata =
             fs::symlink_metadata(&namespace).expect("stat private V9 fs-verity snapshot namespace");
         assert!(
@@ -3291,6 +3565,15 @@ impl Fleet {
                 .verify()
                 .expect("revalidate V9 fs-verity snapshot namespace before child configuration");
         }
+        let snapshot_leaves = snapshot_namespace
+            .as_ref()
+            .map(|namespace| {
+                (0..member_count)
+                    .map(|node_index| namespace.create_leaf(node_index))
+                    .collect::<io::Result<Vec<_>>>()
+                    .expect("create descriptor-pinned private V9 fs-verity snapshot leaves")
+            })
+            .unwrap_or_default();
         let root = workspace.path();
         let mut configs = Vec::with_capacity(member_count);
         let mut nodes = Vec::with_capacity(member_count);
@@ -3301,7 +3584,12 @@ impl Fleet {
             fs::create_dir(&node_root).expect("create qualification node directory");
             let config = node_root.join("config.json");
             let stderr = node_root.join("stderr.log");
-            let (node, address) = ChildNode::spawn(&config, node_index, &stderr);
+            let (node, address) = ChildNode::spawn(
+                &config,
+                node_index,
+                &stderr,
+                snapshot_leaves.get(node_index),
+            );
             configs.push(config);
             nodes.push(node);
             addresses.push(address);
@@ -3330,16 +3618,18 @@ impl Fleet {
         for (node_index, config_path) in configs.iter().enumerate() {
             let node_root = root.join(format!("node-{node_index}"));
             let projected_root = node_root.join("projected");
-            let snapshots = snapshot_namespace
-                .as_ref()
-                .map(|namespace| namespace.path().join(format!("node-{node_index}")))
+            let snapshots = snapshot_leaves
+                .get(node_index)
+                .map(|leaf| leaf.path().to_path_buf())
                 .unwrap_or_else(|| node_root.join("snapshots"));
             let database_path = node_root.join("session.sqlite");
             fs::create_dir(&projected_root).expect("create projected root");
-            fs::create_dir(&snapshots).expect("create snapshots root");
-            if snapshot_namespace.is_some() {
-                fs::set_permissions(&snapshots, Permissions::from_mode(0o700))
-                    .expect("make V9 fs-verity snapshot leaf owner private");
+            if let Some(namespace) = &snapshot_namespace {
+                snapshot_leaves[node_index]
+                    .verify(namespace)
+                    .expect("revalidate descriptor-pinned V9 fs-verity snapshot leaf");
+            } else {
+                fs::create_dir(&snapshots).expect("create snapshots root");
             }
             let initial_credential = pki.credential(node_index, CredentialGeneration::Initial);
             let initial_trust = pki.trust_bundle(TrustGeneration::OldOnly);
@@ -3414,6 +3704,10 @@ impl Fleet {
             namespace
                 .verify()
                 .expect("revalidate V9 fs-verity snapshot namespace before child startup");
+            for leaf in &snapshot_leaves {
+                leaf.verify(namespace)
+                    .expect("revalidate V9 fs-verity snapshot leaf before child startup");
+            }
         }
 
         // Bound the process-heavy store/transport startup to one child at a
@@ -3448,6 +3742,7 @@ impl Fleet {
             nodes,
             workspace,
             _snapshot_namespace: snapshot_namespace,
+            _snapshot_leaves: snapshot_leaves,
             config_paths: configs,
             stderr_paths,
             projected_roots,
@@ -3482,6 +3777,20 @@ impl Fleet {
             namespace
                 .verify()
                 .expect("V9 fs-verity snapshot namespace changed during campaign");
+            assert_eq!(
+                self._snapshot_leaves.len(),
+                self.nodes.len(),
+                "V9 campaign must retain one pinned snapshot leaf per child"
+            );
+            for leaf in &self._snapshot_leaves {
+                leaf.verify(namespace)
+                    .expect("V9 fs-verity snapshot leaf changed during campaign");
+            }
+        } else {
+            assert!(
+                self._snapshot_leaves.is_empty(),
+                "ordinary qualification must not retain V9 snapshot descriptors"
+            );
         }
     }
 
@@ -3847,6 +4156,7 @@ impl Fleet {
             &self.stderr_paths[node_index],
             expected_address,
             deadline,
+            self._snapshot_leaves.get(node_index),
         );
         assert_eq!(actual_address, expected_address);
         self.nodes[node_index] = node;
@@ -4160,11 +4470,12 @@ impl Fleet {
         );
         assert_eq!(
             (
+                resumed_node.availability_interruption_episodes,
                 resumed_node.availability_interruptions,
                 resumed_node.availability_recoveries,
                 resumed_node.max_consecutive_availability_interruptions,
             ),
-            (0, 0, 0),
+            (0, 0, 0, 0),
             "a recovered committed generation rearmed the once-per-mutator synthetic response-loss fault"
         );
         assert!(
@@ -4576,6 +4887,10 @@ impl Fleet {
         deadline: Instant,
     ) -> Vec<QualificationConnectionLifecycleMetrics> {
         for node in &mut self.nodes {
+            assert!(
+                deadline_allows_completion(Instant::now(), deadline),
+                "lifecycle metrics command would start after its absolute deadline"
+            );
             node.send(&QualificationNodeCommand::LifecycleMetrics);
         }
         self.nodes
@@ -4908,6 +5223,10 @@ impl Fleet {
         )
         .expect("valid bounded traffic status participants");
         for node_index in node_indices {
+            assert!(
+                deadline_allows_completion(Instant::now(), deadline),
+                "traffic status command would start after its absolute deadline: node={node_index}"
+            );
             self.nodes[*node_index].send(&QualificationNodeCommand::TrafficStatus);
         }
         node_indices
@@ -4930,10 +5249,6 @@ impl Fleet {
                 }
             })
             .collect()
-    }
-
-    fn traffic_status_snapshots_on(&mut self, node_indices: &[usize]) -> Vec<IndexedTrafficStatus> {
-        self.traffic_status_snapshots_on_by(node_indices, Instant::now() + CHILD_TIMEOUT)
     }
 
     fn traffic_status_snapshots_on_by(
@@ -5121,10 +5436,11 @@ impl Fleet {
             availability_baseline,
             participants,
         ));
-        assert!(subset_traffic_availability_is_settled(
-            availability_baseline,
-            participants,
-        ));
+        assert!(
+            subset_traffic_availability_is_settled(availability_baseline, participants),
+            "recovered-member continuity requires a settled availability baseline: phase={phase}, baseline={availability_baseline:?}, stderr={:?}",
+            self.stderr_diagnostics()
+        );
         assert!(traffic_status_snapshot_matches(
             &progress.pulse_checkpoint,
             participants,
@@ -5134,10 +5450,17 @@ impl Fleet {
             participants,
         ));
         loop {
-            let traffic = self.traffic_status_snapshots_on_by(
-                &participants.observers,
-                progress.next_deadline(absolute_deadline),
+            let observation_deadline = progress.next_deadline(absolute_deadline);
+            let observation_started = Instant::now();
+            assert!(
+                observation_started < observation_deadline,
+                "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
+                progress.pulse_checkpoint,
+                progress.coverage_checkpoint,
+                self.stderr_diagnostics()
             );
+            let traffic =
+                self.traffic_status_snapshots_on_by(&participants.observers, observation_deadline);
             let traffic_observed_at = Instant::now();
             for indexed in &traffic {
                 assert_ne!(
@@ -5263,6 +5586,42 @@ impl Fleet {
         }
     }
 
+    fn recovery_traffic_command_deadline(
+        &mut self,
+        availability_baseline: &[IndexedTrafficStatus],
+        progress: &mut RecoveryTrafficProgressTracker,
+        participants: &TrafficParticipants,
+        phase: &str,
+        absolute_deadline: Instant,
+    ) -> Instant {
+        loop {
+            let now = Instant::now();
+            assert!(
+                deadline_admits_complete_operation(now, absolute_deadline),
+                "recovered-member command exhausted its absolute operation budget: phase={phase}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
+            match recovery_traffic_command_plan(now, progress.next_deadline(absolute_deadline)) {
+                RecoveryTrafficCommandPlan::DispatchBy(command_deadline) => {
+                    return command_deadline;
+                }
+                RecoveryTrafficCommandPlan::RefreshProgress => {
+                    // This is one common passive observation for the entire
+                    // survivor-origin wave. It refreshes both rolling
+                    // checkpoints before any command can consume the status
+                    // observation headroom reserved above.
+                    self.wait_for_recovery_traffic_progress(
+                        availability_baseline,
+                        progress,
+                        participants,
+                        phase,
+                        absolute_deadline,
+                    );
+                }
+            }
+        }
+    }
+
     fn wait_for_recovery_readiness(
         &mut self,
         availability_baseline: &[IndexedTrafficStatus],
@@ -5383,12 +5742,12 @@ impl Fleet {
             participants,
         ));
         loop {
-            let traffic = self.traffic_statuses_on(&participants.observers);
+            let traffic = self.traffic_statuses_on_by(&participants.observers, deadline);
             // TrafficStatus performs a protected backend observation and may
             // exercise consensus transport. Sample lifecycle only after those
             // calls so a drain or classified failure they trigger cannot be
             // hidden behind a stale pre-status snapshot.
-            let lifecycle = self.all_lifecycle_metrics();
+            let lifecycle = self.all_lifecycle_metrics_by(deadline);
             for indexed in &traffic {
                 assert_ne!(
                     indexed.status.state,
@@ -5440,7 +5799,11 @@ impl Fleet {
                 "recovered-member lifecycle or survivor availability remained unsettled: phase={phase}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
                 self.stderr_diagnostics()
             );
-            thread::sleep(Duration::from_millis(20));
+            assert!(
+                sleep_until_deadline(deadline, Duration::from_millis(20)),
+                "recovered-member lifecycle retry exhausted its absolute deadline: phase={phase}, traffic={traffic:?}, lifecycle={lifecycle:?}, stderr={:?}",
+                self.stderr_diagnostics()
+            );
         }
     }
 
@@ -6190,16 +6553,98 @@ impl Fleet {
         absolute_deadline: Instant,
     ) {
         assert!(member < self.member_count());
-        let generations_before = self
-            .all_reauthentication_generations_by(traffic_progress.next_deadline(absolute_deadline));
-        let paths = member_incident_directed_paths(self.member_count(), member);
+        let generation_deadline = self.recovery_traffic_command_deadline(
+            availability_baseline,
+            traffic_progress,
+            participants,
+            "existing-generation-before-survivor-origin-wave",
+            absolute_deadline,
+        );
+        let generations_before = self.all_reauthentication_generations_by(generation_deadline);
+        let paths = member_recovery_directed_paths(self.member_count(), member);
         assert_eq!(paths.len(), 2 * (self.member_count() - 1));
-        for (source, target) in paths {
-            let progress_deadline = traffic_progress.next_deadline(absolute_deadline);
+        let mut survivor_pending = (0..self.member_count())
+            .map(|source| source != member)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            survivor_pending.iter().filter(|pending| **pending).count(),
+            self.member_count() - 1,
+            "the survivor-origin recovery wave has one distinct pending command per survivor"
+        );
+        while survivor_pending.iter().any(|pending| *pending) {
+            let wave_deadline = self.recovery_traffic_command_deadline(
+                availability_baseline,
+                traffic_progress,
+                participants,
+                "existing-generation-survivor-origin-wave",
+                absolute_deadline,
+            );
+            let mut replies =
+                Vec::with_capacity(survivor_pending.iter().filter(|pending| **pending).count());
+            for_each_pending_command_in_wave(&survivor_pending, |source, stage| match stage {
+                PendingCommandWaveStage::Dispatch => {
+                    self.nodes[source].send(&QualificationNodeCommand::DirectedHandshake {
+                        remote_node_index: member,
+                    });
+                }
+                PendingCommandWaveStage::Collect => {
+                    replies.push((source, self.nodes[source].receive_until(wave_deadline)));
+                }
+            });
+            for (source, reply) in replies {
+                match reply {
+                    QualificationNodeReply::DirectedHandshake {
+                        remote_node_index,
+                        reauthentication_generation,
+                    } => {
+                        assert_eq!(remote_node_index, member);
+                        assert_eq!(reauthentication_generation, generations_before[source]);
+                        survivor_pending[source] = false;
+                    }
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::DirectedHandshakeUnavailable,
+                    } if deadline_allows_completion(Instant::now(), wave_deadline) => {}
+                    reply => panic!(
+                        "survivor-origin existing-generation handshake {source}->{member} failed: {reply:?}, source_stderr={}, target_stderr={}",
+                        self.node_stderr(source),
+                        self.node_stderr(member)
+                    ),
+                }
+            }
+            if survivor_pending.iter().any(|pending| *pending) {
+                assert!(
+                    deadline_allows_completion(Instant::now(), wave_deadline),
+                    "survivor-origin recovery wave crossed its operation boundary: member={member}, pending={survivor_pending:?}, stderr={:?}",
+                    self.stderr_diagnostics()
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // The survivor-origin commands all run in one bounded pending-command
+        // wave before this common passive workload pulse. In particular, no
+        // early survivor retry or pulse can head-of-line block another
+        // survivor's first command while its remote-retirement gate is live.
+        self.wait_for_recovery_traffic_progress(
+            availability_baseline,
+            traffic_progress,
+            participants,
+            "existing-generation-survivor-origin-wave",
+            absolute_deadline,
+        );
+        // Recovered-origin paths use the recovered process's one command lane
+        // and remain sequential, with their existing bounded passive pulses.
+        for target in (0..self.member_count()).filter(|target| *target != member) {
+            let progress_deadline = self.recovery_traffic_command_deadline(
+                availability_baseline,
+                traffic_progress,
+                participants,
+                "existing-generation-incident-path",
+                absolute_deadline,
+            );
             self.wait_for_directed_handshake_by(
-                source,
+                member,
                 target,
-                generations_before[source],
+                generations_before[member],
                 progress_deadline,
             );
             self.wait_for_recovery_traffic_progress(
@@ -6210,8 +6655,14 @@ impl Fleet {
                 absolute_deadline,
             );
         }
-        let generations_after = self
-            .all_reauthentication_generations_by(traffic_progress.next_deadline(absolute_deadline));
+        let generation_deadline = self.recovery_traffic_command_deadline(
+            availability_baseline,
+            traffic_progress,
+            participants,
+            "existing-generation-after-survivor-origin-wave",
+            absolute_deadline,
+        );
+        let generations_after = self.all_reauthentication_generations_by(generation_deadline);
         assert_eq!(
             generations_after, generations_before,
             "fault-boundary path proof advanced an explicit reauthentication generation"
@@ -6242,7 +6693,7 @@ impl Fleet {
             "recovered-member reauthentication generation did not advance exactly once"
         );
 
-        for (source, target) in member_incident_directed_paths(self.member_count(), member) {
+        for (source, target) in member_recovery_directed_paths(self.member_count(), member) {
             let expected_generation = if source == member {
                 member_generation
             } else {
@@ -6283,13 +6734,6 @@ impl Fleet {
         } = context;
         assert!(!participants.observers.contains(&member));
         self.assert_all_material_ready_by(traffic_progress.next_deadline(recovery_deadline));
-        self.wait_for_recovery_traffic_progress(
-            traffic_availability_baseline,
-            &mut traffic_progress,
-            participants,
-            "replacement-material-ready",
-            recovery_deadline,
-        );
         self.prove_recovered_member_paths_at_current_generation(
             member,
             traffic_availability_baseline,
@@ -6435,9 +6879,16 @@ impl Fleet {
         deadline: Instant,
     ) {
         loop {
-            match self.nodes[source].invoke(&QualificationNodeCommand::DirectedHandshake {
-                remote_node_index: target,
-            }) {
+            assert!(
+                deadline_allows_completion(Instant::now(), deadline),
+                "directed current-generation handshake {source}->{target} would start after its absolute deadline"
+            );
+            match self.nodes[source].invoke_until(
+                &QualificationNodeCommand::DirectedHandshake {
+                    remote_node_index: target,
+                },
+                deadline,
+            ) {
                 QualificationNodeReply::DirectedHandshake {
                     remote_node_index,
                     reauthentication_generation,
@@ -6453,7 +6904,10 @@ impl Fleet {
                 QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::DirectedHandshakeUnavailable,
                 } if deadline_allows_completion(Instant::now(), deadline) => {
-                    thread::sleep(Duration::from_millis(20));
+                    assert!(
+                        sleep_until_deadline(deadline, Duration::from_millis(20)),
+                        "directed current-generation handshake {source}->{target} retry exhausted its absolute deadline"
+                    );
                 }
                 reply => panic!(
                     "directed current-generation handshake {source}->{target} failed: {reply:?}, source_stderr={}, target_stderr={}",
@@ -7423,6 +7877,7 @@ const CANDIDATE_GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const CANDIDATE_GIT_TERMINATE_GRACE: Duration = Duration::from_millis(250);
 const CANDIDATE_GIT_PIPE_POLL: Duration = Duration::from_millis(5);
 const MAX_CANDIDATE_GIT_STDERR_BYTES: u64 = 8 * 1024;
+const LINUX_EXECUTABLE_FILE_BUSY_OS_ERROR: i32 = 26;
 
 struct BoundedCandidateGitOutput {
     status: std::process::ExitStatus,
@@ -7454,6 +7909,7 @@ fn bounded_candidate_git_command_output(
     command: &mut Command,
     maximum_stdout_bytes: u64,
 ) -> io::Result<BoundedCandidateGitOutput> {
+    let deadline = Instant::now() + CANDIDATE_GIT_COMMAND_TIMEOUT;
     // This creates a fresh process group before exec whose PGID is exactly
     // the child PID; only that freshly-created group is ever signalled below.
     command.process_group(0);
@@ -7461,7 +7917,28 @@ fn bounded_candidate_git_command_output(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if error.raw_os_error() == Some(LINUX_EXECUTABLE_FILE_BUSY_OS_ERROR)
+                    && Instant::now() < deadline =>
+            {
+                // GitHub-hosted storage can transiently retain an external
+                // writable reference to a newly published executable. Retry
+                // only Linux ETXTBSY and charge every retry to the existing
+                // complete command budget; every other spawn error remains
+                // immediately fail-closed.
+                thread::sleep(
+                    CANDIDATE_GIT_PIPE_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let process_group = rustix::process::Pid::from_child(&child);
     let stop_readers = Arc::new(AtomicBool::new(false));
     let stdout = match child.stdout.take() {
@@ -7527,7 +8004,6 @@ fn bounded_candidate_git_command_output(
             return Err(io::Error::other("start bounded candidate Git pipe reader"));
         }
     };
-    let deadline = Instant::now() + CANDIDATE_GIT_COMMAND_TIMEOUT;
     let mut status = None;
     let mut stdout = None;
     let mut stderr = None;
@@ -9871,7 +10347,7 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
     let traffic_after_hard_expiry_boundary = fleet.traffic_statuses_on(&expiry_survivor_indices);
     let hard_traffic_deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     fleet.advance_canary_for_survivors(expiring_node_index, "short-lived-svid-expired");
-    fleet.wait_for_subset_traffic_progress(
+    let traffic_after_hard_expiry = fleet.wait_for_subset_traffic_progress(
         &traffic_after_hard_expiry_boundary,
         &expiry_survivor_traffic,
         "survivor-traffic-through-hard-expiry",
@@ -9898,20 +10374,27 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         }
     ));
 
+    // The directed survivor-to-expired negative above traverses the same
+    // authenticated consensus lanes as live traffic. It can therefore open a
+    // recoverable availability episode while the remote-retirement probe gate
+    // is pending. Prove that episode resolved, and that traffic advanced, under
+    // the already-started hard-expiry deadline before defining the clean
+    // replacement baseline.
+    let replacement_traffic_baseline = fleet.wait_for_subset_traffic_progress(
+        &traffic_after_hard_expiry,
+        &expiry_survivor_traffic,
+        "survivor-traffic-after-expired-path-negatives",
+        hard_traffic_deadline,
+    );
     let replacement_source_before = fleet.projected_status(expiring_node_index);
     let replacement_controller_before = fleet.material_status(expiring_node_index);
-    let replacement_traffic_baseline =
-        fleet.traffic_status_snapshots_on(&expiry_survivor_traffic.observers);
-    let mut replacement_traffic_progress =
+    let replacement_traffic_progress =
         RecoveryTrafficProgressTracker::new(replacement_traffic_baseline.clone(), Instant::now());
-    let prepublication_progress_deadline = replacement_traffic_progress.pulse_deadline();
-    fleet.wait_for_recovery_traffic_progress(
-        &replacement_traffic_baseline,
-        &mut replacement_traffic_progress,
-        &expiry_survivor_traffic,
-        "replacement-prepublication-progress",
-        prepublication_progress_deadline,
-    );
+    // `wait_for_subset_traffic_progress` above already proved the stronger
+    // every-key/every-observer pulse with healthy tasks and settled
+    // availability after the directed negatives. Carry that exact clean
+    // checkpoint into replacement publication instead of discarding it and
+    // demanding an unrelated second prepublication pulse.
     let publication_stage_deadline =
         replacement_traffic_progress.next_deadline(replacement_traffic_progress.pulse_deadline());
     let replacement_recovery_started = fleet.publish_known_projected_generation(
@@ -9931,13 +10414,6 @@ fn run_projected_mtls_fault_and_expiry_recovery(member_count: usize) {
         replacement_source_before.generation,
         replacement_controller_before.epoch,
         replacement_traffic_progress.next_deadline(replacement_recovery_deadline),
-    );
-    fleet.wait_for_recovery_traffic_progress(
-        &replacement_traffic_baseline,
-        &mut replacement_traffic_progress,
-        &expiry_survivor_traffic,
-        "replacement-publication",
-        replacement_recovery_deadline,
     );
     emit_fixed_lifecycle_connection_snapshot(
         "replacement_publication",
@@ -10803,6 +11279,40 @@ fn bounded_candidate_git_runner_returns_success_and_rejects_output_overflow() {
 }
 
 #[test]
+fn bounded_candidate_git_runner_retries_transient_linux_executable_busy_inside_fixed_budget() {
+    let workspace = tempfile::tempdir().expect("create executable-busy Git helper workspace");
+    let helper = workspace.path().join("fake-git");
+    write_candidate_git_helper_script(&helper, b"#!/bin/sh\nprintf 'retry-output'\n");
+    let writable_helper = OpenOptions::new()
+        .write(true)
+        .open(&helper)
+        .expect("hold Git helper executable open for writing");
+    let first_spawn = Command::new(&helper)
+        .status()
+        .expect_err("a writable executable inode must reject execve with ETXTBSY");
+    assert_eq!(
+        first_spawn.raw_os_error(),
+        Some(LINUX_EXECUTABLE_FILE_BUSY_OS_ERROR)
+    );
+    let release_writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(25));
+        drop(writable_helper);
+    });
+
+    let started = Instant::now();
+    let output = bounded_candidate_git_command_output(&mut Command::new(&helper), 64)
+        .expect("bounded Git runner retries transient ETXTBSY");
+    release_writer.join().expect("release executable writer");
+    assert!(
+        started.elapsed() < CANDIDATE_GIT_COMMAND_TIMEOUT,
+        "ETXTBSY retries must consume rather than extend the fixed command budget"
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"retry-output");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn bounded_candidate_git_runner_retains_early_stdout_until_late_stderr_and_exit() {
     let workspace = tempfile::tempdir().expect("create asymmetric Git helper workspace");
     let helper = workspace.path().join("fake-git");
@@ -10908,6 +11418,82 @@ fn v9_external_namespace_is_owner_private_nofollow_and_no_clobber() {
     let link = workspace.path().join("linked-evidence");
     symlink(&root, &link).expect("create hostile evidence-root symlink");
     assert!(v9_open_private_external_root(&link).is_err());
+}
+
+#[test]
+fn v9_snapshot_campaign_and_leaf_are_private_and_descriptor_pinned_across_replacement() {
+    let _fleet = FLEET_TEST_LOCK
+        .lock()
+        .expect("serialize V9 snapshot namespace creation");
+    let workspace = tempfile::tempdir().expect("create V9 snapshot workspace");
+    let root = workspace.path().join("fs-verity-root");
+    fs::create_dir(&root).expect("create V9 snapshot root");
+    fs::set_permissions(&root, Permissions::from_mode(0o700))
+        .expect("make V9 snapshot root owner-private");
+    let base = fs::canonicalize(&root).expect("canonical V9 snapshot root");
+    let base_descriptor = v9_open_private_external_root(&base).expect("open V9 snapshot root");
+    let base_metadata = fstat(&base_descriptor).expect("fstat V9 snapshot root");
+
+    // This precise umask witnesses that mkdirat(..., 0700), unlike the old
+    // tempfile/pathwise leaf setup, never exposes a transient 0755 campaign
+    // or leaf under the common runner default.
+    let previous_umask = umask(Mode::from_raw_mode(0o022));
+    let campaign = create_v9_snapshot_campaign_directory(&base_descriptor);
+    umask(previous_umask);
+    let (campaign_name, descriptor) = campaign.expect("mkdirat private V9 campaign");
+    let campaign_metadata = fstat(&descriptor).expect("fstat private V9 campaign");
+    assert_eq!(
+        Mode::from_raw_mode(campaign_metadata.st_mode).bits() & 0o7777,
+        0o700,
+        "mkdirat campaign creation is exactly owner-private under umask 0022"
+    );
+    let namespace = PinnedV9SnapshotNamespace {
+        namespace: base.join(campaign_name),
+        base,
+        base_descriptor,
+        base_device: base_metadata.st_dev as u64,
+        base_inode: base_metadata.st_ino as u64,
+        descriptor,
+        device: campaign_metadata.st_dev as u64,
+        inode: campaign_metadata.st_ino as u64,
+    };
+    namespace.verify().expect("pin V9 campaign namespace");
+    let previous_umask = umask(Mode::from_raw_mode(0o022));
+    let leaf = namespace.create_leaf(0);
+    umask(previous_umask);
+    let leaf = leaf.expect("mkdirat private V9 leaf");
+    let leaf_metadata = fstat(leaf.inherited_descriptor()).expect("fstat private V9 leaf");
+    assert_eq!(
+        Mode::from_raw_mode(leaf_metadata.st_mode).bits() & 0o7777,
+        0o700,
+        "mkdirat leaf creation is exactly owner-private under umask 0022"
+    );
+    leaf.verify(&namespace)
+        .expect("initial V9 snapshot leaf identity is pinned");
+
+    let detached = namespace.path().join("node-0-detached");
+    fs::rename(leaf.path(), &detached).expect("detach validated V9 snapshot leaf");
+    mkdirat(&namespace.descriptor, "node-0", Mode::from_raw_mode(0o700))
+        .expect("create same-name V9 snapshot replacement");
+    assert!(
+        leaf.verify(&namespace).is_err(),
+        "same-UID replacement between pathname validation and use must fail closed"
+    );
+    let restarted = open(
+        PathBuf::from(format!(
+            "/proc/self/fd/{}/.",
+            leaf.inherited_descriptor().as_raw_fd()
+        )),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("store-style no-follow restart reopens exact inherited V9 leaf");
+    let restarted_metadata = fstat(&restarted).expect("fstat restarted V9 snapshot leaf");
+    assert_eq!(
+        (restarted_metadata.st_dev, restarted_metadata.st_ino),
+        (leaf_metadata.st_dev, leaf_metadata.st_ino),
+        "restart retains the original pinned V9 leaf instead of the same-name replacement"
+    );
 }
 
 #[test]
@@ -18564,6 +19150,7 @@ fn traffic_status_fixture(member_count: usize) -> QualificationTrafficStatus {
         linearizable_reads: 11,
         lease_renewals: 11,
         lease_reacquisitions: 10,
+        availability_interruption_episodes: 1,
         availability_interruptions: 1,
         availability_recoveries: 1,
         max_consecutive_availability_interruptions: 1,
@@ -18665,8 +19252,8 @@ fn traffic_progress_rejects_unresolved_or_incoherent_availability_evidence() {
     }
 
     let mut unresolved = after.clone();
+    unresolved.availability_interruption_episodes += 1;
     unresolved.availability_interruptions += 1;
-    unresolved.max_consecutive_availability_interruptions += 1;
     assert!(traffic_live_mutator_counters_are_consistent(&unresolved));
     assert!(!traffic_availability_recovery_is_resolved(&unresolved));
     assert!(!traffic_status_made_semantic_progress(
@@ -18678,6 +19265,7 @@ fn traffic_progress_rejects_unresolved_or_incoherent_availability_evidence() {
     let mut impossible = after.clone();
     impossible.availability_interruptions = 1;
     impossible.availability_recoveries = 1;
+    impossible.availability_interruption_episodes = 1;
     impossible.max_consecutive_availability_interruptions = 0;
     assert!(!traffic_live_mutator_counters_are_consistent(&impossible));
 
@@ -18725,6 +19313,24 @@ fn member_recovery_scope_preserves_unrelated_survivor_generations_and_retirement
         .iter()
         .any(|(source, target)| *source == 0 && *target == 2));
 
+    assert_eq!(
+        member_recovery_directed_paths(3, member),
+        vec![(0, 1), (2, 1), (1, 0), (1, 2)]
+    );
+    assert_eq!(
+        member_recovery_directed_paths(5, member),
+        vec![
+            (0, 1),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (1, 0),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+        ]
+    );
+
     let before = vec![lifecycle_metrics_fixture(); 5];
     let mut after = before.clone();
     after[member].retirement_explicit += 1;
@@ -18739,6 +19345,94 @@ fn member_recovery_scope_preserves_unrelated_survivor_generations_and_retirement
 }
 
 #[test]
+fn member_recovery_survivor_origin_wave_has_no_cross_survivor_head_of_line_blocking_for_five_voters(
+) {
+    let recovered_member = 1;
+    let pending = (0..5)
+        .map(|node_index| node_index != recovered_member)
+        .collect::<Vec<_>>();
+    let expected_survivors = vec![0, 2, 3, 4];
+    let mut events = Vec::new();
+    let mut dispatched = Vec::new();
+    let mut early_survivor_retry_or_pulse_can_run = false;
+
+    for_each_pending_command_in_wave(&pending, |node_index, stage| {
+        events.push((stage, node_index));
+        match stage {
+            PendingCommandWaveStage::Dispatch => {
+                assert!(
+                    !early_survivor_retry_or_pulse_can_run,
+                    "an early survivor's reply handling must not precede another survivor's first command"
+                );
+                dispatched.push(node_index);
+            }
+            PendingCommandWaveStage::Collect if node_index == expected_survivors[0] => {
+                // This is the earliest point an unavailable reply could cause
+                // a retry and a passive pulse. Every other survivor has
+                // already received its first command, so neither can block
+                // their dispatch behind the five-second remote-retirement
+                // gate of this early survivor.
+                assert_eq!(dispatched, expected_survivors);
+                early_survivor_retry_or_pulse_can_run = true;
+            }
+            PendingCommandWaveStage::Collect => {}
+        }
+    });
+
+    assert!(early_survivor_retry_or_pulse_can_run);
+    assert_eq!(
+        events,
+        vec![
+            (PendingCommandWaveStage::Dispatch, 0),
+            (PendingCommandWaveStage::Dispatch, 2),
+            (PendingCommandWaveStage::Dispatch, 3),
+            (PendingCommandWaveStage::Dispatch, 4),
+            (PendingCommandWaveStage::Collect, 0),
+            (PendingCommandWaveStage::Collect, 2),
+            (PendingCommandWaveStage::Collect, 3),
+            (PendingCommandWaveStage::Collect, 4),
+        ]
+    );
+}
+
+#[test]
+fn member_recovery_near_expiry_checkpoint_refreshes_before_a_wave_and_reserves_observation() {
+    let observed_at = Instant::now();
+    let absolute_deadline =
+        observed_at + Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS);
+    let progress = RecoveryTrafficProgressTracker::new(Vec::new(), observed_at);
+    let rolling_deadline = progress.next_deadline(absolute_deadline);
+    let operation_timeout = Duration::from_millis(QUALIFICATION_OPERATION_TIMEOUT_MILLIS);
+    let observation_headroom =
+        Duration::from_millis(QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS);
+
+    let dispatch_now = observed_at;
+    assert_eq!(
+        recovery_traffic_command_plan(dispatch_now, rolling_deadline),
+        RecoveryTrafficCommandPlan::DispatchBy(rolling_deadline - observation_headroom),
+        "a complete command keeps the fixed common post-wave observation headroom"
+    );
+
+    let exact_unreserved_boundary = rolling_deadline - operation_timeout;
+    assert!(
+        deadline_admits_complete_operation(exact_unreserved_boundary, rolling_deadline),
+        "the existing operation admission alone reaches the rolling boundary"
+    );
+    assert_eq!(
+        recovery_traffic_command_plan(exact_unreserved_boundary, rolling_deadline),
+        RecoveryTrafficCommandPlan::RefreshProgress,
+        "a near-expiry tracker must take the common pre-wave observation instead of dispatching through its post-wave status headroom"
+    );
+    assert!(
+        !deadline_admits_complete_operation(
+            exact_unreserved_boundary,
+            rolling_deadline - observation_headroom,
+        ),
+        "the exact unreserved boundary must reject rather than widen the rolling deadline"
+    );
+}
+
+#[test]
 fn member_recovery_settlement_rejects_an_unresolved_survivor_episode() {
     let (participants, _before, mut settled) = subset_traffic_fixture();
     assert!(subset_traffic_availability_is_settled(
@@ -18746,8 +19440,8 @@ fn member_recovery_settlement_rejects_an_unresolved_survivor_episode() {
         &participants,
     ));
 
+    settled[0].status.availability_interruption_episodes += 1;
     settled[0].status.availability_interruptions += 1;
-    settled[0].status.max_consecutive_availability_interruptions += 1;
     assert!(traffic_live_mutator_counters_are_consistent(
         &settled[0].status
     ));
@@ -18776,6 +19470,7 @@ fn member_recovery_fault_boundary_bounds_and_requires_availability_recovery() {
         &participants,
     ));
 
+    after[0].status.availability_interruption_episodes += 1;
     after[0].status.availability_interruptions += 1;
     assert!(subset_traffic_availability_within_recovery_budget(
         &before,
@@ -18797,7 +19492,19 @@ fn member_recovery_fault_boundary_bounds_and_requires_availability_recovery() {
         &participants,
     ));
 
-    after[0].status.availability_recoveries += 1;
+    after[0].status.availability_interruptions += 2;
+    after[0].status.max_consecutive_availability_interruptions += 2;
+    assert!(subset_traffic_availability_within_recovery_budget(
+        &before,
+        &after,
+        &participants,
+    ));
+    assert!(!subset_traffic_availability_is_settled(
+        &after,
+        &participants,
+    ));
+
+    after[0].status.availability_recoveries += 3;
     assert!(subset_traffic_availability_is_settled(
         &after,
         &participants,
@@ -18808,6 +19515,7 @@ fn member_recovery_fault_boundary_bounds_and_requires_availability_recovery() {
         &participants,
     ));
 
+    after[0].status.availability_interruption_episodes += 1;
     after[0].status.availability_interruptions += 1;
     after[0].status.availability_recoveries += 1;
     assert!(!subset_traffic_availability_within_recovery_budget(
@@ -18856,6 +19564,7 @@ fn subset_traffic_fixture() -> (
             initial.durable_readiness_probes = 0;
             initial.last_generation = 0;
             initial.last_record_fence = 0;
+            initial.availability_interruption_episodes = 0;
             initial.availability_interruptions = 0;
             initial.availability_recoveries = 0;
             initial.max_consecutive_availability_interruptions = 0;
@@ -19040,10 +19749,8 @@ fn recovery_coverage_requires_health_monotonicity_and_inactive_key_stability() {
     ));
 
     let mut unresolved = after.clone();
+    unresolved[0].status.availability_interruption_episodes += 1;
     unresolved[0].status.availability_interruptions += 1;
-    unresolved[0]
-        .status
-        .max_consecutive_availability_interruptions += 1;
     assert!(!recovery_traffic_has_all_key_coverage(
         &before,
         &unresolved,
@@ -19066,6 +19773,7 @@ fn restarted_mutator_counters_are_relative_to_exact_committed_resume_state() {
     resumed.mutation_resume_record_fence = 200;
     resumed.last_generation = 111;
     resumed.last_record_fence = 211;
+    resumed.availability_interruption_episodes = 0;
     resumed.availability_interruptions = 0;
     resumed.availability_recoveries = 0;
     resumed.max_consecutive_availability_interruptions = 0;
@@ -19626,6 +20334,38 @@ fn transition_deadline_never_accepts_a_late_success() {
         started,
         started + operation_timeout - Duration::from_nanos(1)
     ));
+}
+
+#[test]
+fn directed_handshake_traffic_and_lifecycle_replies_use_the_supplied_absolute_deadline() {
+    for command in ["DirectedHandshake", "TrafficStatus", "LifecycleMetrics"] {
+        let (sender, replies) = mpsc::sync_channel::<()>(1);
+        // The reply is deliberately withheld while the command's short
+        // absolute deadline expires. This is a causal channel test, not a
+        // wall-clock assertion: the deadline is already in the past when the
+        // receive boundary is entered, so its budget is exactly zero.
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_nanos(1))
+            .expect("monotonic instant supports a one-nanosecond short deadline");
+        assert!(
+            matches!(
+                receive_qualification_reply_until(&replies, deadline),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "withheld {command} reply must not consume the child default timeout"
+        );
+        sender
+            .send(())
+            .expect("late scripted qualification reply remains observable");
+        assert!(
+            replies.try_recv().is_ok(),
+            "late {command} reply was not observed after the absolute-deadline rejection"
+        );
+        assert!(
+            !sleep_until_deadline(deadline, Duration::from_millis(20)),
+            "{command} retry sleep must not extend an exhausted absolute deadline"
+        );
+    }
 }
 
 #[test]

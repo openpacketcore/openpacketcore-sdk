@@ -783,7 +783,7 @@ pub const SESSION_MTLS_CANDIDATE_EVIDENCE_V2_MAX_BYTES: usize = 64 * 1024;
 pub const SESSION_MTLS_BATCH_RELEASE_GATE_EVIDENCE_V1_MAX_BYTES: usize = 64 * 1024;
 
 /// Version of the private node configuration and control protocol.
-pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 4;
+pub const QUALIFICATION_NODE_SCHEMA_VERSION: u16 = 5;
 /// Maximum accepted node configuration document.
 pub const QUALIFICATION_MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Maximum accepted control request or response line.
@@ -1025,7 +1025,7 @@ pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS: u64 =
 /// the recovered member advance explicit reauthentication, reprove every
 /// incident directed path, and establish the next lifecycle baseline.
 pub const QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE: &str =
-    "member-scoped-reauth-settled-baseline/v3";
+    "member-scoped-reauth-settled-baseline/v4";
 /// Versioned rolling survivor-progress proof used while an expired member is
 /// replaced. Every half-SLO pulse must carry one common committed key through
 /// every survivor observer, while an independent full-SLO checkpoint requires
@@ -6617,6 +6617,10 @@ pub struct QualificationTrafficStatus {
     pub linearizable_reads: u64,
     pub lease_renewals: u64,
     pub lease_reacquisitions: u64,
+    /// Distinct runs of one or more consecutive typed availability outcomes.
+    /// This separates a bounded retry sequence inside one outage from a later,
+    /// independently recovered outage.
+    pub availability_interruption_episodes: u64,
     /// Typed, recoverable availability outcomes observed at terminal backend
     /// checkpoints. This never includes semantic or invariant failures.
     pub availability_interruptions: u64,
@@ -8859,7 +8863,7 @@ mod tests {
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROFILE,
-            "member-scoped-reauth-settled-baseline/v3"
+            "member-scoped-reauth-settled-baseline/v4"
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_PROFILE,
@@ -8899,8 +8903,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:183eb4141c72f8b105f61fb2a07f599821d1ecc12916e21688f3c850fa3f3cf1",
-                "sha256:d15831b43f5a0a2c7142be434bf0f19ae09a28e57433ccda235e29d738b9238c",
+                "sha256:f4fdbdc7ef765362d2bc6c0a99a6970711ed78bce0030238982696d9d3df7af2",
+                "sha256:bfd95da81973536ecaa47340e8b2a8dcef130e6464cef58f0940ab914e8aaef0",
             )
         );
         assert!(is_exact_sha256(&three));
@@ -8921,6 +8925,7 @@ mod tests {
                 linearizable_reads: 7,
                 lease_renewals: 7,
                 lease_reacquisitions: 7,
+                availability_interruption_episodes: 1,
                 availability_interruptions: 1,
                 availability_recoveries: 1,
                 max_consecutive_availability_interruptions: 1,
@@ -9083,8 +9088,8 @@ mod tests {
 
     #[test]
     fn node_control_schema_rejects_incompatible_versions() {
-        assert_eq!(QUALIFICATION_NODE_SCHEMA_VERSION, 4);
-        for incompatible_version in [1, 2, 3] {
+        assert_eq!(QUALIFICATION_NODE_SCHEMA_VERSION, 5);
+        for incompatible_version in [1, 2, 3, 4] {
             let mut config = valid_config();
             config.schema_version = incompatible_version;
             assert_eq!(config.validate(), Err(QualificationConfigError::Schema));
@@ -9353,32 +9358,32 @@ mod tests {
             (
                 SessionMtlsCandidateCampaign::RotationCore,
                 3,
-                "sha256:61350dd7d94e11afebccf36861dc218ade25f91f941bd05102e1453de353c21f",
+                "sha256:42ee8f3df8b619ca5352e97771688f60c27cc46edda1d040cd2f05f1db47c28c",
             ),
             (
                 SessionMtlsCandidateCampaign::RotationCore,
                 5,
-                "sha256:953548e31843d7c5e72e07bc9437cf5cae6fb01cdf845674317cb99c4e0dda79",
+                "sha256:41660b8d18f75b4d54f0027fdae15ecc6def17cef76a92204cd68d44aec7e7ad",
             ),
             (
                 SessionMtlsCandidateCampaign::FaultExpiryRecovery,
                 3,
-                "sha256:33094a539667a1d6500e29d732c932db89440cd92810b50d333a28930ae7309b",
+                "sha256:9426b250e64e9a2e1a13e603fb751e5fa7d97040baa0fc37004d163477785357",
             ),
             (
                 SessionMtlsCandidateCampaign::FaultExpiryRecovery,
                 5,
-                "sha256:4aeac6e2194bcbfa109070cd5b0c85200d70f3d4d5da95687cd48767c366498d",
+                "sha256:113be3f9f8bdac145abc8e86644a0278363431ff2b777c658c326b04614f5fe6",
             ),
             (
                 SessionMtlsCandidateCampaign::TrafficResourceBounds,
                 3,
-                "sha256:8f61f7a13d640e32a3a7be22c312368cbab1826615bbf08624336e4c4aa2b5a0",
+                "sha256:bb9cf323a28a94ae8935c83441e42a1124cec46c2254f56615c8e5b0f1a16c4f",
             ),
             (
                 SessionMtlsCandidateCampaign::TrafficResourceBounds,
                 5,
-                "sha256:bbf5d11cea3c2ee9b87bd2412aeca846b89ac7e24f27c49b203e921e7fb75ab4",
+                "sha256:5eeef1a6ce271c67d48fc860b3e0cd3c23fb8d11e7552cc1879cac88734f0307",
             ),
         ];
         for (campaign, member_count, expected) in vectors {

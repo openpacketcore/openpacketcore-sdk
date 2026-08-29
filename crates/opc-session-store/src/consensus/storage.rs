@@ -4550,6 +4550,36 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
             self.membership_admission.as_ref().is_some_and(|admission| {
                 admission.requires_uniform_membership_fence(meta.last_membership.membership())
             });
+        // Authenticate and retain the predecessor before entering the
+        // replacement transaction. Fixed-profile predecessor verification is
+        // a bounded full scan; snapshot ownership already excludes another
+        // publisher, so it does not need either primary writer guard.
+        let previous = {
+            let conn = self.core.conn.lock().await;
+            consensus::read_current_snapshot_sync(&conn, self.core.storage_identity).map_err(
+                |error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                },
+            )?
+        };
+        let previous_artifact = track_previous_snapshot_artifact(
+            &previous,
+            Arc::clone(&self.core.snapshot_cleanup_failed),
+            self.core.authority_profile,
+            Arc::clone(&self._snapshot_directory_lease),
+        )
+        .await
+        .map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
         #[cfg(test)]
         wait_before_recovery_publication_fence(self.core.snapshot_dir.as_ref()).await;
         let _membership_apply = if installs_uniform_cutover {
@@ -4569,28 +4599,25 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                 )
             })?;
         let install_result = {
-            let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-            let previous_artifact = track_previous_snapshot_artifact(
-                &previous,
-                Arc::clone(&self.core.snapshot_cleanup_failed),
-                self.core.authority_profile,
-                Arc::clone(&self._snapshot_directory_lease),
-            )
-            .await
-            .map_err(|error| {
-                storage_error(
+            let observed_previous =
+                consensus::read_current_snapshot_sync(&conn, self.core.storage_identity).map_err(
+                    |error| {
+                        storage_error(
+                            ErrorSubject::Snapshot(Some(meta.signature())),
+                            ErrorVerb::Read,
+                            error,
+                        )
+                    },
+                )?;
+            if observed_previous != previous {
+                return Err(storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
+                    ErrorVerb::Write,
+                    consensus::invalid_data(
+                        "session consensus current snapshot changed under the publication owner",
+                    ),
+                ));
+            }
             if let Some(promoted_pin) = &promoted_pin {
                 promoted_pin
                     .verify_bound_immutable_snapshot_envelope(&final_path, total_length)
@@ -5401,9 +5428,39 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             last_membership,
             snapshot_id,
         };
+        // Pin and authenticate the predecessor while the snapshot owner still
+        // serializes every publisher, but before taking either primary SQLite
+        // writer guard. Fixed-profile authentication performs a bounded full
+        // envelope scan and must not stall unrelated Raft work.
+        let previous = {
+            let conn = self.core.conn.lock().await;
+            consensus::read_current_snapshot_sync(&conn, self.core.storage_identity).map_err(
+                |error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                },
+            )?
+        };
+        let previous_artifact = track_previous_snapshot_artifact(
+            &previous,
+            Arc::clone(&self.core.snapshot_cleanup_failed),
+            self.core.authority_profile,
+            Arc::clone(&self._snapshot_directory_lease),
+        )
+        .await
+        .map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
         #[cfg(test)]
         wait_before_recovery_publication_fence(self.core.snapshot_dir.as_ref()).await;
-        let _prune_preemption = self.core.request_consensus_log_prune_preemption().await;
+        let prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let conn = live_terminal_consumer
             .acquire_publication_connection(&snapshot_guard)
             .await
@@ -5414,8 +5471,28 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                     io::Error::other(error),
                 )
             })?;
-        let (previous, previous_artifact) = {
-            let previous = consensus::read_current_snapshot_sync(&conn, self.core.storage_identity)
+        let observed_previous =
+            consensus::read_current_snapshot_sync(&conn, self.core.storage_identity).map_err(
+                |error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Read,
+                        error,
+                    )
+                },
+            )?;
+        if observed_previous != previous {
+            return Err(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                consensus::invalid_data(
+                    "session consensus current snapshot changed under the publication owner",
+                ),
+            ));
+        }
+        if let Some(published_pin) = &published_pin {
+            published_pin
+                .verify_bound_immutable_snapshot_envelope(&final_path, byte_length)
                 .map_err(|error| {
                     storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
@@ -5423,65 +5500,45 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                         error,
                     )
                 })?;
-            let previous_artifact = track_previous_snapshot_artifact(
-                &previous,
-                Arc::clone(&self.core.snapshot_cleanup_failed),
-                self.core.authority_profile,
-                Arc::clone(&self._snapshot_directory_lease),
-            )
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
+        }
+        publish_snapshot_metadata_with_readback(
+            &conn,
+            self.core.storage_identity,
+            &meta,
+            &file_name,
+            checksum,
+            byte_length,
+            &mut published_cleanup,
+            self.core.snapshot_publication_indeterminate.as_ref(),
+            || {
+                consensus::save_current_snapshot_with_authority_sync(
+                    &conn,
+                    self.core.storage_identity,
+                    self.core.authority_profile,
+                    &self.core.expected_members,
+                    &self.core.expected_bindings,
+                    self.core.fixed_placement_policy,
+                    &meta,
+                    &file_name,
+                    checksum,
+                    byte_length,
                 )
-            })?;
-            if let Some(published_pin) = &published_pin {
-                published_pin
-                    .verify_bound_immutable_snapshot_envelope(&final_path, byte_length)
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-            }
-            publish_snapshot_metadata_with_readback(
-                &conn,
-                self.core.storage_identity,
-                &meta,
-                &file_name,
-                checksum,
-                byte_length,
-                &mut published_cleanup,
-                self.core.snapshot_publication_indeterminate.as_ref(),
-                || {
-                    consensus::save_current_snapshot_with_authority_sync(
-                        &conn,
-                        self.core.storage_identity,
-                        self.core.authority_profile,
-                        &self.core.expected_members,
-                        &self.core.expected_bindings,
-                        self.core.fixed_placement_policy,
-                        &meta,
-                        &file_name,
-                        checksum,
-                        byte_length,
-                    )
-                    .map(|_| consensus::SnapshotInstallPublicationOutcome::Clean)
-                },
+                .map(|_| consensus::SnapshotInstallPublicationOutcome::Clean)
+            },
+        )
+        .map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                error,
             )
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Write,
-                    error,
-                )
-            })?;
-            (previous, previous_artifact)
-        };
+        })?;
+        // The same-connection readback above is the end of the irreversible
+        // publication boundary. Predecessor cleanup and descriptor return are
+        // already serialized by `snapshot_guard`; retaining either primary
+        // writer guard across their asynchronous work would stall Raft.
+        drop(conn);
+        drop(prune_preemption);
         #[cfg(test)]
         drop(fixed_prepublication_scan_boundary);
         // Every raw/vacuum staging pin either dropped during SQLite
@@ -10310,6 +10367,71 @@ mod tests {
         assert_eq!(
             sealed_bytes, returned_bytes,
             "the returned descriptor remains the pre-replacement sealed inode"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_postpublication_return_does_not_hold_primary_connection() {
+        let directory = FixedRawReadStoreFixture::new();
+        let (_, mut state_machine, _) = open_fixed_raw_read_store(&directory).await;
+        state_machine
+            .apply([fixed_initial_membership_entry()])
+            .await
+            .expect("apply fixed membership");
+
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let hook_directory =
+            snapshot_namespace_test_hook_directory(&state_machine._snapshot_directory_lease);
+        let _gate_guard = FixedSnapshotReturnGateGuard::install(hook_directory, Arc::clone(&gate));
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let build = tokio::spawn(async move { builder.build_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("fixed build reaches the post-publication return gate");
+
+        let applied_while_held = tokio::time::timeout(
+            SNAPSHOT_APPLY_WAIT,
+            state_machine.apply([normal_entry(1, advance_time_command(identity(1), 1, 1))]),
+        )
+        .await;
+        let observed_while_held = if applied_while_held.is_ok() {
+            Some(tokio::time::timeout(SNAPSHOT_APPLY_WAIT, state_machine.applied_state()).await)
+        } else {
+            None
+        };
+        assert!(
+            !build.is_finished(),
+            "the fixed build remains held after durable metadata publication"
+        );
+
+        gate.release();
+        let built = build
+            .await
+            .expect("join fixed post-publication build")
+            .expect("fixed post-publication build succeeds after release");
+        let applied = applied_while_held
+            .expect("consensus write completes while fixed snapshot return is held")
+            .expect("consensus write succeeds while fixed snapshot return is held");
+        assert_eq!(
+            1,
+            applied.len(),
+            "the concurrent consensus write is applied"
+        );
+        let (last_applied, _) = observed_while_held
+            .expect("consensus read starts after the concurrent write")
+            .expect("consensus read completes while fixed snapshot return is held")
+            .expect("consensus read succeeds while fixed snapshot return is held");
+        assert_eq!(
+            Some(log_id(1)),
+            last_applied,
+            "the concurrent consensus read observes the completed write"
+        );
+        assert_eq!(
+            Some(log_id(0)),
+            built.meta.last_log_id,
+            "post-publication primary work cannot alter the already captured snapshot cut"
         );
     }
 

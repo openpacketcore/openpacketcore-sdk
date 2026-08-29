@@ -138,9 +138,10 @@ local socket access, including Kubernetes `pods/exec` access used to launch
 the client, is node-administrator-equivalent qualification authority and must
 be restricted and audited accordingly.
 
-Its strict private node configuration/control schema is version 4. Version 3
-is explicitly rejected because it predates the bounded v5 collector command
-inventory. Version 2 is rejected because it predates the routing-aware
+Its strict private node configuration/control schema is version 5. Version 4
+is explicitly rejected because it predates the distinct availability-episode
+counter in traffic-status evidence. Version 3 is rejected because it predates
+the bounded v5 collector command inventory. Version 2 is rejected because it predates the routing-aware
 optional `dial_addr` representation; version 1 is also rejected because
 lifecycle replies did not carry the fixed `superseded` and `abandoned`
 terminal outcomes. Node config accepts `projected_mtls` with an absolute
@@ -220,7 +221,9 @@ ledger must remain unchanged for the final 2.5-second
 cold-connect/maximum-reconnect-backoff tail. Each survivor may record at most
 one availability episode while the expired member rejoins; that episode must
 recover inside the existing 26-second SLO and be fully settled before the
-clean baseline. A second or late episode fails closed. The half-SLO pulse
+clean baseline. Consecutive typed retry outcomes remain individually counted
+against the unchanged eight-outcome ceiling but do not manufacture additional
+episodes. A second or late episode fails closed. The half-SLO pulse
 cadence and independent full-key coverage clock resume immediately after
 recovery.
 Only after bounded fault-era transport/authentication/timeout/reconnect
@@ -236,7 +239,7 @@ binds this accounting as `new-attempts-plus-baseline-outstanding/v1`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns retain a zero budget throughout the fault and clean intervals.
 The private Schedule v6 binds this procedure as
-`member-scoped-reauth-settled-baseline/v3` with progress profile
+`member-scoped-reauth-settled-baseline/v4` with progress profile
 `common-key-pulse-all-active-key-coverage/v1`. Every epoch-changing interval
 allows `superseded` only up to the existing per-node connection-attempt bound
 `8 * (member_count - 1) + 8`; non-epoch intervals require zero. Actual timeout,

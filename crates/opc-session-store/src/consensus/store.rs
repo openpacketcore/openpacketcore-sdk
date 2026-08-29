@@ -5727,25 +5727,6 @@ impl ConsensusSessionStore {
         }
     }
 
-    /// Revalidation after a response has already proved that the mutation
-    /// committed. Dynamic ingress performed its descriptor-bound recovery gate
-    /// before the first possible transmission, and the leader repeated that
-    /// gate immediately before proposal. Repeating the origin gate here could
-    /// exhaust the original deadline and misclassify a known commit as an
-    /// unknown outcome. Fixed durable authority remains a result boundary and
-    /// therefore retains its full revalidation.
-    async fn require_application_traffic_committed_reply_authority_before(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), StoreError> {
-        // A committed Dynamic response is still returned only by an exact
-        // current member. This is deliberately the cheap scope check: the
-        // recovery workflow must drain the fleet before publishing Active,
-        // and a second terminal reconciliation cannot revoke a known commit.
-        self.require_application_traffic_intermediate_authority_before(deadline)
-            .await
-    }
-
     /// Preserve Fixed's persistent authority checks at every historical
     /// checkpoint while avoiding repeated Dynamic terminal-sidecar probes
     /// inside one leader-owned proposal turn.
@@ -6729,16 +6710,6 @@ impl ConsensusSessionStore {
             match reply {
                 ForwardMutationReply::Applied(response) => {
                     if committed_response_matches_intent(&request.intent, &response) {
-                        if !fixed_raw_v2_consumer_warm_route
-                            && self
-                                .require_application_traffic_committed_reply_authority_before(
-                                    deadline,
-                                )
-                                .await
-                                .is_err()
-                        {
-                            return ConsensusSubmissionEffect::OutcomeUnknown;
-                        }
                         return ConsensusSubmissionEffect::Committed(*response);
                     }
                     if !outcome_may_be_unavailable
@@ -21893,55 +21864,6 @@ mod membership_tests {
         assert_eq!(
             initialized.recovery_progress().state(),
             DurableRecoveryState::Synchronized
-        );
-    }
-
-    #[tokio::test]
-    async fn dynamic_committed_reply_does_not_repeat_origin_terminal_gate() {
-        let directory = tempfile::tempdir().expect("dynamic forwarding boundary directory");
-        let store = ConsensusSessionStore::open(
-            singleton_topology(),
-            SqliteSessionBackend::open(directory.path().join("store.sqlite"))
-                .expect("dynamic forwarding boundary backend"),
-            directory.path().join("snapshots"),
-            BTreeMap::new(),
-        )
-        .await
-        .expect("open dynamic forwarding boundary store");
-        store
-            .initialize_cluster()
-            .await
-            .expect("initialize dynamic forwarding boundary store");
-        store
-            .inner
-            .terminal_recovery_gate_checks
-            .store(0, Ordering::Relaxed);
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        store
-            .require_application_traffic_authority_before(deadline)
-            .await
-            .expect("dynamic origin is recovery-clear before transmission");
-        assert_eq!(
-            store
-                .inner
-                .terminal_recovery_gate_checks
-                .load(Ordering::Relaxed),
-            1,
-            "origin ingress performs exactly one live terminal-recovery reconciliation"
-        );
-
-        store
-            .require_application_traffic_committed_reply_authority_before(deadline)
-            .await
-            .expect("known committed Dynamic reply needs no duplicate origin reconciliation");
-        assert_eq!(
-            store
-                .inner
-                .terminal_recovery_gate_checks
-                .load(Ordering::Relaxed),
-            1,
-            "a committed reply cannot spend the residual deadline on a duplicate origin gate"
         );
     }
 

@@ -447,7 +447,7 @@ an `expiry - 30 seconds` soft boundary, followed by complete hard-deadline drain
 and source/controller `LastGoodExpired`; survivors continue canary progress and
 a valid long-lived leaf restores the affected member in the same process. The
 replacement proof uses the schedule-bound
-`member-scoped-reauth-settled-baseline/v3` checkpoint: its 86-second clock and
+`member-scoped-reauth-settled-baseline/v4` checkpoint: its 86-second clock and
 60-second two-stage server tail begin at the atomic projected-data rename, and
 a final 2.5-second outbound-ledger quiet tail completes the horizon. A
 prepublication common-key pulse plus 13-second observation checkpoints requires
@@ -455,8 +455,10 @@ one active key to advance on every survivor observer and conservatively bounds
 that pulse's worst-case actual event gap to 26 seconds. An independent 26-second
 checkpoint requires every active key on every observer and cannot be reset by a
 faster key. Each survivor may record at most one rejoin availability episode;
-it must recover within that 26-second SLO and settle before the clean baseline,
-and a second or late episode fails closed. Fault-era new-attempt and reconnect
+its consecutive typed retry outcomes remain separately bounded by the
+unchanged eight-outcome ceiling. It must recover within that 26-second SLO and
+settle before the clean baseline, and a second or late episode fails closed.
+Fault-era new-attempt and reconnect
 deltas remain inside the fixed 85/161 per-node bound (ordinary 24/40, fifteen
 five-second refresh rounds over four/eight incident paths, and one scheduled
 post-hard-expiry survivor-to-expired network-negative attempt per involved

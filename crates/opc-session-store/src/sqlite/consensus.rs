@@ -20129,7 +20129,7 @@ pub(crate) struct OperatorRecoveryState {
 /// migration savepoint. It deliberately retains every cardinality and
 /// cross-table invariant from that tail so a cheap live classifier removes
 /// only migration writes, never durable-state validation.
-fn validate_current_operator_recovery_image_sync(
+pub(crate) fn validate_current_operator_recovery_image_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<OperatorRecoveryState> {
@@ -67035,6 +67035,259 @@ BEGIN IMMEDIATE;
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fixed_status_reader_isolates_the_primary_writer_and_fails_closed_freshly() {
+        let directory = tempfile::tempdir().expect("fixed authority reader directory");
+        let database = directory.path().join("sessions.sqlite");
+        let identity = identity();
+        let members = members(&[7, 8, 9]);
+        let bindings = test_member_bindings(&members);
+        let placement_policy = FIXED_TEST_PLACEMENT_POLICY.expect("fixed placement policy");
+        let backend = SqliteSessionBackend::open(&database).expect("fixed backend");
+        let conn = backend.conn.lock().await;
+        initialize_schema_with_profile(
+            &conn,
+            identity,
+            &members,
+            ConsensusAuthorityProfile::FixedImmutable,
+        )
+        .expect("initialize fixed authority");
+        let initial_formation = membership_entry_at(0, vec![members.clone()], members.clone());
+        append_logs_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            std::slice::from_ref(&initial_formation),
+        )
+        .expect("append fixed quorum");
+        save_committed_with_authority_sync(
+            &conn,
+            identity,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            Some(initial_formation.log_id),
+        )
+        .expect("commit fixed quorum");
+        apply_entries_with_authority_sync(
+            &conn,
+            identity,
+            &backend.caps,
+            ConsensusAuthorityProfile::FixedImmutable,
+            &members,
+            &bindings,
+            Some(placement_policy),
+            vec![initial_formation],
+        )
+        .expect("form fixed quorum");
+        activate_fenced_transition_v2_scope_sync(
+            &conn,
+            identity,
+            identity,
+            &members,
+            fenced_transition_v2_profile_digest(),
+            FencedTransitionV2HistoryEpoch::new(FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH)
+                .expect("initial V2 epoch"),
+        )
+        .expect("activate V2 fixture");
+        drop(conn);
+
+        let v2_request = fenced_transition_v2_request(0x74, 1, "writer-contention");
+
+        // Snapshot publication legitimately owns the primary connection for
+        // its atomic metadata transaction. Synchronous status/scope reads
+        // must remain independent rather than reporting a false revocation.
+        let held_primary = backend.conn.lock().await;
+        assert!(backend.fixed_quorum_authority_is_exact_now(
+            identity,
+            &members,
+            &bindings,
+            placement_policy,
+        ));
+        drop(held_primary);
+
+        // A live WAL prune/checkpoint writer may overlap an ordinary
+        // pre-transmission authority probe. That probe is a strict read, not
+        // a schema-repair boundary, and must not turn the writer reservation
+        // into a false BackendUnavailable result.
+        let independent_writer = Connection::open(&database).expect("independent WAL writer");
+        apply_pragma_profile(&independent_writer, false, false)
+            .expect("configure independent WAL writer");
+        independent_writer
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("reserve independent WAL writer");
+        let application_traffic_authority = tokio::time::timeout(
+            Duration::from_millis(250),
+            backend.fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(application_traffic_authority, Ok(Ok(true))),
+            "pre-transmission authority cannot attempt a write behind an independent WAL writer: {application_traffic_authority:?}",
+        );
+        let activated_snapshot = tokio::time::timeout(
+            Duration::from_millis(250),
+            backend.fixed_quorum_activated_v2_mutation_snapshot(
+                crate::sqlite::FixedQuorumActivatedV2MutationSnapshotRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members.clone(),
+                    expected_bindings: bindings.clone(),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                },
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                activated_snapshot,
+                Ok(Ok(
+                    crate::sqlite::FixedQuorumActivatedV2MutationSnapshot::Activated { .. }
+                ))
+            ),
+            "raw V2 mutation acceptance cannot attempt a recovery-schema write behind an independent WAL writer: {activated_snapshot:?}",
+        );
+        let activated_status = tokio::time::timeout(
+            Duration::from_millis(250),
+            backend.fixed_quorum_fenced_transition_v2_status_at_scope(
+                crate::sqlite::FixedQuorumFencedTransitionV2StatusReadRequest {
+                    storage_identity: identity,
+                    scope_identity: identity,
+                    voters: members.clone(),
+                    expected_members: members.clone(),
+                    expected_bindings: bindings.clone(),
+                    expected_placement_policy: placement_policy,
+                    profile_digest: fenced_transition_v2_profile_digest(),
+                    require_activation: true,
+                },
+                &v2_request,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                activated_status,
+                Ok(Ok(
+                    crate::sqlite::FixedQuorumFencedTransitionV2StatusRead::Activated(
+                        FencedTransitionV2Status::NotFound
+                    )
+                ))
+            ),
+            "raw V2 status acceptance cannot attempt a recovery-schema write behind an independent WAL writer: {activated_status:?}",
+        );
+        independent_writer
+            .execute_batch("ROLLBACK;")
+            .expect("release independent WAL writer");
+
+        // A committed authority mismatch must be visible on the very next
+        // checkout. No previously observed true result may be cached.
+        let mismatched_policy = PlacementResiliencePolicy::AllowReducedResilience;
+        backend
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
+                [placement_policy_i64(mismatched_policy)],
+            )
+            .expect("commit fixed placement-policy mismatch");
+        assert!(!backend.fixed_quorum_authority_is_exact_now(
+            identity,
+            &members,
+            &bindings,
+            placement_policy,
+        ));
+        assert!(
+            !backend
+                .fixed_quorum_authority_record_is_exact(
+                    identity,
+                    &members,
+                    &bindings,
+                    placement_policy,
+                    false,
+                )
+                .await
+        );
+        assert!(!backend
+            .fixed_quorum_application_traffic_authority_is_exact(
+                identity,
+                members.clone(),
+                bindings.clone(),
+                placement_policy,
+            )
+            .await
+            .expect("mismatched application authority read"));
+        backend
+            .conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE consensus_identity SET fixed_placement_policy = ?1 WHERE singleton = 1",
+                [placement_policy_i64(placement_policy)],
+            )
+            .expect("restore fixed placement policy");
+        assert!(
+            backend
+                .fixed_quorum_application_traffic_authority_is_exact(
+                    identity,
+                    members.clone(),
+                    bindings.clone(),
+                    placement_policy,
+                )
+                .await
+                .expect("restored application authority read"),
+            "restoring the committed placement policy cannot retain a cached false result",
+        );
+
+        // Synchronous status/scope accessors cannot await a reader lane. When
+        // all bounded lanes are in use they must fail closed, then recover on
+        // the first fresh checkout after capacity returns.
+        let pool = Arc::clone(
+            backend
+                .consensus_acceptance_reader_pool
+                .as_ref()
+                .expect("file-backed stores have acceptance readers"),
+        );
+        let held_readers = {
+            let mut receiver = pool.receiver.lock().await;
+            let mut readers =
+                Vec::with_capacity(crate::sqlite::SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS);
+            for _ in 0..crate::sqlite::SQLITE_CONSENSUS_ACCEPTANCE_READ_WORKERS {
+                readers.push(receiver.try_recv().expect("bounded reader lane"));
+            }
+            readers
+        };
+        assert!(!backend.fixed_quorum_authority_is_exact_now(
+            identity,
+            &members,
+            &bindings,
+            placement_policy,
+        ));
+        for reader in held_readers {
+            pool.sender
+                .send(reader)
+                .await
+                .expect("return bounded reader lane");
+        }
+        assert!(backend.fixed_quorum_authority_is_exact_now(
+            identity,
+            &members,
+            &bindings,
+            placement_policy,
+        ));
+    }
+
     #[tokio::test]
     async fn fixed_application_traffic_snapshot_fails_closed_for_recovery_sidecars() {
         let directory = tempfile::tempdir().expect("fixed authority snapshot directory");
@@ -67095,7 +67348,6 @@ BEGIN IMMEDIATE;
             )
             .await
             .expect("exact fixed authority snapshot"));
-
         let conn = backend.conn.lock().await;
         mark_operator_recovery_pending_sync(&conn, identity, 1, [0x71; 32])
             .expect("mark recovery pending");
@@ -67111,7 +67363,6 @@ BEGIN IMMEDIATE;
                 .await,
             Err(StoreError::BackendUnavailable(_))
         ));
-
         ensure_operator_recovery_latch_sync(
             &database,
             OperatorRecoveryLatch {
@@ -67131,7 +67382,6 @@ BEGIN IMMEDIATE;
             )
             .await
             .is_err());
-
         std::fs::write(
             operator_recovery_latch_path(&database).expect("recovery latch path"),
             b"corrupt",
@@ -67146,13 +67396,12 @@ BEGIN IMMEDIATE;
             )
             .await
             .is_err());
-
         backend.inject_consensus_operator_recovery_failure(true);
         assert!(backend
             .fixed_quorum_application_traffic_authority_is_exact(
                 identity,
-                members,
-                bindings,
+                members.clone(),
+                bindings.clone(),
                 placement_policy,
             )
             .await
