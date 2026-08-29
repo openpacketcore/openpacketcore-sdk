@@ -2854,9 +2854,12 @@ type SnapshotCleanupTestHook = Box<dyn FnOnce(&Path, &Path) + Send>;
 #[derive(Default)]
 struct SnapshotCleanupTestHooks {
     before_rename: Option<SnapshotCleanupTestHook>,
+    #[cfg(target_os = "linux")]
     after_rename: Option<SnapshotCleanupTestHook>,
+    #[cfg(target_os = "linux")]
     post_final_identity_before_unlink: Option<SnapshotCleanupTestHook>,
     fail_post_rename_sync: bool,
+    #[cfg(target_os = "linux")]
     fail_post_unlink_guard_sync: bool,
 }
 
@@ -2875,7 +2878,7 @@ pub(crate) fn snapshot_cleanup_test_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn take_snapshot_cleanup_hook(
     original: &Path,
     after_rename: bool,

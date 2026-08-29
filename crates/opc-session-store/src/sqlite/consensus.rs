@@ -1362,7 +1362,7 @@ pub(crate) fn probe_live_terminal_recovery_handoff_with_connection_sync(
                 "session operator recovery pathname changed during classification",
             ));
         }
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         run_latch_classify_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
         match pinned_sidecar.as_mut() {
             Some(sidecar) => revalidate_operator_recovery_latch_record_path(database, sidecar)?,
@@ -1493,7 +1493,7 @@ pub(crate) fn classify_operator_recovery_latch_with_connection_and_admitted_snap
                 "session operator recovery pathname changed during classification",
             ));
         }
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         run_latch_classify_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
         match pinned_sidecar.as_mut() {
             Some(sidecar) => revalidate_operator_recovery_latch_record_path(database, sidecar)?,
@@ -1966,7 +1966,7 @@ std::thread_local! {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn fail_next_latch_create_at_boundary(boundary: LatchCreateFailureBoundary) {
     LATCH_CREATE_FAILURE_BOUNDARY.with(|slot| {
         assert!(
@@ -1994,7 +1994,7 @@ fn fail_latch_create_at_boundary(boundary: LatchCreateFailureBoundary) -> io::Re
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_latch_replace_after_directory_sync_hook(hook: impl FnOnce(&Path) + 'static) {
     LATCH_REPLACE_AFTER_DIRECTORY_SYNC_HOOK.with(|slot| {
         assert!(
@@ -2025,7 +2025,7 @@ std::thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_latch_transition_before_replace_hook(hook: impl FnOnce(&Path) + 'static) {
     LATCH_TRANSITION_BEFORE_REPLACE_HOOK.with(|slot| {
         assert!(
@@ -2044,7 +2044,7 @@ fn run_latch_transition_before_replace_hook(path: &Path) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_latch_transition_after_temporary_validation_hook(hook: impl FnOnce(&Path) + 'static) {
     LATCH_TRANSITION_AFTER_TEMPORARY_VALIDATION_HOOK.with(|slot| {
         assert!(
@@ -2070,7 +2070,7 @@ std::thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_latch_create_after_directory_sync_hook(hook: impl FnOnce(&Path) + 'static) {
     LATCH_CREATE_AFTER_DIRECTORY_SYNC_HOOK.with(|slot| {
         assert!(
@@ -2095,7 +2095,7 @@ std::thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_latch_resync_after_directory_sync_hook(hook: impl FnOnce(&Path) + 'static) {
     LATCH_RESYNC_AFTER_DIRECTORY_SYNC_HOOK.with(|slot| {
         assert!(
@@ -2114,13 +2114,13 @@ fn run_latch_resync_after_directory_sync_hook(path: &Path) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 std::thread_local! {
     static LATCH_CLASSIFY_BEFORE_FINAL_REVALIDATION_HOOK: std::cell::RefCell<Option<PathOnceHook>> =
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_latch_classify_before_final_revalidation_hook(hook: impl FnOnce(&Path) + 'static) {
     LATCH_CLASSIFY_BEFORE_FINAL_REVALIDATION_HOOK.with(|slot| {
         assert!(
@@ -2131,7 +2131,7 @@ fn install_latch_classify_before_final_revalidation_hook(hook: impl FnOnce(&Path
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn run_latch_classify_before_final_revalidation_hook(path: &Path) {
     let hook = LATCH_CLASSIFY_BEFORE_FINAL_REVALIDATION_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -2145,7 +2145,7 @@ std::thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_latch_consume_before_final_revalidation_hook(hook: impl FnOnce(&Path) + 'static) {
     LATCH_CONSUME_BEFORE_FINAL_REVALIDATION_HOOK.with(|slot| {
         assert!(
@@ -26425,6 +26425,86 @@ fn read_outcome_sync(
     Ok(Some((digest, response)))
 }
 
+/// Test-only exact classification of one generic consensus padding receipt.
+#[cfg(feature = "test-control")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsensusPaddingReceiptStatus {
+    /// This voter has not durably applied the exact request ID.
+    NotFound,
+    /// The exact authenticated command was durably applied at this index.
+    Recorded {
+        /// Original nonzero Openraft log index retained in the receipt.
+        raft_log_index: u64,
+    },
+    /// The request ID is durably bound to another authenticated payload.
+    Conflict,
+}
+
+/// Read one exact `AdvanceLogicalTime` receipt without proposing or replaying
+/// the command. Every successful answer is bound to the current authenticated
+/// authority and checked against this voter's applied state-machine frontier.
+#[cfg(feature = "test-control")]
+pub(crate) fn consensus_padding_receipt_status_sync(
+    conn: &Connection,
+    storage_identity: SessionConsensusIdentity,
+    authority_identity: SessionConsensusIdentity,
+    request_id: SessionConsensusRequestId,
+) -> io::Result<ConsensusPaddingReceiptStatus> {
+    let expected_digest = authorized_mutation_payload_digest(
+        storage_identity,
+        authority_identity,
+        &SessionMutationIntent::AdvanceLogicalTime,
+    )?;
+    let Some((stored_digest, response)) = read_outcome_sync(conn, storage_identity, request_id)?
+    else {
+        return Ok(ConsensusPaddingReceiptStatus::NotFound);
+    };
+    if stored_digest != expected_digest {
+        return Ok(ConsensusPaddingReceiptStatus::Conflict);
+    }
+
+    let response_digest = match (&response.result, response.digest, response.logical_time) {
+        (Ok(SessionMutationOutcome::Unit), Some(response_digest), Some(response_logical_time))
+            if response.sequence != 0 && response.raft_log_index != 0 =>
+        {
+            (response_digest, response_logical_time)
+        }
+        _ => {
+            return Err(invalid_data(
+                "persisted consensus padding receipt has invalid response shape",
+            ));
+        }
+    };
+    let applied = read_applied_sync(conn, storage_identity)?.ok_or_else(|| {
+        invalid_data("persisted consensus padding receipt has no applied frontier")
+    })?;
+    if response.raft_log_index > applied.index {
+        return Err(invalid_data(
+            "persisted consensus padding receipt is beyond the applied frontier",
+        ));
+    }
+    let (machine_sequence, machine_digest, machine_logical_time, _) =
+        read_machine_sync(conn, storage_identity)?;
+    let machine_logical_time = machine_logical_time.ok_or_else(|| {
+        invalid_data("persisted consensus padding receipt has no machine logical time")
+    })?;
+    if response.sequence > machine_sequence || response_digest.1 > machine_logical_time {
+        return Err(invalid_data(
+            "persisted consensus padding receipt is beyond the machine frontier",
+        ));
+    }
+    if response.sequence == machine_sequence
+        && (response_digest.0 != machine_digest || response_digest.1 != machine_logical_time)
+    {
+        return Err(invalid_data(
+            "persisted consensus padding receipt does not match the machine frontier",
+        ));
+    }
+    Ok(ConsensusPaddingReceiptStatus::Recorded {
+        raft_log_index: response.raft_log_index,
+    })
+}
+
 fn validate_membership_ids(
     membership: &StoredMembership<SessionConsensusNodeId, opc_consensus::engine::EmptyNode>,
 ) -> io::Result<()> {
@@ -30857,7 +30937,7 @@ fn pinned_snapshot_database_sidecar_bytes_sync(
 /// snapshot. This never performs destination cleanup or validation while the
 /// source reader remains open.
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn capture_snapshot_database_from_reader_sync(
     reader: &SnapshotReadConnection,
     identity: SessionConsensusIdentity,
@@ -30945,7 +31025,7 @@ pub(crate) fn capture_snapshot_database_from_reader_into_sync(
 
 /// Finish a raw snapshot only after its reader has been released.
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn finalize_captured_snapshot_database_sync(
     identity: SessionConsensusIdentity,
     authority_profile: ConsensusAuthorityProfile,

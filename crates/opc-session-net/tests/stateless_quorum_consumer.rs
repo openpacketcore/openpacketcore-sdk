@@ -98,7 +98,8 @@ use opc_session_store::sqlite::test_support::{
 #[cfg(feature = "test-control")]
 use opc_session_store::test_support::{
     append_consensus_padding_entry_for_test, consensus_local_durable_progress_for_test,
-    ConsensusEngineStateForTest,
+    consensus_padding_receipt_status_for_test, ConsensusEngineStateForTest,
+    ConsensusPaddingReceiptStatusForTest,
 };
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, ConsensusSessionStore,
@@ -10835,6 +10836,13 @@ const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_POST_ADMISSION_COMMANDS: usize =
 #[cfg(feature = "test-control")]
 const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_REQUEST_NAMESPACE: [u8; 8] = *b"OPCRPSW\0";
 #[cfg(feature = "test-control")]
+fn protected_roster_process_loss_snapshot_request_id(ordinal: u64) -> [u8; 16] {
+    let mut request_id = [0; 16];
+    request_id[..8].copy_from_slice(&PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_REQUEST_NAMESPACE);
+    request_id[8..].copy_from_slice(&ordinal.to_be_bytes());
+    request_id
+}
+#[cfg(feature = "test-control")]
 const PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_MAX_IN_FLIGHT: usize =
     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS / 2;
 #[cfg(feature = "test-control")]
@@ -11333,14 +11341,12 @@ async fn advance_protected_roster_process_loss_snapshot_workload(
                         let ordinal = first_ordinal
                             .checked_add(*offset as u64)
                             .expect("process-loss snapshot request ordinal does not overflow");
-                        let mut request_id = [0; 16];
-                        request_id[..8].copy_from_slice(
-                            &PROTECTED_ROSTER_PROCESS_LOSS_SNAPSHOT_REQUEST_NAMESPACE,
-                        );
-                        request_id[8..].copy_from_slice(&ordinal.to_be_bytes());
+                        let request_id =
+                            protected_roster_process_loss_snapshot_request_id(ordinal);
                         async move {
                             (
                                 *offset,
+                                request_id,
                                 append_consensus_padding_entry_for_test(
                                     &fleet.stores[workload_leader],
                                     request_id,
@@ -11352,23 +11358,114 @@ async fn advance_protected_roster_process_loss_snapshot_workload(
                 ))
                 .await;
                 let mut retry_offsets = Vec::new();
-                for (offset, result) in attempts {
+                let mut outcome_unknown = Vec::new();
+                let mut confirmed_rejections = 0usize;
+                for (offset, request_id, result) in attempts {
                     match result {
                         Ok(log_index) => window_log_indexes.push(log_index),
                         Err(StoreError::BackendUnavailable(_)) => retry_offsets.push(offset),
-                        Err(error) => {
-                            let classification = match error {
-                                StoreError::BackendOperationOutcomeUnavailable => {
-                                    "outcome_unknown"
+                        Err(StoreError::BackendOperationOutcomeUnavailable) => {
+                            outcome_unknown.push((offset, request_id));
+                        }
+                        Err(_) => confirmed_rejections = confirmed_rejections.saturating_add(1),
+                    }
+                }
+                if confirmed_rejections != 0 {
+                    let (_, durable_progress) =
+                        fleet.process_loss_durable_progress_diagnostic_for_test();
+                    eprintln!(
+                        "process-loss {phase} snapshot command failed closed; classification=confirmed_rejection; completed={completed}; window_len={window_len}; rejected={confirmed_rejections}; durable_progress={durable_progress}"
+                    );
+                    panic!("process-loss {phase} snapshot command was rejected")
+                }
+
+                // Once submission crosses the accepted/outcome-unknown
+                // boundary, this exact ID never re-enters proposal admission.
+                // Poll all three voter-local WAL readers until one or more
+                // expose the authenticated durable receipt. Any recorded
+                // values must agree; conflicts and corrupt shapes fail closed.
+                let mut unresolved_receipts = outcome_unknown;
+                while !unresolved_receipts.is_empty() {
+                    let observations = futures_util::future::join_all(
+                        unresolved_receipts.iter().map(|(offset, request_id)| async move {
+                            let voter_statuses = futures_util::future::join_all(
+                                fleet.stores.iter().map(|store| {
+                                    consensus_padding_receipt_status_for_test(store, *request_id)
+                                }),
+                            )
+                            .await;
+                            (*offset, *request_id, voter_statuses)
+                        }),
+                    )
+                    .await;
+                    let mut still_unresolved = Vec::new();
+                    let mut newly_recorded = Vec::new();
+                    let mut receipt_conflicts = 0usize;
+                    let mut receipt_corruption = 0usize;
+                    for (offset, request_id, voter_statuses) in observations {
+                        let mut recorded_index = None;
+                        for status in voter_statuses {
+                            match status {
+                                Ok(ConsensusPaddingReceiptStatusForTest::Recorded {
+                                    raft_log_index,
+                                }) => {
+                                    if recorded_index
+                                        .is_some_and(|recorded| recorded != raft_log_index)
+                                    {
+                                        receipt_corruption = receipt_corruption.saturating_add(1);
+                                    } else {
+                                        recorded_index = Some(raft_log_index);
+                                    }
                                 }
-                                _ => "confirmed_rejection",
-                            };
-                            eprintln!(
-                                "process-loss {phase} snapshot command failed closed; classification={classification}; completed={completed}; window_len={window_len}; offset={offset}"
-                            );
-                            panic!("process-loss {phase} snapshot command was rejected")
+                                Ok(ConsensusPaddingReceiptStatusForTest::NotFound)
+                                | Err(StoreError::BackendUnavailable(_)) => {}
+                                Ok(ConsensusPaddingReceiptStatusForTest::Conflict) => {
+                                    receipt_conflicts = receipt_conflicts.saturating_add(1);
+                                }
+                                Err(_) => {
+                                    receipt_corruption = receipt_corruption.saturating_add(1);
+                                }
+                            }
+                        }
+                        if let Some(raft_log_index) = recorded_index {
+                            newly_recorded.push((offset, raft_log_index));
+                        } else {
+                            still_unresolved.push((offset, request_id));
                         }
                     }
+                    if receipt_conflicts != 0 || receipt_corruption != 0 {
+                        let (_, durable_progress) =
+                            fleet.process_loss_durable_progress_diagnostic_for_test();
+                        eprintln!(
+                            "process-loss {phase} snapshot receipt failed closed; completed={completed}; window_len={window_len}; conflicts={receipt_conflicts}; corrupt={receipt_corruption}; durable_progress={durable_progress}"
+                        );
+                        panic!("process-loss {phase} snapshot receipt is invalid")
+                    }
+                    window_log_indexes.extend(
+                        newly_recorded
+                            .iter()
+                            .map(|(_, raft_log_index)| *raft_log_index),
+                    );
+                    if still_unresolved.is_empty() {
+                        no_progress_backoff = Duration::from_millis(20);
+                    } else {
+                        let (engines_running, durable_progress) =
+                            fleet.process_loss_durable_progress_diagnostic_for_test();
+                        if !engines_running {
+                            panic!(
+                                "process-loss {phase} snapshot receipt fails closed because a voter engine stopped; durable_progress={durable_progress}"
+                            );
+                        }
+                        if newly_recorded.is_empty() {
+                            tokio::time::sleep(no_progress_backoff).await;
+                            no_progress_backoff = no_progress_backoff
+                                .saturating_mul(2)
+                                .min(Duration::from_millis(250));
+                        } else {
+                            no_progress_backoff = Duration::from_millis(20);
+                        }
+                    }
+                    unresolved_receipts = still_unresolved;
                 }
                 if !retry_offsets.is_empty() {
                     let (engines_running, durable_progress) =

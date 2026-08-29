@@ -1516,6 +1516,43 @@ impl SqliteSessionBackend {
         }
     }
 
+    /// Read one exact test-control padding receipt through a fresh WAL
+    /// acceptance-reader snapshot. This path never enters proposal admission
+    /// and cannot replay the command whose caller observed ambiguity.
+    #[cfg(feature = "test-control")]
+    pub(crate) async fn consensus_padding_receipt_status_for_test(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+        authority_identity: crate::consensus::SessionConsensusIdentity,
+        request_id: crate::consensus::SessionConsensusRequestId,
+    ) -> Result<consensus::ConsensusPaddingReceiptStatus, StoreError> {
+        self.run_consensus_acceptance_read_task(move |conn| {
+            let tx = conn.unchecked_transaction().map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session consensus padding receipt read is unavailable".into(),
+                )
+            })?;
+            let status = consensus::consensus_padding_receipt_status_sync(
+                &tx,
+                storage_identity,
+                authority_identity,
+                request_id,
+            )
+            .map_err(|_| {
+                StoreError::Serialization(
+                    "session consensus padding receipt state is invalid".into(),
+                )
+            })?;
+            tx.commit().map_err(|_| {
+                StoreError::BackendUnavailable(
+                    "session consensus padding receipt read is unavailable".into(),
+                )
+            })?;
+            Ok(status)
+        })
+        .await
+    }
+
     async fn run_lease_sqlite_task<T, F>(&self, operation: F) -> Result<T, LeaseError>
     where
         T: Send + 'static,

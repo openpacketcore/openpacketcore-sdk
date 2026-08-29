@@ -5391,7 +5391,7 @@ impl EvidenceArtifactIdentity {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn rustix_identity(stat: rustix::fs::Stat) -> EvidenceArtifactIdentity {
     EvidenceArtifactIdentity {
         device: stat.st_dev,
@@ -5400,7 +5400,7 @@ fn rustix_identity(stat: rustix::fs::Stat) -> EvidenceArtifactIdentity {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn rustix_identity(stat: rustix::fs::Stat) -> EvidenceArtifactIdentity {
     EvidenceArtifactIdentity {
         device: u64::try_from(stat.st_dev).expect("evidence artifact device is nonnegative"),
@@ -6394,7 +6394,7 @@ fn verify_live_process_loss_cargo_alias_with_seam(
     .map_err(|_| "open V9 Cargo executable backing without following links")?;
     let backing_stat = fstat(&descriptor).map_err(|_| "fstat V9 Cargo executable backing")?;
     let backing_identity = rustix_identity(backing_stat);
-    let backing_mode = u16::try_from(backing_stat.st_mode & 0o7777)
+    let backing_mode = u16::try_from(u64::from(backing_stat.st_mode) & 0o7777)
         .map_err(|_| "V9 Cargo executable backing mode is out of range")?;
     if backing_text != invocation.cargo_executable
         || !FileType::from_raw_mode(backing_stat.st_mode).is_file()
@@ -7596,13 +7596,52 @@ fn write_release_evidence_artifact_with_seams(
     write_release_evidence_artifact_with_seams_and_lease(artifact, bytes, seams, None)
 }
 
+fn publish_release_evidence_noreplace(
+    directory: &File,
+    temporary: &OsStr,
+    final_leaf: &OsStr,
+) -> rustix::io::Result<()> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox"
+    ))]
+    {
+        rustix::fs::renameat_with(
+            directory,
+            temporary,
+            directory,
+            final_leaf,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        use rustix::fs::{linkat, unlinkat, AtFlags};
+
+        // FreeBSD has no rustix `renameat_with` export. A hard-link publish is
+        // still atomic and no-clobber for this same-filesystem private
+        // namespace. If unlinking the temporary name fails, the caller adds a
+        // durable failure marker and never creates `.accepted`.
+        linkat(
+            directory,
+            temporary,
+            directory,
+            final_leaf,
+            AtFlags::empty(),
+        )?;
+        unlinkat(directory, temporary, AtFlags::empty())
+    }
+}
+
 fn write_release_evidence_artifact_with_seams_and_lease(
     artifact: &PinnedReleaseEvidenceArtifact,
     bytes: &[u8],
     seams: &ReleaseEvidenceWriterSeams<'_>,
     qualification_host_lease: Option<&QualificationHostLease>,
 ) -> Result<(), &'static str> {
-    use rustix::fs::{fstat, openat, renameat_with, Mode, OFlags, RenameFlags};
+    use rustix::fs::{fstat, openat, Mode, OFlags};
 
     if let Some(lease) = qualification_host_lease {
         lease.revalidate()?;
@@ -7647,12 +7686,10 @@ fn write_release_evidence_artifact_with_seams_and_lease(
             .map_err(|_| "evidence parent failure could not seal private namespace")?;
         return Err("evidence parent changed immediately before rename");
     }
-    if renameat_with(
+    if publish_release_evidence_noreplace(
         &artifact.namespace_parent,
         temporary.as_os_str(),
-        &artifact.namespace_parent,
         artifact.leaf.as_os_str(),
-        RenameFlags::NOREPLACE,
     )
     .is_err()
     {

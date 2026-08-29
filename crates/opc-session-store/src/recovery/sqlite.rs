@@ -302,7 +302,7 @@ fn run_pinned_inspection_path_swap_hook(before: bool, path: &Path) {
 /// Exercise the only interval between the durable workflow identity check and
 /// the descriptor-bound target predicate.  Production has no hook: it keeps
 /// the execution lock's original descriptor authoritative throughout.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(super) fn install_target_database_after_identity_admission_hook(
     hook: impl FnOnce(&Path) + 'static,
 ) {
@@ -310,7 +310,7 @@ pub(super) fn install_target_database_after_identity_admission_hook(
         .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(super) fn clear_target_database_after_identity_admission_hook() {
     TARGET_DATABASE_AFTER_IDENTITY_ADMISSION_HOOK.with(|slot| *slot.borrow_mut() = None);
 }
@@ -329,7 +329,7 @@ fn run_target_database_after_identity_admission_hook(path: &Path) {
 /// fence.  The regression test restores the public pathname at that point so
 /// a final pathname fence alone would incorrectly authenticate the original
 /// pin while SQLite has already selected the replacement inode.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_pinned_sqlite_open_mismatch_hook(
     vfs_resolved_path: PathBuf,
     after_open: impl FnOnce() + 'static,
@@ -338,36 +338,36 @@ fn install_pinned_sqlite_open_mismatch_hook(
     PINNED_SQLITE_AFTER_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(after_open)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn pinned_sqlite_open_path_for_test(path: PathBuf) -> PathBuf {
     PINNED_SQLITE_OPEN_PATH_OVERRIDE.with(|slot| slot.borrow_mut().take().unwrap_or(path))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn run_pinned_sqlite_after_open_hook() {
     if let Some(hook) = PINNED_SQLITE_AFTER_OPEN_HOOK.with(|slot| slot.borrow_mut().take()) {
         hook();
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn record_pinned_sqlite_semantic_open_for_test() {
     PINNED_SQLITE_SEMANTIC_OPEN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn reset_pinned_sqlite_semantic_open_count_for_test() {
     PINNED_SQLITE_SEMANTIC_OPEN_COUNT.with(|count| count.set(0));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn pinned_sqlite_semantic_open_count_for_test() -> usize {
     PINNED_SQLITE_SEMANTIC_OPEN_COUNT.with(std::cell::Cell::get)
 }
 
 /// Install the causal legacy-classification seam used to prove that no
 /// predecessor prepass can be combined with a later semantic WAL snapshot.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(super) fn install_legacy_classification_before_proof_hook(hook: impl FnOnce() + 'static) {
     LEGACY_CLASSIFICATION_BEFORE_PROOF_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
@@ -10514,7 +10514,7 @@ fn digest_pinned_file(
 
 /// Require an existing fixed fs-verity seal on a recovery source artifact.
 /// A byte-identical but unsealed replacement is not equivalent evidence.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn measure_fixed_snapshot(path: &Path) -> Result<(), RecoveryError> {
     let file = PinnedSnapshotFile::open(path)?;
     measure_fixed_snapshot_file(&file)
@@ -10539,7 +10539,7 @@ fn measure_fixed_snapshot_file(file: &PinnedSnapshotFile) -> Result<(), Recovery
 /// Seal a freshly copied recovery snapshot after its writer has closed. This
 /// is intentionally distinct from database copies: recovery later writes its
 /// SQLite database, while snapshot envelopes are immutable transport objects.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn seal_fixed_snapshot(path: &Path) -> Result<(), RecoveryError> {
     let file = PinnedSnapshotFile::open(path).map_err(|_| RecoveryError::FileOperationFailed)?;
     seal_fixed_snapshot_file(&file)
@@ -11329,6 +11329,7 @@ mod fixed_snapshot_copy_tests {
         bytes
     }
 
+    #[cfg(target_os = "linux")]
     fn fs_verity_snapshot_tempdir(prefix: &str) -> tempfile::TempDir {
         const QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
         const SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";

@@ -21388,6 +21388,111 @@ mod membership_tests {
         assert!(matches!(applied.op, ReplicationOp::AcquireLease { .. }));
     }
 
+    #[cfg(feature = "test-control")]
+    #[tokio::test]
+    async fn padding_receipt_resolves_accepted_timeout_without_reproposal() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("padding receipt directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("padding receipt SQLite backend");
+        let apply_gate = Arc::clone(&backend.consensus_apply_gate);
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect("open padding receipt store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize padding receipt store");
+
+        let held_apply = apply_gate
+            .acquire_owned()
+            .await
+            .expect("hold padding receipt state-machine apply");
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        let request_id = *b"OPCPADRECEIPT001";
+        let submit_store = store.clone();
+        let submission = tokio::spawn(async move {
+            submit_store
+                .submit_request(
+                    SessionConsensusRequestId::from_bytes(request_id),
+                    SessionMutationIntent::AdvanceLogicalTime,
+                )
+                .await
+        });
+        wait_for_log_index_after(&store, before, "accepted padding receipt proposal").await;
+        assert_eq!(
+            submission.await.expect("padding receipt submit task"),
+            Err(StoreError::BackendOperationOutcomeUnavailable),
+            "an accepted command whose apply result missed its deadline is ambiguous"
+        );
+        assert_eq!(
+            crate::test_support::consensus_padding_receipt_status_for_test(&store, request_id)
+                .await
+                .expect("read held padding receipt"),
+            crate::test_support::ConsensusPaddingReceiptStatusForTest::NotFound,
+            "an accepted but unapplied command has no durable outcome receipt"
+        );
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "the ambiguous caller submitted exactly one command"
+        );
+
+        drop(held_apply);
+        let recorded_index = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match crate::test_support::consensus_padding_receipt_status_for_test(
+                    &store, request_id,
+                )
+                .await
+                .expect("read applied padding receipt")
+                {
+                    crate::test_support::ConsensusPaddingReceiptStatusForTest::NotFound => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    crate::test_support::ConsensusPaddingReceiptStatusForTest::Recorded {
+                        raft_log_index,
+                    } => break raft_log_index,
+                    crate::test_support::ConsensusPaddingReceiptStatusForTest::Conflict => {
+                        panic!("the exact padding receipt cannot conflict")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("padding receipt becomes visible after apply");
+        assert_eq!(recorded_index, before + 1);
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "receipt recovery never reproposes the ambiguous command"
+        );
+        let permits = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
+                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS)
+                    .expect("proposal slot count fits u32"),
+            ),
+        )
+        .await
+        .expect("padding receipt supervisor releases admission after apply")
+        .expect("padding receipt proposal admission remains open");
+        drop(permits);
+    }
+
     #[tokio::test]
     async fn accepted_local_proposals_remain_supervised_after_timeout_and_cancellation() {
         let directory = tempfile::tempdir().expect("proposal supervision directory");

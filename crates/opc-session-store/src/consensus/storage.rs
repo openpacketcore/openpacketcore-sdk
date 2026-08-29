@@ -75,7 +75,7 @@ const SNAPSHOT_APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// Test-only witness for the expensive live-terminal branch. The production
 /// fast probe cannot reach `reconcile_with_gate`, so a focused test can prove
 /// that clear/active calls neither select nor open a current snapshot.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct LiveTerminalRecoveryFullReconciliationObserver {
     full_reconciliations: Arc<AtomicUsize>,
 }
@@ -88,7 +88,7 @@ fn live_terminal_recovery_full_reconciliation_observer(
     OBSERVER.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl LiveTerminalRecoveryFullReconciliationObserver {
     fn install() -> Self {
         let full_reconciliations = Arc::new(AtomicUsize::new(0));
@@ -110,7 +110,7 @@ impl LiveTerminalRecoveryFullReconciliationObserver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for LiveTerminalRecoveryFullReconciliationObserver {
     fn drop(&mut self) {
         let mut installed = live_terminal_recovery_full_reconciliation_observer()
@@ -198,7 +198,7 @@ fn snapshot_directory_admission_test_hooks(
     HOOKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_snapshot_directory_admission_test_hook(
     logical_directory: PathBuf,
     hook: SnapshotDirectoryAdmissionTestHook,
@@ -906,9 +906,12 @@ enum SnapshotPublicationCleanupCrashPoint {
 struct SnapshotArtifactCleanupTestHooks {
     before_rename: Option<SnapshotArtifactCleanupTestHook>,
     after_rename: Option<SnapshotArtifactCleanupTestHook>,
+    #[cfg(target_os = "linux")]
     post_final_identity_before_unlink: Option<SnapshotArtifactCleanupTestHook>,
+    #[cfg(target_os = "linux")]
     fail_before_rename: bool,
     fail_post_rename_sync: bool,
+    #[cfg(target_os = "linux")]
     fail_post_unlink_guard_sync: bool,
     publication_process_loss: Option<SnapshotPublicationCleanupCrashPoint>,
 }
@@ -941,7 +944,7 @@ fn take_snapshot_publication_cleanup_process_loss(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn simulated_snapshot_publication_process_loss(
     original: &Path,
     point: SnapshotPublicationCleanupCrashPoint,
@@ -956,7 +959,7 @@ fn simulated_snapshot_publication_process_loss(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn take_snapshot_artifact_cleanup_hook(
     original: &Path,
     after_rename: bool,
@@ -1463,7 +1466,7 @@ fn remove_identity_bound_snapshot_artifact(
             .expect("rename establishes tombstone state")
             .to_path_buf();
         sync_snapshot_artifact_cleanup_after_rename(&cleanup.original, &tombstone, namespace)?;
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         simulated_snapshot_publication_process_loss(
             &cleanup.original,
             SnapshotPublicationCleanupCrashPoint::AfterOldTombstoneSync,
@@ -1589,7 +1592,7 @@ fn remove_identity_bound_snapshot_artifact(
                 tombstone,
             };
             sync_snapshot_artifact_cleanup_after_unlink_guard_rename(cleanup, namespace)?;
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             simulated_snapshot_publication_process_loss(
                 &cleanup.original,
                 SnapshotPublicationCleanupCrashPoint::AfterOldUnlinkGuardSync,
@@ -1820,13 +1823,13 @@ fn fixed_install_source_copy_gates(
     GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct FixedInstallSourceCopyGateGuard {
     snapshot_directory: PathBuf,
     gate: std::sync::Arc<SnapshotArtifactGate>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl FixedInstallSourceCopyGateGuard {
     fn install(snapshot_directory: PathBuf, gate: std::sync::Arc<SnapshotArtifactGate>) -> Self {
         fixed_install_source_copy_gates()
@@ -1840,7 +1843,7 @@ impl FixedInstallSourceCopyGateGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for FixedInstallSourceCopyGateGuard {
     fn drop(&mut self) {
         self.gate.release();
@@ -1967,13 +1970,13 @@ fn recovery_publication_fence_gates(
     GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct RecoveryPublicationFenceGateGuard {
     snapshot_directory: PathBuf,
     gate: std::sync::Arc<SnapshotArtifactGate>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl RecoveryPublicationFenceGateGuard {
     fn install(snapshot_directory: PathBuf, gate: std::sync::Arc<SnapshotArtifactGate>) -> Self {
         recovery_publication_fence_gates()
@@ -1987,7 +1990,7 @@ impl RecoveryPublicationFenceGateGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for RecoveryPublicationFenceGateGuard {
     fn drop(&mut self) {
         self.gate.release();
@@ -2023,13 +2026,13 @@ fn fixed_snapshot_return_gates(
     GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct FixedSnapshotReturnGateGuard {
     snapshot_directory: PathBuf,
     gate: std::sync::Arc<SnapshotArtifactGate>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl FixedSnapshotReturnGateGuard {
     fn install(snapshot_directory: PathBuf, gate: std::sync::Arc<SnapshotArtifactGate>) -> Self {
         fixed_snapshot_return_gates()
@@ -2043,7 +2046,7 @@ impl FixedSnapshotReturnGateGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for FixedSnapshotReturnGateGuard {
     fn drop(&mut self) {
         self.gate.release();
@@ -2370,7 +2373,7 @@ impl LiveTerminalRecoveryHandoffConsumer {
     /// Strict recovery-manager entry point.  A manager invokes this only
     /// after publishing Terminal(PendingHandoff), so an Active/Clear result
     /// is a fail-closed corruption rather than a readiness observation.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) async fn consume(&self) -> Result<(), SessionConsensusStorageError> {
         let gate = self.acquire_gate().await?;
         self.consume_with_gate(&gate).await

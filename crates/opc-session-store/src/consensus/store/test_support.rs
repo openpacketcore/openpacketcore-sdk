@@ -134,9 +134,58 @@ pub async fn append_consensus_padding_entry_for_test(
             raft_log_index,
             ..
         }) if raft_log_index != 0 => Ok(raft_log_index),
-        Ok(_) => Err(StoreError::BackendOperationOutcomeUnavailable),
+        Ok(SessionConsensusResponse {
+            result: Err(error), ..
+        }) => Err(error),
+        Ok(_) => Err(StoreError::Serialization(
+            "consensus padding response shape is invalid".into(),
+        )),
         Err(error) => Err(error),
     }
+}
+
+/// Test-only voter-local classification for an exact padding command receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusPaddingReceiptStatusForTest {
+    /// This voter has not durably applied the exact authenticated command.
+    NotFound,
+    /// The exact command was durably applied at its original nonzero index.
+    Recorded {
+        /// Original Openraft log index retained by the durable receipt.
+        raft_log_index: u64,
+    },
+    /// The request ID is already bound to another authenticated payload.
+    Conflict,
+}
+
+/// Read one exact voter-local padding receipt without entering proposal
+/// admission. The supplied ID is bound to this store's current authenticated
+/// authority and the fixed `AdvanceLogicalTime` test command.
+pub async fn consensus_padding_receipt_status_for_test(
+    store: &ConsensusSessionStore,
+    request_id: [u8; 16],
+) -> Result<ConsensusPaddingReceiptStatusForTest, StoreError> {
+    let (authority_identity, _) = store.current_scope()?;
+    let status = store
+        .inner
+        .backend
+        .consensus_padding_receipt_status_for_test(
+            store.inner.storage_identity,
+            authority_identity,
+            SessionConsensusRequestId::from_bytes(request_id),
+        )
+        .await?;
+    Ok(match status {
+        crate::sqlite::consensus::ConsensusPaddingReceiptStatus::NotFound => {
+            ConsensusPaddingReceiptStatusForTest::NotFound
+        }
+        crate::sqlite::consensus::ConsensusPaddingReceiptStatus::Recorded { raft_log_index } => {
+            ConsensusPaddingReceiptStatusForTest::Recorded { raft_log_index }
+        }
+        crate::sqlite::consensus::ConsensusPaddingReceiptStatus::Conflict => {
+            ConsensusPaddingReceiptStatusForTest::Conflict
+        }
+    })
 }
 
 /// Request an engine-owned log purge through one exact local log index after

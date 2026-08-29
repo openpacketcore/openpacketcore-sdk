@@ -2573,10 +2573,16 @@ mod tests {
         let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
             .await
             .expect("backend");
-        assert!(matches!(
-            open(&backend, temp.path(), identity(), members()).await,
-            Err(ConfigConsensusStorageError::InvalidIdentity)
-        ));
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("make non-private snapshot root");
+        assert_eq!(
+            open(&backend, temp.path(), identity(), members())
+                .await
+                .map(|_| ()),
+            Err(ConfigConsensusStorageError::InvalidIdentity),
+        );
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore private fixture parent");
 
         let target = temp.path().join("real-target");
         std::fs::create_dir(&target).expect("target");
