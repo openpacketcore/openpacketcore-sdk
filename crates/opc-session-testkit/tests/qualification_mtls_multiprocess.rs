@@ -37,14 +37,14 @@ use opc_session_net::{
     FencedMutationRosterMemberOperationId, FencedMutationRosterMemberProvider,
     FencedMutationRosterProfile, FencedMutationRosterProviderCallOutcome,
     PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    PersistentSessionConsumerV2Diagnostics, PersistentSessionConsumerV2ExecuteError,
-    RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId, SessionConfigurationEpoch,
-    SessionConfigurationGeneration, SessionConsumerClientError, SessionConsumerLeaseMutationError,
-    SessionReplicationManifest, StatelessSessionConsumerClient,
-    CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, DEFAULT_MAX_AUTHENTICATION_AGE,
-    DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW,
-    DEFAULT_ROTATION_JITTER, SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
-    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    PersistentSessionConsumerExecuteError, PersistentSessionConsumerV2Diagnostics,
+    PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver, RemoteSessionConsensusPeer,
+    SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
+    SessionConsumerClientError, SessionConsumerLeaseMutationError, SessionReplicationManifest,
+    StatelessSessionConsumerClient, CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+    DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
+    DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
+    SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::fenced_mutation_roster::{
     RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
@@ -11432,24 +11432,30 @@ async fn qualification_fenced_transition_record(
         expires_at: None,
         payload: EncryptedSessionPayload::new(payload),
     };
+    seal_qualification_consensus_record(member_count, &mut record).await;
+    record
+}
+
+async fn seal_qualification_consensus_record(
+    member_count: usize,
+    record: &mut StoredSessionRecord,
+) {
     let provider = MemoryKeyProvider::new();
     provider
         .insert_active_key(
-            KeyId::new("session-ha-qualification-key-v1")
-                .expect("qualification fenced-transition key ID"),
+            KeyId::new("session-ha-qualification-key-v1").expect("qualification consensus key ID"),
             KeyPurpose::Session,
             record.key.tenant.clone(),
             Zeroizing::new([0x5a; AES_256_GCM_SIV_KEY_LEN]),
         )
-        .expect("install qualification fenced-transition key");
+        .expect("install qualification consensus key");
     record.payload = EncryptedSessionPayload::encrypt(
         &provider,
-        &record,
+        record,
         &format!("qualification-mtls-{member_count}-cluster"),
     )
     .await
-    .expect("seal opaque qualification fenced-transition payload");
-    record
+    .expect("seal opaque qualification consensus payload");
 }
 
 async fn qualification_fenced_transition_v2_request(
@@ -12730,8 +12736,8 @@ enum QualificationConsumerClient {
 
 #[derive(Debug)]
 enum QualificationConsumerExecuteError {
-    Stateless,
-    Persistent,
+    Stateless(SessionConsumerClientError),
+    Persistent(PersistentSessionConsumerExecuteError),
 }
 
 impl QualificationConsumerClient {
@@ -12743,11 +12749,11 @@ impl QualificationConsumerClient {
             Self::Stateless(client) => client
                 .execute(request)
                 .await
-                .map_err(|_| QualificationConsumerExecuteError::Stateless),
+                .map_err(QualificationConsumerExecuteError::Stateless),
             Self::Persistent(client) => client
                 .execute(&request)
                 .await
-                .map_err(|_| QualificationConsumerExecuteError::Persistent),
+                .map_err(QualificationConsumerExecuteError::Persistent),
         }
     }
 
@@ -13140,12 +13146,13 @@ fn qualification_fenced_mutation_roster_client(
 
 impl QualificationProtectedRosterRun {
     async fn start(
+        member_count: usize,
         general: &QualificationConsumerClient,
         protected: PersistentSessionConsumerClient,
         scope: SessionConsumerScope,
     ) -> Self {
         let key = SessionKey {
-            tenant: TenantId::new("qualification-roster-tenant").expect("bounded roster tenant"),
+            tenant: TenantId::new("session-ha-qualification").expect("bounded roster tenant"),
             nf_kind: NetworkFunctionKind::smf(),
             key_type: SessionKeyType::PduSession,
             stable_id: Bytes::from_static(b"qualification-roster-session")
@@ -13162,7 +13169,7 @@ impl QualificationProtectedRosterRun {
             )
             .await
             .expect("general lane obtains the real protected-roster lease");
-        let record = StoredSessionRecord {
+        let mut record = StoredSessionRecord {
             key: key.clone(),
             generation: Generation::new(1),
             owner,
@@ -13172,6 +13179,7 @@ impl QualificationProtectedRosterRun {
             expires_at: None,
             payload: EncryptedSessionPayload::new([]),
         };
+        seal_qualification_consensus_record(member_count, &mut record).await;
         let created = general
             .execute(SessionConsumerRequest::new(
                 scope,
@@ -13718,6 +13726,7 @@ fn run_consumer_multiprocess_qualification(
     }
     let mut protected_roster_run = if matches!(mode, ConsumerQualificationMode::Persistent) {
         let run = runtime.block_on(QualificationProtectedRosterRun::start(
+            member_count,
             &clients[0],
             protected_roster_client.clone(),
             scope,
@@ -13869,14 +13878,21 @@ fn run_consumer_multiprocess_qualification(
         SessionConfigurationEpoch::new(scope_identity.configuration_epoch().get() + 1)
             .expect("bounded foreign scope epoch"),
     ));
+    // Both public clients enforce their topology scope before a Call frame can
+    // cross the wire. Preserve and assert that exact typed pre-transmission
+    // boundary instead of expecting the server's unreachable ScopeMismatch.
     let scope_negative_boundary_rejections = u8::from(matches!(
         runtime.block_on(clients[0].execute(SessionConsumerRequest::new(
             foreign_scope,
             SessionConsumerRequestId::from_bytes([0x43; 16]),
             SessionConsumerOperation::Capabilities,
         ))),
-        Ok(SessionConsumerResponse::Rejected(
-            SessionConsumerRejection::Unauthorized
+        Err(QualificationConsumerExecuteError::Stateless(
+            SessionConsumerClientError::Scope
+        )) | Err(QualificationConsumerExecuteError::Persistent(
+            PersistentSessionConsumerExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Scope
+            }
         ))
     ));
     assert_eq!(scope_negative_boundary_rejections, 1);
