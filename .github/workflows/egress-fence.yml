@@ -123,6 +123,26 @@ jobs:
             --target aarch64-apple-darwin \
             -- \
             -D warnings
+          optimized_sqlite_contracts=(
+            sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch
+            sqlite::consensus::tests::due_protected_roster_maintenance_reclaims_the_oldest_bounded_prefix_only
+            sqlite::consensus::tests::fenced_transition_v2_capacity_opens_successor_and_bounds_eight_exact_epochs
+            sqlite::consensus::tests::fenced_transition_v2_floor_reclaims_oldest_while_successor_remains_writable
+            sqlite::consensus::tests::fenced_transition_v2_post_reclaim_deletion_keeps_retired_and_conflict_closed
+            sqlite::consensus::tests::fenced_transition_v2_reclaims_exactly_1024_then_opens_next_epoch
+            sqlite::consensus::tests::fenced_transition_v2_revoked_authority_masks_nonactive_epoch_in_apply_and_projection
+            sqlite::consensus::tests::fenced_transition_v2_snapshot_during_reclaim_preserves_cursor_and_rejects_regression
+          )
+          broad_test_skips=(
+            consensus::store::membership_tests::protected_roster_ingress_has_two_mutations_and_read_only_status_paths
+            "${optimized_sqlite_contracts[@]}"
+            lagging_replica_installs_compacted_snapshot_without_losing_committed_state
+            fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
+          )
+          broad_skip_arguments=()
+          for contract in "${broad_test_skips[@]}"; do
+            broad_skip_arguments+=(--skip "${contract}")
+          done
           cargo test --locked \
             -p opc-egress-fence \
             -p opc-egress-fence-common \
@@ -135,10 +155,7 @@ jobs:
             -- \
             --test-threads=4 \
             --exact \
-            --skip consensus::store::membership_tests::protected_roster_ingress_has_two_mutations_and_read_only_status_paths \
-            --skip sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch \
-            --skip lagging_replica_installs_compacted_snapshot_without_losing_committed_state \
-            --skip fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
+            "${broad_skip_arguments[@]}"
           # Snapshot installation owns process-wide test controls and durable
           # voter state. Match the main CI shard by running these proofs in
           # fresh, single-test processes outside the shared teardown queue.
@@ -160,19 +177,6 @@ jobs:
             --test-threads=1 \
             --exact \
             fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
-          # This exact 1,025-roster proof dominates the debug unit-test
-          # process and can exhaust the fixed job bound while unrelated tests
-          # occupy its worker threads. Preserve the full cardinality and run
-          # it once in the repository's optimized qualification profile.
-          CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo test --locked \
-            -p opc-session-store \
-            --lib \
-            --all-features \
-            --quiet \
-            -- \
-            --test-threads=1 \
-            --exact \
-            sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch
           # This proof deliberately binds a one-second attached-consensus
           # deadline. Run it exactly once outside the multi-minute SQLite
           # fixtures so host scheduling cannot turn a committed mutation into
@@ -201,6 +205,21 @@ jobs:
             -p opc-session-store \
             --all-features \
             --no-deps
+          # These exact high-cardinality retained-history and reclamation
+          # proofs dominate the shared debug process. Preserve every input,
+          # assertion, and exact selector while running them once each in the
+          # repository's optimized qualification profile.
+          for contract in "${optimized_sqlite_contracts[@]}"; do
+            CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo test --locked \
+              -p opc-session-store \
+              --lib \
+              --all-features \
+              --quiet \
+              -- \
+              --test-threads=1 \
+              --exact \
+              "${contract}"
+          done
 
       - name: Gate every eBPF feature surface
         run: |
