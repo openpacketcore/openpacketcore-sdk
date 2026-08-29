@@ -494,7 +494,7 @@ The immutable schema digests are:
 3ce5f0e622508ba89820742514eddfd2c0575265754c0bdd1a726e5b3335ecca  qualification/v7/session-ha-profile.schema.json
 0b02633f0118283f425c4b60d8540de4503023d3759b7c6939ebaf2d16365772  qualification/v7/session-ha-evidence.schema.json
 5e3becf5094f3e222b94799e0fb7b6b77c3398aeabae743fc65b409c4cd4adfd  qualification/v8/session-ha-persistent-consumer-head-evidence.schema.json
-8e0f1bd7ff65b5cc9f39a2576568d39ba846a4311cc39a3d458763f4bb6eaf5c  qualification/v9/session-ha-persistent-consumer-head-evidence.schema.json
+ecb42383a02a4704988139aafe2f59dfb95988b1e57cdaf05438a664500f2b41  qualification/v9/session-ha-persistent-consumer-head-evidence.schema.json
 ```
 
 The closed V9 external-pair contract records canonical absolute raw paths for

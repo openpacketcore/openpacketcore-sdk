@@ -95,7 +95,7 @@ pub const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_JSON: &str =
     include_str!("../qualification/v9/session-ha-persistent-consumer-head-evidence.schema.json");
 /// SHA-256 binding for the exact tracked v9 evidence schema bytes.
 pub const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_SHA256: &str =
-    "sha256:8e0f1bd7ff65b5cc9f39a2576568d39ba846a4311cc39a3d458763f4bb6eaf5c";
+    "sha256:ecb42383a02a4704988139aafe2f59dfb95988b1e57cdaf05438a664500f2b41";
 
 /// SHA-256 binding for the exact current v9 evidence schema bytes.
 pub fn session_ha_persistent_consumer_head_evidence_v9_schema_sha256() -> String {

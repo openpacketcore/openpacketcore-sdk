@@ -79,8 +79,8 @@ The frozen v8 exact-head schema binds the historical general `/1` transport
 revision 5, digest
 `sha256:5e3becf5094f3e222b94799e0fb7b6b77c3398aeabae743fc65b409c4cd4adfd`.
 The current v9 schema binds `/1` transport revision 6 and application revision
-3, digest
-`sha256:8e0f1bd7ff65b5cc9f39a2576568d39ba846a4311cc39a3d458763f4bb6eaf5c`.
+4, digest
+`sha256:ecb42383a02a4704988139aafe2f59dfb95988b1e57cdaf05438a664500f2b41`.
 The ordinary fenced `/2` wire remains revision 5 and the protected-roster `/3`
 wire is independently revision 5; general `/1` is revision 6. When roster
 support is enabled, the listener deliberately advertises all three consumer

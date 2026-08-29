@@ -167,12 +167,14 @@ cap of 128 rather than that planning estimate.
 The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
 default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
 The exact consensus contract is transport/wire-schema revision 5, application
-revision 3, and error-set revision 6. The revision-5 transport profile retains
+revision 4, and error-set revision 6. The revision-5 transport profile retains
 the explicit forwarded consumer scope, so a peer cannot silently downgrade a
-consumer-scoped operation to an internal call; application revision 3 binds
-outcome-digest v2, and error revision 6 binds that semantic boundary into the
-exact profile. Any other transport, application, or error-set revision fails
-before dispatch;
+consumer-scoped operation to an internal call; application revision 4 also
+fences the former 728bc5 application-revision-3 Postcard tag-27
+`FinalizeOperatorRecoveryV2` encoding, which conflicts with the merged roster
+profile's tags 27 through 30. Error revision 6 binds that semantic boundary
+into the exact profile. Any other transport, application, or error-set revision
+fails before dispatch;
 upgrade every consensus member together while traffic and writers are drained.
 This is not a rolling mixed-profile transition.
 

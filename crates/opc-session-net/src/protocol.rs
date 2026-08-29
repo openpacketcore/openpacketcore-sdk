@@ -110,9 +110,13 @@ pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 5;
 /// compatible. Revision 3 additionally binds the protected-roster established
 /// transition: every applying voter must deterministically enforce its
 /// expected record and owner/fence/credential/guard fields when selecting the
-/// successor. There is no fallback or negotiation: bootstrap requires this
-/// exact value before a connection can carry any consensus command.
-pub const SESSION_CONSENSUS_APPLICATION_REVISION: u16 = 3;
+/// successor. Revision 4 fences the former 728bc5 application-revision-3
+/// profile: that published build encoded `FinalizeOperatorRecoveryV2` as
+/// `SessionMutationIntent` Postcard tag 27, while the merged roster profile
+/// uses tags 27 through 30 and moves recovery to tag 31. There is no fallback
+/// or negotiation: bootstrap requires this exact value before a connection can
+/// carry any consensus command.
+pub const SESSION_CONSENSUS_APPLICATION_REVISION: u16 = 4;
 
 /// Exact resource and semantic profile for consensus-only connections.
 ///
@@ -5398,20 +5402,20 @@ mod tests {
         );
         assert_eq!(SESSION_CONSENSUS_ALPN, b"opc-session-consensus/2");
         assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 5);
-        assert_eq!(SESSION_CONSENSUS_APPLICATION_REVISION, 3);
+        assert_eq!(SESSION_CONSENSUS_APPLICATION_REVISION, 4);
         assert_eq!(
             serde_json::to_value(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE)
                 .expect("consensus contract serializes"),
             serde_json::json!({
                 "wire_schema_revision": 5,
-                "application_revision": 3,
+                "application_revision": 4,
                 "error_set_revision": 6,
                 "max_rpc_payload_bytes": SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
                 "max_roster_rpc_payload_bytes": CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES,
                 "min_frame_size": MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 "max_frame_size": MAX_NEGOTIATED_FRAME_SIZE,
             }),
-            "the bootstrap golden binds v2 outcome-digest and protected-roster established-transition semantics separately from consumer wire"
+            "the bootstrap golden binds v2 outcome-digest, protected-roster established-transition, and the Postcard tag-27 recovery incompatibility separately from consumer wire"
         );
         let mut previous_error_set = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
         previous_error_set.error_set_revision =
@@ -5424,7 +5428,7 @@ mod tests {
         previous_application.application_revision = SESSION_CONSENSUS_APPLICATION_REVISION - 1;
         assert!(
             !previous_application.is_current(),
-            "the adjacent application revision 2 lacks the protected-roster established-transition semantics and must not pass the exact consensus profile gate"
+            "the adjacent application revision 3 is the former 728bc5 tag-27 recovery profile and must not pass the exact consensus profile gate"
         );
         assert_eq!(
             CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE.min_frame_size,

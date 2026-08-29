@@ -3816,10 +3816,24 @@ mod tests {
         SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
         SessionPlacementPolicy, SessionReplicationManifest,
     };
-    use crate::protocol::{
-        write_frame, Request, SessionConsensusContractProfile,
-        SESSION_CONSENSUS_APPLICATION_REVISION,
-    };
+    use crate::protocol::{write_frame, Request, SessionConsensusContractProfile};
+
+    /// The published 728bc5/PR #732 profile must stay explicit here: the
+    /// application revision alone was insufficient to distinguish its
+    /// Postcard tag-27 `FinalizeOperatorRecoveryV2` from the merged roster
+    /// profile, so a future revision bump must not turn this regression into a
+    /// merely adjacent-profile check.
+    fn former_728bc5_application_revision_3_profile() -> SessionConsensusContractProfile {
+        SessionConsensusContractProfile {
+            wire_schema_revision: 5,
+            application_revision: 3,
+            error_set_revision: 6,
+            max_rpc_payload_bytes: 2_097_152,
+            max_roster_rpc_payload_bytes: 2_253_338,
+            min_frame_size: 9_437_184,
+            max_frame_size: 16_777_216,
+        }
+    }
 
     async fn make_remote_retirement_probe_due(peer: &RemoteSessionConsensusPeer) {
         let mut state = peer.connection_pool.cold_connection.state.lock().await;
@@ -6912,8 +6926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consensus_bootstrap_rejects_adjacent_transport_application_or_error_revision_before_handler(
-    ) {
+    async fn consensus_bootstrap_rejects_former_pr_732_tag_27_app3_profile_before_handler() {
         let (server_binding, client_binding) = bindings();
         let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
         let server = SessionConsensusServer::from_transport(
@@ -6931,13 +6944,7 @@ mod tests {
                 SESSION_CONSENSUS_TRANSPORT_REVISION - 1,
                 CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
             ),
-            (
-                SESSION_CONSENSUS_TRANSPORT_REVISION,
-                SessionConsensusContractProfile {
-                    application_revision: SESSION_CONSENSUS_APPLICATION_REVISION - 1,
-                    ..CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
-                },
-            ),
+            (5, former_728bc5_application_revision_3_profile()),
             (
                 SESSION_CONSENSUS_TRANSPORT_REVISION,
                 SessionConsensusContractProfile {
@@ -6983,8 +6990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consensus_client_rejects_adjacent_hello_ack_application_or_error_revision_before_call()
-    {
+    async fn consensus_client_rejects_former_pr_732_tag_27_app3_profile_before_call() {
         let (_server_binding, client_binding) = bindings();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -6993,17 +6999,17 @@ mod tests {
         let server_binding = client_binding.clone();
         let server = tokio::spawn(async move {
             let mut calls = 0;
-            for contract_profile in [
-                SessionConsensusContractProfile {
-                    application_revision: SESSION_CONSENSUS_APPLICATION_REVISION - 1,
-                    ..CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
-                },
-                SessionConsensusContractProfile {
-                    error_set_revision: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
-                        .error_set_revision
-                        - 1,
-                    ..CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
-                },
+            for (transport_revision, contract_profile) in [
+                (5, former_728bc5_application_revision_3_profile()),
+                (
+                    SESSION_CONSENSUS_TRANSPORT_REVISION,
+                    SessionConsensusContractProfile {
+                        error_set_revision: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
+                            .error_set_revision
+                            - 1,
+                        ..CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE
+                    },
+                ),
             ] {
                 let (mut stream, _) = listener.accept().await.expect("accept client");
                 let SessionConsensusBootstrapRequest::Hello(hello) =
@@ -7013,7 +7019,7 @@ mod tests {
                 write_frame(
                     &mut stream,
                     &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
-                        transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+                        transport_revision,
                         contract_profile,
                         identity: hello.identity,
                         server_node_id: server_binding.remote_consensus_node_id(),

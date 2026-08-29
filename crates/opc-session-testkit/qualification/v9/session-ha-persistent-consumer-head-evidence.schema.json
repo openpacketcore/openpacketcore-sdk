@@ -206,13 +206,13 @@
     "general_lane": {
       "allOf": [
         {"$ref": "#/$defs/lane"},
-        {"properties": {"lane": {"const": "general"}, "transport_revision": {"const": 6}, "application_revision": {"const": 3}, "sdk_protocol_revision": {"const": 5}, "consumer_alpn": {"const": "opc-session-consumer/1"}}}
+        {"properties": {"lane": {"const": "general"}, "transport_revision": {"const": 6}, "application_revision": {"const": 4}, "sdk_protocol_revision": {"const": 5}, "consumer_alpn": {"const": "opc-session-consumer/1"}}}
       ]
     },
     "protected_roster_lane": {
       "allOf": [
         {"$ref": "#/$defs/lane"},
-        {"properties": {"lane": {"const": "protected_roster"}, "transport_revision": {"const": 5}, "application_revision": {"const": 3}, "sdk_protocol_revision": {"const": 5}, "consumer_alpn": {"const": "opc-session-consumer/3"}, "tenant_authority": {"$ref": "#/$defs/protected_tenant_authority"}}}
+        {"properties": {"lane": {"const": "protected_roster"}, "transport_revision": {"const": 5}, "application_revision": {"const": 4}, "sdk_protocol_revision": {"const": 5}, "consumer_alpn": {"const": "opc-session-consumer/3"}, "tenant_authority": {"$ref": "#/$defs/protected_tenant_authority"}}}
       ]
     }
   }

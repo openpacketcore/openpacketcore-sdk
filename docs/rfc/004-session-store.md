@@ -1463,12 +1463,14 @@ replication append, or rebuild request. The consensus ALPN and legacy
 production listener.
 
 The exact consensus contract profile MUST use transport/wire-schema revision 5,
-application revision 3, and error-set revision 6. The revision-5 transport
+application revision 4, and error-set revision 6. The revision-5 transport
 profile retains the explicit forwarded consumer scope, so a peer cannot
 silently downgrade a consumer-scoped operation to an internal call; application
-revision 3 binds outcome-digest v2, and error revision 6 binds that semantic
-boundary into the exact profile. Any other transport, application, or error-set
-revision MUST fail before engine dispatch.
+revision 4 fences the former 728bc5 application-revision-3 Postcard tag-27
+`FinalizeOperatorRecoveryV2` encoding, which conflicts with the merged roster
+profile's tags 27 through 30. Error revision 6 binds that semantic boundary
+into the exact profile. Any other transport, application, or error-set revision
+MUST fail before engine dispatch.
 Operators MUST drain traffic and writers, stop every consensus member, upgrade
 the full membership together, verify exact-profile handshakes, and only then
 restore traffic. Mixed-profile rolling operation is unsupported.
