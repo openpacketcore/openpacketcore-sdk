@@ -544,6 +544,40 @@ impl ConsensusColdClaimLockHook {
     }
 }
 
+// This test-only task-local seam pauses an outbound setup only after its
+// complete bootstrap has been accepted and validated. It lets the regression
+// test advance time between physical establishment and cold-pool admission
+// without exposing a production control surface.
+#[cfg(test)]
+struct ConsensusPostAcceptedBootstrapHook {
+    entered: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+impl ConsensusPostAcceptedBootstrapHook {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Notify::new(),
+            release: Notify::new(),
+        })
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CONSENSUS_POST_ACCEPTED_BOOTSTRAP_HOOK: Arc<ConsensusPostAcceptedBootstrapHook>;
+}
+
+#[cfg(test)]
+async fn pause_after_accepted_consensus_bootstrap() {
+    let Ok(hook) = CONSENSUS_POST_ACCEPTED_BOOTSTRAP_HOOK.try_with(Arc::clone) else {
+        return;
+    };
+    hook.entered.notify_one();
+    hook.release.notified().await;
+}
+
 #[derive(Clone, Copy)]
 enum ConsensusStagedConnectionInvalidation {
     Shutdown,
@@ -1554,6 +1588,13 @@ async fn run_detached_consensus_connection_attempt(
             ),
         }
     };
+    #[cfg(test)]
+    if matches!(
+        &outcome,
+        DetachedConsensusConnectionOutcome::Established(Ok(_))
+    ) {
+        pause_after_accepted_consensus_bootstrap().await;
+    }
 
     let connection = match outcome {
         DetachedConsensusConnectionOutcome::Established(Ok(connection))
@@ -1617,6 +1658,13 @@ async fn run_detached_consensus_connection_attempt(
         coordinator
             .publish_no_admission(attempt_id, epoch, SessionConsensusPeerError::Timeout)
             .await;
+        record_consensus_client_connection_failure(SessionConsensusPeerError::Timeout);
+        METRICS
+            .session_net_reconnect_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .session_net_reconnect_failures
+            .fetch_add(1, Ordering::Relaxed);
         reconnect_attempt.failed();
         attempt_metrics.finish();
         return;
@@ -4669,6 +4717,184 @@ mod tests {
             } if current_attempt_id == attempt_id && current_epoch == epoch
         ));
         assert_eq!(state.no_admission_marker, attempt_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_accepted_bootstrap_deadline_records_one_global_timeout_terminal() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let (server_binding, client_binding) = bindings();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind authenticated bootstrap server");
+        let address = listener
+            .local_addr()
+            .expect("read authenticated bootstrap address");
+        let server_release = Arc::new(Notify::new());
+        let server_release_for_task = Arc::clone(&server_release);
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener
+                .accept()
+                .await
+                .expect("accept authenticated bootstrap");
+            let hello: SessionConsensusBootstrapRequest =
+                read_frame(&mut tcp, MAX_HANDSHAKE_FRAME_SIZE)
+                    .await
+                    .expect("read bootstrap Hello");
+            let SessionConsensusBootstrapRequest::Hello(hello) = hello;
+            write_frame(
+                &mut tcp,
+                &SessionConsensusBootstrapResponse::Accepted(SessionConsensusBootstrapAck {
+                    transport_revision: SESSION_CONSENSUS_TRANSPORT_REVISION,
+                    contract_profile: CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
+                    identity: hello.identity,
+                    server_node_id: server_binding.local_consensus_node_id(),
+                    accepted_sender_node_id: hello.sender_node_id,
+                    handshake_nonce: hello.handshake_nonce,
+                    accepted_response_frame_size: hello.requested_response_frame_size,
+                    server_request_frame_size: MAX_NEGOTIATED_FRAME_SIZE as u32,
+                }),
+            )
+            .await
+            .expect("write bootstrap Accepted");
+            server_release_for_task.notified().await;
+        });
+        let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+        let peer = RemoteSessionConsensusPeer::from_transport(
+            ConsensusTarget::resolved(&client_binding, resolver),
+            None,
+            client_binding,
+            Some(Duration::from_secs(5)),
+        );
+        let connector = peer.cold_connector();
+        let coordinator = Arc::clone(&peer.connection_pool.cold_connection);
+        let attempt_id = uuid::Uuid::new_v4();
+        let epoch = connector.epoch();
+        let attempt_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let receipt = Arc::new(ConsensusColdAttemptReceipt::default());
+        coordinator.state.lock().await.phase = ConsensusColdConnectionPhase::Connecting {
+            attempt_id,
+            epoch,
+            attempt_deadline,
+            receipt: Arc::clone(&receipt),
+            remote_retirement_probe: false,
+        };
+        let metrics = || {
+            (
+                METRICS
+                    .session_net_connection_attempts
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_successes
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_transport
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_authentication
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_timeout
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_protocol
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_failure_backend
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_superseded
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_connection_abandoned
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_reconnect_attempts
+                    .load(Ordering::Relaxed),
+                METRICS
+                    .session_net_reconnect_failures
+                    .load(Ordering::Relaxed),
+            )
+        };
+        let before = metrics();
+        let hook = ConsensusPostAcceptedBootstrapHook::new();
+        let mut attempt = {
+            let connector = connector.clone();
+            let coordinator = Arc::clone(&coordinator);
+            let reconnect_gate = Arc::clone(&peer.connection_pool.reconnect_gate);
+            let shutdown = peer.connection_pool.shutdown.subscribe();
+            let hook = Arc::clone(&hook);
+            tokio::spawn(async move {
+                CONSENSUS_POST_ACCEPTED_BOOTSTRAP_HOOK
+                    .scope(
+                        hook,
+                        run_detached_consensus_connection_attempt(
+                            connector,
+                            coordinator,
+                            reconnect_gate,
+                            shutdown,
+                            attempt_id,
+                            epoch,
+                            attempt_deadline,
+                        ),
+                    )
+                    .await;
+            })
+        };
+
+        tokio::select! {
+            _ = hook.entered.notified() => {}
+            result = &mut attempt => {
+                result.expect("join setup that ended before its accepted bootstrap hook");
+                let state = coordinator.state.lock().await;
+                let error = match state.phase {
+                    ConsensusColdConnectionPhase::Failed { error, .. } => Some(error),
+                    _ => None,
+                };
+                panic!("setup ended before its accepted bootstrap hook: {error:?}");
+            }
+        }
+        tokio::time::advance(Duration::from_secs(10) + Duration::from_millis(1)).await;
+        hook.release.notify_one();
+        server_release.notify_one();
+        attempt.await.expect("join post-bootstrap deadline attempt");
+        server.await.expect("join authenticated bootstrap server");
+
+        assert_eq!(receipt.terminal(), Some(SessionConsensusPeerError::Timeout));
+        let after = metrics();
+        assert_eq!(after.0 - before.0, 1, "one setup starts exactly once");
+        assert_eq!(after.4 - before.4, 1, "deadline is a timeout terminal");
+        assert_eq!(
+            after.9 - before.9,
+            1,
+            "timeout consumes one reconnect attempt"
+        );
+        assert_eq!(
+            after.10 - before.10,
+            1,
+            "timeout records one reconnect failure"
+        );
+        assert_eq!(after.8 - before.8, 0, "finished timeout is never abandoned");
+        assert_eq!(after.1 - before.1, 0, "expired setup is never successful");
+        assert_eq!(after.2 - before.2, 0);
+        assert_eq!(after.3 - before.3, 0);
+        assert_eq!(after.5 - before.5, 0);
+        assert_eq!(after.6 - before.6, 0);
+        assert_eq!(after.7 - before.7, 0);
+        let terminal_delta = (after.1 - before.1)
+            + (after.2 - before.2)
+            + (after.3 - before.3)
+            + (after.4 - before.4)
+            + (after.5 - before.5)
+            + (after.6 - before.6)
+            + (after.7 - before.7)
+            + (after.8 - before.8);
+        assert_eq!(
+            terminal_delta,
+            after.0 - before.0,
+            "global terminal conservation"
+        );
     }
 
     #[tokio::test(start_paused = true)]
