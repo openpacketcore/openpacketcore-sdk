@@ -1609,6 +1609,20 @@ impl QualificationNode {
                 }
             }
         };
+        // The listener advertises the protected `/3` roster lane as well as
+        // the general consumer lanes. Establish its immutable exact-scope
+        // profile before publishing that endpoint, matching the production
+        // deployment-readiness contract.
+        if self
+            .store
+            .activate_protected_roster_profile()
+            .await
+            .is_err()
+        {
+            return QualificationNodeReply::Error {
+                code: QualificationNodeErrorCode::BackendUnavailable,
+            };
+        }
         let manifest = match self.store.consumer_authorization_manifest(grants).await {
             Ok(manifest) => manifest,
             Err(_) => {
