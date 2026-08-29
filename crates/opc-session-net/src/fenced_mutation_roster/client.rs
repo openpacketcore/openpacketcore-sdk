@@ -291,11 +291,11 @@ impl AdmissionInput {
     }
 
     /// Build read-only successor recovery for an absent-predecessor admission.
-    pub fn recovery_absent(&self, lease: LeaseGuard) -> Result<RecoveryInput, ClientError> {
+    pub fn recovery_absent(&self, lease: LeaseGuard) -> Result<AbsentRecoveryInput, ClientError> {
         if self.proposal.profile() != Profile::v2() {
             return Err(ClientError::InvalidInput);
         }
-        RecoveryInput::new_absent(
+        AbsentRecoveryInput::new(
             self.roster_id(),
             self.lease.owner().clone(),
             self.lease.fence(),
@@ -359,56 +359,15 @@ impl RecoveryInput {
         lease: LeaseGuard,
         expected_generation: Generation,
     ) -> Result<Self, ClientError> {
-        Self::new_for_profile(
-            Profile::v1(),
-            roster_id,
-            original_owner,
-            original_admission_fence,
-            lease,
-            expected_generation,
-        )
-    }
-
-    fn new_for_profile(
-        profile: Profile,
-        roster_id: RosterId,
-        original_owner: OwnerId,
-        original_admission_fence: FenceToken,
-        lease: LeaseGuard,
-        expected_generation: Generation,
-    ) -> Result<Self, ClientError> {
-        if !lease_has_valid_profile(&lease) || original_admission_fence.get() == 0 {
-            return Err(ClientError::InvalidInput);
-        }
-        if lease.fence() <= original_admission_fence {
-            return Err(ClientError::AuthorityRejected);
-        }
+        validate_recovery_authority(original_admission_fence, &lease)?;
         Ok(Self {
-            profile,
+            profile: Profile::v1(),
             roster_id,
             original_owner,
             original_admission_fence,
             lease,
             expected_generation,
         })
-    }
-
-    /// Construct recovery for an absent-predecessor admission at the
-    /// SDK-fixed generation-one creation point.
-    pub fn new_absent(
-        roster_id: RosterId,
-        original_owner: OwnerId,
-        original_admission_fence: FenceToken,
-        lease: LeaseGuard,
-    ) -> Result<Self, ClientError> {
-        Self::new_for_profile(
-            Profile::v2(),
-            roster_id,
-            original_owner,
-            original_admission_fence,
-            lease,
-            INITIAL_GENERATION,
-        )
     }
 
     /// Return the stable roster identity used by recovery.
@@ -447,6 +406,7 @@ fn lease_has_valid_profile(lease: &LeaseGuard) -> bool {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecoveryInputWire {
     roster_id: RosterId,
     original_owner: OwnerId,
@@ -467,6 +427,108 @@ impl<'de> Deserialize<'de> for RecoveryInput {
         )
         .map_err(serde::de::Error::custom)
     }
+}
+
+/// Read-only cross-node recovery input for an absent-predecessor roster.
+///
+/// This profile-specific capability has a disjoint serialized form that
+/// carries the exact V2 profile and fixes recovery at generation one. It can
+/// neither be decoded as the frozen V1 [`RecoveryInput`] nor supplied to the
+/// V1 recovery method.
+#[derive(Serialize)]
+pub struct AbsentRecoveryInput {
+    profile: Profile,
+    roster_id: RosterId,
+    original_owner: OwnerId,
+    original_admission_fence: FenceToken,
+    lease: LeaseGuard,
+}
+
+impl AbsentRecoveryInput {
+    /// Construct recovery for an absent-predecessor admission under a current,
+    /// higher lease guard.
+    pub fn new(
+        roster_id: RosterId,
+        original_owner: OwnerId,
+        original_admission_fence: FenceToken,
+        lease: LeaseGuard,
+    ) -> Result<Self, ClientError> {
+        validate_recovery_authority(original_admission_fence, &lease)?;
+        Ok(Self {
+            profile: Profile::v2(),
+            roster_id,
+            original_owner,
+            original_admission_fence,
+            lease,
+        })
+    }
+
+    /// Return the stable roster identity used by recovery.
+    pub const fn roster_id(&self) -> RosterId {
+        self.roster_id
+    }
+
+    fn request(&self, scope: Scope) -> Result<RecoveryRequest, ClientError> {
+        RecoveryRequest::new_with_lease_metadata(
+            RecoveryLookup::new(scope, self.roster_id),
+            self.original_owner.clone(),
+            self.original_admission_fence,
+            RecoveryLeaseAuthority::new(
+                self.lease.key().clone(),
+                self.lease.owner().clone(),
+                self.lease.fence(),
+                self.lease.credential_id(),
+                INITIAL_GENERATION,
+                LeaseMetadata::new(self.lease.acquired_at(), self.lease.expires_at()),
+            ),
+        )
+        .map_err(Into::into)
+    }
+}
+
+impl fmt::Debug for AbsentRecoveryInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AbsentRecoveryInput(<redacted>)")
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AbsentRecoveryInputWire {
+    profile: Profile,
+    roster_id: RosterId,
+    original_owner: OwnerId,
+    original_admission_fence: FenceToken,
+    lease: LeaseGuard,
+}
+
+impl<'de> Deserialize<'de> for AbsentRecoveryInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = AbsentRecoveryInputWire::deserialize(deserializer)?;
+        if wire.profile != Profile::v2() {
+            return Err(serde::de::Error::custom(ClientError::InvalidInput));
+        }
+        Self::new(
+            wire.roster_id,
+            wire.original_owner,
+            wire.original_admission_fence,
+            wire.lease,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+fn validate_recovery_authority(
+    original_admission_fence: FenceToken,
+    lease: &LeaseGuard,
+) -> Result<(), ClientError> {
+    if !lease_has_valid_profile(lease) || original_admission_fence.get() == 0 {
+        return Err(ClientError::InvalidInput);
+    }
+    if lease.fence() <= original_admission_fence {
+        return Err(ClientError::AuthorityRejected);
+    }
+    Ok(())
 }
 
 /// Outcome of the single admission mutation.
@@ -520,11 +582,11 @@ impl AdmissionUnknown {
 
     /// Recover an ambiguous absent-predecessor admission without permitting
     /// the caller to choose a creation generation.
-    pub fn recover_absent(self, lease: LeaseGuard) -> Result<RecoveryInput, ClientError> {
+    pub fn recover_absent(self, lease: LeaseGuard) -> Result<AbsentRecoveryInput, ClientError> {
         if self.profile != Profile::v2() {
             return Err(ClientError::InvalidInput);
         }
-        RecoveryInput::new_absent(
+        AbsentRecoveryInput::new(
             self.roster_id,
             self.original_owner,
             self.original_admission_fence,
@@ -1436,8 +1498,9 @@ impl FencedMutationRosterClient {
     /// Perform the one immutable admission mutation.
     /// The input becomes recovery-only before this method awaits. Only a
     /// conclusive `NotTransmitted` permits the identical admission to retry;
-    /// cancellation and every ambiguous result require [`Self::recover`]. A
-    /// retry is counted only for that direct, transport-proven transition.
+    /// cancellation and every ambiguous result require profile-specific
+    /// [`Self::recover`] or [`Self::recover_absent`] readback. A retry is
+    /// counted only for that direct, transport-proven transition.
     pub async fn admit(&self, input: &mut AdmissionInput) -> Result<AdmissionOutcome, ClientError> {
         if input.proposal.profile() != self.profile {
             return Err(ClientError::InvalidInput);
@@ -1467,7 +1530,7 @@ impl FencedMutationRosterClient {
 
     /// Read the exact durable roster under the current higher-fence guard.
     pub async fn recover(&self, input: &RecoveryInput) -> Result<RecoveryOutcome, ClientError> {
-        if input.profile != self.profile {
+        if self.profile != Profile::v1() || input.profile != Profile::v1() {
             return Err(ClientError::InvalidInput);
         }
         match self.executor.recover(input.request(self.scope)?).await? {
@@ -1475,6 +1538,26 @@ impl FencedMutationRosterClient {
                 let roster = RecoveredRoster::from_registration(recovered.registration);
                 Ok(RecoveryOutcome::Admitted(roster))
             }
+            RecoveryResult::Established(receipt) | RecoveryResult::Aborted(receipt) => {
+                Ok(RecoveryOutcome::Terminal(receipt_from_executor(receipt)?))
+            }
+            RecoveryResult::Compacted => Ok(RecoveryOutcome::Compacted),
+        }
+    }
+
+    /// Read the exact durable absent-predecessor roster under the current
+    /// higher-fence guard.
+    pub async fn recover_absent(
+        &self,
+        input: &AbsentRecoveryInput,
+    ) -> Result<RecoveryOutcome, ClientError> {
+        if self.profile != Profile::v2() || input.profile != Profile::v2() {
+            return Err(ClientError::InvalidInput);
+        }
+        match self.executor.recover(input.request(self.scope)?).await? {
+            RecoveryResult::PollAdmitted(recovered) => Ok(RecoveryOutcome::Admitted(
+                RecoveredRoster::from_registration(recovered.registration),
+            )),
             RecoveryResult::Established(receipt) | RecoveryResult::Aborted(receipt) => {
                 Ok(RecoveryOutcome::Terminal(receipt_from_executor(receipt)?))
             }
@@ -1823,8 +1906,9 @@ mod tests {
         },
     };
     use super::{
-        record_resubmit, AdmissionInput, AdmissionInputState, AdmissionUnknown, ClientError,
-        Counter, ExecutorClient, FencedMutationRosterClient, PreparedTerminalState, RecoveryInput,
+        record_resubmit, AbsentRecoveryInput, AdmissionInput, AdmissionInputState,
+        AdmissionUnknown, ClientError, Counter, ExecutorClient, FencedMutationRosterClient,
+        PreparedTerminalState, RecoveryInput,
     };
     use async_trait::async_trait;
     use opc_session_store::{FenceToken, Generation, LeaseGuard, OwnerId};
@@ -2016,7 +2100,7 @@ mod tests {
             v1.admission_status(&admission).await,
             Err(ClientError::InvalidInput)
         ));
-        let recovery = RecoveryInput::new_absent(
+        let recovery = AbsentRecoveryInput::new(
             admission.roster_id(),
             lease().owner().clone(),
             FenceToken::new(1),
@@ -2024,7 +2108,7 @@ mod tests {
         )
         .expect("official V2 recovery input");
         assert!(matches!(
-            v1.recover(&recovery).await,
+            v1.recover_absent(&recovery).await,
             Err(ClientError::InvalidInput)
         ));
         let unknown = AdmissionUnknown {
@@ -2039,7 +2123,20 @@ mod tests {
         ));
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
 
-        let v2 = client(Profile::v2(), executor);
+        let v2 = client(Profile::v2(), Arc::clone(&executor));
+        let v1_recovery = RecoveryInput::new(
+            admission.roster_id(),
+            lease().owner().clone(),
+            FenceToken::new(1),
+            lease(),
+            Generation::new(7),
+        )
+        .expect("official V1 recovery input");
+        assert!(matches!(
+            v2.recover(&v1_recovery).await,
+            Err(ClientError::InvalidInput)
+        ));
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
         let absent = AbsentAdmissionProposal::new(
             Profile::v2(),
             proposal.roster_id(),
@@ -2083,6 +2180,51 @@ mod tests {
             })
             .expect("serialize frozen V1 recovery wire")
         );
+    }
+
+    #[test]
+    fn absent_recovery_wire_round_trips_v2_and_rejects_cross_profile_decode() {
+        let absent = AbsentRecoveryInput::new(
+            RosterId::from_bytes([0x71; 16]).expect("nonzero absent roster ID"),
+            lease().owner().clone(),
+            FenceToken::new(1),
+            lease(),
+        )
+        .expect("V2 absent recovery input");
+        let absent_bytes = postcard::to_allocvec(&absent).expect("serialize V2 recovery input");
+        let recovered: AbsentRecoveryInput =
+            postcard::from_bytes(&absent_bytes).expect("deserialize V2 recovery input");
+        assert_eq!(recovered.profile, Profile::v2());
+        assert_eq!(recovered.roster_id(), absent.roster_id());
+        assert_eq!(
+            postcard::to_allocvec(&recovered).expect("reserialize V2 recovery input"),
+            absent_bytes
+        );
+        assert!(postcard::from_bytes::<RecoveryInput>(&absent_bytes).is_err());
+
+        let v1 = RecoveryInput::new(
+            RosterId::from_bytes([0x72; 16]).expect("nonzero V1 roster ID"),
+            lease().owner().clone(),
+            FenceToken::new(1),
+            lease(),
+            Generation::new(7),
+        )
+        .expect("V1 recovery input");
+        let v1_bytes = postcard::to_allocvec(&v1).expect("serialize V1 recovery input");
+        assert!(postcard::from_bytes::<AbsentRecoveryInput>(&v1_bytes).is_err());
+
+        let absent_json = serde_json::to_value(&absent).expect("serialize V2 recovery JSON");
+        let mut absent_with_v1_generation = absent_json.clone();
+        absent_with_v1_generation["expected_generation"] = serde_json::json!(7);
+        assert!(serde_json::from_value::<RecoveryInput>(absent_with_v1_generation).is_err());
+        let mut wrong_profile = absent_json;
+        wrong_profile["profile"] =
+            serde_json::to_value(Profile::v1()).expect("serialize V1 profile");
+        assert!(serde_json::from_value::<AbsentRecoveryInput>(wrong_profile).is_err());
+        assert!(serde_json::from_value::<AbsentRecoveryInput>(
+            serde_json::to_value(v1).expect("serialize V1 recovery JSON")
+        )
+        .is_err());
     }
 
     #[test]

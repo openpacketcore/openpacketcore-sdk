@@ -50,6 +50,7 @@ use opc_session_net::{
 };
 use opc_session_net::{
     FencedMutationRosterAbsentAdmissionProposal as AbsentAdmissionProposal,
+    FencedMutationRosterAbsentRecoveryInput as AbsentRecoveryInput,
     FencedMutationRosterActive as ActiveRoster,
     FencedMutationRosterAdmissionOutcome as AdmissionOutcome,
     FencedMutationRosterAdmissionProposal as AdmissionProposal,
@@ -8052,7 +8053,7 @@ async fn persistent_three_voter_v2_absent_roster_aborted_terminal_retains_absenc
         "all lease/takeover commands converge before V2 recovery accounting",
     );
     let sequences_before_recovery = fleet.application_sequences().await;
-    let recovery = RecoveryInput::new_absent(
+    let recovery = AbsentRecoveryInput::new(
         roster_id,
         owner.clone(),
         original_lease.fence(),
@@ -8060,7 +8061,7 @@ async fn persistent_three_voter_v2_absent_roster_aborted_terminal_retains_absenc
     )
     .expect("current V2 Aborted recovery input");
     match client
-        .recover(&recovery)
+        .recover_absent(&recovery)
         .await
         .expect("recover retained V2 Aborted terminal")
     {
@@ -8141,10 +8142,10 @@ async fn persistent_three_voter_v2_absent_roster_aborted_terminal_retains_absenc
         "the successor lease converges before the read-only stale-recovery probe",
     );
     let sequences_before_stale_recovery = fleet.application_sequences().await;
-    let stale = RecoveryInput::new_absent(roster_id, owner, original_lease.fence(), expired)
+    let stale = AbsentRecoveryInput::new(roster_id, owner, original_lease.fence(), expired)
         .expect("expired V2 Aborted recovery input is syntactically valid");
     assert!(matches!(
-        client.recover(&stale).await,
+        client.recover_absent(&stale).await,
         Err(RosterClientError::AuthorityRejected)
     ));
     assert_eq!(
@@ -8441,10 +8442,10 @@ async fn persistent_three_voter_v2_absent_roster_tenant_scope_isolation_preserve
         }
     }
     let cross_tenant_recovery =
-        RecoveryInput::new_absent(roster_id, owner_a.clone(), lease_a.fence(), lease_b.clone())
+        AbsentRecoveryInput::new(roster_id, owner_a.clone(), lease_a.fence(), lease_b.clone())
             .expect("syntactically valid cross-tenant recovery input");
     assert!(matches!(
-        client_b.recover(&cross_tenant_recovery).await,
+        client_b.recover_absent(&cross_tenant_recovery).await,
         Err(RosterClientError::AuthorityRejected)
     ));
 

@@ -186,6 +186,13 @@ FencedMutationRosterAbsentAdmissionProposal::new(
 
 FencedMutationRosterClient::prepare_absent(lease, proposal)
 FencedMutationRosterAdmissionUnknown::recover_absent(current_lease)
+FencedMutationRosterAbsentRecoveryInput::new(
+    roster_id,
+    original_owner,
+    original_admission_fence,
+    current_lease,
+)
+FencedMutationRosterClient::recover_absent(absent_recovery_input)
 ```
 
 After those profile-specific preparation and recovery calls, V2 uses the same

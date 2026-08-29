@@ -335,6 +335,7 @@ pub use canonical::{
 };
 pub use client::{
     AbortedTerminal as FencedMutationRosterAbortedTerminal,
+    AbsentRecoveryInput as FencedMutationRosterAbsentRecoveryInput,
     ActiveRoster as FencedMutationRosterActive,
     AdmissionInput as FencedMutationRosterAdmissionInput,
     AdmissionOutcome as FencedMutationRosterAdmissionOutcome,
