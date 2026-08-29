@@ -11378,10 +11378,21 @@ async fn persistent_three_voter_snapshot_maintenance_with_concurrent_read_barrie
                 let progress = consensus_local_durable_progress_for_test(&$fleet.stores[index]);
                 (
                     progress.engine_state,
-                    progress.last_log_index,
-                    progress.applied_index,
-                    progress.snapshot_index,
-                    progress.purged_index,
+                    (progress.storage_error_subject, progress.storage_error_verb),
+                    (
+                        progress.last_log_index,
+                        progress.applied_index,
+                        progress.snapshot_index,
+                        progress.purged_index,
+                    ),
+                    (
+                        progress.consensus_log_prune_attempts,
+                        progress.consensus_log_prune_permanent_failures,
+                        progress.consensus_log_prune_degraded,
+                        progress.consensus_log_prune_last_outcome,
+                        progress.consensus_log_prune_last_returned_turn_outcome,
+                        progress.consensus_log_prune_last_cleanup_outcome,
+                    ),
                 )
             });
             panic!("error={:?}; durable_progress={durable_progress:?}", $error);
@@ -11391,10 +11402,21 @@ async fn persistent_three_voter_snapshot_maintenance_with_concurrent_read_barrie
                 let progress = consensus_local_durable_progress_for_test(&$fleet.stores[index]);
                 (
                     progress.engine_state,
-                    progress.last_log_index,
-                    progress.applied_index,
-                    progress.snapshot_index,
-                    progress.purged_index,
+                    (progress.storage_error_subject, progress.storage_error_verb),
+                    (
+                        progress.last_log_index,
+                        progress.applied_index,
+                        progress.snapshot_index,
+                        progress.purged_index,
+                    ),
+                    (
+                        progress.consensus_log_prune_attempts,
+                        progress.consensus_log_prune_permanent_failures,
+                        progress.consensus_log_prune_degraded,
+                        progress.consensus_log_prune_last_outcome,
+                        progress.consensus_log_prune_last_returned_turn_outcome,
+                        progress.consensus_log_prune_last_cleanup_outcome,
+                    ),
                 )
             });
             panic!("durable_progress={durable_progress:?}");
@@ -11479,10 +11501,21 @@ async fn persistent_three_voter_snapshot_maintenance_with_concurrent_read_barrie
                 let progress = consensus_local_durable_progress_for_test(&fleet.stores[index]);
                 (
                     progress.engine_state,
-                    progress.last_log_index,
-                    progress.applied_index,
-                    progress.snapshot_index,
-                    progress.purged_index,
+                    (progress.storage_error_subject, progress.storage_error_verb),
+                    (
+                        progress.last_log_index,
+                        progress.applied_index,
+                        progress.snapshot_index,
+                        progress.purged_index,
+                    ),
+                    (
+                        progress.consensus_log_prune_attempts,
+                        progress.consensus_log_prune_permanent_failures,
+                        progress.consensus_log_prune_degraded,
+                        progress.consensus_log_prune_last_outcome,
+                        progress.consensus_log_prune_last_returned_turn_outcome,
+                        progress.consensus_log_prune_last_cleanup_outcome,
+                    ),
                 )
             });
             assert!(
