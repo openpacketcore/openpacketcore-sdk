@@ -37,7 +37,8 @@ use opc_session_net::{
     SessionReauthenticationControl, SessionReplicationManifest,
 };
 use opc_session_store::fenced_mutation_roster::{
-    RosterAttestationLeafCertificateV1, RosterCompactAdmissionProvenanceSigningInputV2,
+    RosterAttestationLeafCertificateV1, RosterAttestationTrustRootIdentityV1,
+    RosterCompactAdmissionProvenanceSigningInputV2, RosterCompactAdmissionProvenanceV2,
 };
 use opc_session_store::{
     CompareAndSet, CompareAndSetResult, ConsensusSessionStore, EncryptedSessionPayload,
@@ -52,11 +53,13 @@ use opc_session_store::{
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
     SessionConsumerAuthorization, SessionConsumerAuthorizationGrant, SessionConsumerChange,
     SessionConsumerOperation, SessionConsumerRejection, SessionConsumerRequest,
-    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
-    SessionConsumerTenantNfScope, SessionConsumerV2Operation, SessionConsumerV2Request,
-    SessionConsumerV2Response, SessionKey, SessionKeyType, SessionLeaseManager, SessionOp,
-    SessionOpResult, SessionQuorumConsumer, SqliteSessionBackend, StateClass, StateType,
-    StoreError, StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
+    SessionConsumerResponse, SessionConsumerRosterAdmissionMutationResponse,
+    SessionConsumerRosterAuthorization, SessionConsumerRosterRejection, SessionConsumerScope,
+    SessionConsumerStoreError, SessionConsumerTenantNfScope, SessionConsumerV2Operation,
+    SessionConsumerV2Request, SessionConsumerV2Response, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionOp, SessionOpResult, SessionQuorumConsumer,
+    SessionQuorumRosterIngress, SqliteSessionBackend, StateClass, StateType, StoreError,
+    StoredSessionRecord, SystemClock, ValidatedQuorumTopology,
 };
 use opc_session_testkit::qualification::{
     qualification_key_bytes_sha256, qualification_owner_sha256,
@@ -525,6 +528,7 @@ struct QualificationTrafficRuntime {
 
 struct QualificationConsumerDelayedResponseService {
     inner: Arc<dyn SessionQuorumConsumer>,
+    roster_inner: Arc<dyn SessionQuorumRosterIngress>,
     armed: Arc<AtomicBool>,
     response_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
     ambiguity_witness_hold_gate: Arc<QualificationConsumerResponseHoldGate>,
@@ -558,11 +562,12 @@ impl QualificationConsumerResponseHoldGate {
     }
 
     fn arm(&self) -> bool {
-        self.armed
-            .compare_exchange(0, self.response_count, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-            && self.entered.load(Ordering::SeqCst) == 0
+        self.entered.load(Ordering::SeqCst) == 0
             && self.releases.load(Ordering::SeqCst) == 0
+            && self
+                .armed
+                .compare_exchange(0, self.response_count, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
     }
 
     fn status(&self) -> (usize, usize) {
@@ -611,6 +616,14 @@ impl QualificationConsumerResponseHoldGate {
                 })
                 .is_ok()
             {
+                assert!(
+                    self.entered
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |entered| {
+                            entered.checked_sub(1)
+                        })
+                        .is_ok(),
+                    "released qualification response must still be held"
+                );
                 return;
             }
             notified.await;
@@ -625,14 +638,14 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
         authorization: &SessionConsumerAuthorization,
         request: SessionConsumerRequest,
     ) -> SessionConsumerResponse {
-        let lease_mutation = matches!(
+        let delayed_mutation = matches!(
             request.operation(),
             SessionConsumerOperation::AcquireLease { .. }
                 | SessionConsumerOperation::RenewLease { .. }
                 | SessionConsumerOperation::ReleaseLease { .. }
         );
         let response = self.inner.execute(authorization, request).await;
-        if lease_mutation
+        if delayed_mutation
             && matches!(
                 &response,
                 SessionConsumerResponse::AcquireLease(Ok(_))
@@ -703,6 +716,66 @@ impl SessionQuorumConsumer for QualificationConsumerDelayedResponseService {
         // response operations only. Do not turn its exact mutation grants
         // into a subscription grant.
         Err(SessionConsumerRejection::Unauthorized)
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionQuorumRosterIngress for QualificationConsumerDelayedResponseService {
+    fn expected_roster_attestation_trust_root_identity(
+        &self,
+    ) -> Option<RosterAttestationTrustRootIdentityV1> {
+        self.roster_inner
+            .expected_roster_attestation_trust_root_identity()
+    }
+
+    fn prepare_compact_admission_provenance_input(
+        &self,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: &SessionConsumerRequest,
+        attestation: &RosterIngressAttestationV1,
+        certificate_subject_identity_commitment: [u8; 32],
+    ) -> Result<RosterCompactAdmissionProvenanceSigningInputV2, SessionConsumerRosterRejection>
+    {
+        self.roster_inner
+            .prepare_compact_admission_provenance_input(
+                authorization,
+                request,
+                attestation,
+                certificate_subject_identity_commitment,
+            )
+    }
+
+    async fn execute_roster_ingress(
+        &self,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: SessionConsumerRequest,
+        attestation: RosterIngressAttestationV1,
+        admission_provenance: Option<RosterCompactAdmissionProvenanceV2>,
+    ) -> SessionConsumerResponse {
+        let poll_admit = matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedMutationRosterPollAdmit { .. }
+        );
+        let response = self
+            .roster_inner
+            .execute_roster_ingress(authorization, request, attestation, admission_provenance)
+            .await;
+        if poll_admit
+            && matches!(
+                &response,
+                SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                    SessionConsumerRosterAdmissionMutationResponse::Recorded(_)
+                )
+            )
+            && self.ambiguity_witness_hold_gate.take_armed_response()
+        {
+            // The shared one-response ambiguity witness acknowledges only
+            // after the protected admission is durable. The harness releases
+            // this real response after the short-deadline caller has observed
+            // OutcomeUnknown; no mutation is replayed.
+            self.ambiguity_witness_hold_gate.hold_response().await;
+        }
+        response
     }
 }
 
@@ -1652,17 +1725,19 @@ impl QualificationNode {
                 }
             }
         };
+        let delayed_service = Arc::new(QualificationConsumerDelayedResponseService {
+            inner: Arc::new(self.store.consumer_service()),
+            roster_inner: Arc::new(self.store.consumer_service()),
+            armed: Arc::clone(&self.consumer_delayed_response),
+            response_hold_gate: Arc::clone(&self.consumer_response_hold_gate),
+            ambiguity_witness_hold_gate: Arc::clone(&self.consumer_ambiguity_witness_hold_gate),
+        });
         let listener = SessionQuorumConsumerServer::new(
-            Arc::new(QualificationConsumerDelayedResponseService {
-                inner: Arc::new(self.store.consumer_service()),
-                armed: Arc::clone(&self.consumer_delayed_response),
-                response_hold_gate: Arc::clone(&self.consumer_response_hold_gate),
-                ambiguity_witness_hold_gate: Arc::clone(&self.consumer_ambiguity_witness_hold_gate),
-            }),
+            delayed_service.clone(),
             transport.server_config.clone(),
             authorizer,
         )
-        .with_roster_ingress(Arc::new(self.store.consumer_service()), roster_signer)
+        .with_roster_ingress(delayed_service, roster_signer)
         // The release profile drives sixteen persistent V2 lanes to each
         // listener. Keep a small, explicit four-slot server margin instead
         // of treating that expected peak as an admission ceiling.

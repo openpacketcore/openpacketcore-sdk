@@ -36,15 +36,16 @@ use opc_session_net::{
     FencedMutationRosterId, FencedMutationRosterMember, FencedMutationRosterMemberCall,
     FencedMutationRosterMemberOperationId, FencedMutationRosterMemberProvider,
     FencedMutationRosterProfile, FencedMutationRosterProviderCallOutcome,
-    PersistentSessionConsumerClient, PersistentSessionConsumerConfig,
-    PersistentSessionConsumerExecuteError, PersistentSessionConsumerV2Diagnostics,
-    PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver, RemoteSessionConsensusPeer,
-    SessionClusterId, SessionConfigurationEpoch, SessionConfigurationGeneration,
-    SessionConsumerClientError, SessionConsumerLeaseMutationError, SessionReplicationManifest,
-    StatelessSessionConsumerClient, CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
-    DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
-    DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
-    SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION, SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+    FencedMutationRosterRecoveryInput, PersistentSessionConsumerClient,
+    PersistentSessionConsumerConfig, PersistentSessionConsumerExecuteError,
+    PersistentSessionConsumerV2Diagnostics, PersistentSessionConsumerV2ExecuteError,
+    RemoteAddrResolver, RemoteSessionConsensusPeer, SessionClusterId, SessionConfigurationEpoch,
+    SessionConfigurationGeneration, SessionConsumerClientError, SessionConsumerLeaseMutationError,
+    SessionReplicationManifest, StatelessSessionConsumerClient,
+    CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, DEFAULT_MAX_AUTHENTICATION_AGE,
+    DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW,
+    DEFAULT_ROTATION_JITTER, SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
 };
 use opc_session_store::fenced_mutation_roster::{
     RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
@@ -181,6 +182,10 @@ const CHILD_TIMEOUT: Duration = Duration::from_millis(QUALIFICATION_CHILD_RESPON
 /// post-commit response delay. It exercises the real response deadline rather
 /// than creating a synthetic application outcome.
 const DELAYED_CONSUMER_CLIENT_DEADLINE: Duration = Duration::from_millis(250);
+// The protected roster is exercised across multiple bounded election,
+// process-restart, and second-voter-loss windows. Its authority transitions
+// are explicit releases and higher fences, never incidental wall-clock expiry.
+const PROTECTED_ROSTER_LEASE_TTL: Duration = Duration::from_secs(60 * 60);
 const CANARY_TTL_MILLIS: u64 = 60 * 60 * 1_000;
 const CANARY_STABLE_ID: &str = "rotation-core-canary";
 const CANARY_LEASE_HANDLE: &str = "rotation-core-lease";
@@ -13127,8 +13132,11 @@ impl FencedMutationRosterMemberProvider for QualificationRosterProvider {
 /// capability is consumed by `admit`; every subsequent call is status/recover.
 struct QualificationProtectedRosterRun {
     client: FencedMutationRosterClient,
+    transport: PersistentSessionConsumerClient,
+    voter_index: usize,
     admission: FencedMutationRosterAdmissionInput,
     lease: LeaseGuard,
+    current_recovery: Option<FencedMutationRosterRecoveryInput>,
 }
 
 fn qualification_fenced_mutation_roster_client(
@@ -13144,11 +13152,27 @@ fn qualification_fenced_mutation_roster_client(
         .expect("compose the real protected-roster client")
 }
 
+fn qualification_single_lane_persistent_config() -> PersistentSessionConsumerConfig {
+    let defaults = PersistentSessionConsumerConfig::default();
+    PersistentSessionConsumerConfig::try_new(
+        1,
+        defaults.pending_calls(),
+        defaults.pool_wait_timeout(),
+        defaults.watch_connections(),
+        defaults.setup_timeout(),
+        defaults.connect_attempts(),
+        defaults.reconnect_jitter(),
+        defaults.shutdown_drain(),
+    )
+    .expect("one-lane auxiliary qualification pool stays within public bounds")
+}
+
 impl QualificationProtectedRosterRun {
-    async fn start(
+    async fn prepare(
         member_count: usize,
         general: &QualificationConsumerClient,
         protected: PersistentSessionConsumerClient,
+        voter_index: usize,
         scope: SessionConsumerScope,
     ) -> Self {
         let key = SessionKey {
@@ -13165,7 +13189,7 @@ impl QualificationProtectedRosterRun {
                 SessionConsumerRequestId::from_bytes([0x71; 16]),
                 key.clone(),
                 owner.clone(),
-                Duration::from_secs(30),
+                PROTECTED_ROSTER_LEASE_TTL,
             )
             .await
             .expect("general lane obtains the real protected-roster lease");
@@ -13202,7 +13226,7 @@ impl QualificationProtectedRosterRun {
             ))
         ));
 
-        let client = qualification_fenced_mutation_roster_client(protected, scope);
+        let client = qualification_fenced_mutation_roster_client(protected.clone(), scope);
         let members = (0_u8..6)
             .map(|ordinal| {
                 FencedMutationRosterMember::new(
@@ -13225,40 +13249,92 @@ impl QualificationProtectedRosterRun {
             vec![0x76],
         )
         .expect("bounded no-op protected roster proposal");
-        let mut admission = client
+        let admission = client
             .prepare(lease.clone(), Generation::new(1), proposal)
             .expect("real leased roster admission body");
-        assert!(matches!(
-            client
-                .admit(&mut admission)
-                .await
-                .expect("real /3 PollAdmit"),
-            FencedMutationRosterAdmissionOutcome::Admitted(_)
-        ));
         Self {
             client,
+            transport: protected,
+            voter_index,
             admission,
             lease,
+            current_recovery: None,
         }
     }
 
-    async fn status(&self) -> opc_session_net::FencedMutationRosterRecoveryOutcome {
-        self.client
-            .admission_status(&self.admission)
-            .await
-            .expect("real /3 admission status")
+    async fn admit_outcome_unknown(&mut self) {
+        assert!(matches!(
+            self.client
+                .admit(&mut self.admission)
+                .await
+                .expect("real /3 PollAdmit"),
+            FencedMutationRosterAdmissionOutcome::OutcomeUnknown(_)
+        ));
     }
 
-    /// Reconstruct the same authenticated roster admission on a new live
-    /// `/3` transport. The admission, tenant/scope commitments, and retained
-    /// fence remain byte-for-byte the original accepted capsule; only the
-    /// killed endpoint-local connection pool is replaced.
-    fn rebind_live_voter(
+    async fn status(&self) -> opc_session_net::FencedMutationRosterRecoveryOutcome {
+        match self.current_recovery.as_ref() {
+            Some(recovery) => self
+                .client
+                .recover(recovery)
+                .await
+                .expect("real /3 successor recovery status"),
+            None => self
+                .client
+                .admission_status(&self.admission)
+                .await
+                .expect("real /3 ambiguous-admission status"),
+        }
+    }
+
+    fn voter_index(&self) -> usize {
+        self.voter_index
+    }
+
+    /// Replace the deliberately short-deadline pool at the same voter without
+    /// opening its normal-deadline successor first. The caller proves the
+    /// effectful server task released its listener permit before prewarming.
+    async fn retire_short_deadline_transport(
         &mut self,
         protected: PersistentSessionConsumerClient,
+        voter_index: usize,
         scope: SessionConsumerScope,
     ) {
-        self.client = qualification_fenced_mutation_roster_client(protected, scope);
+        assert_eq!(
+            voter_index, self.voter_index,
+            "the short-deadline transport profile changes at the same voter"
+        );
+        let next_client = qualification_fenced_mutation_roster_client(protected.clone(), scope);
+        let old_client = std::mem::replace(&mut self.client, next_client);
+        let old_transport = std::mem::replace(&mut self.transport, protected);
+        drop(old_client);
+        old_transport.shutdown().await;
+    }
+
+    /// Reconstruct the same authenticated roster admission on a different
+    /// live `/3` transport. The replacement is proven warm before the old
+    /// endpoint-local pool is retired. The admission, tenant/scope
+    /// commitments, and retained fence remain byte-for-byte unchanged.
+    async fn rebind_live_voter(
+        &mut self,
+        protected: PersistentSessionConsumerClient,
+        voter_index: usize,
+        scope: SessionConsumerScope,
+    ) {
+        assert_ne!(
+            voter_index, self.voter_index,
+            "a same-voter protected-roster status must reuse its bounded pool"
+        );
+        protected
+            .prewarm()
+            .await
+            .expect("replacement-voter protected-roster mTLS prewarm");
+        let next_client = qualification_fenced_mutation_roster_client(protected.clone(), scope);
+        let old_client = std::mem::replace(&mut self.client, next_client);
+        let old_transport = std::mem::replace(&mut self.transport, protected);
+        self.voter_index = voter_index;
+        drop(old_client);
+        old_transport.shutdown().await;
     }
 
     async fn recover(
@@ -13285,7 +13361,7 @@ impl QualificationProtectedRosterRun {
                 SessionConsumerRequestId::from_bytes([0x78; 16]),
                 self.lease.key().clone(),
                 self.lease.owner().clone(),
-                Duration::from_secs(30),
+                PROTECTED_ROSTER_LEASE_TTL,
             )
             .await
             .expect("general lane obtains a higher-fence roster recovery lease");
@@ -13325,7 +13401,7 @@ impl QualificationProtectedRosterRun {
                 SessionConsumerRequestId::from_bytes([0x7a; 16]),
                 successor.key().clone(),
                 successor.owner().clone(),
-                Duration::from_secs(30),
+                PROTECTED_ROSTER_LEASE_TTL,
             )
             .await
             .expect("general lane obtains the current recovery lease");
@@ -13358,6 +13434,7 @@ impl QualificationProtectedRosterRun {
             "successor-fence protected-roster recovery",
         );
         self.lease = current;
+        self.current_recovery = Some(recovery);
         stale_rejected
     }
 }
@@ -13518,26 +13595,33 @@ fn run_consumer_multiprocess_qualification(
     let (roster_identity_source, _roster_identity_receiver) = watch::channel(Some(
         fleet.pki.consumer_identity_state(&consumer_identities[0]),
     ));
-    let protected_roster_client_for_voter = |node_index: usize| {
-        let roster_tls = TlsConfigBuilder::new(roster_identity_source.subscribe())
-            .allow_any_trusted_peer()
-            .build_authenticated_client_config()
-            .expect("protected-roster persistent mTLS configuration");
-        PersistentSessionConsumerClient::try_from_fenced_mutation_roster_stateless(
-            StatelessSessionConsumerClient::new(
+    let protected_roster_client_for_voter =
+        |node_index: usize, operation_timeout: Option<Duration>| {
+            let roster_tls = TlsConfigBuilder::new(roster_identity_source.subscribe())
+                .allow_any_trusted_peer()
+                .build_authenticated_client_config()
+                .expect("protected-roster persistent mTLS configuration");
+            let stateless = StatelessSessionConsumerClient::new(
                 endpoints[node_index],
                 rustls_pki_types::ServerName::IpAddress(endpoints[node_index].ip().into()),
                 voter_authorities[node_index].clone(),
                 roster_tls,
-            ),
-            PersistentSessionConsumerConfig::default(),
-        )
-        .expect("fixed protected-roster persistent configuration")
-    };
+            );
+            let stateless = match operation_timeout {
+                Some(timeout) => stateless.with_operation_timeout(timeout),
+                None => stateless,
+            };
+            PersistentSessionConsumerClient::try_from_fenced_mutation_roster_stateless(
+                stateless,
+                qualification_single_lane_persistent_config(),
+            )
+            .expect("fixed protected-roster persistent configuration")
+        };
     // The pre-loss run establishes node 0 deliberately. Every post-loss `/3`
     // operation below replaces this endpoint-pinned pool with the same
     // authenticated identity on a readiness-proven live voter.
-    let protected_roster_client = protected_roster_client_for_voter(0);
+    let protected_roster_client =
+        protected_roster_client_for_voter(0, Some(DELAYED_CONSUMER_CLIENT_DEADLINE));
     assert!(protected_roster_client.fenced_mutation_roster_transport_enabled());
     runtime
         .block_on(protected_roster_client.prewarm())
@@ -13578,7 +13662,7 @@ fn run_consumer_multiprocess_qualification(
                     foreign_authority,
                     scope_tls,
                 ),
-                PersistentSessionConsumerConfig::default(),
+                qualification_single_lane_persistent_config(),
             )
             .expect("scope-control protected persistent configuration");
         let scope_result = runtime.block_on(scope_pool.prewarm());
@@ -13725,12 +13809,52 @@ fn run_consumer_multiprocess_qualification(
         measurements.general_lane.before_leader_loss_operations = 1;
     }
     let mut protected_roster_run = if matches!(mode, ConsumerQualificationMode::Persistent) {
-        let run = runtime.block_on(QualificationProtectedRosterRun::start(
+        let mut run = runtime.block_on(QualificationProtectedRosterRun::prepare(
             member_count,
             &clients[0],
-            protected_roster_client.clone(),
+            protected_roster_client,
+            0,
             scope,
         ));
+        // Preparation has completed every general-lane mutation. Arm the
+        // one-response acknowledgement gate immediately before the already-
+        // warm `/3` PollAdmit. The child enters it only after the admission is
+        // durably Recorded, while this client's shorter deadline classifies
+        // the lost reply as OutcomeUnknown without replaying the mutation.
+        fleet.arm_stateless_consumer_ambiguity_witness_hold(0);
+        runtime.block_on(run.admit_outcome_unknown());
+        let roster_hold_ack_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+        loop {
+            let (armed_responses, held_responses) =
+                fleet.stateless_consumer_ambiguity_witness_hold_status(0);
+            if armed_responses == 0 && held_responses == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < roster_hold_ack_deadline,
+                "protected-roster admission did not acknowledge its durable held response: armed={armed_responses}, held={held_responses}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        fleet.release_stateless_consumer_ambiguity_witness_hold(0);
+        let roster_hold_release_deadline = Instant::now() + V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT;
+        loop {
+            let (armed_responses, held_responses) =
+                fleet.stateless_consumer_ambiguity_witness_hold_status(0);
+            if armed_responses == 0 && held_responses == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < roster_hold_release_deadline,
+                "protected-roster durable response hold did not release: armed={armed_responses}, held={held_responses}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let status_client = protected_roster_client_for_voter(0, None);
+        runtime.block_on(run.retire_short_deadline_transport(status_client, 0, scope));
+        runtime
+            .block_on(run.transport.prewarm())
+            .expect("normal-deadline protected-roster status mTLS prewarm");
         require_protected_roster_admitted_status(
             runtime.block_on(run.status()),
             "before protected-roster lane accounting",
@@ -13803,14 +13927,20 @@ fn run_consumer_multiprocess_qualification(
                         voter_authorities[node_index].clone(),
                         foreign_tls,
                     ),
-                    PersistentSessionConsumerConfig::default(),
+                    qualification_single_lane_persistent_config(),
                 )
                 .expect("foreign-tenant protected persistent configuration");
+            let admission_before = fleet.stateless_consumer_admission_status(node_index);
             let foreign_result = runtime.block_on(foreign_pool.prewarm());
+            let admission_after = fleet.stateless_consumer_admission_status(node_index);
             assert_eq!(
                 protected_tenant_boundary_observation(&foreign_result),
                 1,
                 "every endpoint/authority foreign-tenant `/3` pair must close as non-oracular Unavailable (voter {node_index})"
+            );
+            assert_eq!(
+                admission_after.admission_rejections, admission_before.admission_rejections,
+                "the foreign-tenant `/3` boundary must be admitted by listener capacity before its non-oracular credential rejection (voter {node_index})"
             );
             tenant_observation = tenant_observation
                 .checked_add(1)
@@ -14210,7 +14340,7 @@ fn run_consumer_multiprocess_qualification(
         ConsumerQualificationMode::Persistent => QualificationConsumerClient::Persistent(
             PersistentSessionConsumerClient::try_from_stateless(
                 replacement_stateless,
-                PersistentSessionConsumerConfig::default(),
+                qualification_single_lane_persistent_config(),
             )
             .expect("replacement-leader persistent consumer configuration"),
         ),
@@ -14241,11 +14371,10 @@ fn run_consumer_multiprocess_qualification(
             protected_voter, leader_node_index,
             "the protected `/3` client must not retain the deliberately lost leader endpoint"
         );
-        let rebound = protected_roster_client_for_voter(protected_voter);
-        runtime
-            .block_on(rebound.prewarm())
-            .expect("replacement-voter protected-roster mTLS prewarm");
-        protected.rebind_live_voter(rebound, scope);
+        if protected.voter_index() != protected_voter {
+            let rebound = protected_roster_client_for_voter(protected_voter, None);
+            runtime.block_on(protected.rebind_live_voter(rebound, protected_voter, scope));
+        }
         require_protected_roster_admitted_status(
             runtime.block_on(protected.status()),
             "after protected-roster leader loss",
@@ -14429,11 +14558,10 @@ fn run_consumer_multiprocess_qualification(
     let recovered_reports = fleet.readiness_reports(&all_nodes);
     if let Some(protected) = protected_roster_run.as_mut() {
         let protected_voter = protected_roster_proven_live_voter(&recovered_reports);
-        let rebound = protected_roster_client_for_voter(protected_voter);
-        runtime
-            .block_on(rebound.prewarm())
-            .expect("restarted-voter protected-roster mTLS prewarm");
-        protected.rebind_live_voter(rebound, scope);
+        if protected.voter_index() != protected_voter {
+            let rebound = protected_roster_client_for_voter(protected_voter, None);
+            runtime.block_on(protected.rebind_live_voter(rebound, protected_voter, scope));
+        }
         let stale_fence_rejection =
             runtime.block_on(protected.recover(&leader_survivor_client, scope));
         require_protected_roster_admitted_status(
@@ -14651,11 +14779,10 @@ fn run_consumer_multiprocess_qualification(
             protected_voter, voter_loss_node,
             "the protected `/3` client must not retain the deliberately lost second voter endpoint"
         );
-        let rebound = protected_roster_client_for_voter(protected_voter);
-        runtime
-            .block_on(rebound.prewarm())
-            .expect("second-loss survivor protected-roster mTLS prewarm");
-        protected.rebind_live_voter(rebound, scope);
+        if protected.voter_index() != protected_voter {
+            let rebound = protected_roster_client_for_voter(protected_voter, None);
+            runtime.block_on(protected.rebind_live_voter(rebound, protected_voter, scope));
+        }
         require_protected_roster_admitted_status(
             runtime.block_on(protected.status()),
             "after protected-roster second-voter loss",
@@ -14687,7 +14814,9 @@ fn run_consumer_multiprocess_qualification(
                 client.shutdown().await;
             }
             leader_survivor_client.shutdown().await;
-            protected_roster_client.shutdown().await;
+            if let Some(protected) = protected_roster_run.as_ref() {
+                protected.transport.shutdown().await;
+            }
         });
     }
     drop(replacement_identity_source);
