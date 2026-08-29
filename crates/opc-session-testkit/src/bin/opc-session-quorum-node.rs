@@ -1034,7 +1034,7 @@ impl QualificationTrafficObservation {
     fn availability_snapshot(&self) -> QualificationTrafficAvailabilitySnapshot {
         loop {
             let before = self.availability_snapshot_version.load(Ordering::Acquire);
-            if before % 2 != 0 {
+            if !before.is_multiple_of(2) {
                 std::hint::spin_loop();
                 continue;
             }
