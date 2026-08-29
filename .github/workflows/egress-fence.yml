@@ -135,6 +135,7 @@ jobs:
           )
           broad_test_skips=(
             consensus::store::membership_tests::protected_roster_ingress_has_two_mutations_and_read_only_status_paths
+            consensus::raft_adapter::tests::raw_fixed_handler_uses_one_durable_authority_check_for_each_engine_family
             consensus::storage::tests::promoted_mismatch_never_unlinks_a_same_name_replacement
             "${optimized_sqlite_contracts[@]}"
             lagging_replica_installs_compacted_snapshot_without_losing_committed_state
@@ -190,6 +191,19 @@ jobs:
             --test-threads=1 \
             --exact \
             consensus::storage::tests::promoted_mismatch_never_unlinks_a_same_name_replacement
+          # This proof owns a fixed follower Raft runtime through its final
+          # shutdown. Keep that teardown out of the shared libtest process so
+          # every durable-authority assertion runs before one fresh runtime is
+          # stopped, without changing the product or test deadline.
+          cargo test --locked \
+            -p opc-session-store \
+            --lib \
+            --all-features \
+            --quiet \
+            -- \
+            --test-threads=1 \
+            --exact \
+            consensus::raft_adapter::tests::raw_fixed_handler_uses_one_durable_authority_check_for_each_engine_family
           # This proof deliberately binds a one-second attached-consensus
           # deadline. Run it exactly once outside the multi-minute SQLite
           # fixtures so host scheduling cannot turn a committed mutation into
