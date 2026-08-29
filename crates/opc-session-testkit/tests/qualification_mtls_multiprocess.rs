@@ -983,6 +983,65 @@ fn member_incident_directed_paths(member_count: usize, member: usize) -> Vec<(us
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveredMemberDirectedPathPlan {
+    survivor_to_recovered: Vec<(usize, usize)>,
+    recovered_to_survivor: Vec<(usize, usize)>,
+}
+
+/// A recovered listener can retire every survivor's cached inbound lane at
+/// once. Prewarm those independent survivor-owned lanes as one round before
+/// asking the recovered member to prove its outbound lanes serially.
+fn recovered_member_directed_path_plan(
+    member_count: usize,
+    member: usize,
+) -> RecoveredMemberDirectedPathPlan {
+    assert!(member < member_count);
+    let survivor_to_recovered = (0..member_count)
+        .filter(|source| *source != member)
+        .map(|source| (source, member))
+        .collect();
+    let recovered_to_survivor = (0..member_count)
+        .filter(|target| *target != member)
+        .map(|target| (member, target))
+        .collect();
+    RecoveredMemberDirectedPathPlan {
+        survivor_to_recovered,
+        recovered_to_survivor,
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredMemberDirectedPathAction {
+    Dispatch(usize, usize),
+    Collect(usize, usize),
+}
+
+#[cfg(test)]
+fn recovered_member_directed_path_actions(
+    member_count: usize,
+    member: usize,
+) -> Vec<RecoveredMemberDirectedPathAction> {
+    let plan = recovered_member_directed_path_plan(member_count, member);
+    let mut actions = Vec::with_capacity(member_count.saturating_sub(1) * 4);
+    actions.extend(
+        plan.survivor_to_recovered
+            .iter()
+            .map(|(source, target)| RecoveredMemberDirectedPathAction::Dispatch(*source, *target)),
+    );
+    actions.extend(
+        plan.survivor_to_recovered
+            .iter()
+            .map(|(source, target)| RecoveredMemberDirectedPathAction::Collect(*source, *target)),
+    );
+    for (source, target) in plan.recovered_to_survivor {
+        actions.push(RecoveredMemberDirectedPathAction::Dispatch(source, target));
+        actions.push(RecoveredMemberDirectedPathAction::Collect(source, target));
+    }
+    actions
+}
+
 fn unrelated_survivor_reauthentication_retirements_are_unchanged(
     before: &[QualificationConnectionLifecycleMetrics],
     after: &[QualificationConnectionLifecycleMetrics],
@@ -1879,6 +1938,10 @@ fn lifecycle_transition_is_settled(
 
 fn deadline_allows_completion(now: Instant, deadline: Instant) -> bool {
     now <= deadline
+}
+
+fn child_response_deadline(deadline: Instant) -> Instant {
+    deadline.min(Instant::now() + CHILD_TIMEOUT)
 }
 
 fn deadline_admits_complete_operation(now: Instant, deadline: Instant) -> bool {
@@ -6157,20 +6220,18 @@ impl Fleet {
         generations
     }
 
-    fn all_reauthentication_generations(&mut self) -> Vec<u64> {
-        self.all_reauthentication_generations_by(Instant::now() + CHILD_TIMEOUT)
-    }
-
     fn all_reauthentication_generations_by(&mut self, deadline: Instant) -> Vec<u64> {
         for node in &mut self.nodes {
             node.send(&QualificationNodeCommand::ReauthenticationGeneration);
         }
         self.nodes
             .iter_mut()
-            .map(|node| match node.receive_until(deadline) {
-                QualificationNodeReply::ReauthenticationGeneration { generation } => generation,
-                reply => panic!("unexpected reauthentication generation response: {reply:?}"),
-            })
+            .map(
+                |node| match node.receive_until(child_response_deadline(deadline)) {
+                    QualificationNodeReply::ReauthenticationGeneration { generation } => generation,
+                    reply => panic!("unexpected reauthentication generation response: {reply:?}"),
+                },
+            )
             .collect()
     }
 
@@ -6192,9 +6253,20 @@ impl Fleet {
         assert!(member < self.member_count());
         let generations_before = self
             .all_reauthentication_generations_by(traffic_progress.next_deadline(absolute_deadline));
-        let paths = member_incident_directed_paths(self.member_count(), member);
-        assert_eq!(paths.len(), 2 * (self.member_count() - 1));
-        for (source, target) in paths {
+        let paths = recovered_member_directed_path_plan(self.member_count(), member);
+        self.wait_for_survivor_recovered_handshakes_by(
+            &paths.survivor_to_recovered,
+            &generations_before,
+            traffic_progress.next_deadline(absolute_deadline),
+        );
+        self.wait_for_recovery_traffic_progress(
+            availability_baseline,
+            traffic_progress,
+            participants,
+            "existing-generation-survivor-to-recovered-paths",
+            absolute_deadline,
+        );
+        for (source, target) in paths.recovered_to_survivor {
             let progress_deadline = traffic_progress.next_deadline(absolute_deadline);
             self.wait_for_directed_handshake_by(
                 source,
@@ -6225,11 +6297,18 @@ impl Fleet {
         );
     }
 
-    fn reauthenticate_recovered_member_and_prove_paths(&mut self, member: usize) {
+    fn reauthenticate_recovered_member_and_prove_paths(
+        &mut self,
+        member: usize,
+        deadline: Instant,
+    ) {
         assert!(member < self.member_count());
-        let generations_before = self.all_reauthentication_generations();
+        let generations_before = self.all_reauthentication_generations_by(deadline);
         let member_generation = match self.nodes[member]
-            .invoke(&QualificationNodeCommand::RequestReauthentication)
+            .invoke_until(
+                &QualificationNodeCommand::RequestReauthentication,
+                child_response_deadline(deadline),
+            )
         {
             QualificationNodeReply::ReauthenticationRequested { generation } => generation,
             reply => panic!(
@@ -6242,21 +6321,16 @@ impl Fleet {
             "recovered-member reauthentication generation did not advance exactly once"
         );
 
-        for (source, target) in member_incident_directed_paths(self.member_count(), member) {
-            let expected_generation = if source == member {
-                member_generation
-            } else {
-                // The hard-expiry checkpoint already proved every incident
-                // connection retired and fully drained. A successful
-                // survivor-to-member call after replacement therefore uses a
-                // new TLS/bootstrap connection even though that survivor's
-                // process-local explicit generation intentionally did not
-                // advance.
-                generations_before[source]
-            };
-            self.wait_for_directed_handshake(source, target, expected_generation);
+        let paths = recovered_member_directed_path_plan(self.member_count(), member);
+        self.wait_for_survivor_recovered_handshakes_by(
+            &paths.survivor_to_recovered,
+            &generations_before,
+            deadline,
+        );
+        for (source, target) in paths.recovered_to_survivor {
+            self.wait_for_directed_handshake_by(source, target, member_generation, deadline);
         }
-        let generations_after = self.all_reauthentication_generations();
+        let generations_after = self.all_reauthentication_generations_by(deadline);
         assert!(
             member_reauthentication_generations_are_scoped(
                 &generations_before,
@@ -6336,7 +6410,7 @@ impl Fleet {
         );
         let started = Instant::now();
         let deadline = started + Duration::from_millis(QUALIFICATION_TRAFFIC_TRANSITION_MILLIS);
-        self.reauthenticate_recovered_member_and_prove_paths(member);
+        self.reauthenticate_recovered_member_and_prove_paths(member, deadline);
         self.wait_ready();
         self.advance_canary(phase);
         let (lifecycle_after, traffic_after) = self.wait_for_member_recovery_settlement(
@@ -6425,6 +6499,80 @@ impl Fleet {
     ) {
         let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
         self.wait_for_directed_handshake_by(source, target, expected_generation, deadline);
+    }
+
+    /// Dispatch each survivor-owned path before collecting any response. This
+    /// makes the post-publication/re-authentication prewarm one bounded round
+    /// rather than a source-major window in which an unprobed survivor can
+    /// reach its retired cached lane through live mutation traffic.
+    fn wait_for_survivor_recovered_handshakes_by(
+        &mut self,
+        paths: &[(usize, usize)],
+        expected_generations: &[u64],
+        deadline: Instant,
+    ) {
+        assert!(!paths.is_empty());
+        assert!(paths.iter().all(|(source, target)| source != target));
+        assert!(paths
+            .iter()
+            .all(|(source, _)| *source < self.member_count()));
+        assert!(paths
+            .iter()
+            .all(|(_, target)| *target < self.member_count()));
+        assert!(paths
+            .iter()
+            .enumerate()
+            .all(|(index, (source, _))| paths[..index].iter().all(|(prior, _)| prior != source)));
+        assert_eq!(expected_generations.len(), self.member_count());
+
+        let mut pending = paths.to_vec();
+        while !pending.is_empty() {
+            assert!(
+                deadline_allows_completion(Instant::now(), deadline),
+                "survivor-to-recovered directed handshake dispatch exhausted its absolute deadline: pending={pending:?}"
+            );
+            for (source, target) in &pending {
+                self.nodes[*source].send(&QualificationNodeCommand::DirectedHandshake {
+                    remote_node_index: *target,
+                });
+            }
+
+            let mut retry = Vec::new();
+            for (source, target) in pending {
+                match self.nodes[source].receive_until(child_response_deadline(deadline)) {
+                    QualificationNodeReply::DirectedHandshake {
+                        remote_node_index,
+                        reauthentication_generation,
+                    } => {
+                        assert_eq!(remote_node_index, target);
+                        assert_eq!(reauthentication_generation, expected_generations[source]);
+                        assert!(
+                            deadline_allows_completion(Instant::now(), deadline),
+                            "survivor-to-recovered directed handshake {source}->{target} completed only after its absolute deadline"
+                        );
+                    }
+                    QualificationNodeReply::Error {
+                        code: QualificationNodeErrorCode::DirectedHandshakeUnavailable,
+                    } if deadline_allows_completion(Instant::now(), deadline) => {
+                        retry.push((source, target));
+                    }
+                    reply => panic!(
+                        "survivor-to-recovered directed handshake {source}->{target} failed: {reply:?}, source_stderr={}, target_stderr={}",
+                        self.node_stderr(source),
+                        self.node_stderr(target)
+                    ),
+                }
+            }
+            if retry.is_empty() {
+                return;
+            }
+            assert!(
+                deadline_allows_completion(Instant::now(), deadline),
+                "survivor-to-recovered directed handshake retry exhausted its absolute deadline: pending={retry:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+            pending = retry;
+        }
     }
 
     fn wait_for_directed_handshake_by(
@@ -18735,6 +18883,43 @@ fn member_recovery_scope_preserves_unrelated_survivor_generations_and_retirement
     after[4].retirement_explicit += 1;
     assert!(
         !unrelated_survivor_reauthentication_retirements_are_unchanged(&before, &after, member,)
+    );
+}
+
+#[test]
+fn recovered_member_path_plan_dispatches_all_survivors_before_collection_or_outbound_proofs() {
+    let member = 1;
+    let plan = recovered_member_directed_path_plan(5, member);
+    assert_eq!(
+        plan.survivor_to_recovered,
+        vec![(0, 1), (2, 1), (3, 1), (4, 1)]
+    );
+    assert_eq!(
+        plan.recovered_to_survivor,
+        vec![(1, 0), (1, 2), (1, 3), (1, 4)]
+    );
+
+    use RecoveredMemberDirectedPathAction::{Collect, Dispatch};
+    assert_eq!(
+        recovered_member_directed_path_actions(5, member),
+        vec![
+            Dispatch(0, 1),
+            Dispatch(2, 1),
+            Dispatch(3, 1),
+            Dispatch(4, 1),
+            Collect(0, 1),
+            Collect(2, 1),
+            Collect(3, 1),
+            Collect(4, 1),
+            Dispatch(1, 0),
+            Collect(1, 0),
+            Dispatch(1, 2),
+            Collect(1, 2),
+            Dispatch(1, 3),
+            Collect(1, 3),
+            Dispatch(1, 4),
+            Collect(1, 4),
+        ]
     );
 }
 
