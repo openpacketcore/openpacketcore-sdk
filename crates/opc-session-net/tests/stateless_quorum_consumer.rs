@@ -7049,6 +7049,9 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
             }
         }
     };
+    fleet
+        .wait_all_application_sequences(sequence_before + 2)
+        .await;
     #[cfg(feature = "test-control")]
     {
         let timings = protected_roster_terminal_apply_timings_for_test();
@@ -7065,9 +7068,6 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
             "the terminal applies each fixed storage phase exactly once on every voter"
         );
     }
-    fleet
-        .wait_all_application_sequences(sequence_before + 2)
-        .await;
     assert_eq!(
         fleet.stores[leader].status().last_log_index,
         Some(log_before + 2),
