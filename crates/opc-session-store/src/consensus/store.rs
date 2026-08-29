@@ -40,9 +40,10 @@ use super::raft_adapter::{
 use super::storage::{self, SessionConsensusStorageError};
 use super::types::{
     fenced_transition_v2_batch_outer_request_id, fenced_transition_voter_set_digest,
-    protected_roster_profile_voter_set_digest, validate_fenced_transition_v2_batch,
-    ConsensusRosterAdmissionCommand, ConsensusRosterAdmissionOutcome, ConsensusRosterRejection,
-    ConsensusRosterTerminalCommand, ConsensusRosterTerminalOutcome,
+    protected_roster_profile_v2_voter_set_digest, protected_roster_profile_voter_set_digest,
+    validate_fenced_transition_v2_batch, ConsensusRosterAdmissionCommand,
+    ConsensusRosterAdmissionOutcome, ConsensusRosterRejection, ConsensusRosterTerminalCommand,
+    ConsensusRosterTerminalCommandV2, ConsensusRosterTerminalOutcome,
     FinalizeOperatorRecoveryV2Intent,
 };
 use super::{
@@ -79,27 +80,35 @@ use crate::consumer::{
     SessionConsumerRosterAdmissionReadResponse, SessionConsumerRosterAuthorization,
     SessionConsumerRosterCurrentPublicationAuthorityReadResponse, SessionConsumerRosterRejection,
     SessionConsumerRosterTerminalMutationResponse, SessionConsumerRosterTerminalReadResponse,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerV2FencedTransitionBatchError,
-    SessionConsumerV2FencedTransitionBatchResult, SessionConsumerV2FencedTransitionError,
-    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
-    SessionConsumerV2Response, SessionQuorumConsumer, SessionQuorumRosterIngress,
-    MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
+    SessionConsumerRosterTransportProfile, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerV2FencedTransitionBatchError, SessionConsumerV2FencedTransitionBatchResult,
+    SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
+    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
+    SessionQuorumConsumer, SessionQuorumRosterIngress, MAX_SESSION_CONSUMER_BATCH_RESPONSE_BYTES,
 };
 use crate::error::{LeaseError, StoreError};
 use crate::fenced_mutation_roster::{
     verify_compact_admission_provenance_v2, CompactAdmissionProvenanceVerificationV2,
-    RosterAttestationTrustRootV1, RosterCompactAdmissionProvenanceSigningInputV2,
-    RosterCompactAdmissionProvenanceV2, RosterIngressAttestationV1,
-    RosterIngressAttestationVerificationInputV1,
+    RosterAttestationTrustRootV1, RosterCompactAdmissionProvenance,
+    RosterCompactAdmissionProvenanceInput, RosterCompactAdmissionProvenanceSigningInputV2,
+    RosterCompactAdmissionProvenanceV2, RosterIngressAttestation, RosterIngressAttestationV1,
+    RosterIngressAttestationVerificationInputV1, RosterIngressAttestationVerificationInputV2,
+    RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
 };
 use crate::fenced_mutation_roster_transport::{
-    decode_admission_request_for_scope, decode_terminal_request_for_scope,
-    encode_admission_compacted_response, encode_admission_fresh_response,
-    encode_admission_poll_admitted_response, encode_admission_replayed_response,
-    encode_admission_terminal_response, encode_terminal_admitted_response,
-    encode_terminal_compacted_response, encode_terminal_replayed_bytes_response,
-    encode_terminal_terminalized_bytes_response,
+    decode_admission_request_for_scope, decode_admission_request_for_scope_v2,
+    decode_terminal_request_for_scope, decode_terminal_request_for_scope_v2,
+    encode_admission_compacted_response, encode_admission_compacted_response_v2,
+    encode_admission_fresh_response, encode_admission_fresh_response_v2,
+    encode_admission_poll_admitted_response, encode_admission_poll_admitted_response_v2,
+    encode_admission_replayed_response, encode_admission_replayed_response_v2,
+    encode_admission_terminal_response, encode_admission_terminal_response_v2,
+    encode_terminal_admitted_response, encode_terminal_admitted_response_v2,
+    encode_terminal_compacted_response, encode_terminal_compacted_response_v2,
+    encode_terminal_replayed_bytes_response, encode_terminal_replayed_bytes_response_v2,
+    encode_terminal_terminalized_bytes_response, encode_terminal_terminalized_bytes_response_v2,
     encode_terminal_terminalized_validated_bytes_response,
+    encode_terminal_terminalized_validated_bytes_response_v2,
 };
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionExecuteError, FencedTransitionObservation,
@@ -170,6 +179,8 @@ const FENCED_TRANSITION_ACTIVATION_REQUEST_ID_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-activation-request/v1\0";
 const PROTECTED_ROSTER_PROFILE_ACTIVATION_REQUEST_ID_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/protected-roster-profile-activation-request/v1\0";
+const PROTECTED_ROSTER_PROFILE_V2_ACTIVATION_REQUEST_ID_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/protected-roster-profile-activation-request/v2\0";
 
 #[cfg(test)]
 static CONSUMER_CONSENSUS_PROPOSAL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -296,6 +307,24 @@ fn protected_roster_profile_activation_request_id(
 ) -> SessionConsensusRequestId {
     let mut hasher = Sha256::new();
     hasher.update(PROTECTED_ROSTER_PROFILE_ACTIVATION_REQUEST_ID_DOMAIN);
+    hasher.update(scope.cluster_id().as_bytes());
+    hasher.update(scope.configuration_id().as_bytes());
+    hasher.update(scope.configuration_epoch().get().to_be_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut request_id = [0_u8; 16];
+    request_id.copy_from_slice(&digest[..16]);
+    SessionConsensusRequestId::from_bytes(request_id)
+}
+
+/// Derive the V2 activation request identity in a disjoint namespace.  The
+/// profile descriptor itself is fixed and checked again in the replicated
+/// command, while this domain prevents a V1 activation receipt from
+/// suppressing the V2 certificate proposal for the same voter scope.
+fn protected_roster_profile_v2_activation_request_id(
+    scope: SessionConsensusIdentity,
+) -> SessionConsensusRequestId {
+    let mut hasher = Sha256::new();
+    hasher.update(PROTECTED_ROSTER_PROFILE_V2_ACTIVATION_REQUEST_ID_DOMAIN);
     hasher.update(scope.cluster_id().as_bytes());
     hasher.update(scope.configuration_id().as_bytes());
     hasher.update(scope.configuration_epoch().get().to_be_bytes());
@@ -882,6 +911,62 @@ fn protected_roster_profile_capability_probe_reply(
     }
 }
 
+/// The absent-predecessor roster profile has a separate probe/reply domain
+/// and wire shape.  A V1 answer, including a byte-identical digest under V1's
+/// domain, is never evidence for the V2 certificate.
+const PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V2: [u8; 8] = *b"opc-rp-2";
+const PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V2: u16 = 2;
+const PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V2: [u8; 8] = *b"opc-rr-2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedRosterProfileV2CapabilityProbe {
+    domain: [u8; 8],
+    schema_version: u16,
+    consumer_revision: u16,
+    profile_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedRosterProfileV2CapabilityReply {
+    domain: [u8; 8],
+    schema_version: u16,
+    consumer_revision: u16,
+    outcome: ProtectedRosterProfileV2CapabilityOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ProtectedRosterProfileV2CapabilityOutcome {
+    Supported { profile_digest: [u8; 32] },
+    Unsupported,
+}
+
+fn protected_roster_profile_v2_capability_probe_reply(
+    probe: ProtectedRosterProfileV2CapabilityProbe,
+    local_capability: AtomicFencedTransitionCapability,
+) -> ProtectedRosterProfileV2CapabilityReply {
+    let profile = crate::fenced_mutation_roster::Profile::v2();
+    let supported = probe.domain == PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V2
+        && probe.schema_version == PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V2
+        && profile.schema() == PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V2
+        && probe.consumer_revision == profile.consumer_revision()
+        && probe.profile_digest == profile.digest()
+        && local_capability == AtomicFencedTransitionCapability::V1;
+    ProtectedRosterProfileV2CapabilityReply {
+        domain: PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V2,
+        schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V2,
+        consumer_revision: profile.consumer_revision(),
+        outcome: if supported {
+            ProtectedRosterProfileV2CapabilityOutcome::Supported {
+                profile_digest: profile.digest(),
+            }
+        } else {
+            ProtectedRosterProfileV2CapabilityOutcome::Unsupported
+        },
+    }
+}
+
 /// Exact V1 admission at one linearizable membership scope.
 ///
 /// A fresh proof is intentionally not cached: only a committed activation
@@ -890,6 +975,13 @@ fn protected_roster_profile_capability_probe_reply(
 enum FencedTransitionCapabilityAdmission {
     Activated,
     FreshUnanimous,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CapabilityActivationKind {
+    FencedTransitionV1,
+    ProtectedRosterV1,
+    ProtectedRosterV2,
 }
 
 /// The one local quorum proof that a physical V1 transition or V1 activation
@@ -1052,6 +1144,27 @@ pub struct ConsensusStoreDiagnosticSnapshot {
 /// durations.
 pub const PROTECTED_ROSTER_DIAGNOSTIC_LATENCY_BUCKETS: usize = 16;
 
+/// Fixed, redaction-safe stage counters for the Profile-V2 terminal-status
+/// test-control route. This exists only in test builds and the explicitly
+/// opt-in `test-control` feature; it is not a production diagnostic surface.
+#[cfg(any(test, feature = "test-control"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct ProtectedRosterV2TerminalStatusDiagnosticSnapshotForTest {
+    /// V2 terminal status reached its linearizable-barrier call.
+    pub barrier_entered: u64,
+    /// V2 terminal status reached its V2-only durable backend call.
+    pub backend_entered: u64,
+    /// The V2-only durable backend call returned an error.
+    pub backend_error: u64,
+    /// The V2-only durable backend rejected the request as an invalid key.
+    pub backend_invalid_key: u64,
+    /// The V2-only durable backend reported unavailable or corrupt durable state.
+    pub backend_unavailable: u64,
+    /// The V2-only durable backend returned another redacted error class.
+    pub backend_other: u64,
+}
+
 /// Fixed-cardinality, redaction-safe diagnostics for the protected-roster
 /// consensus and durable-storage path.
 ///
@@ -1191,6 +1304,18 @@ pub(crate) struct ConsensusStoreDiagnosticCounters {
     protected_roster_retirement_cursors: AtomicU64,
     protected_roster_materialized_charge_bytes: AtomicU64,
     protected_roster_reserved_future_charge_bytes: AtomicU64,
+    #[cfg(any(test, feature = "test-control"))]
+    protected_roster_v2_terminal_status_barrier_entered: AtomicU64,
+    #[cfg(any(test, feature = "test-control"))]
+    protected_roster_v2_terminal_status_backend_entered: AtomicU64,
+    #[cfg(any(test, feature = "test-control"))]
+    protected_roster_v2_terminal_status_backend_error: AtomicU64,
+    #[cfg(any(test, feature = "test-control"))]
+    protected_roster_v2_terminal_status_backend_invalid_key: AtomicU64,
+    #[cfg(any(test, feature = "test-control"))]
+    protected_roster_v2_terminal_status_backend_unavailable: AtomicU64,
+    #[cfg(any(test, feature = "test-control"))]
+    protected_roster_v2_terminal_status_backend_other: AtomicU64,
     // This is not a diagnostic value. Reusing the existing per-store Arc
     // keeps the hint store-scoped across every construction path.
     fixed_raw_v2_warm_route: AtomicBool,
@@ -1631,6 +1756,32 @@ impl ConsensusStoreDiagnosticCounters {
             retirement_cursors: occupancy.1 .5,
             materialized_charge_bytes: occupancy.1 .6,
             reserved_future_charge_bytes: occupancy.1 .7,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-control"))]
+    fn protected_roster_v2_terminal_status_snapshot_for_test(
+        &self,
+    ) -> ProtectedRosterV2TerminalStatusDiagnosticSnapshotForTest {
+        ProtectedRosterV2TerminalStatusDiagnosticSnapshotForTest {
+            barrier_entered: self
+                .protected_roster_v2_terminal_status_barrier_entered
+                .load(Ordering::Relaxed),
+            backend_entered: self
+                .protected_roster_v2_terminal_status_backend_entered
+                .load(Ordering::Relaxed),
+            backend_error: self
+                .protected_roster_v2_terminal_status_backend_error
+                .load(Ordering::Relaxed),
+            backend_invalid_key: self
+                .protected_roster_v2_terminal_status_backend_invalid_key
+                .load(Ordering::Relaxed),
+            backend_unavailable: self
+                .protected_roster_v2_terminal_status_backend_unavailable
+                .load(Ordering::Relaxed),
+            backend_other: self
+                .protected_roster_v2_terminal_status_backend_other
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -2701,6 +2852,18 @@ impl ConsensusSessionStore {
         self.inner.diagnostics.protected_roster_snapshot()
     }
 
+    /// Return the redaction-safe stage counters for the Profile-V2
+    /// terminal-status test-control route.
+    #[cfg(any(test, feature = "test-control"))]
+    #[doc(hidden)]
+    pub fn protected_roster_v2_terminal_status_diagnostic_for_test(
+        &self,
+    ) -> ProtectedRosterV2TerminalStatusDiagnosticSnapshotForTest {
+        self.inner
+            .diagnostics
+            .protected_roster_v2_terminal_status_snapshot_for_test()
+    }
+
     #[cfg(test)]
     fn inject_accepted_client_write_receiver_outcome(
         &self,
@@ -3724,6 +3887,141 @@ impl ConsensusSessionStore {
             && self.exact_membership_is_admitted())
     }
 
+    /// Require the independent V2 certificate before any absent-predecessor
+    /// roster command is admitted.  This intentionally does not consult the
+    /// V1 certificate, even when scope and voters are the same.
+    async fn require_protected_roster_profile_v2_activation_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        self.require_exact_membership_admission()?;
+        self.linearizable_barrier_before(deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        if self
+            .activated_protected_roster_profile_v2_scope_is_current()
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(StoreError::CapabilityNotSupported(
+                "protected_roster_profile_v2_not_activated".into(),
+            ))
+        }
+    }
+
+    async fn require_protected_roster_profile_v2_activation_after_read_admit(
+        &self,
+        read_admit: &LinearizableReadAdmit<SessionConsensusNodeId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionCapabilityAdmission, StoreError> {
+        self.require_exact_membership_admission()?;
+        self.inner
+            .read_barrier
+            .revalidate(read_admit, deadline)
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        self.require_application_traffic_authority_before(deadline)
+            .await?;
+        let expected_scope = self.current_scope()?;
+        if self.local_fenced_transition_capability() != AtomicFencedTransitionCapability::V1
+            || !expected_scope.1.contains(&self.inner.local_node_id)
+        {
+            return Err(unsupported_fenced_transition());
+        }
+        if self
+            .inner
+            .backend
+            .consensus_protected_roster_profile_v2_activation_matches_scope(
+                self.inner.storage_identity,
+                expected_scope.0,
+                expected_scope.1.clone(),
+            )
+            .await?
+        {
+            if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
+                return Err(consensus_unavailable());
+            }
+            return Ok(FencedTransitionCapabilityAdmission::Activated);
+        }
+        let profile = crate::fenced_mutation_roster::Profile::v2();
+        let probes = expected_scope
+            .1
+            .iter()
+            .copied()
+            .filter(|member| *member != self.inner.local_node_id)
+            .map(|member| async move {
+                let supported = match self
+                    .call_peer::<_, ProtectedRosterProfileV2CapabilityReply>(
+                        member,
+                        SessionConsensusRpcFamily::ReadBarrier,
+                        &ProtectedRosterProfileV2CapabilityProbe {
+                            domain: PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V2,
+                            schema_version: profile.schema(),
+                            consumer_revision: profile.consumer_revision(),
+                            profile_digest: profile.digest(),
+                        },
+                        deadline,
+                    )
+                    .await
+                {
+                    Ok(ProtectedRosterProfileV2CapabilityReply {
+                        domain,
+                        schema_version,
+                        consumer_revision,
+                        outcome:
+                            ProtectedRosterProfileV2CapabilityOutcome::Supported {
+                                profile_digest: peer_profile,
+                            },
+                    }) if domain == PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V2
+                        && schema_version == profile.schema()
+                        && consumer_revision == profile.consumer_revision()
+                        && peer_profile == profile.digest() =>
+                    {
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(_) => return Err(consensus_unavailable()),
+                };
+                Ok(supported)
+            });
+        for result in futures_util::future::join_all(probes).await {
+            if !result? {
+                return Err(unsupported_fenced_transition());
+            }
+        }
+        if self.current_scope()? != expected_scope || !self.exact_membership_is_admitted() {
+            return Err(consensus_unavailable());
+        }
+        Ok(FencedTransitionCapabilityAdmission::FreshUnanimous)
+    }
+
+    async fn activated_protected_roster_profile_v2_scope_is_current(
+        &self,
+    ) -> Result<bool, StoreError> {
+        self.require_exact_membership_admission()?;
+        let expected_scope = self.current_scope()?;
+        if self.local_fenced_transition_capability() != AtomicFencedTransitionCapability::V1
+            || !expected_scope.1.contains(&self.inner.local_node_id)
+        {
+            return Ok(false);
+        }
+        let activated = self
+            .inner
+            .backend
+            .consensus_protected_roster_profile_v2_activation_matches_scope(
+                self.inner.storage_identity,
+                expected_scope.0,
+                expected_scope.1.clone(),
+            )
+            .await?;
+        Ok(activated
+            && self.current_scope()? == expected_scope
+            && self.exact_membership_is_admitted())
+    }
+
     /// Revalidate every local fact bound to one V1 quorum admission. The
     /// revalidation is intentionally the final action before `client_write_ff`.
     async fn revalidate_fenced_transition_proposal_admission_before(
@@ -3936,6 +4234,16 @@ impl ConsensusSessionStore {
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
         self.activate_protected_roster_profile_before(deadline)
+            .await
+    }
+
+    /// Durably establish Profile V2's independent exact-scope certificate.
+    /// This never upgrades or reuses the frozen V1 roster certificate.
+    pub async fn activate_protected_roster_profile_v2(&self) -> Result<(), StoreError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.activate_protected_roster_profile_v2_before(deadline)
             .await
     }
 
@@ -6488,34 +6796,56 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), StoreError> {
-        self.activate_capability_before(deadline, false).await
+        self.activate_capability_before(deadline, CapabilityActivationKind::FencedTransitionV1)
+            .await
     }
 
     async fn activate_protected_roster_profile_before(
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), StoreError> {
-        self.activate_capability_before(deadline, true).await
+        self.activate_capability_before(deadline, CapabilityActivationKind::ProtectedRosterV1)
+            .await
+    }
+
+    async fn activate_protected_roster_profile_v2_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StoreError> {
+        self.activate_capability_before(deadline, CapabilityActivationKind::ProtectedRosterV2)
+            .await
     }
 
     async fn activate_capability_before(
         &self,
         deadline: tokio::time::Instant,
-        protected_roster_profile: bool,
+        activation: CapabilityActivationKind,
     ) -> Result<(), StoreError> {
         self.require_application_traffic_authority_before(deadline)
             .await?;
         let (scope_identity, _) = self.current_scope()?;
         let request = ForwardMutationRequest {
-            request_id: if protected_roster_profile {
-                protected_roster_profile_activation_request_id(scope_identity)
-            } else {
-                fenced_transition_activation_request_id(scope_identity)
+            request_id: match activation {
+                CapabilityActivationKind::FencedTransitionV1 => {
+                    fenced_transition_activation_request_id(scope_identity)
+                }
+                CapabilityActivationKind::ProtectedRosterV1 => {
+                    protected_roster_profile_activation_request_id(scope_identity)
+                }
+                CapabilityActivationKind::ProtectedRosterV2 => {
+                    protected_roster_profile_v2_activation_request_id(scope_identity)
+                }
             },
-            intent: if protected_roster_profile {
-                SessionMutationIntent::PreflightProtectedRosterProfile
-            } else {
-                SessionMutationIntent::PreflightFencedTransitionCapability
+            intent: match activation {
+                CapabilityActivationKind::FencedTransitionV1 => {
+                    SessionMutationIntent::PreflightFencedTransitionCapability
+                }
+                CapabilityActivationKind::ProtectedRosterV1 => {
+                    SessionMutationIntent::PreflightProtectedRosterProfile
+                }
+                CapabilityActivationKind::ProtectedRosterV2 => {
+                    SessionMutationIntent::PreflightProtectedRosterProfileV2
+                }
             },
             required_consumer_scope: ForwardConsumerScope::Internal,
         };
@@ -6562,24 +6892,37 @@ impl ConsensusSessionStore {
                     self.require_application_traffic_authority_before(deadline)
                         .await?;
                     let (scope_identity, voters) = self.current_scope()?;
-                    let activated = if protected_roster_profile {
-                        self.inner
-                            .backend
-                            .consensus_protected_roster_profile_activation_matches_scope(
-                                self.inner.storage_identity,
-                                scope_identity,
-                                voters,
-                            )
-                            .await?
-                    } else {
-                        self.inner
-                            .backend
-                            .consensus_fenced_transition_activation_matches_scope(
-                                self.inner.storage_identity,
-                                scope_identity,
-                                voters,
-                            )
-                            .await?
+                    let activated = match activation {
+                        CapabilityActivationKind::FencedTransitionV1 => {
+                            self.inner
+                                .backend
+                                .consensus_fenced_transition_activation_matches_scope(
+                                    self.inner.storage_identity,
+                                    scope_identity,
+                                    voters,
+                                )
+                                .await?
+                        }
+                        CapabilityActivationKind::ProtectedRosterV1 => {
+                            self.inner
+                                .backend
+                                .consensus_protected_roster_profile_activation_matches_scope(
+                                    self.inner.storage_identity,
+                                    scope_identity,
+                                    voters,
+                                )
+                                .await?
+                        }
+                        CapabilityActivationKind::ProtectedRosterV2 => {
+                            self.inner
+                                .backend
+                                .consensus_protected_roster_profile_v2_activation_matches_scope(
+                                    self.inner.storage_identity,
+                                    scope_identity,
+                                    voters,
+                                )
+                                .await?
+                        }
                     };
                     if activated {
                         return Ok(());
@@ -6795,8 +7138,13 @@ impl ConsensusSessionStore {
             &request.intent,
             SessionMutationIntent::PreflightProtectedRosterProfile
         );
-        let activation_preflight =
-            fenced_activation_preflight || protected_roster_profile_preflight;
+        let protected_roster_profile_v2_preflight = matches!(
+            &request.intent,
+            SessionMutationIntent::PreflightProtectedRosterProfileV2
+        );
+        let activation_preflight = fenced_activation_preflight
+            || protected_roster_profile_preflight
+            || protected_roster_profile_v2_preflight;
         let consumer_scoped = request.required_consumer_scope.is_consumer_scoped();
         let raw_v2_mutation =
             is_raw_fenced_transition_v2_mutation(&request.intent, allow_operator_recovery);
@@ -6810,16 +7158,22 @@ impl ConsensusSessionStore {
                 Ok(activated) => activated,
                 Err(_) => return ForwardMutationReply::Unavailable,
             };
-        let roster_profile_activated = if is_roster_mutation_intent(&request.intent) {
-            match self
+        let roster_profile_activated = match roster_mutation_profile(&request.intent) {
+            Some(ProtectedRosterProfileVersion::V1) => match self
                 .activated_protected_roster_profile_scope_is_current()
                 .await
             {
                 Ok(activated) => activated,
                 Err(_) => return ForwardMutationReply::Unavailable,
-            }
-        } else {
-            true
+            },
+            Some(ProtectedRosterProfileVersion::V2) => match self
+                .activated_protected_roster_profile_v2_scope_is_current()
+                .await
+            {
+                Ok(activated) => activated,
+                Err(_) => return ForwardMutationReply::Unavailable,
+            },
+            None => true,
         };
         if !roster_profile_activated {
             return ForwardMutationReply::Unavailable;
@@ -6913,6 +7267,7 @@ impl ConsensusSessionStore {
             SessionMutationIntent::FencedTransition(_)
                 | SessionMutationIntent::PreflightFencedTransitionCapability
                 | SessionMutationIntent::PreflightProtectedRosterProfile
+                | SessionMutationIntent::PreflightProtectedRosterProfileV2
         ) {
             #[cfg(test)]
             FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -7056,7 +7411,13 @@ impl ConsensusSessionStore {
                 required_consumer_scope: request.required_consumer_scope.clone(),
             })
         } else if let Some(read_admit) = fenced_read_admit {
-            let capability = match if protected_roster_profile_preflight {
+            let capability = match if protected_roster_profile_v2_preflight {
+                self.require_protected_roster_profile_v2_activation_after_read_admit(
+                    &read_admit,
+                    deadline,
+                )
+                .await
+            } else if protected_roster_profile_preflight {
                 self.require_protected_roster_profile_activation_after_read_admit(
                     &read_admit,
                     deadline,
@@ -7101,10 +7462,11 @@ impl ConsensusSessionStore {
             };
             match (
                 protected_roster_profile_preflight,
+                protected_roster_profile_v2_preflight,
                 fenced_activation_preflight,
                 capability,
             ) {
-                (true, false, FencedTransitionCapabilityAdmission::Activated) => {
+                (true, false, false, FencedTransitionCapabilityAdmission::Activated) => {
                     if self
                         .revalidate_fenced_transition_proposal_admission_before(
                             &admission,
@@ -7134,7 +7496,7 @@ impl ConsensusSessionStore {
                         None => ForwardMutationReply::Unavailable,
                     };
                 }
-                (true, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                (true, false, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
                     request.intent = SessionMutationIntent::ActivateFencedTransitionCapability {
                         schema_version: FENCED_TRANSITION_SCHEMA_V1,
                         scope_identity,
@@ -7144,7 +7506,7 @@ impl ConsensusSessionStore {
                         ),
                     };
                 }
-                (false, true, FencedTransitionCapabilityAdmission::Activated) => {
+                (false, true, false, FencedTransitionCapabilityAdmission::Activated) => {
                     if self
                         .revalidate_fenced_transition_proposal_admission_before(
                             &admission,
@@ -7174,14 +7536,57 @@ impl ConsensusSessionStore {
                         None => ForwardMutationReply::Unavailable,
                     };
                 }
-                (false, true, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                (false, true, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                    let profile = crate::fenced_mutation_roster::Profile::v2();
+                    request.intent = SessionMutationIntent::ActivateProtectedRosterProfileV2 {
+                        schema_version: profile.schema(),
+                        consumer_revision: profile.consumer_revision(),
+                        scope_identity,
+                        voter_set_digest: protected_roster_profile_v2_voter_set_digest(
+                            scope_identity,
+                            &voters,
+                        ),
+                        profile_digest: profile.digest(),
+                    };
+                }
+                (false, false, true, FencedTransitionCapabilityAdmission::Activated) => {
+                    if self
+                        .revalidate_fenced_transition_proposal_admission_before(
+                            &admission,
+                            &request.required_consumer_scope,
+                            deadline,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return ForwardMutationReply::Unavailable;
+                    }
+                    let applied_log_index = self
+                        .inner
+                        .raft
+                        .metrics()
+                        .borrow()
+                        .last_applied
+                        .as_ref()
+                        .map(|log_id| log_id.index)
+                        .filter(|index| *index != 0);
+                    return match applied_log_index {
+                        Some(applied_log_index) => {
+                            ForwardMutationReply::FencedTransitionActivation(Ok(
+                                FencedTransitionActivationReply { applied_log_index },
+                            ))
+                        }
+                        None => ForwardMutationReply::Unavailable,
+                    };
+                }
+                (false, false, true, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
                     request.intent = SessionMutationIntent::ActivateFencedTransitionCapability {
                         schema_version: FENCED_TRANSITION_SCHEMA_V1,
                         scope_identity,
                         voter_set_digest,
                     };
                 }
-                (false, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
+                (false, false, false, FencedTransitionCapabilityAdmission::FreshUnanimous) => {
                     let SessionMutationIntent::FencedTransition(transition) = request.intent else {
                         return ForwardMutationReply::Unavailable;
                     };
@@ -7191,7 +7596,7 @@ impl ConsensusSessionStore {
                         voter_set_digest,
                     };
                 }
-                (false, false, FencedTransitionCapabilityAdmission::Activated) => {}
+                (false, false, false, FencedTransitionCapabilityAdmission::Activated) => {}
                 _ => return ForwardMutationReply::Unavailable,
             }
             Some(admission)
@@ -9104,6 +9509,8 @@ fn mutation_requires_exact_status_resolution(request: &ForwardMutationRequest) -
                 | SessionMutationIntent::FencedTransitionV2(_)
                 | SessionMutationIntent::FencedTransitionV2Batch(_)
                 | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
+                | SessionMutationIntent::RosterAdmissionV2(_)
+                | SessionMutationIntent::RosterTerminalV2(_)
                 | SessionMutationIntent::RosterAdmission(_)
                 | SessionMutationIntent::RosterTerminal(_)
         )
@@ -9185,7 +9592,10 @@ fn committed_response_matches_intent(
     if let Ok(outcome) = &response.result {
         let uses_dedicated_roster_validation = matches!(
             outcome,
-            SessionMutationOutcome::RosterAdmission(_) | SessionMutationOutcome::RosterTerminal(_)
+            SessionMutationOutcome::RosterAdmission(_)
+                | SessionMutationOutcome::RosterTerminal(_)
+                | SessionMutationOutcome::RosterAdmissionV2(_)
+                | SessionMutationOutcome::RosterTerminalV2(_)
         );
         if !uses_dedicated_roster_validation
             && crate::sqlite::consensus::validate_consensus_outcome_records(outcome).is_err()
@@ -9279,6 +9689,14 @@ fn committed_response_matches_intent(
             Ok(SessionMutationOutcome::RosterTerminal(outcome)),
             SessionMutationIntent::RosterTerminal(command),
         ) => roster_terminal_outcome_matches_command(command, outcome),
+        (
+            Ok(SessionMutationOutcome::RosterAdmissionV2(outcome)),
+            SessionMutationIntent::RosterAdmissionV2(command),
+        ) => roster_admission_v2_outcome_matches_command(command, outcome),
+        (
+            Ok(SessionMutationOutcome::RosterTerminalV2(outcome)),
+            SessionMutationIntent::RosterTerminalV2(command),
+        ) => roster_terminal_v2_outcome_matches_command(command, outcome),
         _ => false,
     }
 }
@@ -9287,7 +9705,8 @@ fn roster_admission_outcome_matches_command(
     command: &ConsensusRosterAdmissionCommand,
     outcome: &ConsensusRosterAdmissionOutcome,
 ) -> bool {
-    if validate_roster_admission_command(command, None).is_err() {
+    if validate_roster_admission_command(command, None, ProtectedRosterProfileVersion::V1).is_err()
+    {
         return false;
     }
     match outcome {
@@ -9347,6 +9766,78 @@ fn roster_admission_outcome_matches_command(
     }
 }
 
+/// V2 responses use the same compact structural outcome shape as V1, but the
+/// profile is carried by the appended intent/outcome discriminants and the
+/// command's independently authenticated ingress/provenance carrier.  Keep
+/// this as a distinct matcher so a V1 outcome can never resolve a V2 request
+/// (or the reverse) merely because its binding bytes happen to coincide.
+fn roster_admission_v2_outcome_matches_command(
+    command: &ConsensusRosterAdmissionCommand,
+    outcome: &ConsensusRosterAdmissionOutcome,
+) -> bool {
+    validate_roster_admission_command(command, None, ProtectedRosterProfileVersion::V2).is_ok()
+        && roster_admission_outcome_matches_command_unchecked(command, outcome)
+}
+
+fn roster_admission_outcome_matches_command_unchecked(
+    command: &ConsensusRosterAdmissionCommand,
+    outcome: &ConsensusRosterAdmissionOutcome,
+) -> bool {
+    match outcome {
+        ConsensusRosterAdmissionOutcome::Admitted {
+            outcome_binding,
+            slot,
+            binding,
+            registration_handle,
+            registration_request_id,
+            registration_terminal_slot,
+        } => {
+            let Ok(true) = outcome_binding.matches_admission(command) else {
+                return false;
+            };
+            let Ok(expected_slot) = command.admission_slot() else {
+                return false;
+            };
+            if *slot != expected_slot {
+                return false;
+            }
+            let Ok(expected_binding) = command
+                .admission()
+                .binding_key(registration_request_id.history_epoch())
+            else {
+                return false;
+            };
+            if binding.as_ref() != &expected_binding {
+                return false;
+            }
+            let Ok(registration) =
+                crate::fenced_mutation_roster_executor::BackendRegistration::from_consensus_parts(
+                    *registration_handle,
+                    *registration_request_id,
+                    command.admission(),
+                )
+            else {
+                return false;
+            };
+            let (checked_handle, checked_request_id, checked_terminal_slot) =
+                registration.consensus_parts();
+            checked_handle == *registration_handle
+                && checked_request_id == *registration_request_id
+                && *checked_terminal_slot.as_bytes() == *registration_terminal_slot
+        }
+        ConsensusRosterAdmissionOutcome::Rejected {
+            outcome_binding,
+            rejection,
+        } => {
+            outcome_binding.matches_admission(command) == Ok(true)
+                && roster_rejection_is_typed(*rejection)
+        }
+        ConsensusRosterAdmissionOutcome::Replayed { outcome_binding } => {
+            outcome_binding.matches_admission(command) == Ok(true)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RosterAdmissionIngressDisposition {
     Fresh,
@@ -9374,9 +9865,96 @@ fn roster_terminal_outcome_matches_command(
     command: &ConsensusRosterTerminalCommand,
     outcome: &ConsensusRosterTerminalOutcome,
 ) -> bool {
-    if validate_roster_terminal_command(command, None).is_err() {
+    if validate_roster_terminal_command(command, None, ProtectedRosterProfileVersion::V1).is_err() {
         return false;
     }
+    roster_terminal_outcome_matches_command_unchecked(command, outcome)
+}
+
+/// See [`roster_admission_v2_outcome_matches_command`].  Terminal evidence
+/// is likewise profile-sealed before its common compact result shape is
+/// examined, so an outcome in one wire lane cannot satisfy the other lane.
+fn roster_terminal_v2_outcome_matches_command(
+    command: &ConsensusRosterTerminalCommandV2,
+    outcome: &ConsensusRosterTerminalOutcome,
+) -> bool {
+    if validate_roster_terminal_v2_command(command, None).is_err() {
+        return false;
+    }
+    let Ok(expected_slot) = command.terminal_slot() else {
+        return false;
+    };
+    match outcome {
+        ConsensusRosterTerminalOutcome::Committed {
+            outcome_binding,
+            slot,
+            ..
+        } => {
+            let Ok(expected_body_commitment) =
+                crate::fenced_mutation_roster::TerminalRecord::canonical_body_commitment(
+                    command.record_bytes(),
+                )
+            else {
+                return false;
+            };
+            outcome_binding.matches_terminal_v2(command) == Ok(true)
+                && *slot == expected_slot
+                && outcome.committed_bytes().is_some_and(|committed| {
+                    crate::fenced_mutation_roster_executor::CommittedTerminal::canonical_terminal_body_commitment(
+                        committed,
+                    ) == Ok(expected_body_commitment)
+                })
+        }
+        // Profile V2 does not use the frozen V1 compacted-terminal carrier.
+        // A compacted result could otherwise make a V1 retention artifact
+        // look like an authenticated V2 terminal result.
+        ConsensusRosterTerminalOutcome::Compacted { .. } => false,
+        ConsensusRosterTerminalOutcome::CompactedV2 {
+            outcome_binding,
+            slot,
+            ..
+        } => {
+            let Ok(expected_terminal_body_commitment) =
+                crate::fenced_mutation_roster::TerminalRecord::canonical_body_commitment(
+                    command.record_bytes(),
+                )
+            else {
+                return false;
+            };
+            let Ok(terminal_evidence) = command.terminal_evidence() else {
+                return false;
+            };
+            let Ok(Some((history_epoch, tombstone))) = outcome.compacted_v2_parts() else {
+                return false;
+            };
+            outcome_binding.matches_terminal_v2(command) == Ok(true)
+                && *slot == expected_slot
+                && history_epoch == command.binding().history_epoch()
+                && tombstone.validate_binding_for_profile(
+                    crate::fenced_mutation_roster::Profile::v2(),
+                    command.binding(),
+                ) == Ok(())
+                && tombstone
+                    .validate_profile_v2_compact_terminal_evidence(&terminal_evidence)
+                    .is_ok()
+                && tombstone.terminal_body_commitment() == expected_terminal_body_commitment
+                && tombstone.admission_body_commitment()
+                    == terminal_evidence.provenance().input().admission_commitment
+        }
+        ConsensusRosterTerminalOutcome::Rejected {
+            outcome_binding,
+            rejection,
+        } => {
+            outcome_binding.matches_terminal_v2(command) == Ok(true)
+                && roster_rejection_is_typed(*rejection)
+        }
+    }
+}
+
+fn roster_terminal_outcome_matches_command_unchecked(
+    command: &ConsensusRosterTerminalCommand,
+    outcome: &ConsensusRosterTerminalOutcome,
+) -> bool {
     let Ok(expected_slot) = command.terminal_slot() else {
         return false;
     };
@@ -9434,6 +10012,7 @@ fn roster_terminal_outcome_matches_command(
                     )
                     .is_ok()
         }
+        ConsensusRosterTerminalOutcome::CompactedV2 { .. } => false,
         ConsensusRosterTerminalOutcome::Rejected {
             outcome_binding,
             rejection,
@@ -9457,7 +10036,8 @@ fn roster_rejection_is_typed(rejection: ConsensusRosterRejection) -> bool {
         | ConsensusRosterRejection::InvalidProtectedCheckpoint
         | ConsensusRosterRejection::AggregateBytesFull
         | ConsensusRosterRejection::LiveFull
-        | ConsensusRosterRejection::HistoryFull => true,
+        | ConsensusRosterRejection::HistoryFull
+        | ConsensusRosterRejection::RecordAlreadyExists => true,
     }
 }
 
@@ -9723,9 +10303,13 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         | SessionMutationIntent::ActivateFencedTransition { .. }
         | SessionMutationIntent::PreflightFencedTransitionCapability
         | SessionMutationIntent::PreflightProtectedRosterProfile
+        | SessionMutationIntent::PreflightProtectedRosterProfileV2
         | SessionMutationIntent::ActivateFencedTransitionCapability { .. }
+        | SessionMutationIntent::ActivateProtectedRosterProfileV2 { .. }
         | SessionMutationIntent::RosterAdmission(_)
         | SessionMutationIntent::RosterTerminal(_)
+        | SessionMutationIntent::RosterAdmissionV2(_)
+        | SessionMutationIntent::RosterTerminalV2(_)
         | SessionMutationIntent::Authorized { .. } => false,
         SessionMutationIntent::MaintainFencedTransitionV2History { .. } => {
             matches!(
@@ -9834,11 +10418,23 @@ fn validate_consensus_command_preproposal(
         }
     }
     match intent {
-        SessionMutationIntent::RosterAdmission(roster) => {
-            validate_roster_admission_command(roster, Some(command.request_id))?
-        }
-        SessionMutationIntent::RosterTerminal(roster) => {
-            validate_roster_terminal_command(roster, Some(command.request_id))?
+        SessionMutationIntent::RosterAdmission(roster) => validate_roster_admission_command(
+            roster,
+            Some(command.request_id),
+            ProtectedRosterProfileVersion::V1,
+        )?,
+        SessionMutationIntent::RosterTerminal(roster) => validate_roster_terminal_command(
+            roster,
+            Some(command.request_id),
+            ProtectedRosterProfileVersion::V1,
+        )?,
+        SessionMutationIntent::RosterAdmissionV2(roster) => validate_roster_admission_command(
+            roster,
+            Some(command.request_id),
+            ProtectedRosterProfileVersion::V2,
+        )?,
+        SessionMutationIntent::RosterTerminalV2(roster) => {
+            validate_roster_terminal_v2_command(roster, Some(command.request_id))?
         }
         _ => {}
     }
@@ -9923,10 +10519,16 @@ fn validate_consensus_intent_with_recovery(
     }
     match intent {
         SessionMutationIntent::RosterAdmission(command) => {
-            validate_roster_admission_command(command, None)?
+            validate_roster_admission_command(command, None, ProtectedRosterProfileVersion::V1)?
         }
         SessionMutationIntent::RosterTerminal(command) => {
-            validate_roster_terminal_command(command, None)?
+            validate_roster_terminal_command(command, None, ProtectedRosterProfileVersion::V1)?
+        }
+        SessionMutationIntent::RosterAdmissionV2(command) => {
+            validate_roster_admission_command(command, None, ProtectedRosterProfileVersion::V2)?
+        }
+        SessionMutationIntent::RosterTerminalV2(command) => {
+            validate_roster_terminal_v2_command(command, None)?
         }
         _ => {}
     }
@@ -9936,6 +10538,7 @@ fn validate_consensus_intent_with_recovery(
 fn validate_roster_admission_command(
     command: &ConsensusRosterAdmissionCommand,
     expected_request_id: Option<SessionConsensusRequestId>,
+    profile: ProtectedRosterProfileVersion,
 ) -> Result<(), StoreError> {
     let request_id = command.request_id()?;
     if expected_request_id.is_some_and(|expected| expected != request_id) {
@@ -9945,10 +10548,28 @@ fn validate_roster_admission_command(
     }
     let _slot = command.admission_slot()?;
     let _payload_digest = command.immutable_payload_digest()?;
-    let ingress = command.ingress_attestation()?;
-    let _provenance = command.admission_provenance()?;
-    if command.ingress_request_id() == [0; 16]
-        || ingress.request_id() != command.ingress_request_id()
+    let expected_profile = match profile {
+        ProtectedRosterProfileVersion::V1 => crate::fenced_mutation_roster::Profile::v1(),
+        ProtectedRosterProfileVersion::V2 => crate::fenced_mutation_roster::Profile::v2(),
+    };
+    if command.admission().profile() != expected_profile {
+        return Err(StoreError::InvalidKey(
+            "roster_admission_profile_mismatch".into(),
+        ));
+    }
+    let ingress_request_id = match profile {
+        ProtectedRosterProfileVersion::V1 => {
+            let ingress = command.ingress_attestation()?;
+            let _provenance = command.admission_provenance()?;
+            ingress.request_id()
+        }
+        ProtectedRosterProfileVersion::V2 => {
+            let ingress = command.ingress_attestation_v2()?;
+            let _provenance = command.admission_provenance_v2()?;
+            ingress.request_id()
+        }
+    };
+    if command.ingress_request_id() == [0; 16] || ingress_request_id != command.ingress_request_id()
     {
         return Err(StoreError::InvalidKey(
             "roster_admission_ingress_request_id_mismatch".into(),
@@ -9960,6 +10581,7 @@ fn validate_roster_admission_command(
 fn validate_roster_terminal_command(
     command: &ConsensusRosterTerminalCommand,
     expected_request_id: Option<SessionConsensusRequestId>,
+    profile: ProtectedRosterProfileVersion,
 ) -> Result<(), StoreError> {
     let request_id = command.request_id()?;
     if expected_request_id.is_some_and(|expected| expected != request_id) {
@@ -9982,14 +10604,67 @@ fn validate_roster_terminal_command(
         command.record_bytes(),
     )
     .map_err(|_| StoreError::InvalidKey("roster_terminal_record_invalid".into()))?;
-    command.proof_bundle()?;
-    command.terminal_evidence()?;
+    let ingress_request_id = match profile {
+        ProtectedRosterProfileVersion::V1 => {
+            command.proof_bundle()?;
+            command.terminal_evidence()?;
+            command.ingress_attestation()?.request_id()
+        }
+        // The V1 terminal carrier is intentionally unable to consume V2
+        // evidence. Profile V2 uses `ConsensusRosterTerminalCommandV2`.
+        ProtectedRosterProfileVersion::V2 => {
+            return Err(StoreError::InvalidKey(
+                "roster_terminal_profile_mismatch".into(),
+            ));
+        }
+    };
+    if command.ingress_request_id() == [0; 16] || ingress_request_id != command.ingress_request_id()
+    {
+        return Err(StoreError::InvalidKey(
+            "roster_terminal_ingress_request_id_mismatch".into(),
+        ));
+    }
+    let _outcome_binding = command.outcome_binding()?;
+    Ok(())
+}
+
+/// Validate only the separately framed Profile V2 terminal command.  Keeping
+/// this distinct from V1 is security relevant: the two Postcard payloads are
+/// structurally similar, so a decoder fallback would make carrier selection
+/// depend on probe order rather than the append-only outer intent tag.
+fn validate_roster_terminal_v2_command(
+    command: &ConsensusRosterTerminalCommandV2,
+    expected_request_id: Option<SessionConsensusRequestId>,
+) -> Result<(), StoreError> {
+    let request_id = command.request_id()?;
+    if expected_request_id.is_some_and(|expected| expected != request_id) {
+        return Err(StoreError::InvalidKey(
+            "roster_terminal_v2_request_id_mismatch".into(),
+        ));
+    }
+    let (registration_handle, registration_request_id, registration_terminal_slot) =
+        command.registration_parts();
+    if registration_handle == [0; 32]
+        || registration_terminal_slot == [0; 32]
+        || registration_request_id.history_epoch() != command.binding().history_epoch()
+        || command.terminal_slot()? != registration_terminal_slot
+    {
+        return Err(StoreError::InvalidKey(
+            "roster_terminal_v2_registration_mismatch".into(),
+        ));
+    }
+    crate::fenced_mutation_roster::TerminalRecord::canonical_body_commitment(
+        command.record_bytes(),
+    )
+    .map_err(|_| StoreError::InvalidKey("roster_terminal_v2_record_invalid".into()))?;
+    let _proof_bundle = command.proof_bundle()?;
+    let _terminal_evidence = command.terminal_evidence()?;
     let ingress = command.ingress_attestation()?;
     if command.ingress_request_id() == [0; 16]
         || ingress.request_id() != command.ingress_request_id()
     {
         return Err(StoreError::InvalidKey(
-            "roster_terminal_ingress_request_id_mismatch".into(),
+            "roster_terminal_v2_ingress_request_id_mismatch".into(),
         ));
     }
     let _outcome_binding = command.outcome_binding()?;
@@ -10203,6 +10878,16 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                         self.store.local_fenced_transition_capability(),
                     ));
                 }
+                if let Ok(probe) =
+                    decode_bounded::<ProtectedRosterProfileV2CapabilityProbe>(&request.payload)
+                {
+                    return encode_service_reply(
+                        &protected_roster_profile_v2_capability_probe_reply(
+                            probe,
+                            self.store.local_fenced_transition_capability(),
+                        ),
+                    );
+                }
                 let probe =
                     match decode_bounded::<FencedTransitionV2CapabilityProbe>(&request.payload) {
                         Ok(probe) => probe,
@@ -10250,10 +10935,26 @@ fn protocol_rejection() -> SessionConsensusWireResponse {
 }
 
 fn is_roster_mutation_intent(intent: &SessionMutationIntent) -> bool {
-    matches!(
-        intent,
-        SessionMutationIntent::RosterAdmission(_) | SessionMutationIntent::RosterTerminal(_)
-    )
+    roster_mutation_profile(intent).is_some()
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProtectedRosterProfileVersion {
+    V1,
+    V2,
+}
+
+fn roster_mutation_profile(
+    intent: &SessionMutationIntent,
+) -> Option<ProtectedRosterProfileVersion> {
+    match intent {
+        SessionMutationIntent::RosterAdmission(_) | SessionMutationIntent::RosterTerminal(_) => {
+            Some(ProtectedRosterProfileVersion::V1)
+        }
+        SessionMutationIntent::RosterAdmissionV2(_)
+        | SessionMutationIntent::RosterTerminalV2(_) => Some(ProtectedRosterProfileVersion::V2),
+        _ => None,
+    }
 }
 
 impl ConsensusSessionConsumerService {
@@ -10940,6 +11641,9 @@ fn session_consumer_roster_rejection(
         }
         ConsensusRosterRejection::LiveFull => SessionConsumerRosterRejection::LiveFull,
         ConsensusRosterRejection::HistoryFull => SessionConsumerRosterRejection::HistoryFull,
+        ConsensusRosterRejection::RecordAlreadyExists => {
+            SessionConsumerRosterRejection::RecordAlreadyExists
+        }
     }
 }
 
@@ -11070,6 +11774,59 @@ impl ConsensusSessionConsumerService {
                 history_epoch,
                 tombstone,
             } => encode_admission_compacted_response(scope, history_epoch, *tombstone),
+        };
+        match result {
+            Ok(capsule) => {
+                let response = SessionConsumerRosterAdmissionReadResponse::Recorded(capsule);
+                if recovery {
+                    SessionConsumerResponse::FencedMutationRosterRecover(response)
+                } else {
+                    SessionConsumerResponse::FencedMutationRosterAdmissionStatus(response)
+                }
+            }
+            Err(_) => roster_admission_read_rejected(
+                recovery,
+                SessionConsumerRosterRejection::Unavailable,
+            ),
+        }
+    }
+
+    fn roster_read_response_v2(
+        &self,
+        scope: SessionConsumerScope,
+        read: crate::sqlite::consensus::ProtectedRosterV2ReadResult,
+        recovery: bool,
+    ) -> SessionConsumerResponse {
+        use crate::sqlite::consensus::ProtectedRosterV2ReadResult;
+
+        let result = match read {
+            ProtectedRosterV2ReadResult::Missing => {
+                return roster_admission_read_rejected(
+                    recovery,
+                    SessionConsumerRosterRejection::RecoveryRequired,
+                );
+            }
+            ProtectedRosterV2ReadResult::Admitted(live) => {
+                encode_admission_poll_admitted_response_v2(
+                    scope,
+                    live.registration,
+                    &live.admission,
+                    &live.admission_provenance,
+                )
+            }
+            ProtectedRosterV2ReadResult::Terminalized(terminal) => {
+                encode_admission_terminal_response_v2(
+                    scope,
+                    terminal.registration,
+                    &terminal.admission,
+                    &terminal.committed,
+                    &terminal.admission_provenance,
+                )
+            }
+            ProtectedRosterV2ReadResult::Compacted {
+                history_epoch,
+                tombstone,
+            } => encode_admission_compacted_response_v2(scope, history_epoch, &tombstone),
         };
         match result {
             Ok(capsule) => {
@@ -11267,6 +12024,186 @@ impl ConsensusSessionConsumerService {
                                     scope,
                                     history_epoch,
                                     tombstone,
+                                ) {
+                                    Ok(capsule) => {
+                                        SessionConsumerResponse::FencedMutationRosterTerminalize(
+                                            SessionConsumerRosterTerminalMutationResponse::Recorded(
+                                                capsule,
+                                            ),
+                                        )
+                                    }
+                                    Err(_) => {
+                                        SessionConsumerResponse::FencedMutationRosterTerminalize(
+                                            SessionConsumerRosterTerminalMutationResponse::OutcomeUnknown,
+                                        )
+                                    }
+                                }
+                            }
+                            _ => SessionConsumerResponse::FencedMutationRosterTerminalize(
+                                SessionConsumerRosterTerminalMutationResponse::OutcomeUnknown,
+                            ),
+                        }
+                    }
+                    // A profile-V2 retention projection is deliberately not
+                    // decodable on the frozen OPCRPU1 response lane.
+                    ConsensusRosterTerminalOutcome::CompactedV2 { .. } => {
+                        SessionConsumerResponse::FencedMutationRosterTerminalize(
+                            SessionConsumerRosterTerminalMutationResponse::OutcomeUnknown,
+                        )
+                    }
+                    ConsensusRosterTerminalOutcome::Rejected { rejection, .. } => {
+                        roster_terminal_mutation_rejected(session_consumer_roster_rejection(
+                            rejection,
+                        ))
+                    }
+                },
+                Ok(_) | Err(_) => SessionConsumerResponse::FencedMutationRosterTerminalize(
+                    SessionConsumerRosterTerminalMutationResponse::OutcomeUnknown,
+                ),
+            },
+            Err(StoreError::BackendOperationOutcomeUnavailable) => {
+                SessionConsumerResponse::FencedMutationRosterTerminalize(
+                    SessionConsumerRosterTerminalMutationResponse::OutcomeUnknown,
+                )
+            }
+            Err(_) => SessionConsumerResponse::FencedMutationRosterTerminalize(
+                SessionConsumerRosterTerminalMutationResponse::NotTransmitted,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn roster_terminal_mutate_v2(
+        &self,
+        scope: SessionConsumerScope,
+        ingress_request_id: crate::consumer::SessionConsumerRequestId,
+        attestation: crate::fenced_mutation_roster::RosterIngressAttestationV2,
+        decoded: crate::fenced_mutation_roster_transport::DecodedTerminalRequestV2,
+        deadline: tokio::time::Instant,
+        scope_guard: ConsumerScopeAdmission,
+    ) -> SessionConsumerResponse {
+        let binding = decoded.binding();
+        let (registration_handle, registration_request_id, registration_terminal_slot) =
+            decoded.registration_parts();
+        let authority = decoded.authority().clone();
+        let record = decoded.canonical_record().to_vec();
+        let admission_provenance = match decoded.admission_provenance() {
+            Ok(value) => value,
+            Err(_) => {
+                return roster_terminal_mutation_rejected(
+                    SessionConsumerRosterRejection::Malformed,
+                );
+            }
+        };
+        let compact_evidence = match decoded.terminal_evidence() {
+            Ok(value) => value,
+            Err(_) => {
+                return roster_terminal_mutation_rejected(
+                    SessionConsumerRosterRejection::Malformed,
+                );
+            }
+        };
+        let terminal_evidence = match crate::fenced_mutation_roster::RosterProfileV2CompactTerminalEvidenceV1::from_verified(
+            admission_provenance.clone(),
+            attestation.clone(),
+            compact_evidence,
+        ) {
+            Ok(value) => value,
+            Err(_) => return roster_terminal_mutation_rejected(SessionConsumerRosterRejection::Malformed),
+        };
+        let proof_bundle =
+            match crate::fenced_mutation_roster::RosterProfileV2ExecutorProofBundleV1::from_verified(
+                &admission_provenance,
+                &attestation,
+                terminal_evidence.clone(),
+            ) {
+                Ok(value) => value,
+                Err(_) => {
+                    return roster_terminal_mutation_rejected(
+                        SessionConsumerRosterRejection::Malformed,
+                    );
+                }
+            };
+        let command = match ConsensusRosterTerminalCommandV2::new_with_proof_bundle_evidence_and_ingress_request_id(
+            super::types::ConsensusRosterTerminalCommandInput {
+                binding,
+                registration_handle,
+                registration_request_id,
+                registration_terminal_slot,
+                authority,
+                record,
+            },
+            proof_bundle,
+            terminal_evidence,
+            *ingress_request_id.as_bytes(),
+            attestation,
+        ) {
+            Ok(value) => value,
+            Err(_) => return roster_terminal_mutation_rejected(SessionConsumerRosterRejection::Malformed),
+        };
+        let request_id = match command.request_id() {
+            Ok(value) => value,
+            Err(_) => {
+                return roster_terminal_mutation_rejected(
+                    SessionConsumerRosterRejection::Malformed,
+                );
+            }
+        };
+        drop(scope_guard);
+        #[cfg(test)]
+        ROSTER_INGRESS_TERMINAL_SUBMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
+        match self
+            .store
+            .submit_request_before(
+                request_id,
+                SessionMutationIntent::RosterTerminalV2(Box::new(command)),
+                Some(scope.consensus_identity()),
+                deadline,
+            )
+            .await
+        {
+            Ok(response) => match response.result {
+                Ok(SessionMutationOutcome::RosterTerminalV2(outcome)) => match outcome {
+                    ConsensusRosterTerminalOutcome::Committed { .. } => {
+                        let encoded = if outcome.is_replayed() {
+                            encode_terminal_replayed_bytes_response_v2(
+                                scope,
+                                outcome.committed_bytes().unwrap_or_default().to_vec(),
+                            )
+                        } else {
+                            encode_terminal_terminalized_bytes_response_v2(
+                                scope,
+                                outcome.committed_bytes().unwrap_or_default().to_vec(),
+                            )
+                        };
+                        match encoded {
+                            Ok(capsule) => {
+                                SessionConsumerResponse::FencedMutationRosterTerminalize(
+                                    SessionConsumerRosterTerminalMutationResponse::Recorded(
+                                        capsule,
+                                    ),
+                                )
+                            }
+                            Err(_) => SessionConsumerResponse::FencedMutationRosterTerminalize(
+                                SessionConsumerRosterTerminalMutationResponse::OutcomeUnknown,
+                            ),
+                        }
+                    }
+                    // The frozen V1 compacted result contains a V1
+                    // `TerminalConflictTombstone`, which cannot cross the
+                    // profile-V2 OPCRPU2 response lane.
+                    ConsensusRosterTerminalOutcome::Compacted { .. } => {
+                        SessionConsumerResponse::FencedMutationRosterTerminalize(
+                            SessionConsumerRosterTerminalMutationResponse::OutcomeUnknown,
+                        )
+                    }
+                    ConsensusRosterTerminalOutcome::CompactedV2 { .. } => {
+                        match outcome.compacted_v2_parts() {
+                            Ok(Some((history_epoch, tombstone))) => {
+                                match encode_terminal_compacted_response_v2(
+                                    scope,
+                                    history_epoch,
+                                    &tombstone,
                                 ) {
                                     Ok(capsule) => {
                                         SessionConsumerResponse::FencedMutationRosterTerminalize(
@@ -11926,6 +12863,9 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
         let (admission, authority) = decode_admission_request_for_scope(capsule, request.scope())
             .and_then(|decoded| decoded.into_register_parts())
             .map_err(|_| SessionConsumerRosterRejection::Malformed)?;
+        if admission.profile() != crate::fenced_mutation_roster::Profile::v1() {
+            return Err(SessionConsumerRosterRejection::Capability);
+        }
         authorization
             .authorize_session_key(admission.key())
             .map_err(|_| SessionConsumerRosterRejection::Authority)?;
@@ -11937,6 +12877,93 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
             certificate_subject_identity_commitment,
         )
         .map_err(|_| SessionConsumerRosterRejection::Malformed)
+    }
+
+    fn prepare_compact_admission_provenance_input_for_profile(
+        &self,
+        profile: SessionConsumerRosterTransportProfile,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: &SessionConsumerRequest,
+        attestation: &RosterIngressAttestation,
+        certificate_subject_identity_commitment: [u8; 32],
+    ) -> Result<RosterCompactAdmissionProvenanceInput, SessionConsumerRosterRejection> {
+        let SessionConsumerOperation::FencedMutationRosterPollAdmit { request: capsule } =
+            request.operation()
+        else {
+            return Err(SessionConsumerRosterRejection::Capability);
+        };
+        let expected = if profile.is_current() {
+            crate::fenced_mutation_roster::Profile::v1()
+        } else if profile.is_v2() {
+            crate::fenced_mutation_roster::Profile::v2()
+        } else {
+            return Err(SessionConsumerRosterRejection::Capability);
+        };
+        let (admission, authority) = (if profile.is_v2() {
+            decode_admission_request_for_scope_v2(capsule, request.scope())
+        } else {
+            decode_admission_request_for_scope(capsule, request.scope())
+        })
+        .and_then(|decoded| decoded.into_register_parts())
+        .map_err(|_| SessionConsumerRosterRejection::Malformed)?;
+        // This comparison intentionally precedes the legacy provenance path's
+        // current-scope read. A negotiated lane must never inspect or sign a
+        // capsule from the other profile.
+        if admission.profile() != expected {
+            return Err(SessionConsumerRosterRejection::Capability);
+        }
+        match (profile.is_current(), attestation) {
+            (true, RosterIngressAttestation::V1(attestation)) => self
+                .prepare_compact_admission_provenance_input(
+                    authorization,
+                    request,
+                    attestation,
+                    certificate_subject_identity_commitment,
+                )
+                .map(RosterCompactAdmissionProvenanceInput::V1),
+            (false, RosterIngressAttestation::V2(attestation)) => {
+                if request.validate().is_err()
+                    || validate_consumer_operation(request.operation()).is_err()
+                {
+                    return Err(SessionConsumerRosterRejection::Malformed);
+                }
+                let (operation_tag, capsule_digest) =
+                    session_consumer_roster_ingress_operation(request.operation())?;
+                let root = self
+                    .roster_expected_root()
+                    .ok_or(SessionConsumerRosterRejection::Capability)?;
+                let (configuration_identity, _) = self
+                    .store
+                    .current_scope()
+                    .map_err(|_| SessionConsumerRosterRejection::Unavailable)?;
+                let verification = RosterIngressAttestationVerificationInputV2 {
+                    configuration_identity: &configuration_identity,
+                    expected_peer_identity_commitment: session_consumer_identity_commitment(
+                        authorization.identity(),
+                    ),
+                    expected_scope: session_consumer_roster_scope_commitment(request.scope()),
+                    expected_request_id: *request.request_id().as_bytes(),
+                    expected_operation_tag: operation_tag,
+                    expected_capsule_digest: capsule_digest,
+                };
+                attestation
+                    .verify_connection_binding(&root, &verification)
+                    .map_err(|_| SessionConsumerRosterRejection::Authority)?;
+                authorization
+                    .authorize_session_key(admission.key())
+                    .map_err(|_| SessionConsumerRosterRejection::Authority)?;
+                RosterProfileV2CompactAdmissionProvenanceSigningInputV1::for_admission(
+                    configuration_identity,
+                    &admission,
+                    &authority,
+                    attestation,
+                    certificate_subject_identity_commitment,
+                )
+                .map(RosterCompactAdmissionProvenanceInput::V2)
+                .map_err(|_| SessionConsumerRosterRejection::Malformed)
+            }
+            _ => Err(SessionConsumerRosterRejection::Capability),
+        }
     }
 
     async fn execute_roster_ingress(
@@ -12028,9 +13055,9 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                             return admission_response(SessionConsumerRosterRejection::Malformed);
                         }
                     };
-                let admission_provenance = admission_provenance
-                    .as_ref()
-                    .expect("admission provenance presence checked before dispatch");
+                let Some(admission_provenance) = admission_provenance.as_ref() else {
+                    return admission_response(SessionConsumerRosterRejection::Malformed);
+                };
                 if authorization
                     .authorize_session_key(admission.key())
                     .is_err()
@@ -12521,6 +13548,651 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                         .is_err()
                 {
                     return current_authority_response();
+                }
+                SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
+                    SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current,
+                )
+            }
+            _ => SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized),
+        }
+    }
+
+    async fn execute_roster_ingress_for_profile(
+        &self,
+        profile: SessionConsumerRosterTransportProfile,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: SessionConsumerRequest,
+        attestation: RosterIngressAttestation,
+        admission_provenance: Option<RosterCompactAdmissionProvenance>,
+    ) -> SessionConsumerResponse {
+        let expected = if profile.is_current() {
+            crate::fenced_mutation_roster::Profile::v1()
+        } else if profile.is_v2() {
+            crate::fenced_mutation_roster::Profile::v2()
+        } else {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
+        };
+
+        // The negotiated lane and the sealed ingress envelope must agree
+        // before capsule decoding, scope admission, a barrier, a backend
+        // lookup, or a proposal. A V2 signature can therefore never be
+        // relabelled as V1 (or conversely) to reach the other namespace.
+        if attestation.profile() != expected {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
+        }
+
+        // Every operation that carries an admission must be checked here,
+        // not only PollAdmit. AdmissionStatus is otherwise a pre-barrier
+        // read route through the V1 backend for an opposite-profile body.
+        match request.operation() {
+            SessionConsumerOperation::FencedMutationRosterPollAdmit { request: capsule }
+            | SessionConsumerOperation::FencedMutationRosterAdmissionStatus { request: capsule } => {
+                let admission = (if profile.is_v2() {
+                    decode_admission_request_for_scope_v2(capsule, request.scope())
+                } else {
+                    decode_admission_request_for_scope(capsule, request.scope())
+                })
+                .and_then(|decoded| decoded.into_register_parts())
+                .map(|(admission, _)| admission);
+                if !matches!(admission, Ok(admission) if admission.profile() == expected) {
+                    return SessionConsumerResponse::Rejected(
+                        SessionConsumerRejection::MalformedRequest,
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        if profile.is_current() {
+            let RosterIngressAttestation::V1(attestation) = attestation else {
+                return SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::MalformedRequest,
+                );
+            };
+            let admission_provenance = match admission_provenance {
+                Some(RosterCompactAdmissionProvenance::V1(provenance)) => Some(provenance),
+                None => None,
+                Some(RosterCompactAdmissionProvenance::V2(_)) => {
+                    return SessionConsumerResponse::Rejected(
+                        SessionConsumerRejection::MalformedRequest,
+                    );
+                }
+            };
+            return self
+                .execute_roster_ingress(authorization, request, attestation, admission_provenance)
+                .await;
+        }
+
+        let RosterIngressAttestation::V2(attestation) = attestation else {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
+        };
+
+        // Authenticate the sealed `/4` ingress before even the activation
+        // read.  This preserves the lane boundary for every operation,
+        // including terminal/recovery bodies that carry no Profile field.
+        if request.validate().is_err() || validate_consumer_operation(request.operation()).is_err()
+        {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
+        }
+        let (operation_tag, capsule_digest) =
+            match session_consumer_roster_ingress_operation(request.operation()) {
+                Ok(values) => values,
+                Err(_) => {
+                    return SessionConsumerResponse::Rejected(
+                        SessionConsumerRejection::MalformedRequest,
+                    );
+                }
+            };
+        let Some(root) = self.roster_expected_root() else {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
+        };
+        let (configuration_identity, _) = match self.store.current_scope() {
+            Ok(scope) => scope,
+            Err(_) => {
+                return SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::MalformedRequest,
+                );
+            }
+        };
+        let verification = RosterIngressAttestationVerificationInputV2 {
+            configuration_identity: &configuration_identity,
+            expected_peer_identity_commitment: session_consumer_identity_commitment(
+                authorization.identity(),
+            ),
+            expected_scope: session_consumer_roster_scope_commitment(request.scope()),
+            expected_request_id: *request.request_id().as_bytes(),
+            expected_operation_tag: operation_tag,
+            expected_capsule_digest: capsule_digest,
+        };
+        if attestation
+            .verify_connection_binding(&root, &verification)
+            .is_err()
+        {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
+        }
+
+        if matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedMutationRosterPollAdmit { .. }
+        ) != admission_provenance.is_some()
+        {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
+        }
+        let v2_provenance = match admission_provenance {
+            Some(RosterCompactAdmissionProvenance::V2(provenance)) => Some(provenance),
+            None => None,
+            Some(RosterCompactAdmissionProvenance::V1(_)) => {
+                return SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::MalformedRequest,
+                );
+            }
+        };
+        if let Some(provenance) = v2_provenance.as_ref() {
+            let SessionConsumerOperation::FencedMutationRosterPollAdmit { request: capsule } =
+                request.operation()
+            else {
+                return SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::MalformedRequest,
+                );
+            };
+            let (admission, authority) =
+                match decode_admission_request_for_scope_v2(capsule, request.scope())
+                    .and_then(|decoded| decoded.into_register_parts())
+                {
+                    Ok(parts) => parts,
+                    Err(_) => {
+                        return SessionConsumerResponse::Rejected(
+                            SessionConsumerRejection::MalformedRequest,
+                        );
+                    }
+                };
+            if authorization
+                .authorize_session_key(admission.key())
+                .is_err()
+                || provenance
+                    .verify_for(
+                        &root,
+                        configuration_identity,
+                        &admission,
+                        &authority,
+                        &attestation,
+                    )
+                    .is_err()
+            {
+                return SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::MalformedRequest,
+                );
+            }
+        }
+
+        let deadline = match self.operation_deadline() {
+            Ok(deadline) => deadline,
+            Err(_) => {
+                return SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::MalformedRequest,
+                );
+            }
+        };
+        if self
+            .store
+            .require_protected_roster_profile_v2_activation_before(deadline)
+            .await
+            .is_err()
+        {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
+        }
+        let operation = request.operation().clone();
+        let ingress_kind = match &operation {
+            SessionConsumerOperation::FencedMutationRosterPollAdmit { .. } => 1_u8,
+            SessionConsumerOperation::FencedMutationRosterAdmissionStatus { .. } => 2,
+            SessionConsumerOperation::FencedMutationRosterRecover { .. } => 3,
+            SessionConsumerOperation::FencedMutationRosterTerminalize { .. } => 4,
+            SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. } => 5,
+            SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
+                ..
+            } => 6,
+            _ => 0,
+        };
+        let reject = |rejection| match ingress_kind {
+            1 => roster_admission_mutation_rejected(rejection),
+            2 => roster_admission_read_rejected(false, rejection),
+            3 => roster_admission_read_rejected(true, rejection),
+            4 => roster_terminal_mutation_rejected(rejection),
+            5 => roster_terminal_read_rejected(rejection),
+            6 => roster_current_publication_authority_rejected(),
+            _ => SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized),
+        };
+        match operation {
+            SessionConsumerOperation::FencedMutationRosterPollAdmit { request: capsule } => {
+                let (admission, authority) =
+                    match decode_admission_request_for_scope_v2(&capsule, request.scope())
+                        .and_then(|decoded| decoded.into_register_parts())
+                    {
+                        Ok(parts)
+                            if parts.0.profile()
+                                == crate::fenced_mutation_roster::Profile::v2() =>
+                        {
+                            parts
+                        }
+                        _ => return reject(SessionConsumerRosterRejection::Malformed),
+                    };
+                let Some(provenance) = v2_provenance else {
+                    return reject(SessionConsumerRosterRejection::Malformed);
+                };
+                if authorization
+                    .authorize_session_key(admission.key())
+                    .is_err()
+                {
+                    return reject(SessionConsumerRosterRejection::Authority);
+                }
+                let guard = match self
+                    .store
+                    .admit_consumer_scope(request.scope(), deadline)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Authority),
+                };
+                drop(guard);
+                let command = match ConsensusRosterAdmissionCommand::new_with_provenance_and_ingress_request_id_v2(
+                    admission.clone(), authority, *request.request_id().as_bytes(), attestation, provenance.clone(),
+                ) {
+                    Ok(command) => command,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
+                };
+                let consensus_request_id = match command.request_id() {
+                    Ok(request_id) => request_id,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
+                };
+                #[cfg(test)]
+                ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
+                match self
+                    .store
+                    .submit_request_before(
+                        consensus_request_id,
+                        SessionMutationIntent::RosterAdmissionV2(Box::new(command)),
+                        Some(request.scope().consensus_identity()),
+                        deadline,
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        match response.result {
+                            Ok(SessionMutationOutcome::RosterAdmissionV2(
+                                ConsensusRosterAdmissionOutcome::Admitted {
+                                    registration_handle,
+                                    registration_request_id,
+                                    ..
+                                },
+                            )) => {
+                                let capsule = match roster_admission_ingress_disposition(registration_request_id.history_epoch(), response.raft_log_index) {
+                                Ok(RosterAdmissionIngressDisposition::Fresh) => crate::fenced_mutation_roster_executor::BackendRegistration::from_consensus_parts(
+                                    registration_handle, registration_request_id, &admission,
+                                ).map_err(|_| ()).and_then(|registration| {
+                                    encode_admission_fresh_response_v2(request.scope(), registration, &provenance).map_err(|_| ())
+                                }),
+                                Ok(RosterAdmissionIngressDisposition::Replayed) => encode_admission_replayed_response_v2(request.scope()).map_err(|_| ()),
+                                Err(()) => Err(()),
+                            };
+                                match capsule {
+                                Ok(capsule) => SessionConsumerResponse::FencedMutationRosterPollAdmit(SessionConsumerRosterAdmissionMutationResponse::Recorded(capsule)),
+                                Err(()) => SessionConsumerResponse::FencedMutationRosterPollAdmit(SessionConsumerRosterAdmissionMutationResponse::OutcomeUnknown),
+                            }
+                            }
+                            Ok(SessionMutationOutcome::RosterAdmissionV2(
+                                ConsensusRosterAdmissionOutcome::Replayed { .. },
+                            )) => match encode_admission_replayed_response_v2(request.scope()) {
+                                Ok(capsule) => {
+                                    SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                                        SessionConsumerRosterAdmissionMutationResponse::Recorded(
+                                            capsule,
+                                        ),
+                                    )
+                                }
+                                Err(_) => SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                                    SessionConsumerRosterAdmissionMutationResponse::OutcomeUnknown,
+                                ),
+                            },
+                            Ok(SessionMutationOutcome::RosterAdmissionV2(
+                                ConsensusRosterAdmissionOutcome::Rejected { rejection, .. },
+                            )) => reject(session_consumer_roster_rejection(rejection)),
+                            Ok(_) | Err(_) => {
+                                SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                                    SessionConsumerRosterAdmissionMutationResponse::OutcomeUnknown,
+                                )
+                            }
+                        }
+                    }
+                    Err(StoreError::BackendOperationOutcomeUnavailable) => {
+                        SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                            SessionConsumerRosterAdmissionMutationResponse::OutcomeUnknown,
+                        )
+                    }
+                    Err(_) => SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                        SessionConsumerRosterAdmissionMutationResponse::NotTransmitted,
+                    ),
+                }
+            }
+            SessionConsumerOperation::FencedMutationRosterAdmissionStatus { request: capsule }
+            | SessionConsumerOperation::FencedMutationRosterRecover { request: capsule } => {
+                let recovery = ingress_kind == 3;
+                let decoded = match decode_admission_request_for_scope_v2(&capsule, request.scope())
+                {
+                    Ok(decoded) => decoded,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
+                };
+                let initial_guard = match self
+                    .store
+                    .admit_consumer_scope(request.scope(), deadline)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Authority),
+                };
+                drop(initial_guard);
+                if let Err(error) = self.store.linearizable_barrier_before(deadline).await {
+                    return reject(match error {
+                        LinearizableBarrierFailure::RecoveryRequired => {
+                            SessionConsumerRosterRejection::RecoveryRequired
+                        }
+                        _ => SessionConsumerRosterRejection::Unavailable,
+                    });
+                }
+                let _guard = match self
+                    .store
+                    .admit_consumer_scope(request.scope(), deadline)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Authority),
+                };
+                let floor = self.store.inner.clock.now_utc();
+                let result = if recovery {
+                    match decoded.into_recovery() {
+                        Ok(recovery_request) => {
+                            if authorization
+                                .authorize_session_key(recovery_request.authority().key())
+                                .is_err()
+                            {
+                                return reject(SessionConsumerRosterRejection::Authority);
+                            }
+                            self.store
+                                .inner
+                                .backend
+                                .consensus_protected_roster_v2_recovery(
+                                    self.store.inner.storage_identity,
+                                    recovery_request,
+                                    floor,
+                                )
+                                .await
+                        }
+                        Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
+                    }
+                } else {
+                    match decoded.into_register_parts() {
+                        Ok((admission, authority)) => {
+                            if admission.profile() != crate::fenced_mutation_roster::Profile::v2() {
+                                return reject(SessionConsumerRosterRejection::Malformed);
+                            }
+                            if authorization
+                                .authorize_session_key(admission.key())
+                                .is_err()
+                            {
+                                return reject(SessionConsumerRosterRejection::Authority);
+                            }
+                            self.store
+                                .inner
+                                .backend
+                                .consensus_protected_roster_v2_admission_status(
+                                    self.store.inner.storage_identity,
+                                    admission,
+                                    authority,
+                                    floor,
+                                )
+                                .await
+                        }
+                        Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
+                    }
+                };
+                let (read, authority_time) = match result {
+                    Ok(value) => value,
+                    Err(error) => return reject(roster_store_rejection(&error)),
+                };
+                if attestation
+                    .verify(&root, &verification, authority_time)
+                    .is_err()
+                    || self
+                        .store
+                        .require_application_traffic_authority_before(deadline)
+                        .await
+                        .is_err()
+                {
+                    return reject(SessionConsumerRosterRejection::Authority);
+                }
+                self.roster_read_response_v2(request.scope(), read, recovery)
+            }
+            SessionConsumerOperation::FencedMutationRosterTerminalize { request: capsule }
+            | SessionConsumerOperation::FencedMutationRosterTerminalStatus { request: capsule } => {
+                let terminalize = ingress_kind == 4;
+                let decoded = match decode_terminal_request_for_scope_v2(&capsule, request.scope())
+                {
+                    Ok(decoded) => decoded,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
+                };
+                if authorization
+                    .authorize_session_key(decoded.authority().key())
+                    .is_err()
+                {
+                    return reject(SessionConsumerRosterRejection::Authority);
+                }
+                let initial_guard = match self
+                    .store
+                    .admit_consumer_scope(request.scope(), deadline)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Authority),
+                };
+                if terminalize {
+                    let authority_time = match self.roster_read_time().await {
+                        Ok(time) => time,
+                        Err(value) => return reject(value),
+                    };
+                    if attestation
+                        .verify(&root, &verification, authority_time)
+                        .is_err()
+                    {
+                        return reject(SessionConsumerRosterRejection::Authority);
+                    }
+                    return self
+                        .roster_terminal_mutate_v2(
+                            request.scope(),
+                            request.request_id(),
+                            attestation,
+                            decoded,
+                            deadline,
+                            initial_guard,
+                        )
+                        .await;
+                }
+                drop(initial_guard);
+                #[cfg(any(test, feature = "test-control"))]
+                self.store
+                    .inner
+                    .diagnostics
+                    .protected_roster_v2_terminal_status_barrier_entered
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Err(error) = self.store.linearizable_barrier_before(deadline).await {
+                    return reject(match error {
+                        LinearizableBarrierFailure::RecoveryRequired => {
+                            SessionConsumerRosterRejection::RecoveryRequired
+                        }
+                        _ => SessionConsumerRosterRejection::Unavailable,
+                    });
+                }
+                let _post_barrier_guard = match self
+                    .store
+                    .admit_consumer_scope(request.scope(), deadline)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Authority),
+                };
+                let binding = decoded.binding();
+                let registration = decoded.registration_parts();
+                let authority = decoded.authority().clone();
+                let commitment = match decoded.terminal_body_commitment() {
+                    Ok(value) => value,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
+                };
+                let admission_provenance = match decoded.admission_provenance() {
+                    Ok(value) => value,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
+                };
+                let compact_evidence = match decoded.terminal_evidence() {
+                    Ok(value) => value,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
+                };
+                let evidence = match crate::fenced_mutation_roster::RosterProfileV2CompactTerminalEvidenceV1::from_verified(
+                    admission_provenance,
+                    attestation.clone(),
+                    compact_evidence,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
+                };
+                #[cfg(any(test, feature = "test-control"))]
+                self.store
+                    .inner
+                    .diagnostics
+                    .protected_roster_v2_terminal_status_backend_entered
+                    .fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                ROSTER_INGRESS_TERMINAL_STATUS_READ_COUNT.fetch_add(1, Ordering::Relaxed);
+                let (read, authority_time) = match self
+                    .store
+                    .inner
+                    .backend
+                    .consensus_protected_roster_v2_terminal_status(
+                        self.store.inner.storage_identity,
+                        binding,
+                        registration,
+                        authority,
+                        commitment,
+                        evidence,
+                        self.store.inner.clock.now_utc(),
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        #[cfg(any(test, feature = "test-control"))]
+                        {
+                            let diagnostics = &self.store.inner.diagnostics;
+                            diagnostics
+                                .protected_roster_v2_terminal_status_backend_error
+                                .fetch_add(1, Ordering::Relaxed);
+                            match &error {
+                                StoreError::InvalidKey(_) => diagnostics
+                                    .protected_roster_v2_terminal_status_backend_invalid_key
+                                    .fetch_add(1, Ordering::Relaxed),
+                                StoreError::BackendUnavailable(_) => diagnostics
+                                    .protected_roster_v2_terminal_status_backend_unavailable
+                                    .fetch_add(1, Ordering::Relaxed),
+                                _ => diagnostics
+                                    .protected_roster_v2_terminal_status_backend_other
+                                    .fetch_add(1, Ordering::Relaxed),
+                            };
+                        }
+                        return reject(roster_store_rejection(&error));
+                    }
+                };
+                if attestation
+                    .verify(&root, &verification, authority_time)
+                    .is_err()
+                    || self
+                        .store
+                        .require_application_traffic_authority_before(deadline)
+                        .await
+                        .is_err()
+                {
+                    return reject(SessionConsumerRosterRejection::Authority);
+                }
+                // V2's status response has the same externally retained terminal bytes,
+                // but its backend selection and evidence are profile-isolated.
+                match read {
+                    crate::sqlite::consensus::ProtectedRosterV2ReadResult::Missing => reject(SessionConsumerRosterRejection::RecoveryRequired),
+                    crate::sqlite::consensus::ProtectedRosterV2ReadResult::Admitted(live) => match decoded.into_terminal_request(&live.admission).and_then(|_| encode_terminal_admitted_response_v2(request.scope()).map_err(|_| crate::fenced_mutation_roster_transport::ProtectedRosterTransportError)) {
+                        Ok(capsule) => SessionConsumerResponse::FencedMutationRosterTerminalStatus(SessionConsumerRosterTerminalReadResponse::Recorded(capsule)),
+                        Err(_) => reject(SessionConsumerRosterRejection::Malformed),
+                    },
+                    crate::sqlite::consensus::ProtectedRosterV2ReadResult::Terminalized(terminal) => match decoded.into_terminal_request(&terminal.admission).and_then(|_| encode_terminal_terminalized_validated_bytes_response_v2(request.scope(), &terminal.admission, terminal.committed_canonical).map_err(|_| crate::fenced_mutation_roster_transport::ProtectedRosterTransportError)) {
+                        Ok(capsule) => SessionConsumerResponse::FencedMutationRosterTerminalStatus(SessionConsumerRosterTerminalReadResponse::Recorded(capsule)),
+                        Err(_) => reject(SessionConsumerRosterRejection::Malformed),
+                    },
+                    crate::sqlite::consensus::ProtectedRosterV2ReadResult::Compacted { history_epoch, tombstone } => match encode_terminal_compacted_response_v2(request.scope(), history_epoch, &tombstone) {
+                        Ok(capsule) => SessionConsumerResponse::FencedMutationRosterTerminalStatus(SessionConsumerRosterTerminalReadResponse::Recorded(capsule)),
+                        Err(_) => reject(SessionConsumerRosterRejection::Malformed),
+                    },
+                }
+            }
+            SessionConsumerOperation::FencedMutationRosterCurrentPublicationAuthority {
+                request: capsule,
+            } => {
+                if capsule.scope() != session_consumer_roster_scope_commitment(request.scope())
+                    || authorization.authorize_session_key(capsule.key()).is_err()
+                {
+                    return reject(SessionConsumerRosterRejection::Authority);
+                }
+                let guard = match self
+                    .store
+                    .admit_consumer_scope(request.scope(), deadline)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Authority),
+                };
+                drop(guard);
+                if self
+                    .store
+                    .linearizable_barrier_before(deadline)
+                    .await
+                    .is_err()
+                {
+                    return reject(SessionConsumerRosterRejection::Unavailable);
+                }
+                let _guard = match self
+                    .store
+                    .admit_consumer_scope(request.scope(), deadline)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Authority),
+                };
+                let authority_time = match self
+                    .store
+                    .inner
+                    .backend
+                    .consensus_protected_roster_v2_current_publication_authority(
+                        self.store.inner.storage_identity,
+                        *capsule,
+                        self.store.inner.clock.now_utc(),
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(_) => return reject(SessionConsumerRosterRejection::Authority),
+                };
+                if attestation
+                    .verify(&root, &verification, authority_time)
+                    .is_err()
+                    || self
+                        .store
+                        .require_application_traffic_authority_before(deadline)
+                        .await
+                        .is_err()
+                {
+                    return reject(SessionConsumerRosterRejection::Authority);
                 }
                 SessionConsumerResponse::FencedMutationRosterCurrentPublicationAuthority(
                     SessionConsumerRosterCurrentPublicationAuthorityReadResponse::Current,
@@ -13348,6 +15020,52 @@ mod membership_tests {
         assert_eq!(invalid.retirement_cursors, 0);
         assert_eq!(invalid.materialized_charge_bytes, 0);
         assert_eq!(invalid.reserved_future_charge_bytes, 0);
+    }
+
+    #[test]
+    fn protected_roster_v2_terminal_status_test_diagnostic_is_fixed_and_redacted() {
+        let counters = ConsensusStoreDiagnosticCounters::default();
+        counters
+            .protected_roster_v2_terminal_status_barrier_entered
+            .fetch_add(2, Ordering::Relaxed);
+        counters
+            .protected_roster_v2_terminal_status_backend_entered
+            .fetch_add(1, Ordering::Relaxed);
+        counters
+            .protected_roster_v2_terminal_status_backend_error
+            .fetch_add(1, Ordering::Relaxed);
+        counters
+            .protected_roster_v2_terminal_status_backend_unavailable
+            .fetch_add(1, Ordering::Relaxed);
+
+        let snapshot = counters.protected_roster_v2_terminal_status_snapshot_for_test();
+        assert_eq!(
+            snapshot,
+            ProtectedRosterV2TerminalStatusDiagnosticSnapshotForTest {
+                barrier_entered: 2,
+                backend_entered: 1,
+                backend_error: 1,
+                backend_invalid_key: 0,
+                backend_unavailable: 1,
+                backend_other: 0,
+            }
+        );
+        let value = serde_json::to_value(snapshot).expect("serialize V2 status diagnostic");
+        let object = value.as_object().expect("V2 status diagnostic object");
+        assert_eq!(object.len(), 6);
+        for key in [
+            "barrier_entered",
+            "backend_entered",
+            "backend_error",
+            "backend_invalid_key",
+            "backend_unavailable",
+            "backend_other",
+        ] {
+            assert!(
+                object.get(key).is_some_and(serde_json::Value::is_u64),
+                "{key} is a fixed numeric counter",
+            );
+        }
     }
 
     #[test]
@@ -14924,6 +16642,51 @@ mod membership_tests {
         .expect("admission")
     }
 
+    fn roster_response_maximum_v2_admission() -> Admission {
+        let proposal = AdmissionProposal::new(
+            Profile::v2(),
+            RosterId::from_bytes([0x76; 16]).expect("V2 roster ID"),
+            (0..FRESH_ROSTER_MEMBERS)
+                .map(|ordinal| {
+                    Member::new(
+                        ordinal as u8,
+                        MemberOperationId::from_bytes([ordinal as u8 + 0x20; 16])
+                            .expect("V2 member operation ID"),
+                        vec![
+                            ordinal as u8 + 1;
+                            crate::fenced_mutation_roster::MAX_DESCRIPTOR_BYTES
+                        ],
+                        1,
+                    )
+                    .expect("V2 member")
+                })
+                .collect(),
+            EstablishedMutation::create_checkpoint(StateType::from_static(
+                "roster-response-v2-created",
+            )),
+            vec![0x77; crate::fenced_mutation_roster::MAX_PLAN_BYTES],
+            vec![0x78; crate::fenced_mutation_roster::MAX_CHECKPOINT_BYTES],
+            vec![0x79; crate::fenced_mutation_roster::MAX_RESULT_BYTES],
+        )
+        .expect("maximum V2 admission proposal");
+        Admission::authenticate(
+            proposal,
+            SessionKey {
+                tenant: TenantId::from_static("roster-response-v2-tenant"),
+                nf_kind: NetworkFunctionKind::smf(),
+                key_type: SessionKeyType::PduSession,
+                stable_id: Bytes::from_static(b"roster-response-v2-key")
+                    .try_into()
+                    .expect("V2 stable ID"),
+            },
+            Scope::from_digest([0x7a; 32]),
+            OwnerId::new("roster-response-v2-owner").expect("V2 owner"),
+            FenceToken::new(11),
+            Generation::new(1),
+        )
+        .expect("maximum V2 admission")
+    }
+
     fn roster_response_authority(admission: &Admission) -> AuthorityBinding {
         AuthorityBinding::from_consensus_parts(
             admission.scope().digest(),
@@ -15166,6 +16929,43 @@ mod membership_tests {
         assert!(crate::consensus::raft_adapter::is_singleton_roster_append(
             &append(vec![entry(2, terminal_intent),])
         ));
+
+        let v2_admission = roster_response_maximum_v2_admission();
+        let v2_command = roster_response_production_admission_command(
+            v2_admission.clone(),
+            roster_response_authority(&v2_admission),
+        );
+        let v2_append = append(vec![entry(
+            8,
+            SessionMutationIntent::RosterAdmissionV2(Box::new(v2_command.clone())),
+        )]);
+        assert!(crate::consensus::raft_adapter::is_singleton_roster_append(
+            &v2_append
+        ));
+        assert!(matches!(
+            opc_consensus::encode_bounded(&v2_append),
+            Err(opc_consensus::ConsensusCodecError::TooLarge)
+        ));
+        assert!(opc_consensus::encode_roster_bounded(&v2_append).is_ok());
+
+        let authorized_v2_append = append(vec![entry(
+            9,
+            SessionMutationIntent::Authorized {
+                origin: leader,
+                authority_identity: identity,
+                mutation: Box::new(SessionMutationIntent::RosterAdmissionV2(Box::new(
+                    v2_command,
+                ))),
+            },
+        )]);
+        assert!(crate::consensus::raft_adapter::is_singleton_roster_append(
+            &authorized_v2_append
+        ));
+        assert!(matches!(
+            opc_consensus::encode_bounded(&authorized_v2_append),
+            Err(opc_consensus::ConsensusCodecError::TooLarge)
+        ));
+        assert!(opc_consensus::encode_roster_bounded(&authorized_v2_append).is_ok());
 
         assert!(!crate::consensus::raft_adapter::is_singleton_roster_append(
             &append(vec![])
@@ -17159,6 +18959,48 @@ mod membership_tests {
             fenced_transition_voter_set_digest(identity, &voters),
             protected_roster_profile_voter_set_digest(identity, &voters),
             "a generic V1 activation certificate is never roster-profile evidence",
+        );
+    }
+
+    #[test]
+    fn protected_roster_v2_profile_digest_mismatch_is_unsupported_before_activation() {
+        let profile = crate::fenced_mutation_roster::Profile::v2();
+        let probe = ProtectedRosterProfileV2CapabilityProbe {
+            domain: PROTECTED_ROSTER_PROFILE_PROBE_DOMAIN_V2,
+            schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V2,
+            consumer_revision: profile.consumer_revision(),
+            profile_digest: profile.digest(),
+        };
+        assert!(matches!(
+            protected_roster_profile_v2_capability_probe_reply(
+                probe,
+                AtomicFencedTransitionCapability::V1,
+            ),
+            ProtectedRosterProfileV2CapabilityReply {
+                domain,
+                schema_version,
+                consumer_revision,
+                outcome: ProtectedRosterProfileV2CapabilityOutcome::Supported { profile_digest },
+            } if domain == PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V2
+                && schema_version == PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V2
+                && consumer_revision == profile.consumer_revision()
+                && profile_digest == profile.digest()
+        ));
+
+        let mut mismatched = probe;
+        mismatched.profile_digest[0] ^= 1;
+        assert_eq!(
+            protected_roster_profile_v2_capability_probe_reply(
+                mismatched,
+                AtomicFencedTransitionCapability::V1,
+            ),
+            ProtectedRosterProfileV2CapabilityReply {
+                domain: PROTECTED_ROSTER_PROFILE_REPLY_DOMAIN_V2,
+                schema_version: PROTECTED_ROSTER_PROFILE_PROBE_SCHEMA_V2,
+                consumer_revision: profile.consumer_revision(),
+                outcome: ProtectedRosterProfileV2CapabilityOutcome::Unsupported,
+            },
+            "the pure pre-activation probe rejects a mismatched V2 compatibility digest before any log append",
         );
     }
 
@@ -20961,6 +22803,78 @@ mod membership_tests {
             FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.load(Ordering::Relaxed),
             0,
             "the durable activation lets the following V1 write quorum linearize without a redundant read admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_roster_v2_activation_uses_its_exact_profile_command() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("V2 activation directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("V2 activation backend");
+        let store = ConsensusSessionStore::open(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("open V2 activation store");
+        store
+            .initialize_cluster()
+            .await
+            .expect("initialize V2 activation store");
+
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .expect("initialized log index");
+        store
+            .activate_protected_roster_profile_v2()
+            .await
+            .expect("activate exact protected-roster V2 profile");
+
+        let (scope_identity, voters) = store.current_scope().expect("current V2 scope");
+        assert!(store
+            .inner
+            .backend
+            .consensus_protected_roster_profile_v2_activation_matches_scope(
+                store.inner.storage_identity,
+                scope_identity,
+                voters.clone(),
+            )
+            .await
+            .expect("read exact V2 activation certificate"));
+        assert!(
+            !store
+                .inner
+                .backend
+                .consensus_fenced_transition_activation_matches_scope(
+                    store.inner.storage_identity,
+                    scope_identity,
+                    voters,
+                )
+                .await
+                .expect("read generic V1 activation certificate"),
+            "a V2 profile preflight must not install the generic V1 certificate"
+        );
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "cold V2 activation appends exactly the V2 profile certificate"
+        );
+
+        store
+            .activate_protected_roster_profile_v2()
+            .await
+            .expect("reuse exact protected-roster V2 profile");
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            Some(before + 1),
+            "an exact V2 profile certificate is idempotent"
         );
     }
 

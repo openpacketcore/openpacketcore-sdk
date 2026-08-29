@@ -150,6 +150,9 @@ impl Default for FakeBackendLimits {
 }
 
 impl FakeSessionBackend {
+    const PROTECTED_ROSTER_PROFILE_V2_CAPABILITY: &'static str =
+        "protected_roster_profile_v2_not_activated";
+
     /// Create a new fake backend with all capabilities enabled.
     pub fn new() -> Self {
         Self::with_capabilities(BackendCapabilities::all_enabled())
@@ -468,6 +471,11 @@ impl FakeSessionBackend {
         now: Timestamp,
         max_tracked_keys: usize,
     ) -> Result<(), StoreError> {
+        if Self::contains_protected_roster_established_create(&op) {
+            return Err(StoreError::CapabilityNotSupported(
+                Self::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into(),
+            ));
+        }
         match op {
             ReplicationOp::CompareAndSet {
                 key,
@@ -719,6 +727,11 @@ impl FakeSessionBackend {
                 state.next_fence = state.next_fence.max(fence.get().saturating_add(1));
                 Ok(())
             }
+            ReplicationOp::ProtectedRosterEstablishedCreate { .. } => {
+                Err(StoreError::CapabilityNotSupported(
+                    Self::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into(),
+                ))
+            }
             ReplicationOp::Batch { ops } => {
                 for op in ops {
                     Self::apply_replicated_op_with_state(state, op, now, max_tracked_keys)?;
@@ -726,6 +739,24 @@ impl FakeSessionBackend {
                 Ok(())
             }
         }
+    }
+
+    fn contains_protected_roster_established_create(op: &ReplicationOp) -> bool {
+        let mut pending = vec![op];
+        while let Some(operation) = pending.pop() {
+            match operation {
+                ReplicationOp::ProtectedRosterEstablishedCreate { .. } => return true,
+                ReplicationOp::Batch { ops } => pending.extend(ops),
+                ReplicationOp::CompareAndSet { .. }
+                | ReplicationOp::DeleteFenced { .. }
+                | ReplicationOp::RefreshTtl { .. }
+                | ReplicationOp::AcquireLease { .. }
+                | ReplicationOp::RenewLease { .. }
+                | ReplicationOp::ReleaseLease { .. }
+                | ReplicationOp::ProtectedRosterEstablished { .. } => {}
+            }
+        }
+        false
     }
 
     fn next_direct_replication_sequence(
@@ -772,6 +803,14 @@ impl FakeSessionBackend {
         entries: Vec<ReplicationEntry>,
     ) -> Result<FakeBackendState, StoreError> {
         validate_replication_prefix(&entries)?;
+        if entries
+            .iter()
+            .any(|entry| Self::contains_protected_roster_established_create(&entry.op))
+        {
+            return Err(StoreError::CapabilityNotSupported(
+                Self::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into(),
+            ));
+        }
         let mut staged = FakeBackendState::empty();
 
         for entry in entries {
@@ -1041,6 +1080,11 @@ impl SessionBackend for FakeSessionBackend {
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
         let entry = entry.into_validated()?;
+        if Self::contains_protected_roster_established_create(&entry.op) {
+            return Err(StoreError::CapabilityNotSupported(
+                Self::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into(),
+            ));
+        }
         let mut state = self.inner.lock().await;
         let mut staged = state.stage_data();
         let now = self.clock.now_utc();

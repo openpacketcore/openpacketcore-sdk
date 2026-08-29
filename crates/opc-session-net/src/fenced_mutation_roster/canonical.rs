@@ -22,10 +22,20 @@ use std::{collections::BTreeSet, fmt, marker::PhantomData};
 
 /// Schema version of the sole protected-roster wire profile.
 pub const SCHEMA_V1: u16 = 1;
+/// Schema version of the protected-roster absent-predecessor profile.
+pub const SCHEMA_V2: u16 = opc_session_store::fenced_mutation_roster::SCHEMA_V2;
 /// Consumer revision negotiated by the sole protected-roster profile.
 pub const CONSUMER_REVISION: u16 = 5;
+/// Consumer revision negotiated by the absent-predecessor profile.
+pub const CONSUMER_REVISION_V2: u16 =
+    opc_session_store::fenced_mutation_roster::CONSUMER_REVISION_V2;
 /// Revision-five consumer ALPN, frozen into the profile descriptor.
 pub const CONSUMER_ALPN: &[u8] = b"opc-session-consumer/3";
+/// Revision-six consumer ALPN for the absent-predecessor profile.
+pub const CONSUMER_ALPN_V2: &[u8] = opc_session_store::fenced_mutation_roster::CONSUMER_ALPN_V2;
+/// Fixed authoritative generation created by an absent-predecessor terminal.
+pub const INITIAL_GENERATION: Generation =
+    opc_session_store::fenced_mutation_roster::INITIAL_GENERATION;
 /// Maximum number of ordered member operations in one roster.
 pub const MAX_MEMBERS: usize = 8;
 /// Member count targeted for a newly admitted operational roster.
@@ -45,11 +55,12 @@ pub const MAX_DESCRIPTOR_BYTES: usize = 16 << 10;
 /// Maximum byte length of provider status or conclusive evidence.
 pub const MAX_STATUS_BYTES: usize = 4 << 10;
 /// Maximum number of live admitted rosters.
-pub const MAX_LIVE_ROSTERS: usize = 1_024;
+pub const MAX_LIVE_ROSTERS: usize = opc_session_store::fenced_mutation_roster::MAX_LIVE_ROSTERS;
 /// Maximum combined number of live and retained terminal rosters.
-pub const MAX_RESERVED_AND_RETAINED: usize = 131_072;
+pub const MAX_RESERVED_AND_RETAINED: usize =
+    opc_session_store::fenced_mutation_roster::MAX_RESERVED_AND_RETAINED;
 /// Operational live-and-retained roster target committed by the profile.
-pub(crate) const OPERATIONAL_TARGET: usize = 100_000;
+pub const OPERATIONAL_TARGET: usize = opc_session_store::fenced_mutation_roster::OPERATIONAL_TARGET;
 /// Largest history epoch accepted by durable SQLite-backed implementations.
 pub const MAX_HISTORY_EPOCH: u64 = i64::MAX as u64;
 
@@ -175,6 +186,7 @@ const PHASE_ABORTED: u8 = 2;
 const ESTABLISHED_MUTATION_PUT_CHECKPOINT: u8 = 1;
 const ESTABLISHED_MUTATION_DELETE: u8 = 2;
 const ESTABLISHED_MUTATION_NO_OP: u8 = 3;
+const ESTABLISHED_MUTATION_CREATE_CHECKPOINT: u8 = 4;
 const OUTCOME_APPLIED_EXECUTED: u8 = 1;
 const OUTCOME_APPLIED_ADOPTED: u8 = 2;
 const OUTCOME_NOT_APPLIED_RECONCILED: u8 = 3;
@@ -201,12 +213,20 @@ pub struct Profile {
     digest: [u8; 32],
 }
 impl Profile {
-    /// Return the one supported protected-roster profile.
+    /// Return the frozen present-predecessor protected-roster profile.
     pub fn v1() -> Self {
         Self {
             schema: SCHEMA_V1,
             consumer_revision: CONSUMER_REVISION,
             digest: profile_digest(),
+        }
+    }
+    /// Return the absent-predecessor protected-roster profile.
+    pub fn v2() -> Self {
+        Self {
+            schema: SCHEMA_V2,
+            consumer_revision: CONSUMER_REVISION_V2,
+            digest: profile_v2_digest(),
         }
     }
     /// Return this profile's schema version.
@@ -221,9 +241,9 @@ impl Profile {
     pub const fn digest(self) -> [u8; 32] {
         self.digest
     }
-    /// Verify that this value is exactly the supported profile.
+    /// Verify that this value is exactly a supported profile.
     pub fn validate(self) -> Result<(), Error> {
-        if self == Self::v1() {
+        if self == Self::v1() || self == Self::v2() {
             Ok(())
         } else {
             Err(Error::CapabilityMismatch)
@@ -254,7 +274,7 @@ impl<'de> Deserialize<'de> for Profile {
     }
 }
 
-const PROFILE_DESCRIPTOR: &[u8] = concat!(
+const PROFILE_DESCRIPTOR_V1: &[u8] = concat!(
     "schema=1\n",
     "consumer-revision=5\n",
     "alpn=opc-session-consumer/3\n",
@@ -289,14 +309,47 @@ const PROFILE_DESCRIPTOR: &[u8] = concat!(
     "publication=provider-local-durable-inert-intent-then-adopt,no-consensus-mutation,stable-id-excludes-replaceable-current-fence,current-authority-read-before-and-after-effect,status-first,monotonic-state:absent-to-reserved-to-attempted-to-published,conflict-sticky,created-state-never-reverts-to-absent,logical-state-may-compact-but-not-gc,absent-non-exclusionary-never-effect-authority,begin-never-crosses-effect,adopt-durably-marks-attempted-before-effect,attempted-resend-only-after-provider-retained-exact-not-transmitted,each-call-atomically-raises-durable-fence-floor-and-rejects-lower-or-expired-before-io,outcome-unknown-status-adopt-only,published-tombstone-outlives-terminal-retention,ack-only-after-exact-established-and-postcheck\n"
 ).as_bytes();
 
+// Profile V2 is owned by the durable-store contract. Reuse its exact bytes,
+// rather than maintaining a transport-local copy that could negotiate a
+// digest for semantics the store does not enforce.
+#[cfg(test)]
+const PROFILE_DESCRIPTOR_V2: &[u8] =
+    opc_session_store::fenced_mutation_roster::profile_v2_descriptor();
+
 // Keep the numeric profile literal and the internal maintenance target aligned.
 const _: () = assert!(OPERATIONAL_TARGET == 100_000);
 
-/// Compute the domain-separated digest of every frozen profile item.
+/// Compute the frozen Profile V1 digest.
+pub fn profile_v1_digest() -> [u8; 32] {
+    profile_digest_for(
+        PROFILE_DESCRIPTOR_V1,
+        CONSUMER_ALPN,
+        [
+            ESTABLISHED_MUTATION_PUT_CHECKPOINT,
+            ESTABLISHED_MUTATION_DELETE,
+            ESTABLISHED_MUTATION_NO_OP,
+        ],
+    )
+}
+
+/// Compute the Profile V2 digest.
+pub fn profile_v2_digest() -> [u8; 32] {
+    opc_session_store::fenced_mutation_roster_profile_v2_digest()
+}
+
+/// Compute the frozen unversioned Profile V1 digest.
 pub fn profile_digest() -> [u8; 32] {
+    profile_v1_digest()
+}
+
+fn profile_digest_for<const N: usize>(
+    descriptor: &[u8],
+    consumer_alpn: &[u8],
+    established_mutation_tags: [u8; N],
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(PROFILE_DOMAIN);
-    h.update(PROFILE_DESCRIPTOR);
+    h.update(descriptor);
     for domain in [
         ADMISSION_DOMAIN,
         DESCRIPTOR_DOMAIN,
@@ -363,11 +416,7 @@ pub fn profile_digest() -> [u8; 32] {
     h.update((MAX_EXECUTOR_PROOF_EVIDENCE_BYTES as u64).to_be_bytes());
     h.update((MAX_EXECUTOR_PROOF_BUNDLE_BYTES as u64).to_be_bytes());
     h.update((MAX_COMPACT_TERMINAL_EVIDENCE_BYTES as u64).to_be_bytes());
-    h.update([
-        ESTABLISHED_MUTATION_PUT_CHECKPOINT,
-        ESTABLISHED_MUTATION_DELETE,
-        ESTABLISHED_MUTATION_NO_OP,
-    ]);
+    h.update(established_mutation_tags);
     h.update([
         PROVIDER_NOT_TRANSMITTED,
         PROVIDER_OUTCOME_UNKNOWN,
@@ -396,7 +445,7 @@ pub fn profile_digest() -> [u8; 32] {
         OUTCOME_NOT_APPLIED_RECONCILED,
         OUTCOME_COMPENSATED_RECONCILED,
     ]);
-    h.update(CONSUMER_ALPN);
+    h.update(consumer_alpn);
     h.finalize().into()
 }
 
@@ -596,6 +645,20 @@ impl EstablishedMutation {
         }
     }
 
+    /// Create the exact protected checkpoint when its session row is absent.
+    ///
+    /// Profile V2 reserves exact row absence during admission. Established
+    /// then creates the admitted canonical EnvelopeV1 record at generation
+    /// one; an Aborted terminal leaves the row absent. The admission's
+    /// `expected_generation` remains part of the wire and body commitment and
+    /// must be generation one for this mutation.
+    pub(crate) fn create_checkpoint(state_type: StateType) -> Self {
+        Self {
+            tag: ESTABLISHED_MUTATION_CREATE_CHECKPOINT,
+            state_type: Some(state_type),
+        }
+    }
+
     /// Delete the exact admitted session record on Established.
     pub const fn delete() -> Self {
         Self {
@@ -615,9 +678,18 @@ impl EstablishedMutation {
     pub(crate) fn validate(&self) -> Result<(), Error> {
         match (self.tag, self.state_type.as_ref()) {
             (ESTABLISHED_MUTATION_PUT_CHECKPOINT, Some(_))
+            | (ESTABLISHED_MUTATION_CREATE_CHECKPOINT, Some(_))
             | (ESTABLISHED_MUTATION_DELETE | ESTABLISHED_MUTATION_NO_OP, None) => Ok(()),
             _ => Err(Error::InvalidEstablishedMutation),
         }
+    }
+
+    pub(crate) const fn requires_absent_predecessor(&self) -> bool {
+        self.tag == ESTABLISHED_MUTATION_CREATE_CHECKPOINT
+    }
+
+    pub(crate) const fn requires_present_predecessor(&self) -> bool {
+        !self.requires_absent_predecessor()
     }
 
     pub(crate) const fn tag(&self) -> u8 {
@@ -737,6 +809,61 @@ impl fmt::Debug for AdmissionProposal {
         f.write_str("AdmissionProposal(<redacted>)")
     }
 }
+
+/// Opaque validated proposal for one V2 absent-predecessor roster.
+///
+/// This capability fixes the only legal creation mutation while deliberately
+/// exposing neither a caller-selected initial generation nor the generic
+/// present-predecessor preparation path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AbsentAdmissionProposal(AdmissionProposal);
+
+impl AbsentAdmissionProposal {
+    /// Construct a validated absent-predecessor proposal.
+    pub fn new(
+        profile: Profile,
+        roster_id: RosterId,
+        members: Vec<Member>,
+        state_type: StateType,
+        protected_plan: Vec<u8>,
+        terminal_checkpoint: Vec<u8>,
+        terminal_result: Vec<u8>,
+    ) -> Result<Self, Error> {
+        if profile != Profile::v2() {
+            return Err(Error::CapabilityMismatch);
+        }
+        AdmissionProposal::new(
+            profile,
+            roster_id,
+            members,
+            EstablishedMutation::create_checkpoint(state_type),
+            protected_plan,
+            terminal_checkpoint,
+            terminal_result,
+        )
+        .map(Self)
+    }
+
+    pub(crate) fn into_proposal(self) -> AdmissionProposal {
+        self.0
+    }
+
+    /// Return the stable roster identity retained across every phase.
+    pub const fn roster_id(&self) -> RosterId {
+        self.0.roster_id()
+    }
+
+    /// Return the immutable ordered provider members.
+    pub fn members(&self) -> &[Member] {
+        self.0.members()
+    }
+}
+
+impl fmt::Debug for AbsentAdmissionProposal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AbsentAdmissionProposal(<redacted>)")
+    }
+}
 #[derive(Deserialize)]
 struct ProposalWire {
     profile: Profile,
@@ -782,7 +909,16 @@ fn validate_proposal(
     if checkpoint.len() > MAX_CHECKPOINT_BYTES {
         return Err(Error::CheckpointTooLarge);
     }
-    if established_mutation.tag() == ESTABLISHED_MUTATION_PUT_CHECKPOINT && checkpoint.is_empty() {
+    if (established_mutation.tag() == ESTABLISHED_MUTATION_PUT_CHECKPOINT
+        || established_mutation.requires_absent_predecessor())
+        && checkpoint.is_empty()
+    {
+        return Err(Error::InvalidEstablishedMutation);
+    }
+    if profile == Profile::v1() && !established_mutation.requires_present_predecessor() {
+        return Err(Error::InvalidEstablishedMutation);
+    }
+    if profile == Profile::v2() && !established_mutation.requires_absent_predecessor() {
         return Err(Error::InvalidEstablishedMutation);
     }
     if result.len() > MAX_RESULT_BYTES {
@@ -833,6 +969,11 @@ impl Admission {
         }
         if proposal.established_mutation.tag() == ESTABLISHED_MUTATION_PUT_CHECKPOINT
             && expected_generation.next().is_none()
+        {
+            return Err(Error::InvalidEstablishedMutation);
+        }
+        if proposal.established_mutation.requires_absent_predecessor()
+            && expected_generation != Generation::new(1)
         {
             return Err(Error::InvalidEstablishedMutation);
         }
@@ -2450,8 +2591,23 @@ impl TerminalConflictTombstone {
         history_epoch: u64,
         admission: &Admission,
     ) -> Result<CompactedTerminalStatus, Error> {
+        self.validate_admission_for_profile(Profile::v1(), history_epoch, admission)
+    }
+
+    /// Validate the exact admission profile that originally minted this
+    /// compact tombstone. The V1 wrapper remains frozen for legacy peers.
+    pub(crate) fn validate_admission_for_profile(
+        &self,
+        profile: Profile,
+        history_epoch: u64,
+        admission: &Admission,
+    ) -> Result<CompactedTerminalStatus, Error> {
+        profile.validate()?;
+        if admission.profile() != profile {
+            return Err(Error::InvalidAuthority);
+        }
         let binding_key = admission.binding_key(history_epoch)?;
-        self.validate_binding(binding_key)?;
+        self.validate_binding_for_profile(profile, binding_key)?;
         if self.admission_body_commitment != admission.body_commitment() {
             return Err(Error::RequestConflict);
         }
@@ -2470,12 +2626,24 @@ impl TerminalConflictTombstone {
 
     /// Recompute the exact request binding from the row/index key without
     /// reconstructing the reclaimed admission body.
+    #[cfg(test)]
     pub(crate) fn validate_binding(&self, binding: RequestBindingKey) -> Result<(), Error> {
+        self.validate_binding_for_profile(Profile::v1(), binding)
+    }
+
+    /// Recompute the exact request binding using the profile that minted the
+    /// tombstone's owner and terminal-index commitments.
+    pub(crate) fn validate_binding_for_profile(
+        &self,
+        profile: Profile,
+        binding: RequestBindingKey,
+    ) -> Result<(), Error> {
+        profile.validate()?;
         self.validate()?;
         if self.scope != binding.scope
             || self.terminal_index_binding
                 != tombstone_terminal_index_binding(
-                    Profile::v1(),
+                    profile,
                     binding,
                     self.admission_body_commitment,
                     self.terminal_body_commitment,
@@ -2494,6 +2662,17 @@ impl TerminalConflictTombstone {
         &self,
         lookup: CompactedTerminalLookup<'_>,
     ) -> Result<CompactedTerminalStatus, Error> {
+        self.validate_lookup_for_profile(Profile::v1(), lookup)
+    }
+
+    /// Validate a compacted replay lookup using the exact profile that minted
+    /// the tombstone commitments.
+    pub(crate) fn validate_lookup_for_profile(
+        &self,
+        profile: Profile,
+        lookup: CompactedTerminalLookup<'_>,
+    ) -> Result<CompactedTerminalStatus, Error> {
+        profile.validate()?;
         // The current authenticated ingress may belong to a successor
         // configuration. Historical scope is resolved only from the durable
         // tombstone, while the exact caller key and roster remain bound to it.
@@ -2503,9 +2682,9 @@ impl TerminalConflictTombstone {
             lookup.key,
             lookup.roster_id,
         )?;
-        self.validate_binding(binding_key)?;
+        self.validate_binding_for_profile(profile, binding_key)?;
         if self.admission_owner_commitment
-            != tombstone_admission_owner_commitment(Profile::v1(), lookup.original_owner)
+            != tombstone_admission_owner_commitment(profile, lookup.original_owner)
             || lookup.original_admission_fence.get() != self.admission_fence
             || lookup.current_fence.get() <= self.admission_fence
             || lookup.current_generation.get() != self.expected_generation
@@ -2974,7 +3153,7 @@ mod frozen_cross_crate_goldens {
         // These are the store crate's frozen goldens. Keeping the net copy on
         // this exact corpus catches any client/server canonical-codec drift.
         assert_eq!(
-            profile_digest(),
+            profile_v1_digest(),
             [
                 0x7c, 0x49, 0x24, 0x64, 0xa0, 0x8d, 0xb0, 0x8f, 0xde, 0x85, 0x21, 0x0b, 0xc8, 0xdb,
                 0x00, 0x15, 0x68, 0x82, 0xef, 0x24, 0x50, 0x3b, 0x99, 0x77, 0x34, 0x28, 0xce, 0x24,
@@ -2984,6 +3163,14 @@ mod frozen_cross_crate_goldens {
         assert_eq!(
             profile_digest(),
             opc_session_store::fenced_mutation_roster_profile_digest()
+        );
+        assert_eq!(
+            profile_v1_digest(),
+            opc_session_store::fenced_mutation_roster_profile_v1_digest()
+        );
+        assert_eq!(
+            profile_v2_digest(),
+            opc_session_store::fenced_mutation_roster_profile_v2_digest()
         );
         let admission = admission();
         let admission_frame = admission
@@ -3015,6 +3202,144 @@ mod frozen_cross_crate_goldens {
                 0xe4, 0x52, 0x4e, 0x1a,
             ]
         );
+    }
+
+    #[test]
+    fn net_profile_v2_create_checkpoint_is_profile_bound_and_append_only() {
+        let v1 = Profile::v1();
+        let v2 = Profile::v2();
+        assert!(v1.validate().is_ok());
+        assert!(v2.validate().is_ok());
+        assert_ne!(v1.digest(), v2.digest());
+        assert_eq!(profile_digest(), v1.digest());
+        assert_eq!(profile_v2_digest(), v2.digest());
+
+        let create = EstablishedMutation::create_checkpoint(StateType::from_static("created"));
+        let create_bytes = postcard::to_allocvec(&create).expect("canonical create mutation");
+        assert_eq!(create_bytes[0], ESTABLISHED_MUTATION_CREATE_CHECKPOINT);
+        for mutation in [
+            EstablishedMutation::put_checkpoint(StateType::from_static("updated")),
+            EstablishedMutation::delete(),
+            EstablishedMutation::no_op(),
+        ] {
+            assert!(
+                AdmissionProposal::new(
+                    v1,
+                    RosterId::from_bytes([0x31; ROSTER_ID_BYTES]).expect("roster ID"),
+                    vec![Member::new(
+                        0,
+                        MemberOperationId::from_bytes([0x32; MEMBER_OPERATION_ID_BYTES])
+                            .expect("member ID"),
+                        vec![1],
+                        1,
+                    )
+                    .expect("member")],
+                    mutation,
+                    vec![1],
+                    vec![2],
+                    vec![3],
+                )
+                .is_ok(),
+                "Profile V1 present-predecessor mutation must remain supported",
+            );
+        }
+        for mutation in [
+            EstablishedMutation::put_checkpoint(StateType::from_static("updated")),
+            EstablishedMutation::delete(),
+            EstablishedMutation::no_op(),
+        ] {
+            assert_eq!(
+                AdmissionProposal::new(
+                    v2,
+                    RosterId::from_bytes([0x31; ROSTER_ID_BYTES]).expect("roster ID"),
+                    vec![Member::new(
+                        0,
+                        MemberOperationId::from_bytes([0x32; MEMBER_OPERATION_ID_BYTES])
+                            .expect("member ID"),
+                        vec![1],
+                        1,
+                    )
+                    .expect("member")],
+                    mutation,
+                    vec![1],
+                    vec![2],
+                    vec![3],
+                ),
+                Err(Error::InvalidEstablishedMutation),
+                "Profile V2 is create-only",
+            );
+        }
+        assert_eq!(
+            AdmissionProposal::new(
+                v1,
+                RosterId::from_bytes([0x31; ROSTER_ID_BYTES]).expect("roster ID"),
+                vec![Member::new(
+                    0,
+                    MemberOperationId::from_bytes([0x32; MEMBER_OPERATION_ID_BYTES])
+                        .expect("member ID"),
+                    vec![1],
+                    1,
+                )
+                .expect("member"),],
+                create.clone(),
+                vec![1],
+                vec![2],
+                vec![3],
+            ),
+            Err(Error::InvalidEstablishedMutation)
+        );
+        let proposal = AdmissionProposal::new(
+            v2,
+            RosterId::from_bytes([0x31; ROSTER_ID_BYTES]).expect("roster ID"),
+            vec![Member::new(
+                0,
+                MemberOperationId::from_bytes([0x32; MEMBER_OPERATION_ID_BYTES])
+                    .expect("member ID"),
+                vec![1],
+                1,
+            )
+            .expect("member")],
+            create,
+            vec![1],
+            vec![2],
+            vec![3],
+        )
+        .expect("V2 create proposal");
+        assert!(Admission::authenticate(
+            proposal,
+            key(),
+            Scope::from_digest([9; 32]),
+            OwnerId::new("owner").expect("owner"),
+            FenceToken::new(1),
+            Generation::new(1),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn net_profile_v2_descriptor_is_the_store_canonical_capacity_lifecycle_contract() {
+        assert_eq!(
+            PROFILE_DESCRIPTOR_V2,
+            opc_session_store::fenced_mutation_roster::profile_v2_descriptor()
+        );
+        assert_eq!(
+            MAX_LIVE_ROSTERS,
+            opc_session_store::fenced_mutation_roster::MAX_LIVE_ROSTERS
+        );
+        assert_eq!(
+            MAX_RESERVED_AND_RETAINED,
+            opc_session_store::fenced_mutation_roster::MAX_RESERVED_AND_RETAINED
+        );
+
+        let lines: BTreeSet<&[u8]> = PROFILE_DESCRIPTOR_V2.split(|byte| *byte == b'\n').collect();
+        for expected in [
+            b"production-limits=max-live:1024,live-plus-retained:131072,terminal-retention-seconds:86400".as_slice(),
+            b"capacity-lifecycle=q1-reserves-terminal-slot,q2-converts-reserved-capacity-without-late-capacity-failure,live-never-reclaimed".as_slice(),
+            b"reclaim=deterministic-oldest-eligible,batch:1024,includes-final-partial,terminal-only".as_slice(),
+            b"capacity-retirement-ordering=shared-v1-v2:capacity-before-retirement".as_slice(),
+        ] {
+            assert!(lines.contains(expected));
+        }
     }
 
     #[test]
@@ -3081,6 +3406,83 @@ mod frozen_cross_crate_goldens {
             changed_owner_commitment.validate_admission(4, &admission),
             Err(Error::InvalidAuthority),
             "the owner commitment is bound into the terminal index binding"
+        );
+    }
+
+    #[test]
+    fn tombstone_v2_compacted_response_requires_its_exact_profile() {
+        let admission = Admission::authenticate(
+            AdmissionProposal::new(
+                Profile::v2(),
+                RosterId::from_bytes([0x71; ROSTER_ID_BYTES]).expect("roster ID"),
+                vec![Member::new(
+                    0,
+                    MemberOperationId::from_bytes([0x72; MEMBER_OPERATION_ID_BYTES])
+                        .expect("member ID"),
+                    vec![0x73],
+                    1,
+                )
+                .expect("member")],
+                EstablishedMutation::create_checkpoint(StateType::from_static("tombstone-v2")),
+                vec![0x74],
+                vec![0x75],
+                vec![0x76],
+            )
+            .expect("V2 proposal"),
+            key(),
+            Scope::from_digest([0x77; 32]),
+            OwnerId::new("tombstone-v2-owner").expect("owner"),
+            FenceToken::new(7),
+            INITIAL_GENERATION,
+        )
+        .expect("V2 admission");
+        let binding = admission.binding_key(4).expect("binding");
+        let request_id = RequestId::bind(4, &admission).expect("request ID");
+        let terminal =
+            TerminalRecord::new(&admission, request_id, Phase::Established, vec![[0x78; 32]])
+                .expect("terminal");
+        let tombstone =
+            TerminalConflictTombstone::new(&admission, &terminal).expect("V2 compacted response");
+
+        assert!(tombstone
+            .validate_binding_for_profile(Profile::v2(), binding)
+            .is_ok());
+        assert!(tombstone
+            .validate_admission_for_profile(Profile::v2(), 4, &admission)
+            .is_ok());
+        assert_eq!(
+            tombstone.validate_binding(binding),
+            Err(Error::InvalidAuthority),
+            "a V2 compacted response cannot replay through the frozen V1 path"
+        );
+
+        let lookup = CompactedTerminalLookup {
+            history_epoch: 4,
+            key: admission.key(),
+            roster_id: admission.roster_id(),
+            original_owner: admission.logical_owner(),
+            original_admission_fence: admission.admission_fence(),
+            current_fence: FenceToken::new(admission.admission_fence().get() + 1),
+            current_generation: admission.expected_generation(),
+        };
+        assert!(tombstone
+            .validate_lookup_for_profile(Profile::v2(), lookup)
+            .is_ok());
+
+        let canonical = tombstone
+            .to_canonical_bytes()
+            .expect("canonical V2 response");
+        let mut trailing = canonical.clone();
+        trailing.push(0);
+        assert_eq!(
+            TerminalConflictTombstone::from_canonical_bytes(&trailing),
+            Err(Error::InvalidEncoding),
+            "the shared response shape rejects extra bytes before profile validation"
+        );
+        assert_eq!(
+            TerminalConflictTombstone::from_canonical_bytes(&canonical),
+            Ok(tombstone),
+            "V2 uses the shared canonical tombstone shape"
         );
     }
 

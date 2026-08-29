@@ -1061,6 +1061,8 @@ pub(crate) fn is_singleton_roster_append(
                     intent,
                     SessionMutationIntent::RosterAdmission(_)
                         | SessionMutationIntent::RosterTerminal(_)
+                        | SessionMutationIntent::RosterAdmissionV2(_)
+                        | SessionMutationIntent::RosterTerminalV2(_)
                 )
             }
             _ => false,

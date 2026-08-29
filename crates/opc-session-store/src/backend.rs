@@ -1035,6 +1035,28 @@ pub enum ReplicationOp {
         /// Mutations in original submission order.
         ops: Vec<ReplicationOp>,
     },
+    /// Replay of an Established protected-roster creation from exact absence.
+    ///
+    /// This append-only variant preserves the existing present-predecessor
+    /// journal encoding. Replay authenticates the current lease and requires
+    /// the row to remain absent before inserting the exact generation-one
+    /// terminal record.
+    ProtectedRosterEstablishedCreate {
+        /// Exact key whose absence was reserved at admission.
+        key: SessionKey,
+        /// Exact immutable-provenance generation-one record to create.
+        record: StoredSessionRecord,
+        /// Current authenticated execution owner.
+        owner: OwnerId,
+        /// Current authenticated execution fence and persistent floor.
+        fence: FenceToken,
+        /// Credential of the active execution lease.
+        credential_id: u64,
+        /// Exact issuance time of the execution lease.
+        guard_acquired_at: Timestamp,
+        /// Exact expiry of the execution lease.
+        guard_expires_at: Timestamp,
+    },
 }
 
 /// The only legal session-record effects of a protected-roster Established
@@ -1162,6 +1184,9 @@ impl ReplicationOp {
                         validate_stored_record_expiry_at(record, reference_timestamp)?;
                     }
                 }
+                Self::ProtectedRosterEstablishedCreate { record, .. } => {
+                    validate_stored_record_expiry_at(record, reference_timestamp)?;
+                }
                 Self::Batch { ops } => pending.extend(ops),
                 Self::DeleteFenced { .. } | Self::ReleaseLease { .. } => {}
             }
@@ -1229,6 +1254,27 @@ where
                     key,
                     expected_record,
                     successor,
+                    owner,
+                    fence,
+                    credential_id,
+                    guard_acquired_at,
+                    guard_expires_at,
+                });
+            }
+            ReplicationTransformWork::Visit(ReplicationOp::ProtectedRosterEstablishedCreate {
+                key,
+                record,
+                owner,
+                fence,
+                credential_id,
+                guard_acquired_at,
+                guard_expires_at,
+            }) => {
+                // The record is the exact terminal materialization already
+                // sealed into consensus and must not be independently wrapped.
+                transformed.push(ReplicationOp::ProtectedRosterEstablishedCreate {
+                    key,
+                    record,
                     owner,
                     fence,
                     credential_id,

@@ -52,8 +52,11 @@ pub mod test_support {
     pub use super::consensus::{
         protected_roster_terminal_apply_timing_test_guard,
         protected_roster_terminal_apply_timings_for_test,
+        protected_roster_v2_terminal_status_validation_stages_for_test,
         reset_protected_roster_terminal_apply_timings_for_test,
+        reset_protected_roster_v2_terminal_status_validation_stages_for_test,
         ProtectedRosterTerminalApplyTimings,
+        ProtectedRosterV2TerminalStatusValidationStagesForTest,
     };
 }
 
@@ -2312,6 +2315,129 @@ impl SqliteSessionBackend {
         .await
     }
 
+    /// Read one exact Profile-V2 admission under the caller's linearizable
+    /// barrier.  This uses the isolated V2 SQLite carrier; V1 status is never
+    /// consulted as a fallback.
+    pub(crate) async fn consensus_protected_roster_v2_admission_status(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        admission: crate::fenced_mutation_roster::Admission,
+        current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterV2ReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_v2_admission_status_sync(
+                conn,
+                identity,
+                &admission,
+                &current_authority,
+                logical_time,
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Recover one exact Profile-V2 carrier under a strictly newer current
+    /// fence.  The V2 stable slot is queried directly and no V1 record can
+    /// satisfy this read.
+    pub(crate) async fn consensus_protected_roster_v2_recovery(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        recovery: crate::fenced_mutation_roster_executor::RecoveryRequest,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterV2ReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_v2_recovery_sync(
+                conn,
+                identity,
+                &recovery,
+                logical_time,
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Read one exact Profile-V2 terminal body and V2 compact evidence after
+    /// a caller-owned linearizable barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn consensus_protected_roster_v2_terminal_status(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        binding: crate::fenced_mutation_roster::RequestBindingKey,
+        registration_parts: ([u8; 32], crate::fenced_mutation_roster::RequestId, [u8; 32]),
+        current_authority: crate::fenced_mutation_roster_executor::AuthorityBinding,
+        terminal_body_commitment: [u8; 32],
+        terminal_evidence: crate::fenced_mutation_roster::RosterProfileV2CompactTerminalEvidenceV1,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<(consensus::ProtectedRosterV2ReadResult, opc_types::Timestamp), StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            let read = consensus::read_protected_roster_v2_terminal_status_sync(
+                conn,
+                identity,
+                binding,
+                consensus::ProtectedRosterV2TerminalStatusRequest {
+                    registration_parts,
+                    current_authority: &current_authority,
+                    terminal_body_commitment,
+                    terminal_evidence: &terminal_evidence,
+                    logical_time,
+                },
+            )?;
+            Ok((read, logical_time))
+        })
+        .await
+    }
+
+    /// Validate one Established Profile-V2 publication and current authority
+    /// through the isolated V2 roster tables only.
+    pub(crate) async fn consensus_protected_roster_v2_current_publication_authority(
+        &self,
+        identity: crate::consensus::SessionConsensusIdentity,
+        request: crate::consumer::SessionConsumerRosterCurrentPublicationAuthorityCapsule,
+        wall_time_floor: opc_types::Timestamp,
+    ) -> Result<opc_types::Timestamp, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            let logical_time = consensus::logical_time_sync(conn, identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "session consensus logical time is unavailable".into(),
+                    )
+                })?
+                .map_or(wall_time_floor, |time| time.max(wall_time_floor));
+            consensus::read_protected_roster_v2_current_publication_authority_sync(
+                conn,
+                identity,
+                &request,
+                logical_time,
+            )?;
+            Ok(logical_time)
+        })
+        .await
+    }
+
     /// Check the bounded V1 activation certificate after a caller-owned
     /// consensus barrier.  A missing or stale certificate is a normal
     /// unsupported state; storage failure remains unavailable.
@@ -2611,6 +2737,26 @@ impl SqliteSessionBackend {
                 .map_err(|_| {
                     StoreError::BackendUnavailable(
                         "fenced transition V2 history is unavailable".into(),
+                    )
+                })
+        })
+        .await
+    }
+
+    /// Report whether the durable Profile-V2 protected-roster namespace has
+    /// ever been materialized. Its exact-scope activation certificate is
+    /// intentionally cleared at membership cutover, so learner admission
+    /// must gate on the durable namespace rather than that transient scope
+    /// certificate.
+    pub(crate) async fn consensus_protected_roster_v2_history_is_activated(
+        &self,
+        storage_identity: crate::consensus::SessionConsensusIdentity,
+    ) -> Result<bool, StoreError> {
+        self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
+            consensus::protected_roster_v2_history_is_activated_sync(conn, storage_identity)
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "protected roster V2 history is unavailable".into(),
                     )
                 })
         })

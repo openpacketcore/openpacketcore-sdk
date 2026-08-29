@@ -16,10 +16,11 @@ use crate::{
     fenced_mutation_roster::{
         decode_frame, encode_frame, roster_ingress_capsule_commitment, Admission,
         RequestBindingKey, RequestId, RosterCompactAdmissionProvenanceV2,
-        RosterCompactTerminalEvidenceV2, RosterExecutorProofBundleV1, RosterId, Scope,
-        TerminalConflictTombstone, TerminalRecord, MAX_ADMISSION_CODEC_BYTES,
-        MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES,
-        MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES, MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES,
+        RosterCompactTerminalEvidenceV2, RosterExecutorProofBundleV1, RosterId,
+        RosterProfileV2CompactAdmissionProvenanceV1, Scope, TerminalConflictTombstone,
+        TerminalRecord, MAX_ADMISSION_CODEC_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES,
+        MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
+        MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES,
     },
     fenced_mutation_roster_executor::{
         AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration, BackendRejection,
@@ -33,6 +34,10 @@ const ADMISSION_REQUEST_MAGIC: [u8; 8] = *b"OPCRPA1\0";
 const ADMISSION_RESPONSE_MAGIC: [u8; 8] = *b"OPCRPS1\0";
 const TERMINAL_REQUEST_MAGIC: [u8; 8] = *b"OPCRPT1\0";
 const TERMINAL_RESPONSE_MAGIC: [u8; 8] = *b"OPCRPU1\0";
+const ADMISSION_REQUEST_V2_MAGIC: [u8; 8] = *b"OPCRPA2\0";
+const ADMISSION_RESPONSE_V2_MAGIC: [u8; 8] = *b"OPCRPS2\0";
+const TERMINAL_REQUEST_V2_MAGIC: [u8; 8] = *b"OPCRPT2\0";
+const TERMINAL_RESPONSE_V2_MAGIC: [u8; 8] = *b"OPCRPU2\0";
 const ADMISSION_REQUEST_DOMAIN: &[u8] =
     b"openpacketcore/protected-roster/admission-port/request/v1\0";
 const ADMISSION_RESPONSE_DOMAIN: &[u8] =
@@ -41,6 +46,23 @@ const TERMINAL_REQUEST_DOMAIN: &[u8] =
     b"openpacketcore/protected-roster/terminal-port/request/v1\0";
 const TERMINAL_RESPONSE_DOMAIN: &[u8] =
     b"openpacketcore/protected-roster/terminal-port/response/v1\0";
+const ADMISSION_REQUEST_V2_DOMAIN: &[u8] =
+    b"openpacketcore/protected-roster/admission-port/profile-v2/request/v1\0";
+const ADMISSION_RESPONSE_V2_DOMAIN: &[u8] =
+    b"openpacketcore/protected-roster/admission-port/profile-v2/response/v1\0";
+const TERMINAL_REQUEST_V2_DOMAIN: &[u8] =
+    b"openpacketcore/protected-roster/terminal-port/profile-v2/request/v1\0";
+const TERMINAL_RESPONSE_V2_DOMAIN: &[u8] =
+    b"openpacketcore/protected-roster/terminal-port/profile-v2/response/v1\0";
+const PROTECTED_ROSTER_V2_TRANSPORT_COMPATIBILITY_DESCRIPTOR_DOMAIN: &[u8] =
+    b"openpacketcore/protected-roster/profile-v2/transport-carriers/v1\0";
+const PROTECTED_ROSTER_V2_TRANSPORT_COMPATIBILITY_DESCRIPTOR: &[u8] = concat!(
+    "admission-request-v2=postcard-frame,magic:OPCRPA2\\0,domain:admission-port/profile-v2/request/v1,wire:AdmissionRequestWire(register:scope,admission,authority|recover:scope,roster-id,original-owner,original-admission-fence,authority)\n",
+    "admission-response-v2=postcard-frame,magic:OPCRPS2\\0,domain:admission-port/profile-v2/response/v1,wire:AdmissionResponseWireV2(fresh:scope,registration,profile-v2-admission-provenance|replayed:scope|poll-admitted:scope,registration,admission,profile-v2-admission-provenance|terminal:scope,registration,admission,committed,profile-v2-admission-provenance|compacted:scope,history-epoch,profile-v2-terminal-conflict-tombstone|reject:scope,rejection)\n",
+    "terminal-request-v2=postcard-frame,magic:OPCRPT2\\0,domain:terminal-port/profile-v2/request/v1,wire:TerminalRequestWireV2(scope,binding,registration,authority,record,profile-v2-admission-provenance,generic-compact-terminal-evidence),no-v1-bundle-or-voter-ingress\n",
+    "terminal-response-v2=postcard-frame,magic:OPCRPU2\\0,domain:terminal-port/profile-v2/response/v1,wire:TerminalResponseWireV2(terminalized:scope,committed|replayed:scope,committed|admitted:scope|compacted:scope,history-epoch,profile-v2-terminal-conflict-tombstone|reject:scope,rejection),no-v1-tombstone\n",
+    "bounds=admission-capsule,terminal-v2-capsule,terminal-v2-hello-frame,port-envelope-overhead;response=profile-v2-frames-only,no-v1-frame-probe\n"
+).as_bytes();
 const SCOPE_DOMAIN: &[u8] = b"openpacketcore/protected-roster/consumer-scope/v1\0";
 
 /// Reserved deterministic envelope allowance around canonical roster bodies.
@@ -62,6 +84,74 @@ pub(crate) const MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES: usize =
         + MAX_EXECUTOR_PROOF_BUNDLE_BYTES
         + MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES
         + MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES;
+
+/// Maximum `/4` terminal inner capsule. Its V2 admission provenance and
+/// generic executor evidence are client-supplied; the voter adds the fresh
+/// typed ingress envelope only after authenticating the `/4` transport.
+pub(crate) const MAX_PROTECTED_ROSTER_V2_TERMINAL_CAPSULE_BYTES: usize =
+    MAX_COMMITTED_TERMINAL_CODEC_BYTES
+        + MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES
+        + MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES
+        + MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES;
+
+/// Exact authenticated consumer Hello frame bound for a `/4` terminal
+/// capsule. This is deliberately a V2-only value: `/3` retains its frozen
+/// larger terminal envelope bound.
+pub(crate) const MAX_PROTECTED_ROSTER_V2_TERMINAL_FRAME_BYTES: usize =
+    MAX_PROTECTED_ROSTER_V2_TERMINAL_CAPSULE_BYTES * 4 + 4 * 1024;
+
+/// Digest the exact `/4` consumer-port carrier contract used in V2 activation.
+///
+/// This is public only through the crate-root compatibility re-export so the
+/// network-side duplicate codec literals can assert equality with the durable
+/// contract. It carries no caller material.
+#[doc(hidden)]
+pub fn protected_roster_v2_transport_compatibility_descriptor_digest() -> [u8; 32] {
+    protected_roster_v2_transport_compatibility_descriptor_digest_for(
+        PROTECTED_ROSTER_V2_TRANSPORT_COMPATIBILITY_DESCRIPTOR,
+        [
+            ADMISSION_REQUEST_V2_MAGIC,
+            ADMISSION_RESPONSE_V2_MAGIC,
+            TERMINAL_REQUEST_V2_MAGIC,
+            TERMINAL_RESPONSE_V2_MAGIC,
+        ],
+        [
+            ADMISSION_REQUEST_V2_DOMAIN,
+            ADMISSION_RESPONSE_V2_DOMAIN,
+            TERMINAL_REQUEST_V2_DOMAIN,
+            TERMINAL_RESPONSE_V2_DOMAIN,
+        ],
+        [
+            MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+            MAX_PROTECTED_ROSTER_V2_TERMINAL_CAPSULE_BYTES,
+            MAX_PROTECTED_ROSTER_V2_TERMINAL_FRAME_BYTES,
+            MAX_PROTECTED_ROSTER_PORT_ENVELOPE_OVERHEAD_BYTES,
+        ],
+    )
+}
+
+fn protected_roster_v2_transport_compatibility_descriptor_digest_for(
+    descriptor: &[u8],
+    magics: [[u8; 8]; 4],
+    domains: [&[u8]; 4],
+    bounds: [usize; 4],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(PROTECTED_ROSTER_V2_TRANSPORT_COMPATIBILITY_DESCRIPTOR_DOMAIN);
+    h.update(descriptor);
+    for magic in magics {
+        h.update(b"\0magic:");
+        h.update(magic);
+    }
+    for domain in domains {
+        h.update(b"\0domain:");
+        h.update(domain);
+    }
+    for bound in bounds {
+        h.update((bound as u64).to_be_bytes());
+    }
+    h.finalize().into()
+}
 
 /// Fixed redaction-safe failure from the protected-roster client transport.
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -89,6 +179,7 @@ impl From<SessionConsumerRosterRejection> for BackendRejection {
             SessionConsumerRosterRejection::AggregateBytesFull => Self::AggregateBytesFull,
             SessionConsumerRosterRejection::LiveFull => Self::LiveFull,
             SessionConsumerRosterRejection::HistoryFull => Self::HistoryFull,
+            SessionConsumerRosterRejection::RecordAlreadyExists => Self::RecordAlreadyExists,
             SessionConsumerRosterRejection::Malformed
             | SessionConsumerRosterRejection::Capability
             | SessionConsumerRosterRejection::Conflict => Self::TerminalConflict,
@@ -236,6 +327,44 @@ enum AdmissionResponseWire {
     },
 }
 
+/// Disjoint `/4` admission response envelope. The fields intentionally
+/// mirror V1 where the application response is the same, but its Postcard
+/// enum lives behind a distinct framed domain and its provenance can only be
+/// decoded as the V2 carrier.
+#[derive(Serialize, Deserialize)]
+enum AdmissionResponseWireV2 {
+    Fresh {
+        scope: [u8; 32],
+        registration: RegistrationWire,
+        admission_provenance: Vec<u8>,
+    },
+    Replayed {
+        scope: [u8; 32],
+    },
+    PollAdmitted {
+        scope: [u8; 32],
+        registration: RegistrationWire,
+        admission: Vec<u8>,
+        admission_provenance: Vec<u8>,
+    },
+    Terminal {
+        scope: [u8; 32],
+        registration: RegistrationWire,
+        admission: Vec<u8>,
+        committed: Vec<u8>,
+        admission_provenance: Vec<u8>,
+    },
+    Compacted {
+        scope: [u8; 32],
+        history_epoch: u64,
+        tombstone: Vec<u8>,
+    },
+    Reject {
+        scope: [u8; 32],
+        rejection: SessionConsumerRosterRejection,
+    },
+}
+
 #[derive(Serialize, Deserialize)]
 struct TerminalRequestWire {
     scope: [u8; 32],
@@ -244,6 +373,20 @@ struct TerminalRequestWire {
     authority: AuthorityWire,
     record: Vec<u8>,
     proof_bundle: Vec<u8>,
+    terminal_evidence: Vec<u8>,
+}
+
+/// V2 terminal requests carry retained V2 admission provenance and generic
+/// executor evidence only. A client must never send a voter TransportIngress
+/// attestation, a V1 executor bundle, or a V1 terminal evidence wrapper.
+#[derive(Serialize, Deserialize)]
+struct TerminalRequestWireV2 {
+    scope: [u8; 32],
+    binding: RequestBindingKey,
+    registration: RegistrationWire,
+    authority: AuthorityWire,
+    record: Vec<u8>,
+    admission_provenance: Vec<u8>,
     terminal_evidence: Vec<u8>,
 }
 
@@ -274,6 +417,33 @@ enum TerminalResponseWire {
     },
 }
 
+/// Disjoint `/4` terminal response envelope. It intentionally mirrors the
+/// terminal decision shape while using an independent enum, frame magic, and
+/// domain so a frozen `/3` response cannot be decoded after `/4` negotiation.
+#[derive(Serialize, Deserialize)]
+enum TerminalResponseWireV2 {
+    Terminalized {
+        scope: [u8; 32],
+        committed: Vec<u8>,
+    },
+    Replayed {
+        scope: [u8; 32],
+        committed: Vec<u8>,
+    },
+    Admitted {
+        scope: [u8; 32],
+    },
+    Compacted {
+        scope: [u8; 32],
+        history_epoch: u64,
+        tombstone: Vec<u8>,
+    },
+    Reject {
+        scope: [u8; 32],
+        rejection: SessionConsumerRosterRejection,
+    },
+}
+
 /// Reconstruct the exact opaque PollAdmit request capsule commitment carried
 /// by a root-certified ingress statement. This has no provider or wall-clock
 /// dependency and is shared by deterministic SQLite apply/followers.
@@ -287,6 +457,23 @@ pub(crate) fn roster_poll_admit_ingress_capsule_commitment(
         authority: authority.into(),
     };
     roster_ingress_capsule_commitment(1, &encode_admission_request(&wire)?).map_err(|_| ())
+}
+
+/// Reconstruct the exact `/4` PollAdmit capsule commitment. The V1 helper
+/// above is frozen and must never authenticate an `/4` frame.
+pub(crate) fn roster_poll_admit_ingress_capsule_commitment_v2(
+    admission: &Admission,
+    authority: &AuthorityBinding,
+) -> Result<[u8; 32], ()> {
+    if admission.profile() != crate::fenced_mutation_roster::Profile::v2() {
+        return Err(());
+    }
+    let wire = AdmissionRequestWire::Register {
+        scope: authority.ingress_scope().digest(),
+        admission: admission.to_canonical_bytes().map_err(|_| ())?,
+        authority: authority.into(),
+    };
+    roster_ingress_capsule_commitment(1, &encode_admission_request_v2(&wire)?).map_err(|_| ())
 }
 
 /// Reconstruct the exact opaque Terminalize request capsule commitment
@@ -314,6 +501,33 @@ pub(crate) fn roster_terminal_ingress_capsule_commitment(
     roster_ingress_capsule_commitment(4, &encode_terminal_request(&wire)?).map_err(|_| ())
 }
 
+/// Reconstruct the `/4` terminal capsule commitment from only Profile V2
+/// carriers.  The frozen V1 helper remains intentionally separate: accepting
+/// a V2 proof through it would make the carrier choice depend on decode order.
+pub(crate) fn roster_terminal_ingress_capsule_commitment_v2(
+    binding: RequestBindingKey,
+    registration: BackendRegistration,
+    authority: &AuthorityBinding,
+    terminal: &TerminalRecord,
+    admission: &Admission,
+    admission_provenance: &RosterProfileV2CompactAdmissionProvenanceV1,
+    terminal_evidence: &RosterCompactTerminalEvidenceV2,
+) -> Result<[u8; 32], ()> {
+    if admission.profile() != crate::fenced_mutation_roster::Profile::v2() {
+        return Err(());
+    }
+    let wire = TerminalRequestWireV2 {
+        scope: authority.ingress_scope().digest(),
+        binding,
+        registration: RegistrationWire::from_registration(registration),
+        authority: authority.into(),
+        record: terminal.to_canonical_bytes(admission).map_err(|_| ())?,
+        admission_provenance: admission_provenance.canonical_bytes().map_err(|_| ())?,
+        terminal_evidence: terminal_evidence.canonical_bytes().map_err(|_| ())?,
+    };
+    roster_ingress_capsule_commitment(4, &encode_terminal_request_v2(&wire)?).map_err(|_| ())
+}
+
 fn encode_admission_request(wire: &AdmissionRequestWire) -> Result<Vec<u8>, ()> {
     encode_frame(
         ADMISSION_REQUEST_MAGIC,
@@ -330,6 +544,26 @@ fn encode_terminal_request(wire: &TerminalRequestWire) -> Result<Vec<u8>, ()> {
         TERMINAL_REQUEST_DOMAIN,
         wire,
         MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES,
+    )
+    .map_err(|_| ())
+}
+
+fn encode_admission_request_v2(wire: &AdmissionRequestWire) -> Result<Vec<u8>, ()> {
+    encode_frame(
+        ADMISSION_REQUEST_V2_MAGIC,
+        ADMISSION_REQUEST_V2_DOMAIN,
+        wire,
+        MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+    )
+    .map_err(|_| ())
+}
+
+fn encode_terminal_request_v2(wire: &TerminalRequestWireV2) -> Result<Vec<u8>, ()> {
+    encode_frame(
+        TERMINAL_REQUEST_V2_MAGIC,
+        TERMINAL_REQUEST_V2_DOMAIN,
+        wire,
+        MAX_PROTECTED_ROSTER_V2_TERMINAL_CAPSULE_BYTES,
     )
     .map_err(|_| ())
 }
@@ -362,12 +596,32 @@ fn encode_admission_response(wire: &AdmissionResponseWire) -> Result<Vec<u8>, ()
     .map_err(|_| ())
 }
 
+fn encode_admission_response_v2(wire: &AdmissionResponseWireV2) -> Result<Vec<u8>, ()> {
+    encode_frame(
+        ADMISSION_RESPONSE_V2_MAGIC,
+        ADMISSION_RESPONSE_V2_DOMAIN,
+        wire,
+        MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+    )
+    .map_err(|_| ())
+}
+
 fn encode_terminal_response(wire: &TerminalResponseWire) -> Result<Vec<u8>, ()> {
     encode_frame(
         TERMINAL_RESPONSE_MAGIC,
         TERMINAL_RESPONSE_DOMAIN,
         wire,
         MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES,
+    )
+    .map_err(|_| ())
+}
+
+fn encode_terminal_response_v2(wire: &TerminalResponseWireV2) -> Result<Vec<u8>, ()> {
+    encode_frame(
+        TERMINAL_RESPONSE_V2_MAGIC,
+        TERMINAL_RESPONSE_V2_DOMAIN,
+        wire,
+        MAX_PROTECTED_ROSTER_V2_TERMINAL_CAPSULE_BYTES,
     )
     .map_err(|_| ())
 }
@@ -393,6 +647,14 @@ fn admission_provenance_bytes(
         .map_err(|_| ProtectedRosterTransportError)
 }
 
+fn admission_provenance_v2_bytes(
+    provenance: &RosterProfileV2CompactAdmissionProvenanceV1,
+) -> Result<Vec<u8>, ProtectedRosterTransportError> {
+    provenance
+        .canonical_bytes()
+        .map_err(|_| ProtectedRosterTransportError)
+}
+
 fn admission_response_capsule(
     wire: AdmissionResponseWire,
 ) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
@@ -402,11 +664,29 @@ fn admission_response_capsule(
     .map_err(|_| ProtectedRosterTransportError)
 }
 
+fn admission_response_capsule_v2(
+    wire: AdmissionResponseWireV2,
+) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
+    SessionConsumerRosterAdmissionCapsule::new(
+        encode_admission_response_v2(&wire).map_err(|_| ProtectedRosterTransportError)?,
+    )
+    .map_err(|_| ProtectedRosterTransportError)
+}
+
 fn terminal_response_capsule(
     wire: TerminalResponseWire,
 ) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
     SessionConsumerRosterTerminalCapsule::new(
         encode_terminal_response(&wire).map_err(|_| ProtectedRosterTransportError)?,
+    )
+    .map_err(|_| ProtectedRosterTransportError)
+}
+
+fn terminal_response_capsule_v2(
+    wire: TerminalResponseWireV2,
+) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
+    SessionConsumerRosterTerminalCapsule::new(
+        encode_terminal_response_v2(&wire).map_err(|_| ProtectedRosterTransportError)?,
     )
     .map_err(|_| ProtectedRosterTransportError)
 }
@@ -427,6 +707,22 @@ pub(crate) fn encode_admission_fresh_response(
     })
 }
 
+/// Encode the `/4` fresh admission reply with only the Profile V2 compact
+/// provenance carrier. The wire envelope is frozen; the profile-specific
+/// client decoder selects this variant only after `/4` negotiation.
+#[doc(hidden)]
+pub(crate) fn encode_admission_fresh_response_v2(
+    consumer_scope: SessionConsumerScope,
+    registration: BackendRegistration,
+    admission_provenance: &RosterProfileV2CompactAdmissionProvenanceV1,
+) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
+    admission_response_capsule_v2(AdmissionResponseWireV2::Fresh {
+        scope: response_scope(consumer_scope),
+        registration: RegistrationWire::from_registration(registration),
+        admission_provenance: admission_provenance_v2_bytes(admission_provenance)?,
+    })
+}
+
 /// Encode an admitted stable-slot replay without issuing an execution
 /// capability. The consumer must use the authenticated recovery read path.
 #[doc(hidden)]
@@ -434,6 +730,17 @@ pub(crate) fn encode_admission_replayed_response(
     consumer_scope: SessionConsumerScope,
 ) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
     admission_response_capsule(AdmissionResponseWire::Replayed {
+        scope: response_scope(consumer_scope),
+    })
+}
+
+/// Encode a `/4` stable-slot replay. This must not use the frozen `/3`
+/// response envelope, even though its body has no profile-specific fields.
+#[doc(hidden)]
+pub(crate) fn encode_admission_replayed_response_v2(
+    consumer_scope: SessionConsumerScope,
+) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
+    admission_response_capsule_v2(AdmissionResponseWireV2::Replayed {
         scope: response_scope(consumer_scope),
     })
 }
@@ -451,6 +758,25 @@ pub(crate) fn encode_admission_poll_admitted_response(
         registration: RegistrationWire::from_registration(registration),
         admission: admission_bytes_for_consumer_scope(consumer_scope, admission)?,
         admission_provenance: admission_provenance_bytes(admission_provenance)?,
+    })
+}
+
+/// Encode a `/4` live admission response without substituting V1 provenance.
+#[doc(hidden)]
+pub(crate) fn encode_admission_poll_admitted_response_v2(
+    consumer_scope: SessionConsumerScope,
+    registration: BackendRegistration,
+    admission: &Admission,
+    admission_provenance: &RosterProfileV2CompactAdmissionProvenanceV1,
+) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
+    if admission.profile() != crate::fenced_mutation_roster::Profile::v2() {
+        return Err(ProtectedRosterTransportError);
+    }
+    admission_response_capsule_v2(AdmissionResponseWireV2::PollAdmitted {
+        scope: response_scope(consumer_scope),
+        registration: RegistrationWire::from_registration(registration),
+        admission: admission_bytes_for_consumer_scope(consumer_scope, admission)?,
+        admission_provenance: admission_provenance_v2_bytes(admission_provenance)?,
     })
 }
 
@@ -474,6 +800,29 @@ pub(crate) fn encode_admission_terminal_response(
     })
 }
 
+/// Encode a `/4` terminal recovery response with its retained V2 provenance.
+#[doc(hidden)]
+pub(crate) fn encode_admission_terminal_response_v2(
+    consumer_scope: SessionConsumerScope,
+    registration: BackendRegistration,
+    admission: &Admission,
+    committed: &CommittedTerminal,
+    admission_provenance: &RosterProfileV2CompactAdmissionProvenanceV1,
+) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
+    if admission.profile() != crate::fenced_mutation_roster::Profile::v2() {
+        return Err(ProtectedRosterTransportError);
+    }
+    admission_response_capsule_v2(AdmissionResponseWireV2::Terminal {
+        scope: response_scope(consumer_scope),
+        registration: RegistrationWire::from_registration(registration),
+        admission: admission_bytes_for_consumer_scope(consumer_scope, admission)?,
+        committed: committed
+            .to_canonical_bytes(admission)
+            .map_err(|_| ProtectedRosterTransportError)?,
+        admission_provenance: admission_provenance_v2_bytes(admission_provenance)?,
+    })
+}
+
 /// Encode a bounded terminal-compaction recovery response without payload.
 #[doc(hidden)]
 pub(crate) fn encode_admission_compacted_response(
@@ -485,6 +834,27 @@ pub(crate) fn encode_admission_compacted_response(
         return Err(ProtectedRosterTransportError);
     }
     admission_response_capsule(AdmissionResponseWire::Compacted {
+        scope: response_scope(consumer_scope),
+        history_epoch,
+        tombstone: tombstone
+            .to_canonical_bytes()
+            .map_err(|_| ProtectedRosterTransportError)?,
+    })
+}
+
+/// Encode a `/4` compact-admission response with only a Profile V2 compact
+/// tombstone. This is deliberately not a projection of the frozen V1
+/// tombstone: an old carrier must fail frame decoding after `/4` negotiation.
+#[doc(hidden)]
+pub(crate) fn encode_admission_compacted_response_v2(
+    consumer_scope: SessionConsumerScope,
+    history_epoch: u64,
+    tombstone: &TerminalConflictTombstone,
+) -> Result<SessionConsumerRosterAdmissionCapsule, ProtectedRosterTransportError> {
+    if history_epoch == 0 {
+        return Err(ProtectedRosterTransportError);
+    }
+    admission_response_capsule_v2(AdmissionResponseWireV2::Compacted {
         scope: response_scope(consumer_scope),
         history_epoch,
         tombstone: tombstone
@@ -510,6 +880,23 @@ fn encode_terminal_committed_bytes_response(
     terminal_response_capsule(wire)
 }
 
+fn encode_terminal_committed_bytes_response_v2(
+    consumer_scope: SessionConsumerScope,
+    committed: Vec<u8>,
+    replayed: bool,
+) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
+    if committed.is_empty() || committed.len() > MAX_COMMITTED_TERMINAL_CODEC_BYTES {
+        return Err(ProtectedRosterTransportError);
+    }
+    let scope = response_scope(consumer_scope);
+    let wire = if replayed {
+        TerminalResponseWireV2::Replayed { scope, committed }
+    } else {
+        TerminalResponseWireV2::Terminalized { scope, committed }
+    };
+    terminal_response_capsule_v2(wire)
+}
+
 /// Wrap already-canonical committed terminal bytes emitted by the same
 /// terminal consensus apply. The client validates the bytes against its
 /// retained immutable admission before accepting them.
@@ -519,6 +906,15 @@ pub(crate) fn encode_terminal_terminalized_bytes_response(
     committed: Vec<u8>,
 ) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
     encode_terminal_committed_bytes_response(consumer_scope, committed, false)
+}
+
+/// Wrap Profile V2 terminal bytes in the disjoint `/4` response frame.
+#[doc(hidden)]
+pub(crate) fn encode_terminal_terminalized_bytes_response_v2(
+    consumer_scope: SessionConsumerScope,
+    committed: Vec<u8>,
+) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
+    encode_terminal_committed_bytes_response_v2(consumer_scope, committed, false)
 }
 
 /// Wrap a retained canonical terminal for a status read after the caller has
@@ -535,6 +931,17 @@ pub(crate) fn encode_terminal_terminalized_validated_bytes_response(
     encode_terminal_committed_bytes_response(consumer_scope, committed, false)
 }
 
+/// Wrap a validated Profile V2 terminal status reply in the `/4` frame.
+#[doc(hidden)]
+pub(crate) fn encode_terminal_terminalized_validated_bytes_response_v2(
+    consumer_scope: SessionConsumerScope,
+    admission: &Admission,
+    committed: Vec<u8>,
+) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
+    let _ = admission;
+    encode_terminal_committed_bytes_response_v2(consumer_scope, committed, false)
+}
+
 /// Wrap already-canonical bytes for an idempotent terminal replay emitted by
 /// the terminal consensus apply. No record or authority is reconstructed at
 /// the transport boundary.
@@ -546,12 +953,31 @@ pub(crate) fn encode_terminal_replayed_bytes_response(
     encode_terminal_committed_bytes_response(consumer_scope, committed, true)
 }
 
+/// Wrap a Profile V2 terminal replay in the disjoint `/4` response frame.
+#[doc(hidden)]
+pub(crate) fn encode_terminal_replayed_bytes_response_v2(
+    consumer_scope: SessionConsumerScope,
+    committed: Vec<u8>,
+) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
+    encode_terminal_committed_bytes_response_v2(consumer_scope, committed, true)
+}
+
 /// Encode an exact nonterminal terminal-status response.
 #[doc(hidden)]
 pub(crate) fn encode_terminal_admitted_response(
     consumer_scope: SessionConsumerScope,
 ) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
     terminal_response_capsule(TerminalResponseWire::Admitted {
+        scope: response_scope(consumer_scope),
+    })
+}
+
+/// Encode a Profile V2 nonterminal terminal-status reply in the `/4` frame.
+#[doc(hidden)]
+pub(crate) fn encode_terminal_admitted_response_v2(
+    consumer_scope: SessionConsumerScope,
+) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
+    terminal_response_capsule_v2(TerminalResponseWireV2::Admitted {
         scope: response_scope(consumer_scope),
     })
 }
@@ -567,6 +993,27 @@ pub(crate) fn encode_terminal_compacted_response(
         return Err(ProtectedRosterTransportError);
     }
     terminal_response_capsule(TerminalResponseWire::Compacted {
+        scope: response_scope(consumer_scope),
+        history_epoch,
+        tombstone: tombstone
+            .to_canonical_bytes()
+            .map_err(|_| ProtectedRosterTransportError)?,
+    })
+}
+
+/// Encode a Profile V2 compact-terminal response with the independently
+/// framed Profile V2 tombstone. A frozen V1 tombstone has no conversion into
+/// this carrier and cannot reach the `/4` response lane.
+#[doc(hidden)]
+pub(crate) fn encode_terminal_compacted_response_v2(
+    consumer_scope: SessionConsumerScope,
+    history_epoch: u64,
+    tombstone: &TerminalConflictTombstone,
+) -> Result<SessionConsumerRosterTerminalCapsule, ProtectedRosterTransportError> {
+    if history_epoch == 0 {
+        return Err(ProtectedRosterTransportError);
+    }
+    terminal_response_capsule_v2(TerminalResponseWireV2::Compacted {
         scope: response_scope(consumer_scope),
         history_epoch,
         tombstone: tombstone
@@ -602,6 +1049,78 @@ pub(crate) fn decode_admission_request_for_scope(
             expect_scope(actual, scope).map_err(|_| ProtectedRosterTransportError)?;
             let admission = decode_admission(&admission, scope, None)
                 .map_err(|_| ProtectedRosterTransportError)?;
+            let authority = authority
+                .into_authority(scope)
+                .map_err(|_| ProtectedRosterTransportError)?;
+            let request = RegistrationRequest::new_with_lease_metadata(
+                admission,
+                authority.owner().clone(),
+                authority.fence(),
+                authority.credential_id(),
+                authority.generation(),
+                authority.acquired_at(),
+                authority.expires_at(),
+            )
+            .map_err(|_| ProtectedRosterTransportError)?;
+            if request.authority() != &authority {
+                return Err(ProtectedRosterTransportError);
+            }
+            Ok(DecodedAdmissionRequest::Register(request))
+        }
+        AdmissionRequestWire::Recover {
+            scope: actual,
+            roster_id,
+            original_owner,
+            original_admission_fence,
+            authority,
+        } => {
+            expect_scope(actual, scope).map_err(|_| ProtectedRosterTransportError)?;
+            let authority = authority
+                .into_authority(scope)
+                .map_err(|_| ProtectedRosterTransportError)?;
+            let request = RecoveryRequest::new(RecoveryRequestInput::new(
+                RecoveryLookup::new(scope, roster_id),
+                original_owner,
+                original_admission_fence,
+                authority,
+            ))
+            .map_err(|_| ProtectedRosterTransportError)?;
+            Ok(DecodedAdmissionRequest::Recover(request))
+        }
+    }
+}
+
+/// Decode only a separately framed `/4` admission request. The caller must
+/// have selected the negotiated V2 profile before this point; this function
+/// never probes the V1 frame as a fallback.
+#[doc(hidden)]
+pub(crate) fn decode_admission_request_for_scope_v2(
+    capsule: &SessionConsumerRosterAdmissionCapsule,
+    consumer_scope: SessionConsumerScope,
+) -> Result<DecodedAdmissionRequest, ProtectedRosterTransportError> {
+    let scope = protected_roster_scope_from_consumer_scope(consumer_scope);
+    let wire: AdmissionRequestWire = decode_frame(
+        capsule.canonical_bytes(),
+        ADMISSION_REQUEST_V2_MAGIC,
+        ADMISSION_REQUEST_V2_DOMAIN,
+        MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+    )
+    .map_err(|_| ProtectedRosterTransportError)?;
+    if encode_admission_request_v2(&wire).ok().as_deref() != Some(capsule.canonical_bytes()) {
+        return Err(ProtectedRosterTransportError);
+    }
+    match wire {
+        AdmissionRequestWire::Register {
+            scope: actual,
+            admission,
+            authority,
+        } => {
+            expect_scope(actual, scope).map_err(|_| ProtectedRosterTransportError)?;
+            let admission = decode_admission(&admission, scope, None)
+                .map_err(|_| ProtectedRosterTransportError)?;
+            if admission.profile() != crate::fenced_mutation_roster::Profile::v2() {
+                return Err(ProtectedRosterTransportError);
+            }
             let authority = authority
                 .into_authority(scope)
                 .map_err(|_| ProtectedRosterTransportError)?;
@@ -716,6 +1235,50 @@ pub(crate) fn decode_terminal_request_for_scope(
     })
 }
 
+/// Decode a `/4` terminal port request after the listener has authenticated
+/// the negotiated Profile V2 ingress. This deliberately decodes only the V2
+/// proof/evidence carriers: callers must never use it as a speculative
+/// fallback for the frozen `/3` lane.
+#[doc(hidden)]
+pub(crate) fn decode_terminal_request_for_scope_v2(
+    capsule: &SessionConsumerRosterTerminalCapsule,
+    consumer_scope: SessionConsumerScope,
+) -> Result<DecodedTerminalRequestV2, ProtectedRosterTransportError> {
+    let scope = protected_roster_scope_from_consumer_scope(consumer_scope);
+    let wire: TerminalRequestWireV2 = decode_frame(
+        capsule.canonical_bytes(),
+        TERMINAL_REQUEST_V2_MAGIC,
+        TERMINAL_REQUEST_V2_DOMAIN,
+        MAX_PROTECTED_ROSTER_V2_TERMINAL_CAPSULE_BYTES,
+    )
+    .map_err(|_| ProtectedRosterTransportError)?;
+    if encode_terminal_request_v2(&wire).ok().as_deref() != Some(capsule.canonical_bytes()) {
+        return Err(ProtectedRosterTransportError);
+    }
+    expect_scope(wire.scope, scope).map_err(|_| ProtectedRosterTransportError)?;
+    Ok(DecodedTerminalRequestV2 {
+        binding: wire.binding,
+        registration: wire.registration,
+        authority: wire
+            .authority
+            .into_authority(scope)
+            .map_err(|_| ProtectedRosterTransportError)?,
+        record: wire.record,
+        admission_provenance: RosterProfileV2CompactAdmissionProvenanceV1::decode_canonical(
+            &wire.admission_provenance,
+        )
+        .map_err(|_| ProtectedRosterTransportError)?
+        .canonical_bytes()
+        .map_err(|_| ProtectedRosterTransportError)?,
+        terminal_evidence: RosterCompactTerminalEvidenceV2::decode_canonical(
+            &wire.terminal_evidence,
+        )
+        .map_err(|_| ProtectedRosterTransportError)?
+        .canonical_bytes()
+        .map_err(|_| ProtectedRosterTransportError)?,
+    })
+}
+
 /// SDK-private terminal request awaiting server-side live admission lookup.
 #[doc(hidden)]
 pub(crate) struct DecodedTerminalRequest {
@@ -814,6 +1377,89 @@ impl DecodedTerminalRequest {
     }
 }
 
+/// SDK-private `/4` terminal request awaiting its exact V2 admission lookup.
+#[doc(hidden)]
+pub(crate) struct DecodedTerminalRequestV2 {
+    binding: RequestBindingKey,
+    registration: RegistrationWire,
+    authority: AuthorityBinding,
+    record: Vec<u8>,
+    admission_provenance: Vec<u8>,
+    terminal_evidence: Vec<u8>,
+}
+
+impl DecodedTerminalRequestV2 {
+    pub(crate) const fn binding(&self) -> RequestBindingKey {
+        self.binding
+    }
+
+    pub(crate) fn registration_parts(&self) -> ([u8; 32], RequestId, [u8; 32]) {
+        (
+            self.registration.handle,
+            self.registration.request_id,
+            self.registration.terminal_slot,
+        )
+    }
+
+    pub(crate) fn authority(&self) -> &AuthorityBinding {
+        &self.authority
+    }
+
+    pub(crate) fn canonical_record(&self) -> &[u8] {
+        &self.record
+    }
+
+    /// Decode exactly the retained V2 admission provenance supplied by the
+    /// executor. The service cross-checks it against durable V2 state before
+    /// constructing the voter-side proof/evidence envelopes.
+    pub(crate) fn admission_provenance(
+        &self,
+    ) -> Result<RosterProfileV2CompactAdmissionProvenanceV1, ProtectedRosterTransportError> {
+        RosterProfileV2CompactAdmissionProvenanceV1::decode_canonical(&self.admission_provenance)
+            .map_err(|_| ProtectedRosterTransportError)
+    }
+
+    pub(crate) fn terminal_evidence(
+        &self,
+    ) -> Result<RosterCompactTerminalEvidenceV2, ProtectedRosterTransportError> {
+        RosterCompactTerminalEvidenceV2::decode_canonical(&self.terminal_evidence)
+            .map_err(|_| ProtectedRosterTransportError)
+    }
+
+    pub(crate) fn terminal_body_commitment(
+        &self,
+    ) -> Result<[u8; 32], ProtectedRosterTransportError> {
+        TerminalRecord::canonical_body_commitment(&self.record)
+            .map_err(|_| ProtectedRosterTransportError)
+    }
+
+    pub(crate) fn into_terminal_request(
+        self,
+        admission: &Admission,
+    ) -> Result<(BackendRegistration, AuthorityBinding, TerminalBody), ProtectedRosterTransportError>
+    {
+        let authority =
+            AuthorityBinding::for_validated_admission(admission, &self.authority, false)
+                .map_err(|_| ProtectedRosterTransportError)?;
+        let registration = self
+            .registration
+            .into_registration(admission)
+            .map_err(|_| ProtectedRosterTransportError)?;
+        if self.binding
+            != admission
+                .binding_key(registration.consensus_parts().1.history_epoch())
+                .map_err(|_| ProtectedRosterTransportError)?
+        {
+            return Err(ProtectedRosterTransportError);
+        }
+        let record = TerminalRecord::from_canonical_bytes(&self.record, admission)
+            .map_err(|_| ProtectedRosterTransportError)?;
+        let body = TerminalBody::from_record(record, admission)
+            .map_err(|_| ProtectedRosterTransportError)?;
+        Ok((registration, authority, body))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +1483,36 @@ mod tests {
             .expect("bounded response wire")
             .first()
             .expect("postcard enum tag")
+    }
+
+    #[test]
+    fn profile_v2_terminal_response_frame_rejects_the_frozen_v1_lane() {
+        let scope = [0xB1; 32];
+        let v1 = encode_terminal_response(&TerminalResponseWire::Admitted { scope })
+            .expect("bounded frozen V1 terminal response");
+        let v2 = encode_terminal_response_v2(&TerminalResponseWireV2::Admitted { scope })
+            .expect("bounded V2 terminal response");
+
+        assert!(
+            decode_frame::<TerminalResponseWireV2>(
+                &v1,
+                TERMINAL_RESPONSE_V2_MAGIC,
+                TERMINAL_RESPONSE_V2_DOMAIN,
+                MAX_PROTECTED_ROSTER_V2_TERMINAL_CAPSULE_BYTES,
+            )
+            .is_err(),
+            "a frozen V1 terminal response cannot enter the /4 encoder contract"
+        );
+        assert!(
+            decode_frame::<TerminalResponseWire>(
+                &v2,
+                TERMINAL_RESPONSE_MAGIC,
+                TERMINAL_RESPONSE_DOMAIN,
+                MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES,
+            )
+            .is_err(),
+            "a /4 terminal response cannot enter the frozen V1 encoder contract"
+        );
     }
 
     #[test]

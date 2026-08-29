@@ -200,19 +200,28 @@ pub use consumer::{
 pub use error::{CapabilityError, LeaseError, StoreError};
 pub use fake::FakeSessionBackend;
 pub use fenced_mutation_roster::{
-    profile_digest as fenced_mutation_roster_profile_digest, roster_executor_evidence_commitment,
-    roster_ingress_capsule_commitment, AdmissionProposal as FencedMutationRosterAdmissionProposal,
-    Error as FencedMutationRosterError,
+    profile_digest as fenced_mutation_roster_profile_digest,
+    profile_v1_digest as fenced_mutation_roster_profile_v1_digest,
+    profile_v2_digest as fenced_mutation_roster_profile_v2_digest,
+    roster_executor_evidence_commitment, roster_ingress_capsule_commitment,
+    AdmissionProposal as FencedMutationRosterAdmissionProposal, Error as FencedMutationRosterError,
     EstablishedMutation as FencedMutationRosterEstablishedMutation,
     Member as FencedMutationRosterMember,
     MemberOperationId as FencedMutationRosterMemberOperationId, Phase as FencedMutationRosterPhase,
     Profile as FencedMutationRosterProfile, RosterAttestationCertificateRoleV1,
     RosterAttestationLeafCertificatePartsV1, RosterAttestationTrustRootIdentityV1,
-    RosterAttestationTrustRootV1, RosterId as FencedMutationRosterId,
-    RosterIngressAttestationSigningInputV1, RosterIngressAttestationV1,
-    CONSUMER_ALPN as FENCED_MUTATION_ROSTER_CONSUMER_ALPN,
+    RosterAttestationTrustRootV1, RosterCompactAdmissionProvenance,
+    RosterCompactAdmissionProvenanceInput, RosterId as FencedMutationRosterId,
+    RosterIngressAttestation, RosterIngressAttestationSigningInputV1,
+    RosterIngressAttestationSigningInputV2, RosterIngressAttestationV1, RosterIngressAttestationV2,
+    RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
+    RosterProfileV2CompactAdmissionProvenanceV1, RosterProfileV2CompactTerminalEvidenceV1,
+    RosterProfileV2ExecutorProofBundleV1, CONSUMER_ALPN as FENCED_MUTATION_ROSTER_CONSUMER_ALPN,
+    CONSUMER_ALPN_V2 as FENCED_MUTATION_ROSTER_CONSUMER_ALPN_V2,
     CONSUMER_REVISION as FENCED_MUTATION_ROSTER_CONSUMER_REVISION,
+    CONSUMER_REVISION_V2 as FENCED_MUTATION_ROSTER_CONSUMER_REVISION_V2,
     FRESH_ROSTER_MEMBERS as FENCED_MUTATION_ROSTER_FRESH_MEMBERS,
+    INITIAL_GENERATION as FENCED_MUTATION_ROSTER_INITIAL_GENERATION,
     MAX_CHECKPOINT_BYTES as FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES,
     MAX_DESCRIPTOR_BYTES as FENCED_MUTATION_ROSTER_MAX_DESCRIPTOR_BYTES,
     MAX_HISTORY_EPOCH as FENCED_MUTATION_ROSTER_MAX_HISTORY_EPOCH,
@@ -223,11 +232,19 @@ pub use fenced_mutation_roster::{
     MAX_RESULT_BYTES as FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES,
     MAX_STATUS_BYTES as FENCED_MUTATION_ROSTER_MAX_STATUS_BYTES,
     MEMBER_OPERATION_ID_BYTES as FENCED_MUTATION_ROSTER_MEMBER_OPERATION_ID_BYTES,
+    OPERATIONAL_TARGET as FENCED_MUTATION_ROSTER_OPERATIONAL_TARGET,
     RECLAIM_BATCH as FENCED_MUTATION_ROSTER_RECLAIM_BATCH,
     ROSTER_ID_BYTES as FENCED_MUTATION_ROSTER_ID_BYTES,
-    SCHEMA_V1 as FENCED_MUTATION_ROSTER_SCHEMA_V1,
+    SCHEMA_V1 as FENCED_MUTATION_ROSTER_SCHEMA_V1, SCHEMA_V2 as FENCED_MUTATION_ROSTER_SCHEMA_V2,
     TERMINAL_RETENTION as FENCED_MUTATION_ROSTER_TERMINAL_RETENTION,
 };
+/// Profile V2's storage descriptor remains part of activation compatibility.
+/// Compact conflict authority itself uses the common profile-aware retention
+/// tombstone and is never exposed through the public composition surface.
+#[doc(hidden)]
+pub use fenced_mutation_roster_storage::protected_roster_v2_storage_descriptor_digest;
+#[doc(hidden)]
+pub use fenced_mutation_roster_transport::protected_roster_v2_transport_compatibility_descriptor_digest as fenced_mutation_roster_profile_v2_transport_compatibility_descriptor_digest;
 pub use fenced_transition::{
     fenced_transition_v2_profile_digest, AtomicFencedTransitionCapability,
     FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,

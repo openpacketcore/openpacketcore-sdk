@@ -13,12 +13,15 @@
 #[cfg(test)]
 use crate::fenced_mutation_roster::MAX_HISTORY_FLOOR_CODEC_BYTES;
 use crate::fenced_mutation_roster::{
-    Admission, IrreversibleHistoryFloor, RequestBindingKey, RosterCompactAdmissionProvenanceV2,
-    RosterCompactTerminalEvidenceV2, RosterExecutorProofBundleV1, RosterIngressAttestationV1,
-    TerminalConflictTombstone, CHARGE_WITNESS_VERSION, MAX_ADMISSION_CODEC_BYTES,
-    MAX_BUSINESS_SESSION_HEADER_BYTES, MAX_CHECKPOINT_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES,
-    MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_HISTORY_EPOCH,
-    MAX_LIVE_ROSTERS, MAX_RESERVED_AND_RETAINED, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
+    decode_frame, encode_frame, Admission, IrreversibleHistoryFloor, RequestBindingKey,
+    RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceV2,
+    RosterExecutorProofBundleV1, RosterIngressAttestationV1, RosterIngressAttestationV2,
+    RosterProfileV2CompactAdmissionProvenanceV1, RosterProfileV2CompactTerminalEvidenceV1,
+    RosterProfileV2ExecutorProofBundleV1, TerminalConflictTombstone, CHARGE_WITNESS_VERSION,
+    MAX_ADMISSION_CODEC_BYTES, MAX_BUSINESS_SESSION_HEADER_BYTES, MAX_CHECKPOINT_BYTES,
+    MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES,
+    MAX_EXECUTOR_PROOF_BUNDLE_BYTES, MAX_HISTORY_EPOCH, MAX_LIVE_ROSTERS,
+    MAX_RESERVED_AND_RETAINED, MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES,
     MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES, MAX_ROSTER_INGRESS_ATTESTATION_BYTES,
     MAX_TOMBSTONE_CODEC_BYTES, PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES, RECLAIM_BATCH,
     STORAGE_CHARGE_LIVE_INDEX_BYTES, STORAGE_CHARGE_LIVE_ROW_BYTES, STORAGE_CHARGE_PAGE_BYTES,
@@ -61,6 +64,25 @@ const MAX_PRODUCTION_RECORD_SNAPSHOT_BYTES: usize = MAX_ADMISSION_CODEC_BYTES
     + 2 * MAX_ROSTER_INGRESS_ATTESTATION_BYTES
     + MAX_BUSINESS_SESSION_COPY_BYTES
     + 512;
+/// V2 has a distinct retained-evidence envelope which binds typed `/4`
+/// ingress and V2 admission provenance. It is never admitted by the frozen
+/// V1 record decoder or its V1 charge accounting.
+const MAX_PRODUCTION_RESERVATION_RECORD_V2_SNAPSHOT_BYTES: usize = MAX_ADMISSION_CODEC_BYTES
+    + MAX_COMMITTED_TERMINAL_CODEC_BYTES
+    + MAX_TOMBSTONE_CODEC_BYTES
+    + MAX_BUSINESS_SESSION_COPY_BYTES
+    + (3 * MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES)
+    + (4 * MAX_ROSTER_INGRESS_ATTESTATION_BYTES)
+    + (2 * MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES)
+    + 512;
+const MAX_PROFILE_V2_COMPACT_TERMINAL_EVIDENCE_BYTES: usize =
+    MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES
+        + MAX_ROSTER_INGRESS_ATTESTATION_BYTES
+        + MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES;
+const MAX_PROFILE_V2_EXECUTOR_PROOF_BUNDLE_BYTES: usize =
+    MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES
+        + (2 * MAX_ROSTER_INGRESS_ATTESTATION_BYTES)
+        + MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES;
 /// The complete V3 stream is bounded in `u64`, rather than `usize` or a
 /// postcard frame length. A valid frozen deployment can legitimately exceed
 /// both a 32-bit postcard frame and a 32-bit process address space.
@@ -112,17 +134,31 @@ pub(crate) struct GlobalChargeBudget {
 #[cfg(test)]
 mod production_tests {
     use super::*;
+    use crate::consensus::SessionConsensusIdentity;
     use crate::fenced_mutation_roster::{
         AdmissionProposal, EstablishedMutation, Member, MemberOperationId, Phase, Profile,
-        RequestId, RosterId, Scope, TerminalRecord, MEMBER_OPERATION_ID_BYTES, ROSTER_ID_BYTES,
+        RequestId, RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+        RosterAttestationLeafCertificateV1, RosterAttestationTrustRootV1,
+        RosterCompactTerminalEvidenceBindingV2, RosterCompactTerminalEvidenceV2,
+        RosterCompactTerminalMemberProjectionV2, RosterCompactTerminalMemberProofPartsV2,
+        RosterCompactTerminalMemberSigningInputV2, RosterId,
+        RosterIngressAttestationSigningInputV1, RosterIngressAttestationSigningInputV2,
+        RosterIngressAttestationV1, RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
+        RosterProfileV2TerminalAttestationSigningInputV1, RosterProviderOperationV1,
+        RosterProviderOutcomeV1, Scope, TerminalRecord, MEMBER_OPERATION_ID_BYTES, ROSTER_ID_BYTES,
     };
     use crate::fenced_mutation_roster_executor::{
         AuthorityBinding, AuthorityLeaseMetadata, BackendRegistration, ConsensusCommitMetadata,
     };
-    use crate::model::{FenceToken, Generation, OwnerId, SessionKey};
+    use crate::model::{FenceToken, Generation, OwnerId, SessionKey, StateType};
     use crate::{SessionKeyType, StableId};
     use bytes::Bytes;
+    use opc_crypto::CryptoEnvelopeV1;
+    use opc_key::{
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+    };
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+    use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 
     fn profile() -> ChargeProfile {
         ChargeProfile::test_profile(16, 8, 6, 3, 2, 2, 1)
@@ -157,8 +193,32 @@ mod production_tests {
         .unwrap()
     }
 
+    fn live_v2(
+        admission: &Admission,
+        epoch: u64,
+        profile: ChargeProfile,
+    ) -> ProductionReservationRecordV2 {
+        let binding = admission.binding_key(epoch).unwrap();
+        let reservation =
+            ProductionAdmissionAbsentBusinessReservationV2::new(admission, binding).unwrap();
+        let (ingress, provenance) = v2_carrier_inputs(admission);
+        ProductionReservationRecord::live_v2_absent_with_provenance_and_ingress(
+            admission,
+            &ingress,
+            &provenance,
+            epoch,
+            reservation,
+            profile,
+        )
+        .unwrap()
+    }
+
     fn empty_witness() -> GlobalChargeWitness {
         GlobalChargeWitness::v1(0, 0, zero_counters())
+    }
+
+    fn vacant(binding: RequestBindingKey) -> ProductionBindingVacancyGuard {
+        ProductionBindingVacancyGuard::from_lookups(binding, None, None).unwrap()
     }
 
     fn aged_maintenance_time() -> ConsensusMaintenanceTimestamp {
@@ -166,6 +226,44 @@ mod production_tests {
             Timestamp::now_utc().add_seconds(2 * 24 * 60 * 60).unwrap(),
         )
         .unwrap()
+    }
+
+    fn compact_v1_terminal(
+        admission: &Admission,
+        epoch: u64,
+        profile: ChargeProfile,
+    ) -> ProductionReservationRecord {
+        let mut record = live(admission, epoch, profile);
+        record
+            .terminalize(&terminal_at(admission, epoch), profile)
+            .unwrap();
+        let at_boundary = record
+            .terminalized_at()
+            .unwrap()
+            .checked_add_retention()
+            .unwrap();
+        record.reclaim_at(at_boundary, profile).unwrap();
+        record
+    }
+
+    fn compact_v2_terminal(
+        admission: &Admission,
+        profile: ChargeProfile,
+    ) -> ProductionReservationRecordV2 {
+        let live = live_v2(admission, 1, profile);
+        let (terminal, evidence, bundle) = v2_terminal_fixture(admission);
+        let mut record = live
+            .prepare_terminalization(&terminal, &bundle, &evidence, profile)
+            .unwrap()
+            .replacement()
+            .clone();
+        let at_boundary = record
+            .terminalized_at()
+            .unwrap()
+            .checked_add_retention()
+            .unwrap();
+        record.reclaim_at(at_boundary, profile).unwrap();
+        record
     }
 
     fn v3_stream(chunks: &[(u8, Vec<u8>)]) -> Vec<u8> {
@@ -588,6 +686,17 @@ mod production_tests {
         fence: FenceToken,
         generation: Generation,
     ) -> Admission {
+        admission_for_authority_in_scope(tenant, identity, owner, fence, generation, [9; 32])
+    }
+
+    fn admission_for_authority_in_scope(
+        tenant: &'static str,
+        identity: u16,
+        owner: OwnerId,
+        fence: FenceToken,
+        generation: Generation,
+        scope: [u8; 32],
+    ) -> Admission {
         let proposal = AdmissionProposal::new(
             Profile::v1(),
             RosterId::from_bytes([7; ROSTER_ID_BYTES]).unwrap(),
@@ -613,12 +722,433 @@ mod production_tests {
         Admission::authenticate(
             proposal,
             key,
-            Scope::from_digest([9; 32]),
+            Scope::from_digest(scope),
             owner,
             fence,
             generation,
         )
         .unwrap()
+    }
+
+    fn absent_predecessor_admission(identity: u16) -> Admission {
+        try_absent_predecessor_admission(identity, Generation::new(1)).unwrap()
+    }
+
+    fn v2_carrier_inputs(
+        admission: &Admission,
+    ) -> (
+        RosterIngressAttestationV2,
+        RosterProfileV2CompactAdmissionProvenanceV1,
+    ) {
+        let root_key = SigningKey::from_bytes((&[0x71; 32]).into()).unwrap();
+        let root = RosterAttestationTrustRootV1::new(
+            [0x72; 32],
+            root_key
+                .verifying_key()
+                .to_sec1_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let ingress_key = SigningKey::from_bytes((&[0x73; 32]).into()).unwrap();
+        let identity = SessionConsensusIdentity::new(
+            crate::consensus::SessionConsensusClusterId::new("v2-storage").unwrap(),
+            crate::consensus::SessionConsensusConfigurationId::from_bytes([0x74; 32]),
+            crate::consensus::SessionConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let at: Timestamp = "2024-01-01T00:00:00Z".parse().unwrap();
+        let ingress_input = RosterIngressAttestationSigningInputV2 {
+            peer_identity_commitment: [0x75; 32],
+            consumer_scope: admission.scope().digest(),
+            request_id: [0x76; 16],
+            operation_tag: 1,
+            canonical_capsule_digest: [0x77; 32],
+            authenticated_at: at.add_seconds(1).unwrap(),
+            peer_certificate_expires_at: at.add_seconds(9).unwrap(),
+            material_generation: 1,
+            handshake_epoch: 1,
+        };
+        let ingress_certificate = attestation_certificate(
+            &root,
+            &root_key,
+            &ingress_key,
+            identity,
+            admission.scope().digest(),
+            [0x78; 32],
+            at,
+        );
+        let ingress = RosterIngressAttestationV2::issue_from_signed_parts(
+            &root,
+            ingress_certificate.clone(),
+            &ingress_input,
+            sign_digest(&ingress_key, ingress_input.digest().unwrap()),
+        )
+        .unwrap();
+        let authority = AuthorityBinding::for_admission(
+            admission,
+            admission.logical_owner().clone(),
+            admission.admission_fence(),
+            AuthorityLeaseMetadata::new(
+                1,
+                admission.expected_generation(),
+                at.add_seconds(1).unwrap(),
+                at.add_seconds(9).unwrap(),
+            ),
+        )
+        .unwrap();
+        let provenance_input =
+            RosterProfileV2CompactAdmissionProvenanceSigningInputV1::for_admission(
+                identity, admission, &authority, &ingress, [0x78; 32],
+            )
+            .unwrap();
+        let provenance = RosterProfileV2CompactAdmissionProvenanceV1::issue_from_signed_parts(
+            &root,
+            ingress_certificate,
+            &provenance_input,
+            sign_digest(&ingress_key, provenance_input.digest().unwrap()),
+        )
+        .unwrap();
+        (ingress, provenance)
+    }
+
+    fn attestation_certificate(
+        root: &RosterAttestationTrustRootV1,
+        root_key: &SigningKey,
+        ingress_key: &SigningKey,
+        identity: SessionConsensusIdentity,
+        scope: [u8; 32],
+        subject: [u8; 32],
+        at: Timestamp,
+    ) -> RosterAttestationLeafCertificatePartsV1 {
+        let mut certificate = RosterAttestationLeafCertificatePartsV1 {
+            root_id: root.root_id(),
+            role: RosterAttestationCertificateRoleV1::TransportIngress,
+            configuration_identity: identity,
+            scope,
+            subject_identity_commitment: subject,
+            leaf_epoch: 1,
+            key_id: [0x79; 32],
+            not_before: at,
+            not_after: at.add_seconds(10).unwrap(),
+            public_key: ingress_key
+                .verifying_key()
+                .to_sec1_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+            root_signature: [0; 64],
+        };
+        certificate.root_signature = sign_digest(
+            root_key,
+            RosterAttestationLeafCertificateV1::signing_digest(&certificate).unwrap(),
+        );
+        certificate
+    }
+
+    fn sign_digest(key: &SigningKey, digest: [u8; 32]) -> [u8; 64] {
+        let signature: Signature = key.sign_prehash(&digest).unwrap();
+        signature.normalize_s().to_bytes().into()
+    }
+
+    fn v2_terminal_fixture(
+        admission: &Admission,
+    ) -> (
+        CommittedTerminal,
+        RosterProfileV2CompactTerminalEvidenceV1,
+        RosterProfileV2ExecutorProofBundleV1,
+    ) {
+        let root_key = SigningKey::from_bytes((&[0x71; 32]).into()).unwrap();
+        let root = RosterAttestationTrustRootV1::new(
+            [0x72; 32],
+            root_key
+                .verifying_key()
+                .to_sec1_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let ingress_key = SigningKey::from_bytes((&[0x73; 32]).into()).unwrap();
+        let executor_key = SigningKey::from_bytes((&[0x7a; 32]).into()).unwrap();
+        let identity = SessionConsensusIdentity::new(
+            crate::consensus::SessionConsensusClusterId::new("v2-storage").unwrap(),
+            crate::consensus::SessionConsensusConfigurationId::from_bytes([0x74; 32]),
+            crate::consensus::SessionConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let at: Timestamp = "2024-01-01T00:00:00Z".parse().unwrap();
+        let (admission_ingress, provenance) = v2_carrier_inputs(admission);
+        let authority = AuthorityBinding::for_admission(
+            admission,
+            admission.logical_owner().clone(),
+            admission.admission_fence(),
+            AuthorityLeaseMetadata::new(
+                1,
+                admission.expected_generation(),
+                at.add_seconds(1).unwrap(),
+                at.add_seconds(9).unwrap(),
+            ),
+        )
+        .unwrap();
+        let binding = admission.binding_key(1).unwrap();
+        let request_id = RequestId::bind(1, admission).unwrap();
+        let registration = BackendRegistration::issue([0x7b; 32], request_id, admission).unwrap();
+        let evidence = vec![0x7c];
+        let terminal_record = TerminalRecord::new(
+            admission,
+            request_id,
+            Phase::Established,
+            admission
+                .members()
+                .iter()
+                .map(|member| {
+                    crate::fenced_mutation_roster::stable_terminal_proof_commitment(
+                        binding,
+                        registration,
+                        admission,
+                        Phase::Established,
+                        member,
+                        RosterProviderOutcomeV1::AppliedExecuted,
+                        crate::fenced_mutation_roster::roster_executor_evidence_commitment(
+                            &evidence,
+                        ),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap();
+        let committed = CommittedTerminal::issue_from_record(
+            registration,
+            admission,
+            &authority,
+            terminal_record.clone(),
+            ConsensusCommitMetadata::issue(1, 2, at.add_seconds(2).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let terminal_input = RosterIngressAttestationSigningInputV2 {
+            peer_identity_commitment: [0x75; 32],
+            consumer_scope: admission.scope().digest(),
+            request_id: [0x7d; 16],
+            operation_tag: 4,
+            canonical_capsule_digest: [0x7e; 32],
+            authenticated_at: at.add_seconds(2).unwrap(),
+            peer_certificate_expires_at: at.add_seconds(9).unwrap(),
+            material_generation: 1,
+            handshake_epoch: 1,
+        };
+        let terminal_ingress = RosterIngressAttestationV2::issue_from_signed_parts(
+            &root,
+            attestation_certificate(
+                &root,
+                &root_key,
+                &ingress_key,
+                identity,
+                admission.scope().digest(),
+                [0x78; 32],
+                at,
+            ),
+            &terminal_input,
+            sign_digest(&ingress_key, terminal_input.digest().unwrap()),
+        )
+        .unwrap();
+        assert_ne!(admission_ingress, terminal_ingress);
+        let (handle, registration_request_id, terminal_slot) = registration.consensus_parts();
+        let input_for = |member: &Member| RosterProfileV2TerminalAttestationSigningInputV1 {
+            profile: Profile::v2(),
+            configuration_identity: identity,
+            certificate_subject_identity_commitment: [0x7f; 32],
+            certificate_role: RosterAttestationCertificateRoleV1::Executor,
+            admission_provenance_commitment: provenance.commitment().unwrap(),
+            binding: binding.to_bytes(),
+            registration_handle: handle,
+            registration_request_id: registration_request_id.to_bytes(),
+            registration_terminal_slot: *terminal_slot.as_bytes(),
+            roster_id: *admission.roster_id().as_bytes(),
+            admission_commitment: admission.body_commitment(),
+            terminal_phase: Phase::Established,
+            terminal_body_commitment: terminal_record.body_commitment(),
+            ordinal: member.ordinal(),
+            member_operation_id: *member.operation_id().as_bytes(),
+            descriptor: member.descriptor().to_vec(),
+            descriptor_commitment: member.descriptor_commitment(),
+            expected_member_version: member.expected_version(),
+            admission_generation: admission.expected_generation().get(),
+            authority_scope: authority.scope().digest(),
+            authority_ingress_scope: authority.ingress_scope().digest(),
+            authority_key_canonical: authority.key().canonical_digest_input(),
+            authority_owner: authority.owner().as_str().as_bytes().to_vec(),
+            authority_fence: authority.fence().get(),
+            authority_credential_id: authority.credential_id(),
+            authority_generation: authority.generation().get(),
+            authority_acquired_at: authority.acquired_at(),
+            authority_expires_at: authority.expires_at(),
+            proof_epoch: 1,
+            provider_operation: RosterProviderOperationV1::Execute,
+            outcome: RosterProviderOutcomeV1::AppliedExecuted,
+            evidence: evidence.clone(),
+        };
+        let compact_binding = RosterCompactTerminalEvidenceBindingV2::from_terminal_v2_input(
+            &provenance,
+            admission.terminal_checkpoint(),
+            admission.terminal_result(),
+            &input_for(&admission.members()[0]),
+        )
+        .unwrap();
+        let certificate_for = |role, subject, key: &SigningKey| {
+            let mut certificate = RosterAttestationLeafCertificatePartsV1 {
+                root_id: root.root_id(),
+                role,
+                configuration_identity: identity,
+                scope: authority.ingress_scope().digest(),
+                subject_identity_commitment: subject,
+                leaf_epoch: 1,
+                key_id: [0x80; 32],
+                not_before: at,
+                not_after: at.add_seconds(10).unwrap(),
+                public_key: key
+                    .verifying_key()
+                    .to_sec1_point(true)
+                    .as_bytes()
+                    .try_into()
+                    .unwrap(),
+                root_signature: [0; 64],
+            };
+            certificate.root_signature = sign_digest(
+                &root_key,
+                RosterAttestationLeafCertificateV1::signing_digest(&certificate).unwrap(),
+            );
+            certificate
+        };
+        let proofs = admission
+            .members()
+            .iter()
+            .zip(terminal_record.proof_commitments())
+            .map(|(member, stable)| {
+                let projection = RosterCompactTerminalMemberProjectionV2::from_terminal_v2_input(
+                    &input_for(member),
+                    *stable,
+                )
+                .unwrap();
+                let provider_certificate = certificate_for(
+                    RosterAttestationCertificateRoleV1::Provider,
+                    [0x81; 32],
+                    &executor_key,
+                );
+                let provider = RosterAttestationLeafCertificateV1::issue_from_signed_parts(
+                    &root,
+                    provider_certificate.clone(),
+                )
+                .unwrap();
+                RosterCompactTerminalMemberProofPartsV2 {
+                    provider_signature: sign_digest(
+                        &executor_key,
+                        crate::fenced_mutation_roster::provider_receipt_compact_digest(
+                            &compact_binding,
+                            &projection,
+                            &provider,
+                        )
+                        .unwrap(),
+                    ),
+                    signature: sign_digest(
+                        &executor_key,
+                        RosterCompactTerminalMemberSigningInputV2 {
+                            binding: compact_binding.clone(),
+                            member: projection.clone(),
+                        }
+                        .digest()
+                        .unwrap(),
+                    ),
+                    member: projection,
+                    provider_certificate,
+                }
+            })
+            .collect();
+        let compact_evidence = RosterCompactTerminalEvidenceV2::issue_from_signed_parts(
+            &root,
+            certificate_for(
+                RosterAttestationCertificateRoleV1::Executor,
+                [0x7f; 32],
+                &executor_key,
+            ),
+            &compact_binding,
+            proofs,
+        )
+        .unwrap();
+        let terminal_evidence = RosterProfileV2CompactTerminalEvidenceV1::from_verified(
+            provenance.clone(),
+            terminal_ingress.clone(),
+            compact_evidence,
+        )
+        .unwrap();
+        let bundle = RosterProfileV2ExecutorProofBundleV1::from_verified(
+            &provenance,
+            &terminal_ingress,
+            terminal_evidence.clone(),
+        )
+        .unwrap();
+        (committed, terminal_evidence, bundle)
+    }
+
+    fn try_absent_predecessor_admission(
+        identity: u16,
+        generation: Generation,
+    ) -> Result<Admission, crate::fenced_mutation_roster::Error> {
+        let key = SessionKey {
+            tenant: TenantId::from_static("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from(identity.to_be_bytes().to_vec())).unwrap(),
+        };
+        let state_type = StateType::from_static("created");
+        let key_id = KeyId::new("v2-roster-test-key").unwrap();
+        let session_key_digest = crate::hex::encode_lower(&key.digest());
+        let aad = EnvelopeAad::session(
+            key.tenant.clone(),
+            1,
+            SessionAad::new(
+                key.nf_kind.as_str(),
+                session_key_digest,
+                state_type.as_str(),
+                Generation::new(1).get(),
+                FenceToken::new(1).get(),
+                "v2-roster-test-backend",
+            )
+            .unwrap(),
+        );
+        let checkpoint = CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![0x51; 12],
+            aad: serialize_bound_aad(&aad, &key_id).unwrap(),
+            ciphertext_and_tag: vec![0x52; AEAD_TAG_LEN],
+        }
+        .encode()
+        .unwrap();
+        let proposal = AdmissionProposal::new(
+            Profile::v2(),
+            RosterId::from_bytes([8; ROSTER_ID_BYTES]).unwrap(),
+            vec![Member::new(
+                0,
+                MemberOperationId::from_bytes([2; MEMBER_OPERATION_ID_BYTES]).unwrap(),
+                vec![2],
+                1,
+            )
+            .unwrap()],
+            EstablishedMutation::create_checkpoint(state_type),
+            vec![2],
+            checkpoint,
+            vec![4],
+        )
+        .unwrap();
+        Admission::authenticate(
+            proposal,
+            key,
+            Scope::from_digest([10; 32]),
+            OwnerId::new("owner").unwrap(),
+            FenceToken::new(1),
+            generation,
+        )
     }
 
     fn maximum_authority_admission(identity: u16) -> Admission {
@@ -655,6 +1185,26 @@ mod production_tests {
         epoch: u64,
         raft_log_index: u64,
     ) -> CommittedTerminal {
+        terminal_at_with_phase(admission, epoch, raft_log_index, Phase::Aborted)
+    }
+
+    fn established_terminal(admission: &Admission) -> CommittedTerminal {
+        let terminal_sequence = admission
+            .key()
+            .stable_id
+            .as_ref()
+            .iter()
+            .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte))
+            + 1;
+        terminal_at_with_phase(admission, 1, terminal_sequence, Phase::Established)
+    }
+
+    fn terminal_at_with_phase(
+        admission: &Admission,
+        epoch: u64,
+        raft_log_index: u64,
+        phase: Phase,
+    ) -> CommittedTerminal {
         let terminal_sequence = admission
             .key()
             .stable_id
@@ -665,7 +1215,7 @@ mod production_tests {
         let record = TerminalRecord::new(
             admission,
             RequestId::bind(epoch, admission).unwrap(),
-            Phase::Aborted,
+            phase,
             vec![[1; 32]; admission.members().len()],
         )
         .unwrap();
@@ -705,9 +1255,17 @@ mod production_tests {
             live.peak_charge_bytes
                 + u64::try_from(floor.to_canonical_bytes().unwrap().len()).unwrap(),
         );
-        let prepared =
-            prepare_production_admission(None, live, None, None, empty_witness(), budget, profile)
-                .unwrap();
+        let prepared = prepare_production_admission(ProductionAdmissionPreparation {
+            vacancy: &vacant(live.binding),
+            existing: None,
+            record: live,
+            existing_floor: None,
+            existing_retirement_cursor: None,
+            witness: empty_witness(),
+            budget,
+            profile,
+        })
+        .unwrap();
         assert!(prepared.is_insertion());
         assert_eq!(prepared.canonical_rows_validated(), 1);
         assert_eq!(prepared.next_witness().roster.live_reservations, 1);
@@ -766,15 +1324,16 @@ mod production_tests {
         let admission = admission(31);
         let live = live(&admission, 1, profile);
         let terminal = terminal(&admission);
-        let admitted = prepare_production_admission(
-            None,
-            live,
-            None,
-            None,
-            empty_witness(),
-            GlobalChargeBudget::v1(u64::MAX),
+        let admitted = prepare_production_admission(ProductionAdmissionPreparation {
+            vacancy: &vacant(live.binding),
+            existing: None,
+            record: live,
+            existing_floor: None,
+            existing_retirement_cursor: None,
+            witness: empty_witness(),
+            budget: GlobalChargeBudget::v1(u64::MAX),
             profile,
-        )
+        })
         .unwrap();
         let prepared = prepare_production_terminalization(
             admitted.replacement().unwrap(),
@@ -803,6 +1362,697 @@ mod production_tests {
             business.action(),
             ProductionTerminalBusinessAction::AbortedCompareRelease { .. }
         ));
+    }
+
+    #[test]
+    fn v1_business_reservation_rejects_v2_absent_predecessor_create() {
+        let admission = absent_predecessor_admission(33);
+        let present = ProductionBusinessState::present(
+            admission.key().clone(),
+            Generation::new(1),
+            admission.body_commitment().to_vec(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ProductionAdmissionBusinessReservation::new(&admission, present),
+            Err(ReservationError::BusinessCas)
+        );
+    }
+
+    #[test]
+    fn v2_absent_reservation_accepts_only_v2_create_at_generation_one() {
+        let v2_admission = absent_predecessor_admission(34);
+        let binding = v2_admission.binding_key(1).unwrap();
+        let reservation =
+            ProductionAdmissionAbsentBusinessReservationV2::new(&v2_admission, binding).unwrap();
+
+        assert_eq!(reservation.predicate().key(), v2_admission.key());
+        assert_eq!(reservation.predicate().generation(), Generation::new(1));
+        assert_eq!(
+            reservation.admission_commitment(),
+            v2_admission.body_commitment()
+        );
+        assert_eq!(reservation.binding(), binding);
+        let present_predecessor_admission = admission(35);
+        assert!(ProductionAdmissionAbsentBusinessReservationV2::new(
+            &present_predecessor_admission,
+            present_predecessor_admission.binding_key(1).unwrap(),
+        )
+        .is_err());
+        assert!(try_absent_predecessor_admission(36, Generation::new(2)).is_err());
+
+        let other = absent_predecessor_admission(37);
+        assert!(reservation.validate_for(&other, binding).is_err());
+        assert!(reservation
+            .validate_for(&v2_admission, other.binding_key(1).unwrap())
+            .is_err());
+
+        let bytes = reservation.to_canonical_bytes().unwrap();
+        assert_eq!(&bytes[..8], &ABSENT_BUSINESS_RESERVATION_V2_MAGIC);
+        assert_eq!(
+            ProductionAdmissionAbsentBusinessReservationV2::from_canonical_bytes(&bytes).unwrap(),
+            reservation
+        );
+    }
+
+    #[test]
+    fn v2_q1_rejects_malformed_checkpoint_and_binds_the_exact_successor() {
+        let admission = absent_predecessor_admission(41);
+        let binding = admission.binding_key(1).unwrap();
+        let reservation =
+            ProductionAdmissionAbsentBusinessReservationV2::new(&admission, binding).unwrap();
+        assert_eq!(reservation.successor().key(), admission.key());
+        assert_eq!(reservation.successor().generation(), Generation::new(1));
+        let successor = reservation.successor().authoritative_record().unwrap();
+        assert_eq!(successor.key, *admission.key());
+        assert_eq!(successor.owner, *admission.logical_owner());
+        assert_eq!(successor.fence, admission.admission_fence());
+        assert_eq!(successor.generation, Generation::new(1));
+        assert_eq!(
+            successor.state_type,
+            *admission.established_mutation().state_type().unwrap()
+        );
+        assert!(successor.expires_at.is_none());
+
+        let mut altered = reservation.clone();
+        altered.successor.canonical.push(0);
+        assert_eq!(
+            altered.validate_for(&admission, binding),
+            Err(ReservationError::BusinessCas),
+            "Q2 cannot replace the Q1-validated successor",
+        );
+
+        let malformed = AdmissionProposal::new(
+            Profile::v2(),
+            RosterId::from_bytes([0x42; ROSTER_ID_BYTES]).unwrap(),
+            vec![Member::new(
+                0,
+                MemberOperationId::from_bytes([0x43; MEMBER_OPERATION_ID_BYTES]).unwrap(),
+                vec![1],
+                1,
+            )
+            .unwrap()],
+            EstablishedMutation::create_checkpoint(StateType::from_static("created")),
+            vec![1],
+            vec![0x44],
+            vec![2],
+        )
+        .unwrap();
+        let malformed = Admission::authenticate(
+            malformed,
+            admission.key().clone(),
+            admission.scope(),
+            admission.logical_owner().clone(),
+            admission.admission_fence(),
+            Generation::new(1),
+        )
+        .unwrap();
+        assert_eq!(
+            ProductionAdmissionAbsentBusinessReservationV2::new(
+                &malformed,
+                malformed.binding_key(1).unwrap(),
+            ),
+            Err(ReservationError::BusinessCas),
+            "Q1 rejects a noncanonical checkpoint before any provider effect",
+        );
+    }
+
+    #[test]
+    fn v2_established_terminal_is_generation_one_insert_only() {
+        let admission = absent_predecessor_admission(38);
+        let binding = admission.binding_key(1).unwrap();
+        let reservation =
+            ProductionAdmissionAbsentBusinessReservationV2::new(&admission, binding).unwrap();
+        let terminal = established_terminal(&admission);
+        let cas = ProductionTerminalAbsentBusinessCasV2::from_committed(
+            &admission,
+            binding,
+            &terminal,
+            &reservation,
+        )
+        .unwrap();
+
+        match cas.action() {
+            ProductionTerminalAbsentBusinessActionV2::EstablishedCreate {
+                reservation: action_reservation,
+                successor,
+            } => {
+                assert_eq!(action_reservation, &reservation);
+                assert_eq!(successor.key(), admission.key());
+                assert_eq!(successor.generation(), Generation::new(1));
+            }
+            ProductionTerminalAbsentBusinessActionV2::AbortedCompareAbsentRelease { .. } => {
+                panic!("Established V2 create must materialize exactly one successor")
+            }
+        }
+    }
+
+    #[test]
+    fn v2_aborted_terminal_reproves_absence_and_releases_without_a_row() {
+        let admission = absent_predecessor_admission(39);
+        let binding = admission.binding_key(1).unwrap();
+        let reservation =
+            ProductionAdmissionAbsentBusinessReservationV2::new(&admission, binding).unwrap();
+        let cas = ProductionTerminalAbsentBusinessCasV2::from_committed(
+            &admission,
+            binding,
+            &terminal(&admission),
+            &reservation,
+        )
+        .unwrap();
+
+        match cas.action() {
+            ProductionTerminalAbsentBusinessActionV2::AbortedCompareAbsentRelease {
+                reservation: action_reservation,
+            } => {
+                assert_eq!(action_reservation, &reservation);
+                assert_eq!(action_reservation.predicate().key(), admission.key());
+            }
+            ProductionTerminalAbsentBusinessActionV2::EstablishedCreate { .. } => {
+                panic!("Aborted V2 terminal must not materialize a business row")
+            }
+        }
+    }
+
+    #[test]
+    fn v2_live_carrier_round_trips_and_binds_q1_ingress_to_provenance() {
+        let admission = absent_predecessor_admission(40);
+        let binding = admission.binding_key(1).unwrap();
+        let reservation =
+            ProductionAdmissionAbsentBusinessReservationV2::new(&admission, binding).unwrap();
+        let (ingress, provenance) = v2_carrier_inputs(&admission);
+        let record = ProductionReservationRecord::live_v2_absent_with_provenance_and_ingress(
+            &admission,
+            &ingress,
+            &provenance,
+            1,
+            reservation,
+            ChargeProfile::v1(),
+        )
+        .unwrap();
+
+        let canonical = record.to_canonical_bytes().unwrap();
+        assert_eq!(&canonical[..8], &PRODUCTION_RESERVATION_RECORD_V2_MAGIC);
+        let hydrated =
+            ProductionReservationRecordV2::from_canonical_vec_hydrated(canonical.clone()).unwrap();
+        assert_eq!(hydrated.canonical(), canonical);
+        assert_eq!(hydrated.record(), &record);
+        assert_eq!(hydrated.admission(), Some(&admission));
+        assert_eq!(
+            hydrated
+                .admission_ingress()
+                .expect("live V2 row retains Q1 ingress")
+                .canonical_bytes()
+                .unwrap(),
+            ingress.canonical_bytes().unwrap(),
+        );
+        assert_eq!(
+            hydrated.admission_provenance().canonical_bytes().unwrap(),
+            provenance.canonical_bytes().unwrap(),
+        );
+        let mut corrupt = canonical;
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(matches!(
+            ProductionReservationRecordV2::from_canonical_vec_hydrated(corrupt),
+            Err(ReservationError::CanonicalEncoding)
+        ));
+
+        let root_key = SigningKey::from_bytes((&[0x71; 32]).into()).unwrap();
+        let ingress_key = SigningKey::from_bytes((&[0x73; 32]).into()).unwrap();
+        let root = RosterAttestationTrustRootV1::new(
+            [0x72; 32],
+            root_key
+                .verifying_key()
+                .to_sec1_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let identity = SessionConsensusIdentity::new(
+            crate::consensus::SessionConsensusClusterId::new("v2-storage").unwrap(),
+            crate::consensus::SessionConsensusConfigurationId::from_bytes([0x74; 32]),
+            crate::consensus::SessionConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let at: Timestamp = "2024-01-01T00:00:00Z".parse().unwrap();
+        let v1_input = RosterIngressAttestationSigningInputV1 {
+            peer_identity_commitment: [0x75; 32],
+            consumer_scope: admission.scope().digest(),
+            request_id: [0x7a; 16],
+            operation_tag: 1,
+            canonical_capsule_digest: [0x77; 32],
+            authenticated_at: at.add_seconds(1).unwrap(),
+            peer_certificate_expires_at: at.add_seconds(9).unwrap(),
+            material_generation: 1,
+            handshake_epoch: 1,
+        };
+        let v1_ingress = RosterIngressAttestationV1::issue_from_signed_parts(
+            &root,
+            attestation_certificate(
+                &root,
+                &root_key,
+                &ingress_key,
+                identity,
+                admission.scope().digest(),
+                [0x78; 32],
+                at,
+            ),
+            &v1_input,
+            sign_digest(&ingress_key, v1_input.digest().unwrap()),
+        )
+        .unwrap();
+        let mut cross_profile = record;
+        cross_profile.admission_ingress = v1_ingress.canonical_bytes().unwrap();
+        let cross_profile = encode_frame(
+            PRODUCTION_RESERVATION_RECORD_V2_MAGIC,
+            PRODUCTION_RESERVATION_RECORD_V2_DOMAIN,
+            &cross_profile,
+            MAX_PRODUCTION_RECORD_SNAPSHOT_BYTES,
+        )
+        .unwrap();
+        assert!(matches!(
+            ProductionReservationRecordV2::from_canonical_bytes(&cross_profile),
+            Err(ReservationError::SnapshotMismatch)
+        ));
+    }
+
+    #[test]
+    fn v2_distinct_q1_q2_terminalization_round_trips_retained_carrier() {
+        let admission = absent_predecessor_admission(42);
+        let record = live_v2(&admission, 1, ChargeProfile::v1());
+        let (terminal, evidence, bundle) = v2_terminal_fixture(&admission);
+
+        let prepared = record
+            .prepare_terminalization(&terminal, &bundle, &evidence, ChargeProfile::v1())
+            .unwrap();
+        let retained = prepared.replacement();
+        assert!(matches!(
+            retained.state(),
+            ProductionReservationStateV2::Retained
+        ));
+        assert!(retained.absence_reservation().is_none());
+        let canonical = retained.to_canonical_bytes().unwrap();
+        assert_eq!(
+            ProductionReservationRecordV2::from_canonical_bytes(&canonical).unwrap(),
+            *retained
+        );
+        assert_eq!(
+            retained.terminal_evidence_bytes().unwrap(),
+            evidence.canonical_bytes().unwrap()
+        );
+        assert_eq!(
+            retained.terminal_proof_bundle_bytes().unwrap(),
+            bundle.canonical_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn v2_rejects_reusing_q1_ingress_as_q2() {
+        let admission = absent_predecessor_admission(43);
+        let record = live_v2(&admission, 1, ChargeProfile::v1());
+        let (terminal, evidence, _) = v2_terminal_fixture(&admission);
+        let provenance = RosterProfileV2CompactAdmissionProvenanceV1::decode_canonical(
+            record.admission_provenance_bytes(),
+        )
+        .unwrap();
+        let q1_ingress =
+            RosterIngressAttestationV2::decode_canonical(record.admission_ingress_bytes()).unwrap();
+        let reused_evidence = RosterProfileV2CompactTerminalEvidenceV1::from_verified(
+            provenance.clone(),
+            q1_ingress.clone(),
+            evidence.evidence().clone(),
+        )
+        .unwrap();
+        let reused_bundle = RosterProfileV2ExecutorProofBundleV1::from_verified(
+            &provenance,
+            &q1_ingress,
+            reused_evidence.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            record.prepare_terminalization(
+                &terminal,
+                &reused_bundle,
+                &reused_evidence,
+                ChargeProfile::v1(),
+            ),
+            Err(ReservationError::SnapshotMismatch)
+        ));
+    }
+
+    #[test]
+    fn v2_rejects_mismatched_q2_capsule_before_prepared_write() {
+        let admission = absent_predecessor_admission(44);
+        let record = live_v2(&admission, 1, ChargeProfile::v1());
+        let before = record.to_canonical_bytes().unwrap();
+        let (terminal, evidence, _) = v2_terminal_fixture(&admission);
+        let provenance = RosterProfileV2CompactAdmissionProvenanceV1::decode_canonical(
+            record.admission_provenance_bytes(),
+        )
+        .unwrap();
+        let q1_ingress =
+            RosterIngressAttestationV2::decode_canonical(record.admission_ingress_bytes()).unwrap();
+        let substituted = RosterProfileV2CompactTerminalEvidenceV1::from_verified(
+            provenance.clone(),
+            q1_ingress.clone(),
+            evidence.evidence().clone(),
+        )
+        .unwrap();
+        let tampered_bundle = RosterProfileV2ExecutorProofBundleV1::from_verified(
+            &provenance,
+            &q1_ingress,
+            substituted,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            record.prepare_terminalization(
+                &terminal,
+                &tampered_bundle,
+                &evidence,
+                ChargeProfile::v1(),
+            ),
+            Err(ReservationError::SnapshotMismatch)
+        ));
+        assert_eq!(record.to_canonical_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn v2_reclaim_requires_the_exact_retention_boundary_and_preserves_conflict_closure() {
+        let profile = profile();
+        let admission = absent_predecessor_admission(49);
+        let live = live_v2(&admission, 1, profile);
+        let (terminal, evidence, bundle) = v2_terminal_fixture(&admission);
+        let retained = live
+            .prepare_terminalization(&terminal, &bundle, &evidence, profile)
+            .unwrap()
+            .replacement()
+            .clone();
+        let witness = GlobalChargeWitness::empty().with_roster(
+            counters_with_production_record_v2(zero_counters(), &retained, profile).unwrap(),
+        );
+        let boundary = retained
+            .terminalized_at()
+            .unwrap()
+            .checked_add_retention()
+            .unwrap();
+
+        assert!(matches!(
+            prepare_production_v2_reclaim(
+                &retained,
+                ConsensusMaintenanceTimestamp(boundary.0 - 1),
+                witness,
+                GlobalChargeBudget::v1(u64::MAX),
+                profile,
+            ),
+            Err(ReservationError::NotEligible)
+        ));
+
+        let prepared = prepare_production_v2_reclaim(
+            &retained,
+            boundary,
+            witness,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+        let compact = prepared.replacement();
+        assert!(matches!(
+            compact.state(),
+            ProductionReservationStateV2::Tombstone
+        ));
+        assert!(compact.absence_reservation().is_none());
+        assert!(compact.admission().is_err());
+        let tombstone = compact.tombstone().unwrap().unwrap();
+        assert!(tombstone
+            .validate_admission_for_profile(
+                crate::fenced_mutation_roster::Profile::v2(),
+                1,
+                &admission,
+            )
+            .is_ok());
+        assert!(tombstone
+            .validate_admission_for_profile(
+                crate::fenced_mutation_roster::Profile::v2(),
+                1,
+                &absent_predecessor_admission(50),
+            )
+            .is_err());
+        assert!(tombstone
+            .validate_profile_v2_compact_terminal_evidence(
+                &compact.v2_terminal_evidence().unwrap().unwrap(),
+            )
+            .is_ok());
+        assert!(
+            prepared.next_witness().total_charge_bytes().unwrap()
+                < prepared.previous_witness().total_charge_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn v2_compact_tombstone_round_trip_keeps_terminal_conflict_evidence() {
+        let profile = ChargeProfile::v1();
+        let admission = absent_predecessor_admission(51);
+        let live = live_v2(&admission, 1, profile);
+        let (terminal, evidence, bundle) = v2_terminal_fixture(&admission);
+        let retained = live
+            .prepare_terminalization(&terminal, &bundle, &evidence, profile)
+            .unwrap()
+            .replacement()
+            .clone();
+        let witness = GlobalChargeWitness::empty().with_roster(
+            counters_with_production_record_v2(zero_counters(), &retained, profile).unwrap(),
+        );
+        let compact = prepare_production_v2_reclaim(
+            &retained,
+            retained
+                .terminalized_at()
+                .unwrap()
+                .checked_add_retention()
+                .unwrap(),
+            witness,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap()
+        .replacement()
+        .clone();
+
+        let canonical = compact.to_canonical_bytes().unwrap();
+        let hydrated =
+            ProductionReservationRecordV2::from_canonical_vec_hydrated(canonical.clone()).unwrap();
+        assert_eq!(hydrated.canonical(), canonical);
+        assert!(hydrated.admission().is_none());
+        assert!(hydrated.admission_ingress().is_none());
+        assert_eq!(
+            hydrated
+                .terminal_evidence()
+                .unwrap()
+                .canonical_bytes()
+                .unwrap(),
+            evidence.canonical_bytes().unwrap(),
+        );
+        let tombstone = compact.tombstone().unwrap().unwrap();
+        let binding = admission.binding_key(1).unwrap();
+        assert!(tombstone
+            .validate_binding_for_profile(crate::fenced_mutation_roster::Profile::v2(), binding)
+            .is_ok());
+        assert!(tombstone
+            .validate_binding_for_profile(crate::fenced_mutation_roster::Profile::v1(), binding)
+            .is_err());
+        assert!(tombstone
+            .validate_profile_v2_compact_terminal_evidence(
+                &compact.v2_terminal_evidence().unwrap().unwrap(),
+            )
+            .is_ok());
+        assert!(hydrated.tombstone().is_some());
+        assert!(hydrated.terminal_evidence().is_some());
+        assert_eq!(
+            hydrated.admission_provenance().canonical_bytes().unwrap(),
+            compact
+                .v2_admission_provenance()
+                .unwrap()
+                .canonical_bytes()
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn v2_q1_reserves_shared_witness_peak_and_rejects_without_effect() {
+        let profile = profile();
+        let v1 = live(&admission(45), 1, profile);
+        let v2 = live_v2(&absent_predecessor_admission(46), 1, profile);
+        let witness = GlobalChargeWitness::v1(
+            0,
+            0,
+            validate_production_snapshot(std::slice::from_ref(&v1), profile).unwrap(),
+        );
+        let required = witness
+            .total_charge_bytes()
+            .unwrap()
+            .checked_add(v2.peak_charge_bytes())
+            .unwrap();
+
+        let unchanged = witness;
+        assert!(matches!(
+            prepare_production_v2_admission_capacity(
+                &v2,
+                witness,
+                GlobalChargeBudget::v1(required - 1),
+                profile,
+            ),
+            Err(ReservationError::BudgetExceeded),
+        ));
+        assert_eq!(witness, unchanged, "a rejected V2 Q1 has no witness effect");
+
+        let prepared = prepare_production_v2_admission_capacity(
+            &v2,
+            witness,
+            GlobalChargeBudget::v1(required),
+            profile,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.next_witness().roster.live_reservations,
+            witness.roster.live_reservations + 1
+        );
+        assert_eq!(
+            prepared.next_witness().roster.retained_and_live_bindings,
+            witness.roster.retained_and_live_bindings + 1
+        );
+        assert_eq!(
+            validate_production_snapshot_combined_witness(
+                std::slice::from_ref(&v1),
+                std::slice::from_ref(&v2),
+                prepared.next_witness(),
+                GlobalChargeBudget::v1(required),
+                profile,
+            )
+            .unwrap(),
+            prepared.next_witness().roster,
+        );
+
+        let mut tampered = prepared.next_witness();
+        tampered.roster.live_reservations += 1;
+        assert_eq!(
+            validate_production_snapshot_combined_witness(
+                std::slice::from_ref(&v1),
+                std::slice::from_ref(&v2),
+                tampered,
+                GlobalChargeBudget::v1(required),
+                profile,
+            ),
+            Err(ReservationError::WitnessMismatch),
+        );
+    }
+
+    #[test]
+    fn v2_combined_snapshot_rejects_binding_alias_and_preserves_key_isolation() {
+        let profile = profile();
+        let first = live_v2(&absent_predecessor_admission(47), 1, profile);
+        let second = live_v2(&absent_predecessor_admission(48), 1, profile);
+        assert_ne!(
+            first.absence_reservation().unwrap().predicate().key(),
+            second.absence_reservation().unwrap().predicate().key(),
+        );
+        assert!(
+            validate_production_snapshot_combined(&[], &[first.clone(), second], profile,).is_ok()
+        );
+        assert_eq!(
+            validate_production_snapshot_combined(&[], &[first.clone(), first], profile),
+            Err(ReservationError::Duplicate),
+        );
+    }
+
+    #[test]
+    fn binding_vacancy_requires_both_profile_tables_to_be_absent() {
+        let profile = profile();
+        let v1 = live(&admission(52), 1, profile);
+        let mut v2 = live_v2(&absent_predecessor_admission(53), 1, profile);
+        v2.binding = v1.binding;
+
+        assert!(matches!(
+            ProductionBindingVacancyGuard::from_lookups(v1.binding, Some(&v1), None),
+            Err(ReservationError::Duplicate)
+        ));
+        assert!(matches!(
+            ProductionBindingVacancyGuard::from_lookups(v1.binding, None, Some(&v2)),
+            Err(ReservationError::Duplicate)
+        ));
+
+        let wrong = vacant(v1.binding);
+        let other = live(&admission(54), 1, profile);
+        assert!(matches!(
+            prepare_production_admission(ProductionAdmissionPreparation {
+                vacancy: &wrong,
+                existing: None,
+                record: other,
+                existing_floor: None,
+                existing_retirement_cursor: None,
+                witness: empty_witness(),
+                budget: GlobalChargeBudget::v1(u64::MAX),
+                profile,
+            }),
+            Err(ReservationError::SnapshotMismatch)
+        ));
+
+        let v2 = live_v2(&absent_predecessor_admission(55), 1, profile);
+        let prepared = prepare_production_v2_admission_with_floor(
+            &vacant(v2.binding()),
+            &v2,
+            None,
+            None,
+            empty_witness(),
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.floor_cas().key(),
+            ProductionFloorKey::from_binding(v2.binding()).unwrap()
+        );
+    }
+
+    #[test]
+    fn mixed_reclaim_rows_expose_only_their_exact_profile_carriers() {
+        let profile = profile();
+        let v1 = live(&admission(56), 1, profile);
+        let v2 = live_v2(&absent_predecessor_admission(57), 1, profile);
+
+        let v1_update = ProductionMixedReclaimRow::V1 {
+            expected: Box::new(v1.clone()),
+            replacement: Box::new(v1.clone()),
+        };
+        assert_eq!(v1_update.v1_replacement(), Some((&v1, &v1)));
+        assert_eq!(v1_update.v1_expected_row(), Some(&v1));
+        assert_eq!(v1_update.v1_replacement_row(), Some(&v1));
+        assert!(v1_update.v2_replacement().is_none());
+        assert!(v1_update.v1_delete().is_none());
+
+        let v2_update = ProductionMixedReclaimRow::V2 {
+            expected: Box::new(v2.clone()),
+            replacement: Box::new(v2.clone()),
+        };
+        assert_eq!(v2_update.v2_replacement(), Some((&v2, &v2)));
+        assert_eq!(v2_update.v2_expected_row(), Some(&v2));
+        assert_eq!(v2_update.v2_replacement_row(), Some(&v2));
+        assert!(v2_update.v1_replacement().is_none());
+        assert!(v2_update.v2_delete().is_none());
+
+        let v1_delete = ProductionMixedReclaimRow::DeleteV1(Box::new(v1.clone()));
+        assert_eq!(v1_delete.v1_delete(), Some(&v1));
+        assert_eq!(v1_delete.v1_expected_row(), Some(&v1));
+        assert!(v1_delete.v1_replacement_row().is_none());
+        assert!(v1_delete.v2_delete().is_none());
+
+        let v2_delete = ProductionMixedReclaimRow::DeleteV2(Box::new(v2.clone()));
+        assert_eq!(v2_delete.v2_delete(), Some(&v2));
+        assert_eq!(v2_delete.v2_expected_row(), Some(&v2));
+        assert!(v2_delete.v2_replacement_row().is_none());
+        assert!(v2_delete.v1_delete().is_none());
     }
 
     #[test]
@@ -958,15 +2208,16 @@ mod production_tests {
                 - 1,
         );
         assert!(matches!(
-            prepare_production_admission(
-                None,
-                record.clone(),
-                None,
-                None,
-                empty_witness(),
-                short,
-                profile
-            ),
+            prepare_production_admission(ProductionAdmissionPreparation {
+                vacancy: &vacant(record.binding),
+                existing: None,
+                record: record.clone(),
+                existing_floor: None,
+                existing_retirement_cursor: None,
+                witness: empty_witness(),
+                budget: short,
+                profile,
+            }),
             Err(ReservationError::BudgetExceeded)
         ));
         let unknown = GlobalChargeWitness {
@@ -974,15 +2225,16 @@ mod production_tests {
             ..empty_witness()
         };
         assert!(matches!(
-            prepare_production_admission(
-                None,
+            prepare_production_admission(ProductionAdmissionPreparation {
+                vacancy: &vacant(record.binding),
+                existing: None,
                 record,
-                None,
-                None,
-                unknown,
-                GlobalChargeBudget::v1(u64::MAX),
-                profile
-            ),
+                existing_floor: None,
+                existing_retirement_cursor: None,
+                witness: unknown,
+                budget: GlobalChargeBudget::v1(u64::MAX),
+                profile,
+            }),
             Err(ReservationError::UnknownWitnessVersion)
         ));
     }
@@ -1127,15 +2379,16 @@ mod production_tests {
             durable_epoch_bindings: MAX_RESERVED_AND_RETAINED - 1,
             ..zero_counters()
         };
-        let at_boundary = prepare_production_admission(
-            None,
-            record.clone(),
-            None,
-            None,
-            GlobalChargeWitness::v1(0, 0, boundary),
-            GlobalChargeBudget::v1(u64::MAX),
+        let at_boundary = prepare_production_admission(ProductionAdmissionPreparation {
+            vacancy: &vacant(record.binding),
+            existing: None,
+            record: record.clone(),
+            existing_floor: None,
+            existing_retirement_cursor: None,
+            witness: GlobalChargeWitness::v1(0, 0, boundary),
+            budget: GlobalChargeBudget::v1(u64::MAX),
             profile,
-        )
+        })
         .unwrap();
         assert_eq!(
             at_boundary
@@ -1149,12 +2402,13 @@ mod production_tests {
             MAX_RESERVED_AND_RETAINED
         );
         assert!(matches!(
-            prepare_production_admission(
-                None,
-                record.clone(),
-                Some(floor),
-                None,
-                GlobalChargeWitness::v1(
+            prepare_production_admission(ProductionAdmissionPreparation {
+                vacancy: &vacant(record.binding),
+                existing: None,
+                record: record.clone(),
+                existing_floor: Some(floor),
+                existing_retirement_cursor: None,
+                witness: GlobalChargeWitness::v1(
                     0,
                     0,
                     AggregateCounters {
@@ -1163,18 +2417,19 @@ mod production_tests {
                         ..zero_counters()
                     },
                 ),
-                GlobalChargeBudget::v1(u64::MAX),
+                budget: GlobalChargeBudget::v1(u64::MAX),
                 profile,
-            ),
+            }),
             Err(ReservationError::BindingLimit)
         ));
         assert!(matches!(
-            prepare_production_admission(
-                None,
+            prepare_production_admission(ProductionAdmissionPreparation {
+                vacancy: &vacant(record.binding),
+                existing: None,
                 record,
-                Some(floor),
-                None,
-                GlobalChargeWitness::v1(
+                existing_floor: Some(floor),
+                existing_retirement_cursor: None,
+                witness: GlobalChargeWitness::v1(
                     0,
                     0,
                     AggregateCounters {
@@ -1182,21 +2437,22 @@ mod production_tests {
                         ..zero_counters()
                     },
                 ),
-                GlobalChargeBudget::v1(u64::MAX),
+                budget: GlobalChargeBudget::v1(u64::MAX),
                 profile,
-            ),
+            }),
             Err(ReservationError::DurableBindingLimit)
         ));
 
         let floor_limited_admission = admission(u16::MAX - 2);
         let floor_limited_record = live(&floor_limited_admission, 1, profile);
         assert!(matches!(
-            prepare_production_admission(
-                None,
-                floor_limited_record,
-                None,
-                None,
-                GlobalChargeWitness::v1(
+            prepare_production_admission(ProductionAdmissionPreparation {
+                vacancy: &vacant(floor_limited_record.binding),
+                existing: None,
+                record: floor_limited_record,
+                existing_floor: None,
+                existing_retirement_cursor: None,
+                witness: GlobalChargeWitness::v1(
                     0,
                     0,
                     AggregateCounters {
@@ -1204,9 +2460,9 @@ mod production_tests {
                         ..zero_counters()
                     },
                 ),
-                GlobalChargeBudget::v1(u64::MAX),
+                budget: GlobalChargeBudget::v1(u64::MAX),
                 profile,
-            ),
+            }),
             Err(ReservationError::FloorLimit)
         ));
     }
@@ -1377,15 +2633,16 @@ mod production_tests {
             business_reservation: None,
             fail_at: None,
         };
-        let admission_tx = prepare_production_admission(
-            None,
-            live,
-            None,
-            None,
-            store.witness,
-            GlobalChargeBudget::v1(u64::MAX),
+        let admission_tx = prepare_production_admission(ProductionAdmissionPreparation {
+            vacancy: &vacant(live.binding),
+            existing: None,
+            record: live,
+            existing_floor: None,
+            existing_retirement_cursor: None,
+            witness: store.witness,
+            budget: GlobalChargeBudget::v1(u64::MAX),
             profile,
-        )
+        })
         .unwrap();
         let stale = admission_tx.clone();
         store.compare_and_apply_production(admission_tx).unwrap();
@@ -1718,6 +2975,226 @@ mod production_tests {
     }
 
     #[test]
+    fn mixed_terminal_retirement_releases_a_v1_only_empty_final_partition() {
+        let profile = profile();
+        let record = compact_v1_terminal(&admission(145), 1, profile);
+        let floor = IrreversibleHistoryFloor::initial(record.binding()).unwrap();
+        let counters = counters_with_production_floor(
+            counters_with_production_record(zero_counters(), &record, profile).unwrap(),
+            floor,
+        )
+        .unwrap();
+        let witness = GlobalChargeWitness::v1(0, 0, counters);
+        let partition = ProductionMixedTerminalRetirementPartition::new_with_partition_empty_after(
+            floor, None, 1, true, true,
+        )
+        .unwrap();
+
+        let prepared = prepare_production_mixed_terminal_retirement(
+            &[ProductionMixedTerminalRetirementSelection::V1(&record)],
+            &[partition],
+            witness,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.floor_actions().len(), 1);
+        assert_eq!(prepared.floor_actions()[0].floor().expected(), Some(floor));
+        assert_eq!(prepared.floor_actions()[0].floor().replacement(), None);
+        assert_eq!(prepared.floor_actions()[0].cursor().replacement(), None);
+        assert_eq!(prepared.next_witness().roster.durable_epoch_bindings(), 0);
+        assert_eq!(prepared.next_witness().roster.floor_count(), 0);
+    }
+
+    #[test]
+    fn mixed_terminal_retirement_releases_one_shared_empty_v1_v2_partition() {
+        let profile = profile();
+        let v1_admission = admission_for_authority_in_scope(
+            "tenant",
+            146,
+            OwnerId::new("owner").unwrap(),
+            FenceToken::new(1),
+            Generation::new(1),
+            [10; 32],
+        );
+        let v1 = compact_v1_terminal(&v1_admission, 1, profile);
+        let v2 = compact_v2_terminal(&absent_predecessor_admission(147), profile);
+        let floor = IrreversibleHistoryFloor::initial(v1.binding()).unwrap();
+        assert_eq!(
+            ProductionFloorKey::from_binding(v2.binding()).unwrap(),
+            ProductionFloorKey::from_floor(floor).unwrap()
+        );
+        let counters = counters_with_production_floor(
+            counters_with_production_record_v2(
+                counters_with_production_record(zero_counters(), &v1, profile).unwrap(),
+                &v2,
+                profile,
+            )
+            .unwrap(),
+            floor,
+        )
+        .unwrap();
+        let witness = GlobalChargeWitness::v1(0, 0, counters);
+        let partition = ProductionMixedTerminalRetirementPartition::new_with_partition_empty_after(
+            floor, None, 1, true, true,
+        )
+        .unwrap();
+
+        let prepared = prepare_production_mixed_terminal_retirement(
+            &[
+                ProductionMixedTerminalRetirementSelection::V2(&v2),
+                ProductionMixedTerminalRetirementSelection::V1(&v1),
+            ],
+            &[partition],
+            witness,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.rows().len(), 2);
+        assert!(prepared.rows()[0].v2_delete().is_some());
+        assert!(prepared.rows()[1].v1_delete().is_some());
+        assert_eq!(prepared.floor_actions().len(), 1);
+        assert_eq!(prepared.floor_actions()[0].floor().replacement(), None);
+        assert_eq!(prepared.next_witness().roster.durable_epoch_bindings(), 0);
+        assert_eq!(prepared.next_witness().roster.floor_count(), 0);
+    }
+
+    #[test]
+    fn mixed_terminal_retirement_preserves_the_floor_for_a_higher_epoch_or_partial_page() {
+        let profile = profile();
+        let retired = compact_v1_terminal(&admission(148), 1, profile);
+        let higher = live(&admission(149), 2, profile);
+        let floor = IrreversibleHistoryFloor::initial(retired.binding()).unwrap();
+        let counters = counters_with_production_floor(
+            counters_with_production_record(
+                counters_with_production_record(zero_counters(), &retired, profile).unwrap(),
+                &higher,
+                profile,
+            )
+            .unwrap(),
+            floor,
+        )
+        .unwrap();
+        let witness = GlobalChargeWitness::v1(0, 0, counters);
+
+        let higher_epoch =
+            ProductionMixedTerminalRetirementPartition::new_with_partition_empty_after(
+                floor, None, 1, true, false,
+            )
+            .unwrap();
+        let advanced = prepare_production_mixed_terminal_retirement(
+            &[ProductionMixedTerminalRetirementSelection::V1(&retired)],
+            &[higher_epoch],
+            witness,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+        assert_eq!(
+            advanced.floor_actions()[0].floor().replacement(),
+            Some(floor.advance_to(1).unwrap())
+        );
+        assert_eq!(advanced.next_witness().roster.durable_epoch_bindings(), 1);
+        assert_eq!(advanced.next_witness().roster.floor_count(), 1);
+
+        let partial = ProductionMixedTerminalRetirementPartition::new_with_partition_empty_after(
+            floor, None, 1, false, false,
+        )
+        .unwrap();
+        let partial = prepare_production_mixed_terminal_retirement(
+            &[ProductionMixedTerminalRetirementSelection::V1(&retired)],
+            &[partial],
+            witness,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+        assert_eq!(
+            partial.floor_actions()[0].floor().replacement(),
+            Some(floor)
+        );
+        assert_eq!(partial.floor_actions()[0].cursor().replacement(), None);
+        assert!(matches!(
+            ProductionMixedTerminalRetirementPartition::new_with_partition_empty_after(
+                floor, None, 1, false, true,
+            ),
+            Err(ReservationError::FloorAdvance)
+        ));
+    }
+
+    #[test]
+    fn mixed_terminal_retirement_global_prefix_never_installs_a_partition_cursor() {
+        let profile = profile();
+        let records = (1..=(RECLAIM_BATCH + 1))
+            .map(|identity| {
+                compact_v1_terminal(&admission(u16::try_from(identity).unwrap()), 1, profile)
+            })
+            .collect::<Vec<_>>();
+        let floor = IrreversibleHistoryFloor::initial(records[0].binding()).unwrap();
+        let counters = counters_with_production_floor(
+            records
+                .iter()
+                .try_fold(zero_counters(), |counters, record| {
+                    counters_with_production_record(counters, record, profile)
+                })
+                .unwrap(),
+            floor,
+        )
+        .unwrap();
+        let witness = GlobalChargeWitness::v1(0, 0, counters);
+        let selections = records
+            .iter()
+            .take(RECLAIM_BATCH)
+            .map(ProductionMixedTerminalRetirementSelection::V1)
+            .collect::<Vec<_>>();
+        let prefix_partition =
+            ProductionMixedTerminalRetirementPartition::new_with_partition_empty_after(
+                floor, None, 1, false, false,
+            )
+            .unwrap();
+
+        let prefix = prepare_production_mixed_terminal_retirement(
+            &selections,
+            &[prefix_partition],
+            witness,
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+
+        assert_eq!(prefix.rows().len(), RECLAIM_BATCH);
+        assert_eq!(prefix.floor_actions().len(), 1);
+        assert_eq!(prefix.floor_actions()[0].floor().replacement(), Some(floor));
+        assert_eq!(prefix.floor_actions()[0].cursor().expected(), None);
+        assert_eq!(prefix.floor_actions()[0].cursor().replacement(), None);
+        assert_eq!(prefix.next_witness().roster.durable_epoch_bindings(), 1);
+        assert_eq!(prefix.next_witness().roster.floor_count(), 1);
+
+        let final_partition =
+            ProductionMixedTerminalRetirementPartition::new_with_partition_empty_after(
+                floor, None, 1, true, true,
+            )
+            .unwrap();
+        let final_page = prepare_production_mixed_terminal_retirement(
+            &[ProductionMixedTerminalRetirementSelection::V1(
+                records.last().unwrap(),
+            )],
+            &[final_partition],
+            prefix.next_witness(),
+            GlobalChargeBudget::v1(u64::MAX),
+            profile,
+        )
+        .unwrap();
+        assert_eq!(final_page.floor_actions()[0].floor().replacement(), None);
+        assert_eq!(final_page.floor_actions()[0].cursor().replacement(), None);
+        assert_eq!(final_page.next_witness().roster.durable_epoch_bindings(), 0);
+        assert_eq!(final_page.next_witness().roster.floor_count(), 0);
+    }
+
+    #[test]
     fn adapter_failure_at_every_stage_rolls_back_admission_row_reservation_floor_and_witness() {
         let profile = profile();
         let admitted = admission(44);
@@ -1728,15 +3205,16 @@ mod production_tests {
             .unwrap()
             .expected
             .clone();
-        let transaction = prepare_production_admission(
-            None,
+        let transaction = prepare_production_admission(ProductionAdmissionPreparation {
+            vacancy: &vacant(record.binding),
+            existing: None,
             record,
-            None,
-            None,
-            empty_witness(),
-            GlobalChargeBudget::v1(u64::MAX),
+            existing_floor: None,
+            existing_retirement_cursor: None,
+            witness: empty_witness(),
+            budget: GlobalChargeBudget::v1(u64::MAX),
             profile,
-        )
+        })
         .unwrap();
 
         for stage in [
@@ -2095,15 +3573,16 @@ mod production_tests {
         let first_floor = IrreversibleHistoryFloor::initial(first.binding).unwrap();
         let second_floor = IrreversibleHistoryFloor::initial(second.binding).unwrap();
         assert!(matches!(
-            prepare_production_admission(
-                None,
-                second,
-                Some(first_floor),
-                None,
-                empty_witness(),
-                GlobalChargeBudget::v1(u64::MAX),
+            prepare_production_admission(ProductionAdmissionPreparation {
+                vacancy: &vacant(second.binding),
+                existing: None,
+                record: second,
+                existing_floor: Some(first_floor),
+                existing_retirement_cursor: None,
+                witness: empty_witness(),
+                budget: GlobalChargeBudget::v1(u64::MAX),
                 profile,
-            ),
+            }),
             Err(ReservationError::FloorAdvance)
         ));
         assert_ne!(first_floor, second_floor);
@@ -2541,18 +4020,19 @@ impl ComponentBytes {
             compact_provenance_bytes,
             tombstone_bytes,
         };
-        result.validate()?;
+        result.validate_with_tombstone_bound(MAX_TOMBSTONE_CODEC_BYTES)?;
         Ok(result)
     }
 
-    fn validate(self) -> Result<(), ReservationError> {
+    fn validate_with_tombstone_bound(self, tombstone_bound: usize) -> Result<(), ReservationError> {
         if self.canonical_admission_bytes > MAX_ADMISSION_CODEC_BYTES
             || self.terminal_record_bytes > MAX_COMMITTED_TERMINAL_CODEC_BYTES
             || self.business_session_copy_bytes > MAX_BUSINESS_SESSION_COPY_BYTES
             || self.composite_receipt_bytes > MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES
             || self.terminal_evidence_envelope_bytes > MAX_TERMINAL_EVIDENCE_ENVELOPE_BYTES
-            || self.compact_provenance_bytes > MAX_COMPACT_PROVENANCE_BYTES
-            || self.tombstone_bytes > MAX_TOMBSTONE_CODEC_BYTES
+            || self.compact_provenance_bytes
+                > MAX_COMPACT_PROVENANCE_BYTES.max(MAX_PROFILE_V2_COMPACT_TERMINAL_EVIDENCE_BYTES)
+            || self.tombstone_bytes > tombstone_bound
         {
             return Err(ReservationError::ComponentBounds);
         }
@@ -2702,6 +4182,196 @@ pub(crate) struct ProductionReservationRecord {
     tombstone_charge_bytes: u64,
 }
 
+/// Structurally disjoint V2 live-admission row for an absent predecessor.
+///
+/// This is deliberately not an optional field on [`ProductionReservationRecord`]:
+/// doing so would alter the frozen V1 Postcard layout and could let a V2
+/// absence reservation enter V1 restart/snapshot validation. SQLite persists
+/// this object through its dedicated V2 admissions/reservation tables.
+///
+/// Its ingress and compact provenance are concretely `/4` values.  A V1
+/// envelope is not an alternate representation here: accepting one would
+/// make a V2 absence predicate durable under V1 authentication semantics.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ProductionReservationRecordV2 {
+    binding: RequestBindingKey,
+    admission: Vec<u8>,
+    admission_ingress: Vec<u8>,
+    admission_provenance: Vec<u8>,
+    terminal: Option<Vec<u8>>,
+    terminal_proof_bundle: Option<Vec<u8>>,
+    terminal_evidence: Option<Vec<u8>>,
+    tombstone: Option<Vec<u8>>,
+    terminalized_at: Option<ConsensusMaintenanceTimestamp>,
+    terminal_sequence: Option<u64>,
+    absence_reservation: Option<ProductionAdmissionAbsentBusinessReservationV2>,
+    state: ProductionReservationStateV2,
+    peak_charge_bytes: u64,
+    retained_charge_bytes: u64,
+    tombstone_charge_bytes: u64,
+}
+
+const PRODUCTION_RESERVATION_RECORD_V2_MAGIC: [u8; 8] = *b"OPCRRV2\0";
+const PRODUCTION_RESERVATION_RECORD_V2_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/reservation-record/v2\0";
+
+/// Digest of V2's disjoint row framing and shared retention contract.
+///
+/// V2 owns only its reservation-record frame and table layout. Its compact
+/// terminal, irreversible floor, and retirement cursor are the common
+/// protected-roster frames, keyed only by `RequestBindingKey` partition.
+/// Literal contract labels keep this descriptor honest without coupling it to
+/// private constants in the roster domain module.
+#[doc(hidden)]
+pub fn protected_roster_v2_storage_descriptor_digest() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"opc/session-store/protected-roster/v2-storage-descriptor/v2\0");
+    hasher.update(PRODUCTION_RESERVATION_RECORD_V2_MAGIC);
+    hasher.update(PRODUCTION_RESERVATION_RECORD_V2_DOMAIN);
+    hasher.update(b"common-terminal-conflict-tombstone/v1\0");
+    hasher.update(b"common-irreversible-history-floor/v1\0");
+    hasher.update(b"common-production-floor-key-cas/v1\0");
+    hasher.update(b"common-production-retirement-cursor-cas/v1\0");
+    hasher.update(b"binding,root-signed-v2-provenance,root-signed-v2-terminal-evidence;shared-floor(scope,tenant-partition,retired-through);shared-cursor(scope,tenant-partition,target-epoch,last-deleted);global-terminal-sequence-horizon\0");
+    hasher.finalize().into()
+}
+
+/// Dedicated V2 row lifecycle with a disjoint compact terminal carrier.
+/// It shares no serialized state field with the V1 Postcard record.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ProductionReservationStateV2 {
+    /// Q1's exact absent-row reservation is still live.
+    Live,
+    /// Q2 retained one exact terminal carrier after atomically releasing Q1.
+    Retained,
+    /// V2 row carrying the common compact conflict tombstone until shared
+    /// irreversible-history retirement removes it.
+    Tombstone,
+}
+
+impl<'de> Deserialize<'de> for ProductionReservationRecordV2 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            binding: RequestBindingKey,
+            admission: BoundedSnapshotBytes<MAX_ADMISSION_CODEC_BYTES>,
+            admission_ingress: BoundedSnapshotBytes<MAX_ROSTER_INGRESS_ATTESTATION_BYTES>,
+            admission_provenance:
+                BoundedSnapshotBytes<MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES>,
+            terminal: Option<BoundedSnapshotBytes<MAX_COMMITTED_TERMINAL_CODEC_BYTES>>,
+            terminal_proof_bundle:
+                Option<BoundedSnapshotBytes<MAX_PROFILE_V2_EXECUTOR_PROOF_BUNDLE_BYTES>>,
+            terminal_evidence:
+                Option<BoundedSnapshotBytes<MAX_PROFILE_V2_COMPACT_TERMINAL_EVIDENCE_BYTES>>,
+            tombstone: Option<BoundedSnapshotBytes<MAX_TOMBSTONE_CODEC_BYTES>>,
+            terminalized_at: Option<ConsensusMaintenanceTimestamp>,
+            terminal_sequence: Option<u64>,
+            absence_reservation: Option<ProductionAdmissionAbsentBusinessReservationV2>,
+            state: ProductionReservationStateV2,
+            peak_charge_bytes: u64,
+            retained_charge_bytes: u64,
+            tombstone_charge_bytes: u64,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            binding: wire.binding,
+            admission: wire.admission.0,
+            admission_ingress: wire.admission_ingress.0,
+            admission_provenance: wire.admission_provenance.0,
+            terminal: wire.terminal.map(|value| value.0),
+            terminal_proof_bundle: wire.terminal_proof_bundle.map(|value| value.0),
+            terminal_evidence: wire.terminal_evidence.map(|value| value.0),
+            tombstone: wire.tombstone.map(|value| value.0),
+            terminalized_at: wire.terminalized_at,
+            terminal_sequence: wire.terminal_sequence,
+            absence_reservation: wire.absence_reservation,
+            state: wire.state,
+            peak_charge_bytes: wire.peak_charge_bytes,
+            retained_charge_bytes: wire.retained_charge_bytes,
+            tombstone_charge_bytes: wire.tombstone_charge_bytes,
+        })
+    }
+}
+
+/// One fully validated Profile-V2 durable roster row together with its exact
+/// framed SQLite bytes. This seals the one-pass decode used by V2 status and
+/// recovery reads: callers can use the authenticated component values without
+/// reparsing the potentially multi-megabyte admission or terminal carrier.
+#[derive(Clone)]
+pub(crate) struct HydratedProductionReservationRecordV2 {
+    record: ProductionReservationRecordV2,
+    canonical: Vec<u8>,
+    admission: Option<Admission>,
+    admission_ingress: Option<RosterIngressAttestationV2>,
+    admission_provenance: RosterProfileV2CompactAdmissionProvenanceV1,
+    committed_terminal: Option<Box<CommittedTerminal>>,
+    committed_canonical: Option<Vec<u8>>,
+    terminal_proof_bundle: Option<RosterProfileV2ExecutorProofBundleV1>,
+    terminal_evidence: Option<RosterProfileV2CompactTerminalEvidenceV1>,
+    tombstone: Option<TerminalConflictTombstone>,
+}
+
+impl HydratedProductionReservationRecordV2 {
+    /// Return the validated durable V2 row projection.
+    pub(crate) const fn record(&self) -> &ProductionReservationRecordV2 {
+        &self.record
+    }
+
+    /// Return the exact framed bytes which were decoded for this row.
+    pub(crate) fn canonical(&self) -> &[u8] {
+        &self.canonical
+    }
+
+    /// Return the decoded admission authenticated with this durable row.
+    pub(crate) const fn admission(&self) -> Option<&Admission> {
+        self.admission.as_ref()
+    }
+
+    /// Return the decoded V2 admission ingress authenticated with this row.
+    pub(crate) const fn admission_ingress(&self) -> Option<&RosterIngressAttestationV2> {
+        self.admission_ingress.as_ref()
+    }
+
+    /// Return the decoded V2 compact admission provenance for this row.
+    pub(crate) const fn admission_provenance(
+        &self,
+    ) -> &RosterProfileV2CompactAdmissionProvenanceV1 {
+        &self.admission_provenance
+    }
+
+    /// Return the retained terminal already decoded during row validation.
+    pub(crate) fn committed_terminal(&self) -> Option<&CommittedTerminal> {
+        self.committed_terminal.as_deref()
+    }
+
+    /// Return the exact original terminal frame retained by this row.
+    pub(crate) fn committed_canonical(&self) -> Option<&[u8]> {
+        self.committed_canonical.as_deref()
+    }
+
+    /// Return the decoded Profile-V2 retained proof bundle.
+    pub(crate) fn terminal_proof_bundle(&self) -> Option<&RosterProfileV2ExecutorProofBundleV1> {
+        self.terminal_proof_bundle.as_ref()
+    }
+
+    /// Return the decoded Profile-V2 compact terminal evidence.
+    pub(crate) fn terminal_evidence(&self) -> Option<&RosterProfileV2CompactTerminalEvidenceV1> {
+        self.terminal_evidence.as_ref()
+    }
+
+    /// Return the common compact tombstone already decoded and validated with
+    /// this V2 row. A recovery verifier can combine it with the retained
+    /// provenance and evidence above without reparsing durable bytes.
+    pub(crate) fn tombstone(&self) -> Option<&TerminalConflictTombstone> {
+        self.tombstone.as_ref()
+    }
+
+    /// Discard read-side hydration after a caller only needs the durable row.
+    pub(crate) fn into_record(self) -> ProductionReservationRecordV2 {
+        self.record
+    }
+}
+
 /// One fully validated durable roster row together with the exact bytes read
 /// from SQLite. Read-side adapters retain this hydration so a status lookup
 /// never reparses its potentially multi-megabyte admission or terminal body.
@@ -2822,6 +4492,27 @@ impl<'de> Deserialize<'de> for ProductionReservationRecord {
 }
 
 impl ProductionReservationRecord {
+    /// Build the dedicated V2 live-admission row for an exact absent
+    /// predecessor. This never creates a V1 business reservation or a
+    /// synthetic authoritative-row value.
+    pub(crate) fn live_v2_absent_with_provenance_and_ingress(
+        admission: &Admission,
+        admission_ingress: &RosterIngressAttestationV2,
+        admission_provenance: &RosterProfileV2CompactAdmissionProvenanceV1,
+        epoch: u64,
+        absence_reservation: ProductionAdmissionAbsentBusinessReservationV2,
+        profile: ChargeProfile,
+    ) -> Result<ProductionReservationRecordV2, ReservationError> {
+        ProductionReservationRecordV2::live_with_provenance_and_ingress(
+            admission,
+            admission_ingress,
+            admission_provenance,
+            epoch,
+            absence_reservation,
+            profile,
+        )
+    }
+
     /// Encode one exact row for a SQLite compare-and-swap.
     pub(crate) fn to_canonical_bytes(&self) -> Result<Vec<u8>, ReservationError> {
         self.validate(ChargeProfile::v1())?;
@@ -3465,6 +5156,1638 @@ impl ProductionReservationRecord {
     }
 }
 
+impl ProductionReservationRecordV2 {
+    fn live_with_provenance_and_ingress(
+        admission: &Admission,
+        admission_ingress: &RosterIngressAttestationV2,
+        admission_provenance: &RosterProfileV2CompactAdmissionProvenanceV1,
+        epoch: u64,
+        absence_reservation: ProductionAdmissionAbsentBusinessReservationV2,
+        profile: ChargeProfile,
+    ) -> Result<Self, ReservationError> {
+        validate_epoch(epoch)?;
+        let admission_bytes = admission
+            .to_canonical_bytes()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let admission_ingress = admission_ingress
+            .canonical_bytes()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let admission_provenance = admission_provenance
+            .canonical_bytes()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let binding = admission
+            .binding_key(epoch)
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        absence_reservation.validate_for(admission, binding)?;
+        let charges = profile.charge(production_components_v2(
+            &admission_bytes,
+            None,
+            None,
+            max_v2_compact_evidence_bytes(),
+        )?)?;
+        Ok(Self {
+            binding,
+            admission: admission_bytes,
+            admission_ingress,
+            admission_provenance,
+            terminal: None,
+            terminal_proof_bundle: None,
+            terminal_evidence: None,
+            tombstone: None,
+            terminalized_at: None,
+            terminal_sequence: None,
+            absence_reservation: Some(absence_reservation),
+            state: ProductionReservationStateV2::Live,
+            peak_charge_bytes: charges.peak,
+            retained_charge_bytes: charges.retained,
+            tombstone_charge_bytes: charges.tombstone,
+        })
+    }
+
+    /// Return the exact V2 live-row binding.
+    pub(crate) const fn binding(&self) -> RequestBindingKey {
+        self.binding
+    }
+
+    /// Return the isolated V2 lifecycle state. SQLite must accept an absence
+    /// reservation only when this is [`ProductionReservationStateV2::Live`].
+    pub(crate) const fn state(&self) -> ProductionReservationStateV2 {
+        self.state
+    }
+
+    /// Return the global terminal sequence retained by V2 Q2.
+    pub(crate) const fn terminal_sequence(&self) -> Option<u64> {
+        self.terminal_sequence
+    }
+
+    /// Return the authenticated terminal time used by deterministic V2
+    /// maintenance selection. It exists only after Q2.
+    pub(crate) const fn terminalized_at(&self) -> Option<ConsensusMaintenanceTimestamp> {
+        self.terminalized_at
+    }
+
+    /// Rehydrate the V2-profile admission provenance retained in every V2
+    /// lifecycle state, including compact tombstones.
+    #[cfg(test)]
+    pub(crate) fn v2_admission_provenance(
+        &self,
+    ) -> Result<RosterProfileV2CompactAdmissionProvenanceV1, ReservationError> {
+        RosterProfileV2CompactAdmissionProvenanceV1::decode_canonical(&self.admission_provenance)
+            .map_err(|_| ReservationError::CanonicalEncoding)
+    }
+
+    /// Rehydrate V2 terminal evidence where Q2 has completed. A tombstone
+    /// retains this typed evidence to keep post-compaction status fail-closed.
+    #[cfg(test)]
+    pub(crate) fn v2_terminal_evidence(
+        &self,
+    ) -> Result<Option<RosterProfileV2CompactTerminalEvidenceV1>, ReservationError> {
+        self.terminal_evidence
+            .as_deref()
+            .map(RosterProfileV2CompactTerminalEvidenceV1::decode_canonical)
+            .transpose()
+            .map_err(|_| ReservationError::CanonicalEncoding)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn peak_charge_bytes(&self) -> u64 {
+        self.peak_charge_bytes
+    }
+
+    /// Rehydrate the exact authenticated V2 admission after canonical row
+    /// validation. This never manufactures an absent predecessor.
+    pub(crate) fn admission(&self) -> Result<Admission, ReservationError> {
+        Admission::from_canonical_bytes(&self.admission)
+            .map_err(|_| ReservationError::CanonicalEncoding)
+    }
+
+    /// Return the sealed canonical admission bytes for the dedicated V2
+    /// admissions table.
+    pub(crate) fn admission_bytes(&self) -> &[u8] {
+        &self.admission
+    }
+
+    /// Return the root-certified admission ingress bytes retained by V2.
+    #[cfg(test)]
+    pub(crate) fn admission_ingress_bytes(&self) -> &[u8] {
+        &self.admission_ingress
+    }
+
+    /// Return the compact admission provenance bytes retained by V2.
+    #[cfg(test)]
+    pub(crate) fn admission_provenance_bytes(&self) -> &[u8] {
+        &self.admission_provenance
+    }
+
+    /// Return the sealed terminal evidence canonical bytes only after Q2 has
+    /// retained the profile-V2 terminal carrier.
+    #[cfg(test)]
+    pub(crate) fn terminal_evidence_bytes(&self) -> Option<&[u8]> {
+        self.terminal_evidence.as_deref()
+    }
+
+    /// Return the sealed V2 proof-bundle canonical bytes retained with Q2.
+    #[cfg(test)]
+    pub(crate) fn terminal_proof_bundle_bytes(&self) -> Option<&[u8]> {
+        self.terminal_proof_bundle.as_deref()
+    }
+
+    /// Return the exact absence reservation Q1 installed atomically.
+    pub(crate) fn absence_reservation(
+        &self,
+    ) -> Option<&ProductionAdmissionAbsentBusinessReservationV2> {
+        self.absence_reservation.as_ref()
+    }
+
+    /// Rehydrate the compact V2 conflict carrier after the full terminal has
+    /// been reclaimed. A malformed compact row is never treated as absence.
+    pub(crate) fn tombstone(&self) -> Result<Option<TerminalConflictTombstone>, ReservationError> {
+        match (self.state, self.tombstone.as_deref()) {
+            (ProductionReservationStateV2::Tombstone, Some(bytes)) => {
+                let tombstone = TerminalConflictTombstone::from_canonical_bytes(bytes)
+                    .map_err(|_| ReservationError::CanonicalEncoding)?;
+                tombstone
+                    .validate_binding_for_profile(
+                        crate::fenced_mutation_roster::Profile::v2(),
+                        self.binding,
+                    )
+                    .map_err(|_| ReservationError::SnapshotMismatch)?;
+                Ok(Some(tombstone))
+            }
+            (ProductionReservationStateV2::Tombstone, None) => Err(ReservationError::StateShape),
+            (_, None) => Ok(None),
+            _ => Err(ReservationError::StateShape),
+        }
+    }
+
+    /// Frame this V2 row under a disjoint prefix; V1 decoders cannot accept
+    /// it as a `ProductionReservationRecord`.
+    pub(crate) fn to_canonical_bytes(&self) -> Result<Vec<u8>, ReservationError> {
+        self.to_canonical_bytes_with_profile(ChargeProfile::v1())
+    }
+
+    fn to_canonical_bytes_with_profile(
+        &self,
+        profile: ChargeProfile,
+    ) -> Result<Vec<u8>, ReservationError> {
+        self.validate(profile)?;
+        encode_frame(
+            PRODUCTION_RESERVATION_RECORD_V2_MAGIC,
+            PRODUCTION_RESERVATION_RECORD_V2_DOMAIN,
+            self,
+            MAX_PRODUCTION_RESERVATION_RECORD_V2_SNAPSHOT_BYTES,
+        )
+        .map_err(|_| ReservationError::CanonicalEncoding)
+    }
+
+    /// Decode and fully revalidate one dedicated V2 row.
+    #[cfg(test)]
+    pub(crate) fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ReservationError> {
+        Self::from_canonical_vec_hydrated(bytes.to_vec())
+            .map(HydratedProductionReservationRecordV2::into_record)
+    }
+
+    /// Decode, validate, and byte-for-byte recanonicalize one dedicated V2
+    /// row while retaining every parsed authenticated component needed by a
+    /// status or recovery read. Unlike [`Self::from_canonical_bytes`], this
+    /// owns the exact durable frame and never invokes validation recursively.
+    pub(crate) fn from_canonical_vec_hydrated(
+        canonical: Vec<u8>,
+    ) -> Result<HydratedProductionReservationRecordV2, ReservationError> {
+        if canonical.len() > MAX_PRODUCTION_RESERVATION_RECORD_V2_SNAPSHOT_BYTES {
+            return Err(ReservationError::ComponentBounds);
+        }
+        let record: Self = decode_frame(
+            &canonical,
+            PRODUCTION_RESERVATION_RECORD_V2_MAGIC,
+            PRODUCTION_RESERVATION_RECORD_V2_DOMAIN,
+            MAX_PRODUCTION_RESERVATION_RECORD_V2_SNAPSHOT_BYTES,
+        )
+        .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let (
+            admission,
+            admission_ingress,
+            admission_provenance,
+            committed_terminal,
+            committed_canonical,
+            terminal_proof_bundle,
+            terminal_evidence,
+            tombstone,
+        ) = record.validate_and_hydrate(ChargeProfile::v1())?;
+        if encode_frame(
+            PRODUCTION_RESERVATION_RECORD_V2_MAGIC,
+            PRODUCTION_RESERVATION_RECORD_V2_DOMAIN,
+            &record,
+            MAX_PRODUCTION_RESERVATION_RECORD_V2_SNAPSHOT_BYTES,
+        )
+        .map_err(|_| ReservationError::CanonicalEncoding)?
+            != canonical
+        {
+            return Err(ReservationError::CanonicalEncoding);
+        }
+        Ok(HydratedProductionReservationRecordV2 {
+            record,
+            canonical,
+            admission,
+            admission_ingress,
+            admission_provenance,
+            committed_terminal,
+            committed_canonical,
+            terminal_proof_bundle,
+            terminal_evidence,
+            tombstone,
+        })
+    }
+
+    /// Build the exact Q2 absent-row CAS from a live V2 admission. This does
+    /// not itself authorize a retained terminal record: callers must use
+    /// [`Self::prepare_terminalization`] with the V2-only terminal carrier.
+    pub(crate) fn terminal_cas(
+        &self,
+        terminal: &CommittedTerminal,
+    ) -> Result<ProductionTerminalAbsentBusinessCasV2, ReservationError> {
+        let admission = Admission::from_canonical_bytes(&self.admission)
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let reservation = self
+            .absence_reservation
+            .as_ref()
+            .filter(|_| self.state == ProductionReservationStateV2::Live)
+            .ok_or(ReservationError::InvalidState)?;
+        ProductionTerminalAbsentBusinessCasV2::from_committed(
+            &admission,
+            self.binding,
+            terminal,
+            reservation,
+        )
+    }
+
+    /// Prepare the one retained V2 terminal carrier and exact Q2 absence CAS.
+    ///
+    /// SQLite must persist `replacement`, apply `business_cas`, and delete
+    /// the exact V2 absence-reservation row in one second consensus mutation.
+    /// The V2 compact envelope binds its ingress and provenance back to this
+    /// live row; V1 evidence cannot reach this transition. The full root,
+    /// authority, registration, and fresh-terminal-ingress cryptographic
+    /// verifier requires consensus-owned inputs and runs before this storage
+    /// preparation path; this layer rechecks only canonical structural and
+    /// exact durable-binding facts.
+    pub(crate) fn prepare_terminalization(
+        &self,
+        terminal: &CommittedTerminal,
+        terminal_proof_bundle: &RosterProfileV2ExecutorProofBundleV1,
+        terminal_evidence: &RosterProfileV2CompactTerminalEvidenceV1,
+        profile: ChargeProfile,
+    ) -> Result<PreparedProductionTerminalizationV2, ReservationError> {
+        self.validate(profile)?;
+        if self.state != ProductionReservationStateV2::Live {
+            return Err(ReservationError::InvalidState);
+        }
+        let admission = Admission::from_canonical_bytes(&self.admission)
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let terminal_bytes = terminal
+            .to_canonical_bytes(&admission)
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        if terminal.record().request_id().history_epoch() != self.binding.history_epoch() {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        let evidence_bytes = terminal_evidence
+            .canonical_bytes()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let proof_bundle_bytes = terminal_proof_bundle
+            .canonical_bytes()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        validate_v2_terminal_evidence(
+            terminal_evidence,
+            &admission,
+            &self.admission_ingress,
+            &self.admission_provenance,
+            terminal.record(),
+        )?;
+        validate_v2_terminal_proof_bundle(
+            terminal_proof_bundle,
+            terminal_evidence,
+            &self.admission_provenance,
+        )?;
+        let business_cas = self.terminal_cas(terminal)?;
+        let compact_bytes = self
+            .admission_provenance
+            .len()
+            .checked_add(evidence_bytes.len())
+            .ok_or(ReservationError::Arithmetic)?;
+        if compact_bytes > max_v2_compact_evidence_bytes() {
+            return Err(ReservationError::ComponentBounds);
+        }
+        let retained = profile.charge(production_components_v2(
+            &self.admission,
+            Some(&terminal_bytes),
+            None,
+            compact_bytes,
+        )?)?;
+        if retained.retained > self.peak_charge_bytes {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        let replacement = Self {
+            binding: self.binding,
+            admission: self.admission.clone(),
+            admission_ingress: self.admission_ingress.clone(),
+            admission_provenance: self.admission_provenance.clone(),
+            terminal: Some(terminal_bytes),
+            terminal_proof_bundle: Some(proof_bundle_bytes),
+            terminal_evidence: Some(evidence_bytes),
+            tombstone: None,
+            terminalized_at: Some(ConsensusMaintenanceTimestamp::from_consensus_timestamp(
+                terminal.commit_metadata().committed_at(),
+            )?),
+            terminal_sequence: Some(terminal.terminal_sequence()),
+            absence_reservation: None,
+            state: ProductionReservationStateV2::Retained,
+            peak_charge_bytes: self.peak_charge_bytes,
+            retained_charge_bytes: retained.retained,
+            tombstone_charge_bytes: retained.tombstone,
+        };
+        replacement.validate(profile)?;
+        Ok(PreparedProductionTerminalizationV2 {
+            replacement,
+            business_cas,
+        })
+    }
+
+    /// Compact an aged V2 terminal without ever restoring the Q1 absence
+    /// reservation. The replacement retains V2's root-signed compact
+    /// provenance and terminal evidence beside the shared conflict tombstone.
+    fn reclaim_at(
+        &mut self,
+        maintenance_time: ConsensusMaintenanceTimestamp,
+        profile: ChargeProfile,
+    ) -> Result<(), ReservationError> {
+        self.validate(profile)?;
+        if self.state != ProductionReservationStateV2::Retained {
+            return Err(ReservationError::InvalidState);
+        }
+        let terminalized_at = self.terminalized_at.ok_or(ReservationError::StateShape)?;
+        if terminalized_at.checked_add_retention()? > maintenance_time {
+            return Err(ReservationError::NotEligible);
+        }
+        let admission = Admission::from_canonical_bytes(&self.admission)
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let terminal = CommittedTerminal::from_canonical_bytes(
+            self.terminal
+                .as_deref()
+                .ok_or(ReservationError::StateShape)?,
+            &admission,
+        )
+        .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let provenance = RosterProfileV2CompactAdmissionProvenanceV1::decode_canonical(
+            &self.admission_provenance,
+        )
+        .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let evidence = RosterProfileV2CompactTerminalEvidenceV1::decode_canonical(
+            self.terminal_evidence
+                .as_deref()
+                .ok_or(ReservationError::StateShape)?,
+        )
+        .map_err(|_| ReservationError::CanonicalEncoding)?;
+        if evidence.provenance() != &provenance {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        let tombstone = TerminalConflictTombstone::from_committed_terminal(&admission, &terminal)
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        tombstone
+            .validate_binding_for_profile(
+                crate::fenced_mutation_roster::Profile::v2(),
+                self.binding,
+            )
+            .map_err(|_| ReservationError::SnapshotMismatch)?;
+        tombstone
+            .validate_profile_v2_compact_terminal_evidence(&evidence)
+            .map_err(|_| ReservationError::SnapshotMismatch)?;
+        let tombstone_bytes = tombstone
+            .to_canonical_bytes()
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+        let compact_bytes = self
+            .admission_provenance
+            .len()
+            .checked_add(self.terminal_evidence.as_ref().map_or(0, Vec::len))
+            .ok_or(ReservationError::Arithmetic)?;
+        let charges = profile.charge(production_components_v2(
+            &[],
+            None,
+            Some(&tombstone_bytes),
+            compact_bytes,
+        )?)?;
+        self.admission.clear();
+        self.admission_ingress.clear();
+        self.terminal = None;
+        self.terminal_proof_bundle = None;
+        self.tombstone = Some(tombstone_bytes);
+        self.absence_reservation = None;
+        self.state = ProductionReservationStateV2::Tombstone;
+        self.peak_charge_bytes = 0;
+        self.retained_charge_bytes = 0;
+        self.tombstone_charge_bytes = charges.tombstone;
+        self.validate(profile)
+    }
+
+    fn validate(&self, profile: ChargeProfile) -> Result<(), ReservationError> {
+        self.validate_and_hydrate(profile).map(|_| ())
+    }
+
+    /// Validate every V2 durable invariant while retaining the decoded
+    /// authenticated pieces needed by a hot status/recovery read.
+    #[allow(clippy::type_complexity)]
+    fn validate_and_hydrate(
+        &self,
+        profile: ChargeProfile,
+    ) -> Result<
+        (
+            Option<Admission>,
+            Option<RosterIngressAttestationV2>,
+            RosterProfileV2CompactAdmissionProvenanceV1,
+            Option<Box<CommittedTerminal>>,
+            Option<Vec<u8>>,
+            Option<RosterProfileV2ExecutorProofBundleV1>,
+            Option<RosterProfileV2CompactTerminalEvidenceV1>,
+            Option<TerminalConflictTombstone>,
+        ),
+        ReservationError,
+    > {
+        validate_epoch(self.binding.history_epoch())?;
+        let admission_provenance = RosterProfileV2CompactAdmissionProvenanceV1::decode_canonical(
+            &self.admission_provenance,
+        )
+        .map_err(|_| ReservationError::CanonicalEncoding)?;
+        validate_v2_provenance_binding(self.binding, &admission_provenance)?;
+        let (admission, admission_ingress) =
+            if self.state == ProductionReservationStateV2::Tombstone {
+                if !self.admission.is_empty() || !self.admission_ingress.is_empty() {
+                    return Err(ReservationError::StateShape);
+                }
+                (None, None)
+            } else {
+                let admission = Admission::from_canonical_bytes(&self.admission)
+                    .map_err(|_| ReservationError::CanonicalEncoding)?;
+                if admission
+                    .binding_key(self.binding.history_epoch())
+                    .map_err(|_| ReservationError::CanonicalEncoding)?
+                    != self.binding
+                    || admission.profile() != crate::fenced_mutation_roster::Profile::v2()
+                {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                let ingress = RosterIngressAttestationV2::decode_canonical(&self.admission_ingress)
+                    .map_err(|_| ReservationError::CanonicalEncoding)?;
+                if admission_provenance.input().ingress != *ingress.signing_input() {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                (Some(admission), Some(ingress))
+            };
+        match self.state {
+            ProductionReservationStateV2::Live => {
+                let admission = admission.as_ref().ok_or(ReservationError::StateShape)?;
+                let admission_ingress = admission_ingress
+                    .as_ref()
+                    .ok_or(ReservationError::StateShape)?;
+                let live = profile.charge(production_components_v2(
+                    &self.admission,
+                    None,
+                    None,
+                    max_v2_compact_evidence_bytes(),
+                )?)?;
+                if self.terminal.is_some()
+                    || self.terminal_proof_bundle.is_some()
+                    || self.terminal_evidence.is_some()
+                    || self.tombstone.is_some()
+                    || self.terminalized_at.is_some()
+                    || self.terminal_sequence.is_some()
+                {
+                    return Err(ReservationError::StateShape);
+                }
+                self.absence_reservation
+                    .as_ref()
+                    .ok_or(ReservationError::StateShape)?
+                    .validate_for(admission, self.binding)?;
+                if self.peak_charge_bytes == live.peak
+                    && self.retained_charge_bytes == live.retained
+                    && self.tombstone_charge_bytes == live.tombstone
+                {
+                    Ok((
+                        Some(admission.clone()),
+                        Some(admission_ingress.clone()),
+                        admission_provenance,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                } else {
+                    Err(ReservationError::SnapshotMismatch)
+                }
+            }
+            ProductionReservationStateV2::Retained => {
+                let admission = admission.as_ref().ok_or(ReservationError::StateShape)?;
+                let admission_ingress = admission_ingress
+                    .as_ref()
+                    .ok_or(ReservationError::StateShape)?;
+                let live = profile.charge(production_components_v2(
+                    &self.admission,
+                    None,
+                    None,
+                    max_v2_compact_evidence_bytes(),
+                )?)?;
+                if self.absence_reservation.is_some() || self.tombstone.is_some() {
+                    return Err(ReservationError::StateShape);
+                }
+                let terminal = self
+                    .terminal
+                    .as_deref()
+                    .ok_or(ReservationError::StateShape)?;
+                let terminal = CommittedTerminal::from_canonical_bytes(terminal, admission)
+                    .map_err(|_| ReservationError::CanonicalEncoding)?;
+                if terminal.record().request_id().history_epoch() != self.binding.history_epoch()
+                    || self.terminal_sequence != Some(terminal.terminal_sequence())
+                    || self.terminalized_at
+                        != Some(ConsensusMaintenanceTimestamp::from_consensus_timestamp(
+                            terminal.commit_metadata().committed_at(),
+                        )?)
+                {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                let terminal_evidence = self
+                    .terminal_evidence
+                    .as_deref()
+                    .ok_or(ReservationError::StateShape)
+                    .and_then(|bytes| {
+                        RosterProfileV2CompactTerminalEvidenceV1::decode_canonical(bytes)
+                            .map_err(|_| ReservationError::CanonicalEncoding)
+                    })?;
+                let terminal_proof_bundle = self
+                    .terminal_proof_bundle
+                    .as_deref()
+                    .ok_or(ReservationError::StateShape)
+                    .and_then(|bytes| {
+                        RosterProfileV2ExecutorProofBundleV1::decode_canonical(bytes)
+                            .map_err(|_| ReservationError::CanonicalEncoding)
+                    })?;
+                validate_v2_terminal_evidence(
+                    &terminal_evidence,
+                    admission,
+                    &self.admission_ingress,
+                    &self.admission_provenance,
+                    terminal.record(),
+                )?;
+                validate_v2_terminal_proof_bundle(
+                    &terminal_proof_bundle,
+                    &terminal_evidence,
+                    &self.admission_provenance,
+                )?;
+                let compact_bytes = self
+                    .admission_provenance
+                    .len()
+                    .checked_add(self.terminal_evidence.as_ref().map_or(0, Vec::len))
+                    .ok_or(ReservationError::Arithmetic)?;
+                if compact_bytes > max_v2_compact_evidence_bytes() {
+                    return Err(ReservationError::ComponentBounds);
+                }
+                let retained = profile.charge(production_components_v2(
+                    &self.admission,
+                    self.terminal.as_deref(),
+                    None,
+                    compact_bytes,
+                )?)?;
+                if self.peak_charge_bytes == live.peak
+                    && self.retained_charge_bytes == retained.retained
+                    && self.tombstone_charge_bytes == retained.tombstone
+                {
+                    Ok((
+                        Some(admission.clone()),
+                        Some(admission_ingress.clone()),
+                        admission_provenance,
+                        Some(Box::new(terminal)),
+                        Some(self.terminal.as_deref().unwrap_or_default().to_vec()),
+                        Some(terminal_proof_bundle),
+                        Some(terminal_evidence),
+                        None,
+                    ))
+                } else {
+                    Err(ReservationError::SnapshotMismatch)
+                }
+            }
+            ProductionReservationStateV2::Tombstone => {
+                if self.absence_reservation.is_some()
+                    || !self.admission.is_empty()
+                    || !self.admission_ingress.is_empty()
+                    || self.terminal.is_some()
+                    || self.terminal_proof_bundle.is_some()
+                {
+                    return Err(ReservationError::StateShape);
+                }
+                let terminalized_at = self.terminalized_at.ok_or(ReservationError::StateShape)?;
+                let terminal_sequence = self
+                    .terminal_sequence
+                    .filter(|sequence| *sequence > 0)
+                    .ok_or(ReservationError::StateShape)?;
+                let terminal_evidence = self
+                    .terminal_evidence
+                    .as_deref()
+                    .ok_or(ReservationError::StateShape)
+                    .and_then(|bytes| {
+                        RosterProfileV2CompactTerminalEvidenceV1::decode_canonical(bytes)
+                            .map_err(|_| ReservationError::CanonicalEncoding)
+                    })?;
+                if terminal_evidence.provenance() != &admission_provenance {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                let tombstone = self.tombstone()?.ok_or(ReservationError::StateShape)?;
+                if tombstone.terminal_raft_log_index() == 0 {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                tombstone
+                    .validate_binding_for_profile(
+                        crate::fenced_mutation_roster::Profile::v2(),
+                        self.binding,
+                    )
+                    .map_err(|_| ReservationError::SnapshotMismatch)?;
+                tombstone
+                    .validate_profile_v2_compact_terminal_evidence(&terminal_evidence)
+                    .map_err(|_| ReservationError::SnapshotMismatch)?;
+                let compact_bytes = self
+                    .admission_provenance
+                    .len()
+                    .checked_add(self.terminal_evidence.as_ref().map_or(0, Vec::len))
+                    .ok_or(ReservationError::Arithmetic)?;
+                let tombstone_bytes = self
+                    .tombstone
+                    .as_deref()
+                    .ok_or(ReservationError::StateShape)?;
+                let charges = profile.charge(production_components_v2(
+                    &[],
+                    None,
+                    Some(tombstone_bytes),
+                    compact_bytes,
+                )?)?;
+                if self.peak_charge_bytes == 0
+                    && self.retained_charge_bytes == 0
+                    && self.tombstone_charge_bytes == charges.tombstone
+                {
+                    let _ = (terminalized_at, terminal_sequence);
+                    Ok((
+                        None,
+                        None,
+                        admission_provenance,
+                        None,
+                        None,
+                        None,
+                        Some(terminal_evidence),
+                        Some(tombstone),
+                    ))
+                } else {
+                    Err(ReservationError::SnapshotMismatch)
+                }
+            }
+        }
+    }
+}
+
+/// Complete V2 Q2 replacement. It is deliberately distinct from the V1
+/// prepared transaction: Q2 has exactly one retained V2 carrier and one
+/// absence-predicate CAS, never a V1 business-reservation transition.
+#[derive(Clone)]
+pub(crate) struct PreparedProductionTerminalizationV2 {
+    replacement: ProductionReservationRecordV2,
+    business_cas: ProductionTerminalAbsentBusinessCasV2,
+}
+
+/// V2's witness-coupled Q1/Q2 result.
+///
+/// The V2 row and the shared global witness are separate durable projections,
+/// but this type keeps their expected and replacement values together so a
+/// SQLite caller cannot reserve or release charge without the exact carrier
+/// CAS.  It deliberately contains no authority or verifier input: those are
+/// validated before this capacity-only planner is called.
+#[derive(Clone)]
+pub(crate) struct PreparedProductionV2CapacityTransition {
+    next: GlobalChargeWitness,
+}
+
+/// Q1's row-capacity and V2 floor insertion/assertion are one prepared
+/// consensus action.  Keeping the floor beside the witness transition makes
+/// it impossible for an adapter to persist a live absent reservation without
+/// its conflict-closing history floor.
+#[derive(Clone)]
+pub(crate) struct PreparedProductionV2Admission {
+    previous: GlobalChargeWitness,
+    next: GlobalChargeWitness,
+    floor: ProductionFloorCas,
+    retirement_cursor: ProductionRetirementCursorCas,
+}
+
+impl PreparedProductionV2Admission {
+    pub(crate) const fn previous_witness(&self) -> GlobalChargeWitness {
+        self.previous
+    }
+
+    pub(crate) const fn next_witness(&self) -> GlobalChargeWitness {
+        self.next
+    }
+
+    pub(crate) const fn floor_cas(&self) -> &ProductionFloorCas {
+        &self.floor
+    }
+
+    /// Return the exact shared cursor assertion paired with V2 admission.
+    pub(crate) const fn retirement_cursor_cas(&self) -> &ProductionRetirementCursorCas {
+        &self.retirement_cursor
+    }
+}
+
+/// Exact one-row V2 retained-to-compact replacement plus its shared-witness
+/// compare-and-swap. Mixed-profile maintenance composes these transitions in
+/// the one globally ordered reclaim prefix selected by consensus.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct PreparedProductionV2Reclaim {
+    replacement: ProductionReservationRecordV2,
+    previous: GlobalChargeWitness,
+    next: GlobalChargeWitness,
+}
+
+#[cfg(test)]
+impl PreparedProductionV2Reclaim {
+    pub(crate) const fn replacement(&self) -> &ProductionReservationRecordV2 {
+        &self.replacement
+    }
+
+    pub(crate) const fn previous_witness(&self) -> GlobalChargeWitness {
+        self.previous
+    }
+
+    pub(crate) const fn next_witness(&self) -> GlobalChargeWitness {
+        self.next
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for PreparedProductionV2Reclaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PreparedProductionV2Reclaim(<redacted>)")
+    }
+}
+
+/// Namespace tag carried by common maintenance guards. It is deliberately not
+/// serialized into either frozen V1 or isolated V2 row codec.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ProductionRosterProfileTag {
+    V1,
+    V2,
+}
+
+/// Borrowed row selected from the single profile-union reclaim query.
+pub(crate) enum ProductionMixedReclaimSelection<'a> {
+    V1(&'a ProductionReservationRecord),
+    V2(&'a ProductionReservationRecordV2),
+}
+
+/// Exact replacement action produced by one union reclaim preparation.
+#[derive(Clone)]
+pub(crate) enum ProductionMixedReclaimRow {
+    V1 {
+        expected: Box<ProductionReservationRecord>,
+        replacement: Box<ProductionReservationRecord>,
+    },
+    V2 {
+        expected: Box<ProductionReservationRecordV2>,
+        replacement: Box<ProductionReservationRecordV2>,
+    },
+    DeleteV1(Box<ProductionReservationRecord>),
+    DeleteV2(Box<ProductionReservationRecordV2>),
+}
+
+impl ProductionMixedReclaimRow {
+    pub(crate) fn binding(&self) -> RequestBindingKey {
+        match self {
+            Self::V1 { expected, .. } => expected.binding(),
+            Self::V2 { expected, .. } => expected.binding(),
+            Self::DeleteV1(expected) => expected.binding(),
+            Self::DeleteV2(expected) => expected.binding(),
+        }
+    }
+
+    /// Return the exact V1 compare-and-replace pair. The adapter must compare
+    /// `expected` before it writes `replacement` in the V1 table.
+    pub(crate) fn v1_replacement(
+        &self,
+    ) -> Option<(&ProductionReservationRecord, &ProductionReservationRecord)> {
+        match self {
+            Self::V1 {
+                expected,
+                replacement,
+            } => Some((expected, replacement)),
+            Self::V2 { .. } | Self::DeleteV1(_) | Self::DeleteV2(_) => None,
+        }
+    }
+
+    /// Return the exact V2 compare-and-replace pair. The adapter must compare
+    /// `expected` before it writes `replacement` in the V2 table.
+    pub(crate) fn v2_replacement(
+        &self,
+    ) -> Option<(
+        &ProductionReservationRecordV2,
+        &ProductionReservationRecordV2,
+    )> {
+        match self {
+            Self::V2 {
+                expected,
+                replacement,
+            } => Some((expected, replacement)),
+            Self::V1 { .. } | Self::DeleteV1(_) | Self::DeleteV2(_) => None,
+        }
+    }
+
+    /// Return the exact V1 row that the adapter must compare and delete.
+    pub(crate) fn v1_delete(&self) -> Option<&ProductionReservationRecord> {
+        match self {
+            Self::DeleteV1(expected) => Some(expected),
+            Self::V1 { .. } | Self::V2 { .. } | Self::DeleteV2(_) => None,
+        }
+    }
+
+    /// Return the exact V2 row that the adapter must compare and delete.
+    pub(crate) fn v2_delete(&self) -> Option<&ProductionReservationRecordV2> {
+        match self {
+            Self::DeleteV2(expected) => Some(expected),
+            Self::V1 { .. } | Self::V2 { .. } | Self::DeleteV1(_) => None,
+        }
+    }
+
+    /// Return the V1 expected carrier for either a replace or delete action.
+    #[cfg(test)]
+    pub(crate) fn v1_expected_row(&self) -> Option<&ProductionReservationRecord> {
+        match self {
+            Self::V1 { expected, .. } | Self::DeleteV1(expected) => Some(expected),
+            Self::V2 { .. } | Self::DeleteV2(_) => None,
+        }
+    }
+
+    /// Return the V1 replacement carrier, if this action writes rather than
+    /// deletes its exact expected row.
+    #[cfg(test)]
+    pub(crate) fn v1_replacement_row(&self) -> Option<&ProductionReservationRecord> {
+        match self {
+            Self::V1 { replacement, .. } => Some(replacement),
+            Self::V2 { .. } | Self::DeleteV1(_) | Self::DeleteV2(_) => None,
+        }
+    }
+
+    /// Return the V2 expected carrier for either a replace or delete action.
+    #[cfg(test)]
+    pub(crate) fn v2_expected_row(&self) -> Option<&ProductionReservationRecordV2> {
+        match self {
+            Self::V2 { expected, .. } => Some(expected.as_ref()),
+            Self::DeleteV2(expected) => Some(expected),
+            Self::V1 { .. } | Self::DeleteV1(_) => None,
+        }
+    }
+
+    /// Return the V2 replacement carrier, if this action writes rather than
+    /// deletes its exact expected row.
+    #[cfg(test)]
+    pub(crate) fn v2_replacement_row(&self) -> Option<&ProductionReservationRecordV2> {
+        match self {
+            Self::V2 { replacement, .. } => Some(replacement),
+            Self::V1 { .. } | Self::DeleteV1(_) | Self::DeleteV2(_) => None,
+        }
+    }
+}
+
+/// Adapter-reproved exact oldest union prefix under
+/// `(terminalized_at, binding, profile)`. The final partial batch is legal;
+/// a shorter caller-selected subset is not.
+#[derive(Clone)]
+pub(crate) struct ProductionMixedReclaimOldestGuard {
+    selected: Vec<(
+        ConsensusMaintenanceTimestamp,
+        RequestBindingKey,
+        ProductionRosterProfileTag,
+    )>,
+}
+
+impl ProductionMixedReclaimOldestGuard {
+    pub(crate) fn selected(
+        &self,
+    ) -> &[(
+        ConsensusMaintenanceTimestamp,
+        RequestBindingKey,
+        ProductionRosterProfileTag,
+    )] {
+        &self.selected
+    }
+}
+
+/// One composable witness transition for a profile-union reclaim batch.
+#[derive(Clone)]
+pub(crate) struct PreparedProductionMixedReclaim {
+    rows: Vec<ProductionMixedReclaimRow>,
+    previous: GlobalChargeWitness,
+    next: GlobalChargeWitness,
+    guard: ProductionMixedReclaimOldestGuard,
+}
+
+impl PreparedProductionMixedReclaim {
+    pub(crate) fn rows(&self) -> &[ProductionMixedReclaimRow] {
+        &self.rows
+    }
+
+    pub(crate) const fn previous_witness(&self) -> GlobalChargeWitness {
+        self.previous
+    }
+
+    pub(crate) const fn next_witness(&self) -> GlobalChargeWitness {
+        self.next
+    }
+
+    pub(crate) const fn oldest_guard(&self) -> &ProductionMixedReclaimOldestGuard {
+        &self.guard
+    }
+}
+
+/// Plan the exact selected cross-profile reclaim prefix. SQLite must issue one
+/// UNION query with the guard tuple/order/cutoff/limit and compare every row
+/// before applying any replacement and the one shared-witness CAS.
+pub(crate) fn prepare_production_mixed_reclaim(
+    selected: &[ProductionMixedReclaimSelection<'_>],
+    maintenance_time: ConsensusMaintenanceTimestamp,
+    witness: GlobalChargeWitness,
+    budget: GlobalChargeBudget,
+    profile: ChargeProfile,
+) -> Result<PreparedProductionMixedReclaim, ReservationError> {
+    witness.admits(budget)?;
+    if selected.is_empty() || selected.len() > RECLAIM_BATCH {
+        return Err(ReservationError::SnapshotMismatch);
+    }
+    let mut previous_order = None;
+    let mut rows = Vec::with_capacity(selected.len());
+    let mut guard_rows = Vec::with_capacity(selected.len());
+    let mut counters = witness.roster;
+    for selection in selected {
+        match selection {
+            ProductionMixedReclaimSelection::V1(record) => {
+                record.validate(profile)?;
+                if record.state != ReservationState::Retained {
+                    return Err(ReservationError::InvalidState);
+                }
+                let at = record.terminalized_at.ok_or(ReservationError::StateShape)?;
+                if at.checked_add_retention()? > maintenance_time {
+                    return Err(ReservationError::NotEligible);
+                }
+                let order = (at, record.binding(), ProductionRosterProfileTag::V1);
+                if previous_order.is_some_and(|previous| previous >= order) {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                previous_order = Some(order);
+                let mut replacement = (*record).clone();
+                replacement.reclaim_at(maintenance_time, profile)?;
+                counters = counters_without_production_record(counters, record, profile)?;
+                counters = counters_with_production_record(counters, &replacement, profile)?;
+                rows.push(ProductionMixedReclaimRow::V1 {
+                    expected: Box::new((*record).clone()),
+                    replacement: Box::new(replacement),
+                });
+                guard_rows.push(order);
+            }
+            ProductionMixedReclaimSelection::V2(record) => {
+                record.validate(profile)?;
+                if record.state != ProductionReservationStateV2::Retained {
+                    return Err(ReservationError::InvalidState);
+                }
+                let at = record.terminalized_at.ok_or(ReservationError::StateShape)?;
+                if at.checked_add_retention()? > maintenance_time {
+                    return Err(ReservationError::NotEligible);
+                }
+                let order = (at, record.binding(), ProductionRosterProfileTag::V2);
+                if previous_order.is_some_and(|previous| previous >= order) {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                previous_order = Some(order);
+                let mut replacement = (*record).clone();
+                replacement.reclaim_at(maintenance_time, profile)?;
+                counters = counters_without_production_record_v2(counters, record, profile)?;
+                counters = counters_with_production_record_v2(counters, &replacement, profile)?;
+                rows.push(ProductionMixedReclaimRow::V2 {
+                    expected: Box::new((*record).clone()),
+                    replacement: Box::new(replacement),
+                });
+                guard_rows.push(order);
+            }
+        }
+    }
+    let next = witness.with_roster(counters);
+    next.admits(budget)?;
+    Ok(PreparedProductionMixedReclaim {
+        rows,
+        previous: witness,
+        next,
+        guard: ProductionMixedReclaimOldestGuard {
+            selected: guard_rows,
+        },
+    })
+}
+
+/// Borrowed compact row from the single cross-profile terminal-sequence
+/// prefix. A caller cannot mix independent V1/V2 retirement horizons.
+pub(crate) enum ProductionMixedTerminalRetirementSelection<'a> {
+    V1(&'a ProductionReservationRecord),
+    V2(&'a ProductionReservationRecordV2),
+}
+
+/// Exact profile-tagged terminal-history prefix which SQLite must re-prove
+/// before deleting rows and applying the accompanying shared floor/cursor
+/// CASes in the same witness transaction.
+#[derive(Clone)]
+pub(crate) struct ProductionMixedTerminalRetirementGuard {
+    selected: Vec<(u64, RequestBindingKey, ProductionRosterProfileTag)>,
+    partitions: Vec<ProductionMixedTerminalRetirementPartitionGuard>,
+}
+
+/// Authoritative shared partition state for one page of the global terminal
+/// prefix. A partition applies equally to V1 and V2 row tables because its
+/// key derives solely from the request binding.
+#[derive(Clone)]
+pub(crate) struct ProductionMixedTerminalRetirementPartition {
+    floor: IrreversibleHistoryFloor,
+    cursor: Option<ProductionRetirementCursor>,
+    target_epoch: u64,
+    final_batch: bool,
+    partition_empty_after: bool,
+}
+
+impl ProductionMixedTerminalRetirementPartition {
+    /// Build a partition retirement action with the adapter's exact
+    /// cross-profile partition-empty proof. An empty-partition assertion is
+    /// meaningful only after the final target-epoch page; it releases the
+    /// floor instead of preserving it at the retired epoch.
+    pub(crate) fn new_with_partition_empty_after(
+        floor: IrreversibleHistoryFloor,
+        cursor: Option<ProductionRetirementCursor>,
+        target_epoch: u64,
+        final_batch: bool,
+        partition_empty_after: bool,
+    ) -> Result<Self, ReservationError> {
+        validate_epoch(target_epoch)?;
+        if target_epoch <= floor.retired_through() || (partition_empty_after && !final_batch) {
+            return Err(ReservationError::FloorAdvance);
+        }
+        if let Some(cursor) = cursor.as_ref() {
+            cursor.validate_for_floor(floor)?;
+            if cursor.target_epoch() != target_epoch {
+                return Err(ReservationError::FloorAdvance);
+            }
+        }
+        Ok(Self {
+            floor,
+            cursor,
+            target_epoch,
+            final_batch,
+            partition_empty_after,
+        })
+    }
+}
+
+/// Exact partition range that SQLite must re-prove along with the global
+/// terminal-sequence prefix. On a final page, the adapter must also prove no
+/// retained or tombstone row from either profile remains at `target_epoch`.
+#[derive(Clone)]
+pub(crate) struct ProductionMixedTerminalRetirementPartitionGuard;
+
+/// Exact shared retention mutation produced by mixed terminal retirement.
+/// Profile tags belong only to the independent row deletes, never to the
+/// floor/cursor authority that closes their common binding namespace.
+#[derive(Clone)]
+pub(crate) struct ProductionMixedTerminalRetirementFloorAction {
+    floor: ProductionFloorCas,
+    cursor: ProductionRetirementCursorCas,
+}
+
+impl ProductionMixedTerminalRetirementFloorAction {
+    pub(crate) const fn floor(&self) -> &ProductionFloorCas {
+        &self.floor
+    }
+
+    pub(crate) const fn cursor(&self) -> &ProductionRetirementCursorCas {
+        &self.cursor
+    }
+}
+
+impl ProductionMixedTerminalRetirementGuard {
+    pub(crate) fn selected(&self) -> &[(u64, RequestBindingKey, ProductionRosterProfileTag)] {
+        &self.selected
+    }
+
+    pub(crate) fn partitions(&self) -> &[ProductionMixedTerminalRetirementPartitionGuard] {
+        &self.partitions
+    }
+}
+
+/// Row deletions and one shared witness advance for an exact global terminal
+/// prefix. Shared floor/cursor CASes are validated under this guard; no
+/// independent planner may advance the global terminal horizon.
+#[derive(Clone)]
+pub(crate) struct PreparedProductionMixedTerminalRetirement {
+    rows: Vec<ProductionMixedReclaimRow>,
+    floor_actions: Vec<ProductionMixedTerminalRetirementFloorAction>,
+    previous: GlobalChargeWitness,
+    next: GlobalChargeWitness,
+    guard: ProductionMixedTerminalRetirementGuard,
+}
+
+impl PreparedProductionMixedTerminalRetirement {
+    pub(crate) fn rows(&self) -> &[ProductionMixedReclaimRow] {
+        &self.rows
+    }
+
+    /// Shared floor/cursor CASes to apply with profile-tagged row deletes and
+    /// the one shared witness compare-and-swap.
+    pub(crate) fn floor_actions(&self) -> &[ProductionMixedTerminalRetirementFloorAction] {
+        &self.floor_actions
+    }
+
+    pub(crate) const fn previous_witness(&self) -> GlobalChargeWitness {
+        self.previous
+    }
+
+    pub(crate) const fn next_witness(&self) -> GlobalChargeWitness {
+        self.next
+    }
+
+    pub(crate) const fn guard(&self) -> &ProductionMixedTerminalRetirementGuard {
+        &self.guard
+    }
+}
+
+/// Validate and plan one profile-union tombstone prefix. Terminal sequences
+/// are consensus/application coordinates and may legitimately be sparse; the
+/// guard therefore requires strictly increasing values above the witness
+/// horizon. SQLite re-proves that this is the complete ordered union prefix
+/// before it may advance the shared closure, so no V1 or V2 row can be
+/// omitted. A final partition page also requires the adapter to prove that an
+/// opposite-profile retained row does not remain at the target epoch. A
+/// floor can be deleted only when its partition also carries an adapter-proved
+/// absence of higher-epoch rows across both profiles.
+pub(crate) fn prepare_production_mixed_terminal_retirement(
+    selected: &[ProductionMixedTerminalRetirementSelection<'_>],
+    partitions: &[ProductionMixedTerminalRetirementPartition],
+    witness: GlobalChargeWitness,
+    budget: GlobalChargeBudget,
+    profile: ChargeProfile,
+) -> Result<PreparedProductionMixedTerminalRetirement, ReservationError> {
+    witness.admits(budget)?;
+    if selected.is_empty() || selected.len() > RECLAIM_BATCH {
+        return Err(ReservationError::SnapshotMismatch);
+    }
+    let mut previous_sequence = witness.retired_terminal_sequence();
+    let mut counters = witness.roster;
+    let mut rows = Vec::with_capacity(selected.len());
+    let mut guard_rows = Vec::with_capacity(selected.len());
+    let mut seen_bindings = BTreeMap::new();
+    for selection in selected {
+        match selection {
+            ProductionMixedTerminalRetirementSelection::V1(record) => {
+                record.validate(profile)?;
+                let sequence = record
+                    .terminal_sequence()
+                    .ok_or(ReservationError::StateShape)?;
+                if record.state != ReservationState::Tombstone || sequence <= previous_sequence {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                if seen_bindings.insert(record.binding(), ()).is_some() {
+                    return Err(ReservationError::Duplicate);
+                }
+                counters = counters_without_production_record(counters, record, profile)?;
+                rows.push(ProductionMixedReclaimRow::DeleteV1(Box::new(
+                    (*record).clone(),
+                )));
+                guard_rows.push((sequence, record.binding(), ProductionRosterProfileTag::V1));
+            }
+            ProductionMixedTerminalRetirementSelection::V2(record) => {
+                record.validate(profile)?;
+                let sequence = record
+                    .terminal_sequence()
+                    .ok_or(ReservationError::StateShape)?;
+                if record.state != ProductionReservationStateV2::Tombstone
+                    || sequence <= previous_sequence
+                {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+                if seen_bindings.insert(record.binding(), ()).is_some() {
+                    return Err(ReservationError::Duplicate);
+                }
+                counters = counters_without_production_record_v2(counters, record, profile)?;
+                rows.push(ProductionMixedReclaimRow::DeleteV2(Box::new(
+                    (*record).clone(),
+                )));
+                guard_rows.push((sequence, record.binding(), ProductionRosterProfileTag::V2));
+            }
+        }
+        previous_sequence = match guard_rows.last() {
+            Some((sequence, _, _)) => *sequence,
+            None => return Err(ReservationError::SnapshotMismatch),
+        };
+    }
+    let mut floor_actions: Vec<ProductionMixedTerminalRetirementFloorAction> =
+        Vec::with_capacity(partitions.len());
+    let mut partition_guards = Vec::with_capacity(partitions.len());
+    let mut covered = BTreeMap::new();
+    for partition in partitions {
+        let key = ProductionFloorKey::from_floor(partition.floor)?;
+        if covered.insert((key, partition.target_epoch), ()).is_some() {
+            return Err(ReservationError::Duplicate);
+        }
+        let mut bindings = selected
+            .iter()
+            .filter_map(|selection| {
+                let binding = match selection {
+                    ProductionMixedTerminalRetirementSelection::V1(record) => record.binding(),
+                    ProductionMixedTerminalRetirementSelection::V2(record) => record.binding(),
+                };
+                (ProductionFloorKey::from_binding(binding).ok() == Some(key)
+                    && binding.history_epoch() == partition.target_epoch)
+                    .then_some(binding)
+            })
+            .collect::<Vec<_>>();
+        bindings.sort_unstable();
+        if bindings.is_empty() || bindings.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ReservationError::FloorAdvance);
+        }
+        if let Some(cursor) = partition.cursor.as_ref() {
+            cursor.validate_for_floor(partition.floor)?;
+            if cursor.target_epoch() != partition.target_epoch {
+                return Err(ReservationError::FloorAdvance);
+            }
+        }
+        for binding in &bindings {
+            partition
+                .floor
+                .validate_new_binding(*binding)
+                .map_err(|_| ReservationError::FloorAdvance)?;
+        }
+        let (floor, cursor) = if partition.final_batch {
+            let replacement = partition
+                .floor
+                .advance_to(partition.target_epoch)
+                .map_err(|_| ReservationError::FloorAdvance)?;
+            counters = counters_without_production_floor(counters, partition.floor)?;
+            if !partition.partition_empty_after {
+                counters = counters_with_production_floor(counters, replacement)?;
+            }
+            if let Some(cursor) = partition.cursor.as_ref() {
+                counters = counters_without_retirement_cursor(counters, cursor)?;
+            }
+            (
+                ProductionFloorCas {
+                    key,
+                    expected: Some(partition.floor),
+                    replacement: (!partition.partition_empty_after).then_some(replacement),
+                },
+                ProductionRetirementCursorCas {
+                    key,
+                    expected: partition.cursor.clone(),
+                    replacement: None,
+                },
+            )
+        } else {
+            // A global terminal-sequence prefix does not establish that its
+            // bindings are the next contiguous range in this partition's
+            // binding order. It therefore cannot create or advance a
+            // partition-local cursor. An already durable cursor is preserved
+            // until a final page consumes it.
+            (
+                ProductionFloorCas {
+                    key,
+                    expected: Some(partition.floor),
+                    replacement: Some(partition.floor),
+                },
+                ProductionRetirementCursorCas {
+                    key,
+                    expected: partition.cursor.clone(),
+                    replacement: partition.cursor.clone(),
+                },
+            )
+        };
+        partition_guards.push(ProductionMixedTerminalRetirementPartitionGuard);
+        floor_actions.push(ProductionMixedTerminalRetirementFloorAction { floor, cursor });
+    }
+    for selection in selected {
+        let binding = match selection {
+            ProductionMixedTerminalRetirementSelection::V1(record) => record.binding(),
+            ProductionMixedTerminalRetirementSelection::V2(record) => record.binding(),
+        };
+        let key = ProductionFloorKey::from_binding(binding)?;
+        if !covered.contains_key(&(key, binding.history_epoch())) {
+            return Err(ReservationError::FloorAdvance);
+        }
+    }
+    let next = witness
+        .with_roster(counters)
+        .retire_through_terminal_sequence(previous_sequence)?;
+    next.admits(budget)?;
+    Ok(PreparedProductionMixedTerminalRetirement {
+        rows,
+        floor_actions,
+        previous: witness,
+        next,
+        guard: ProductionMixedTerminalRetirementGuard {
+            selected: guard_rows,
+            partitions: partition_guards,
+        },
+    })
+}
+
+impl PreparedProductionV2CapacityTransition {
+    /// Return the exact witness to write with the V2 row transition.
+    pub(crate) const fn next_witness(&self) -> GlobalChargeWitness {
+        self.next
+    }
+}
+
+impl fmt::Debug for PreparedProductionV2CapacityTransition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PreparedProductionV2CapacityTransition(<redacted>)")
+    }
+}
+
+/// Reserve V2 Q1's live slot, its one retained terminal-history slot, and
+/// the exact maximum terminal charge in the existing global witness.
+///
+/// The live row's contribution is `live + (peak - live)`, rather than merely
+/// its current bytes.  Consequently a later valid Q2 can only replace that
+/// reserved peak with a retained charge no greater than the peak; it never
+/// needs a second capacity admission.  The caller must compare-and-insert the
+/// exact V2 row and write [`PreparedProductionV2CapacityTransition::next_witness`]
+/// in the same consensus transaction.
+#[cfg(test)]
+pub(crate) fn prepare_production_v2_admission_capacity(
+    record: &ProductionReservationRecordV2,
+    witness: GlobalChargeWitness,
+    budget: GlobalChargeBudget,
+    profile: ChargeProfile,
+) -> Result<PreparedProductionV2CapacityTransition, ReservationError> {
+    record.validate(profile)?;
+    if record.state != ProductionReservationStateV2::Live {
+        return Err(ReservationError::InvalidState);
+    }
+    witness.admits(budget)?;
+    let next = witness.with_roster(counters_with_production_record_v2(
+        witness.roster,
+        record,
+        profile,
+    )?);
+    next.admits(budget)?;
+    Ok(PreparedProductionV2CapacityTransition { next })
+}
+
+/// Prepare V2 Q1 with the exact shared floor, cursor, and dual-table vacancy
+/// assertions. This is the sole production admission entry point; the
+/// capacity-only helper is retained for focused domain tests.
+pub(crate) fn prepare_production_v2_admission_with_floor(
+    vacancy: &ProductionBindingVacancyGuard,
+    record: &ProductionReservationRecordV2,
+    existing_floor: Option<IrreversibleHistoryFloor>,
+    existing_cursor: Option<&ProductionRetirementCursor>,
+    witness: GlobalChargeWitness,
+    budget: GlobalChargeBudget,
+    profile: ChargeProfile,
+) -> Result<PreparedProductionV2Admission, ReservationError> {
+    vacancy.validate_for(record.binding())?;
+    record.validate(profile)?;
+    if record.state != ProductionReservationStateV2::Live {
+        return Err(ReservationError::InvalidState);
+    }
+    witness.admits(budget)?;
+    let key = ProductionFloorKey::from_binding(record.binding())?;
+    let initial_floor = IrreversibleHistoryFloor::initial(record.binding())
+        .map_err(|_| ReservationError::FloorAdvance)?;
+    let floor = match existing_floor {
+        Some(existing_floor) => {
+            existing_floor
+                .validate_new_binding(record.binding())
+                .map_err(|_| ReservationError::FloorAdvance)?;
+            ProductionFloorCas {
+                key,
+                expected: Some(existing_floor),
+                replacement: Some(existing_floor),
+            }
+        }
+        None => ProductionFloorCas {
+            key,
+            expected: None,
+            replacement: Some(initial_floor),
+        },
+    };
+    if let Some(cursor) = existing_cursor {
+        cursor.validate_for_floor(floor.replacement().ok_or(ReservationError::FloorAdvance)?)?;
+        // An unfinished common-partition retirement closes admissions for
+        // both row tables until its cursor is consumed by maintenance.
+        return Err(ReservationError::FloorAdvance);
+    }
+    let retirement_cursor = ProductionRetirementCursorCas::assert_existing(key, None);
+    let mut counters = witness.roster;
+    if floor.expected().is_none() {
+        counters = counters_with_production_floor(
+            counters,
+            floor.replacement().ok_or(ReservationError::FloorAdvance)?,
+        )?;
+    }
+    counters = counters_with_production_record_v2(counters, record, profile)?;
+    let next = witness.with_roster(counters);
+    next.admits(budget)?;
+    Ok(PreparedProductionV2Admission {
+        previous: witness,
+        next,
+        floor,
+        retirement_cursor,
+    })
+}
+
+/// Consume a V2 Q1 capacity reservation during Q2.
+///
+/// This is intentionally after all terminal cryptographic verification and
+/// after [`ProductionReservationRecordV2::prepare_terminalization`] has bound
+/// the exact absence CAS.  A valid Q2 cannot fail from capacity: the live
+/// contribution already reserved `peak`, and the retained carrier is checked
+/// to be no larger than that peak.  Any failure here is therefore malformed
+/// or mismatched durable state, never a late "full" result.
+pub(crate) fn prepare_production_v2_terminal_capacity(
+    current: &ProductionReservationRecordV2,
+    terminalization: &PreparedProductionTerminalizationV2,
+    witness: GlobalChargeWitness,
+    budget: GlobalChargeBudget,
+    profile: ChargeProfile,
+) -> Result<PreparedProductionV2CapacityTransition, ReservationError> {
+    current.validate(profile)?;
+    if current.state != ProductionReservationStateV2::Live {
+        return Err(ReservationError::InvalidState);
+    }
+    let replacement = terminalization.replacement();
+    replacement.validate(profile)?;
+    if replacement.binding != current.binding
+        || replacement.state != ProductionReservationStateV2::Retained
+        || replacement.peak_charge_bytes != current.peak_charge_bytes
+        || replacement.retained_charge_bytes > current.peak_charge_bytes
+    {
+        return Err(ReservationError::SnapshotMismatch);
+    }
+    witness.admits(budget)?;
+    let counters = counters_without_production_record_v2(witness.roster, current, profile)?;
+    let next = witness.with_roster(counters_with_production_record_v2(
+        counters,
+        replacement,
+        profile,
+    )?);
+    // This also verifies a forged/mismatched witness fails before it can be
+    // exchanged for a retained row.  Given the checks above it cannot reject
+    // a valid pre-admitted Q2 for capacity.
+    next.admits(budget)?;
+    Ok(PreparedProductionV2CapacityTransition { next })
+}
+
+/// Prepare exactly one V2 retained carrier for compaction at its fixed
+/// terminal retention boundary. This is intentionally composable: consensus
+/// first selects the single cross-profile oldest prefix, then chains each
+/// selected row's witness transition in that order.
+#[cfg(test)]
+pub(crate) fn prepare_production_v2_reclaim(
+    current: &ProductionReservationRecordV2,
+    maintenance_time: ConsensusMaintenanceTimestamp,
+    witness: GlobalChargeWitness,
+    budget: GlobalChargeBudget,
+    profile: ChargeProfile,
+) -> Result<PreparedProductionV2Reclaim, ReservationError> {
+    current.validate(profile)?;
+    if current.state != ProductionReservationStateV2::Retained {
+        return Err(ReservationError::InvalidState);
+    }
+    let terminalized_at = current
+        .terminalized_at
+        .ok_or(ReservationError::StateShape)?;
+    if terminalized_at.checked_add_retention()? > maintenance_time {
+        return Err(ReservationError::NotEligible);
+    }
+    witness.admits(budget)?;
+    let mut replacement = current.clone();
+    replacement.reclaim_at(maintenance_time, profile)?;
+    let counters = counters_without_production_record_v2(witness.roster, current, profile)?;
+    let next = witness.with_roster(counters_with_production_record_v2(
+        counters,
+        &replacement,
+        profile,
+    )?);
+    next.admits(budget)?;
+    Ok(PreparedProductionV2Reclaim {
+        replacement,
+        previous: witness,
+        next,
+    })
+}
+
+impl PreparedProductionTerminalizationV2 {
+    /// Return the V2 terminal carrier to retain in the dedicated V2 table.
+    pub(crate) const fn replacement(&self) -> &ProductionReservationRecordV2 {
+        &self.replacement
+    }
+
+    /// Return the exact absent-row action that must share Q2 with the
+    /// replacement and removal of the V2 reservation row.
+    pub(crate) const fn business_cas(&self) -> &ProductionTerminalAbsentBusinessCasV2 {
+        &self.business_cas
+    }
+}
+
+impl fmt::Debug for PreparedProductionTerminalizationV2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PreparedProductionTerminalizationV2(<redacted>)")
+    }
+}
+
+const fn max_v2_compact_evidence_bytes() -> usize {
+    MAX_PROFILE_V2_COMPACT_TERMINAL_EVIDENCE_BYTES
+}
+
+fn validate_v2_provenance_binding(
+    binding: RequestBindingKey,
+    provenance: &RosterProfileV2CompactAdmissionProvenanceV1,
+) -> Result<(), ReservationError> {
+    let bytes = binding.to_bytes();
+    let input = provenance.input();
+    if input.profile != crate::fenced_mutation_roster::Profile::v2()
+        || input.scope.as_slice() != &bytes[8..40]
+        || input.tenant_scope_partition.as_slice() != &bytes[40..72]
+        || input.session_key_commitment.as_slice() != &bytes[72..104]
+        || input.roster_id.as_slice() != &bytes[104..120]
+    {
+        return Err(ReservationError::SnapshotMismatch);
+    }
+    Ok(())
+}
+
+fn validate_v2_terminal_evidence(
+    terminal_evidence: &RosterProfileV2CompactTerminalEvidenceV1,
+    admission: &Admission,
+    admission_ingress: &[u8],
+    admission_provenance: &[u8],
+    terminal: &crate::fenced_mutation_roster::TerminalRecord,
+) -> Result<(), ReservationError> {
+    // Q1 and Q2 carry distinct authenticated ingress statements. Durable
+    // storage can prove that Q1 provenance still names Q1 ingress, but the
+    // fresh Q2 ingress is cryptographically checked by consensus with its
+    // command, root, authority, and registration inputs.
+    if terminal_evidence
+        .provenance()
+        .canonical_bytes()
+        .map_err(|_| ReservationError::CanonicalEncoding)?
+        .as_slice()
+        != admission_provenance
+    {
+        return Err(ReservationError::SnapshotMismatch);
+    }
+    let admission_ingress = RosterIngressAttestationV2::decode_canonical(admission_ingress)
+        .map_err(|_| ReservationError::CanonicalEncoding)?;
+    if terminal_evidence.provenance().input().ingress != *admission_ingress.signing_input()
+        || terminal_evidence.ingress() == &admission_ingress
+    {
+        return Err(ReservationError::SnapshotMismatch);
+    }
+    terminal_evidence
+        .evidence()
+        .verify_raw_terminal(admission, terminal)
+        .map_err(|_| ReservationError::CanonicalEncoding)
+}
+
+fn validate_v2_terminal_proof_bundle(
+    terminal_proof_bundle: &RosterProfileV2ExecutorProofBundleV1,
+    terminal_evidence: &RosterProfileV2CompactTerminalEvidenceV1,
+    admission_provenance: &[u8],
+) -> Result<(), ReservationError> {
+    let admission_provenance =
+        RosterProfileV2CompactAdmissionProvenanceV1::decode_canonical(admission_provenance)
+            .map_err(|_| ReservationError::CanonicalEncoding)?;
+    if terminal_proof_bundle.admission_provenance_commitment()
+        != admission_provenance
+            .commitment()
+            .map_err(|_| ReservationError::CanonicalEncoding)?
+        || terminal_proof_bundle.ingress() != terminal_evidence.ingress()
+        || terminal_proof_bundle.terminal_evidence() != terminal_evidence
+    {
+        return Err(ReservationError::SnapshotMismatch);
+    }
+    Ok(())
+}
+
+impl fmt::Debug for ProductionReservationRecordV2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProductionReservationRecordV2(<redacted>)")
+    }
+}
+
 impl fmt::Debug for ProductionReservationRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ProductionReservationRecord(<redacted>)")
@@ -3488,15 +6811,36 @@ fn production_components(
     )
 }
 
+/// V2-only charge components.  Its larger compact carrier bound must never
+/// relax the frozen V1 `ComponentBytes` validation path.
+fn production_components_v2(
+    admission: &[u8],
+    terminal: Option<&[u8]>,
+    tombstone: Option<&[u8]>,
+    compact_provenance_bytes: usize,
+) -> Result<ComponentBytes, ReservationError> {
+    ComponentBytes::from_exact_with_compact(
+        admission.len(),
+        terminal.map_or(MAX_COMMITTED_TERMINAL_CODEC_BYTES, <[u8]>::len),
+        MAX_BUSINESS_SESSION_COPY_BYTES,
+        MAX_COMPOSITE_RECEIPT_OVERHEAD_BYTES,
+        MAX_TERMINAL_EVIDENCE_ENVELOPE_BYTES,
+        compact_provenance_bytes,
+        tombstone.map_or(MAX_TOMBSTONE_CODEC_BYTES, <[u8]>::len),
+    )
+}
+
 /// Pure, prevalidated deterministic retained-to-tombstone batch.
 ///
 /// The adapter compares every `rows` entry before it replaces any row. This
 /// makes a malformed or stale later row fail the entire reclaim batch.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct PreparedProductionReclaim {
     transaction: PreparedProductionTransaction,
 }
 
+#[cfg(test)]
 impl PreparedProductionReclaim {
     pub(crate) fn transaction(&self) -> &PreparedProductionTransaction {
         &self.transaction
@@ -3521,6 +6865,7 @@ pub(crate) struct ProductionReclaimOldestGuard {
 }
 
 impl ProductionReclaimOldestGuard {
+    #[cfg(test)]
     fn new(
         maintenance_time: ConsensusMaintenanceTimestamp,
         selected: Vec<(ConsensusMaintenanceTimestamp, RequestBindingKey)>,
@@ -3551,6 +6896,7 @@ impl fmt::Debug for ProductionReclaimOldestGuard {
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for PreparedProductionReclaim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PreparedProductionReclaim(<redacted>)")
@@ -3564,6 +6910,7 @@ impl fmt::Debug for PreparedProductionReclaim {
 /// reached the fixed 24-hour age. Ordering is `(terminalized_at, binding)` and
 /// the exact batch is the oldest `min(1024, eligible)`, including a smaller
 /// final batch. A live or ambiguous row is never selected.
+#[cfg(test)]
 pub(crate) fn prepare_production_reclaim(
     records: &BTreeMap<RequestBindingKey, ProductionReservationRecord>,
     maintenance_time: ConsensusMaintenanceTimestamp,
@@ -3766,6 +7113,46 @@ pub(crate) fn validate_production_snapshot(
     Ok(counters)
 }
 
+/// Reconstruct the one global V1+V2 capacity projection for focused snapshot
+/// conformance tests.  Production recovery uses
+/// [`ProductionSnapshotStreamValidator`] so it can merge the two SQL tables
+/// without materializing a second ledger-sized collection.
+#[cfg(test)]
+pub(crate) fn validate_production_snapshot_combined(
+    records: &[ProductionReservationRecord],
+    records_v2: &[ProductionReservationRecordV2],
+    profile: ChargeProfile,
+) -> Result<AggregateCounters, ReservationError> {
+    let mut counters = validate_production_snapshot(records, profile)?;
+    let mut bindings = BTreeMap::new();
+    let mut live_business = BTreeMap::new();
+    for record in records {
+        bindings.insert(record.binding(), ());
+        if let Some(reservation) = record.business_reservation() {
+            live_business.insert(reservation.expected().key().canonical_digest_input(), ());
+        }
+    }
+    for record in records_v2 {
+        record.validate(profile)?;
+        if bindings.insert(record.binding(), ()).is_some() {
+            return Err(ReservationError::Duplicate);
+        }
+        if record.state() == ProductionReservationStateV2::Live {
+            let reservation = record
+                .absence_reservation()
+                .ok_or(ReservationError::StateShape)?;
+            if live_business
+                .insert(reservation.predicate().key().canonical_digest_input(), ())
+                .is_some()
+            {
+                return Err(ReservationError::Duplicate);
+            }
+        }
+        counters = counters_with_production_record_v2(counters, record, profile)?;
+    }
+    Ok(counters)
+}
+
 /// Recompute a restart snapshot and require its persisted global witness to match.
 #[cfg(test)]
 pub(crate) fn validate_production_snapshot_witness(
@@ -3789,10 +7176,29 @@ pub(crate) fn validate_production_snapshot_witness(
     Ok(counters)
 }
 
+/// Require a persisted witness to reconstruct exactly from both profile
+/// tables.  This is the test counterpart of the production streaming pass.
+#[cfg(test)]
+pub(crate) fn validate_production_snapshot_combined_witness(
+    records: &[ProductionReservationRecord],
+    records_v2: &[ProductionReservationRecordV2],
+    witness: GlobalChargeWitness,
+    budget: GlobalChargeBudget,
+    profile: ChargeProfile,
+) -> Result<AggregateCounters, ReservationError> {
+    let counters = validate_production_snapshot_combined(records, records_v2, profile)?;
+    witness.admits(budget)?;
+    if witness.roster != counters {
+        return Err(ReservationError::WitnessMismatch);
+    }
+    Ok(counters)
+}
+
 /// Incremental restart/snapshot validator for an already SQL-ordered roster
-/// namespace.  It intentionally retains only aggregate counters: SQLite's
-/// primary/unique indexes prove binding, business-key, and terminal-sequence
-/// uniqueness while the caller merge-joins the normalized side tables.
+/// namespace. It retains aggregate counters plus only the bounded fixed-width
+/// binding and terminal-sequence keys needed to reject aliases across the V1
+/// and V2 SQL namespaces. Neither map carries subscriber payload or becomes
+/// a parallel durable ledger.
 ///
 /// This is deliberately separate from the slice-based conformance validator
 /// below.  The latter remains useful to pure-domain tests which intentionally
@@ -3809,6 +7215,10 @@ pub(crate) struct ProductionSnapshotStreamValidator {
     record_count: usize,
     floor_count: usize,
     cursor_count: usize,
+    // Row tables are profile-specific, but their durable binding authority is
+    // shared. A V1/V2 alias would create two claims on one request binding.
+    bindings: BTreeMap<RequestBindingKey, ()>,
+    terminal_sequences: BTreeMap<u64, RequestBindingKey>,
 }
 
 impl ProductionSnapshotStreamValidator {
@@ -3824,6 +7234,8 @@ impl ProductionSnapshotStreamValidator {
             record_count: 0,
             floor_count: 0,
             cursor_count: 0,
+            bindings: BTreeMap::new(),
+            terminal_sequences: BTreeMap::new(),
         }
     }
 
@@ -3871,6 +7283,18 @@ impl ProductionSnapshotStreamValidator {
         {
             return Err(ReservationError::SnapshotMismatch);
         }
+        if self.bindings.insert(record.binding(), ()).is_some() {
+            return Err(ReservationError::Duplicate);
+        }
+        if let Some(sequence) = record.terminal_sequence() {
+            if self
+                .terminal_sequences
+                .insert(sequence, record.binding())
+                .is_some()
+            {
+                return Err(ReservationError::Duplicate);
+            }
+        }
         self.record_count = self
             .record_count
             .checked_add(1)
@@ -3879,6 +7303,84 @@ impl ProductionSnapshotStreamValidator {
             return Err(ReservationError::DurableBindingLimit);
         }
         self.counters = counters_with_production_record(self.counters, record, profile)?;
+        Ok(())
+    }
+
+    /// Account for one canonical V2 carrier in the same deployment-wide
+    /// witness pass as V1 rows. Profile-specific row identities remain
+    /// disjoint, while terminal sequences and capacity share one witness.
+    pub(crate) fn add_v2_record(
+        &mut self,
+        record: &ProductionReservationRecordV2,
+        terminal_raft_log_index: Option<u64>,
+        witness: GlobalChargeWitness,
+        profile: ChargeProfile,
+    ) -> Result<(), ReservationError> {
+        record.validate(profile)?;
+        let applied_raft_log_index = self
+            .applied_raft_log_index
+            .filter(|index| *index != 0)
+            .ok_or(ReservationError::SnapshotMismatch)?;
+        let admission_raft_log_index = record.binding().history_epoch();
+        if admission_raft_log_index == 0 || admission_raft_log_index > applied_raft_log_index {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        match record.state() {
+            ProductionReservationStateV2::Live if terminal_raft_log_index.is_none() => {}
+            ProductionReservationStateV2::Retained => {
+                let terminal_raft_log_index = terminal_raft_log_index
+                    .filter(|index| *index != 0)
+                    .ok_or(ReservationError::SnapshotMismatch)?;
+                if terminal_raft_log_index <= admission_raft_log_index
+                    || terminal_raft_log_index > applied_raft_log_index
+                {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+            }
+            ProductionReservationStateV2::Tombstone => {
+                let terminal_raft_log_index = terminal_raft_log_index
+                    .filter(|index| *index != 0)
+                    .ok_or(ReservationError::SnapshotMismatch)?;
+                if terminal_raft_log_index <= admission_raft_log_index
+                    || terminal_raft_log_index > applied_raft_log_index
+                {
+                    return Err(ReservationError::SnapshotMismatch);
+                }
+            }
+            ProductionReservationStateV2::Live => return Err(ReservationError::SnapshotMismatch),
+        }
+        if record
+            .terminal_sequence()
+            .is_some_and(|sequence| sequence <= witness.retired_terminal_sequence())
+        {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        if record
+            .terminal_sequence()
+            .is_some_and(|sequence| sequence > self.application_sequence)
+        {
+            return Err(ReservationError::SnapshotMismatch);
+        }
+        if self.bindings.insert(record.binding(), ()).is_some() {
+            return Err(ReservationError::Duplicate);
+        }
+        if let Some(sequence) = record.terminal_sequence() {
+            if self
+                .terminal_sequences
+                .insert(sequence, record.binding())
+                .is_some()
+            {
+                return Err(ReservationError::Duplicate);
+            }
+        }
+        self.record_count = self
+            .record_count
+            .checked_add(1)
+            .ok_or(ReservationError::Arithmetic)?;
+        if self.record_count > MAX_RESERVED_AND_RETAINED {
+            return Err(ReservationError::DurableBindingLimit);
+        }
+        self.counters = counters_with_production_record_v2(self.counters, record, profile)?;
         Ok(())
     }
 
@@ -4563,6 +8065,56 @@ impl ProductionRowCas {
     }
 }
 
+/// Exact cross-table vacancy proof for one requested roster binding.
+///
+/// V1 and V2 retain physically distinct rows, but neither may independently
+/// admit a binding: both tables must have been queried under the same
+/// consensus transaction before Q1 creates either row. The guard carries no
+/// row body, only the exact opaque key whose absence the adapter proved.
+#[derive(Clone, Copy)]
+pub(crate) struct ProductionBindingVacancyGuard {
+    binding: RequestBindingKey,
+}
+
+impl ProductionBindingVacancyGuard {
+    /// Construct a guard from the two exact lookups performed by the
+    /// committing adapter. A present row is never converted into an absence
+    /// assertion, including when it belongs to the other profile table.
+    pub(crate) fn from_lookups(
+        binding: RequestBindingKey,
+        v1: Option<&ProductionReservationRecord>,
+        v2: Option<&ProductionReservationRecordV2>,
+    ) -> Result<Self, ReservationError> {
+        if let Some(record) = v1 {
+            if record.binding() != binding {
+                return Err(ReservationError::SnapshotMismatch);
+            }
+            return Err(ReservationError::Duplicate);
+        }
+        if let Some(record) = v2 {
+            if record.binding() != binding {
+                return Err(ReservationError::SnapshotMismatch);
+            }
+            return Err(ReservationError::Duplicate);
+        }
+        Ok(Self { binding })
+    }
+
+    fn validate_for(&self, binding: RequestBindingKey) -> Result<(), ReservationError> {
+        if self.binding == binding {
+            Ok(())
+        } else {
+            Err(ReservationError::SnapshotMismatch)
+        }
+    }
+}
+
+impl fmt::Debug for ProductionBindingVacancyGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProductionBindingVacancyGuard(<redacted>)")
+    }
+}
+
 impl fmt::Debug for ProductionRowCas {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ProductionRowCas(<redacted>)")
@@ -4817,29 +8369,6 @@ pub(crate) struct ProductionGlobalTerminalRetirementGuard {
 }
 
 impl ProductionGlobalTerminalRetirementGuard {
-    fn new(
-        selected: Vec<(u64, RequestBindingKey)>,
-        mut released_partitions: Vec<ProductionFloorKey>,
-    ) -> Result<Self, ReservationError> {
-        if selected.is_empty()
-            || selected.len() > RECLAIM_BATCH
-            || selected.windows(2).any(|pair| pair[0].0 >= pair[1].0)
-        {
-            return Err(ReservationError::SnapshotMismatch);
-        }
-        released_partitions.sort_unstable();
-        if released_partitions
-            .windows(2)
-            .any(|pair| pair[0] == pair[1])
-        {
-            return Err(ReservationError::SnapshotMismatch);
-        }
-        Ok(Self {
-            selected,
-            released_partitions,
-        })
-    }
-
     pub(crate) fn selected(&self) -> &[(u64, RequestBindingKey)] {
         &self.selected
     }
@@ -5177,6 +8706,20 @@ impl ProductionBusinessState {
             .map_err(|_| ReservationError::BusinessCas)?;
         Self::from_authoritative_record(&record)
     }
+
+    /// Materialize and validate the sole V2 generation-one successor before
+    /// admission is allowed to cross the provider-effect boundary.
+    fn created(admission: &Admission) -> Result<Self, ReservationError> {
+        if admission.profile() != crate::fenced_mutation_roster::Profile::v2()
+            || !admission
+                .established_mutation()
+                .requires_absent_predecessor()
+            || admission.expected_generation() != crate::model::Generation::new(1)
+        {
+            return Err(ReservationError::BusinessCas);
+        }
+        Self::updated(admission, crate::model::Generation::new(1), [0; 32])
+    }
 }
 
 impl<'de> Deserialize<'de> for ProductionBusinessState {
@@ -5216,7 +8759,11 @@ impl ProductionAdmissionBusinessReservation {
         admission: &Admission,
         expected: ProductionBusinessState,
     ) -> Result<Self, ReservationError> {
-        if expected.key != *admission.key()
+        if admission.profile() != crate::fenced_mutation_roster::Profile::v1()
+            || !admission
+                .established_mutation()
+                .requires_present_predecessor()
+            || expected.key != *admission.key()
             || expected.generation != admission.expected_generation()
         {
             return Err(ReservationError::BusinessCas);
@@ -5232,7 +8779,11 @@ impl ProductionAdmissionBusinessReservation {
     }
 
     fn validate_for(&self, admission: &Admission) -> Result<(), ReservationError> {
-        if self.admission_commitment != admission.body_commitment()
+        if admission.profile() != crate::fenced_mutation_roster::Profile::v1()
+            || !admission
+                .established_mutation()
+                .requires_present_predecessor()
+            || self.admission_commitment != admission.body_commitment()
             || self.expected.key != *admission.key()
             || self.expected.generation != admission.expected_generation()
         {
@@ -5328,6 +8879,9 @@ impl ProductionTerminalBusinessCas {
         let expected = reservation.expected.clone();
         match terminal.materialization() {
             TerminalMaterialization::Aborted => Ok(Self::AbortedCompareRelease { expected }),
+            TerminalMaterialization::Established(EstablishedMaterialization::Created {
+                ..
+            }) => Err(ReservationError::BusinessCas),
             TerminalMaterialization::Established(EstablishedMaterialization::Updated {
                 from,
                 to,
@@ -5371,6 +8925,291 @@ impl ProductionTerminalBusinessCas {
 impl fmt::Debug for ProductionTerminalBusinessCas {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ProductionTerminalBusinessCas(<redacted>)")
+    }
+}
+
+#[cfg(test)]
+const MAX_ABSENT_BUSINESS_RESERVATION_V2_CODEC_BYTES: usize =
+    MAX_BUSINESS_SESSION_COPY_BYTES + 1024;
+#[cfg(test)]
+const ABSENT_BUSINESS_RESERVATION_V2_MAGIC: [u8; 8] = *b"OPCABR2\0";
+#[cfg(test)]
+const ABSENT_BUSINESS_RESERVATION_V2_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/absent-business-reservation/v2\0";
+
+/// Exact V2 predicate that proves the authoritative business row was absent
+/// at admission.
+///
+/// A V2 create never carries a fake business record or a caller-chosen
+/// generation. The only generation represented by this type is the fixed
+/// first generation, returned by [`Self::generation`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProductionAbsentBusinessPredicateV2 {
+    key: crate::model::SessionKey,
+    admission_commitment: [u8; 32],
+}
+
+impl ProductionAbsentBusinessPredicateV2 {
+    fn for_admission(admission: &Admission) -> Result<Self, ReservationError> {
+        if admission.profile() != crate::fenced_mutation_roster::Profile::v2()
+            || !admission
+                .established_mutation()
+                .requires_absent_predecessor()
+            || admission.expected_generation() != crate::model::Generation::new(1)
+        {
+            return Err(ReservationError::BusinessCas);
+        }
+        Ok(Self {
+            key: admission.key().clone(),
+            admission_commitment: admission.body_commitment(),
+        })
+    }
+
+    fn validate_for(&self, admission: &Admission) -> Result<(), ReservationError> {
+        if self.key != *admission.key() || self.admission_commitment != admission.body_commitment()
+        {
+            return Err(ReservationError::BusinessCas);
+        }
+        Self::for_admission(admission).map(|_| ())
+    }
+
+    /// Return the exact session key whose authoritative row must be absent.
+    pub(crate) fn key(&self) -> &crate::model::SessionKey {
+        &self.key
+    }
+
+    /// Return the only generation an absent-predecessor V2 create may write.
+    pub(crate) const fn generation(&self) -> crate::model::Generation {
+        crate::model::Generation::new(1)
+    }
+
+    #[cfg(test)]
+    fn validate_shape(&self) -> Result<(), ReservationError> {
+        if self.admission_commitment == [0; 32] {
+            return Err(ReservationError::CanonicalEncoding);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    const fn admission_commitment(&self) -> [u8; 32] {
+        self.admission_commitment
+    }
+}
+
+impl fmt::Debug for ProductionAbsentBusinessPredicateV2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProductionAbsentBusinessPredicateV2(<redacted>)")
+    }
+}
+
+/// Exact V2 admission reservation for an absent authoritative row.
+///
+/// SQLite persists this in its dedicated V2 reservation table. The binding is
+/// part of the durable predicate, so replay and conflict handling remain tied
+/// to the exact tenant/scope/fence-authenticated admission rather than merely
+/// to a session key.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProductionAdmissionAbsentBusinessReservationV2 {
+    predicate: ProductionAbsentBusinessPredicateV2,
+    binding: RequestBindingKey,
+    /// Exact canonical generation-one successor validated before any provider
+    /// effect.  Retaining this alongside the absence predicate prevents Q2
+    /// from constructing a different record from caller-controlled bytes.
+    successor: ProductionBusinessState,
+}
+
+impl ProductionAdmissionAbsentBusinessReservationV2 {
+    /// Reserve exact absence for the supplied authenticated V2 admission and
+    /// its one issued roster binding.
+    pub(crate) fn new(
+        admission: &Admission,
+        binding: RequestBindingKey,
+    ) -> Result<Self, ReservationError> {
+        let predicate = ProductionAbsentBusinessPredicateV2::for_admission(admission)?;
+        let expected_binding = admission
+            .binding_key(binding.history_epoch())
+            .map_err(|_| ReservationError::BusinessCas)?;
+        if binding != expected_binding {
+            return Err(ReservationError::BusinessCas);
+        }
+        let successor = ProductionBusinessState::created(admission)?;
+        Ok(Self {
+            predicate,
+            binding,
+            successor,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ReservationError> {
+        let value: Self = decode_frame(
+            bytes,
+            ABSENT_BUSINESS_RESERVATION_V2_MAGIC,
+            ABSENT_BUSINESS_RESERVATION_V2_DOMAIN,
+            MAX_ABSENT_BUSINESS_RESERVATION_V2_CODEC_BYTES,
+        )
+        .map_err(|_| ReservationError::CanonicalEncoding)?;
+        value.predicate.validate_shape()?;
+        if value.to_canonical_bytes()?.as_slice() != bytes {
+            return Err(ReservationError::CanonicalEncoding);
+        }
+        Ok(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn to_canonical_bytes(&self) -> Result<Vec<u8>, ReservationError> {
+        self.predicate.validate_shape()?;
+        encode_frame(
+            ABSENT_BUSINESS_RESERVATION_V2_MAGIC,
+            ABSENT_BUSINESS_RESERVATION_V2_DOMAIN,
+            self,
+            MAX_ABSENT_BUSINESS_RESERVATION_V2_CODEC_BYTES,
+        )
+        .map_err(|_| ReservationError::CanonicalEncoding)
+    }
+
+    /// Re-prove every exact V2 admission and binding fact before Q2.
+    pub(crate) fn validate_for(
+        &self,
+        admission: &Admission,
+        binding: RequestBindingKey,
+    ) -> Result<(), ReservationError> {
+        self.predicate.validate_for(admission)?;
+        if self.binding != binding {
+            return Err(ReservationError::BusinessCas);
+        }
+        let expected = Self::new(admission, binding)?;
+        if self.successor != expected.successor {
+            return Err(ReservationError::BusinessCas);
+        }
+        Ok(())
+    }
+
+    /// Return the exact absence predicate that Q1 and Q2 must compare.
+    pub(crate) fn predicate(&self) -> &ProductionAbsentBusinessPredicateV2 {
+        &self.predicate
+    }
+
+    /// Return the exact durable roster binding that owns this reservation.
+    pub(crate) const fn binding(&self) -> RequestBindingKey {
+        self.binding
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn admission_commitment(&self) -> [u8; 32] {
+        self.predicate.admission_commitment()
+    }
+
+    /// Return the exact canonical successor committed by Q1.
+    pub(crate) const fn successor(&self) -> &ProductionBusinessState {
+        &self.successor
+    }
+}
+
+impl fmt::Debug for ProductionAdmissionAbsentBusinessReservationV2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProductionAdmissionAbsentBusinessReservationV2(<redacted>)")
+    }
+}
+
+/// Exact V2 absent-row transition coupled only to Q2 terminalization.
+#[derive(Clone)]
+pub(crate) enum ProductionTerminalAbsentBusinessCasV2 {
+    /// Re-prove absence and release the V2 reservation without materializing
+    /// any authoritative session row.
+    AbortedCompareAbsentRelease {
+        reservation: ProductionAdmissionAbsentBusinessReservationV2,
+    },
+    /// Re-prove absence, insert the exact generation-one successor, and
+    /// release the V2 reservation atomically.
+    EstablishedCreate {
+        reservation: ProductionAdmissionAbsentBusinessReservationV2,
+        successor: ProductionBusinessState,
+    },
+}
+
+/// Borrowed V2 terminal action for dedicated SQLite V2-table dispatch.
+pub(crate) enum ProductionTerminalAbsentBusinessActionV2<'a> {
+    /// Re-prove exact absence and remove only the V2 reservation.
+    AbortedCompareAbsentRelease {
+        reservation: &'a ProductionAdmissionAbsentBusinessReservationV2,
+    },
+    /// Re-prove exact absence, INSERT the successor, and remove the V2
+    /// reservation in the same consensus mutation.
+    EstablishedCreate {
+        reservation: &'a ProductionAdmissionAbsentBusinessReservationV2,
+        successor: &'a ProductionBusinessState,
+    },
+}
+
+impl<'a> ProductionTerminalAbsentBusinessActionV2<'a> {
+    /// Return the exact V2 absence predicate to compare before Q2 applies.
+    pub(crate) fn predicate(&self) -> &'a ProductionAbsentBusinessPredicateV2 {
+        match self {
+            Self::AbortedCompareAbsentRelease { reservation }
+            | Self::EstablishedCreate { reservation, .. } => reservation.predicate(),
+        }
+    }
+
+    /// Return the exact V2 reservation that Q2 must remove atomically.
+    pub(crate) fn reservation(&self) -> &'a ProductionAdmissionAbsentBusinessReservationV2 {
+        match self {
+            Self::AbortedCompareAbsentRelease { reservation }
+            | Self::EstablishedCreate { reservation, .. } => reservation,
+        }
+    }
+}
+
+impl ProductionTerminalAbsentBusinessCasV2 {
+    /// Return the exact typed Q2 operation for SQLite consensus dispatch.
+    pub(crate) const fn action(&self) -> ProductionTerminalAbsentBusinessActionV2<'_> {
+        match self {
+            Self::AbortedCompareAbsentRelease { reservation } => {
+                ProductionTerminalAbsentBusinessActionV2::AbortedCompareAbsentRelease {
+                    reservation,
+                }
+            }
+            Self::EstablishedCreate {
+                reservation,
+                successor,
+            } => ProductionTerminalAbsentBusinessActionV2::EstablishedCreate {
+                reservation,
+                successor,
+            },
+        }
+    }
+
+    /// Build the sole V2 Q2 transition from an authenticated terminal. No
+    /// other materialization can consume an absent-predecessor reservation.
+    pub(crate) fn from_committed(
+        admission: &Admission,
+        binding: RequestBindingKey,
+        terminal: &CommittedTerminal,
+        reservation: &ProductionAdmissionAbsentBusinessReservationV2,
+    ) -> Result<Self, ReservationError> {
+        reservation.validate_for(admission, binding)?;
+        match terminal.materialization() {
+            TerminalMaterialization::Aborted => Ok(Self::AbortedCompareAbsentRelease {
+                reservation: reservation.clone(),
+            }),
+            TerminalMaterialization::Established(EstablishedMaterialization::Created {
+                generation,
+                record_commitment: _,
+            }) if *generation == reservation.predicate().generation() => {
+                Ok(Self::EstablishedCreate {
+                    reservation: reservation.clone(),
+                    successor: reservation.successor().clone(),
+                })
+            }
+            _ => Err(ReservationError::BusinessCas),
+        }
+    }
+}
+
+impl fmt::Debug for ProductionTerminalAbsentBusinessCasV2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProductionTerminalAbsentBusinessCasV2(<redacted>)")
     }
 }
 
@@ -5524,21 +9363,39 @@ impl fmt::Debug for PreparedProductionTransaction {
 
 /// Compatibility name for the one-row admission/terminal production path.
 pub(crate) type PreparedProductionChargeTransition = PreparedProductionTransaction;
+#[cfg(test)]
 pub(crate) type PreparedProductionRetirement = PreparedProductionTransaction;
+
+/// Inputs consumed when preparing an admission's one-row production transition.
+pub(crate) struct ProductionAdmissionPreparation<'a> {
+    pub(crate) vacancy: &'a ProductionBindingVacancyGuard,
+    pub(crate) existing: Option<&'a ProductionReservationRecord>,
+    pub(crate) record: ProductionReservationRecord,
+    pub(crate) existing_floor: Option<IrreversibleHistoryFloor>,
+    pub(crate) existing_retirement_cursor: Option<&'a ProductionRetirementCursor>,
+    pub(crate) witness: GlobalChargeWitness,
+    pub(crate) budget: GlobalChargeBudget,
+    pub(crate) profile: ChargeProfile,
+}
 
 /// Prepare one atomic consensus admission plus its capacity reservation and
 /// witness transition. The terminal-history slot is charged here, before any
 /// provider effect, so a valid live admission cannot fail terminalization for
 /// retained-history capacity.
 pub(crate) fn prepare_production_admission(
-    existing: Option<&ProductionReservationRecord>,
-    record: ProductionReservationRecord,
-    existing_floor: Option<IrreversibleHistoryFloor>,
-    existing_retirement_cursor: Option<&ProductionRetirementCursor>,
-    witness: GlobalChargeWitness,
-    budget: GlobalChargeBudget,
-    profile: ChargeProfile,
+    preparation: ProductionAdmissionPreparation<'_>,
 ) -> Result<PreparedProductionChargeTransition, ReservationError> {
+    let ProductionAdmissionPreparation {
+        vacancy,
+        existing,
+        record,
+        existing_floor,
+        existing_retirement_cursor,
+        witness,
+        budget,
+        profile,
+    } = preparation;
+    vacancy.validate_for(record.binding)?;
     if existing.is_some() {
         return Err(ReservationError::Duplicate);
     }
@@ -5841,112 +9698,6 @@ pub(crate) fn prepare_production_retirement(
     })
 }
 
-/// Prepare one globally ordered compact-tombstone retirement prefix.
-///
-/// The caller supplies only rows already selected by the terminal-sequence
-/// index plus any partitions which become empty after this exact prefix.  The
-/// adapter re-proves that it is the complete `min(RECLAIM_BATCH, tombstone
-/// prefix before the first retained terminal)` and that every empty partition
-/// is released.  Consequently this function never scans the whole roster and
-/// Q1/Q2 remain single-row operations; only deterministic maintenance can
-/// advance `retired_terminal_sequence`.
-pub(crate) fn prepare_production_global_terminal_retirement(
-    selected: &[(RequestBindingKey, ProductionReservationRecord)],
-    released_partitions: &[(IrreversibleHistoryFloor, Option<ProductionRetirementCursor>)],
-    witness: GlobalChargeWitness,
-    budget: GlobalChargeBudget,
-    profile: ChargeProfile,
-) -> Result<PreparedProductionRetirement, ReservationError> {
-    witness.admits(budget)?;
-    if selected.is_empty() || selected.len() > RECLAIM_BATCH {
-        return Err(ReservationError::SnapshotMismatch);
-    }
-    let mut next_counters = witness.roster;
-    let mut rows = Vec::with_capacity(selected.len());
-    let mut ordered = Vec::with_capacity(selected.len());
-    let mut selected_partitions = BTreeMap::new();
-    let mut previous_sequence = witness.retired_terminal_sequence();
-    for (binding, record) in selected {
-        if *binding != record.binding
-            || record.state != ReservationState::Tombstone
-            || record
-                .terminal_sequence
-                .is_none_or(|sequence| sequence <= previous_sequence)
-        {
-            return Err(ReservationError::SnapshotMismatch);
-        }
-        record.validate(profile)?;
-        let sequence = record
-            .terminal_sequence
-            .ok_or(ReservationError::SnapshotMismatch)?;
-        previous_sequence = sequence;
-        let key = ProductionFloorKey::from_binding(*binding)?;
-        selected_partitions
-            .entry(key)
-            .and_modify(|count| *count += 1_usize)
-            .or_insert(1_usize);
-        next_counters = counters_without_production_record(next_counters, record, profile)?;
-        rows.push(ProductionRowCas {
-            binding: *binding,
-            expected: Some(record.clone()),
-            expected_canonical: None,
-            replacement: None,
-            replacement_canonical: None,
-        });
-        ordered.push((sequence, *binding));
-    }
-    let mut released_floors = Vec::with_capacity(released_partitions.len());
-    let mut released_retirement_cursors = Vec::new();
-    let mut released_keys = Vec::with_capacity(released_partitions.len());
-    for (floor, cursor) in released_partitions {
-        let key = ProductionFloorKey::from_floor(*floor)?;
-        if !selected_partitions.contains_key(&key) {
-            return Err(ReservationError::FloorAdvance);
-        }
-        if released_keys.contains(&key) {
-            return Err(ReservationError::Duplicate);
-        }
-        if let Some(cursor) = cursor {
-            cursor.validate_for_floor(*floor)?;
-            next_counters = counters_without_retirement_cursor(next_counters, cursor)?;
-            released_retirement_cursors.push(ProductionRetirementCursorCas {
-                key,
-                expected: Some(cursor.clone()),
-                replacement: None,
-            });
-        }
-        next_counters = counters_without_production_floor(next_counters, *floor)?;
-        released_floors.push(ProductionFloorCas {
-            key,
-            expected: Some(*floor),
-            replacement: None,
-        });
-        released_keys.push(key);
-    }
-    let guard = ProductionGlobalTerminalRetirementGuard::new(ordered, released_keys)?;
-    let next = witness
-        .with_roster(next_counters)
-        .retire_through_terminal_sequence(previous_sequence)?;
-    next.admits(budget)?;
-    Ok(PreparedProductionTransaction {
-        rows,
-        previous: witness,
-        next,
-        floor: None,
-        retirement_cursor: None,
-        released_floors,
-        released_retirement_cursors,
-        partition_guard: None,
-        global_terminal_retirement_guard: Some(guard),
-        reclaim_oldest_guard: None,
-        admission_business_reservation: None,
-        business: None,
-        #[cfg(test)]
-        canonical_rows_validated: u32::try_from(selected.len())
-            .map_err(|_| ReservationError::Arithmetic)?,
-    })
-}
-
 struct ProductionTransitionPreparation {
     current: Option<ProductionReservationRecord>,
     expected_canonical: Option<Vec<u8>>,
@@ -6154,6 +9905,25 @@ fn counters_with_production_record(
     )
 }
 
+/// Add one V2 carrier to the same global witness used by V1.  The profiles
+/// have disjoint durable row encodings, but their finite live/history slots
+/// and schema-charge budget are one deployment-wide resource.
+fn counters_with_production_record_v2(
+    counters: AggregateCounters,
+    record: &ProductionReservationRecordV2,
+    profile: ChargeProfile,
+) -> Result<AggregateCounters, ReservationError> {
+    counters_for_record(
+        counters,
+        match record.state {
+            ProductionReservationStateV2::Live => ReservationState::Live,
+            ProductionReservationStateV2::Retained => ReservationState::Retained,
+            ProductionReservationStateV2::Tombstone => ReservationState::Tombstone,
+        },
+        production_record_v2_charges(record, profile)?,
+    )
+}
+
 pub(crate) fn counters_with_production_floor(
     mut counters: AggregateCounters,
     floor: IrreversibleHistoryFloor,
@@ -6277,6 +10047,44 @@ fn counters_without_production_record(
     Ok(counters)
 }
 
+/// Remove one V2 carrier from the shared witness before replacing it at Q2.
+fn counters_without_production_record_v2(
+    mut counters: AggregateCounters,
+    record: &ProductionReservationRecordV2,
+    profile: ChargeProfile,
+) -> Result<AggregateCounters, ReservationError> {
+    let contribution = counters_for_record(
+        zero_counters(),
+        match record.state {
+            ProductionReservationStateV2::Live => ReservationState::Live,
+            ProductionReservationStateV2::Retained => ReservationState::Retained,
+            ProductionReservationStateV2::Tombstone => ReservationState::Tombstone,
+        },
+        production_record_v2_charges(record, profile)?,
+    )?;
+    counters.materialized_charge_bytes = counters
+        .materialized_charge_bytes
+        .checked_sub(contribution.materialized_charge_bytes)
+        .ok_or(ReservationError::WitnessMismatch)?;
+    counters.reserved_future_charge_bytes = counters
+        .reserved_future_charge_bytes
+        .checked_sub(contribution.reserved_future_charge_bytes)
+        .ok_or(ReservationError::WitnessMismatch)?;
+    counters.live_reservations = counters
+        .live_reservations
+        .checked_sub(contribution.live_reservations)
+        .ok_or(ReservationError::WitnessMismatch)?;
+    counters.retained_and_live_bindings = counters
+        .retained_and_live_bindings
+        .checked_sub(contribution.retained_and_live_bindings)
+        .ok_or(ReservationError::WitnessMismatch)?;
+    counters.durable_epoch_bindings = counters
+        .durable_epoch_bindings
+        .checked_sub(contribution.durable_epoch_bindings)
+        .ok_or(ReservationError::WitnessMismatch)?;
+    Ok(counters)
+}
+
 fn production_record_charges(
     record: &ProductionReservationRecord,
     profile: ChargeProfile,
@@ -6303,6 +10111,45 @@ fn production_record_charges(
                 .ok_or(ReservationError::Arithmetic)?,
         )?),
         ReservationState::Tombstone => profile.charge(production_components(
+            &[],
+            None,
+            record.tombstone.as_deref(),
+            record
+                .admission_provenance
+                .len()
+                .checked_add(record.terminal_evidence.as_ref().map_or(0, Vec::len))
+                .ok_or(ReservationError::Arithmetic)?,
+        )?),
+    }
+}
+
+/// Recompute the V2 carrier's exact charge from canonical row components.
+///
+/// A V2 `Live` row reserves the full compact terminal envelope at Q1.  A
+/// `Retained` row materializes only its actually sealed V2 evidence; its
+/// construction already proves that charge is bounded by the reservation.
+fn production_record_v2_charges(
+    record: &ProductionReservationRecordV2,
+    profile: ChargeProfile,
+) -> Result<Charges, ReservationError> {
+    match record.state {
+        ProductionReservationStateV2::Live => profile.charge(production_components_v2(
+            &record.admission,
+            None,
+            None,
+            max_v2_compact_evidence_bytes(),
+        )?),
+        ProductionReservationStateV2::Retained => profile.charge(production_components_v2(
+            &record.admission,
+            record.terminal.as_deref(),
+            None,
+            record
+                .admission_provenance
+                .len()
+                .checked_add(record.terminal_evidence.as_ref().map_or(0, Vec::len))
+                .ok_or(ReservationError::Arithmetic)?,
+        )?),
+        ProductionReservationStateV2::Tombstone => profile.charge(production_components_v2(
             &[],
             None,
             record.tombstone.as_deref(),

@@ -26,7 +26,9 @@ pub enum ProtocolError {
 /// TCP and ordinary socket failures remain transport failures. Certificate,
 /// trust, and peer-authentication failures collapse to the existing
 /// redaction-safe authentication category; every other rustls failure is a TLS
-/// protocol failure.
+/// protocol failure. The protected-roster setup boundary may inspect the
+/// original `io::Error` with [`tls_io_error_is_no_application_protocol`]
+/// before this public classification deliberately collapses the cause.
 pub(crate) fn classify_tls_io_error(error: std::io::Error) -> ProtocolError {
     let Some(rustls_error) = error
         .get_ref()
@@ -39,6 +41,22 @@ pub(crate) fn classify_tls_io_error(error: std::io::Error) -> ProtocolError {
     } else {
         ProtocolError::UnexpectedResponse
     }
+}
+
+/// Return whether a TLS setup error is exactly the redaction-safe ALPN
+/// capability rejection consumed by the private protected-roster boundary.
+pub(crate) fn tls_io_error_is_no_application_protocol(error: &std::io::Error) -> bool {
+    use tokio_rustls::rustls::{AlertDescription, Error};
+
+    matches!(
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<Error>()),
+        Some(
+            Error::NoApplicationProtocol
+                | Error::AlertReceived(AlertDescription::NoApplicationProtocol)
+        )
+    )
 }
 
 /// Return whether a server-side TLS accept failure is a local peer-credential
@@ -126,11 +144,21 @@ mod tests {
             Error::General("redacted test failure".to_owned()),
             Error::InvalidMessage(InvalidMessage::MessageTooShort),
             Error::PeerSentOversizedRecord,
-            Error::NoApplicationProtocol,
-            Error::AlertReceived(AlertDescription::NoApplicationProtocol),
         ] {
             assert!(matches!(
                 classify_tls_io_error(wrapped_rustls_error(protocol_error)),
+                ProtocolError::UnexpectedResponse
+            ));
+        }
+
+        for no_application_protocol in [
+            Error::NoApplicationProtocol,
+            Error::AlertReceived(AlertDescription::NoApplicationProtocol),
+        ] {
+            let error = wrapped_rustls_error(no_application_protocol);
+            assert!(tls_io_error_is_no_application_protocol(&error));
+            assert!(matches!(
+                classify_tls_io_error(error),
                 ProtocolError::UnexpectedResponse
             ));
         }

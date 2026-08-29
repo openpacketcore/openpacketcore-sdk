@@ -37,6 +37,8 @@ use opc_key::{
 };
 #[cfg(feature = "test-control")]
 use opc_session_net::DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT;
+#[cfg(feature = "test-control")]
+use opc_session_net::SESSION_QUORUM_CONSUMER_ROSTER_ALPN;
 use opc_session_net::{
     session_consumer_payload_budget, PersistentSessionConsumerClient,
     PersistentSessionConsumerConfig, PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver,
@@ -47,10 +49,12 @@ use opc_session_net::{
     SessionConsumerPreparedCheckpointBackend, SessionQuorumConsumerServer,
     SessionQuorumConsumerServerHandle, SessionReauthenticationControl, SessionReplicationManifest,
     StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
-    SESSION_QUORUM_CONSUMER_ROSTER_ALPN, SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
+    SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN, SESSION_QUORUM_CONSUMER_ROSTER_V2_TRANSPORT_REVISION,
     SESSION_QUORUM_CONSUMER_V2_ALPN,
 };
 use opc_session_net::{
+    FencedMutationRosterAbsentAdmissionProposal as AbsentAdmissionProposal,
+    FencedMutationRosterAbsentRecoveryInput as AbsentRecoveryInput,
     FencedMutationRosterActive as ActiveRoster,
     FencedMutationRosterAdmissionOutcome as AdmissionOutcome,
     FencedMutationRosterAdmissionProposal as AdmissionProposal,
@@ -88,12 +92,16 @@ use opc_session_net::{
 use opc_session_store::fenced_mutation_roster::{
     RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
     RosterAttestationLeafCertificateV1, RosterCompactAdmissionProvenanceSigningInputV2,
-    RosterIngressAttestationSigningInputV1,
+    RosterIngressAttestationSigningInputV1, RosterIngressAttestationSigningInputV2,
+    RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
 };
 #[cfg(feature = "test-control")]
 use opc_session_store::sqlite::test_support::{
+    protected_roster_terminal_apply_timing_test_guard,
     protected_roster_terminal_apply_timings_for_test,
+    protected_roster_v2_terminal_status_validation_stages_for_test,
     reset_protected_roster_terminal_apply_timings_for_test,
+    reset_protected_roster_v2_terminal_status_validation_stages_for_test,
 };
 #[cfg(feature = "test-control")]
 use opc_session_store::test_support::{
@@ -101,6 +109,10 @@ use opc_session_store::test_support::{
     consensus_padding_receipt_status_for_test, ConsensusEngineStateForTest,
     ConsensusPaddingReceiptStatusForTest,
 };
+#[cfg(feature = "test-control")]
+use opc_session_store::PreparedCompareAndSetPrepareError;
+#[cfg(feature = "test-control")]
+use opc_session_store::ProtectedRosterConsensusDiagnosticSnapshot;
 use opc_session_store::{
     AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, ConsensusSessionStore,
     EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
@@ -108,27 +120,29 @@ use opc_session_store::{
     FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
     FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
     Generation, LeaseGuard, OwnerId, PreparedCheckpointBudget, PreparedCompareAndSetExecuteError,
-    PreparedCompareAndSetOutcome, PreparedCompareAndSetPrepareError, PreparedCompareAndSetStatus,
-    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
-    PreparedFencedTransitionLookup, ProtectedRosterConsensusDiagnosticSnapshot,
-    QuorumReplicaDescriptor, QuorumTopologyConfig, QuorumTopologyMode, RecordExpiryPreflight,
-    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
-    RestoreScanRequest, RosterAttestationTrustRootIdentityV1, RosterAttestationTrustRootV1,
-    RosterIngressAttestationV1, SessionBackend, SessionConsensusCommand, SessionConsensusIdentity,
-    SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusResponse, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionConsumerAuthorization, SessionConsumerAuthorizationGrant, SessionConsumerChange,
-    SessionConsumerLeaseError, SessionConsumerOperation, SessionConsumerOutcomeUnknown,
-    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
-    SessionConsumerResponse, SessionConsumerRosterAuthorization, SessionConsumerRosterRejection,
-    SessionConsumerScope, SessionConsumerStoreError, SessionConsumerTenantNfScope,
-    SessionConsumerV2FencedTransitionError, SessionConsumerV2FencedTransitionStatus,
-    SessionConsumerV2Operation, SessionConsumerV2Request, SessionConsumerV2Response,
-    SessionConsumerVoterAuthority, SessionKey, SessionKeyType, SessionLeaseManager,
-    SessionMutationIntent, SessionOp, SessionPayloadEncoding, SessionQuorumConsumer,
-    SessionQuorumRosterIngress, SqliteSessionBackend, StateClass, StateType, StoreError,
-    StoredSessionRecord, ValidatedQuorumTopology, FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES,
-    FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES, FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES,
+    PreparedCompareAndSetOutcome, PreparedCompareAndSetStatus, PreparedFencedTransitionJournal,
+    PreparedFencedTransitionJournalKey, PreparedFencedTransitionLookup, QuorumReplicaDescriptor,
+    QuorumTopologyConfig, QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity,
+    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest,
+    RosterAttestationTrustRootIdentityV1, RosterAttestationTrustRootV1,
+    RosterCompactAdmissionProvenance, RosterCompactAdmissionProvenanceInput,
+    RosterIngressAttestation, RosterIngressAttestationV1, RosterIngressAttestationV2,
+    SessionBackend, SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusResponse,
+    SessionConsensusWireRequest, SessionConsensusWireResponse, SessionConsumerAuthorization,
+    SessionConsumerAuthorizationGrant, SessionConsumerChange, SessionConsumerLeaseError,
+    SessionConsumerOperation, SessionConsumerOutcomeUnknown, SessionConsumerRejection,
+    SessionConsumerRequest, SessionConsumerRequestId, SessionConsumerResponse,
+    SessionConsumerRosterAuthorization, SessionConsumerRosterRejection,
+    SessionConsumerRosterTransportProfile, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerTenantNfScope, SessionConsumerV2FencedTransitionError,
+    SessionConsumerV2FencedTransitionStatus, SessionConsumerV2Operation, SessionConsumerV2Request,
+    SessionConsumerV2Response, SessionConsumerVoterAuthority, SessionKey, SessionKeyType,
+    SessionLeaseManager, SessionMutationIntent, SessionOp, SessionPayloadEncoding,
+    SessionQuorumConsumer, SessionQuorumRosterIngress, SqliteSessionBackend, StateClass, StateType,
+    StoreError, StoredSessionRecord, ValidatedQuorumTopology,
+    FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES, FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES,
+    FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES,
 };
 #[cfg(feature = "test-control")]
 use opc_session_store::{
@@ -230,6 +244,103 @@ fn protected_roster_terminal_status_response_diagnostic(
 #[cfg(not(feature = "test-control"))]
 fn protected_roster_terminal_status_response_diagnostic(
     _transport: &CommitThenLoseConsumerResponse,
+) -> &'static str {
+    "test-control-disabled"
+}
+
+/// Fixed-cardinality, redaction-safe evidence for a failed protected-roster
+/// terminal-status barrier.  This intentionally exposes only readiness and
+/// counter deltas: never a voter identity, peer address, scope, request, or
+/// protected terminal material.
+#[cfg(feature = "test-control")]
+fn protected_roster_terminal_status_barrier_diagnostic(
+    fleet: &ThreeVoterConsumerFleet,
+    read_barrier_calls_before: usize,
+    diagnostics_before: &[(u64, u64, u64, u64)],
+    v2_status_stage_before: &[(u64, u64, u64, u64, u64, u64)],
+    v2_validation_stage_before: (u64, u64, u64, u64, u64, u64, u64),
+) -> String {
+    let readiness = fleet
+        .stores
+        .iter()
+        .map(|store| {
+            let status = store.status();
+            (
+                status.admitted,
+                status.leader_id.is_some(),
+                status.last_log_index == status.applied_index,
+            )
+        })
+        .collect::<Vec<_>>();
+    let diagnostics_delta = fleet
+        .stores
+        .iter()
+        .zip(diagnostics_before)
+        .map(|(store, before)| {
+            let after = store.diagnostic_snapshot();
+            (
+                after.route_deadline.saturating_sub(before.0),
+                after.route_metrics_watch_closed.saturating_sub(before.1),
+                after.raw_read_barrier_unavailable.saturating_sub(before.2),
+                after.raw_read_barrier_deadline.saturating_sub(before.3),
+            )
+        })
+        .collect::<Vec<_>>();
+    let v2_status_stage_delta = fleet
+        .stores
+        .iter()
+        .zip(v2_status_stage_before)
+        .map(|(store, before)| {
+            let after = store.protected_roster_v2_terminal_status_diagnostic_for_test();
+            (
+                after.barrier_entered.saturating_sub(before.0),
+                after.backend_entered.saturating_sub(before.1),
+                after.backend_error.saturating_sub(before.2),
+                after.backend_invalid_key.saturating_sub(before.3),
+                after.backend_unavailable.saturating_sub(before.4),
+                after.backend_other.saturating_sub(before.5),
+            )
+        })
+        .collect::<Vec<_>>();
+    let validation_after = protected_roster_v2_terminal_status_validation_stages_for_test();
+    let v2_validation_stage_delta = (
+        validation_after
+            .record_decoded
+            .saturating_sub(v2_validation_stage_before.0),
+        validation_after
+            .retained_evidence_invariant
+            .saturating_sub(v2_validation_stage_before.1),
+        validation_after
+            .authority_verified
+            .saturating_sub(v2_validation_stage_before.2),
+        validation_after
+            .admission_attestation_verified
+            .saturating_sub(v2_validation_stage_before.3),
+        validation_after
+            .terminal_attestation_verified
+            .saturating_sub(v2_validation_stage_before.4),
+        validation_after
+            .terminal_proof_and_ingress_verified
+            .saturating_sub(v2_validation_stage_before.5),
+        validation_after
+            .retained_shape_verified
+            .saturating_sub(v2_validation_stage_before.6),
+    );
+    format!(
+        "read_barrier_delta={}; readiness(admitted,leader_known,applied_at_log)={readiness:?}; diagnostics_delta(route_deadline,route_watch_closed,raw_barrier_unavailable,raw_barrier_deadline)={diagnostics_delta:?}; v2_status_stage_delta(barrier_entered,backend_entered,backend_error,backend_invalid_key,backend_unavailable,backend_other)={v2_status_stage_delta:?}; v2_validation_stage_delta(record_decoded,retained_evidence_invariant,authority_verified,admission_attestation_verified,terminal_attestation_verified,terminal_proof_and_ingress_verified,retained_shape_verified)={v2_validation_stage_delta:?}",
+        fleet
+            .read_barrier_calls()
+            .saturating_sub(read_barrier_calls_before),
+    )
+}
+
+#[cfg(not(feature = "test-control"))]
+fn protected_roster_terminal_status_barrier_diagnostic(
+    _fleet: &ThreeVoterConsumerFleet,
+    _read_barrier_calls_before: usize,
+    _diagnostics_before: &[(u64, u64, u64, u64)],
+    _v2_status_stage_before: &[(u64, u64, u64, u64, u64, u64)],
+    _v2_validation_stage_before: (u64, u64, u64, u64, u64, u64, u64),
 ) -> &'static str {
     "test-control-disabled"
 }
@@ -515,6 +626,7 @@ impl Drop for AbortConsumerServerOnDrop {
 /// snapshots on its dedicated mount.
 enum ThreeVoterFleetDirectory {
     Owned(tempfile::TempDir),
+    #[cfg(feature = "test-control")]
     Reopened(PathBuf),
 }
 
@@ -536,10 +648,12 @@ impl ThreeVoterFleetDirectory {
     fn path(&self) -> &Path {
         match self {
             Self::Owned(directory) => directory.path(),
+            #[cfg(feature = "test-control")]
             Self::Reopened(path) => path,
         }
     }
 
+    #[cfg(feature = "test-control")]
     fn retain_after_process_loss(self) -> PathBuf {
         match self {
             Self::Owned(directory) => directory.keep(),
@@ -605,6 +719,28 @@ impl ThreeVoterConsumerFleet {
             .activate_protected_roster_profile()
             .await
             .expect("activate protected-roster profile before advertising deployment readiness");
+        fleet.wait_all_ready().await;
+        fleet
+    }
+
+    async fn start_fixed_durable_with_v2_roster_attestation(
+        pki: Arc<TestPki>,
+        root: RosterAttestationTrustRootV1,
+    ) -> Self {
+        let fleet = Self::start_with_topology(pki, None, true, Some(root)).await;
+        fleet.wait_all_ready().await;
+        let (leader, _, _) = fleet.wait_for_observed_leader().await;
+        fleet.stores[leader]
+            .activate_fenced_transition_capability()
+            .await
+            .expect(
+                "activate atomic fenced-transition capability before V2 protected-roster readiness",
+            );
+        fleet.wait_all_ready().await;
+        fleet.stores[leader]
+            .activate_protected_roster_profile_v2()
+            .await
+            .expect("activate V2 protected-roster profile before advertising deployment readiness");
         fleet.wait_all_ready().await;
         fleet
     }
@@ -1847,6 +1983,26 @@ impl SessionQuorumRosterIngress for CommitThenLoseConsumerResponse {
             )
     }
 
+    fn prepare_compact_admission_provenance_input_for_profile(
+        &self,
+        profile: SessionConsumerRosterTransportProfile,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: &SessionConsumerRequest,
+        attestation: &RosterIngressAttestation,
+        certificate_subject_identity_commitment: [u8; 32],
+    ) -> Result<RosterCompactAdmissionProvenanceInput, SessionConsumerRosterRejection> {
+        self.roster_ingress
+            .as_ref()
+            .ok_or(SessionConsumerRosterRejection::Capability)?
+            .prepare_compact_admission_provenance_input_for_profile(
+                profile,
+                authorization,
+                request,
+                attestation,
+                certificate_subject_identity_commitment,
+            )
+    }
+
     async fn execute_roster_ingress(
         &self,
         authorization: &SessionConsumerRosterAuthorization,
@@ -1886,6 +2042,169 @@ impl SessionQuorumRosterIngress for CommitThenLoseConsumerResponse {
             .as_ref()
             .expect("only roster wrappers expose the protected ingress")
             .execute_roster_ingress(authorization, request, attestation, admission_provenance)
+            .await;
+        let admission_recorded = matches!(
+            &response,
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                opc_session_store::consumer::SessionConsumerRosterAdmissionMutationResponse::Recorded(_)
+            )
+        );
+        let terminal_recorded = matches!(
+            &response,
+            SessionConsumerResponse::FencedMutationRosterTerminalize(
+                opc_session_store::consumer::SessionConsumerRosterTerminalMutationResponse::Recorded(_)
+            )
+        );
+        if admission_recorded {
+            self.roster_admission_recorded_responses
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        if terminal_recorded {
+            self.roster_terminal_recorded_responses
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        if terminal {
+            self.roster_terminal_response_completions
+                .fetch_add(1, Ordering::SeqCst);
+            self.roster_terminal_response_elapsed_millis.store(
+                u64::try_from(roster_ingress_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            match &response {
+                SessionConsumerResponse::FencedMutationRosterTerminalize(
+                    opc_session_store::consumer::SessionConsumerRosterTerminalMutationResponse::OutcomeUnknown,
+                ) => {
+                    self.roster_terminal_outcome_unknown_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                SessionConsumerResponse::FencedMutationRosterTerminalize(
+                    opc_session_store::consumer::SessionConsumerRosterTerminalMutationResponse::NotTransmitted,
+                ) => {
+                    self.roster_terminal_not_transmitted_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                SessionConsumerResponse::FencedMutationRosterTerminalize(
+                    opc_session_store::consumer::SessionConsumerRosterTerminalMutationResponse::Rejected(_),
+                ) => {
+                    self.roster_terminal_rejected_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
+        #[cfg(feature = "test-control")]
+        if terminal_status {
+            self.roster_terminal_status_response_elapsed_millis.store(
+                u64::try_from(roster_ingress_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            match &response {
+                SessionConsumerResponse::FencedMutationRosterTerminalStatus(
+                    opc_session_store::consumer::SessionConsumerRosterTerminalReadResponse::Recorded(_),
+                ) => {
+                    self.roster_terminal_status_recorded_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                SessionConsumerResponse::FencedMutationRosterTerminalStatus(
+                    opc_session_store::consumer::SessionConsumerRosterTerminalReadResponse::Rejected(
+                        SessionConsumerRosterRejection::RecoveryRequired,
+                    ),
+                ) => {
+                    self.roster_terminal_status_recovery_required_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                SessionConsumerResponse::FencedMutationRosterTerminalStatus(
+                    opc_session_store::consumer::SessionConsumerRosterTerminalReadResponse::Rejected(
+                        SessionConsumerRosterRejection::Unavailable,
+                    ),
+                ) => {
+                    self.roster_terminal_status_unavailable_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                SessionConsumerResponse::FencedMutationRosterTerminalStatus(
+                    opc_session_store::consumer::SessionConsumerRosterTerminalReadResponse::Rejected(
+                        SessionConsumerRosterRejection::Authority,
+                    ),
+                ) => {
+                    self.roster_terminal_status_authority_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                SessionConsumerResponse::FencedMutationRosterTerminalStatus(
+                    opc_session_store::consumer::SessionConsumerRosterTerminalReadResponse::Rejected(_),
+                ) => {
+                    self.roster_terminal_status_other_rejected_responses
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
+        if admission
+            && admission_recorded
+            && self
+                .lose_roster_admission
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.roster_admission_committed.notify_waiters();
+            std::future::pending::<SessionConsumerResponse>().await;
+        }
+        if terminal
+            && terminal_recorded
+            && self
+                .lose_roster_terminal
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.roster_terminal_committed.notify_waiters();
+            std::future::pending::<SessionConsumerResponse>().await;
+        }
+        response
+    }
+
+    async fn execute_roster_ingress_for_profile(
+        &self,
+        profile: SessionConsumerRosterTransportProfile,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: SessionConsumerRequest,
+        attestation: RosterIngressAttestation,
+        admission_provenance: Option<RosterCompactAdmissionProvenance>,
+    ) -> SessionConsumerResponse {
+        let admission = matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedMutationRosterPollAdmit { .. }
+        );
+        let terminal = matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedMutationRosterTerminalize { .. }
+        );
+        #[cfg(feature = "test-control")]
+        let terminal_status = matches!(
+            request.operation(),
+            SessionConsumerOperation::FencedMutationRosterTerminalStatus { .. }
+        );
+        if admission {
+            self.roster_admission_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        if terminal {
+            self.roster_terminal_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        #[cfg(feature = "test-control")]
+        if terminal_status {
+            self.roster_terminal_status_calls
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        let roster_ingress_started = Instant::now();
+        let response = self
+            .roster_ingress
+            .as_ref()
+            .expect("only roster wrappers expose the protected ingress")
+            .execute_roster_ingress_for_profile(
+                profile,
+                authorization,
+                request,
+                attestation,
+                admission_provenance,
+            )
             .await;
         let admission_recorded = matches!(
             &response,
@@ -2329,6 +2648,27 @@ async fn three_voter_authorizer_after_full_restart(
         .expect("post-restart three-voter consumer authorizer")
 }
 
+async fn three_voter_authorizer_for_tenants(
+    store: &ConsensusSessionStore,
+    grants: impl IntoIterator<Item = (String, TenantId)>,
+) -> SessionConsumerAuthorizer {
+    let manifest = store
+        .consumer_authorization_manifest(grants.into_iter().map(|(identity, tenant)| {
+            SessionConsumerAuthorizationGrant::try_new(
+                SpiffeId::new(identity).expect("three-voter multi-tenant client SPIFFE"),
+                [SessionConsumerTenantNfScope::new(
+                    tenant,
+                    NetworkFunctionKind::smf(),
+                )],
+            )
+            .expect("three-voter explicit multi-tenant consumer grant")
+        }))
+        .await
+        .expect("three-voter multi-tenant consumer manifest");
+    SessionConsumerAuthorizer::try_new(manifest)
+        .expect("three-voter multi-tenant consumer authorizer")
+}
+
 async fn admitted_store_and_authorizer(
     client_spiffes: impl IntoIterator<Item = String>,
     server_spiffe: &str,
@@ -2506,9 +2846,34 @@ fn protected_roster_persistent_client(
     .expect("protected-roster persistent consumer")
 }
 
+fn protected_roster_v2_persistent_client(
+    pki: &TestPki,
+    address: SocketAddr,
+    server_spiffe: &str,
+    client_spiffe: &str,
+    voter_authority: SessionConsumerVoterAuthority,
+) -> PersistentSessionConsumerClient {
+    PersistentSessionConsumerClient::try_from_fenced_mutation_roster_v2_stateless(
+        consumer_client(pki, address, server_spiffe, client_spiffe, voter_authority),
+        PersistentSessionConsumerConfig::default(),
+    )
+    .expect("V2 protected-roster persistent consumer")
+}
+
 fn test_key() -> SessionKey {
     SessionKey {
         tenant: TenantId::new("consumer-test").expect("tenant"),
+        nf_kind: NetworkFunctionKind::smf(),
+        key_type: SessionKeyType::PduSession,
+        stable_id: Bytes::from_static(b"opaque-session-reference")
+            .try_into()
+            .expect("stable ID"),
+    }
+}
+
+fn tenant_test_key(tenant: TenantId) -> SessionKey {
+    SessionKey {
+        tenant,
         nf_kind: NetworkFunctionKind::smf(),
         key_type: SessionKeyType::PduSession,
         stable_id: Bytes::from_static(b"opaque-session-reference")
@@ -2524,6 +2889,13 @@ struct CountingKeyProvider {
 
 impl CountingKeyProvider {
     fn with_active_session_key() -> Arc<Self> {
+        Self::with_active_session_key_for_tenant(
+            TenantId::new("consumer-test").expect("test tenant"),
+            "consumer-v2-test-key",
+        )
+    }
+
+    fn with_active_session_key_for_tenant(tenant: TenantId, key_id: &str) -> Arc<Self> {
         let provider = Arc::new(Self {
             inner: MemoryKeyProvider::new(),
             calls: AtomicUsize::new(0),
@@ -2531,9 +2903,9 @@ impl CountingKeyProvider {
         provider
             .inner
             .insert_active_key(
-                KeyId::new("consumer-v2-test-key").expect("test key ID"),
+                KeyId::new(key_id).expect("test key ID"),
                 KeyPurpose::Session,
-                TenantId::new("consumer-test").expect("test tenant"),
+                tenant,
                 Zeroizing::new([0x61; AES_256_GCM_SIV_KEY_LEN]),
             )
             .expect("install test key");
@@ -5178,6 +5550,7 @@ async fn prepared_cas_three_voter_receipt_converges_after_real_commit_and_lost_r
     .await;
 }
 
+#[cfg(feature = "test-control")]
 async fn prepared_cas_three_voter_receipt_converges_with_payload(
     payload: EncryptedSessionPayload,
     physical_attempt_timeout: Duration,
@@ -6557,10 +6930,9 @@ async fn authenticated_consumer_v2_recovers_journaled_protected_transition_after
 // multithreaded runtime so this remains the production topology rather than a
 // serial in-process approximation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal(
-) {
+async fn persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal() {
     let pki = Arc::new(TestPki::new());
-    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
         Arc::clone(&pki),
         ProductionRosterAttestationIssuer::trust_root(),
     )
@@ -6585,16 +6957,18 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
         Some(RosterIngressSigner::trust_root(attestor.as_ref()).identity()),
         "the fixed quorum must expose the same root that certifies /3 ingress"
     );
-    let transport = Arc::new(CommitThenLoseConsumerResponse::roster_passthrough(
+    let transport = Arc::new(CommitThenLoseConsumerResponse::roster_loss(
         consumer,
         roster_ingress,
+        true,
+        true,
     ));
     let (server, address) = SessionQuorumConsumerServer::new(
         transport.clone(),
         pki.server_config(&server_spiffe),
         authorizer,
     )
-    .with_roster_ingress(transport.clone(), ingress_signer)
+    .with_roster_v2_ingress(transport.clone(), ingress_signer)
     .listen(
         "127.0.0.1:0"
             .parse::<SocketAddr>()
@@ -6603,20 +6977,10 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
     .await
     .expect("start maximum protected-roster listener");
 
-    // Establish the incumbent record through the public SessionBackend
-    // boundary. The protected roster is therefore a real checked successor,
-    // never a direct test insertion into SQLite or consensus state.
-    let setup_directory = tempfile::tempdir().expect("protected-roster journal directory");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(
-            setup_directory.path(),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .expect("private protected-roster journal directory");
-    }
+    // Acquire authority through the public SessionBackend boundary while
+    // deliberately leaving the authoritative session row absent. The roster
+    // admission itself must reserve that exact absence; a synthetic pre-seed
+    // would leave fresh product sessions unable to use this contract.
     let setup_provider = CountingKeyProvider::with_active_session_key();
     let setup_client = consumer_client(
         &pki,
@@ -6625,85 +6989,50 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
         &client_spiffe,
         voter_authority.clone(),
     );
-    let setup_physical: Arc<dyn SessionBackend> = Arc::new(
-        SessionConsumerFencedTransitionBackend::stateless(setup_client)
-            .expect("public stateless SessionBackend"),
-    );
-    let setup_outer: Arc<dyn SessionBackend> = Arc::new(
-        EncryptingSessionBackend::new(
-            setup_physical,
-            Arc::clone(&setup_provider),
-            "three-voter-protected-roster",
-        )
-        .with_fenced_transition_journal(Arc::new(
-            PreparedFencedTransitionJournal::create_new(
-                setup_directory.path().join("prepared.sqlite"),
-                PreparedFencedTransitionJournalKey::from_bytes([0x7a; 32]),
-            )
-            .expect("create protected-roster SessionBackend journal"),
-        )),
-    );
     let key = test_key();
     let owner = OwnerId::new("three-voter-roster-owner").expect("roster owner");
-    let setup_lease = FencedTransitionLease::acquire(
-        key.clone(),
-        owner.clone(),
-        FenceToken::new(0),
-        Duration::from_secs(60),
-    )
-    .expect("incumbent roster lease");
-    let setup = FencedTransitionRequest::new(
-        FencedTransitionRequestId::from_bytes([0xb1; 16]),
-        setup_lease.clone(),
-        FencedTransitionMutation::create(StoredSessionRecord {
-            key: key.clone(),
-            generation: Generation::new(1),
-            owner: owner.clone(),
-            fence: setup_lease
-                .committed_fence()
-                .expect("incumbent roster fence"),
-            state_class: StateClass::AuthoritativeSession,
-            state_type: StateType::from_static("three-voter-roster-current"),
-            expires_at: None,
-            payload: EncryptedSessionPayload::new([0x51]),
-        }),
-    )
-    .expect("incumbent protected roster record");
-    let setup = setup_outer
-        .prepare_fenced_transition(setup)
+    let roster_lease = setup_client
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xb1; 16]),
+            key.clone(),
+            owner.clone(),
+            Duration::from_secs(60),
+        )
         .await
-        .expect("prepare incumbent through SessionBackend");
-    let setup = setup_outer
-        .fenced_transition(&setup)
-        .await
-        .expect("commit incumbent through SessionBackend");
-    let roster_lease = setup.lease().clone();
-    let roster_generation = setup.committed_generation();
-    let sequence_before = fleet.application_sequences().await[leader];
-    let log_before = fleet.stores[leader]
-        .status()
-        .last_log_index
-        .expect("protected-roster proposal baseline");
-    fleet.wait_all_application_sequences(sequence_before).await;
+        .expect("fresh absent-record roster lease");
+    let roster_generation = Generation::new(1);
+    for store in &fleet.stores {
+        assert!(
+            store
+                .get(&key)
+                .await
+                .expect("fresh authoritative read")
+                .is_none(),
+            "lease acquisition must not pre-seed the protected business row"
+        );
+    }
+    let lease_sequence = fleet.application_sequences().await[leader];
+    fleet.wait_all_application_sequences(lease_sequence).await;
 
-    let persistent = protected_roster_persistent_client(
+    let persistent = protected_roster_v2_persistent_client(
         &pki,
         address,
         &server_spiffe,
         &client_spiffe,
         voter_authority,
     );
-    assert!(persistent.fenced_mutation_roster_transport_enabled());
+    assert!(persistent.fenced_mutation_roster_v2_transport_enabled());
+    assert!(!persistent.fenced_mutation_roster_transport_enabled());
     assert_eq!(
-        SESSION_QUORUM_CONSUMER_ROSTER_ALPN,
-        b"opc-session-consumer/3"
+        SESSION_QUORUM_CONSUMER_ROSTER_V2_ALPN,
+        b"opc-session-consumer/4"
     );
-    assert_eq!(SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION, 5);
+    assert_eq!(SESSION_QUORUM_CONSUMER_ROSTER_V2_TRANSPORT_REVISION, 6);
     let shutdown_client = persistent.clone();
     let provider = Arc::new(SixMemberRosterEvidenceProvider::new(attestor.clone()));
     let publication_provider = Arc::new(EstablishedPublicationEvidenceProvider::default());
     let adapter = persistent
-        .into_fenced_mutation_roster_provider_adapter(
+        .into_fenced_mutation_roster_v2_provider_adapter(
             Arc::clone(&provider),
             Arc::clone(&publication_provider),
             executor_attestor,
@@ -6717,7 +7046,7 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
     let terminal_state_type = StateType::from_static("three-voter-roster-established");
     let mut expected_terminal = StoredSessionRecord {
         key: key.clone(),
-        generation: roster_generation.next().expect("terminal generation"),
+        generation: roster_generation,
         owner: owner.clone(),
         fence: roster_lease.fence(),
         state_class: StateClass::AuthoritativeSession,
@@ -6768,24 +7097,50 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
             .expect("ordered opaque roster member")
         })
         .collect::<Vec<_>>();
-    let proposal = AdmissionProposal::new(
-        FencedMutationRosterProfile::v1(),
+    let proposal = AbsentAdmissionProposal::new(
+        FencedMutationRosterProfile::v2(),
         RosterId::from_bytes([0xb2; 16]).expect("stable roster ID"),
         members.clone(),
-        EstablishedMutation::put_checkpoint(terminal_state_type),
+        terminal_state_type,
         protected_plan.clone(),
         protected_checkpoint.clone(),
         protected_result.clone(),
     )
     .expect("maximum protected roster proposal");
+    // Maximum-size checkpoint construction is intentionally expensive and is
+    // outside the admission measurement. Refresh the same exact authority at
+    // the public boundary immediately before PollAdmit so a loaded test host
+    // cannot turn payload preparation time into a lease-expiry result. The
+    // renewal preserves the key, owner, and fence; the baseline below excludes
+    // that explicit setup mutation and still proves PollAdmit appends once.
+    let roster_lease = setup_client
+        .renew_with_id(
+            SessionConsumerRequestId::from_bytes([0xb3; 16]),
+            roster_lease,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("refresh exact roster lease immediately before admission");
+    assert_eq!(roster_lease.key(), &key);
+    assert_eq!(roster_lease.owner(), &owner);
+    assert_eq!(roster_lease.fence(), expected_terminal.fence);
+    let sequence_before = fleet.application_sequences().await[leader];
+    let log_before = fleet.stores[leader]
+        .status()
+        .last_log_index
+        .expect("protected-roster proposal baseline");
     let mut admission = roster_client
-        .prepare(roster_lease, roster_generation, proposal)
+        .prepare_absent(roster_lease, proposal)
         .expect("prepare exact protected roster body");
-    let mut roster = match roster_client
+    let admission_outcome = roster_client
         .admit(&mut admission)
         .await
-        .expect("one real PollAdmit")
-    {
+        .expect("one real PollAdmit");
+    assert!(
+        matches!(&admission_outcome, AdmissionOutcome::OutcomeUnknown(_)),
+        "the injectable committed admission reply loss must leave the client ambiguous"
+    );
+    let mut roster = match admission_outcome {
         AdmissionOutcome::Admitted(active) => DurableCrashRecoveredRoster::Active(active),
         AdmissionOutcome::NotTransmitted => {
             panic!(
@@ -6794,6 +7149,14 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
             )
         }
         AdmissionOutcome::OutcomeUnknown(_) => {
+            // The response-loss wrapper returns only after the leader has
+            // committed and applied the admission.  A linearizable status read
+            // may legitimately bring a follower's application metric up to
+            // that already-committed index, so follower application counters
+            // are not a mutation boundary.  The exact leader log assertion
+            // below proves the whole admission/status sequence appended only
+            // the one PollAdmit proposal without delaying this lease-bound
+            // read behind follower convergence.
             let mut recovered = None;
             for attempt in 0..PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
                 match roster_client.admission_status(&admission).await {
@@ -6809,6 +7172,9 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
                         if attempt + 1 < PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
                             tokio::task::yield_now().await;
                         }
+                    }
+                    Err(RosterClientError::AuthorityRejected) => {
+                        panic!("exact maximum PollAdmit status authority was rejected")
                     }
                     Err(_) => {
                         panic!("exact maximum PollAdmit status readback rejected its bound request")
@@ -6948,6 +7314,12 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
     let proofs = CompleteProofSet::new(proofs).expect("six SDK-issued conclusive proofs");
     assert_eq!(proofs.len(), 6);
     assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
+    let provider_calls_before_terminal = (
+        provider.prepare_calls.load(Ordering::SeqCst),
+        provider.execute_calls.load(Ordering::SeqCst),
+        provider.status_calls.load(Ordering::SeqCst),
+        provider.adopt_calls.load(Ordering::SeqCst),
+    );
     let mut terminal = roster_client
         .prepare_terminal(roster.for_terminal(), &proofs)
         .await
@@ -6957,12 +7329,21 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
         .lock()
         .await;
     #[cfg(feature = "test-control")]
+    let _terminal_apply_timing_store_guard =
+        protected_roster_terminal_apply_timing_test_guard().await;
+    #[cfg(feature = "test-control")]
     reset_protected_roster_terminal_apply_timings_for_test();
+    #[cfg(feature = "test-control")]
+    reset_protected_roster_v2_terminal_status_validation_stages_for_test();
     let terminalize_started = Instant::now();
     let terminalize_outcome = roster_client
         .terminalize(&mut terminal)
         .await
         .expect("one real Terminalize");
+    assert!(
+        matches!(&terminalize_outcome, TerminalizationOutcome::OutcomeUnknown),
+        "the injectable committed terminal reply loss must leave the client ambiguous"
+    );
     let mut publication = match terminalize_outcome {
         TerminalizationOutcome::Committed(TerminalReceipt::Established(established)) => {
             assert_eq!(established.protected_checkpoint(), protected_checkpoint);
@@ -6976,8 +7357,71 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
             panic!("fresh protected terminal must return its committed Established receipt")
         }
         TerminalizationOutcome::OutcomeUnknown => {
+            // The response-loss wrapper parks only after the inner service has
+            // produced its Recorded Q2 response. Openraft's metrics and the
+            // two follower state machines may still be observing that already
+            // committed entry, so first wait for the known second transition
+            // to apply everywhere. The readback proof below then fences both
+            // applied and last-log indexes: catch-up is allowed here, but a
+            // third status-induced proposal is not.
+            let terminal_log_index = log_before + 2;
+            fleet
+                .wait_all_application_sequences(terminal_log_index)
+                .await;
+            let sequences_before_status = fleet.application_sequences().await;
+            let log_indexes_before_status =
+                std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                    fleet.stores[index].status().last_log_index
+                });
             let terminalize_elapsed_millis = terminalize_started.elapsed().as_millis();
             let terminal_status_started = Instant::now();
+            let terminal_status_barriers_before = fleet.read_barrier_calls();
+            let terminal_status_diagnostics_before = fleet
+                .stores
+                .iter()
+                .map(|store| {
+                    let snapshot = store.diagnostic_snapshot();
+                    (
+                        snapshot.route_deadline,
+                        snapshot.route_metrics_watch_closed,
+                        snapshot.raw_read_barrier_unavailable,
+                        snapshot.raw_read_barrier_deadline,
+                    )
+                })
+                .collect::<Vec<_>>();
+            #[cfg(feature = "test-control")]
+            let terminal_status_v2_stage_before = fleet
+                .stores
+                .iter()
+                .map(|store| {
+                    let snapshot = store.protected_roster_v2_terminal_status_diagnostic_for_test();
+                    (
+                        snapshot.barrier_entered,
+                        snapshot.backend_entered,
+                        snapshot.backend_error,
+                        snapshot.backend_invalid_key,
+                        snapshot.backend_unavailable,
+                        snapshot.backend_other,
+                    )
+                })
+                .collect::<Vec<_>>();
+            #[cfg(not(feature = "test-control"))]
+            let terminal_status_v2_stage_before = Vec::new();
+            #[cfg(feature = "test-control")]
+            let terminal_status_v2_validation_stage_before = {
+                let snapshot = protected_roster_v2_terminal_status_validation_stages_for_test();
+                (
+                    snapshot.record_decoded,
+                    snapshot.retained_evidence_invariant,
+                    snapshot.authority_verified,
+                    snapshot.admission_attestation_verified,
+                    snapshot.terminal_attestation_verified,
+                    snapshot.terminal_proof_and_ingress_verified,
+                    snapshot.retained_shape_verified,
+                )
+            };
+            #[cfg(not(feature = "test-control"))]
+            let terminal_status_v2_validation_stage_before = (0, 0, 0, 0, 0, 0, 0);
             let mut committed = None;
             for attempt in 0..PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
                 match roster_client.terminal_status(&mut terminal).await {
@@ -7005,6 +7449,18 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
             }
             let terminal_status_elapsed_millis = terminal_status_started.elapsed().as_millis();
             if let Some(established) = committed {
+                assert_eq!(
+                    fleet.application_sequences().await,
+                    sequences_before_status,
+                    "exact terminal status readback cannot advance an already-applied roster mutation"
+                );
+                assert_eq!(
+                    std::array::from_fn::<_, THREE_VOTER_COUNT, _>(|index| {
+                        fleet.stores[index].status().last_log_index
+                    }),
+                    log_indexes_before_status,
+                    "exact terminal status readback is observational and cannot append a third roster proposal"
+                );
                 established.into_publication()
             } else {
                 let applied = fleet.application_sequence_observation().await;
@@ -7019,33 +7475,40 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
                 .all(|record| matches!(record, Ok(Some(record)) if record == &expected_terminal));
                 let (decoded, decode_failures, nonempty) = fleet.append_entries_observation();
                 panic!(
-                "protected terminal remained ambiguous after bounded exact-body readback; terminalize_elapsed_millis={terminalize_elapsed_millis}; terminal_status_elapsed_millis={terminal_status_elapsed_millis}; sequence_before={sequence_before}; applied={applied:?}; applied_deltas={applied_deltas:?}; terminal_record_materialized={terminal_record_materialized}; ingress_admission_calls={}; ingress_admission_recorded_responses={}; ingress_terminal_calls={}; ingress_terminal_recorded_responses={}; ingress_terminal_response_completions={}; ingress_terminal_outcome_unknown_responses={}; ingress_terminal_not_transmitted_responses={}; ingress_terminal_rejected_responses={}; ingress_terminal_response_elapsed_millis={}; terminal_status_server={}; terminal_apply_timings={}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}",
-                transport.roster_admission_calls.load(Ordering::SeqCst),
-                transport
-                    .roster_admission_recorded_responses
-                    .load(Ordering::SeqCst),
-                transport.roster_terminal_calls.load(Ordering::SeqCst),
-                transport
-                    .roster_terminal_recorded_responses
-                    .load(Ordering::SeqCst),
-                transport
-                    .roster_terminal_response_completions
-                    .load(Ordering::SeqCst),
-                transport
-                    .roster_terminal_outcome_unknown_responses
-                    .load(Ordering::SeqCst),
-                transport
-                    .roster_terminal_not_transmitted_responses
-                    .load(Ordering::SeqCst),
-                transport
-                    .roster_terminal_rejected_responses
-                    .load(Ordering::SeqCst),
-                transport
-                    .roster_terminal_response_elapsed_millis
-                    .load(Ordering::SeqCst),
-                protected_roster_terminal_status_response_diagnostic(transport.as_ref()),
-                protected_roster_terminal_apply_timing_diagnostic(),
-            )
+                    "protected terminal remained ambiguous after bounded exact-body readback; terminalize_elapsed_millis={terminalize_elapsed_millis}; terminal_status_elapsed_millis={terminal_status_elapsed_millis}; sequence_before={sequence_before}; applied={applied:?}; applied_deltas={applied_deltas:?}; terminal_record_materialized={terminal_record_materialized}; ingress_admission_calls={}; ingress_admission_recorded_responses={}; ingress_terminal_calls={}; ingress_terminal_recorded_responses={}; ingress_terminal_response_completions={}; ingress_terminal_outcome_unknown_responses={}; ingress_terminal_not_transmitted_responses={}; ingress_terminal_rejected_responses={}; ingress_terminal_response_elapsed_millis={}; terminal_status_server={}; terminal_status_barrier={}; terminal_apply_timings={}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}",
+                    transport.roster_admission_calls.load(Ordering::SeqCst),
+                    transport
+                        .roster_admission_recorded_responses
+                        .load(Ordering::SeqCst),
+                    transport.roster_terminal_calls.load(Ordering::SeqCst),
+                    transport
+                        .roster_terminal_recorded_responses
+                        .load(Ordering::SeqCst),
+                    transport
+                        .roster_terminal_response_completions
+                        .load(Ordering::SeqCst),
+                    transport
+                        .roster_terminal_outcome_unknown_responses
+                        .load(Ordering::SeqCst),
+                    transport
+                        .roster_terminal_not_transmitted_responses
+                        .load(Ordering::SeqCst),
+                    transport
+                        .roster_terminal_rejected_responses
+                        .load(Ordering::SeqCst),
+                    transport
+                        .roster_terminal_response_elapsed_millis
+                        .load(Ordering::SeqCst),
+                    protected_roster_terminal_status_response_diagnostic(transport.as_ref()),
+                    protected_roster_terminal_status_barrier_diagnostic(
+                        &fleet,
+                        terminal_status_barriers_before,
+                        &terminal_status_diagnostics_before,
+                        &terminal_status_v2_stage_before,
+                        terminal_status_v2_validation_stage_before,
+                    ),
+                    protected_roster_terminal_apply_timing_diagnostic(),
+                )
             }
         }
     };
@@ -7075,6 +7538,16 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
     );
     assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 1);
     assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        (
+            provider.prepare_calls.load(Ordering::SeqCst),
+            provider.execute_calls.load(Ordering::SeqCst),
+            provider.status_calls.load(Ordering::SeqCst),
+            provider.adopt_calls.load(Ordering::SeqCst),
+        ),
+        provider_calls_before_terminal,
+        "terminal receipt recovery must status the exact terminal and never replay provider work",
+    );
     adapter
         .publish(&mut publication)
         .await
@@ -7116,6 +7589,1644 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
     assert_eq!(plaintext.as_slice(), terminal_plaintext.as_slice());
 
     shutdown_client.shutdown().await;
+    server.abort_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_three_voter_v2_absent_roster_rejects_authoritative_incumbent_before_provider_work(
+) {
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+        Arc::clone(&pki),
+        ProductionRosterAttestationIssuer::trust_root(),
+    )
+    .await;
+    let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    let server_spiffe = three_voter_spiffe(leader);
+    let client_spiffe = spiffe("three-voter-v2-absent-incumbent-client");
+    let authorizer = three_voter_authorizer(&fleet.stores[leader], &client_spiffe).await;
+    let voter_authority = fleet.voter_authority(leader);
+    let attestor = ProductionRosterAttestationIssuer::new(
+        fleet.consensus_identity(leader),
+        authorizer.scope(),
+    );
+    let ingress_signer: Arc<dyn RosterIngressSigner> = attestor.clone();
+    let executor_attestor: Arc<dyn FencedMutationRosterExecutorAttestor> = attestor.clone();
+    let service = Arc::new(fleet.stores[leader].consumer_service());
+    let consumer: Arc<dyn SessionQuorumConsumer> = service.clone();
+    let roster_ingress: Arc<dyn SessionQuorumRosterIngress> = service;
+    let transport = Arc::new(CommitThenLoseConsumerResponse::roster_passthrough(
+        consumer,
+        roster_ingress,
+    ));
+    let (server, address) = SessionQuorumConsumerServer::new(
+        transport.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_roster_v2_ingress(transport.clone(), ingress_signer)
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("V2 absent incumbent listener"),
+    )
+    .await
+    .expect("start V2 absent incumbent listener");
+
+    // This is an intentional incumbent fixture, built through the public
+    // SessionBackend rather than by reaching into SQLite. The V2 admission
+    // below must prove the row collision without calling a roster provider.
+    let setup_provider = CountingKeyProvider::with_active_session_key();
+    let physical: Arc<dyn SessionBackend> = Arc::new(
+        SessionConsumerFencedTransitionBackend::stateless(consumer_client(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            voter_authority.clone(),
+        ))
+        .expect("public V2 absent incumbent SessionBackend"),
+    );
+    let setup_directory = tempfile::tempdir().expect("V2 absent incumbent journal directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(
+            setup_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("private V2 absent incumbent journal directory");
+    }
+    let outer: Arc<dyn SessionBackend> = Arc::new(
+        EncryptingSessionBackend::new(
+            physical,
+            Arc::clone(&setup_provider),
+            "three-voter-v2-absent-incumbent",
+        )
+        .with_fenced_transition_journal(Arc::new(
+            PreparedFencedTransitionJournal::create_new(
+                setup_directory.path().join("prepared.sqlite"),
+                PreparedFencedTransitionJournalKey::from_bytes([0xc3; 32]),
+            )
+            .expect("create V2 absent incumbent journal"),
+        )),
+    );
+    let key = test_key();
+    let owner =
+        OwnerId::new("three-voter-v2-absent-incumbent-owner").expect("V2 absent incumbent owner");
+    let lease = FencedTransitionLease::acquire(
+        key.clone(),
+        owner.clone(),
+        FenceToken::new(0),
+        Duration::from_secs(60),
+    )
+    .expect("V2 absent incumbent lease");
+    let incumbent = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0xc4; 16]),
+        lease.clone(),
+        FencedTransitionMutation::create(StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner: owner.clone(),
+            fence: lease
+                .committed_fence()
+                .expect("V2 absent incumbent committed fence"),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("three-voter-v2-absent-incumbent-current"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([0x91]),
+        }),
+    )
+    .expect("V2 absent incumbent request");
+    let incumbent = outer
+        .prepare_fenced_transition(incumbent)
+        .await
+        .expect("prepare V2 absent incumbent");
+    let incumbent = outer
+        .fenced_transition(&incumbent)
+        .await
+        .expect("commit V2 absent incumbent");
+    let incumbent_before = fleet.stores[leader]
+        .get(&key)
+        .await
+        .expect("read converged V2 incumbent")
+        .expect("V2 incumbent is authoritative before admission");
+    let log_before = fleet.stores[leader]
+        .status()
+        .last_log_index
+        .expect("V2 absent incumbent roster baseline");
+    let sequence_before = log_before;
+    fleet.wait_all_application_sequences(sequence_before).await;
+    assert_eq!(
+        fleet.application_sequences().await,
+        [sequence_before; THREE_VOTER_COUNT],
+        "the incumbent read barrier and every fixture entry apply before the no-effect V2 admission",
+    );
+
+    let persistent = protected_roster_v2_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
+    assert!(persistent.fenced_mutation_roster_v2_transport_enabled());
+    let shutdown_client = persistent.clone();
+    let provider = Arc::new(SixMemberRosterEvidenceProvider::new(attestor.clone()));
+    let publication_provider = Arc::new(EstablishedPublicationEvidenceProvider::default());
+    let adapter = persistent
+        .into_fenced_mutation_roster_v2_provider_adapter(
+            Arc::clone(&provider),
+            publication_provider,
+            executor_attestor,
+            NonZeroUsize::new(THREE_VOTER_COUNT).expect("positive V2 absent incumbent concurrency"),
+        )
+        .expect("compose V2 absent incumbent adapter");
+    let client = adapter.client().clone();
+    let terminal_state_type = StateType::from_static("three-voter-v2-absent-incumbent-created");
+    let mut terminal = StoredSessionRecord {
+        key: key.clone(),
+        generation: Generation::new(1),
+        owner,
+        fence: incumbent.lease().fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: terminal_state_type.clone(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([0x92]),
+    };
+    let checkpoint = EncryptedSessionPayload::encrypt(
+        setup_provider.as_ref(),
+        &terminal,
+        "three-voter-v2-absent-incumbent",
+    )
+    .await
+    .expect("seal V2 absent incumbent terminal checkpoint")
+    .as_bytes()
+    .to_vec();
+    terminal.payload = EncryptedSessionPayload::try_envelope(&checkpoint)
+        .expect("canonical V2 absent incumbent terminal checkpoint");
+    let members = (0_u8..6)
+        .map(|ordinal| {
+            Member::new(
+                ordinal,
+                MemberOperationId::from_bytes([ordinal + 31; 16])
+                    .expect("V2 absent incumbent member ID"),
+                vec![0xf0, ordinal],
+                u64::from(ordinal) + 91,
+            )
+            .expect("V2 absent incumbent member")
+        })
+        .collect::<Vec<_>>();
+    let proposal = AbsentAdmissionProposal::new(
+        FencedMutationRosterProfile::v2(),
+        RosterId::from_bytes([0xc5; 16]).expect("V2 absent incumbent roster ID"),
+        members,
+        terminal_state_type,
+        vec![0x93],
+        checkpoint,
+        vec![0x94],
+    )
+    .expect("V2 absent incumbent proposal");
+    let mut admission = client
+        .prepare_absent(incumbent.lease().clone(), proposal)
+        .expect("prepare V2 absence assertion against incumbent");
+    assert!(matches!(
+        client.admit(&mut admission).await,
+        Err(RosterClientError::AdmissionRecordAlreadyExists)
+    ));
+    assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
+    fleet
+        .wait_all_application_sequences(sequence_before + 1)
+        .await;
+    assert_eq!(
+        fleet.application_sequences().await,
+        [sequence_before + 1; THREE_VOTER_COUNT],
+        "the incumbent rejection is one committed no-effect admission command",
+    );
+    assert_eq!(
+        fleet.stores[leader].status().last_log_index,
+        Some(log_before + 1),
+        "the no-effect rejection occupies exactly one consensus position",
+    );
+    assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
+    for store in &fleet.stores {
+        assert_eq!(
+            store
+                .get(&key)
+                .await
+                .expect("read V2 absent incumbent after rejection")
+                .as_ref(),
+            Some(&incumbent_before),
+            "the rejected V2 create leaves the exact incumbent intact",
+        );
+    }
+
+    shutdown_client.shutdown().await;
+    server.abort_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_three_voter_v2_absent_roster_not_found_is_adoption_only() {
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+        Arc::clone(&pki),
+        ProductionRosterAttestationIssuer::trust_root(),
+    )
+    .await;
+    let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    let server_spiffe = three_voter_spiffe(leader);
+    let client_spiffe = spiffe("three-voter-v2-absent-not-found-client");
+    let authorizer = three_voter_authorizer(&fleet.stores[leader], &client_spiffe).await;
+    let voter_authority = fleet.voter_authority(leader);
+    let attestor = ProductionRosterAttestationIssuer::new(
+        fleet.consensus_identity(leader),
+        authorizer.scope(),
+    );
+    let ingress_signer: Arc<dyn RosterIngressSigner> = attestor.clone();
+    let executor_attestor: Arc<dyn FencedMutationRosterExecutorAttestor> = attestor.clone();
+    let service = Arc::new(fleet.stores[leader].consumer_service());
+    let consumer: Arc<dyn SessionQuorumConsumer> = service.clone();
+    let roster_ingress: Arc<dyn SessionQuorumRosterIngress> = service;
+    let transport = Arc::new(CommitThenLoseConsumerResponse::roster_passthrough(
+        consumer,
+        roster_ingress,
+    ));
+    let (server, address) = SessionQuorumConsumerServer::new(
+        transport.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_roster_v2_ingress(transport.clone(), ingress_signer)
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("V2 NotFound protected-roster listener"),
+    )
+    .await
+    .expect("start V2 NotFound protected-roster listener");
+
+    let key = test_key();
+    let owner = OwnerId::new("three-voter-v2-absent-not-found-owner").expect("V2 NotFound owner");
+    let setup_provider = CountingKeyProvider::with_active_session_key();
+    let roster_lease = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority.clone(),
+    )
+    .acquire_with_id(
+        SessionConsumerRequestId::from_bytes([0xd1; 16]),
+        key.clone(),
+        owner.clone(),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("V2 NotFound absent roster lease");
+    let sequence_before = fleet
+        .application_sequences()
+        .await
+        .into_iter()
+        .max()
+        .expect("three-voter V2 replay baseline");
+    fleet.wait_all_application_sequences(sequence_before).await;
+    assert_eq!(
+        fleet.application_sequences().await,
+        [sequence_before; THREE_VOTER_COUNT],
+        "all lease commands converge before V2 replay accounting",
+    );
+
+    let persistent = protected_roster_v2_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
+    let shutdown_client = persistent.clone();
+    let provider = Arc::new(
+        SixMemberRosterEvidenceProvider::sixth_execute_outcome_unknown_then_adopted(
+            attestor.clone(),
+        ),
+    );
+    let publication_provider = Arc::new(EstablishedPublicationEvidenceProvider::default());
+    let adapter = persistent
+        .into_fenced_mutation_roster_v2_provider_adapter(
+            Arc::clone(&provider),
+            publication_provider,
+            executor_attestor,
+            NonZeroUsize::new(THREE_VOTER_COUNT).expect("positive V2 NotFound concurrency"),
+        )
+        .expect("compose V2 NotFound protected-roster adapter");
+    let client = adapter.client().clone();
+    let state_type = StateType::from_static("three-voter-v2-absent-not-found-created");
+    let mut expected_terminal = StoredSessionRecord {
+        key: key.clone(),
+        generation: Generation::new(1),
+        owner,
+        fence: roster_lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: state_type.clone(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([0xd2]),
+    };
+    let checkpoint = EncryptedSessionPayload::encrypt(
+        setup_provider.as_ref(),
+        &expected_terminal,
+        "three-voter-v2-absent-not-found",
+    )
+    .await
+    .expect("seal V2 NotFound checkpoint")
+    .as_bytes()
+    .to_vec();
+    expected_terminal.payload = EncryptedSessionPayload::try_envelope(&checkpoint)
+        .expect("canonical V2 NotFound checkpoint");
+    let members = (0_u8..6)
+        .map(|ordinal| {
+            Member::new(
+                ordinal,
+                MemberOperationId::from_bytes([ordinal + 41; 16]).expect("V2 NotFound member ID"),
+                vec![0xe0, ordinal],
+                u64::from(ordinal) + 101,
+            )
+            .expect("V2 NotFound member")
+        })
+        .collect::<Vec<_>>();
+    let proposal = AbsentAdmissionProposal::new(
+        FencedMutationRosterProfile::v2(),
+        RosterId::from_bytes([0xd3; 16]).expect("V2 NotFound roster ID"),
+        members,
+        state_type,
+        vec![0xd4],
+        checkpoint,
+        vec![0xd5],
+    )
+    .expect("V2 NotFound proposal");
+    let mut admission = client
+        .prepare_absent(roster_lease, proposal)
+        .expect("prepare V2 NotFound roster");
+    let mut active = match client
+        .admit(&mut admission)
+        .await
+        .expect("admit V2 NotFound roster")
+    {
+        AdmissionOutcome::Admitted(active) => active,
+        _ => panic!("V2 NotFound fixture needs a returned active roster"),
+    };
+    fleet
+        .wait_all_application_sequences(sequence_before + 1)
+        .await;
+
+    for ordinal in 0_u8..5 {
+        let mut member = active
+            .member(MemberOrdinal::new(ordinal).expect("V2 NotFound member ordinal"))
+            .expect("issue conclusive V2 NotFound member");
+        assert!(matches!(
+            client
+                .prepare_member(&mut member)
+                .await
+                .expect("prepare V2 NotFound member"),
+            MemberPrepareOutcome::Prepared
+        ));
+        assert!(matches!(
+            client
+                .execute(&mut member)
+                .await
+                .expect("execute V2 NotFound member"),
+            ExecuteOutcome::Conclusive(_)
+        ));
+    }
+    let mut sixth = active
+        .member(MemberOrdinal::new(5).expect("V2 NotFound sixth ordinal"))
+        .expect("issue V2 NotFound sixth member");
+    assert!(matches!(
+        client
+            .prepare_member(&mut sixth)
+            .await
+            .expect("prepare V2 NotFound sixth"),
+        MemberPrepareOutcome::Prepared
+    ));
+    assert!(matches!(
+        client
+            .execute(&mut sixth)
+            .await
+            .expect("execute V2 NotFound sixth"),
+        ExecuteOutcome::Ambiguous(MemberRecoveryStatus::OutcomeUnknown)
+    ));
+    let mut sixth = sixth
+        .into_recoverable()
+        .expect("ambiguous V2 NotFound sixth is recovery-only");
+    assert!(matches!(
+        client
+            .status(&mut sixth)
+            .await
+            .expect("V2 NotFound exact status"),
+        MemberRecoveryOutcome::Ambiguous(MemberRecoveryStatus::NotFound)
+    ));
+    assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 6);
+    assert_eq!(provider.status_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        client
+            .adopt(&mut sixth)
+            .await
+            .expect("V2 NotFound exact adoption"),
+        MemberRecoveryOutcome::Conclusive(_)
+    ));
+    assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fleet.application_sequences().await,
+        [sequence_before + 1; THREE_VOTER_COUNT],
+        "V2 NotFound status and adoption remain outside roster consensus"
+    );
+    assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
+
+    shutdown_client.shutdown().await;
+    server.abort_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_three_voter_v2_absent_roster_aborted_terminal_retains_absence_and_exact_recovery(
+) {
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+        Arc::clone(&pki),
+        ProductionRosterAttestationIssuer::trust_root(),
+    )
+    .await;
+    let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    let server_spiffe = three_voter_spiffe(leader);
+    let client_spiffe = spiffe("three-voter-v2-absent-aborted-client");
+    let authorizer = three_voter_authorizer(&fleet.stores[leader], &client_spiffe).await;
+    let voter_authority = fleet.voter_authority(leader);
+    let attestor = ProductionRosterAttestationIssuer::new(
+        fleet.consensus_identity(leader),
+        authorizer.scope(),
+    );
+    let ingress_signer: Arc<dyn RosterIngressSigner> = attestor.clone();
+    let executor_attestor: Arc<dyn FencedMutationRosterExecutorAttestor> = attestor.clone();
+    let service = Arc::new(fleet.stores[leader].consumer_service());
+    let consumer: Arc<dyn SessionQuorumConsumer> = service.clone();
+    let roster_ingress: Arc<dyn SessionQuorumRosterIngress> = service;
+    let transport = Arc::new(CommitThenLoseConsumerResponse::roster_loss(
+        consumer,
+        roster_ingress,
+        false,
+        true,
+    ));
+    let (server, address) = SessionQuorumConsumerServer::new(
+        transport.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_roster_v2_ingress(transport.clone(), ingress_signer)
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("V2 Aborted protected-roster listener"),
+    )
+    .await
+    .expect("start V2 Aborted protected-roster listener");
+
+    let key = test_key();
+    let owner = OwnerId::new("three-voter-v2-absent-aborted-owner").expect("V2 Aborted owner");
+    let setup_provider = CountingKeyProvider::with_active_session_key();
+    let lease_client = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority.clone(),
+    );
+    let original_lease = lease_client
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xd6; 16]),
+            key.clone(),
+            owner.clone(),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("V2 Aborted absent roster lease");
+    for store in &fleet.stores {
+        assert!(
+            store
+                .get(&key)
+                .await
+                .expect("V2 Aborted absent read")
+                .is_none(),
+            "the admission lease must leave the V2 business row absent"
+        );
+    }
+    let sequence_before = fleet
+        .application_sequences()
+        .await
+        .into_iter()
+        .max()
+        .expect("three-voter V2 replay baseline");
+    fleet.wait_all_application_sequences(sequence_before).await;
+    assert_eq!(
+        fleet.application_sequences().await,
+        [sequence_before; THREE_VOTER_COUNT],
+        "all lease commands converge before V2 replay accounting",
+    );
+
+    let persistent = protected_roster_v2_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
+    let shutdown_client = persistent.clone();
+    let provider = Arc::new(
+        SixMemberRosterEvidenceProvider::execute_outcome_unknown_then_reconciled(attestor.clone()),
+    );
+    let publication_provider = Arc::new(EstablishedPublicationEvidenceProvider::default());
+    let adapter = persistent
+        .into_fenced_mutation_roster_v2_provider_adapter(
+            Arc::clone(&provider),
+            Arc::clone(&publication_provider),
+            executor_attestor,
+            NonZeroUsize::new(THREE_VOTER_COUNT).expect("positive V2 Aborted concurrency"),
+        )
+        .expect("compose V2 Aborted protected-roster adapter");
+    let client = adapter.client().clone();
+    let state_type = StateType::from_static("three-voter-v2-absent-aborted-created");
+    let expected_terminal = StoredSessionRecord {
+        key: key.clone(),
+        generation: Generation::new(1),
+        owner: owner.clone(),
+        fence: original_lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: state_type.clone(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([0xd7]),
+    };
+    let checkpoint = EncryptedSessionPayload::encrypt(
+        setup_provider.as_ref(),
+        &expected_terminal,
+        "three-voter-v2-absent-aborted",
+    )
+    .await
+    .expect("seal V2 Aborted checkpoint")
+    .as_bytes()
+    .to_vec();
+    let members = (0_u8..6)
+        .map(|ordinal| {
+            Member::new(
+                ordinal,
+                MemberOperationId::from_bytes([ordinal + 51; 16]).expect("V2 Aborted member ID"),
+                vec![0xe6, ordinal],
+                u64::from(ordinal) + 111,
+            )
+            .expect("V2 Aborted member")
+        })
+        .collect::<Vec<_>>();
+    let roster_id = RosterId::from_bytes([0xd8; 16]).expect("V2 Aborted roster ID");
+    let proposal = AbsentAdmissionProposal::new(
+        FencedMutationRosterProfile::v2(),
+        roster_id,
+        members,
+        state_type,
+        vec![0xd9],
+        checkpoint.clone(),
+        vec![0xda],
+    )
+    .expect("V2 Aborted proposal");
+    let mut admission = client
+        .prepare_absent(original_lease.clone(), proposal)
+        .expect("prepare V2 Aborted absence admission");
+    let mut active = match client
+        .admit(&mut admission)
+        .await
+        .expect("admit V2 Aborted roster")
+    {
+        AdmissionOutcome::Admitted(active) => active,
+        AdmissionOutcome::NotTransmitted | AdmissionOutcome::OutcomeUnknown(_) => {
+            panic!("fresh V2 Aborted admission must return its exact active roster")
+        }
+    };
+    fleet
+        .wait_all_application_sequences(sequence_before + 1)
+        .await;
+
+    let mut proofs = Vec::with_capacity(6);
+    for ordinal in 0_u8..6 {
+        let mut member = active
+            .member(MemberOrdinal::new(ordinal).expect("V2 Aborted member ordinal"))
+            .expect("issue V2 Aborted member");
+        assert!(matches!(
+            client
+                .prepare_member(&mut member)
+                .await
+                .expect("prepare V2 Aborted member"),
+            MemberPrepareOutcome::Prepared
+        ));
+        assert!(matches!(
+            client
+                .execute(&mut member)
+                .await
+                .expect("execute V2 Aborted member"),
+            ExecuteOutcome::Ambiguous(MemberRecoveryStatus::OutcomeUnknown)
+        ));
+        let mut member = member
+            .into_recoverable()
+            .expect("ambiguous V2 Aborted member is recovery-only");
+        match client
+            .reconcile(&mut member)
+            .await
+            .expect("reconcile V2 Aborted member")
+        {
+            MemberRecoveryOutcome::Conclusive(proof) => proofs.push(*proof),
+            _ => panic!("each V2 Aborted member needs conclusive reconciliation"),
+        }
+    }
+    let proofs = CompleteProofSet::new(proofs).expect("six V2 Aborted proofs");
+    let provider_calls_before_terminal = (
+        provider.prepare_calls.load(Ordering::SeqCst),
+        provider.execute_calls.load(Ordering::SeqCst),
+        provider.status_calls.load(Ordering::SeqCst),
+        provider.adopt_calls.load(Ordering::SeqCst),
+        provider.reconcile_calls.load(Ordering::SeqCst),
+    );
+    let mut terminal = client
+        .prepare_terminal(active.for_terminal(), &proofs)
+        .await
+        .expect("prepare exact V2 Aborted terminal");
+    assert!(matches!(
+        client
+            .terminalize(&mut terminal)
+            .await
+            .expect("V2 Aborted committed response loss"),
+        TerminalizationOutcome::OutcomeUnknown
+    ));
+    let terminal_status_sequences = fleet.application_sequences().await;
+    match client
+        .terminal_status(&mut terminal)
+        .await
+        .expect("exact V2 Aborted terminal status")
+    {
+        TerminalStatus::Committed(TerminalReceipt::Aborted(aborted)) => {
+            assert_eq!(aborted.protected_checkpoint(), checkpoint);
+            assert_eq!(aborted.protected_result(), [0xda]);
+        }
+        TerminalStatus::Committed(TerminalReceipt::Established(_))
+        | TerminalStatus::Admitted
+        | TerminalStatus::Compacted => panic!("V2 reconciliation terminal must retain Aborted"),
+    }
+    assert_eq!(
+        fleet.application_sequences().await,
+        terminal_status_sequences,
+        "exact V2 Aborted status is read-only"
+    );
+    fleet
+        .wait_all_application_sequences(sequence_before + 2)
+        .await;
+    for store in &fleet.stores {
+        assert!(
+            store
+                .get(&key)
+                .await
+                .expect("V2 Aborted final absence read")
+                .is_none(),
+            "an Aborted V2 create must never materialize the business record"
+        );
+    }
+    assert_eq!(publication_provider.status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(publication_provider.publish_calls.load(Ordering::SeqCst), 0);
+
+    lease_client
+        .release_with_id(
+            SessionConsumerRequestId::from_bytes([0xdb; 16]),
+            original_lease.clone(),
+        )
+        .await
+        .expect("release original V2 Aborted guard");
+    let successor = lease_client
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xdc; 16]),
+            key.clone(),
+            OwnerId::new("three-voter-v2-absent-aborted-successor")
+                .expect("V2 Aborted successor owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("acquire V2 Aborted successor guard");
+    assert!(successor.fence() > original_lease.fence());
+    let recovery_baseline = fleet
+        .application_sequences()
+        .await
+        .into_iter()
+        .max()
+        .expect("three-voter V2 Aborted recovery baseline");
+    fleet
+        .wait_all_application_sequences(recovery_baseline)
+        .await;
+    assert_eq!(
+        fleet.application_sequences().await,
+        [recovery_baseline; THREE_VOTER_COUNT],
+        "all lease/takeover commands converge before V2 recovery accounting",
+    );
+    let sequences_before_recovery = fleet.application_sequences().await;
+    let recovery = AbsentRecoveryInput::new(
+        roster_id,
+        owner.clone(),
+        original_lease.fence(),
+        successor.clone(),
+    )
+    .expect("current V2 Aborted recovery input");
+    match client
+        .recover_absent(&recovery)
+        .await
+        .expect("recover retained V2 Aborted terminal")
+    {
+        RecoveryOutcome::Terminal(TerminalReceipt::Aborted(aborted)) => {
+            assert_eq!(aborted.protected_checkpoint(), checkpoint);
+            assert_eq!(aborted.protected_result(), [0xda]);
+        }
+        RecoveryOutcome::Terminal(TerminalReceipt::Established(_))
+        | RecoveryOutcome::Admitted(_)
+        | RecoveryOutcome::Compacted => {
+            panic!("V2 Aborted recovery must retain the exact terminal")
+        }
+    }
+    assert_eq!(
+        fleet.application_sequences().await,
+        sequences_before_recovery,
+        "V2 Aborted recovery cannot append a roster mutation"
+    );
+    assert_eq!(
+        (
+            provider.prepare_calls.load(Ordering::SeqCst),
+            provider.execute_calls.load(Ordering::SeqCst),
+            provider.status_calls.load(Ordering::SeqCst),
+            provider.adopt_calls.load(Ordering::SeqCst),
+            provider.reconcile_calls.load(Ordering::SeqCst),
+        ),
+        provider_calls_before_terminal,
+        "V2 Aborted status and recovery never replay provider work"
+    );
+    assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(publication_provider.status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(publication_provider.publish_calls.load(Ordering::SeqCst), 0);
+
+    lease_client
+        .release_with_id(
+            SessionConsumerRequestId::from_bytes([0xdd; 16]),
+            successor.clone(),
+        )
+        .await
+        .expect("release current V2 Aborted recovery guard");
+    let expired = lease_client
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xde; 16]),
+            key.clone(),
+            OwnerId::new("three-voter-v2-absent-aborted-expired")
+                .expect("V2 Aborted expired owner"),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("acquire deliberately expiring V2 Aborted guard");
+    while Timestamp::now_utc() <= expired.expires_at() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let current = lease_client
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xdf; 16]),
+            key.clone(),
+            OwnerId::new("three-voter-v2-absent-aborted-current")
+                .expect("V2 Aborted current owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("acquire V2 Aborted higher current guard");
+    assert!(current.fence() > expired.fence());
+    let stale_recovery_baseline = fleet
+        .application_sequences()
+        .await
+        .into_iter()
+        .max()
+        .expect("three-voter V2 stale-recovery baseline");
+    fleet
+        .wait_all_application_sequences(stale_recovery_baseline)
+        .await;
+    assert_eq!(
+        fleet.application_sequences().await,
+        [stale_recovery_baseline; THREE_VOTER_COUNT],
+        "the successor lease converges before the read-only stale-recovery probe",
+    );
+    let sequences_before_stale_recovery = fleet.application_sequences().await;
+    let stale = AbsentRecoveryInput::new(roster_id, owner, original_lease.fence(), expired)
+        .expect("expired V2 Aborted recovery input is syntactically valid");
+    assert!(matches!(
+        client.recover_absent(&stale).await,
+        Err(RosterClientError::AuthorityRejected)
+    ));
+    assert_eq!(
+        fleet.application_sequences().await,
+        sequences_before_stale_recovery,
+        "an expired V2 recovery guard is rejected without a roster mutation"
+    );
+    assert_eq!(
+        (
+            provider.prepare_calls.load(Ordering::SeqCst),
+            provider.execute_calls.load(Ordering::SeqCst),
+            provider.status_calls.load(Ordering::SeqCst),
+            provider.adopt_calls.load(Ordering::SeqCst),
+            provider.reconcile_calls.load(Ordering::SeqCst),
+        ),
+        provider_calls_before_terminal,
+        "stale V2 recovery authority is rejected before provider work"
+    );
+    assert!(current.fence() > successor.fence());
+
+    shutdown_client.shutdown().await;
+    server.abort_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_three_voter_v2_absent_roster_tenant_scope_isolation_preserves_exact_authority()
+{
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+        Arc::clone(&pki),
+        ProductionRosterAttestationIssuer::trust_root(),
+    )
+    .await;
+    let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    let server_spiffe = three_voter_spiffe(leader);
+    let tenant_a = TenantId::new("consumer-v2-isolation-a").expect("tenant A");
+    let tenant_b = TenantId::new("consumer-v2-isolation-b").expect("tenant B");
+    let client_a_spiffe = tenant_spiffe(tenant_a.as_str(), "isolation-client");
+    let client_b_spiffe = tenant_spiffe(tenant_b.as_str(), "isolation-client");
+    let authorizer = three_voter_authorizer_for_tenants(
+        &fleet.stores[leader],
+        [
+            (client_a_spiffe.clone(), tenant_a.clone()),
+            (client_b_spiffe.clone(), tenant_b.clone()),
+        ],
+    )
+    .await;
+    let attestor = ProductionRosterAttestationIssuer::new(
+        fleet.consensus_identity(leader),
+        authorizer.scope(),
+    );
+    let ingress_signer: Arc<dyn RosterIngressSigner> = attestor.clone();
+    let executor_attestor: Arc<dyn FencedMutationRosterExecutorAttestor> = attestor.clone();
+    let service = Arc::new(fleet.stores[leader].consumer_service());
+    let consumer: Arc<dyn SessionQuorumConsumer> = service.clone();
+    let roster_ingress: Arc<dyn SessionQuorumRosterIngress> = service;
+    let transport = Arc::new(CommitThenLoseConsumerResponse::roster_passthrough(
+        consumer,
+        roster_ingress,
+    ));
+    let (server, address) = SessionQuorumConsumerServer::new(
+        transport.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_roster_v2_ingress(transport.clone(), ingress_signer)
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("V2 tenant isolation listener"),
+    )
+    .await
+    .expect("start V2 tenant isolation listener");
+
+    let key_a = tenant_test_key(tenant_a.clone());
+    let key_b = tenant_test_key(tenant_b.clone());
+    assert_eq!(key_a.stable_id, key_b.stable_id);
+    let owner_a = OwnerId::new("v2-isolation-owner-a").expect("owner A");
+    let owner_b = OwnerId::new("v2-isolation-owner-b").expect("owner B");
+    let lease_client_a = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_a_spiffe,
+        fleet.voter_authority(leader),
+    );
+    let lease_client_b = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_b_spiffe,
+        fleet.voter_authority(leader),
+    );
+    let lease_a = lease_client_a
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xf1; 16]),
+            key_a.clone(),
+            owner_a.clone(),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("tenant A absent lease");
+    let lease_b = lease_client_b
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xf2; 16]),
+            key_b.clone(),
+            owner_b.clone(),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("tenant B absent lease");
+    assert!(lease_a.fence().get() != 0);
+    assert!(lease_b.fence() > lease_a.fence());
+    let sequence_before = fleet
+        .application_sequences()
+        .await
+        .into_iter()
+        .max()
+        .expect("three-voter tenant-isolation baseline");
+    fleet.wait_all_application_sequences(sequence_before).await;
+    assert_eq!(
+        fleet.application_sequences().await,
+        [sequence_before; THREE_VOTER_COUNT],
+        "both tenant-scoped leases converge before roster accounting",
+    );
+
+    let provider_a = CountingKeyProvider::with_active_session_key_for_tenant(
+        tenant_a.clone(),
+        "consumer-v2-isolation-key-a",
+    );
+    let provider_b = CountingKeyProvider::with_active_session_key_for_tenant(
+        tenant_b.clone(),
+        "consumer-v2-isolation-key-b",
+    );
+    let state_type = StateType::from_static("three-voter-v2-isolation-created");
+    let roster_id = RosterId::from_bytes([0xf3; 16]).expect("shared opaque roster ID");
+    let members = (0_u8..6)
+        .map(|ordinal| {
+            Member::new(
+                ordinal,
+                MemberOperationId::from_bytes([ordinal + 81; 16]).expect("shared opaque member ID"),
+                vec![0xf4, ordinal],
+                u64::from(ordinal) + 151,
+            )
+            .expect("shared opaque member")
+        })
+        .collect::<Vec<_>>();
+    let mut expected_a = StoredSessionRecord {
+        key: key_a.clone(),
+        generation: Generation::new(1),
+        owner: owner_a.clone(),
+        fence: lease_a.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: state_type.clone(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([0xf5]),
+    };
+    let checkpoint_a = EncryptedSessionPayload::encrypt(
+        provider_a.as_ref(),
+        &expected_a,
+        "three-voter-v2-isolation-a",
+    )
+    .await
+    .expect("seal tenant A checkpoint")
+    .as_bytes()
+    .to_vec();
+    expected_a.payload = EncryptedSessionPayload::try_envelope(&checkpoint_a)
+        .expect("canonical tenant A checkpoint");
+    let mut expected_b = StoredSessionRecord {
+        key: key_b.clone(),
+        generation: Generation::new(1),
+        owner: owner_b.clone(),
+        fence: lease_b.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: state_type.clone(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([0xf6]),
+    };
+    let checkpoint_b = EncryptedSessionPayload::encrypt(
+        provider_b.as_ref(),
+        &expected_b,
+        "three-voter-v2-isolation-b",
+    )
+    .await
+    .expect("seal tenant B checkpoint")
+    .as_bytes()
+    .to_vec();
+    expected_b.payload = EncryptedSessionPayload::try_envelope(&checkpoint_b)
+        .expect("canonical tenant B checkpoint");
+    let proposal_a = AbsentAdmissionProposal::new(
+        FencedMutationRosterProfile::v2(),
+        roster_id,
+        members.clone(),
+        state_type.clone(),
+        vec![0xf7],
+        checkpoint_a.clone(),
+        vec![0xf8],
+    )
+    .expect("tenant A exact V2 admission");
+    let proposal_b = AbsentAdmissionProposal::new(
+        FencedMutationRosterProfile::v2(),
+        roster_id,
+        members.clone(),
+        state_type.clone(),
+        vec![0xf9],
+        checkpoint_b.clone(),
+        vec![0xfa],
+    )
+    .expect("tenant B exact V2 admission");
+
+    let persistent_a = protected_roster_v2_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_a_spiffe,
+        fleet.voter_authority(leader),
+    );
+    let shutdown_a = persistent_a.clone();
+    let effects_a = Arc::new(SixMemberRosterEvidenceProvider::new(attestor.clone()));
+    let adapter_a = persistent_a
+        .into_fenced_mutation_roster_v2_provider_adapter(
+            Arc::clone(&effects_a),
+            Arc::new(EstablishedPublicationEvidenceProvider::default()),
+            executor_attestor.clone(),
+            NonZeroUsize::new(THREE_VOTER_COUNT).expect("tenant A concurrency"),
+        )
+        .expect("compose tenant A V2 adapter");
+    let client_a = adapter_a.client().clone();
+    let persistent_b = protected_roster_v2_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_b_spiffe,
+        fleet.voter_authority(leader),
+    );
+    let shutdown_b = persistent_b.clone();
+    let effects_b = Arc::new(SixMemberRosterEvidenceProvider::new(attestor.clone()));
+    let adapter_b = persistent_b
+        .into_fenced_mutation_roster_v2_provider_adapter(
+            Arc::clone(&effects_b),
+            Arc::new(EstablishedPublicationEvidenceProvider::default()),
+            executor_attestor,
+            NonZeroUsize::new(THREE_VOTER_COUNT).expect("tenant B concurrency"),
+        )
+        .expect("compose tenant B V2 adapter");
+    let client_b = adapter_b.client().clone();
+
+    let mut admission_a = client_a
+        .prepare_absent(lease_a.clone(), proposal_a)
+        .expect("prepare tenant A exact absence reservation");
+    let mut active_a = match client_a.admit(&mut admission_a).await.expect("tenant A Q1") {
+        AdmissionOutcome::Admitted(active) => active,
+        AdmissionOutcome::NotTransmitted | AdmissionOutcome::OutcomeUnknown(_) => {
+            panic!("tenant A Q1 returns its exact active roster")
+        }
+    };
+    fleet
+        .wait_all_application_sequences(sequence_before + 1)
+        .await;
+    assert!(fleet.stores[leader]
+        .get(&key_b)
+        .await
+        .expect("tenant B remains absent beside tenant A reservation")
+        .is_none());
+    let mut admission_b = client_b
+        .prepare_absent(lease_b.clone(), proposal_b)
+        .expect("prepare tenant B exact absence reservation");
+    let mut active_b = match client_b.admit(&mut admission_b).await.expect("tenant B Q1") {
+        AdmissionOutcome::Admitted(active) => active,
+        AdmissionOutcome::NotTransmitted | AdmissionOutcome::OutcomeUnknown(_) => {
+            panic!("tenant B Q1 returns its exact active roster")
+        }
+    };
+    fleet
+        .wait_all_application_sequences(sequence_before + 2)
+        .await;
+    for (client, admission, expected_plan) in [
+        (&client_a, &admission_a, &[0xf7][..]),
+        (&client_b, &admission_b, &[0xf9][..]),
+    ] {
+        match client
+            .admission_status(admission)
+            .await
+            .expect("exact tenant Q1 status")
+        {
+            RecoveryOutcome::Admitted(recovered) => {
+                assert_eq!(recovered.roster_id(), roster_id);
+                assert_eq!(recovered.members(), members.as_slice());
+                assert_eq!(recovered.protected_plan(), expected_plan);
+            }
+            RecoveryOutcome::Terminal(_) | RecoveryOutcome::Compacted => {
+                panic!("live tenant reservation remains admitted")
+            }
+        }
+    }
+    let cross_tenant_recovery =
+        AbsentRecoveryInput::new(roster_id, owner_a.clone(), lease_a.fence(), lease_b.clone())
+            .expect("syntactically valid cross-tenant recovery input");
+    assert!(matches!(
+        client_b.recover_absent(&cross_tenant_recovery).await,
+        Err(RosterClientError::AuthorityRejected)
+    ));
+
+    for (client, active, expected_checkpoint, expected_result) in [
+        (&client_a, &mut active_a, &checkpoint_a, &[0xf8][..]),
+        (&client_b, &mut active_b, &checkpoint_b, &[0xfa][..]),
+    ] {
+        let mut proofs = Vec::with_capacity(6);
+        for ordinal in 0_u8..6 {
+            let mut member = active
+                .member(MemberOrdinal::new(ordinal).expect("tenant member ordinal"))
+                .expect("tenant member");
+            assert!(matches!(
+                client
+                    .prepare_member(&mut member)
+                    .await
+                    .expect("tenant prepare"),
+                MemberPrepareOutcome::Prepared
+            ));
+            match client.execute(&mut member).await.expect("tenant execute") {
+                ExecuteOutcome::Conclusive(proof) => proofs.push(*proof),
+                ExecuteOutcome::NotTransmitted => {
+                    panic!("tenant effect is available on the healthy fixed quorum")
+                }
+                ExecuteOutcome::Ambiguous(_) => panic!("tenant effect is conclusive"),
+            }
+        }
+        let proofs = CompleteProofSet::new(proofs).expect("tenant exact complete proofs");
+        let mut terminal = client
+            .prepare_terminal(active.for_terminal(), &proofs)
+            .await
+            .expect("prepare tenant Q2");
+        match client.terminalize(&mut terminal).await.expect("tenant Q2") {
+            TerminalizationOutcome::Committed(TerminalReceipt::Established(established)) => {
+                assert_eq!(established.protected_checkpoint(), expected_checkpoint);
+                assert_eq!(established.protected_result(), expected_result);
+            }
+            TerminalizationOutcome::Committed(TerminalReceipt::Aborted(_))
+            | TerminalizationOutcome::NotTransmitted
+            | TerminalizationOutcome::OutcomeUnknown => panic!("tenant Q2 commits exactly once"),
+        }
+    }
+    fleet
+        .wait_all_application_sequences(sequence_before + 4)
+        .await;
+    for store in &fleet.stores {
+        assert_eq!(
+            store.get(&key_a).await.expect("tenant A record").as_ref(),
+            Some(&expected_a)
+        );
+        assert_eq!(
+            store.get(&key_b).await.expect("tenant B record").as_ref(),
+            Some(&expected_b)
+        );
+    }
+    assert_eq!(effects_a.execute_calls.load(Ordering::SeqCst), 6);
+    assert_eq!(effects_b.execute_calls.load(Ordering::SeqCst), 6);
+    assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 2);
+
+    let foreign_spiffe = tenant_spiffe("consumer-v2-isolation-foreign", "isolation-client");
+    let foreign = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &foreign_spiffe,
+        fleet.voter_authority(leader),
+    );
+    let foreign_existing = foreign
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xfb; 16]),
+            key_a,
+            OwnerId::new("v2-isolation-foreign-owner").expect("foreign owner"),
+            Duration::from_secs(60),
+        )
+        .await;
+    let foreign_absent = foreign
+        .acquire_with_id(
+            SessionConsumerRequestId::from_bytes([0xfc; 16]),
+            tenant_test_key(
+                TenantId::new("consumer-v2-isolation-foreign").expect("foreign tenant"),
+            ),
+            OwnerId::new("v2-isolation-foreign-owner").expect("foreign owner"),
+            Duration::from_secs(60),
+        )
+        .await;
+    assert!(matches!(
+        foreign_existing,
+        Err(SessionConsumerLeaseMutationError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable,
+        })
+    ));
+    assert!(matches!(
+        foreign_absent,
+        Err(SessionConsumerLeaseMutationError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable,
+        })
+    ));
+
+    shutdown_a.shutdown().await;
+    shutdown_b.shutdown().await;
+    server.abort_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_three_voter_v1_ingress_rejects_v2_absent_roster_before_provider_work() {
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
+        Arc::clone(&pki),
+        ProductionRosterAttestationIssuer::trust_root(),
+    )
+    .await;
+    let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    let server_spiffe = three_voter_spiffe(leader);
+    let client_spiffe = spiffe("three-voter-v1-v2-capability-client");
+    let authorizer = three_voter_authorizer(&fleet.stores[leader], &client_spiffe).await;
+    let voter_authority = fleet.voter_authority(leader);
+    let attestor = ProductionRosterAttestationIssuer::new(
+        fleet.consensus_identity(leader),
+        authorizer.scope(),
+    );
+    let ingress_signer: Arc<dyn RosterIngressSigner> = attestor.clone();
+    let executor_attestor: Arc<dyn FencedMutationRosterExecutorAttestor> = attestor.clone();
+    let service = Arc::new(fleet.stores[leader].consumer_service());
+    let consumer: Arc<dyn SessionQuorumConsumer> = service.clone();
+    let roster_ingress: Arc<dyn SessionQuorumRosterIngress> = service;
+    let transport = Arc::new(CommitThenLoseConsumerResponse::roster_passthrough(
+        consumer,
+        roster_ingress,
+    ));
+    let (server, address) = SessionQuorumConsumerServer::new(
+        transport.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_roster_ingress(transport.clone(), ingress_signer)
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("mixed V1/V2 protected-roster listener"),
+    )
+    .await
+    .expect("start mixed V1/V2 protected-roster listener");
+
+    let key = test_key();
+    let owner = OwnerId::new("three-voter-v1-v2-capability-owner").expect("mixed V1/V2 owner");
+    let lease = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority.clone(),
+    )
+    .acquire_with_id(
+        SessionConsumerRequestId::from_bytes([0xe1; 16]),
+        key.clone(),
+        owner.clone(),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("mixed V1/V2 absent lease");
+    let sequence_before = fleet.application_sequences().await[leader];
+    fleet.wait_all_application_sequences(sequence_before).await;
+    let setup_provider = CountingKeyProvider::with_active_session_key();
+    let state_type = StateType::from_static("three-voter-v1-v2-capability-created");
+    let terminal = StoredSessionRecord {
+        key: key.clone(),
+        generation: Generation::new(1),
+        owner,
+        fence: lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: state_type.clone(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([0xe2]),
+    };
+    let checkpoint = EncryptedSessionPayload::encrypt(
+        setup_provider.as_ref(),
+        &terminal,
+        "three-voter-v1-v2-capability",
+    )
+    .await
+    .expect("seal mixed V1/V2 checkpoint")
+    .as_bytes()
+    .to_vec();
+    let members = (0_u8..6)
+        .map(|ordinal| {
+            Member::new(
+                ordinal,
+                MemberOperationId::from_bytes([ordinal + 61; 16]).expect("mixed V1/V2 member ID"),
+                vec![0xe3, ordinal],
+                u64::from(ordinal) + 121,
+            )
+            .expect("mixed V1/V2 member")
+        })
+        .collect::<Vec<_>>();
+    let proposal = AbsentAdmissionProposal::new(
+        FencedMutationRosterProfile::v2(),
+        RosterId::from_bytes([0xe4; 16]).expect("mixed V1/V2 roster ID"),
+        members.clone(),
+        state_type,
+        vec![0xe5],
+        checkpoint,
+        vec![0xe6],
+    )
+    .expect("mixed V1/V2 absent proposal");
+    let persistent = protected_roster_v2_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority.clone(),
+    );
+    let shutdown_client = persistent.clone();
+    let provider = Arc::new(SixMemberRosterEvidenceProvider::new(attestor.clone()));
+    let publication_provider = Arc::new(EstablishedPublicationEvidenceProvider::default());
+    let adapter = persistent
+        .into_fenced_mutation_roster_v2_provider_adapter(
+            Arc::clone(&provider),
+            Arc::clone(&publication_provider),
+            executor_attestor,
+            NonZeroUsize::new(THREE_VOTER_COUNT).expect("positive mixed V1/V2 concurrency"),
+        )
+        .expect("compose V2 client against V1 ingress");
+    let client = adapter.client().clone();
+    let mut admission = client
+        .prepare_absent(lease, proposal)
+        .expect("prepare V2 body before mixed-capability ingress");
+    let rejected = client.admit(&mut admission).await;
+    assert!(
+        matches!(rejected, Err(RosterClientError::TerminalConflict)),
+        "the V1-only listener rejects /4 during TLS before any Call byte: {rejected:?}"
+    );
+    assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(publication_provider.status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(publication_provider.publish_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fleet.application_sequences().await,
+        [sequence_before; THREE_VOTER_COUNT],
+        "mixed V1/V2 capability rejection cannot append a roster mutation"
+    );
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
+
+    shutdown_client.shutdown().await;
+    server.abort_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_three_voter_v2_absent_roster_replays_exact_bytes_and_rejects_conflict() {
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_v2_roster_attestation(
+        Arc::clone(&pki),
+        ProductionRosterAttestationIssuer::trust_root(),
+    )
+    .await;
+    let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    let server_spiffe = three_voter_spiffe(leader);
+    let client_spiffe = spiffe("three-voter-v2-absent-replay-client");
+    let authorizer = three_voter_authorizer(&fleet.stores[leader], &client_spiffe).await;
+    let voter_authority = fleet.voter_authority(leader);
+    let attestor = ProductionRosterAttestationIssuer::new(
+        fleet.consensus_identity(leader),
+        authorizer.scope(),
+    );
+    let ingress_signer: Arc<dyn RosterIngressSigner> = attestor.clone();
+    let executor_attestor: Arc<dyn FencedMutationRosterExecutorAttestor> = attestor.clone();
+    let service = Arc::new(fleet.stores[leader].consumer_service());
+    let consumer: Arc<dyn SessionQuorumConsumer> = service.clone();
+    let roster_ingress: Arc<dyn SessionQuorumRosterIngress> = service;
+    let transport = Arc::new(CommitThenLoseConsumerResponse::roster_passthrough(
+        consumer,
+        roster_ingress,
+    ));
+    let (server, address) = SessionQuorumConsumerServer::new(
+        transport.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_roster_v2_ingress(transport.clone(), ingress_signer)
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("V2 replay protected-roster listener"),
+    )
+    .await
+    .expect("start V2 replay protected-roster listener");
+
+    let key = test_key();
+    let owner = OwnerId::new("three-voter-v2-absent-replay-owner").expect("V2 replay owner");
+    let lease = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority.clone(),
+    )
+    .acquire_with_id(
+        SessionConsumerRequestId::from_bytes([0xe7; 16]),
+        key.clone(),
+        owner.clone(),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("V2 replay absent lease");
+    let sequence_before = fleet
+        .application_sequences()
+        .await
+        .into_iter()
+        .max()
+        .expect("three-voter V2 replay baseline");
+    fleet.wait_all_application_sequences(sequence_before).await;
+    assert_eq!(
+        fleet.application_sequences().await,
+        [sequence_before; THREE_VOTER_COUNT],
+        "all lease commands converge before V2 replay accounting",
+    );
+    let setup_provider = CountingKeyProvider::with_active_session_key();
+    let state_type = StateType::from_static("three-voter-v2-absent-replay-created");
+    let terminal = StoredSessionRecord {
+        key: key.clone(),
+        generation: Generation::new(1),
+        owner,
+        fence: lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: state_type.clone(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([0xe8]),
+    };
+    let checkpoint = EncryptedSessionPayload::encrypt(
+        setup_provider.as_ref(),
+        &terminal,
+        "three-voter-v2-absent-replay",
+    )
+    .await
+    .expect("seal V2 replay checkpoint")
+    .as_bytes()
+    .to_vec();
+    let members = (0_u8..6)
+        .map(|ordinal| {
+            Member::new(
+                ordinal,
+                MemberOperationId::from_bytes([ordinal + 71; 16]).expect("V2 replay member ID"),
+                vec![0xe9, ordinal],
+                u64::from(ordinal) + 131,
+            )
+            .expect("V2 replay member")
+        })
+        .collect::<Vec<_>>();
+    let roster_id = RosterId::from_bytes([0xea; 16]).expect("V2 replay roster ID");
+    let proposal = AbsentAdmissionProposal::new(
+        FencedMutationRosterProfile::v2(),
+        roster_id,
+        members.clone(),
+        state_type.clone(),
+        vec![0xeb],
+        checkpoint.clone(),
+        vec![0xec],
+    )
+    .expect("V2 exact replay proposal");
+    let conflicting = AbsentAdmissionProposal::new(
+        FencedMutationRosterProfile::v2(),
+        roster_id,
+        members,
+        state_type,
+        vec![0xed],
+        checkpoint,
+        vec![0xec],
+    )
+    .expect("V2 one-byte conflict proposal");
+    let persistent = protected_roster_v2_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority.clone(),
+    );
+    let shutdown_client = persistent.clone();
+    let provider = Arc::new(SixMemberRosterEvidenceProvider::new(attestor));
+    let publication_provider = Arc::new(EstablishedPublicationEvidenceProvider::default());
+    let adapter = persistent
+        .into_fenced_mutation_roster_v2_provider_adapter(
+            Arc::clone(&provider),
+            Arc::clone(&publication_provider),
+            executor_attestor.clone(),
+            NonZeroUsize::new(THREE_VOTER_COUNT).expect("positive V2 replay concurrency"),
+        )
+        .expect("compose V2 replay adapter");
+    let client = adapter.client().clone();
+    let mut initial = client
+        .prepare_absent(lease.clone(), proposal.clone())
+        .expect("prepare initial V2 admission");
+    let initial = match client
+        .admit(&mut initial)
+        .await
+        .expect("admit initial V2 roster")
+    {
+        AdmissionOutcome::Admitted(active) => active,
+        AdmissionOutcome::NotTransmitted | AdmissionOutcome::OutcomeUnknown(_) => {
+            panic!("initial V2 replay admission must return its exact active roster")
+        }
+    };
+    fleet
+        .wait_all_application_sequences(sequence_before + 1)
+        .await;
+    let replay_persistent = protected_roster_v2_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority.clone(),
+    );
+    let replay_shutdown = replay_persistent.clone();
+    let replay_adapter = replay_persistent
+        .into_fenced_mutation_roster_v2_provider_adapter(
+            Arc::clone(&provider),
+            Arc::clone(&publication_provider),
+            executor_attestor.clone(),
+            NonZeroUsize::new(THREE_VOTER_COUNT).expect("positive V2 replay concurrency"),
+        )
+        .expect("compose fresh V2 replay adapter");
+    let replay_client = replay_adapter.client().clone();
+    let mut exact_replay = replay_client
+        .prepare_absent(lease.clone(), proposal)
+        .expect("prepare byte-identical V2 replay");
+    assert!(matches!(
+        replay_client.admit(&mut exact_replay).await,
+        Err(RosterClientError::RecoveryRequired)
+    ));
+    match replay_client
+        .admission_status(&exact_replay)
+        .await
+        .expect("read the byte-identical retained V2 admission")
+    {
+        RecoveryOutcome::Admitted(replayed) => {
+            assert_eq!(replayed.roster_id(), initial.roster_id());
+            assert_eq!(replayed.members(), initial.members());
+            assert_eq!(replayed.protected_plan(), initial.protected_plan());
+        }
+        RecoveryOutcome::Terminal(_) | RecoveryOutcome::Compacted => {
+            panic!("an exact admission replay remains PollAdmitted")
+        }
+    }
+    let conflict_persistent = protected_roster_v2_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
+    let conflict_shutdown = conflict_persistent.clone();
+    let conflict_adapter = conflict_persistent
+        .into_fenced_mutation_roster_v2_provider_adapter(
+            Arc::clone(&provider),
+            publication_provider,
+            executor_attestor,
+            NonZeroUsize::new(THREE_VOTER_COUNT).expect("positive V2 conflict concurrency"),
+        )
+        .expect("compose fresh V2 conflict adapter");
+    let conflict_client = conflict_adapter.client().clone();
+    let mut conflict = conflict_client
+        .prepare_absent(lease, conflicting)
+        .expect("prepare one-byte conflicting V2 replay");
+    assert!(matches!(
+        conflict_client.admit(&mut conflict).await,
+        Err(RosterClientError::TerminalConflict)
+    ));
+    assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.adopt_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
+    fleet
+        .wait_all_application_sequences(sequence_before + 3)
+        .await;
+    assert_eq!(
+        fleet.application_sequences().await,
+        [sequence_before + 3; THREE_VOTER_COUNT]
+    );
+    for store in &fleet.stores {
+        assert!(
+            store
+                .get(&key)
+                .await
+                .expect("read V2 replay business row")
+                .is_none(),
+            "an admission replay or conflict cannot materialize the business row",
+        );
+    }
+    assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
+
+    shutdown_client.shutdown().await;
+    replay_shutdown.shutdown().await;
+    conflict_shutdown.shutdown().await;
     server.abort_and_wait().await;
 }
 
@@ -10749,9 +12860,35 @@ impl RosterIngressSigner for ProductionRosterAttestationIssuer {
         .map_err(|_| RosterIngressSignerError)
     }
 
+    async fn attest_v2(
+        &self,
+        input: &RosterIngressAttestationSigningInputV2,
+    ) -> Result<RosterIngressAttestationV2, RosterIngressSignerError> {
+        RosterIngressAttestationV2::issue_from_signed_parts(
+            &self.root,
+            self.ingress_certificate.clone(),
+            input,
+            Self::low_s_p1363(
+                &self.ingress_key,
+                input.digest().map_err(|_| RosterIngressSignerError)?,
+            ),
+        )
+        .map_err(|_| RosterIngressSignerError)
+    }
+
     fn compact_admission_certificate(
         &self,
     ) -> Result<RosterAttestationLeafCertificatePartsV1, RosterIngressSignerError> {
+        Ok(self.ingress_certificate.clone())
+    }
+
+    fn compact_admission_certificate_v2(
+        &self,
+        attestation: &RosterIngressAttestationV2,
+    ) -> Result<RosterAttestationLeafCertificatePartsV1, RosterIngressSignerError> {
+        attestation
+            .verify_same_leaf_certificate(&self.root, &self.ingress_certificate)
+            .map_err(|_| RosterIngressSignerError)?;
         Ok(self.ingress_certificate.clone())
     }
 
@@ -10759,6 +12896,20 @@ impl RosterIngressSigner for ProductionRosterAttestationIssuer {
         &self,
         input: &RosterCompactAdmissionProvenanceSigningInputV2,
     ) -> Result<[u8; 64], RosterIngressSignerError> {
+        Ok(Self::low_s_p1363(
+            &self.ingress_key,
+            input.digest().map_err(|_| RosterIngressSignerError)?,
+        ))
+    }
+
+    async fn sign_compact_admission_v2(
+        &self,
+        input: &RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
+        attestation: &RosterIngressAttestationV2,
+    ) -> Result<[u8; 64], RosterIngressSignerError> {
+        attestation
+            .verify_same_leaf_certificate(&self.root, &self.ingress_certificate)
+            .map_err(|_| RosterIngressSignerError)?;
         Ok(Self::low_s_p1363(
             &self.ingress_key,
             input.digest().map_err(|_| RosterIngressSignerError)?,
@@ -11287,7 +13438,9 @@ fn run_protected_roster_process_loss_child(state: &Path, phase: &str) {
                     panic!("process-loss child observation fails; phase={phase}")
                 }
                 ProtectedRosterProcessLossChildCleanup::HandedToProcessWideReaper => {
-                    panic!("process-loss child reaper handoff follows observation failure; phase={phase}")
+                    panic!(
+                        "process-loss child reaper handoff follows observation failure; phase={phase}"
+                    )
                 }
             },
         }
@@ -11297,7 +13450,9 @@ fn run_protected_roster_process_loss_child(state: &Path, phase: &str) {
                     panic!("process-loss child exceeds its fixed exit bound; phase={phase}")
                 }
                 ProtectedRosterProcessLossChildCleanup::HandedToProcessWideReaper => {
-                    panic!("process-loss child reaper handoff follows exit-bound failure; phase={phase}")
+                    panic!(
+                        "process-loss child reaper handoff follows exit-bound failure; phase={phase}"
+                    )
                 }
             }
         }
@@ -12294,12 +14449,10 @@ async fn protected_roster_process_loss_phase_two(state: &Path) {
         );
         assert_eq!(
             protected_roster_process_loss_counter_total(
-                &terminal_diagnostics_after[voter]
-                    .state_machine_sqlite_commit_latency_millis,
+                &terminal_diagnostics_after[voter].state_machine_sqlite_commit_latency_millis,
             ),
             protected_roster_process_loss_counter_total(
-                &terminal_diagnostics_before[voter]
-                    .state_machine_sqlite_commit_latency_millis,
+                &terminal_diagnostics_before[voter].state_machine_sqlite_commit_latency_millis,
             ) + 1,
             "exactly one roster-bearing state-machine transaction commits Established on every voter",
         );

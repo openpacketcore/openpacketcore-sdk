@@ -11,6 +11,14 @@ pub(crate) mod storage;
 pub(crate) mod store;
 pub mod types;
 
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub use crate::sqlite::test_support::{
+    protected_roster_terminal_apply_timing_test_guard,
+    protected_roster_v2_terminal_status_validation_stages_for_test,
+    reset_protected_roster_v2_terminal_status_validation_stages_for_test,
+    ProtectedRosterV2TerminalStatusValidationStagesForTest,
+};
 pub use network::{
     SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
@@ -19,6 +27,9 @@ pub use network::{
 #[cfg(feature = "test-control")]
 #[doc(hidden)]
 pub use store::test_support;
+#[cfg(any(test, feature = "test-control"))]
+#[doc(hidden)]
+pub use store::ProtectedRosterV2TerminalStatusDiagnosticSnapshotForTest;
 pub use store::{
     validate_consensus_physical_fenced_transition_request, ConsensusSessionConsumerService,
     ConsensusSessionStore, ConsensusSessionStoreOpenError, ConsensusStoreDiagnosticSnapshot,
