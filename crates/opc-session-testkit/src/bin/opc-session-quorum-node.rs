@@ -2076,24 +2076,16 @@ impl QualificationNode {
                 code: QualificationNodeErrorCode::TrafficUnavailable,
             };
         };
-        let replication_head = match self.protected.max_replication_sequence().await {
-            Ok(head) => {
-                traffic
-                    .observation
-                    .record_authoritative_replication_head(head);
-                head
-            }
-            Err(error) => {
-                traffic
-                    .observation
-                    .record_failure(QualificationTrafficFailure::store(
-                        QualificationTrafficFailureCode::BackendUnavailable,
-                        QualificationTrafficFailureStage::Watch,
-                        &error,
-                    ));
-                traffic.observation.authoritative_replication_head()
-            }
-        };
+        let recovery_started_at = tokio::time::Instant::now();
+        let deadline = recovery_started_at
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
+        let replication_head = refresh_traffic_status_authoritative_head(
+            &self.protected,
+            &traffic.observation,
+            recovery_started_at,
+            deadline,
+        )
+        .await;
         self.traffic_status_with_replication_head(replication_head)
     }
 
@@ -3448,6 +3440,61 @@ async fn wait_for_traffic_recovery_retry(deadline: tokio::time::Instant) -> bool
         .min(deadline.saturating_duration_since(now));
     tokio::time::sleep(delay).await;
     tokio::time::Instant::now() < deadline
+}
+
+/// Refreshes the status head without ever presenting a cached value as a new
+/// authoritative observation. Only typed backend unavailability is retried;
+/// every other store error remains terminal for this status response.
+async fn refresh_traffic_status_authoritative_head<B: TrafficWatchBackend + ?Sized>(
+    backend: &B,
+    observation: &QualificationTrafficObservation,
+    recovery_started_at: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> u64 {
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            observation.record_failure(QualificationTrafficFailure::recovery_deadline_exceeded(
+                QualificationTrafficFailureStage::Watch,
+                recovery_started_at,
+            ));
+            return observation.authoritative_replication_head();
+        }
+
+        match tokio::time::timeout_at(deadline, backend.traffic_replication_head()).await {
+            Ok(Ok(head)) if tokio::time::Instant::now() < deadline => {
+                observation.record_authoritative_replication_head(head);
+                return head;
+            }
+            Ok(Ok(_)) | Err(_) => {
+                observation.record_failure(
+                    QualificationTrafficFailure::recovery_deadline_exceeded(
+                        QualificationTrafficFailureStage::Watch,
+                        recovery_started_at,
+                    ),
+                );
+                return observation.authoritative_replication_head();
+            }
+            Ok(Err(StoreError::BackendUnavailable(_))) => {
+                if !wait_for_traffic_recovery_retry(deadline).await {
+                    observation.record_failure(
+                        QualificationTrafficFailure::recovery_deadline_exceeded(
+                            QualificationTrafficFailureStage::Watch,
+                            recovery_started_at,
+                        ),
+                    );
+                    return observation.authoritative_replication_head();
+                }
+            }
+            Ok(Err(error)) => {
+                observation.record_failure(QualificationTrafficFailure::store(
+                    QualificationTrafficFailureCode::BackendUnavailable,
+                    QualificationTrafficFailureStage::Watch,
+                    &error,
+                ));
+                return observation.authoritative_replication_head();
+            }
+        }
+    }
 }
 
 fn traffic_recovery_deadline(
@@ -6618,6 +6665,8 @@ mod tests {
 
     struct ScriptedTrafficWatchState {
         heads: std::collections::VecDeque<Result<u64, StoreError>>,
+        head_delay: Option<Duration>,
+        head_requests: usize,
         logs: std::collections::VecDeque<Result<Vec<ReplicationEntry>, StoreError>>,
         watches: std::collections::VecDeque<
             Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError>,
@@ -6634,9 +6683,22 @@ mod tests {
                 Item = Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError>,
             >,
         ) -> Self {
+            Self::with_head_delay(heads, logs, watches, None)
+        }
+
+        fn with_head_delay(
+            heads: impl IntoIterator<Item = Result<u64, StoreError>>,
+            logs: impl IntoIterator<Item = Result<Vec<ReplicationEntry>, StoreError>>,
+            watches: impl IntoIterator<
+                Item = Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError>,
+            >,
+            head_delay: Option<Duration>,
+        ) -> Self {
             Self {
                 state: Arc::new(tokio::sync::Mutex::new(ScriptedTrafficWatchState {
                     heads: heads.into_iter().collect(),
+                    head_delay,
+                    head_requests: 0,
                     logs: logs.into_iter().collect(),
                     watches: watches.into_iter().collect(),
                     log_requests: Vec::new(),
@@ -6649,6 +6711,10 @@ mod tests {
             self.state.lock().await.log_requests.clone()
         }
 
+        async fn head_requests(&self) -> usize {
+            self.state.lock().await.head_requests
+        }
+
         async fn watch_starts(&self) -> Vec<u64> {
             self.state.lock().await.watch_starts.clone()
         }
@@ -6657,6 +6723,14 @@ mod tests {
     #[async_trait::async_trait]
     impl TrafficWatchBackend for ScriptedTrafficWatchBackend {
         async fn traffic_replication_head(&self) -> Result<u64, StoreError> {
+            let head_delay = {
+                let mut state = self.state.lock().await;
+                state.head_requests = state.head_requests.saturating_add(1);
+                state.head_delay
+            };
+            if let Some(delay) = head_delay {
+                tokio::time::sleep(delay).await;
+            }
             self.state.lock().await.heads.pop_front().unwrap_or(Ok(0))
         }
 
@@ -6712,6 +6786,102 @@ mod tests {
         })
         .await
         .expect("traffic watch recovery installs a replacement stream");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_head_refresh_retries_typed_unavailability_and_publishes_success() {
+        let backend = ScriptedTrafficWatchBackend::new(
+            [
+                Err(StoreError::BackendUnavailable(
+                    "scripted transient status failure".to_owned(),
+                )),
+                Ok(47),
+            ],
+            [],
+            [],
+        );
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let recovery_started_at = tokio::time::Instant::now();
+        let head = refresh_traffic_status_authoritative_head(
+            &backend,
+            &observation,
+            recovery_started_at,
+            recovery_started_at
+                + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS),
+        )
+        .await;
+
+        assert_eq!(head, 47);
+        assert_eq!(observation.authoritative_replication_head(), 47);
+        assert_eq!(observation.failure(), None);
+        assert_eq!(backend.head_requests().await, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_head_refresh_latches_non_transient_error_without_retry() {
+        let backend = ScriptedTrafficWatchBackend::new(
+            [Err(StoreError::CapabilityNotSupported(
+                "scripted terminal status failure".to_owned(),
+            ))],
+            [],
+            [],
+        );
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let recovery_started_at = tokio::time::Instant::now();
+        let head = refresh_traffic_status_authoritative_head(
+            &backend,
+            &observation,
+            recovery_started_at,
+            recovery_started_at
+                + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS),
+        )
+        .await;
+
+        assert_eq!(head, 41);
+        assert_eq!(observation.authoritative_replication_head(), 41);
+        assert_eq!(
+            observation.failure(),
+            Some(QualificationTrafficFailure {
+                code: QualificationTrafficFailureCode::BackendUnavailable,
+                stage: QualificationTrafficFailureStage::Watch,
+                error_class: QualificationTrafficErrorClass::Other,
+                recovery_elapsed_millis: None,
+            })
+        );
+        assert_eq!(backend.head_requests().await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_head_refresh_timeout_preserves_last_proven_head_and_latches_deadline() {
+        let backend = ScriptedTrafficWatchBackend::with_head_delay(
+            [Ok(47)],
+            [],
+            [],
+            Some(Duration::from_millis(100)),
+        );
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let recovery_started_at = tokio::time::Instant::now();
+        let deadline = recovery_started_at + Duration::from_millis(25);
+        let head = refresh_traffic_status_authoritative_head(
+            &backend,
+            &observation,
+            recovery_started_at,
+            deadline,
+        )
+        .await;
+
+        assert_eq!(head, 41);
+        assert_eq!(observation.authoritative_replication_head(), 41);
+        assert_eq!(
+            observation.failure(),
+            Some(QualificationTrafficFailure {
+                code: QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded,
+                stage: QualificationTrafficFailureStage::Watch,
+                error_class: QualificationTrafficErrorClass::BackendUnavailable,
+                recovery_elapsed_millis: Some(25),
+            })
+        );
+        assert_eq!(backend.head_requests().await, 1);
     }
 
     #[tokio::test]
