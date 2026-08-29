@@ -135,6 +135,7 @@ jobs:
           )
           broad_test_skips=(
             consensus::store::membership_tests::protected_roster_ingress_has_two_mutations_and_read_only_status_paths
+            consensus::storage::tests::promoted_mismatch_never_unlinks_a_same_name_replacement
             "${optimized_sqlite_contracts[@]}"
             lagging_replica_installs_compacted_snapshot_without_losing_committed_state
             fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
@@ -177,6 +178,18 @@ jobs:
             --test-threads=1 \
             --exact \
             fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect
+          # This proof owns a scoped snapshot-promotion gate while it verifies
+          # an unrelated concurrent install. Give that process-global test
+          # control a fresh process without changing its one-second bound.
+          cargo test --locked \
+            -p opc-session-store \
+            --lib \
+            --all-features \
+            --quiet \
+            -- \
+            --test-threads=1 \
+            --exact \
+            consensus::storage::tests::promoted_mismatch_never_unlinks_a_same_name_replacement
           # This proof deliberately binds a one-second attached-consensus
           # deadline. Run it exactly once outside the multi-minute SQLite
           # fixtures so host scheduling cannot turn a committed mutation into
