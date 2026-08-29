@@ -276,124 +276,6 @@ pub enum ConsensusStorageErrorVerbForTest {
     Other,
 }
 
-/// Fixed test-only disposition of the last local physical log-prune turn.
-///
-/// No SQLite text, database path, identity, row value, or payload is exposed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsensusLogPruneLastOutcomeForTest {
-    /// This store does not install the physical prune lane.
-    NotInstalled,
-    /// The lane has not returned a turn since this store opened.
-    NoTurn,
-    /// One bounded turn committed successfully.
-    Completed,
-    /// SQLite writer contention scheduled a retry.
-    RetriedContention,
-    /// A primary writer preempted the turn and scheduled a retry.
-    RetriedPrimaryPreemption,
-    /// An unowned SQLite interrupt scheduled a retry.
-    RetriedInterrupted,
-    /// Strict identity, authority, lineage, or value validation failed.
-    PermanentValidation,
-    /// SQLite returned a non-contention, non-interrupt error.
-    PermanentSqlite,
-    /// A retained row could not fit the fixed per-turn byte bound.
-    PermanentBoundedProgress,
-    /// Transaction cleanup could not roll back the active turn.
-    PermanentRollback,
-    /// The worker returned a connection still inside a transaction.
-    PermanentTransactionOwnership,
-    /// The blocking worker failed to return its connection.
-    PermanentWorkerJoin,
-}
-
-/// Fixed test-only disposition of the cleanup that preceded a returned prune
-/// turn. It contains no SQLite text, database path, identity, or payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsensusLogPruneCleanupOutcomeForTest {
-    /// The turn did not require transaction cleanup.
-    NoCleanup,
-    /// Cleanup found the connection already in autocommit mode.
-    AlreadyAutocommit,
-    /// ROLLBACK succeeded and restored autocommit mode.
-    RollbackOkAutocommit,
-    /// ROLLBACK reported success but the connection remained in a transaction.
-    RollbackOkTransactionActive,
-    /// ROLLBACK returned SQLite interrupt.
-    RollbackInterrupted,
-    /// ROLLBACK returned SQLite writer contention.
-    RollbackContention,
-    /// ROLLBACK returned another SQLite error.
-    RollbackPermanent,
-}
-
-fn consensus_log_prune_outcome_for_test(
-    outcome: Option<crate::sqlite::consensus::ConsensusLogPruneLastOutcomeForTest>,
-) -> ConsensusLogPruneLastOutcomeForTest {
-    use crate::sqlite::consensus::ConsensusLogPruneLastOutcomeForTest as InternalOutcome;
-
-    match outcome {
-        None => ConsensusLogPruneLastOutcomeForTest::NotInstalled,
-        Some(InternalOutcome::NoTurn) => ConsensusLogPruneLastOutcomeForTest::NoTurn,
-        Some(InternalOutcome::Completed) => ConsensusLogPruneLastOutcomeForTest::Completed,
-        Some(InternalOutcome::RetriedContention) => {
-            ConsensusLogPruneLastOutcomeForTest::RetriedContention
-        }
-        Some(InternalOutcome::RetriedPrimaryPreemption) => {
-            ConsensusLogPruneLastOutcomeForTest::RetriedPrimaryPreemption
-        }
-        Some(InternalOutcome::RetriedInterrupted) => {
-            ConsensusLogPruneLastOutcomeForTest::RetriedInterrupted
-        }
-        Some(InternalOutcome::PermanentValidation) => {
-            ConsensusLogPruneLastOutcomeForTest::PermanentValidation
-        }
-        Some(InternalOutcome::PermanentSqlite) => {
-            ConsensusLogPruneLastOutcomeForTest::PermanentSqlite
-        }
-        Some(InternalOutcome::PermanentBoundedProgress) => {
-            ConsensusLogPruneLastOutcomeForTest::PermanentBoundedProgress
-        }
-        Some(InternalOutcome::PermanentRollback) => {
-            ConsensusLogPruneLastOutcomeForTest::PermanentRollback
-        }
-        Some(InternalOutcome::PermanentTransactionOwnership) => {
-            ConsensusLogPruneLastOutcomeForTest::PermanentTransactionOwnership
-        }
-        Some(InternalOutcome::PermanentWorkerJoin) => {
-            ConsensusLogPruneLastOutcomeForTest::PermanentWorkerJoin
-        }
-    }
-}
-
-fn consensus_log_prune_cleanup_outcome_for_test(
-    outcome: crate::sqlite::consensus::ConsensusLogPruneCleanupOutcomeForTest,
-) -> ConsensusLogPruneCleanupOutcomeForTest {
-    use crate::sqlite::consensus::ConsensusLogPruneCleanupOutcomeForTest as InternalOutcome;
-
-    match outcome {
-        InternalOutcome::NoCleanup => ConsensusLogPruneCleanupOutcomeForTest::NoCleanup,
-        InternalOutcome::AlreadyAutocommit => {
-            ConsensusLogPruneCleanupOutcomeForTest::AlreadyAutocommit
-        }
-        InternalOutcome::RollbackOkAutocommit => {
-            ConsensusLogPruneCleanupOutcomeForTest::RollbackOkAutocommit
-        }
-        InternalOutcome::RollbackOkTransactionActive => {
-            ConsensusLogPruneCleanupOutcomeForTest::RollbackOkTransactionActive
-        }
-        InternalOutcome::RollbackInterrupted => {
-            ConsensusLogPruneCleanupOutcomeForTest::RollbackInterrupted
-        }
-        InternalOutcome::RollbackContention => {
-            ConsensusLogPruneCleanupOutcomeForTest::RollbackContention
-        }
-        InternalOutcome::RollbackPermanent => {
-            ConsensusLogPruneCleanupOutcomeForTest::RollbackPermanent
-        }
-    }
-}
-
 fn consensus_storage_error_subject_for_test<NID>(
     subject: &opc_consensus::engine::ErrorSubject<NID>,
 ) -> ConsensusStorageErrorSubjectForTest
@@ -509,19 +391,6 @@ pub struct ConsensusLocalDurableProgressForTest {
     pub snapshot_index: Option<u64>,
     /// Highest log index durably purged locally.
     pub purged_index: Option<u64>,
-    /// Accepted physical-prune turn count from local fixed diagnostics.
-    pub consensus_log_prune_attempts: u64,
-    /// Terminal physical-prune failure count from local fixed diagnostics.
-    pub consensus_log_prune_permanent_failures: u64,
-    /// Whether the fixed physical-prune lane is terminally degraded.
-    pub consensus_log_prune_degraded: bool,
-    /// Fixed, redaction-safe disposition of the last local physical-prune turn.
-    pub consensus_log_prune_last_outcome: ConsensusLogPruneLastOutcomeForTest,
-    /// Result returned by the last local blocking prune turn before any
-    /// worker-level connection-ownership check.
-    pub consensus_log_prune_last_returned_turn_outcome: ConsensusLogPruneLastOutcomeForTest,
-    /// Cleanup state that preceded the last returned local prune turn.
-    pub consensus_log_prune_last_cleanup_outcome: ConsensusLogPruneCleanupOutcomeForTest,
 }
 
 /// Return one passive local consensus observation without issuing a read
@@ -531,7 +400,6 @@ pub fn consensus_local_durable_progress_for_test(
 ) -> ConsensusLocalDurableProgressForTest {
     let metrics = store.inner.raft.metrics();
     let current = metrics.borrow();
-    let diagnostics = store.inner.diagnostics.snapshot();
     let (engine_state, storage_error_subject, storage_error_verb) = match &current.running_state {
         Ok(()) => (ConsensusEngineStateForTest::Running, None, None),
         Err(Fatal::StorageError(StorageError::IO { source })) => {
@@ -558,31 +426,6 @@ pub fn consensus_local_durable_progress_for_test(
         applied_index: current.last_applied.as_ref().map(|log_id| log_id.index),
         snapshot_index: current.snapshot.as_ref().map(|log_id| log_id.index),
         purged_index: current.purged.as_ref().map(|log_id| log_id.index),
-        consensus_log_prune_attempts: diagnostics.consensus_log_prune_attempts,
-        consensus_log_prune_permanent_failures: diagnostics.consensus_log_prune_permanent_failures,
-        consensus_log_prune_degraded: diagnostics.consensus_log_prune_degraded,
-        consensus_log_prune_last_outcome: consensus_log_prune_outcome_for_test(
-            store
-                .inner
-                .consensus_log_prune_lane
-                .as_ref()
-                .map(|lane| lane.last_outcome_for_test()),
-        ),
-        consensus_log_prune_last_returned_turn_outcome: consensus_log_prune_outcome_for_test(
-            store
-                .inner
-                .consensus_log_prune_lane
-                .as_ref()
-                .map(|lane| lane.last_returned_turn_outcome_for_test()),
-        ),
-        consensus_log_prune_last_cleanup_outcome: store
-            .inner
-            .consensus_log_prune_lane
-            .as_ref()
-            .map(|lane| {
-                consensus_log_prune_cleanup_outcome_for_test(lane.last_cleanup_outcome_for_test())
-            })
-            .unwrap_or(ConsensusLogPruneCleanupOutcomeForTest::NoCleanup),
     }
 }
 

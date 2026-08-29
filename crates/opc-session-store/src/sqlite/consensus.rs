@@ -11,8 +11,6 @@ use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-#[cfg(any(test, feature = "test-control"))]
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Condvar;
@@ -3676,124 +3674,7 @@ enum ConsensusLogPruneTurnError {
     TransientContention,
     PreemptedByPrimary,
     Interrupted,
-    #[cfg(any(test, feature = "test-control"))]
-    Permanent(ConsensusLogPrunePermanentSource),
-    #[cfg(not(any(test, feature = "test-control")))]
     Permanent,
-}
-
-/// Fixed internal source category for a terminal physical-prune turn.
-///
-/// This deliberately retains no SQLite text, path, row, identity, or payload.
-/// The feature-gated integration diagnostic below maps it to a similarly
-/// fixed test-only outcome only after the lane has stopped.
-#[cfg(any(test, feature = "test-control"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConsensusLogPrunePermanentSource {
-    /// A strict identity, authority, lineage, or value-bound check failed.
-    Validation,
-    /// SQLite returned neither contention nor interruption.
-    Sqlite,
-    /// A retained row cannot fit one bounded physical-prune turn.
-    BoundedProgress,
-    /// The transaction could not be rolled back after a failed turn.
-    Rollback,
-}
-
-/// Redaction-safe last physical-prune lane outcome exposed only to
-/// test-control and unit-test callers.
-#[cfg(any(test, feature = "test-control"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub(crate) enum ConsensusLogPruneLastOutcomeForTest {
-    /// The lane has not returned a turn since it was opened.
-    NoTurn = 0,
-    /// One bounded turn committed successfully.
-    Completed = 1,
-    /// SQLite writer contention scheduled a bounded retry.
-    RetriedContention = 2,
-    /// A primary writer preempted the turn and scheduled a retry.
-    RetriedPrimaryPreemption = 3,
-    /// An unowned SQLite interrupt scheduled a bounded retry.
-    RetriedInterrupted = 4,
-    /// Strict authority, lineage, identity, or value validation failed.
-    PermanentValidation = 5,
-    /// SQLite returned a non-contention, non-interrupt error.
-    PermanentSqlite = 6,
-    /// A row exceeded the fixed per-turn byte budget.
-    PermanentBoundedProgress = 7,
-    /// Cleanup could not roll back the active prune transaction.
-    PermanentRollback = 8,
-    /// The worker returned a connection that remained inside a transaction.
-    PermanentTransactionOwnership = 9,
-    /// The blocking prune worker failed to return its connection.
-    PermanentWorkerJoin = 10,
-}
-
-#[cfg(any(test, feature = "test-control"))]
-impl ConsensusLogPruneLastOutcomeForTest {
-    fn from_raw(value: u8) -> Self {
-        match value {
-            1 => Self::Completed,
-            2 => Self::RetriedContention,
-            3 => Self::RetriedPrimaryPreemption,
-            4 => Self::RetriedInterrupted,
-            5 => Self::PermanentValidation,
-            6 => Self::PermanentSqlite,
-            7 => Self::PermanentBoundedProgress,
-            8 => Self::PermanentRollback,
-            9 => Self::PermanentTransactionOwnership,
-            10 => Self::PermanentWorkerJoin,
-            _ => Self::NoTurn,
-        }
-    }
-
-    fn from_permanent_source(source: ConsensusLogPrunePermanentSource) -> Self {
-        match source {
-            ConsensusLogPrunePermanentSource::Validation => Self::PermanentValidation,
-            ConsensusLogPrunePermanentSource::Sqlite => Self::PermanentSqlite,
-            ConsensusLogPrunePermanentSource::BoundedProgress => Self::PermanentBoundedProgress,
-            ConsensusLogPrunePermanentSource::Rollback => Self::PermanentRollback,
-        }
-    }
-}
-
-/// Redaction-safe disposition of transaction cleanup in one physical-prune
-/// turn. This is separate because a returned retry can still violate the
-/// worker's connection-ownership invariant.
-#[cfg(any(test, feature = "test-control"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub(crate) enum ConsensusLogPruneCleanupOutcomeForTest {
-    /// The last returned turn did not enter transaction cleanup.
-    NoCleanup = 0,
-    /// Cleanup found the connection already in autocommit mode.
-    AlreadyAutocommit = 1,
-    /// ROLLBACK succeeded and left the connection in autocommit mode.
-    RollbackOkAutocommit = 2,
-    /// ROLLBACK reported success but left the connection in a transaction.
-    RollbackOkTransactionActive = 3,
-    /// ROLLBACK returned SQLite interrupt.
-    RollbackInterrupted = 4,
-    /// ROLLBACK returned SQLite contention.
-    RollbackContention = 5,
-    /// ROLLBACK returned another SQLite error.
-    RollbackPermanent = 6,
-}
-
-#[cfg(any(test, feature = "test-control"))]
-impl ConsensusLogPruneCleanupOutcomeForTest {
-    fn from_raw(value: u8) -> Self {
-        match value {
-            1 => Self::AlreadyAutocommit,
-            2 => Self::RollbackOkAutocommit,
-            3 => Self::RollbackOkTransactionActive,
-            4 => Self::RollbackInterrupted,
-            5 => Self::RollbackContention,
-            6 => Self::RollbackPermanent,
-            _ => Self::NoCleanup,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3820,87 +3701,12 @@ fn classify_consensus_log_prune_sqlite_error(
         {
             ConsensusLogPruneTurnError::Interrupted
         }
-        _ => consensus_log_prune_sqlite_permanent(),
+        _ => ConsensusLogPruneTurnError::Permanent,
     }
 }
 
 fn consensus_log_prune_permanent<T>(_error: T) -> ConsensusLogPruneTurnError {
-    consensus_log_prune_validation_permanent()
-}
-
-fn consensus_log_prune_sqlite_permanent() -> ConsensusLogPruneTurnError {
-    #[cfg(any(test, feature = "test-control"))]
-    {
-        ConsensusLogPruneTurnError::Permanent(ConsensusLogPrunePermanentSource::Sqlite)
-    }
-    #[cfg(not(any(test, feature = "test-control")))]
-    {
-        ConsensusLogPruneTurnError::Permanent
-    }
-}
-
-fn consensus_log_prune_validation_permanent() -> ConsensusLogPruneTurnError {
-    #[cfg(any(test, feature = "test-control"))]
-    {
-        ConsensusLogPruneTurnError::Permanent(ConsensusLogPrunePermanentSource::Validation)
-    }
-    #[cfg(not(any(test, feature = "test-control")))]
-    {
-        ConsensusLogPruneTurnError::Permanent
-    }
-}
-
-fn consensus_log_prune_bounded_progress_permanent() -> ConsensusLogPruneTurnError {
-    #[cfg(any(test, feature = "test-control"))]
-    {
-        ConsensusLogPruneTurnError::Permanent(ConsensusLogPrunePermanentSource::BoundedProgress)
-    }
-    #[cfg(not(any(test, feature = "test-control")))]
-    {
-        ConsensusLogPruneTurnError::Permanent
-    }
-}
-
-fn consensus_log_prune_rollback_permanent() -> ConsensusLogPruneTurnError {
-    #[cfg(any(test, feature = "test-control"))]
-    {
-        ConsensusLogPruneTurnError::Permanent(ConsensusLogPrunePermanentSource::Rollback)
-    }
-    #[cfg(not(any(test, feature = "test-control")))]
-    {
-        ConsensusLogPruneTurnError::Permanent
-    }
-}
-
-#[cfg(any(test, feature = "test-control"))]
-fn consensus_log_prune_permanent_outcome_for_test(
-    error: &ConsensusLogPruneTurnError,
-) -> ConsensusLogPruneLastOutcomeForTest {
-    let ConsensusLogPruneTurnError::Permanent(source) = error else {
-        unreachable!("only permanent prune failures have a terminal source")
-    };
-    ConsensusLogPruneLastOutcomeForTest::from_permanent_source(*source)
-}
-
-#[cfg(any(test, feature = "test-control"))]
-fn consensus_log_prune_turn_outcome_for_test(
-    result: &Result<ConsensusLogPruneTurnCompletion, ConsensusLogPruneTurnError>,
-) -> ConsensusLogPruneLastOutcomeForTest {
-    match result {
-        Ok(_) => ConsensusLogPruneLastOutcomeForTest::Completed,
-        Err(ConsensusLogPruneTurnError::TransientContention) => {
-            ConsensusLogPruneLastOutcomeForTest::RetriedContention
-        }
-        Err(ConsensusLogPruneTurnError::PreemptedByPrimary) => {
-            ConsensusLogPruneLastOutcomeForTest::RetriedPrimaryPreemption
-        }
-        Err(ConsensusLogPruneTurnError::Interrupted) => {
-            ConsensusLogPruneLastOutcomeForTest::RetriedInterrupted
-        }
-        Err(error @ ConsensusLogPruneTurnError::Permanent(_)) => {
-            consensus_log_prune_permanent_outcome_for_test(error)
-        }
-    }
+    ConsensusLogPruneTurnError::Permanent
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -4357,17 +4163,6 @@ pub(crate) struct ConsensusLogPruneLane {
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
     primary_writers: Arc<AtomicUsize>,
-    /// The most recent lane disposition, retained only for redaction-safe
-    /// feature-gated qualification diagnostics.
-    #[cfg(any(test, feature = "test-control"))]
-    last_outcome_for_test: AtomicU8,
-    /// The result returned by the most recent blocking turn, separately from
-    /// any later worker-level ownership failure.
-    #[cfg(any(test, feature = "test-control"))]
-    last_returned_turn_outcome_for_test: AtomicU8,
-    /// The cleanup state before a turn is returned to the lane worker.
-    #[cfg(any(test, feature = "test-control"))]
-    last_cleanup_outcome_for_test: Arc<AtomicU8>,
     #[cfg(all(test, target_os = "linux"))]
     turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
 }
@@ -4411,16 +4206,6 @@ impl ConsensusLogPruneLane {
             worker: tokio::sync::Mutex::new(None),
             diagnostics,
             primary_writers: Arc::new(AtomicUsize::new(0)),
-            #[cfg(any(test, feature = "test-control"))]
-            last_outcome_for_test: AtomicU8::new(ConsensusLogPruneLastOutcomeForTest::NoTurn as u8),
-            #[cfg(any(test, feature = "test-control"))]
-            last_returned_turn_outcome_for_test: AtomicU8::new(
-                ConsensusLogPruneLastOutcomeForTest::NoTurn as u8,
-            ),
-            #[cfg(any(test, feature = "test-control"))]
-            last_cleanup_outcome_for_test: Arc::new(AtomicU8::new(
-                ConsensusLogPruneCleanupOutcomeForTest::NoCleanup as u8,
-            )),
             #[cfg(all(test, target_os = "linux"))]
             turn_gate: consensus_log_prune_turn_gate_for_source(&source),
         });
@@ -4459,54 +4244,6 @@ impl ConsensusLogPruneLane {
 
     pub(crate) fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::Acquire)
-    }
-
-    #[cfg(any(test, feature = "test-control"))]
-    fn record_last_outcome_for_test(&self, outcome: ConsensusLogPruneLastOutcomeForTest) {
-        self.last_outcome_for_test
-            .store(outcome as u8, Ordering::Release);
-    }
-
-    #[cfg(any(test, feature = "test-control"))]
-    pub(crate) fn last_outcome_for_test(&self) -> ConsensusLogPruneLastOutcomeForTest {
-        ConsensusLogPruneLastOutcomeForTest::from_raw(
-            self.last_outcome_for_test.load(Ordering::Acquire),
-        )
-    }
-
-    #[cfg(any(test, feature = "test-control"))]
-    fn record_last_returned_turn_outcome_for_test(
-        &self,
-        outcome: ConsensusLogPruneLastOutcomeForTest,
-    ) {
-        self.last_returned_turn_outcome_for_test
-            .store(outcome as u8, Ordering::Release);
-    }
-
-    #[cfg(any(test, feature = "test-control"))]
-    pub(crate) fn last_returned_turn_outcome_for_test(
-        &self,
-    ) -> ConsensusLogPruneLastOutcomeForTest {
-        ConsensusLogPruneLastOutcomeForTest::from_raw(
-            self.last_returned_turn_outcome_for_test
-                .load(Ordering::Acquire),
-        )
-    }
-
-    #[cfg(any(test, feature = "test-control"))]
-    fn record_last_cleanup_outcome_for_test(
-        &self,
-        outcome: ConsensusLogPruneCleanupOutcomeForTest,
-    ) {
-        self.last_cleanup_outcome_for_test
-            .store(outcome as u8, Ordering::Release);
-    }
-
-    #[cfg(any(test, feature = "test-control"))]
-    pub(crate) fn last_cleanup_outcome_for_test(&self) -> ConsensusLogPruneCleanupOutcomeForTest {
-        ConsensusLogPruneCleanupOutcomeForTest::from_raw(
-            self.last_cleanup_outcome_for_test.load(Ordering::Acquire),
-        )
     }
 
     fn fail_permanently(&self) {
@@ -4705,17 +4442,11 @@ async fn run_consensus_log_prune_lane(
         if let Some(diagnostics) = &lane.diagnostics {
             diagnostics.begin_consensus_log_prune_turn();
         }
-        #[cfg(any(test, feature = "test-control"))]
-        lane.record_last_cleanup_outcome_for_test(
-            ConsensusLogPruneCleanupOutcomeForTest::NoCleanup,
-        );
         let source_for_turn = Arc::clone(&source);
         let expected_members_for_turn = expected_members.clone();
         let expected_bindings_for_turn = expected_bindings.clone();
         let primary_writers = Arc::clone(&lane.primary_writers);
         let interrupt_delivery = Arc::clone(&lane.interrupt_delivery);
-        #[cfg(any(test, feature = "test-control"))]
-        let cleanup_outcome_for_test = Arc::clone(&lane.last_cleanup_outcome_for_test);
         #[cfg(all(test, target_os = "linux"))]
         let turn_gate = lane.turn_gate.clone();
         let turn = tokio::task::spawn_blocking(move || {
@@ -4737,8 +4468,6 @@ async fn run_consensus_log_prune_lane(
                     primary_writers: Arc::clone(&primary_writers),
                     interrupt_delivery: Arc::clone(&interrupt_delivery),
                     preemption_requested: Arc::clone(&preemption_requested),
-                    #[cfg(any(test, feature = "test-control"))]
-                    cleanup_outcome_for_test,
                     #[cfg(all(test, target_os = "linux"))]
                     turn_gate: turn_gate.clone(),
                 },
@@ -4770,21 +4499,11 @@ async fn run_consensus_log_prune_lane(
         // secondary connection before a primary can enter SQLite.
         let turn = match turn {
             Ok((returned, result)) if returned.is_autocommit() => {
-                #[cfg(any(test, feature = "test-control"))]
-                lane.record_last_returned_turn_outcome_for_test(
-                    consensus_log_prune_turn_outcome_for_test(&result),
-                );
                 connection = returned;
                 drop(turn_ownership);
                 result
             }
-            Ok((returned, result)) => {
-                #[cfg(any(test, feature = "test-control"))]
-                lane.record_last_returned_turn_outcome_for_test(
-                    consensus_log_prune_turn_outcome_for_test(&result),
-                );
-                #[cfg(not(any(test, feature = "test-control")))]
-                let _ = result;
+            Ok((returned, _)) => {
                 drop(returned);
                 drop(turn_ownership);
                 if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
@@ -4793,10 +4512,6 @@ async fn run_consensus_log_prune_lane(
                     }
                     return;
                 }
-                #[cfg(any(test, feature = "test-control"))]
-                lane.record_last_outcome_for_test(
-                    ConsensusLogPruneLastOutcomeForTest::PermanentTransactionOwnership,
-                );
                 lane.fail_permanently();
                 return;
             }
@@ -4810,10 +4525,6 @@ async fn run_consensus_log_prune_lane(
                     }
                     return;
                 }
-                #[cfg(any(test, feature = "test-control"))]
-                lane.record_last_outcome_for_test(
-                    ConsensusLogPruneLastOutcomeForTest::PermanentWorkerJoin,
-                );
                 lane.fail_permanently();
                 return;
             }
@@ -4821,8 +4532,6 @@ async fn run_consensus_log_prune_lane(
         drop(interrupt_cleanup);
         match turn {
             Ok(completion) => {
-                #[cfg(any(test, feature = "test-control"))]
-                lane.record_last_outcome_for_test(ConsensusLogPruneLastOutcomeForTest::Completed);
                 if let Some(diagnostics) = &lane.diagnostics {
                     diagnostics.complete_consensus_log_prune_turn(
                         completion.rows_deleted,
@@ -4847,11 +4556,9 @@ async fn run_consensus_log_prune_lane(
                 }
             }
             Err(
-                error @ (ConsensusLogPruneTurnError::TransientContention
-                | ConsensusLogPruneTurnError::PreemptedByPrimary),
+                ConsensusLogPruneTurnError::TransientContention
+                | ConsensusLogPruneTurnError::PreemptedByPrimary,
             ) => {
-                #[cfg(not(any(test, feature = "test-control")))]
-                let _ = error;
                 if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
                     if let Some(diagnostics) = &lane.diagnostics {
                         diagnostics.cancel_consensus_log_prune_turn();
@@ -4861,14 +4568,6 @@ async fn run_consensus_log_prune_lane(
                 if let Some(diagnostics) = &lane.diagnostics {
                     diagnostics.retry_consensus_log_prune_turn();
                 }
-                #[cfg(any(test, feature = "test-control"))]
-                lane.record_last_outcome_for_test(
-                    if matches!(error, ConsensusLogPruneTurnError::TransientContention) {
-                        ConsensusLogPruneLastOutcomeForTest::RetriedContention
-                    } else {
-                        ConsensusLogPruneLastOutcomeForTest::RetriedPrimaryPreemption
-                    },
-                );
                 if !wait_consensus_log_prune_pacing(&mut stop, &lane).await {
                     return;
                 }
@@ -4887,10 +4586,6 @@ async fn run_consensus_log_prune_lane(
                 if let Some(diagnostics) = &lane.diagnostics {
                     diagnostics.retry_consensus_log_prune_turn();
                 }
-                #[cfg(any(test, feature = "test-control"))]
-                lane.record_last_outcome_for_test(
-                    ConsensusLogPruneLastOutcomeForTest::RetriedInterrupted,
-                );
                 // sqlite3_interrupt() may land after a primary writer has
                 // announced itself but before the prune connection enters a
                 // VDBE. SQLite then reports SQLITE_INTERRUPT to the first
@@ -4906,22 +4601,6 @@ async fn run_consensus_log_prune_lane(
                 }
                 lane.signal();
             }
-            #[cfg(any(test, feature = "test-control"))]
-            Err(error @ ConsensusLogPruneTurnError::Permanent(_)) => {
-                if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
-                    if let Some(diagnostics) = &lane.diagnostics {
-                        diagnostics.cancel_consensus_log_prune_turn();
-                    }
-                    return;
-                }
-                #[cfg(any(test, feature = "test-control"))]
-                lane.record_last_outcome_for_test(consensus_log_prune_permanent_outcome_for_test(
-                    &error,
-                ));
-                lane.fail_permanently();
-                return;
-            }
-            #[cfg(not(any(test, feature = "test-control")))]
             Err(ConsensusLogPruneTurnError::Permanent) => {
                 if lane.stopping.load(Ordering::Acquire) || *stop.borrow() {
                     if let Some(diagnostics) = &lane.diagnostics {
@@ -4981,8 +4660,6 @@ struct ConsensusLogPruneTurnControl {
     primary_writers: Arc<AtomicUsize>,
     interrupt_delivery: Arc<Mutex<()>>,
     preemption_requested: Arc<AtomicBool>,
-    #[cfg(any(test, feature = "test-control"))]
-    cleanup_outcome_for_test: Arc<AtomicU8>,
     #[cfg(all(test, target_os = "linux"))]
     turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
 }
@@ -5120,13 +4797,9 @@ fn prune_consensus_log_turn_sync(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             drop(progress);
-            let rollback = rollback_consensus_log_prune_transaction(
-                conn,
-                #[cfg(any(test, feature = "test-control"))]
-                control.cleanup_outcome_for_test.as_ref(),
-            );
+            let rollback = rollback_consensus_log_prune_transaction(conn);
             drop(interrupt_delivery);
-            rollback.map_err(|_| consensus_log_prune_rollback_permanent())?;
+            rollback.map_err(|_| ConsensusLogPruneTurnError::Permanent)?;
             return Err(classify_consensus_log_prune_sqlite_error(&error));
         }
     };
@@ -5201,14 +4874,10 @@ fn prune_consensus_log_turn_sync(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 drop(progress);
-                let rollback = rollback_consensus_log_prune_transaction(
-                    conn,
-                    #[cfg(any(test, feature = "test-control"))]
-                    control.cleanup_outcome_for_test.as_ref(),
-                );
+                let rollback = rollback_consensus_log_prune_transaction(conn);
                 drop(tx);
                 drop(interrupt_delivery);
-                rollback.map_err(|_| consensus_log_prune_rollback_permanent())?;
+                rollback.map_err(|_| ConsensusLogPruneTurnError::Permanent)?;
             } else {
                 drop(progress);
                 drop(tx);
@@ -5225,83 +4894,37 @@ fn prune_consensus_log_turn_sync(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             drop(progress);
-            let rollback = rollback_consensus_log_prune_transaction(
-                conn,
-                #[cfg(any(test, feature = "test-control"))]
-                control.cleanup_outcome_for_test.as_ref(),
-            );
+            let rollback = rollback_consensus_log_prune_transaction(conn);
             drop(tx);
             drop(interrupt_delivery);
-            rollback.map_err(|_| consensus_log_prune_rollback_permanent())?;
+            rollback.map_err(|_| ConsensusLogPruneTurnError::Permanent)?;
             Err(error)
         }
     };
-    #[cfg(any(test, feature = "test-control"))]
-    {
-        match result {
-            Err(
-                ConsensusLogPruneTurnError::Interrupted | ConsensusLogPruneTurnError::Permanent(_),
-            ) if control.preemption_requested.load(Ordering::Acquire) => {
-                Err(ConsensusLogPruneTurnError::PreemptedByPrimary)
-            }
-            result => result,
+    match result {
+        Err(ConsensusLogPruneTurnError::Interrupted | ConsensusLogPruneTurnError::Permanent)
+            if control.preemption_requested.load(Ordering::Acquire) =>
+        {
+            Err(ConsensusLogPruneTurnError::PreemptedByPrimary)
         }
-    }
-    #[cfg(not(any(test, feature = "test-control")))]
-    {
-        match result {
-            Err(
-                ConsensusLogPruneTurnError::Interrupted | ConsensusLogPruneTurnError::Permanent,
-            ) if control.preemption_requested.load(Ordering::Acquire) => {
-                Err(ConsensusLogPruneTurnError::PreemptedByPrimary)
-            }
-            result => result,
-        }
+        result => result,
     }
 }
 
 fn rollback_consensus_log_prune_transaction(
     conn: &Connection,
-    #[cfg(any(test, feature = "test-control"))] cleanup_outcome_for_test: &AtomicU8,
 ) -> Result<(), ConsensusLogPruneTurnError> {
     if conn.is_autocommit() {
-        #[cfg(any(test, feature = "test-control"))]
-        cleanup_outcome_for_test.store(
-            ConsensusLogPruneCleanupOutcomeForTest::AlreadyAutocommit as u8,
-            Ordering::Release,
-        );
         return Ok(());
     }
     let result = conn
         .execute_batch("ROLLBACK")
         .map_err(|rollback_error| classify_consensus_log_prune_sqlite_error(&rollback_error));
-    #[cfg(any(test, feature = "test-control"))]
-    {
-        let outcome = match &result {
-            Ok(()) if conn.is_autocommit() => {
-                ConsensusLogPruneCleanupOutcomeForTest::RollbackOkAutocommit
-            }
-            Ok(()) => ConsensusLogPruneCleanupOutcomeForTest::RollbackOkTransactionActive,
-            Err(ConsensusLogPruneTurnError::Interrupted) => {
-                ConsensusLogPruneCleanupOutcomeForTest::RollbackInterrupted
-            }
-            Err(ConsensusLogPruneTurnError::TransientContention) => {
-                ConsensusLogPruneCleanupOutcomeForTest::RollbackContention
-            }
-            Err(ConsensusLogPruneTurnError::Permanent(_)) => {
-                ConsensusLogPruneCleanupOutcomeForTest::RollbackPermanent
-            }
-            Err(ConsensusLogPruneTurnError::PreemptedByPrimary) => {
-                ConsensusLogPruneCleanupOutcomeForTest::RollbackPermanent
-            }
-        };
-        cleanup_outcome_for_test.store(outcome as u8, Ordering::Release);
-    }
     if result.is_ok() && !conn.is_autocommit() {
         // A successful ROLLBACK must restore connection ownership. Keep this
         // invariant local to the cleanup helper instead of relying only on
         // the worker's outer fail-closed ownership check.
-        Err(consensus_log_prune_rollback_permanent())
+        Err(ConsensusLogPruneTurnError::Permanent)
     } else {
         result
     }
@@ -5350,7 +4973,7 @@ fn read_purged_for_prune_sync(
     if checked_u64(term).map_err(consensus_log_prune_permanent)? != log_id.leader_id.term
         || checked_u64(index).map_err(consensus_log_prune_permanent)? != log_id.index
     {
-        return Err(consensus_log_prune_validation_permanent());
+        return Err(ConsensusLogPruneTurnError::Permanent);
     }
     Ok(Some(log_id))
 }
@@ -5428,7 +5051,7 @@ fn prune_consensus_log_rows_in_tx(
         if retained {
             // A row larger than the fixed budget cannot be a supported
             // durable entry. Refuse a zero-progress requeue loop.
-            return Err(consensus_log_prune_bounded_progress_permanent());
+            return Err(ConsensusLogPruneTurnError::Permanent);
         }
     }
     preempt_consensus_log_prune_if_requested(primary_writers)?;
@@ -41452,7 +41075,7 @@ mod tests {
         );
         assert_eq!(
             classify_consensus_log_prune_sqlite_error(&error),
-            ConsensusLogPruneTurnError::Permanent(ConsensusLogPrunePermanentSource::Sqlite)
+            ConsensusLogPruneTurnError::Permanent
         );
         let error = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
@@ -46043,7 +45666,7 @@ mod tests {
             })
             .await
             .expect("join production-window gate observer"),
-            "the real BEGIN IMMEDIATE transaction opened before the synthetic interrupt"
+            "the real prune lane reached the controlled interruption window"
         );
 
         if point == ConsensusLogPruneTurnGatePoint::AfterBeginSuccessBeforeSyntheticInterrupt {
@@ -46065,6 +45688,23 @@ mod tests {
             assert!(
                 !snapshot.consensus_log_prune_degraded && !lane.is_degraded(),
                 "an interrupted BEGIN that opened a transaction must roll back before retrying; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.consensus_log_prune_attempts,
+                2,
+                "the interrupted BEGIN and its successful retry are the only turns; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.consensus_log_prune_busy_retries, 1,
+                "the interrupted BEGIN schedules exactly one retry; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.consensus_log_prune_permanent_failures, 0,
+                "the interrupted BEGIN cleanup must not degrade the lane; diagnostics={snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.consensus_log_prune_drained_turns, 1,
+                "the successful retry drains the backlog once; diagnostics={snapshot:?}"
             );
             assert_eq!(
                 primary
@@ -46406,9 +46046,7 @@ mod tests {
                 #[cfg(all(test, target_os = "linux"))]
                 None,
             ),
-            Err(ConsensusLogPruneTurnError::Permanent(
-                ConsensusLogPrunePermanentSource::BoundedProgress,
-            )),
+            Err(ConsensusLogPruneTurnError::Permanent),
             "an oversize retained row is a sticky nonspinning corruption"
         );
         drop(tx);
