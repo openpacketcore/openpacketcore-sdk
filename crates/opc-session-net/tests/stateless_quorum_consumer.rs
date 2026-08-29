@@ -37,8 +37,6 @@ use opc_key::{
 };
 #[cfg(feature = "test-control")]
 use opc_session_net::DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT;
-#[cfg(feature = "test-control")]
-use opc_session_net::SESSION_QUORUM_CONSUMER_ROSTER_ALPN;
 use opc_session_net::{
     session_consumer_payload_budget, PersistentSessionConsumerClient,
     PersistentSessionConsumerConfig, PersistentSessionConsumerV2ExecuteError, RemoteAddrResolver,
@@ -88,6 +86,10 @@ use opc_session_net::{
     FencedMutationRosterTerminalReceipt as TerminalReceipt,
     FencedMutationRosterTerminalStatus as TerminalStatus,
     FencedMutationRosterTerminalizationOutcome as TerminalizationOutcome,
+};
+#[cfg(feature = "test-control")]
+use opc_session_net::{
+    SESSION_QUORUM_CONSUMER_ROSTER_ALPN, SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION,
 };
 use opc_session_store::fenced_mutation_roster::{
     RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
@@ -6923,6 +6925,573 @@ async fn authenticated_consumer_v2_recovers_journaled_protected_transition_after
         drop(store);
         drop(snapshots);
     }
+}
+
+// The real consensus service runs all three authenticated voter transports at
+// once. The maximum protected envelope is intentionally exercised on a
+// multithreaded runtime so this remains the production topology rather than a
+// serial in-process approximation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal(
+) {
+    let pki = Arc::new(TestPki::new());
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable_with_roster_attestation(
+        Arc::clone(&pki),
+        ProductionRosterAttestationIssuer::trust_root(),
+    )
+    .await;
+    let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    let ingress = leader;
+    let server_spiffe = three_voter_spiffe(ingress);
+    let client_spiffe = spiffe("three-voter-roster-maximum-client");
+    let authorizer = three_voter_authorizer(&fleet.stores[ingress], &client_spiffe).await;
+    let voter_authority = fleet.voter_authority(ingress);
+    let attestor = ProductionRosterAttestationIssuer::new(
+        fleet.consensus_identity(ingress),
+        authorizer.scope(),
+    );
+    let ingress_signer: Arc<dyn RosterIngressSigner> = attestor.clone();
+    let executor_attestor: Arc<dyn FencedMutationRosterExecutorAttestor> = attestor.clone();
+    let service = Arc::new(fleet.stores[ingress].consumer_service());
+    let consumer: Arc<dyn SessionQuorumConsumer> = service.clone();
+    let roster_ingress: Arc<dyn SessionQuorumRosterIngress> = service;
+    assert_eq!(
+        roster_ingress.expected_roster_attestation_trust_root_identity(),
+        Some(RosterIngressSigner::trust_root(attestor.as_ref()).identity()),
+        "the fixed quorum must expose the same root that certifies /3 ingress"
+    );
+    let transport = Arc::new(CommitThenLoseConsumerResponse::roster_passthrough(
+        consumer,
+        roster_ingress,
+    ));
+    let (server, address) = SessionQuorumConsumerServer::new(
+        transport.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_roster_ingress(transport.clone(), ingress_signer)
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("maximum protected-roster listener"),
+    )
+    .await
+    .expect("start maximum protected-roster listener");
+
+    // Establish the incumbent record through the public SessionBackend
+    // boundary. The protected roster is therefore a real checked successor,
+    // never a direct test insertion into SQLite or consensus state.
+    let setup_directory = tempfile::tempdir().expect("protected-roster journal directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(
+            setup_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("private protected-roster journal directory");
+    }
+    let setup_provider = CountingKeyProvider::with_active_session_key();
+    let setup_client = consumer_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority.clone(),
+    );
+    let setup_physical: Arc<dyn SessionBackend> = Arc::new(
+        SessionConsumerFencedTransitionBackend::stateless(setup_client)
+            .expect("public stateless SessionBackend"),
+    );
+    let setup_outer: Arc<dyn SessionBackend> = Arc::new(
+        EncryptingSessionBackend::new(
+            setup_physical,
+            Arc::clone(&setup_provider),
+            "three-voter-protected-roster",
+        )
+        .with_fenced_transition_journal(Arc::new(
+            PreparedFencedTransitionJournal::create_new(
+                setup_directory.path().join("prepared.sqlite"),
+                PreparedFencedTransitionJournalKey::from_bytes([0x7a; 32]),
+            )
+            .expect("create protected-roster SessionBackend journal"),
+        )),
+    );
+    let key = test_key();
+    let owner = OwnerId::new("three-voter-roster-owner").expect("roster owner");
+    let setup_lease = FencedTransitionLease::acquire(
+        key.clone(),
+        owner.clone(),
+        FenceToken::new(0),
+        Duration::from_secs(60),
+    )
+    .expect("incumbent roster lease");
+    let setup = FencedTransitionRequest::new(
+        FencedTransitionRequestId::from_bytes([0xb1; 16]),
+        setup_lease.clone(),
+        FencedTransitionMutation::create(StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner: owner.clone(),
+            fence: setup_lease
+                .committed_fence()
+                .expect("incumbent roster fence"),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("three-voter-roster-current"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([0x51]),
+        }),
+    )
+    .expect("incumbent protected roster record");
+    let setup = setup_outer
+        .prepare_fenced_transition(setup)
+        .await
+        .expect("prepare incumbent through SessionBackend");
+    let setup = setup_outer
+        .fenced_transition(&setup)
+        .await
+        .expect("commit incumbent through SessionBackend");
+    let roster_lease = setup.lease().clone();
+    let roster_generation = setup.committed_generation();
+    let sequence_before = fleet.application_sequences().await[leader];
+    let log_before = fleet.stores[leader]
+        .status()
+        .last_log_index
+        .expect("protected-roster proposal baseline");
+    fleet.wait_all_application_sequences(sequence_before).await;
+
+    let persistent = protected_roster_persistent_client(
+        &pki,
+        address,
+        &server_spiffe,
+        &client_spiffe,
+        voter_authority,
+    );
+    assert!(persistent.fenced_mutation_roster_transport_enabled());
+    assert_eq!(
+        SESSION_QUORUM_CONSUMER_ROSTER_ALPN,
+        b"opc-session-consumer/3"
+    );
+    assert_eq!(SESSION_QUORUM_CONSUMER_ROSTER_TRANSPORT_REVISION, 5);
+    let shutdown_client = persistent.clone();
+    let provider = Arc::new(SixMemberRosterEvidenceProvider::new(attestor.clone()));
+    let publication_provider = Arc::new(EstablishedPublicationEvidenceProvider::default());
+    let adapter = persistent
+        .into_fenced_mutation_roster_provider_adapter(
+            Arc::clone(&provider),
+            Arc::clone(&publication_provider),
+            executor_attestor,
+            NonZeroUsize::new(THREE_VOTER_COUNT).expect("positive roster concurrency"),
+        )
+        .expect("compose public protected-roster provider adapter");
+    let roster_client = adapter.client().clone();
+
+    let protected_plan = vec![0x70; FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES];
+    let protected_result = vec![0x72; FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES];
+    let terminal_state_type = StateType::from_static("three-voter-roster-established");
+    let mut expected_terminal = StoredSessionRecord {
+        key: key.clone(),
+        generation: roster_generation.next().expect("terminal generation"),
+        owner: owner.clone(),
+        fence: roster_lease.fence(),
+        state_class: StateClass::AuthoritativeSession,
+        state_type: terminal_state_type.clone(),
+        expires_at: None,
+        payload: EncryptedSessionPayload::new([]),
+    };
+    let envelope_overhead = EncryptedSessionPayload::encrypt(
+        setup_provider.as_ref(),
+        &expected_terminal,
+        "three-voter-protected-roster",
+    )
+    .await
+    .expect("derive SDK checkpoint envelope overhead")
+    .as_bytes()
+    .len();
+    let terminal_plaintext =
+        vec![0x73; FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES - envelope_overhead];
+    expected_terminal.payload = EncryptedSessionPayload::new(&terminal_plaintext);
+    let protected_checkpoint = EncryptedSessionPayload::encrypt(
+        setup_provider.as_ref(),
+        &expected_terminal,
+        "three-voter-protected-roster",
+    )
+    .await
+    .expect("seal exact maximum checkpoint through SessionBackend provider")
+    .as_bytes()
+    .to_vec();
+    assert_eq!(protected_plan.len(), FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES);
+    assert_eq!(
+        protected_checkpoint.len(),
+        FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES
+    );
+    assert_eq!(
+        protected_result.len(),
+        FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES
+    );
+    expected_terminal.payload = EncryptedSessionPayload::try_envelope(&protected_checkpoint)
+        .expect("canonical maximum checkpoint envelope");
+    let members = (0_u8..6)
+        .map(|ordinal| {
+            Member::new(
+                ordinal,
+                MemberOperationId::from_bytes([ordinal + 1; 16]).expect("stable opaque member ID"),
+                vec![0xd0, ordinal],
+                u64::from(ordinal) + 41,
+            )
+            .expect("ordered opaque roster member")
+        })
+        .collect::<Vec<_>>();
+    let proposal = AdmissionProposal::new(
+        FencedMutationRosterProfile::v1(),
+        RosterId::from_bytes([0xb2; 16]).expect("stable roster ID"),
+        members.clone(),
+        EstablishedMutation::put_checkpoint(terminal_state_type),
+        protected_plan.clone(),
+        protected_checkpoint.clone(),
+        protected_result.clone(),
+    )
+    .expect("maximum protected roster proposal");
+    let mut admission = roster_client
+        .prepare(roster_lease, roster_generation, proposal)
+        .expect("prepare exact protected roster body");
+    let mut roster = match roster_client
+        .admit(&mut admission)
+        .await
+        .expect("one real PollAdmit")
+    {
+        AdmissionOutcome::Admitted(active) => DurableCrashRecoveredRoster::Active(active),
+        AdmissionOutcome::NotTransmitted => {
+            panic!(
+                "fresh maximum PollAdmit must reach the authenticated roster ingress; ingress calls={}",
+                transport.roster_admission_calls.load(Ordering::SeqCst)
+            )
+        }
+        AdmissionOutcome::OutcomeUnknown(_) => {
+            let mut recovered = None;
+            for attempt in 0..PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
+                match roster_client.admission_status(&admission).await {
+                    Ok(RecoveryOutcome::Admitted(value)) => {
+                        recovered = Some(value);
+                        break;
+                    }
+                    Ok(RecoveryOutcome::Terminal(_)) | Ok(RecoveryOutcome::Compacted) => {
+                        panic!("lost maximum PollAdmit reply cannot already be terminal")
+                    }
+                    Err(RosterClientError::Unavailable)
+                    | Err(RosterClientError::AdmissionRecordMissing) => {
+                        if attempt + 1 < PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Err(_) => {
+                        panic!("exact maximum PollAdmit status readback rejected its bound request")
+                    }
+                }
+            }
+            let Some(recovered) = recovered else {
+                let applied = fleet.application_sequence_observation().await;
+                let (decoded, decode_failures, nonempty) = fleet.append_entries_observation();
+                panic!(
+                    "maximum PollAdmit remained ambiguous after bounded same-request readback; applied={applied:?}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}"
+                )
+            };
+            DurableCrashRecoveredRoster::Recovered(recovered)
+        }
+    };
+    fleet
+        .wait_all_application_sequences(sequence_before + 1)
+        .await;
+    assert_eq!(
+        fleet.stores[leader].status().last_log_index,
+        Some(log_before + 1),
+        "PollAdmitted appends exactly one real quorum proposal",
+    );
+    assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(roster.members(), members.as_slice());
+    assert_eq!(roster.protected_plan(), protected_plan);
+
+    let mut proofs = Vec::with_capacity(6);
+    match &mut roster {
+        DurableCrashRecoveredRoster::Active(active) => {
+            for ordinal in 0_u8..6 {
+                let mut member = active
+                    .member(MemberOrdinal::new(ordinal).expect("member ordinal"))
+                    .expect("issue exactly one ordered member");
+                assert!(matches!(
+                    roster_client
+                        .prepare_member(&mut member)
+                        .await
+                        .expect("provider-local prepare"),
+                    MemberPrepareOutcome::Prepared
+                ));
+                match roster_client
+                    .execute(&mut member)
+                    .await
+                    .expect("provider-local execute")
+                {
+                    ExecuteOutcome::Conclusive(proof) => proofs.push(*proof),
+                    _ => panic!("fresh member effect must be conclusive"),
+                }
+            }
+        }
+        DurableCrashRecoveredRoster::Recovered(recovered) => {
+            for ordinal in 0_u8..6 {
+                let mut member = recovered
+                    .member(MemberOrdinal::new(ordinal).expect("recovered member ordinal"))
+                    .expect("issue exactly one recovered member");
+                assert!(matches!(
+                    roster_client
+                        .status(&mut member)
+                        .await
+                        .expect("provider-local recovery status"),
+                    MemberRecoveryOutcome::Ambiguous(MemberRecoveryStatus::NotFound)
+                ));
+                match roster_client
+                    .adopt(&mut member)
+                    .await
+                    .expect("provider-local exact adoption")
+                {
+                    MemberRecoveryOutcome::Conclusive(proof) => proofs.push(*proof),
+                    _ => panic!("NotFound cannot bypass exact member adoption"),
+                }
+            }
+        }
+    }
+    let recovered_after_ambiguous_admission =
+        matches!(&roster, DurableCrashRecoveredRoster::Recovered(_));
+    assert_eq!(
+        provider.prepare_calls.load(Ordering::SeqCst),
+        if recovered_after_ambiguous_admission {
+            0
+        } else {
+            6
+        }
+    );
+    assert_eq!(
+        provider.execute_calls.load(Ordering::SeqCst),
+        if recovered_after_ambiguous_admission {
+            0
+        } else {
+            6
+        }
+    );
+    assert_eq!(
+        provider.status_calls.load(Ordering::SeqCst),
+        if recovered_after_ambiguous_admission {
+            6
+        } else {
+            0
+        }
+    );
+    assert_eq!(
+        provider.adopt_calls.load(Ordering::SeqCst),
+        if recovered_after_ambiguous_admission {
+            6
+        } else {
+            0
+        }
+    );
+    assert_eq!(
+        provider.executions(),
+        members
+            .iter()
+            .enumerate()
+            .map(|(ordinal, member)| (
+                u8::try_from(ordinal).expect("six member ordinal"),
+                *member.operation_id().as_bytes(),
+                member.descriptor().to_vec(),
+                member.expected_version(),
+            ))
+            .collect::<Vec<_>>()
+    );
+    fleet
+        .wait_all_application_sequences(sequence_before + 1)
+        .await;
+    assert_eq!(
+        fleet.stores[leader].status().last_log_index,
+        Some(log_before + 1),
+        "six provider effects and their local journal transitions append no quorum proposal",
+    );
+    assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
+
+    let proofs = CompleteProofSet::new(proofs).expect("six SDK-issued conclusive proofs");
+    assert_eq!(proofs.len(), 6);
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 0);
+    let mut terminal = roster_client
+        .prepare_terminal(roster.for_terminal(), &proofs)
+        .await
+        .expect("bind the six proofs to one exact terminal body");
+    #[cfg(feature = "test-control")]
+    let _terminal_apply_timing_guard = PROTECTED_ROSTER_TERMINAL_APPLY_TIMING_TEST_LOCK
+        .lock()
+        .await;
+    #[cfg(feature = "test-control")]
+    reset_protected_roster_terminal_apply_timings_for_test();
+    let terminalize_started = Instant::now();
+    let terminalize_outcome = roster_client
+        .terminalize(&mut terminal)
+        .await
+        .expect("one real Terminalize");
+    let mut publication = match terminalize_outcome {
+        TerminalizationOutcome::Committed(TerminalReceipt::Established(established)) => {
+            assert_eq!(established.protected_checkpoint(), protected_checkpoint);
+            assert_eq!(established.protected_result(), protected_result);
+            established.into_publication()
+        }
+        TerminalizationOutcome::Committed(TerminalReceipt::Aborted(_)) => {
+            panic!("six applied proofs must not commit an Aborted protected terminal")
+        }
+        TerminalizationOutcome::NotTransmitted => {
+            panic!("fresh protected terminal must return its committed Established receipt")
+        }
+        TerminalizationOutcome::OutcomeUnknown => {
+            let terminalize_elapsed_millis = terminalize_started.elapsed().as_millis();
+            let terminal_status_started = Instant::now();
+            let mut committed = None;
+            for attempt in 0..PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
+                match roster_client.terminal_status(&mut terminal).await {
+                    Ok(TerminalStatus::Committed(TerminalReceipt::Established(established))) => {
+                        assert_eq!(established.protected_checkpoint(), protected_checkpoint);
+                        assert_eq!(established.protected_result(), protected_result);
+                        committed = Some(established);
+                        break;
+                    }
+                    Ok(TerminalStatus::Committed(TerminalReceipt::Aborted(_)))
+                    | Ok(TerminalStatus::Compacted) => {
+                        panic!("six conclusive Applied proofs cannot recover as non-Established")
+                    }
+                    Ok(TerminalStatus::Admitted)
+                    | Err(RosterClientError::Unavailable)
+                    | Err(RosterClientError::AdmissionRecordMissing) => {
+                        if attempt + 1 < PROTECTED_ROSTER_STATUS_READBACK_ATTEMPTS {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Err(_) => {
+                        panic!("exact maximum terminal status readback rejected its bound body")
+                    }
+                }
+            }
+            let terminal_status_elapsed_millis = terminal_status_started.elapsed().as_millis();
+            if let Some(established) = committed {
+                established.into_publication()
+            } else {
+                let applied = fleet.application_sequence_observation().await;
+                let applied_deltas = applied.map(|sequence| {
+                    sequence.map(|sequence| sequence.saturating_sub(sequence_before))
+                });
+                let terminal_record_materialized = futures_util::future::join_all(
+                    fleet.stores.iter().map(|store| store.get(&key)),
+                )
+                .await
+                .iter()
+                .all(|record| matches!(record, Ok(Some(record)) if record == &expected_terminal));
+                let (decoded, decode_failures, nonempty) = fleet.append_entries_observation();
+                panic!(
+                "protected terminal remained ambiguous after bounded exact-body readback; terminalize_elapsed_millis={terminalize_elapsed_millis}; terminal_status_elapsed_millis={terminal_status_elapsed_millis}; sequence_before={sequence_before}; applied={applied:?}; applied_deltas={applied_deltas:?}; terminal_record_materialized={terminal_record_materialized}; ingress_admission_calls={}; ingress_admission_recorded_responses={}; ingress_terminal_calls={}; ingress_terminal_recorded_responses={}; ingress_terminal_response_completions={}; ingress_terminal_outcome_unknown_responses={}; ingress_terminal_not_transmitted_responses={}; ingress_terminal_rejected_responses={}; ingress_terminal_response_elapsed_millis={}; terminal_status_server={}; terminal_apply_timings={}; append_entries_decoded={decoded}; append_entries_decode_failures={decode_failures}; nonempty_append_entries_seen={nonempty}",
+                transport.roster_admission_calls.load(Ordering::SeqCst),
+                transport
+                    .roster_admission_recorded_responses
+                    .load(Ordering::SeqCst),
+                transport.roster_terminal_calls.load(Ordering::SeqCst),
+                transport
+                    .roster_terminal_recorded_responses
+                    .load(Ordering::SeqCst),
+                transport
+                    .roster_terminal_response_completions
+                    .load(Ordering::SeqCst),
+                transport
+                    .roster_terminal_outcome_unknown_responses
+                    .load(Ordering::SeqCst),
+                transport
+                    .roster_terminal_not_transmitted_responses
+                    .load(Ordering::SeqCst),
+                transport
+                    .roster_terminal_rejected_responses
+                    .load(Ordering::SeqCst),
+                transport
+                    .roster_terminal_response_elapsed_millis
+                    .load(Ordering::SeqCst),
+                protected_roster_terminal_status_response_diagnostic(transport.as_ref()),
+                protected_roster_terminal_apply_timing_diagnostic(),
+            )
+            }
+        }
+    };
+    fleet
+        .wait_all_application_sequences(sequence_before + 2)
+        .await;
+    #[cfg(feature = "test-control")]
+    {
+        let timings = protected_roster_terminal_apply_timings_for_test();
+        assert_eq!(
+            [
+                timings.decode_and_proof_count,
+                timings.terminalization_preparation_count,
+                timings.production_apply_count,
+                timings.committed_outcome_count,
+                timings.replication_notification_count,
+                timings.transaction_remainder_commit_count,
+            ],
+            [THREE_VOTER_COUNT as u64; 6],
+            "the terminal applies each fixed storage phase exactly once on every voter"
+        );
+    }
+    assert_eq!(
+        fleet.stores[leader].status().last_log_index,
+        Some(log_before + 2),
+        "terminalization is the second and final fresh-success quorum proposal",
+    );
+    assert_eq!(transport.roster_admission_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.roster_terminal_calls.load(Ordering::SeqCst), 1);
+    adapter
+        .publish(&mut publication)
+        .await
+        .expect("publication needs the exact Established receipt");
+    assert_eq!(publication_provider.status_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(publication_provider.publish_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fleet.application_sequences().await,
+        [sequence_before + 2; THREE_VOTER_COUNT],
+        "the Established-only authority read and provider-local publication cannot append a roster proposal"
+    );
+    assert_eq!(
+        fleet.stores[leader].status().last_log_index,
+        Some(log_before + 2),
+        "publication cannot append a third fresh-success quorum proposal",
+    );
+    for store in &fleet.stores {
+        assert_eq!(
+            store
+                .get(&key)
+                .await
+                .expect("replicated terminal row")
+                .as_ref(),
+            Some(&expected_terminal)
+        );
+    }
+    let plaintext = expected_terminal
+        .payload
+        .decrypt(
+            setup_provider.as_ref(),
+            &expected_terminal.key,
+            &expected_terminal.state_type,
+            expected_terminal.generation,
+            expected_terminal.fence,
+            "three-voter-protected-roster",
+        )
+        .await
+        .expect("decrypt exact established checkpoint");
+    assert_eq!(plaintext.as_slice(), terminal_plaintext.as_slice());
+
+    shutdown_client.shutdown().await;
+    server.abort_and_wait().await;
 }
 
 // The real consensus service runs all three authenticated voter transports at
