@@ -4721,6 +4721,26 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn post_accepted_bootstrap_deadline_records_one_global_timeout_terminal() {
+        const CHILD_MARKER: &str = "OPC_SESSION_NET_POST_ACCEPTED_BOOTSTRAP_METRICS_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current session-net test executable"),
+            )
+            .args([
+                "--exact",
+                "consensus::tests::post_accepted_bootstrap_deadline_records_one_global_timeout_terminal",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .expect("run isolated post-bootstrap metrics child");
+            assert!(
+                status.success(),
+                "isolated post-bootstrap metrics child passes"
+            );
+            return;
+        }
         let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
             .lock()
             .await;
