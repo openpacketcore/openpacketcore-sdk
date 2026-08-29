@@ -1788,9 +1788,11 @@ TCP, TLS, and Hello are
 performed only on establishment or re-establishment of the relevant lane, not
 on reuse.
 
-Stateless-client clones share a bounded physical-admission ceiling per clone
-lineage. V1 and V2 share exactly 16 request connections, while watch admission
-remains separately capped at 16. The respective
+Stateless-client clones share bounded physical admission per clone lineage.
+The V1 family, including protected-roster `/3`, has exactly 16 request
+connections, and ordinary V2 `/2` has an independent 16, for at most 32
+request connections in total. Watch admission remains separately capped at
+16. The respective
 permit MUST be acquired before resolve/TCP and held for the complete physical
 connection lifetime, including by a persistent client derived from that
 stateless lineage. Independently constructed stateless clients define
