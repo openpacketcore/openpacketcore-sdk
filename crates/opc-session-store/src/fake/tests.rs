@@ -87,6 +87,19 @@ fn test_record_with_state_class(
     }
 }
 
+fn protected_roster_established_create(key: SessionKey, timestamp: Timestamp) -> ReplicationOp {
+    let record = test_record(key.clone(), 1, 1, "owner-v2");
+    ReplicationOp::ProtectedRosterEstablishedCreate {
+        key,
+        record,
+        owner: OwnerId::new("owner-v2").expect("owner"),
+        fence: FenceToken::new(1),
+        credential_id: 1,
+        guard_acquired_at: timestamp,
+        guard_expires_at: timestamp,
+    }
+}
+
 async fn acquire_test_lease(
     backend: &FakeSessionBackend,
     key: &SessionKey,
@@ -228,6 +241,123 @@ async fn failed_replication_preserves_expired_internal_state_and_watchers() {
         StoreError::BackendUnavailable("divergent replication entry sequence".into())
     );
 
+    assert_eq!(backend_data_snapshot(&backend).await, before);
+    assert_no_replication_entry(&mut watch).await;
+}
+
+#[tokio::test]
+async fn protected_roster_v2_create_replication_is_rejected_without_state_change() {
+    let backend = FakeSessionBackend::new();
+    let now = backend.clock.now_utc();
+    let mut watch = backend.watch(1).await.expect("watch create rejection");
+    let before = backend_data_snapshot(&backend).await;
+    let rejected = replication_entry(
+        1,
+        "v2-create",
+        now,
+        protected_roster_established_create(test_key("t1", b"v2-create"), now),
+    );
+
+    assert_eq!(
+        backend
+            .replicate_entry(rejected)
+            .await
+            .expect_err("fake backend must reject Profile V2 create replay"),
+        StoreError::CapabilityNotSupported(
+            FakeSessionBackend::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into()
+        )
+    );
+    assert_eq!(backend_data_snapshot(&backend).await, before);
+    assert_no_replication_entry(&mut watch).await;
+}
+
+#[tokio::test]
+async fn nested_protected_roster_v2_create_replication_is_rejected_atomically() {
+    let backend = FakeSessionBackend::new();
+    let now = backend.clock.now_utc();
+    let mut watch = backend
+        .watch(1)
+        .await
+        .expect("watch nested create rejection");
+    let before = backend_data_snapshot(&backend).await;
+    let rejected = replication_entry(
+        1,
+        "nested-v2-create",
+        now,
+        ReplicationOp::Batch {
+            ops: vec![
+                ReplicationOp::DeleteFenced {
+                    key: test_key("t1", b"would-mutate-first"),
+                    owner: OwnerId::new("owner-a").expect("owner"),
+                    fence: FenceToken::new(1),
+                },
+                ReplicationOp::Batch {
+                    ops: vec![protected_roster_established_create(
+                        test_key("t1", b"nested-v2-create"),
+                        now,
+                    )],
+                },
+            ],
+        },
+    );
+
+    assert_eq!(
+        backend
+            .replicate_entry(rejected)
+            .await
+            .expect_err("fake backend must reject a nested Profile V2 create before replay"),
+        StoreError::CapabilityNotSupported(
+            FakeSessionBackend::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into()
+        )
+    );
+    assert_eq!(backend_data_snapshot(&backend).await, before);
+    assert_no_replication_entry(&mut watch).await;
+}
+
+#[tokio::test]
+async fn protected_roster_v2_create_rebuild_is_rejected_without_state_change() {
+    let backend = FakeSessionBackend::new();
+    let original_key = test_key("t1", b"rebuild-original");
+    let lease = acquire_test_lease(&backend, &original_key, "owner-a").await;
+    backend
+        .compare_and_set(cas_for_lease(original_key, &lease, None, 1))
+        .await
+        .expect("seed fake state");
+    let watch_start = backend.max_replication_sequence().await.expect("head") + 1;
+    let mut watch = backend
+        .watch(watch_start)
+        .await
+        .expect("watch rebuild rejection");
+    let before = backend_data_snapshot(&backend).await;
+    let now = backend.clock.now_utc();
+    let rejected = vec![
+        replication_entry(
+            1,
+            "rebuild-would-mutate-first",
+            now,
+            ReplicationOp::DeleteFenced {
+                key: test_key("t1", b"rebuild-would-mutate-first"),
+                owner: OwnerId::new("owner-a").expect("owner"),
+                fence: FenceToken::new(1),
+            },
+        ),
+        replication_entry(
+            2,
+            "rebuild-v2-create",
+            now,
+            protected_roster_established_create(test_key("t1", b"rebuild-v2-create"), now),
+        ),
+    ];
+
+    assert_eq!(
+        backend
+            .rebuild_replication_state(rejected)
+            .await
+            .expect_err("fake backend must reject a Profile V2 create during rebuild"),
+        StoreError::CapabilityNotSupported(
+            FakeSessionBackend::PROTECTED_ROSTER_PROFILE_V2_CAPABILITY.into()
+        )
+    );
     assert_eq!(backend_data_snapshot(&backend).await, before);
     assert_no_replication_entry(&mut watch).await;
 }

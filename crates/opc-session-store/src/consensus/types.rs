@@ -11,10 +11,12 @@ use sha2::{Digest, Sha256};
 use crate::backend::{CompareAndSet, CompareAndSetResult};
 use crate::error::StoreError;
 use crate::fenced_mutation_roster::{
-    Admission, RequestBindingKey, RequestId as RosterRequestId, RosterCompactAdmissionProvenanceV2,
-    RosterCompactTerminalEvidenceV2, RosterExecutorProofBundleV1, RosterIngressAttestationV1,
-    TerminalConflictTombstone, TerminalRecord, MAX_ADMISSION_CODEC_BYTES,
-    MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES,
+    Admission, Profile, RequestBindingKey, RequestId as RosterRequestId,
+    RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceV2,
+    RosterExecutorProofBundleV1, RosterIngressAttestationV1, RosterIngressAttestationV2,
+    RosterProfileV2CompactAdmissionProvenanceV1, RosterProfileV2CompactTerminalEvidenceV1,
+    RosterProfileV2ExecutorProofBundleV1, TerminalConflictTombstone, TerminalRecord,
+    MAX_ADMISSION_CODEC_BYTES, MAX_COMMITTED_TERMINAL_CODEC_BYTES, MAX_EXECUTOR_PROOF_BUNDLE_BYTES,
     MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES, MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES,
     MAX_ROSTER_INGRESS_ATTESTATION_BYTES, MAX_TERMINAL_CODEC_BYTES, MAX_TOMBSTONE_CODEC_BYTES,
 };
@@ -93,6 +95,40 @@ pub const SESSION_CONSENSUS_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR: &str = concat!(
     "count:u16be,ordered-full-ids:bytes56)[0..16];",
     "authorized=origin:node-id|authority:identity|box(intent)"
 );
+
+/// Append-only Postcard tags for the independent protected-roster V2 lane.
+///
+/// The frozen V1 intent and outcome discriminants end at 26 and 7
+/// respectively. These tags are deliberately documented separately from the
+/// fenced-transition V2 descriptor above: changing that descriptor would
+/// change an unrelated established profile digest.
+pub(crate) const SESSION_CONSENSUS_PROTECTED_ROSTER_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR: &str = concat!(
+    "wire-profile=1;raft-rpc-codec=postcard;durable-log-codec=serde-json;",
+    "intent-discriminants=roster-admission-v2:27|roster-terminal-v2:28|",
+    "preflight-protected-roster-v2:29|activate-protected-roster-v2:30;",
+    "outcome-discriminants=roster-admission-v2:8|roster-terminal-v2:9;",
+    "postcard=derive-serde,struct-fields-declaration-order,enum-tags=varint;",
+    "activation=schema:u16|consumer-revision:u16|scope:identity|voters:bytes32|profile:bytes32"
+);
+
+/// Frozen applied-digest encoding contract for the protected-roster V2 lane.
+///
+/// This is intentionally separate from the generic consensus V2 descriptor:
+/// the roster chain uses its own domain, magic, and direct-or-authorized
+/// envelope.  Profile V2 activation commits this exact descriptor so voters
+/// with a different durable-log interpretation fail the capability probe
+/// before an activation or roster command can be appended.
+pub(crate) const SESSION_CONSENSUS_PROTECTED_ROSTER_V2_APPLIED_DIGEST_SCHEMA_DESCRIPTOR: &str = concat!(
+    "domain=openpacketcore/session-consensus/roster-applied/v1\\0;",
+    "magic=OPC-SC-ROSTER-APPLIED\\0;encoding-version=1;",
+    "header=sequence:u64be|previous-digest:bytes32|effective-logical-time:timestamp-v2|",
+    "schema:u16be|identity:v2|request-id:bytes16|logical-time:timestamp-v2;",
+    "outer-intent-tags=direct:0|authorized:1(origin:u64be,authority:identity);",
+    "inner-operation-tags=roster-admission-v1:1|roster-terminal-v1:2|",
+    "roster-admission-v2:3|roster-terminal-v2:4;",
+    "inner-payload=exact-attempt-digest:bytes32;semantic-caps=direct-or-authorized-only,",
+    "exact-attempt-digest-only,profile-v2-tags:3|4"
+);
 const FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition-voter-set/v1\0";
 /// Domain-separated immutable protected-roster profile certificate binding.
@@ -102,6 +138,12 @@ const FENCED_TRANSITION_VOTER_SET_DIGEST_DOMAIN: &[u8] =
 /// mistaken for unanimous support of the frozen protected-roster profile.
 const PROTECTED_ROSTER_PROFILE_VOTER_SET_DIGEST_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/protected-roster-profile-voter-set/v1\0";
+/// Domain-separated binding for the absent-predecessor protected-roster
+/// profile.  This must never share a certificate digest namespace with the
+/// frozen V1 profile: both profiles can be present in the same durable
+/// protected-roster namespace.
+const PROTECTED_ROSTER_PROFILE_V2_VOTER_SET_DIGEST_DOMAIN: &[u8] =
+    b"openpacketcore/session-consensus/protected-roster-profile-voter-set/v2\0";
 const FENCED_TRANSITION_V2_BATCH_OUTER_REQUEST_ID_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/fenced-transition/v2/batch/outer-id/v1\0";
 
@@ -124,6 +166,10 @@ const ROSTER_REGISTRATION_HANDLE_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/roster-registration-handle/v1\0";
 const ROSTER_ADMISSION_SLOT_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/roster-admission-slot/v2\0";
+const MAX_PROFILE_V2_COMPACT_TERMINAL_EVIDENCE_BYTES: usize =
+    MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES
+        + MAX_ROSTER_INGRESS_ATTESTATION_BYTES
+        + MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES;
 const ROSTER_CONSENSUS_REQUEST_ID_DOMAIN: &[u8] =
     b"openpacketcore/session-consensus/roster-request-id/v1\0";
 const ROSTER_ADMISSION_PAYLOAD_DIGEST_DOMAIN: &[u8] =
@@ -162,6 +208,15 @@ pub(crate) fn fenced_transition_voter_set_digest(
     hasher.finalize().into()
 }
 
+// SQLite persistence tests deliberately consume this sealed fixture through a
+// crate-private re-export so their reopen/snapshot assertions exercise the
+// exact V2 ingress, provenance, proof, and evidence carriers above.
+#[cfg(test)]
+pub(crate) use tests::{
+    roster_v2_aborted_persistence_fixture, roster_v2_persistence_fixture,
+    RosterV2PersistenceFixture,
+};
+
 /// Bind the exact voter scope to the immutable protected-roster profile.
 ///
 /// The profile itself is static SDK configuration, so retaining this digest in
@@ -176,6 +231,24 @@ pub(crate) fn protected_roster_profile_voter_set_digest(
     hasher.update(PROTECTED_ROSTER_PROFILE_VOTER_SET_DIGEST_DOMAIN);
     hasher.update(fenced_transition_voter_set_digest(identity, voters));
     hasher.update(crate::fenced_mutation_roster::profile_digest());
+    hasher.finalize().into()
+}
+
+/// Bind the exact voter scope to the immutable absent-predecessor roster
+/// profile.
+///
+/// The V2 activation certificate retains this fixed-width scope binding and
+/// the separately persisted exact [`crate::fenced_mutation_roster::Profile`]
+/// digest.  A V1 certificate therefore cannot authorize a V2 roster command,
+/// even when its voters and configuration identity are otherwise identical.
+pub(crate) fn protected_roster_profile_v2_voter_set_digest(
+    identity: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PROTECTED_ROSTER_PROFILE_V2_VOTER_SET_DIGEST_DOMAIN);
+    hasher.update(fenced_transition_voter_set_digest(identity, voters));
+    hasher.update(crate::fenced_mutation_roster::Profile::v2().digest());
     hasher.finalize().into()
 }
 
@@ -391,7 +464,13 @@ pub(crate) fn roster_registration_handle(binding: RequestBindingKey) -> [u8; 32]
 
 fn roster_admission_slot(admission: &Admission) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(ROSTER_ADMISSION_SLOT_DOMAIN);
+    hasher.update(
+        if admission.profile() == crate::fenced_mutation_roster::Profile::v2() {
+            crate::fenced_mutation_roster::ROSTER_PROFILE_V2_ADMISSION_SLOT_DOMAIN
+        } else {
+            ROSTER_ADMISSION_SLOT_DOMAIN
+        },
+    );
     hasher.update(admission.scope().digest());
     let key = admission.key().canonical_digest_input();
     hasher.update((key.len() as u64).to_be_bytes());
@@ -680,6 +759,37 @@ impl ConsensusRosterAdmissionCommand {
         )
     }
 
+    /// Construct Profile V2's separately authenticated command carrier.  The
+    /// wire field remains the same bounded opaque capsule so V1's frozen
+    /// command shape is unchanged; only a V2 intent may later consume this
+    /// V2-domain statement.
+    pub(crate) fn new_with_provenance_and_ingress_request_id_v2(
+        admission: Admission,
+        authority: AuthorityBinding,
+        ingress_request_id: [u8; 16],
+        ingress_attestation: RosterIngressAttestationV2,
+        admission_provenance: RosterProfileV2CompactAdmissionProvenanceV1,
+    ) -> Result<Self, StoreError> {
+        if ingress_request_id == [0; 16] || ingress_attestation.request_id() != ingress_request_id {
+            return Err(roster_command_rejected());
+        }
+        Self::new_from_parts(
+            admission,
+            authority,
+            ingress_request_id,
+            BoundedRosterCapsule::new(
+                ingress_attestation
+                    .canonical_bytes()
+                    .map_err(|_| roster_command_rejected())?,
+            )?,
+            BoundedRosterCapsule::new(
+                admission_provenance
+                    .canonical_bytes()
+                    .map_err(|_| roster_command_rejected())?,
+            )?,
+        )
+    }
+
     pub(crate) fn admission(&self) -> &Admission {
         &self.admission
     }
@@ -693,11 +803,26 @@ impl ConsensusRosterAdmissionCommand {
             .map_err(|_| roster_command_rejected())
     }
 
+    pub(crate) fn ingress_attestation_v2(&self) -> Result<RosterIngressAttestationV2, StoreError> {
+        RosterIngressAttestationV2::decode_canonical(&self.ingress_attestation.0)
+            .map_err(|_| roster_command_rejected())
+    }
+
     /// Decode the exact compact admission provenance retained in this command.
     pub(crate) fn admission_provenance(
         &self,
     ) -> Result<RosterCompactAdmissionProvenanceV2, StoreError> {
         RosterCompactAdmissionProvenanceV2::decode_canonical(&self.admission_provenance.0)
+            .map_err(|_| roster_command_rejected())
+    }
+
+    /// Decode Profile V2's separately domain-bound compact provenance.  This
+    /// must never fall back to the frozen V1-ingress carrier: the opaque wire
+    /// capsule is shared solely to preserve V1 command bytes.
+    pub(crate) fn admission_provenance_v2(
+        &self,
+    ) -> Result<RosterProfileV2CompactAdmissionProvenanceV1, StoreError> {
+        RosterProfileV2CompactAdmissionProvenanceV1::decode_canonical(&self.admission_provenance.0)
             .map_err(|_| roster_command_rejected())
     }
 
@@ -776,18 +901,34 @@ impl<'de> Deserialize<'de> for ConsensusRosterAdmissionCommand {
             .authority
             .into_authority()
             .map_err(serde::de::Error::custom)?;
-        let ingress = RosterIngressAttestationV1::decode_canonical(&wire.ingress_attestation.0)
-            .map_err(serde::de::Error::custom)?;
-        let provenance =
-            RosterCompactAdmissionProvenanceV2::decode_canonical(&wire.admission_provenance.0)
+        if admission.profile() == crate::fenced_mutation_roster::Profile::v2() {
+            let ingress = RosterIngressAttestationV2::decode_canonical(&wire.ingress_attestation.0)
                 .map_err(serde::de::Error::custom)?;
-        Self::new_with_provenance_and_ingress_request_id(
-            admission,
-            authority,
-            wire.ingress_request_id,
-            ingress,
-            provenance,
-        )
+            let provenance = RosterProfileV2CompactAdmissionProvenanceV1::decode_canonical(
+                &wire.admission_provenance.0,
+            )
+            .map_err(serde::de::Error::custom)?;
+            Self::new_with_provenance_and_ingress_request_id_v2(
+                admission,
+                authority,
+                wire.ingress_request_id,
+                ingress,
+                provenance,
+            )
+        } else {
+            let ingress = RosterIngressAttestationV1::decode_canonical(&wire.ingress_attestation.0)
+                .map_err(serde::de::Error::custom)?;
+            let provenance =
+                RosterCompactAdmissionProvenanceV2::decode_canonical(&wire.admission_provenance.0)
+                    .map_err(serde::de::Error::custom)?;
+            Self::new_with_provenance_and_ingress_request_id(
+                admission,
+                authority,
+                wire.ingress_request_id,
+                ingress,
+                provenance,
+            )
+        }
         .map_err(serde::de::Error::custom)
     }
 }
@@ -1063,13 +1204,243 @@ impl<'de> Deserialize<'de> for ConsensusRosterTerminalCommand {
             .authority
             .into_authority()
             .map_err(serde::de::Error::custom)?;
+        let input = ConsensusRosterTerminalCommandInput {
+            binding: wire.binding,
+            registration_handle: wire.registration_handle,
+            registration_request_id: wire.registration_request_id,
+            registration_terminal_slot: wire.registration_terminal_slot,
+            authority,
+            record: wire.record.into_inner(),
+        };
+        let ingress = RosterIngressAttestationV1::decode_canonical(&wire.ingress_attestation.0)
+            .map_err(serde::de::Error::custom)?;
         let proof_bundle = RosterExecutorProofBundleV1::decode_canonical(&wire.proof_bundle.0)
             .map_err(serde::de::Error::custom)?;
         let terminal_evidence =
             RosterCompactTerminalEvidenceV2::decode_canonical(&wire.terminal_evidence.0)
                 .map_err(serde::de::Error::custom)?;
-        let ingress = RosterIngressAttestationV1::decode_canonical(&wire.ingress_attestation.0)
+        Self::new_with_proof_bundle_evidence_and_ingress_request_id(
+            input,
+            proof_bundle,
+            terminal_evidence,
+            wire.ingress_request_id,
+            ingress,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Profile V2's independently bounded terminal command carrier.
+///
+/// The frozen V1 terminal wire remains represented by
+/// [`ConsensusRosterTerminalCommand`].  This separate type is selected by
+/// the appended `RosterTerminalV2` intent before any carrier decoding, which
+/// prevents structurally similar `/3` and `/4` attestations from being
+/// accepted through a probe-order side channel.  Its terminal-evidence bound
+/// includes the retained V2 provenance and typed ingress envelope.
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConsensusRosterTerminalCommandV2 {
+    binding: RequestBindingKey,
+    registration_handle: [u8; 32],
+    registration_request_id: RosterRequestId,
+    registration_terminal_slot: [u8; 32],
+    authority: AuthorityBinding,
+    record: BoundedRosterCapsule<MAX_TERMINAL_CODEC_BYTES>,
+    proof_bundle: BoundedRosterCapsule<MAX_EXECUTOR_PROOF_BUNDLE_BYTES>,
+    terminal_evidence: BoundedRosterCapsule<MAX_PROFILE_V2_COMPACT_TERMINAL_EVIDENCE_BYTES>,
+    ingress_request_id: [u8; 16],
+    ingress_attestation: BoundedRosterCapsule<MAX_ROSTER_INGRESS_ATTESTATION_BYTES>,
+    digest_cache: ConsensusRosterCommandDigestCache,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ConsensusRosterTerminalWireV2 {
+    binding: RequestBindingKey,
+    registration_handle: [u8; 32],
+    registration_request_id: RosterRequestId,
+    registration_terminal_slot: [u8; 32],
+    authority: ConsensusRosterAuthorityWire,
+    record: BoundedRosterCapsule<MAX_TERMINAL_CODEC_BYTES>,
+    proof_bundle: BoundedRosterCapsule<MAX_EXECUTOR_PROOF_BUNDLE_BYTES>,
+    terminal_evidence: BoundedRosterCapsule<MAX_PROFILE_V2_COMPACT_TERMINAL_EVIDENCE_BYTES>,
+    ingress_request_id: [u8; 16],
+    ingress_attestation: BoundedRosterCapsule<MAX_ROSTER_INGRESS_ATTESTATION_BYTES>,
+}
+
+impl ConsensusRosterTerminalCommandV2 {
+    /// Construct the only V2 terminal command form from V2-only sealed
+    /// evidence.  Neither the frozen V1 proof bundle nor V1 terminal evidence
+    /// can be encoded through this constructor.
+    pub(crate) fn new_with_proof_bundle_evidence_and_ingress_request_id(
+        input: ConsensusRosterTerminalCommandInput,
+        proof_bundle: RosterProfileV2ExecutorProofBundleV1,
+        terminal_evidence: RosterProfileV2CompactTerminalEvidenceV1,
+        ingress_request_id: [u8; 16],
+        ingress_attestation: RosterIngressAttestationV2,
+    ) -> Result<Self, StoreError> {
+        let ConsensusRosterTerminalCommandInput {
+            binding,
+            registration_handle,
+            registration_request_id,
+            registration_terminal_slot,
+            authority,
+            record,
+        } = input;
+        if registration_handle == [0; 32]
+            || registration_terminal_slot == [0; 32]
+            || record.is_empty()
+            || binding.history_epoch() != registration_request_id.history_epoch()
+            || ingress_request_id == [0; 16]
+            || ingress_attestation.request_id() != ingress_request_id
+        {
+            return Err(roster_command_rejected());
+        }
+        TerminalRecord::canonical_body_commitment(&record)
+            .map_err(|_| roster_command_rejected())?;
+        let proof_bundle = BoundedRosterCapsule::new(
+            proof_bundle
+                .canonical_bytes()
+                .map_err(|_| roster_command_rejected())?,
+        )?;
+        let terminal_evidence = BoundedRosterCapsule::new(
+            terminal_evidence
+                .canonical_bytes()
+                .map_err(|_| roster_command_rejected())?,
+        )?;
+        let ingress_attestation = BoundedRosterCapsule::new(
+            ingress_attestation
+                .canonical_bytes()
+                .map_err(|_| roster_command_rejected())?,
+        )?;
+        let digest_cache = roster_terminal_digest_cache(RosterTerminalDigestCacheInput {
+            binding,
+            registration_handle,
+            registration_request_id,
+            registration_terminal_slot,
+            authority: &authority,
+            record: &record,
+            proof_bundle: &proof_bundle.0,
+            terminal_evidence: &terminal_evidence.0,
+            ingress_request_id,
+            ingress_attestation: &ingress_attestation.0,
+        })?;
+        Ok(Self {
+            binding,
+            registration_handle,
+            registration_request_id,
+            registration_terminal_slot,
+            authority,
+            record: BoundedRosterCapsule::new(record)?,
+            proof_bundle,
+            terminal_evidence,
+            ingress_request_id,
+            ingress_attestation,
+            digest_cache,
+        })
+    }
+
+    pub(crate) const fn binding(&self) -> RequestBindingKey {
+        self.binding
+    }
+
+    pub(crate) const fn registration_parts(&self) -> ([u8; 32], RosterRequestId, [u8; 32]) {
+        (
+            self.registration_handle,
+            self.registration_request_id,
+            self.registration_terminal_slot,
+        )
+    }
+
+    pub(crate) fn authority(&self) -> &AuthorityBinding {
+        &self.authority
+    }
+
+    pub(crate) fn record_bytes(&self) -> &[u8] {
+        &self.record.0
+    }
+
+    pub(crate) fn proof_bundle(&self) -> Result<RosterProfileV2ExecutorProofBundleV1, StoreError> {
+        RosterProfileV2ExecutorProofBundleV1::decode_canonical(&self.proof_bundle.0)
+            .map_err(|_| roster_command_rejected())
+    }
+
+    pub(crate) fn terminal_evidence(
+        &self,
+    ) -> Result<RosterProfileV2CompactTerminalEvidenceV1, StoreError> {
+        RosterProfileV2CompactTerminalEvidenceV1::decode_canonical(&self.terminal_evidence.0)
+            .map_err(|_| roster_command_rejected())
+    }
+
+    pub(crate) fn ingress_attestation(&self) -> Result<RosterIngressAttestationV2, StoreError> {
+        RosterIngressAttestationV2::decode_canonical(&self.ingress_attestation.0)
+            .map_err(|_| roster_command_rejected())
+    }
+
+    pub(crate) const fn ingress_request_id(&self) -> [u8; 16] {
+        self.ingress_request_id
+    }
+
+    pub(crate) fn request_id(&self) -> Result<SessionConsensusRequestId, StoreError> {
+        Ok(roster_consensus_request_id(self.terminal_slot()?))
+    }
+
+    pub(crate) fn terminal_slot(&self) -> Result<[u8; 32], StoreError> {
+        Ok(self.registration_terminal_slot)
+    }
+
+    pub(crate) fn immutable_payload_digest(&self) -> [u8; 32] {
+        self.digest_cache.immutable_payload_digest
+    }
+
+    pub(crate) fn exact_attempt_digest(&self) -> Result<[u8; 32], StoreError> {
+        Ok(self.digest_cache.exact_attempt_digest)
+    }
+
+    pub(crate) fn outcome_binding(&self) -> Result<ConsensusRosterOutcomeBinding, StoreError> {
+        ConsensusRosterOutcomeBinding::for_terminal_v2(self)
+    }
+}
+
+impl Serialize for ConsensusRosterTerminalCommandV2 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ConsensusRosterTerminalWireV2 {
+            binding: self.binding,
+            registration_handle: self.registration_handle,
+            registration_request_id: self.registration_request_id,
+            registration_terminal_slot: self.registration_terminal_slot,
+            authority: (&self.authority).into(),
+            record: self.record.clone(),
+            proof_bundle: self.proof_bundle.clone(),
+            terminal_evidence: self.terminal_evidence.clone(),
+            ingress_request_id: self.ingress_request_id,
+            ingress_attestation: self.ingress_attestation.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConsensusRosterTerminalCommandV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ConsensusRosterTerminalWireV2::deserialize(deserializer)?;
+        let authority = wire
+            .authority
+            .into_authority()
             .map_err(serde::de::Error::custom)?;
+        let ingress = RosterIngressAttestationV2::decode_canonical(&wire.ingress_attestation.0)
+            .map_err(serde::de::Error::custom)?;
+        let proof_bundle =
+            RosterProfileV2ExecutorProofBundleV1::decode_canonical(&wire.proof_bundle.0)
+                .map_err(serde::de::Error::custom)?;
+        let terminal_evidence =
+            RosterProfileV2CompactTerminalEvidenceV1::decode_canonical(&wire.terminal_evidence.0)
+                .map_err(serde::de::Error::custom)?;
         Self::new_with_proof_bundle_evidence_and_ingress_request_id(
             ConsensusRosterTerminalCommandInput {
                 binding: wire.binding,
@@ -1085,6 +1456,12 @@ impl<'de> Deserialize<'de> for ConsensusRosterTerminalCommand {
             ingress,
         )
         .map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Debug for ConsensusRosterTerminalCommandV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsensusRosterTerminalCommandV2(<redacted>)")
     }
 }
 
@@ -1124,6 +1501,16 @@ impl ConsensusRosterOutcomeBinding {
         })
     }
 
+    pub(crate) fn for_terminal_v2(
+        command: &ConsensusRosterTerminalCommandV2,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            request_id: command.request_id()?,
+            immutable_payload_digest: command.immutable_payload_digest(),
+            exact_attempt_digest: command.exact_attempt_digest()?,
+        })
+    }
+
     pub(crate) fn matches_admission(
         self,
         command: &ConsensusRosterAdmissionCommand,
@@ -1136,6 +1523,13 @@ impl ConsensusRosterOutcomeBinding {
         command: &ConsensusRosterTerminalCommand,
     ) -> Result<bool, StoreError> {
         Ok(self == Self::for_terminal(command)?)
+    }
+
+    pub(crate) fn matches_terminal_v2(
+        self,
+        command: &ConsensusRosterTerminalCommandV2,
+    ) -> Result<bool, StoreError> {
+        Ok(self == Self::for_terminal_v2(command)?)
     }
 }
 
@@ -1240,6 +1634,15 @@ pub enum ConsensusRosterTerminalOutcome {
         outcome_binding: ConsensusRosterOutcomeBinding,
         rejection: ConsensusRosterRejection,
     },
+    /// Profile-V2 compact outcome. This is appended after every frozen V1
+    /// variant so Postcard discriminants for the original outcomes do not
+    /// move. Its opaque bytes decode only as the V2 tombstone frame.
+    CompactedV2 {
+        outcome_binding: ConsensusRosterOutcomeBinding,
+        slot: [u8; 32],
+        history_epoch: u64,
+        tombstone: BoundedRosterCapsule<MAX_TOMBSTONE_CODEC_BYTES>,
+    },
 }
 
 impl ConsensusRosterTerminalOutcome {
@@ -1310,10 +1713,74 @@ impl ConsensusRosterTerminalOutcome {
         })
     }
 
+    pub(crate) fn committed_v2(
+        command: &ConsensusRosterTerminalCommandV2,
+        replayed: bool,
+        committed: &CommittedTerminal,
+        admission: &Admission,
+    ) -> Result<Self, StoreError> {
+        let committed = committed
+            .to_canonical_bytes(admission)
+            .map_err(|_| roster_command_rejected())?;
+        Ok(Self::Committed {
+            outcome_binding: command.outcome_binding()?,
+            slot: command.terminal_slot()?,
+            replayed,
+            committed: BoundedRosterCapsule::new(committed)?,
+        })
+    }
+
+    pub(crate) fn rejected_v2(
+        command: &ConsensusRosterTerminalCommandV2,
+        rejection: ConsensusRosterRejection,
+    ) -> Result<Self, StoreError> {
+        Ok(Self::Rejected {
+            outcome_binding: command.outcome_binding()?,
+            rejection,
+        })
+    }
+
+    /// Construct the separately framed V2 compact outcome. A frozen V1
+    /// tombstone cannot reach this constructor: the proof/evidence
+    /// commitments are re-derived from the exact sealed V2 terminal command
+    /// before the V2 frame is carried in the outcome.
+    pub(crate) fn compacted_v2(
+        command: &ConsensusRosterTerminalCommandV2,
+        tombstone: TerminalConflictTombstone,
+    ) -> Result<Self, StoreError> {
+        let terminal_body_commitment =
+            TerminalRecord::canonical_body_commitment(command.record_bytes())
+                .map_err(|_| roster_command_rejected())?;
+        let terminal_evidence = command.terminal_evidence()?;
+        let provenance = terminal_evidence.provenance();
+        tombstone
+            .validate_binding_for_profile(Profile::v2(), command.binding())
+            .map_err(|_| roster_command_rejected())?;
+        tombstone
+            .validate_profile_v2_compact_terminal_evidence(&terminal_evidence)
+            .map_err(|_| roster_command_rejected())?;
+        if tombstone.terminal_body_commitment() != terminal_body_commitment
+            || tombstone.admission_body_commitment() != provenance.input().admission_commitment
+        {
+            return Err(roster_command_rejected());
+        }
+        let tombstone = BoundedRosterCapsule::new(
+            tombstone
+                .to_canonical_bytes()
+                .map_err(|_| roster_command_rejected())?,
+        )?;
+        Ok(Self::CompactedV2 {
+            outcome_binding: command.outcome_binding()?,
+            slot: command.terminal_slot()?,
+            history_epoch: command.binding().history_epoch(),
+            tombstone,
+        })
+    }
+
     pub(crate) fn committed_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Committed { committed, .. } => Some(&committed.0),
-            Self::Compacted { .. } | Self::Rejected { .. } => None,
+            Self::Compacted { .. } | Self::Rejected { .. } | Self::CompactedV2 { .. } => None,
         }
     }
 
@@ -1330,7 +1797,27 @@ impl ConsensusRosterTerminalOutcome {
                 TerminalConflictTombstone::from_canonical_bytes(&tombstone.0)
                     .map_err(|_| roster_command_rejected())?,
             ))),
-            Self::Committed { .. } | Self::Rejected { .. } => Ok(None),
+            Self::Committed { .. } | Self::Rejected { .. } | Self::CompactedV2 { .. } => Ok(None),
+        }
+    }
+
+    /// Decode the V2-only compact retention projection. The V1 compacted
+    /// outcome intentionally returns `None` rather than attempting a
+    /// structurally ambiguous V2 decode.
+    pub(crate) fn compacted_v2_parts(
+        &self,
+    ) -> Result<Option<(u64, TerminalConflictTombstone)>, StoreError> {
+        match self {
+            Self::CompactedV2 {
+                history_epoch,
+                tombstone,
+                ..
+            } => Ok(Some((
+                *history_epoch,
+                TerminalConflictTombstone::from_canonical_bytes(&tombstone.0)
+                    .map_err(|_| roster_command_rejected())?,
+            ))),
+            Self::Committed { .. } | Self::Compacted { .. } | Self::Rejected { .. } => Ok(None),
         }
     }
 
@@ -1354,6 +1841,7 @@ pub enum ConsensusRosterRejection {
     AggregateBytesFull,
     LiveFull,
     HistoryFull,
+    RecordAlreadyExists,
 }
 
 impl fmt::Debug for ConsensusRosterAdmissionOutcome {
@@ -1611,6 +2099,43 @@ pub enum SessionMutationIntent {
     /// frozen profile; it must never reach the replicated log directly.
     #[doc(hidden)]
     PreflightProtectedRosterProfile,
+    /// SDK-internal atomic immutable absent-predecessor protected-roster
+    /// admission.  This is deliberately disjoint from [`Self::RosterAdmission`]
+    /// so every replica can require the V2 activation certificate before the
+    /// roster's first business reservation is considered.
+    #[doc(hidden)]
+    RosterAdmissionV2(Box<ConsensusRosterAdmissionCommand>),
+    /// SDK-internal atomic absent-predecessor protected-roster
+    /// terminalization.  This remains the second and only other roster
+    /// business mutation; capability activation is a separate reusable
+    /// deployment-time command.
+    #[doc(hidden)]
+    RosterTerminalV2(Box<ConsensusRosterTerminalCommandV2>),
+    /// SDK-internal unanimous exact-profile proof for the
+    /// absent-predecessor protected-roster contract. It must never reach the
+    /// replicated log directly.
+    #[doc(hidden)]
+    PreflightProtectedRosterProfileV2,
+    /// SDK-internal exact-scope activation certificate for Profile V2.
+    ///
+    /// Unlike V1, this uses a dedicated durable certificate table. The
+    /// `profile_digest` remains explicit in the command and table so an
+    /// equal voter scope under a different profile cannot be replayed as V2.
+    #[doc(hidden)]
+    ActivateProtectedRosterProfileV2 {
+        /// Exact Profile V2 schema, held explicitly rather than inferred from
+        /// a digest so a future descriptor cannot reuse this command shape.
+        schema_version: u16,
+        /// Exact Profile V2 consumer revision admitted by every voter.
+        consumer_revision: u16,
+        /// Exact authority scope observed during unanimous V2 proof.
+        scope_identity: SessionConsensusIdentity,
+        /// Canonical digest of the exact voter IDs in that scope and V2
+        /// profile domain.
+        voter_set_digest: [u8; 32],
+        /// Digest of [`crate::fenced_mutation_roster::Profile::v2`].
+        profile_digest: [u8; 32],
+    },
 }
 
 impl fmt::Debug for SessionMutationIntent {
@@ -1738,11 +2263,19 @@ impl SessionConsensusCommand {
 
 impl SessionMutationIntent {
     fn contains_roster_command(&self) -> bool {
-        matches!(self, Self::RosterAdmission(_) | Self::RosterTerminal(_))
-            || matches!(self, Self::Authorized { mutation, .. } if matches!(
-                mutation.as_ref(),
-                Self::RosterAdmission(_) | Self::RosterTerminal(_)
-            ))
+        matches!(
+            self,
+            Self::RosterAdmission(_)
+                | Self::RosterTerminal(_)
+                | Self::RosterAdmissionV2(_)
+                | Self::RosterTerminalV2(_)
+        ) || matches!(self, Self::Authorized { mutation, .. } if matches!(
+            mutation.as_ref(),
+            Self::RosterAdmission(_)
+                | Self::RosterTerminal(_)
+                | Self::RosterAdmissionV2(_)
+                | Self::RosterTerminalV2(_)
+        ))
     }
 
     fn contains_fenced_transition_v2(&self) -> bool {
@@ -1961,6 +2494,14 @@ fn append_roster_applied_intent(
             out.push(0);
             append_roster_applied_inner(out, 2, command.exact_attempt_digest()?);
         }
+        SessionMutationIntent::RosterAdmissionV2(command) => {
+            out.push(0);
+            append_roster_applied_inner(out, 3, command.exact_attempt_digest()?);
+        }
+        SessionMutationIntent::RosterTerminalV2(command) => {
+            out.push(0);
+            append_roster_applied_inner(out, 4, command.exact_attempt_digest()?);
+        }
         SessionMutationIntent::Authorized {
             origin,
             authority_identity,
@@ -1975,6 +2516,12 @@ fn append_roster_applied_intent(
                 }
                 SessionMutationIntent::RosterTerminal(command) => {
                     append_roster_applied_inner(out, 2, command.exact_attempt_digest()?);
+                }
+                SessionMutationIntent::RosterAdmissionV2(command) => {
+                    append_roster_applied_inner(out, 3, command.exact_attempt_digest()?);
+                }
+                SessionMutationIntent::RosterTerminalV2(command) => {
+                    append_roster_applied_inner(out, 4, command.exact_attempt_digest()?);
                 }
                 _ => {
                     return Err(StoreError::Serialization(
@@ -2026,6 +2573,13 @@ pub enum SessionMutationOutcome {
     /// Compact outcome of one atomic protected-roster terminalization.
     #[doc(hidden)]
     RosterTerminal(ConsensusRosterTerminalOutcome),
+    /// Compact outcome of one Profile V2 protected-roster admission.  This
+    /// distinct wire tag prevents a V2 result from being replayed as V1.
+    #[doc(hidden)]
+    RosterAdmissionV2(ConsensusRosterAdmissionOutcome),
+    /// Compact outcome of one Profile V2 protected-roster terminalization.
+    #[doc(hidden)]
+    RosterTerminalV2(ConsensusRosterTerminalOutcome),
 }
 
 impl fmt::Debug for SessionMutationOutcome {
@@ -2108,13 +2662,17 @@ impl<T> SessionConsensusRpc<T> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde::de::DeserializeOwned;
     use serde::{Deserialize, Serialize};
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
     use bytes::Bytes;
+    use opc_crypto::CryptoEnvelopeV1;
+    use opc_key::{
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+    };
     use opc_types::{NetworkFunctionKind, TenantId};
     use p256::ecdsa::signature::hazmat::PrehashSigner;
     use p256::ecdsa::SigningKey;
@@ -2128,6 +2686,10 @@ mod tests {
         RosterCompactTerminalEvidenceV2, RosterCompactTerminalMemberProjectionV2,
         RosterCompactTerminalMemberProofPartsV2, RosterCompactTerminalMemberSigningInputV2,
         RosterExecutorMemberProofPartsV1, RosterId, RosterIngressAttestationSigningInputV1,
+        RosterIngressAttestationSigningInputV2, RosterIngressAttestationV2,
+        RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
+        RosterProfileV2CompactAdmissionProvenanceV1, RosterProfileV2CompactTerminalEvidenceV1,
+        RosterProfileV2ExecutorProofBundleV1, RosterProfileV2TerminalAttestationSigningInputV1,
         RosterProviderOperationV1, RosterProviderOutcomeV1, Scope, TerminalRecord,
         FRESH_ROSTER_MEMBERS,
     };
@@ -2752,7 +3314,7 @@ mod tests {
                 registration_handle,
                 registration_request_id,
                 registration_terminal_slot: *registration_terminal_slot.as_bytes(),
-                authority,
+                authority: authority.clone(),
                 record: terminal
                     .to_canonical_bytes(admission)
                     .expect("terminal bytes"),
@@ -2774,6 +3336,405 @@ mod tests {
             roster_test_proof_bundle(admission),
         )
         .expect("terminal command")
+    }
+
+    /// A fully sealed `/4` fixture shared by persistence tests.  It remains
+    /// `cfg(test)` so it cannot become a production command-construction
+    /// path; its role is to make reopen and snapshot tests exercise the exact
+    /// V2 ingress, provenance, proof, and evidence carriers.
+    pub(crate) struct RosterV2PersistenceFixture {
+        pub(crate) identity: SessionConsensusIdentity,
+        pub(crate) root: RosterAttestationTrustRootV1,
+        pub(crate) admission: Admission,
+        pub(crate) authority: AuthorityBinding,
+        pub(crate) admission_ingress: RosterIngressAttestationV2,
+        pub(crate) admission_provenance: RosterProfileV2CompactAdmissionProvenanceV1,
+        pub(crate) terminal_command: ConsensusRosterTerminalCommandV2,
+    }
+
+    // This intentionally creates an independently sealed `/4` command for
+    // the frozen wire-discriminant test below.  Reusing the V1 fixture there
+    // would hide the exact type boundary that production routing relies on.
+    fn roster_v2_terminal_command_for_wire_tag() -> ConsensusRosterTerminalCommandV2 {
+        roster_v2_persistence_fixture().terminal_command
+    }
+
+    pub(crate) fn roster_v2_persistence_fixture() -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_for_phase(Phase::Established)
+    }
+
+    /// An independently sealed V2 aborted terminal fixture.  This exercises
+    /// the same ingress/provenance and compact proof path as the Established
+    /// fixture while retaining the phase-appropriate Reconcile outcome.
+    pub(crate) fn roster_v2_aborted_persistence_fixture() -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_for_phase(Phase::Aborted)
+    }
+
+    fn roster_v2_persistence_fixture_for_phase(phase: Phase) -> RosterV2PersistenceFixture {
+        let key = SessionKey {
+            tenant: TenantId::from_static("v2-wire-tag-tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: StableId::new(Bytes::from_static(b"v2-wire-tag-key")).expect("V2 stable ID"),
+        };
+        let owner = OwnerId::new("v2-wire-tag-owner").expect("V2 owner");
+        let fence = FenceToken::new(9);
+        let state_type = StateType::from_static("v2-wire-tag");
+        let envelope_key_id = KeyId::new("v2-wire-tag-envelope").expect("V2 envelope key ID");
+        let session_key_digest = crate::hex::encode_lower(&key.digest());
+        let aad = EnvelopeAad::session(
+            key.tenant.clone(),
+            1,
+            SessionAad::new(
+                key.nf_kind.as_str(),
+                session_key_digest,
+                state_type.as_str(),
+                Generation::new(1).get(),
+                fence.get(),
+                "v2-wire-tag-backend",
+            )
+            .expect("V2 envelope AAD"),
+        );
+        let checkpoint = CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: envelope_key_id.clone(),
+            nonce: vec![0x92; 12],
+            aad: serialize_bound_aad(&aad, &envelope_key_id).expect("V2 bound AAD"),
+            ciphertext_and_tag: vec![0x93; AEAD_TAG_LEN],
+        }
+        .encode()
+        .expect("V2 terminal checkpoint envelope");
+        let proposal = AdmissionProposal::new(
+            Profile::v2(),
+            RosterId::from_bytes([0x91; 16]).expect("V2 roster ID"),
+            (0..FRESH_ROSTER_MEMBERS)
+                .map(|ordinal| {
+                    Member::new(
+                        ordinal as u8,
+                        MemberOperationId::from_bytes([ordinal as u8 + 0x31; 16])
+                            .expect("V2 member operation ID"),
+                        vec![ordinal as u8 + 1],
+                        1,
+                    )
+                    .expect("V2 member")
+                })
+                .collect(),
+            EstablishedMutation::create_checkpoint(state_type),
+            vec![0x92],
+            checkpoint,
+            vec![0x94],
+        )
+        .expect("V2 proposal");
+        let admission = Admission::authenticate(
+            proposal,
+            key,
+            Scope::from_digest([0x95; 32]),
+            owner,
+            fence,
+            Generation::new(1),
+        )
+        .expect("V2 admission");
+        let authority = roster_digest_authority(&admission, 10, 1, 61);
+        let root_key = SigningKey::from_bytes((&[0x96; 32]).into()).expect("V2 root key");
+        let ingress_key = SigningKey::from_bytes((&[0x97; 32]).into()).expect("V2 ingress key");
+        let executor_key = SigningKey::from_bytes((&[0x98; 32]).into()).expect("V2 executor key");
+        let root =
+            RosterAttestationTrustRootV1::new([0x99; 32], compressed_key(root_key.verifying_key()))
+                .expect("V2 trust root");
+        let ingress_input = RosterIngressAttestationSigningInputV2 {
+            peer_identity_commitment: [0x9a; 32],
+            consumer_scope: admission.scope().digest(),
+            request_id: [0x9b; 16],
+            operation_tag: 1,
+            canonical_capsule_digest:
+                crate::fenced_mutation_roster_transport::roster_poll_admit_ingress_capsule_commitment_v2(
+                    &admission,
+                    &authority,
+                )
+                .expect("V2 admission capsule"),
+            authenticated_at: legacy_time(2),
+            peer_certificate_expires_at: legacy_time(61),
+            material_generation: 1,
+            handshake_epoch: 1,
+        };
+        let ingress_certificate = roster_test_certificate(
+            &root,
+            &root_key,
+            RosterTestCertificateInput {
+                role: RosterAttestationCertificateRoleV1::TransportIngress,
+                identity: legacy_identity(),
+                scope: admission.scope().digest(),
+                subject_identity_commitment: ingress_input.peer_identity_commitment,
+                key_id: [0x9d; 32],
+                public_key: ingress_key.verifying_key(),
+            },
+        );
+        let admission_ingress = RosterIngressAttestationV2::issue_from_signed_parts(
+            &root,
+            ingress_certificate.clone(),
+            &ingress_input,
+            sign_digest(
+                &ingress_key,
+                ingress_input.digest().expect("V2 admission ingress digest"),
+            ),
+        )
+        .expect("V2 admission ingress");
+        let provenance_input =
+            RosterProfileV2CompactAdmissionProvenanceSigningInputV1::for_admission(
+                legacy_identity(),
+                &admission,
+                &authority,
+                &admission_ingress,
+                ingress_input.peer_identity_commitment,
+            )
+            .expect("V2 provenance input");
+        let provenance = RosterProfileV2CompactAdmissionProvenanceV1::issue_from_signed_parts(
+            &root,
+            ingress_certificate,
+            &provenance_input,
+            sign_digest(
+                &ingress_key,
+                provenance_input.digest().expect("V2 provenance digest"),
+            ),
+        )
+        .expect("V2 provenance");
+
+        let binding = admission.binding_key(1).expect("V2 binding");
+        let registration_request_id = RequestId::bind(1, &admission).expect("V2 request ID");
+        let registration = BackendRegistration::from_consensus_parts(
+            roster_registration_handle(binding),
+            registration_request_id,
+            &admission,
+        )
+        .expect("V2 registration");
+        let (registration_handle, registration_request_id, registration_terminal_slot) =
+            registration.consensus_parts();
+        let evidence = vec![0x9f];
+        let (provider_operation, provider_outcome) = match phase {
+            Phase::Established => (
+                RosterProviderOperationV1::Execute,
+                RosterProviderOutcomeV1::AppliedExecuted,
+            ),
+            Phase::Aborted => (
+                RosterProviderOperationV1::Reconcile,
+                RosterProviderOutcomeV1::NotAppliedReconciled,
+            ),
+        };
+        let terminal = TerminalRecord::new(
+            &admission,
+            registration_request_id,
+            phase,
+            admission
+                .members()
+                .iter()
+                .map(|member| {
+                    crate::fenced_mutation_roster::stable_terminal_proof_commitment(
+                        binding,
+                        registration,
+                        &admission,
+                        phase,
+                        member,
+                        provider_outcome,
+                        crate::fenced_mutation_roster::roster_executor_evidence_commitment(
+                            &evidence,
+                        ),
+                    )
+                    .expect("V2 terminal proof commitment")
+                })
+                .collect(),
+        )
+        .expect("V2 terminal record");
+        let input_for = |member: &Member| RosterProfileV2TerminalAttestationSigningInputV1 {
+            profile: Profile::v2(),
+            configuration_identity: legacy_identity(),
+            certificate_subject_identity_commitment: [0xa3; 32],
+            certificate_role: RosterAttestationCertificateRoleV1::Executor,
+            admission_provenance_commitment: provenance
+                .commitment()
+                .expect("V2 provenance commitment"),
+            binding: binding.to_bytes(),
+            registration_handle,
+            registration_request_id: registration_request_id.to_bytes(),
+            registration_terminal_slot: *registration_terminal_slot.as_bytes(),
+            roster_id: *admission.roster_id().as_bytes(),
+            admission_commitment: admission.body_commitment(),
+            terminal_phase: phase,
+            terminal_body_commitment: terminal.body_commitment(),
+            ordinal: member.ordinal(),
+            member_operation_id: *member.operation_id().as_bytes(),
+            descriptor: member.descriptor().to_vec(),
+            descriptor_commitment: member.descriptor_commitment(),
+            expected_member_version: member.expected_version(),
+            admission_generation: admission.expected_generation().get(),
+            authority_scope: authority.scope().digest(),
+            authority_ingress_scope: authority.ingress_scope().digest(),
+            authority_key_canonical: authority.key().canonical_digest_input(),
+            authority_owner: authority.owner().as_str().as_bytes().to_vec(),
+            authority_fence: authority.fence().get(),
+            authority_credential_id: authority.credential_id(),
+            authority_generation: authority.generation().get(),
+            authority_acquired_at: authority.acquired_at(),
+            authority_expires_at: authority.expires_at(),
+            proof_epoch: 1,
+            provider_operation,
+            outcome: provider_outcome,
+            evidence: evidence.clone(),
+        };
+        let first_input = input_for(&admission.members()[0]);
+        let compact_binding = RosterCompactTerminalEvidenceBindingV2::from_terminal_v2_input(
+            &provenance,
+            admission.terminal_checkpoint(),
+            admission.terminal_result(),
+            &first_input,
+        )
+        .expect("V2 compact binding");
+        let compact_proofs = admission
+            .members()
+            .iter()
+            .zip(terminal.proof_commitments())
+            .map(|(member, stable_proof_commitment)| {
+                let input = input_for(member);
+                let projection = RosterCompactTerminalMemberProjectionV2::from_terminal_v2_input(
+                    &input,
+                    *stable_proof_commitment,
+                )
+                .expect("V2 compact projection");
+                let provider_certificate = roster_test_certificate(
+                    &root,
+                    &root_key,
+                    RosterTestCertificateInput {
+                        role: RosterAttestationCertificateRoleV1::Provider,
+                        identity: legacy_identity(),
+                        scope: authority.ingress_scope().digest(),
+                        subject_identity_commitment: [0xa4; 32],
+                        key_id: [0xa5; 32],
+                        public_key: executor_key.verifying_key(),
+                    },
+                );
+                let provider = RosterAttestationLeafCertificateV1::issue_from_signed_parts(
+                    &root,
+                    provider_certificate.clone(),
+                )
+                .expect("V2 provider certificate");
+                RosterCompactTerminalMemberProofPartsV2 {
+                    provider_signature: sign_digest(
+                        &executor_key,
+                        crate::fenced_mutation_roster::provider_receipt_compact_digest(
+                            &compact_binding,
+                            &projection,
+                            &provider,
+                        )
+                        .expect("V2 provider receipt digest"),
+                    ),
+                    provider_certificate,
+                    signature: sign_digest(
+                        &executor_key,
+                        RosterCompactTerminalMemberSigningInputV2 {
+                            binding: compact_binding.clone(),
+                            member: projection.clone(),
+                        }
+                        .digest()
+                        .expect("V2 compact member digest"),
+                    ),
+                    member: projection,
+                }
+            })
+            .collect();
+        let compact_evidence = RosterCompactTerminalEvidenceV2::issue_from_signed_parts(
+            &root,
+            roster_test_certificate(
+                &root,
+                &root_key,
+                RosterTestCertificateInput {
+                    role: RosterAttestationCertificateRoleV1::Executor,
+                    identity: legacy_identity(),
+                    scope: authority.ingress_scope().digest(),
+                    subject_identity_commitment: [0xa3; 32],
+                    key_id: [0xa6; 32],
+                    public_key: executor_key.verifying_key(),
+                },
+            ),
+            &compact_binding,
+            compact_proofs,
+        )
+        .expect("V2 compact evidence");
+        let terminal_ingress_input = RosterIngressAttestationSigningInputV2 {
+            operation_tag: 4,
+            canonical_capsule_digest:
+                crate::fenced_mutation_roster_transport::roster_terminal_ingress_capsule_commitment_v2(
+                    binding,
+                    registration,
+                    &authority,
+                    &terminal,
+                    &admission,
+                    &provenance,
+                    &compact_evidence,
+                )
+                .expect("V2 terminal capsule"),
+            request_id: [0xa1; 16],
+            ..ingress_input
+        };
+        let terminal_ingress = RosterIngressAttestationV2::issue_from_signed_parts(
+            &root,
+            roster_test_certificate(
+                &root,
+                &root_key,
+                RosterTestCertificateInput {
+                    role: RosterAttestationCertificateRoleV1::TransportIngress,
+                    identity: legacy_identity(),
+                    scope: admission.scope().digest(),
+                    subject_identity_commitment: terminal_ingress_input.peer_identity_commitment,
+                    key_id: [0xa2; 32],
+                    public_key: ingress_key.verifying_key(),
+                },
+            ),
+            &terminal_ingress_input,
+            sign_digest(
+                &ingress_key,
+                terminal_ingress_input
+                    .digest()
+                    .expect("V2 terminal ingress digest"),
+            ),
+        )
+        .expect("V2 terminal ingress");
+        let terminal_evidence = RosterProfileV2CompactTerminalEvidenceV1::from_verified(
+            provenance.clone(),
+            terminal_ingress.clone(),
+            compact_evidence,
+        )
+        .expect("V2 terminal evidence");
+        let proof_bundle = RosterProfileV2ExecutorProofBundleV1::from_verified(
+            &provenance,
+            &terminal_ingress,
+            terminal_evidence.clone(),
+        )
+        .expect("V2 proof bundle");
+        let terminal_command = ConsensusRosterTerminalCommandV2::new_with_proof_bundle_evidence_and_ingress_request_id(
+            ConsensusRosterTerminalCommandInput {
+                binding,
+                registration_handle,
+                registration_request_id,
+                registration_terminal_slot: *registration_terminal_slot.as_bytes(),
+                authority: authority.clone(),
+                record: terminal
+                    .to_canonical_bytes(&admission)
+                    .expect("V2 terminal bytes"),
+            },
+            proof_bundle,
+            terminal_evidence,
+            terminal_ingress_input.request_id,
+            terminal_ingress,
+        )
+        .expect("V2 terminal command");
+        RosterV2PersistenceFixture {
+            identity: legacy_identity(),
+            root,
+            admission,
+            authority,
+            admission_ingress,
+            admission_provenance: provenance,
+            terminal_command,
+        }
     }
 
     fn legacy_identity() -> SessionConsensusIdentity {
@@ -4120,12 +5081,16 @@ mod tests {
                 record,
             },
         );
+        let terminal_command_v2 = roster_v2_terminal_command_for_wire_tag();
         let admission_outcome_binding = admission_command
             .outcome_binding()
             .expect("admission outcome binding");
         let terminal_outcome_binding = terminal_command
             .outcome_binding()
             .expect("terminal outcome binding");
+        let terminal_outcome_binding_v2 = terminal_command_v2
+            .outcome_binding()
+            .expect("V2 terminal outcome binding");
 
         assert_eq!(
             postcard::to_allocvec(&SessionMutationIntent::PreflightFencedTransitionCapability)
@@ -4143,14 +5108,14 @@ mod tests {
         );
         assert_eq!(
             postcard::to_allocvec(&SessionMutationIntent::RosterAdmission(Box::new(
-                admission_command
+                admission_command.clone()
             )))
             .expect("admission intent")[0],
             24
         );
         assert_eq!(
             postcard::to_allocvec(&SessionMutationIntent::RosterTerminal(Box::new(
-                terminal_command
+                terminal_command.clone()
             )))
             .expect("terminal intent")[0],
             25
@@ -4159,6 +5124,36 @@ mod tests {
             postcard::to_allocvec(&SessionMutationIntent::PreflightProtectedRosterProfile)
                 .expect("protected roster profile preflight intent")[0],
             26
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationIntent::RosterAdmissionV2(Box::new(
+                admission_command.clone()
+            )))
+            .expect("V2 admission intent")[0],
+            27
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationIntent::RosterTerminalV2(Box::new(
+                terminal_command_v2.clone()
+            )))
+            .expect("V2 terminal intent")[0],
+            28
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationIntent::PreflightProtectedRosterProfileV2)
+                .expect("V2 protected roster profile preflight intent")[0],
+            29
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationIntent::ActivateProtectedRosterProfileV2 {
+                schema_version: Profile::v2().schema(),
+                consumer_revision: Profile::v2().consumer_revision(),
+                scope_identity: legacy_identity(),
+                voter_set_digest: [0x83; 32],
+                profile_digest: Profile::v2().digest(),
+            })
+            .expect("V2 protected roster profile activation intent")[0],
+            30
         );
         assert_eq!(
             postcard::to_allocvec(&SessionMutationOutcome::FencedTransition(
@@ -4192,6 +5187,71 @@ mod tests {
             ))
             .expect("terminal outcome")[0],
             7
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationOutcome::RosterAdmissionV2(
+                ConsensusRosterAdmissionOutcome::Rejected {
+                    outcome_binding: admission_outcome_binding,
+                    rejection: ConsensusRosterRejection::Authority,
+                }
+            ))
+            .expect("V2 admission outcome")[0],
+            8
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SessionMutationOutcome::RosterTerminalV2(
+                ConsensusRosterTerminalOutcome::Rejected {
+                    outcome_binding: terminal_outcome_binding_v2,
+                    rejection: ConsensusRosterRejection::Authority,
+                }
+            ))
+            .expect("V2 terminal outcome")[0],
+            9
+        );
+
+        // `ConsensusRosterTerminalOutcome` is itself durable Postcard input
+        // under both outer terminal outcomes. Keep the frozen V1 tags and
+        // prove the V2 compact projection was appended after them rather
+        // than retagging a V1 compact terminal receipt.
+        assert_eq!(
+            postcard::to_allocvec(&ConsensusRosterTerminalOutcome::Committed {
+                outcome_binding: terminal_outcome_binding,
+                slot: terminal_command.terminal_slot().expect("terminal slot"),
+                replayed: false,
+                committed: BoundedRosterCapsule::new(vec![0x91]).expect("committed capsule"),
+            })
+            .expect("V1 committed terminal outcome")[0],
+            0
+        );
+        assert_eq!(
+            postcard::to_allocvec(&ConsensusRosterTerminalOutcome::Compacted {
+                outcome_binding: terminal_outcome_binding,
+                slot: terminal_command.terminal_slot().expect("terminal slot"),
+                history_epoch: 9,
+                tombstone: BoundedRosterCapsule::new(vec![0x92]).expect("V1 tombstone capsule"),
+            })
+            .expect("V1 compacted terminal outcome")[0],
+            1
+        );
+        assert_eq!(
+            postcard::to_allocvec(&ConsensusRosterTerminalOutcome::Rejected {
+                outcome_binding: terminal_outcome_binding,
+                rejection: ConsensusRosterRejection::Authority,
+            })
+            .expect("V1 rejected terminal outcome")[0],
+            2
+        );
+        assert_eq!(
+            postcard::to_allocvec(&ConsensusRosterTerminalOutcome::CompactedV2 {
+                outcome_binding: terminal_outcome_binding_v2,
+                slot: terminal_command_v2
+                    .terminal_slot()
+                    .expect("V2 terminal slot"),
+                history_epoch: 9,
+                tombstone: BoundedRosterCapsule::new(vec![0x93]).expect("V2 tombstone capsule"),
+            })
+            .expect("V2 compacted terminal outcome")[0],
+            3
         );
     }
 

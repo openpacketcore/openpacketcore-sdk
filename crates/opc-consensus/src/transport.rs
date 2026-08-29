@@ -24,8 +24,19 @@ const PROTECTED_ROSTER_ADMISSION_COMPACT_PROVENANCE_BYTES: usize = 2_048;
 const PROTECTED_ROSTER_ADMISSION_AUTHORITY_COMMAND_WRAPPER_BYTES: usize = 4_096;
 
 const PROTECTED_ROSTER_TERMINAL_CODEC_BYTES: usize = 1_065_423;
-const PROTECTED_ROSTER_TERMINAL_PROOF_BUNDLE_BYTES: usize = 36_864;
-const PROTECTED_ROSTER_TERMINAL_COMPACT_EVIDENCE_BYTES: usize = 4_096;
+/// Maximum canonical Profile-V2 executor proof bundle accepted in a
+/// protected-roster consensus command.
+///
+/// This is sourced from the public roster profile bound. Keeping it public
+/// permits the session-store profile to assert that consensus never rejects a
+/// profile-valid command before its deterministic validation path.
+pub const CONSENSUS_PROTECTED_ROSTER_TERMINAL_PROOF_BUNDLE_BYTES: usize = 40_960;
+/// Maximum canonical Profile-V2 compact terminal evidence accepted in a
+/// protected-roster consensus command.
+///
+/// This is sourced from the public roster profile bound; it is intentionally
+/// not a separate transport-only limit.
+pub const CONSENSUS_PROTECTED_ROSTER_TERMINAL_COMPACT_EVIDENCE_BYTES: usize = 8_192;
 const PROTECTED_ROSTER_TERMINAL_INGRESS_BYTES: usize = 1_024;
 const PROTECTED_ROSTER_TERMINAL_BINDING_COMMAND_WRAPPER_BYTES: usize = 4_096;
 
@@ -54,9 +65,9 @@ const PROTECTED_ROSTER_TERMINAL_COMMAND_BYTES: usize = protected_roster_checked_
         protected_roster_checked_add(
             protected_roster_checked_add(
                 PROTECTED_ROSTER_TERMINAL_CODEC_BYTES,
-                PROTECTED_ROSTER_TERMINAL_PROOF_BUNDLE_BYTES,
+                CONSENSUS_PROTECTED_ROSTER_TERMINAL_PROOF_BUNDLE_BYTES,
             ),
-            PROTECTED_ROSTER_TERMINAL_COMPACT_EVIDENCE_BYTES,
+            CONSENSUS_PROTECTED_ROSTER_TERMINAL_COMPACT_EVIDENCE_BYTES,
         ),
         PROTECTED_ROSTER_TERMINAL_INGRESS_BYTES,
     ),
@@ -85,7 +96,7 @@ pub const CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES: usize = protected_roster_check
 
 const _: () = {
     assert!(PROTECTED_ROSTER_ADMISSION_COMMAND_BYTES == 2_252_826);
-    assert!(PROTECTED_ROSTER_TERMINAL_COMMAND_BYTES == 1_111_503);
+    assert!(PROTECTED_ROSTER_TERMINAL_COMMAND_BYTES == 1_119_695);
     assert!(CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES == 2_253_338);
 };
 

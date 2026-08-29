@@ -90,6 +90,16 @@ pub const SESSION_CONSUMER_ROSTER_ALPN: &[u8] = b"opc-session-consumer/3";
 /// Wire revision required by [`SESSION_CONSUMER_ROSTER_ALPN`].
 pub const SESSION_CONSUMER_ROSTER_TRANSPORT_REVISION: u16 = 5;
 
+/// ALPN selected only by the additive V2 protected-roster capability.
+///
+/// This deliberately differs from [`SESSION_CONSUMER_ROSTER_ALPN`], so a
+/// V1 peer cannot interpret an absent-predecessor operation as a V1 roster
+/// operation before the exact Hello profile is checked.
+pub const SESSION_CONSUMER_ROSTER_V2_ALPN: &[u8] = b"opc-session-consumer/4";
+
+/// Wire revision required by [`SESSION_CONSUMER_ROSTER_V2_ALPN`].
+pub const SESSION_CONSUMER_ROSTER_V2_TRANSPORT_REVISION: u16 = 6;
+
 /// Largest byte-exact canonical admission capsule accepted by the consumer
 /// boundary. One admission remains one quorum mutation.
 pub const MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES: usize =
@@ -100,6 +110,12 @@ pub const MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES: usize =
 pub const MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES: usize =
     crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES;
 
+/// Largest byte-exact `/4` terminal capsule accepted by the consumer
+/// boundary. Unlike `/3`, this contains retained V2 provenance plus generic
+/// compact terminal evidence and never a V1 executor bundle.
+pub const MAX_SESSION_CONSUMER_ROSTER_V2_TERMINAL_CAPSULE_BYTES: usize =
+    crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_V2_TERMINAL_CAPSULE_BYTES;
+
 /// Largest authenticated consumer JSON frame accepted for a complete
 /// protected-roster admission capsule and its consumer envelope.
 pub const MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES: usize =
@@ -109,6 +125,11 @@ pub const MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES: usize =
 /// protected-roster terminal capsule and its consumer envelope.
 pub const MAX_SESSION_CONSUMER_ROSTER_TERMINAL_FRAME_BYTES: usize =
     MAX_SESSION_CONSUMER_ROSTER_TERMINAL_CAPSULE_BYTES * 4 + 4 * 1024;
+
+/// Largest authenticated consumer JSON frame accepted for a complete `/4`
+/// terminal capsule and its consumer envelope.
+pub const MAX_SESSION_CONSUMER_ROSTER_V2_TERMINAL_FRAME_BYTES: usize =
+    crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_V2_TERMINAL_FRAME_BYTES;
 
 /// Exact profile negotiated before a protected-roster consumer operation is
 /// admitted.
@@ -127,7 +148,7 @@ pub struct SessionConsumerRosterTransportProfile {
 }
 
 impl SessionConsumerRosterTransportProfile {
-    /// Return the sole roster profile supported by this SDK build.
+    /// Return the frozen V1 roster profile.
     pub fn current() -> Self {
         Self {
             roster_profile: crate::fenced_mutation_roster::Profile::v1(),
@@ -138,14 +159,35 @@ impl SessionConsumerRosterTransportProfile {
         }
     }
 
-    /// Return whether this is exactly the profile supported by this SDK build.
+    /// Return the additive V2 roster profile for absent-predecessor admission.
+    pub fn v2() -> Self {
+        Self {
+            roster_profile: crate::fenced_mutation_roster::Profile::v2(),
+            admission_capsule_bytes: MAX_SESSION_CONSUMER_ROSTER_ADMISSION_CAPSULE_BYTES as u32,
+            terminal_capsule_bytes: MAX_SESSION_CONSUMER_ROSTER_V2_TERMINAL_CAPSULE_BYTES as u32,
+            admission_frame_bytes: MAX_SESSION_CONSUMER_ROSTER_ADMISSION_FRAME_BYTES as u32,
+            terminal_frame_bytes: MAX_SESSION_CONSUMER_ROSTER_V2_TERMINAL_FRAME_BYTES as u32,
+        }
+    }
+
+    /// Return whether this is exactly the frozen V1 profile.
     pub fn is_current(self) -> bool {
         self == Self::current()
+    }
+
+    /// Return whether this is exactly the additive V2 profile.
+    pub fn is_v2(self) -> bool {
+        self == Self::v2()
     }
 
     /// Return the exact frame budget required for a whole admission capsule.
     pub const fn admission_frame_bytes(self) -> usize {
         self.admission_frame_bytes as usize
+    }
+
+    /// Return the exact canonical terminal capsule budget for this profile.
+    pub const fn terminal_capsule_bytes(self) -> usize {
+        self.terminal_capsule_bytes as usize
     }
 
     /// Return the exact frame budget required for a whole terminal capsule.
@@ -536,6 +578,8 @@ pub enum SessionConsumerRosterRejection {
     Capability,
     /// The bounded quorum path could not dispatch the operation.
     Unavailable,
+    /// Admission required exact row absence but an authoritative row exists.
+    RecordAlreadyExists,
 }
 
 /// Exact safe outcome of the sole admission mutation.
@@ -3097,6 +3141,12 @@ pub(crate) fn session_consumer_change(
                     kind,
                 })
             }
+            crate::ReplicationOp::ProtectedRosterEstablishedCreate { key, .. } => {
+                Some(SessionConsumerChangeItem {
+                    key: key.clone(),
+                    kind: SessionConsumerChangeKind::RecordWritten,
+                })
+            }
             crate::ReplicationOp::Batch { ops } => {
                 pending.extend(ops.iter().rev());
                 None
@@ -3344,6 +3394,17 @@ pub trait SessionQuorumConsumer: Send + Sync {
     >;
 }
 
+#[cfg(test)]
+fn invoke_legacy_roster_ingress_for_profile<T>(
+    profile: SessionConsumerRosterTransportProfile,
+    invoke: impl FnOnce() -> T,
+) -> Result<T, SessionConsumerRosterRejection> {
+    profile
+        .is_current()
+        .then(invoke)
+        .ok_or(SessionConsumerRosterRejection::Capability)
+}
+
 /// Dedicated protected-roster ingress port.
 ///
 /// Unlike [`SessionQuorumConsumer`], this port is usable only with a
@@ -3382,6 +3443,41 @@ pub trait SessionQuorumRosterIngress: Send + Sync {
         Err(SessionConsumerRosterRejection::Capability)
     }
 
+    /// Prepare the exact compact-admission signer input for one negotiated
+    /// protected-roster profile.
+    ///
+    /// The source-compatible default preserves the frozen V1 path exactly.
+    /// It rejects V2 before legacy ingress code can decode a capsule, look up
+    /// roster state, or submit consensus work. An ingress that intentionally
+    /// supports V2 must override this method and validate the profile before
+    /// performing any profile-dependent recovery or admission lookup.
+    fn prepare_compact_admission_provenance_input_for_profile(
+        &self,
+        profile: SessionConsumerRosterTransportProfile,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: &SessionConsumerRequest,
+        attestation: &crate::fenced_mutation_roster::RosterIngressAttestation,
+        certificate_subject_identity_commitment: [u8; 32],
+    ) -> Result<
+        crate::fenced_mutation_roster::RosterCompactAdmissionProvenanceInput,
+        SessionConsumerRosterRejection,
+    > {
+        if !profile.is_current() {
+            return Err(SessionConsumerRosterRejection::Capability);
+        }
+        let crate::fenced_mutation_roster::RosterIngressAttestation::V1(attestation) = attestation
+        else {
+            return Err(SessionConsumerRosterRejection::Capability);
+        };
+        self.prepare_compact_admission_provenance_input(
+            authorization,
+            request,
+            attestation,
+            certificate_subject_identity_commitment,
+        )
+        .map(crate::fenced_mutation_roster::RosterCompactAdmissionProvenanceInput::V1)
+    }
+
     /// Dispatch one already-authenticated revision-five protected-roster
     /// request.
     ///
@@ -3399,6 +3495,44 @@ pub trait SessionQuorumRosterIngress: Send + Sync {
             crate::fenced_mutation_roster::RosterCompactAdmissionProvenanceV2,
         >,
     ) -> SessionConsumerResponse;
+
+    /// Dispatch one already-authenticated request for the exact negotiated
+    /// protected-roster profile.
+    ///
+    /// The default delegates only the frozen V1 profile to the existing
+    /// ingress method. V2 fails closed before legacy ingress code can inspect
+    /// a capsule or touch provider/consensus state.
+    async fn execute_roster_ingress_for_profile(
+        &self,
+        profile: SessionConsumerRosterTransportProfile,
+        authorization: &SessionConsumerRosterAuthorization,
+        request: SessionConsumerRequest,
+        attestation: crate::fenced_mutation_roster::RosterIngressAttestation,
+        admission_provenance: Option<
+            crate::fenced_mutation_roster::RosterCompactAdmissionProvenance,
+        >,
+    ) -> SessionConsumerResponse {
+        if !profile.is_current() {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
+        }
+        let crate::fenced_mutation_roster::RosterIngressAttestation::V1(attestation) = attestation
+        else {
+            return SessionConsumerResponse::Rejected(SessionConsumerRejection::MalformedRequest);
+        };
+        let admission_provenance = match admission_provenance {
+            Some(crate::fenced_mutation_roster::RosterCompactAdmissionProvenance::V1(value)) => {
+                Some(value)
+            }
+            None => None,
+            Some(crate::fenced_mutation_roster::RosterCompactAdmissionProvenance::V2(_)) => {
+                return SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::MalformedRequest,
+                );
+            }
+        };
+        self.execute_roster_ingress(authorization, request, attestation, admission_provenance)
+            .await
+    }
 }
 
 /// Derive the exact opaque commitment of an authenticated peer identity for a
@@ -3833,6 +3967,31 @@ mod tests {
             manifest.authorize(&identity).expect("authorization token"),
             key,
         )
+    }
+
+    #[test]
+    fn v2_profile_never_invokes_legacy_roster_ingress() {
+        let mut invoked = false;
+        let result = super::invoke_legacy_roster_ingress_for_profile(
+            super::SessionConsumerRosterTransportProfile::v2(),
+            || {
+                invoked = true;
+            },
+        );
+        assert_eq!(
+            result,
+            Err(super::SessionConsumerRosterRejection::Capability)
+        );
+        assert!(!invoked);
+
+        let result = super::invoke_legacy_roster_ingress_for_profile(
+            super::SessionConsumerRosterTransportProfile::current(),
+            || {
+                invoked = true;
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert!(invoked);
     }
 
     #[test]

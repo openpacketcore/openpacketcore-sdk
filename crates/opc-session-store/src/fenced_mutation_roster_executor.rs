@@ -38,6 +38,8 @@ pub(crate) enum ExecutorError {
     InvalidTerminal,
     /// Admission's required present session record was not available.
     AdmissionRecordMissing,
+    /// Admission's required absent session record was already present.
+    AdmissionRecordAlreadyExists,
     /// Admission's required present session generation differed.
     AdmissionGenerationConflict,
     /// Admission rejected a Put whose successor generation would overflow.
@@ -63,6 +65,7 @@ impl fmt::Display for ExecutorError {
             Self::TerminalConflict => "roster executor terminal conflict",
             Self::InvalidTerminal => "invalid roster executor terminal",
             Self::AdmissionRecordMissing => "roster admission record missing",
+            Self::AdmissionRecordAlreadyExists => "roster admission record already exists",
             Self::AdmissionGenerationConflict => "roster admission generation conflict",
             Self::AdmissionGenerationExhausted => "roster admission generation exhausted",
             Self::AdmissionBusinessKeyReserved => "roster admission business key reserved",
@@ -580,6 +583,8 @@ pub(crate) enum BackendRejection {
     TerminalConflict,
     /// Admission found no exact present protected business record.
     RecordMissing,
+    /// Admission found an already-present protected business record.
+    RecordAlreadyExists,
     /// Admission found a different protected business generation.
     GenerationConflict,
     /// Admission cannot produce a checked successor generation for Put.
@@ -603,6 +608,7 @@ impl From<BackendRejection> for ExecutorError {
             BackendRejection::RecoveryRequired => Self::RecoveryRequired,
             BackendRejection::TerminalConflict => Self::TerminalConflict,
             BackendRejection::RecordMissing => Self::AdmissionRecordMissing,
+            BackendRejection::RecordAlreadyExists => Self::AdmissionRecordAlreadyExists,
             BackendRejection::GenerationConflict => Self::AdmissionGenerationConflict,
             BackendRejection::GenerationExhausted => Self::AdmissionGenerationExhausted,
             BackendRejection::BusinessKeyReserved => Self::AdmissionBusinessKeyReserved,
@@ -726,11 +732,40 @@ pub(crate) enum EstablishedMaterialization {
         /// Exact generation retained by the transaction.
         generation: Generation,
     },
+    /// The admitted checkpoint created the previously absent session record.
+    Created {
+        /// The fixed first generation written by the transaction.
+        generation: Generation,
+        /// Commitment to the immutable authoritative record header and bytes.
+        record_commitment: [u8; 32],
+    },
 }
 
 impl EstablishedMaterialization {
     fn for_admission(admission: &Admission) -> Result<Self, ExecutorError> {
         let mutation = admission.established_mutation();
+        if mutation.requires_absent_predecessor() {
+            let generation = Generation::new(1);
+            if admission.profile() != crate::fenced_mutation_roster::Profile::v2()
+                || admission.expected_generation() != generation
+            {
+                return Err(ExecutorError::InvalidTerminal);
+            }
+            let state_type = mutation
+                .state_type()
+                .ok_or(ExecutorError::InvalidTerminal)?;
+            return Ok(Self::Created {
+                generation,
+                record_commitment: terminal_record_commitment(
+                    admission,
+                    generation,
+                    state_type.as_str(),
+                ),
+            });
+        }
+        if admission.profile() != crate::fenced_mutation_roster::Profile::v1() {
+            return Err(ExecutorError::InvalidTerminal);
+        }
         if mutation == &crate::fenced_mutation_roster::EstablishedMutation::delete() {
             return Ok(Self::Deleted {
                 generation: admission.expected_generation(),
@@ -774,6 +809,14 @@ impl EstablishedMaterialization {
                 hasher.update([3]);
                 hasher.update(generation.get().to_be_bytes());
             }
+            Self::Created {
+                generation,
+                record_commitment,
+            } => {
+                hasher.update([4]);
+                hasher.update(generation.get().to_be_bytes());
+                hasher.update(record_commitment);
+            }
         }
     }
 }
@@ -784,7 +827,7 @@ impl fmt::Debug for EstablishedMaterialization {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum TerminalMaterializationWire {
     Updated {
         from: Generation,
@@ -798,6 +841,10 @@ enum TerminalMaterializationWire {
         generation: Generation,
     },
     Aborted,
+    Created {
+        generation: Generation,
+        record_commitment: [u8; 32],
+    },
 }
 
 impl From<&TerminalMaterialization> for TerminalMaterializationWire {
@@ -821,6 +868,13 @@ impl From<&TerminalMaterialization> for TerminalMaterializationWire {
                 generation,
             }) => Self::NoOp {
                 generation: *generation,
+            },
+            TerminalMaterialization::Established(EstablishedMaterialization::Created {
+                generation,
+                record_commitment,
+            }) => Self::Created {
+                generation: *generation,
+                record_commitment: *record_commitment,
             },
             TerminalMaterialization::Aborted => Self::Aborted,
         }
@@ -846,6 +900,13 @@ impl From<TerminalMaterializationWire> for TerminalMaterialization {
                 Self::Established(EstablishedMaterialization::NoOp { generation })
             }
             TerminalMaterializationWire::Aborted => Self::Aborted,
+            TerminalMaterializationWire::Created {
+                generation,
+                record_commitment,
+            } => Self::Established(EstablishedMaterialization::Created {
+                generation,
+                record_commitment,
+            }),
         }
     }
 }
@@ -1192,6 +1253,7 @@ impl CommittedTerminal {
                 TerminalMaterializationWire::Updated { .. }
                     | TerminalMaterializationWire::Deleted { .. }
                     | TerminalMaterializationWire::NoOp { .. }
+                    | TerminalMaterializationWire::Created { .. }
             ) | (Ok(Phase::Aborted), TerminalMaterializationWire::Aborted)
         );
         if wire.committing_registration_handle == [0; 32]
@@ -1446,4 +1508,110 @@ fn terminal_receipt_commitment(
 fn update_terminal_commitment_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
+}
+
+#[cfg(test)]
+mod materialization_tests {
+    use super::*;
+    use crate::{
+        fenced_mutation_roster::{
+            AdmissionProposal, EstablishedMutation, Member, MemberOperationId, Profile, RosterId,
+        },
+        SessionKeyType, StableId, StateType,
+    };
+    use bytes::Bytes;
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    fn admission(
+        profile: Profile,
+        mutation: EstablishedMutation,
+        generation: Generation,
+    ) -> Admission {
+        let proposal = AdmissionProposal::new(
+            profile,
+            RosterId::from_bytes([1; 16]).expect("roster ID"),
+            vec![Member::new(
+                0,
+                MemberOperationId::from_bytes([2; 16]).expect("operation ID"),
+                vec![3],
+                1,
+            )
+            .expect("member")],
+            mutation,
+            vec![],
+            vec![4],
+            vec![],
+        )
+        .expect("proposal");
+        Admission::authenticate(
+            proposal,
+            SessionKey {
+                tenant: TenantId::from_static("tenant"),
+                nf_kind: NetworkFunctionKind::smf(),
+                key_type: SessionKeyType::PduSession,
+                stable_id: StableId::new(Bytes::from_static(b"session")).expect("stable ID"),
+            },
+            Scope::from_digest([5; 32]),
+            OwnerId::new("owner").expect("owner"),
+            FenceToken::new(1),
+            generation,
+        )
+        .expect("admission")
+    }
+
+    #[test]
+    fn v2_create_materializes_at_fixed_generation_one() {
+        let state_type = StateType::new("state").expect("state type");
+        let admission = admission(
+            Profile::v2(),
+            EstablishedMutation::create_checkpoint(state_type.clone()),
+            Generation::new(1),
+        );
+        let materialization =
+            EstablishedMaterialization::for_admission(&admission).expect("created materialization");
+        assert_eq!(
+            materialization,
+            EstablishedMaterialization::Created {
+                generation: Generation::new(1),
+                record_commitment: terminal_record_commitment(
+                    &admission,
+                    Generation::new(1),
+                    state_type.as_str()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn v1_put_remains_updated_and_wire_tags_are_append_only() {
+        let state_type = StateType::new("state").expect("state type");
+        let admission = admission(
+            Profile::v1(),
+            EstablishedMutation::put_checkpoint(state_type),
+            Generation::new(7),
+        );
+        assert!(matches!(
+            EstablishedMaterialization::for_admission(&admission).expect("updated materialization"),
+            EstablishedMaterialization::Updated { from, to, .. }
+                if from == Generation::new(7) && to == Generation::new(8)
+        ));
+        let updated = TerminalMaterializationWire::Updated {
+            from: Generation::new(7),
+            to: Generation::new(8),
+            record_commitment: [9; 32],
+        };
+        let created = TerminalMaterializationWire::Created {
+            generation: Generation::new(1),
+            record_commitment: [10; 32],
+        };
+        let updated_bytes = postcard::to_allocvec(&updated).expect("updated wire");
+        let created_bytes = postcard::to_allocvec(&created).expect("created wire");
+        assert_eq!(updated_bytes[0], 0);
+        assert_eq!(created_bytes[0], 4);
+        assert_eq!(
+            postcard::from_bytes::<TerminalMaterializationWire>(&created_bytes)
+                .expect("created wire round trip"),
+            created
+        );
+    }
 }

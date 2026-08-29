@@ -1174,7 +1174,7 @@ impl QualificationNode {
                     Err(()) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::InvalidRequest,
-                        }
+                        };
                     }
                 };
                 let owner = match OwnerId::new(owner) {
@@ -1182,7 +1182,7 @@ impl QualificationNode {
                     Err(_) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::InvalidRequest,
-                        }
+                        };
                     }
                 };
                 match self
@@ -1231,7 +1231,7 @@ impl QualificationNode {
                     Err(()) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::InvalidRequest,
-                        }
+                        };
                     }
                 };
                 let record = StoredSessionRecord {
@@ -1275,7 +1275,7 @@ impl QualificationNode {
                     Err(()) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::InvalidRequest,
-                        }
+                        };
                     }
                 };
                 match self.protected.get(&key).await {
@@ -1362,7 +1362,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::InvalidRequest,
-                }
+                };
             }
         };
         let grants = match qualification_stateless_consumer_grants(identities) {
@@ -1370,7 +1370,7 @@ impl QualificationNode {
             Err(()) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::InvalidRequest,
-                }
+                };
             }
         };
         let manifest = match self.store.consumer_authorization_manifest(grants).await {
@@ -1378,7 +1378,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::BackendUnavailable,
-                }
+                };
             }
         };
         let scope = manifest.scope();
@@ -1387,7 +1387,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::InvalidRequest,
-                }
+                };
             }
         };
         let listener = SessionQuorumConsumerServer::new(
@@ -1432,7 +1432,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::TrafficUnavailable,
-                }
+                };
             }
         };
         let Some(watch_start) = initial_head.checked_add(1) else {
@@ -1500,7 +1500,7 @@ impl QualificationNode {
             Err(()) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::TrafficUnavailable,
-                }
+                };
             }
         };
         let existing_observation = self
@@ -1543,7 +1543,7 @@ impl QualificationNode {
                     Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::TrafficUnavailable,
-                        }
+                        };
                     }
                 };
             while reconciled_sequence < head {
@@ -1564,7 +1564,7 @@ impl QualificationNode {
                     Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::TrafficUnavailable,
-                        }
+                        };
                     }
                 };
                 for entry in entries {
@@ -1603,7 +1603,7 @@ impl QualificationNode {
                 Ok(Err(_)) | Err(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::TrafficUnavailable,
-                    }
+                    };
                 }
             }
         };
@@ -1720,7 +1720,7 @@ impl QualificationNode {
             Err(()) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::TrafficUnavailable,
-                }
+                };
             }
         };
         let owner = match OwnerId::new(format!("rotation-traffic-owner-{}", self.node_index)) {
@@ -2115,7 +2115,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::DirectedHandshakeUnavailable,
-                }
+                };
             }
         };
         let succeeded = match directed.peer.call(request).await {
@@ -2218,7 +2218,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
-                }
+                };
             }
         };
         self.concurrent_watches.insert(
@@ -2266,12 +2266,12 @@ impl QualificationNode {
                 Ok(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::InvalidRequest,
-                    }
+                    };
                 }
                 Err(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
-                    }
+                    };
                 }
             }
         }
@@ -2291,7 +2291,7 @@ impl QualificationNode {
                     Ok(Some(Ok(_))) | Ok(Some(Err(_))) | Ok(None) | Err(_) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
-                        }
+                        };
                     }
                 };
                 if append_concurrent_watch_events(entry, &mut events).is_err() {
@@ -2352,12 +2352,12 @@ impl QualificationNode {
                 Ok(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::InvalidRequest,
-                    }
+                    };
                 }
                 Err(()) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::InvalidRequest,
-                    }
+                    };
                 }
             };
             let state_type = match StateType::new(slot.state_type.as_str().to_owned()) {
@@ -2365,7 +2365,7 @@ impl QualificationNode {
                 Err(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::InvalidRequest,
-                    }
+                    };
                 }
             };
             let attempted = QualificationConcurrentMutationSnapshot {
@@ -2424,7 +2424,7 @@ impl QualificationNode {
             Err(_) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::InvalidRequest,
-                }
+                };
             }
         };
         let scope = match concurrent_restore_scope(state_type_model) {
@@ -2432,7 +2432,7 @@ impl QualificationNode {
             Err(()) => {
                 return QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
-                }
+                };
             }
         };
         let mut cursor = None;
@@ -2458,7 +2458,7 @@ impl QualificationNode {
                 Err(_) => {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
-                    }
+                    };
                 }
             };
             if page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1
@@ -2476,7 +2476,7 @@ impl QualificationNode {
                     Ok(Some(_)) | Ok(None) | Err(()) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::ConcurrentRestoreUnavailable,
-                        }
+                        };
                     }
                 };
                 if records.len() >= QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS {
@@ -2712,6 +2712,21 @@ fn append_concurrent_watch_events(
                 let Some(record) = record else {
                     continue;
                 };
+                let Some(record) = concurrent_record_snapshot(&record)? else {
+                    continue;
+                };
+                if events.len() >= QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS {
+                    return Err(());
+                }
+                events.push(QualificationConcurrentWatchEvent {
+                    journal_sequence: sequence,
+                    record,
+                });
+            }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. } => {
+                if record.key != key {
+                    return Err(());
+                }
                 let Some(record) = concurrent_record_snapshot(&record)? else {
                     continue;
                 };
@@ -3408,7 +3423,7 @@ async fn run_traffic_mutation_task_inner(
                 return Err(QualificationTrafficFailure::fixed(
                     QualificationTrafficFailureCode::InvariantViolation,
                     QualificationTrafficFailureStage::CompareAndSet,
-                ))
+                ));
             }
         }
         // Publish the committed record identity immediately. A clean stop or
@@ -3799,6 +3814,21 @@ fn observe_applied_records(
                     watch_traffic_generations[node_index].store(generation, Ordering::Release);
                 }
             }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. } => {
+                count = count.saturating_add(1);
+                if let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                {
+                    if record.key != *key {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    let generation = record.generation.get();
+                    let previous = watch_traffic_generations[node_index].load(Ordering::Acquire);
+                    if previous.checked_add(1) != Some(generation) {
+                        return Err(QualificationTrafficFailureCode::InvariantViolation);
+                    }
+                    watch_traffic_generations[node_index].store(generation, Ordering::Release);
+                }
+            }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
             ReplicationOp::DeleteFenced { .. }
             | ReplicationOp::RefreshTtl { .. }
@@ -3870,6 +3900,30 @@ fn reconcile_applied_traffic_records(
                     record.fence.get(),
                 )?;
                 if record.fence.get() == 0
+                    || !traffic_record_is_exact(&expected_record, record)
+                    || traffic_generations[node_index].checked_add(1) != Some(generation)
+                {
+                    return Err(QualificationTrafficFailureCode::InvariantViolation);
+                }
+                traffic_generations[node_index] = generation;
+                traffic_record_fences[node_index] = record.fence.get();
+            }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. } => {
+                let Some(node_index) = traffic_keys.iter().position(|candidate| candidate == key)
+                else {
+                    continue;
+                };
+                let generation = record.generation.get();
+                let expected_record = expected_traffic_record(
+                    key,
+                    seed,
+                    member_count,
+                    node_index,
+                    generation,
+                    record.fence.get(),
+                )?;
+                if record.key != *key
+                    || record.fence.get() == 0
                     || !traffic_record_is_exact(&expected_record, record)
                     || traffic_generations[node_index].checked_add(1) != Some(generation)
                 {
@@ -6092,6 +6146,51 @@ mod tests {
         }
     }
 
+    fn reconciliation_roster_create(node_index: usize) -> ReplicationOp {
+        let ReplicationOp::CompareAndSet {
+            key, new_record, ..
+        } = reconciliation_cas(node_index, 1)
+        else {
+            unreachable!()
+        };
+        ReplicationOp::ProtectedRosterEstablishedCreate {
+            key,
+            owner: new_record.owner.clone(),
+            fence: new_record.fence,
+            record: new_record,
+            credential_id: 1,
+            guard_acquired_at: opc_types::Timestamp::now_utc(),
+            guard_expires_at: opc_types::Timestamp::now_utc(),
+        }
+    }
+
+    fn concurrent_roster_create(stable_id: &str) -> ReplicationOp {
+        let key = qualification_key(stable_id).expect("concurrent key");
+        let state_type =
+            opc_session_testkit::qualification::qualification_concurrent_state_type(stable_id)
+                .expect("history-derived concurrent state type");
+        let record = StoredSessionRecord {
+            key: key.clone(),
+            generation: Generation::new(1),
+            owner: OwnerId::new("concurrent-owner").expect("concurrent owner"),
+            fence: opc_session_store::FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::new(state_type.as_str().to_owned())
+                .expect("validated concurrent state type"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(b"concurrent-roster-create"),
+        };
+        ReplicationOp::ProtectedRosterEstablishedCreate {
+            key,
+            owner: record.owner.clone(),
+            fence: record.fence,
+            record,
+            credential_id: 1,
+            guard_acquired_at: opc_types::Timestamp::now_utc(),
+            guard_expires_at: opc_types::Timestamp::now_utc(),
+        }
+    }
+
     #[test]
     fn traffic_watch_and_reconciliation_project_roster_put_only() {
         let keys = (0..3)
@@ -6133,6 +6232,81 @@ mod tests {
             **operation_successor = successor;
             assert_eq!(observe_applied_records(&non_write, &keys, &watched), Ok(0));
         }
+    }
+
+    #[test]
+    fn traffic_watch_and_reconciliation_project_roster_create_direct_and_nested() {
+        let keys = (0..3)
+            .map(qualification_traffic_key)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("traffic keys");
+        let direct = reconciliation_roster_create(0);
+        let watched = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        assert_eq!(observe_applied_records(&direct, &keys, &watched), Ok(1));
+        assert_eq!(watched[0].load(Ordering::Acquire), 1);
+
+        let seed = qualification_traffic_seed(3).expect("traffic seed");
+        let mut generations = [0, 0, 0];
+        let mut fences = [0, 0, 0];
+        assert!(reconcile_applied_traffic_records(
+            &direct,
+            &keys,
+            &mut generations,
+            &mut fences,
+            seed,
+            3,
+        )
+        .is_ok());
+        assert_eq!(generations, [1, 0, 0]);
+        assert_eq!(fences, [2, 0, 0]);
+
+        let nested = ReplicationOp::Batch {
+            ops: vec![ReplicationOp::Batch {
+                ops: vec![reconciliation_roster_create(1)],
+            }],
+        };
+        assert_eq!(observe_applied_records(&nested, &keys, &watched), Ok(1));
+        assert_eq!(watched[1].load(Ordering::Acquire), 1);
+        assert!(reconcile_applied_traffic_records(
+            &nested,
+            &keys,
+            &mut generations,
+            &mut fences,
+            seed,
+            3,
+        )
+        .is_ok());
+        assert_eq!(generations, [1, 1, 0]);
+        assert_eq!(fences, [2, 2, 0]);
+    }
+
+    #[test]
+    fn concurrent_watch_projects_roster_create_direct_and_nested() {
+        let timestamp = opc_types::Timestamp::now_utc();
+        let direct = ReplicationEntry {
+            sequence: 7,
+            tx_id: "concurrent-v2-direct".try_into().expect("transaction ID"),
+            op: concurrent_roster_create("concurrent-v2-direct"),
+            timestamp,
+        };
+        let nested = ReplicationEntry {
+            sequence: 8,
+            tx_id: "concurrent-v2-nested".try_into().expect("transaction ID"),
+            op: ReplicationOp::Batch {
+                ops: vec![ReplicationOp::Batch {
+                    ops: vec![concurrent_roster_create("concurrent-v2-nested")],
+                }],
+            },
+            timestamp,
+        };
+        let mut events = Vec::new();
+
+        append_concurrent_watch_events(direct, &mut events).expect("direct V2 create event");
+        append_concurrent_watch_events(nested, &mut events).expect("nested V2 create event");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].journal_sequence, 7);
+        assert_eq!(events[1].journal_sequence, 8);
     }
 
     #[test]

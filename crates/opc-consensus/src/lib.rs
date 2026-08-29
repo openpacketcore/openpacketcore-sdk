@@ -53,5 +53,6 @@ pub use transport::{
     decode_roster_bounded, encode_roster_bounded, ConsensusPeer, ConsensusPeerError,
     ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
     CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES, CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
-    CONSENSUS_SCHEMA_VERSION,
+    CONSENSUS_PROTECTED_ROSTER_TERMINAL_COMPACT_EVIDENCE_BYTES,
+    CONSENSUS_PROTECTED_ROSTER_TERMINAL_PROOF_BUNDLE_BYTES, CONSENSUS_SCHEMA_VERSION,
 };

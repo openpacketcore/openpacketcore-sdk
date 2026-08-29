@@ -25,32 +25,57 @@ current exact voter scope. The fresh roster itself therefore retains exactly
 two state-changing quorum transactions: PollAdmitted before any provider effect
 and one all-or-none Established or Aborted terminal mutation.
 
+The absent-predecessor candidate uses an independent V2 sequence. Every voter
+first activates the existing fenced-transition prerequisite, then calls
+`ConsensusSessionStore::activate_protected_roster_profile_v2()` against the
+exact voter set, and advertises only `opc-session-consumer/4` through
+`SessionQuorumConsumerServer::with_roster_v2_ingress`. The real consumer is
+constructed once with
+`PersistentSessionConsumerClient::from_fenced_mutation_roster_v2_stateless`
+and consumed once by
+`into_fenced_mutation_roster_v2_provider_adapter`. Tests inspect the persistent
+pool counters and provider identity across complete roster rounds; compilation
+alone is not treated as activation or composition evidence.
+
+V2 activation advances a clean/current durable replica from format 4 to format
+5. A membership cutover clears its exact-scope V2 certificate, and the new
+voter set must reactivate unanimously before `/4` traffic. A prospective
+learner is independently checked for the exact revision-8 replication schema,
+V2 applied-state digest, and format-5 descriptor before `add_learner` whenever
+durable V2 history exists.
+
 ## Candidate lineage
 
-The signed semantic candidate immediately before this evidence-only refresh is
-`f380444d29a59e0a1fbea49bb4afff3adee3f0c8`, tree
-`05b3a52cdd86572d93d59a949eb260492276d4e1`. It is based directly on the
-normal PR #717 merge at `ff3d41b08b73d987e52c9a87481f3ef7266f760c` and is
-published as [draft PR #729](https://github.com/openpacketcore/openpacketcore-sdk/pull/729).
-The PR remains a candidate, not a consumable pin: hosted checks and the final
-frozen-head review must complete before it leaves draft, and there is no merge
-SHA yet. The PR head ref, rather than the self-referential hash in this
-committed document, is authoritative for the final documentation-only commit.
+The absent-predecessor prerequisite is based directly on the reviewed and
+merged SDK PR #729 commit
+`0e93409e0e83215b3d1a7d0e4ea166f88d758c27`, whose reviewed feature head was
+`78d71cc3763dfcfec9f9c66ff5cc2f4ab5ef548d` and tree was
+`5a9416d9c385cc28fa0bf63ee0ea282d22d358d4`. It does not copy or reinterpret
+the merged #707/#729 present-predecessor implementation. The preserved signed
+causal RED commit is `3002720ba7dd8464f64331bd77eb2879c76ccd17`;
+the prerequisite PR head and merge SHA will be recorded in the downstream
+ePDG dependency contract after exact-head review and merge.
+
+The earlier V1 candidate lineage and evidence below remain the evidence for
+merged PR #729. They are not attributed to the additive V2 bytes.
 
 ## Focused behavior evidence
 
-The following locked tests run through the production revision-five roster
-transport. Commands are shown without private paths or credentials.
+The first locked test runs through the additive revision-six
+absent-predecessor roster transport. The remaining established-roster tests
+below retain the merged revision-five evidence. Commands are shown without
+private paths or credentials.
 
 ```text
 env CARGO_PROFILE_TEST_OPT_LEVEL=1 \
   cargo test --locked -p opc-session-net --test stateless_quorum_consumer \
-  persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal \
+  persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal \
   -- --exact --nocapture
 
 result: PASS
-topology: three real Openraft voters over mTLS ALPN opc-session-consumer/3
-shape: six ordered members, maximum plan/checkpoint/result envelopes
+topology: three real Openraft voters over mTLS ALPN opc-session-consumer/4
+shape: absent predecessor, generation-one create, six ordered members,
+       maximum plan/checkpoint/result envelopes
 assertion: exactly two accepted roster mutations (PollAdmit, Terminalize)
 ```
 

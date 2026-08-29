@@ -24,7 +24,8 @@ use rusqlite::{params, types::Value, Connection};
 use sha2::{Digest, Sha256};
 
 use super::sqlite::{
-    backup_and_reset_replica, prepare_test_workflow, seal_plan, RecoveryFailpoint, ResetInput,
+    backup_and_reset_replica, hash_current_checkpoint_for_test, prepare_test_workflow, seal_plan,
+    RecoveryFailpoint, ResetInput,
 };
 use super::*;
 use crate::capability::BackendCapabilities;
@@ -39,7 +40,7 @@ use crate::topology::{
 };
 use crate::{
     CompareAndSet, CompareAndSetResult, EncryptedSessionPayload, EncryptingSessionBackend,
-    Generation, OwnerId, ReplicationEntry, ReplicationOp, SessionBackend,
+    FenceToken, Generation, OwnerId, ReplicationEntry, ReplicationOp, SessionBackend,
     SessionConsensusEntryDigest, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRequestId, SessionConsensusResponse, SessionConsensusRpcHandler,
     SessionConsensusWireRequest, SessionConsensusWireResponse, SessionKey, SessionKeyType,
@@ -2565,6 +2566,340 @@ fn activate_protected_roster_recovery_fixture(replica: &RecoveryReplica) {
     .expect("activate protected roster format");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         .expect("checkpoint protected roster activation");
+}
+
+fn production_protected_roster_v2_namespace_ddl() -> String {
+    let root = tempfile::tempdir().expect("production V2 namespace root");
+    let database = root.path().join("production-v2-namespace.sqlite");
+    consensus::initialize_protected_roster_v2_recovery_fixture(
+        &database,
+        consensus::ProtectedRosterV2RecoveryFixtureState::Live,
+    )
+    .expect("materialize production V2 namespace");
+    let conn = Connection::open(&database).expect("open production V2 namespace");
+    let mut ddl = String::new();
+    for name in [
+        "consensus_protected_roster_v2_activation",
+        "consensus_protected_roster_v2_admissions",
+        "consensus_protected_roster_v2_reclaim_due",
+        "consensus_protected_roster_v2_partition_epoch",
+        "consensus_protected_roster_v2_terminal_sequence",
+        "consensus_protected_roster_v2_absence_reservations",
+    ] {
+        let schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .expect("read production V2 namespace DDL");
+        ddl.push_str(&schema);
+        ddl.push_str(";\n");
+    }
+    ddl
+}
+
+fn activate_inactive_protected_roster_v2_recovery_fixture(replica: &RecoveryReplica) {
+    // The inactive format-five state has no certificate row, but its namespace
+    // must remain byte-for-byte the production DDL. Derive it from the sealed
+    // production materializer so this recovery fixture cannot drift.
+    let namespace_ddl = production_protected_roster_v2_namespace_ddl();
+    let conn = Connection::open(&replica.database_path).expect("open protected roster V2 fixture");
+    conn.execute_batch(&namespace_ddl)
+        .expect("install production V2 namespace");
+    conn.execute_batch(
+        "UPDATE consensus_identity SET schema_version = 5 WHERE singleton = 1; \
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .expect("activate inactive protected roster V2 format");
+    assert!(matches!(
+        consensus::protected_roster_v2_recovery_layout_sync(&conn),
+        Ok(consensus::ProtectedRosterV2RecoveryLayout::Inactive)
+    ));
+}
+
+fn sealed_protected_roster_v2_recovery_fixture(
+    root: &Path,
+    state: consensus::ProtectedRosterV2RecoveryFixtureState,
+) -> (
+    RecoveryReplica,
+    SessionConsensusIdentity,
+    BTreeSet<SessionConsensusNodeId>,
+) {
+    std::fs::create_dir_all(root).expect("create sealed V2 recovery root");
+    let replica_id = replica_id("sealed-v2-recovery");
+    let database = root.join("sealed-v2-recovery.sqlite");
+    let snapshots = root.join("sealed-v2-recovery-snapshots");
+    std::fs::create_dir(&snapshots).expect("create sealed V2 recovery snapshots");
+    let fixture = consensus::initialize_protected_roster_v2_recovery_fixture(&database, state)
+        .expect("materialize sealed V2 recovery fixture");
+    let conn = Connection::open(&database).expect("open sealed V2 recovery database");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint sealed V2 recovery fixture");
+    drop(conn);
+    let replica = RecoveryReplica::new_bound(
+        replica_id,
+        ReplicaBackingIdentity::new("sealed-v2-recovery-backing").expect("backing identity"),
+        fixture.identity,
+        database,
+        snapshots,
+    );
+    (replica, fixture.identity, fixture.members)
+}
+
+fn inspect_sealed_protected_roster_v2_fixture(
+    replica: &RecoveryReplica,
+    fixture_identity: SessionConsensusIdentity,
+    members: &BTreeSet<SessionConsensusNodeId>,
+) -> Result<RecoveryReplicaEvidence, RecoveryError> {
+    inspect_replica(InspectionInput {
+        key: &integrity_key(),
+        replica,
+        identity: fixture_identity,
+        expected_members: members,
+        limits: RecoveryLimits::default(),
+    })
+}
+
+#[test]
+fn format5_protected_roster_v2_replica_is_recoverable() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (replica, members) = current_receipt_inspection_fixture(temp.path());
+    let conn = Connection::open(&replica.database_path).expect("open inactive V2 checkpoint");
+    let predecessor_digest =
+        hash_current_checkpoint_for_test(&conn).expect("hash pre-cutover V2 checkpoint");
+    drop(conn);
+    inspect_current_fixture(&replica, &members)
+        .expect("offline recovery accepts pre-cutover format");
+    activate_inactive_protected_roster_v2_recovery_fixture(&replica);
+    let conn = Connection::open(&replica.database_path).expect("open inactive V2 checkpoint");
+    let inactive_digest =
+        hash_current_checkpoint_for_test(&conn).expect("hash inactive post-cutover V2 checkpoint");
+    assert_ne!(
+        predecessor_digest, inactive_digest,
+        "complete inactive V2 namespace commits to checkpoint"
+    );
+    drop(conn);
+
+    inspect_current_fixture(&replica, &members)
+        .expect("offline recovery accepts inactive format five");
+}
+
+#[test]
+fn format5_protected_roster_v2_signed_q1_and_q2_replicas_are_recoverable() {
+    let mut checkpoint_digests = Vec::new();
+    for (name, state) in [
+        (
+            "live-q1",
+            consensus::ProtectedRosterV2RecoveryFixtureState::Live,
+        ),
+        (
+            "established-q2",
+            consensus::ProtectedRosterV2RecoveryFixtureState::Established,
+        ),
+        (
+            "aborted-q2",
+            consensus::ProtectedRosterV2RecoveryFixtureState::Aborted,
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let (replica, fixture_identity, members) =
+            sealed_protected_roster_v2_recovery_fixture(temp.path(), state);
+        let conn = Connection::open(&replica.database_path).expect("open signed V2 checkpoint");
+        let checkpoint = hash_current_checkpoint_for_test(&conn)
+            .unwrap_or_else(|error| panic!("hash sealed {name} V2 checkpoint: {error:?}"));
+        assert!(
+            !checkpoint_digests.contains(&checkpoint),
+            "signed {name} V2 durable state must have a distinct checkpoint digest"
+        );
+        checkpoint_digests.push(checkpoint);
+        drop(conn);
+        inspect_sealed_protected_roster_v2_fixture(&replica, fixture_identity, &members)
+            .unwrap_or_else(|error| panic!("recover sealed {name} V2 state: {error:?}"));
+    }
+}
+
+#[test]
+fn format5_checkpoint_digest_commits_every_v2_durable_table() {
+    for (name, mutation) in [
+        (
+            "activation",
+            "UPDATE consensus_protected_roster_v2_activation SET voter_set_digest = zeroblob(32);",
+        ),
+        (
+            "absence",
+            "UPDATE consensus_protected_roster_v2_absence_reservations SET business_key = zeroblob(32);",
+        ),
+        (
+            "admission",
+            "UPDATE consensus_protected_roster_v2_admissions SET canonical_record = zeroblob(length(canonical_record));",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let (replica, fixture_identity, members) = sealed_protected_roster_v2_recovery_fixture(
+            temp.path(),
+            consensus::ProtectedRosterV2RecoveryFixtureState::Live,
+        );
+        let conn = Connection::open(&replica.database_path).expect("open signed V2 checkpoint");
+        hash_current_checkpoint_for_test(&conn).expect("hash valid V2 checkpoint");
+        conn.execute_batch(mutation)
+            .expect("tamper V2 checkpoint row");
+        assert_eq!(
+            hash_current_checkpoint_for_test(&conn),
+            Err(RecoveryError::CorruptReplica),
+            "{name} row must fail authenticated checkpoint hashing"
+        );
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint V2 tamper");
+        drop(conn);
+        assert_eq!(
+            inspect_sealed_protected_roster_v2_fixture(&replica, fixture_identity, &members),
+            Err(RecoveryError::CorruptReplica),
+            "{name} tamper is rejected before branch selection",
+        );
+    }
+}
+
+#[test]
+fn format5_signed_v2_admission_and_terminal_evidence_tamper_is_corrupt() {
+    for (name, state) in [
+        (
+            "q1-ingress-and-provenance",
+            consensus::ProtectedRosterV2RecoveryFixtureState::Live,
+        ),
+        (
+            "q2-terminal-proof-and-evidence",
+            consensus::ProtectedRosterV2RecoveryFixtureState::Established,
+        ),
+        (
+            "aborted-q2-terminal-proof-and-evidence",
+            consensus::ProtectedRosterV2RecoveryFixtureState::Aborted,
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let (replica, fixture_identity, members) =
+            sealed_protected_roster_v2_recovery_fixture(temp.path(), state);
+        let conn = Connection::open(&replica.database_path).expect("open signed V2 tamper");
+        conn.execute_batch(
+            "UPDATE consensus_protected_roster_v2_admissions \
+             SET canonical_record = zeroblob(length(canonical_record)); \
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("tamper sealed V2 canonical evidence");
+        drop(conn);
+        assert_eq!(
+            inspect_sealed_protected_roster_v2_fixture(&replica, fixture_identity, &members),
+            Err(RecoveryError::CorruptReplica),
+            "{name}",
+        );
+    }
+}
+
+#[test]
+fn format5_signed_v2_create_journal_tamper_is_corrupt_before_branch_selection() {
+    fn non_authoritative(record: &mut StoredSessionRecord) {
+        record.state_class = StateClass::ReplicatedDr;
+    }
+
+    fn expiring(record: &mut StoredSessionRecord) {
+        record.expires_at = Some(receipt_inspection_timestamp());
+    }
+
+    fn invalid_envelope(record: &mut StoredSessionRecord) {
+        record.payload = EncryptedSessionPayload::new(b"not-an-envelope");
+    }
+
+    fn invalid_bound_aad(record: &mut StoredSessionRecord) {
+        record.fence = FenceToken::new(record.fence.get().saturating_add(1));
+    }
+
+    for (name, mutate) in [
+        (
+            "non-authoritative",
+            non_authoritative as fn(&mut StoredSessionRecord),
+        ),
+        ("expiry", expiring as fn(&mut StoredSessionRecord)),
+        (
+            "invalid-envelope",
+            invalid_envelope as fn(&mut StoredSessionRecord),
+        ),
+        (
+            "invalid-bound-aad",
+            invalid_bound_aad as fn(&mut StoredSessionRecord),
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let (replica, fixture_identity, members) = sealed_protected_roster_v2_recovery_fixture(
+            temp.path(),
+            consensus::ProtectedRosterV2RecoveryFixtureState::Established,
+        );
+        let conn = Connection::open(&replica.database_path).expect("open signed V2 journal");
+        let encoded: String = conn
+            .query_row(
+                "SELECT entry_json FROM session_replication_log WHERE sequence = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read V2 create journal");
+        let mut entry: ReplicationEntry =
+            serde_json::from_str(&encoded).expect("decode sealed V2 create journal");
+        let ReplicationOp::ProtectedRosterEstablishedCreate { record, .. } = &mut entry.op else {
+            panic!("the sealed V2 Established terminal writes a create journal entry");
+        };
+        mutate(record);
+        conn.execute(
+            "UPDATE session_replication_log SET entry_json = ?1 WHERE sequence = 1",
+            [serde_json::to_string(&entry).expect("encode tampered V2 create journal")],
+        )
+        .expect("persist V2 create journal tamper");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint V2 create journal tamper");
+        drop(conn);
+
+        assert_eq!(
+            inspect_sealed_protected_roster_v2_fixture(&replica, fixture_identity, &members),
+            Err(RecoveryError::CorruptReplica),
+            "{name} V2 create journal is rejected before branch selection",
+        );
+    }
+}
+
+#[test]
+fn format5_protected_roster_v2_partial_or_extra_namespace_is_corrupt() {
+    for (name, mutation) in [
+        (
+            "partial-admissions-table",
+            "DROP TABLE consensus_protected_roster_v2_admissions;",
+        ),
+        (
+            "missing-terminal-index",
+            "DROP INDEX consensus_protected_roster_v2_terminal_sequence;",
+        ),
+        (
+            "unknown-index",
+            "CREATE INDEX consensus_protected_roster_v2_unknown ON consensus_protected_roster_v2_admissions(binding);",
+        ),
+        (
+            "extra-table",
+            "CREATE TABLE consensus_protected_roster_v2_extra (singleton INTEGER);",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let (replica, members) = current_receipt_inspection_fixture(&temp.path().join(name));
+        activate_inactive_protected_roster_v2_recovery_fixture(&replica);
+        let conn = Connection::open(&replica.database_path).expect("open V2 corruption fixture");
+        conn.execute_batch(mutation)
+            .expect("apply V2 namespace mutation");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint V2 namespace mutation");
+        drop(conn);
+
+        assert_eq!(
+            inspect_current_fixture(&replica, &members),
+            Err(RecoveryError::CorruptReplica),
+            "{name}",
+        );
+    }
 }
 
 #[test]

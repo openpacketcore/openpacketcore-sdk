@@ -432,6 +432,25 @@ fn apply_validated_replicated_op_sync(
             guard_expires_at,
             now,
         ),
+        ReplicationOp::ProtectedRosterEstablishedCreate {
+            key,
+            record,
+            owner,
+            fence,
+            credential_id,
+            guard_acquired_at,
+            guard_expires_at,
+        } => apply_protected_roster_established_create_sync(
+            conn,
+            &key,
+            &record,
+            &owner,
+            fence,
+            credential_id,
+            guard_acquired_at,
+            guard_expires_at,
+            now,
+        ),
         ReplicationOp::Batch { ops } => {
             for sub_op in ops {
                 apply_validated_replicated_op_sync(conn, sub_op, now)?;
@@ -465,6 +484,23 @@ fn validate_protected_roster_authoritative_record(
         .map_err(|_| {
             StoreError::Serialization("protected roster replication record is invalid".into())
         })
+}
+
+/// Validate the exact session-record effect of a protected-roster V2
+/// Established terminal from absence.  Unlike the V1 present-predecessor
+/// terminal, this is an insert-only effect and therefore has a fixed first
+/// generation as part of its durable replay contract.
+pub(crate) fn validate_protected_roster_established_create(
+    record: &crate::StoredSessionRecord,
+    key: &crate::model::SessionKey,
+) -> Result<(), StoreError> {
+    validate_protected_roster_authoritative_record(record, key)?;
+    if record.generation != crate::model::Generation::new(1) {
+        return Err(StoreError::InvalidKey(
+            "protected roster create replication record is invalid".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Apply the session-record projection of one already-committed protected
@@ -603,6 +639,95 @@ fn apply_protected_roster_established_sync(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_protected_roster_established_create_sync(
+    conn: &Connection,
+    key: &crate::model::SessionKey,
+    record: &crate::StoredSessionRecord,
+    owner: &crate::model::OwnerId,
+    fence: crate::model::FenceToken,
+    credential_id: u64,
+    guard_acquired_at: Timestamp,
+    guard_expires_at: Timestamp,
+    now: Timestamp,
+) -> Result<(), StoreError> {
+    validate_protected_roster_established_create(record, key)?;
+    if credential_id == 0
+        || guard_expires_at <= guard_acquired_at
+        || fence.get() < record.fence.get()
+    {
+        return Err(StoreError::StaleFence);
+    }
+    let current_fence = current_fence_sync(conn, key)?;
+    if current_fence > fence.get() {
+        return Err(StoreError::StaleFence);
+    }
+    let lease: Option<(i32, i64, String, i64, Option<String>, String)> = conn
+        .query_row(
+            r#"
+            SELECT active, credential_id, owner, fence, acquired_at, guard_expires_at
+            FROM leases
+            WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
+            "#,
+            params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster replication unavailable".into())
+        })?;
+    let Some((
+        active,
+        stored_credential,
+        stored_owner,
+        stored_fence,
+        stored_acquired,
+        stored_expiry,
+    )) = lease
+    else {
+        return Err(StoreError::StaleFence);
+    };
+    let stored_acquired =
+        persisted_normalized_timestamp(stored_acquired).ok_or(StoreError::StaleFence)?;
+    let stored_expiry = Timestamp::from_str(&stored_expiry).map_err(|_| {
+        StoreError::Serialization("protected roster replication metadata is invalid".into())
+    })?;
+    if active == 0
+        || persisted_u64(stored_credential)? != credential_id
+        || persisted_owner_id(stored_owner)? != *owner
+        || persisted_u64(stored_fence)? != fence.get()
+        || stored_acquired != guard_acquired_at
+        || stored_expiry != guard_expires_at
+    {
+        return Err(StoreError::StaleFence);
+    }
+    if guard_expires_at <= now {
+        return Err(StoreError::LeaseExpired);
+    }
+    if super::ops::get_raw_sync(conn, key)?.is_some() {
+        return Err(StoreError::CasConflict);
+    }
+    super::ops::insert_record_if_absent_sync(conn, record)?;
+    if current_fence < fence.get() {
+        insert_or_replace_fence_sync(conn, key, fence.get())?;
+    }
+    Ok(())
+}
+
 fn validate_replication_payload_len(
     record: &crate::StoredSessionRecord,
     max_value_bytes: usize,
@@ -658,6 +783,10 @@ pub(crate) fn validate_replication_payloads(
                     }
                     validate_replication_payload_len(record, max_value_bytes)?;
                 }
+            }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. } => {
+                validate_protected_roster_established_create(record, key)?;
+                validate_replication_payload_len(record, max_value_bytes)?;
             }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter()),
             _ => {}
@@ -813,4 +942,129 @@ pub(crate) fn rebuild_replication_state_sync(
     tx.commit()
         .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use bytes::Bytes;
+    use opc_crypto::CryptoEnvelopeV1;
+    use opc_key::{
+        serialize_bound_aad, AeadAlgorithm, EnvelopeAad, KeyId, SessionAad, AEAD_TAG_LEN,
+        AES_256_GCM_SIV_NONCE_LEN,
+    };
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    use super::*;
+    use crate::{
+        EncryptedSessionPayload, FenceToken, Generation, OwnerId, SessionKey, SessionKeyType,
+        StateType, StoredSessionRecord,
+    };
+
+    fn timestamp(second: u8) -> Timestamp {
+        Timestamp::from_str(&format!("2026-08-27T00:00:{second:02}Z")).expect("timestamp")
+    }
+
+    fn key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::from_static("replication-v2-tenant"),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"replication-v2-create")
+                .try_into()
+                .expect("stable ID"),
+        }
+    }
+
+    fn sealed_payload_for(record: &StoredSessionRecord) -> EncryptedSessionPayload {
+        let key_id = KeyId::new("replication-v2-test-key").expect("key ID");
+        let aad = EnvelopeAad::session(
+            record.key.tenant.clone(),
+            1,
+            SessionAad::new(
+                record.key.nf_kind.as_str(),
+                "replication-v2-keyed-digest",
+                record.state_type.as_str(),
+                record.generation.get(),
+                record.fence.get(),
+                "replication-v2-test-backend",
+            )
+            .expect("session AAD"),
+        );
+        let encoded = CryptoEnvelopeV1 {
+            algorithm: AeadAlgorithm::Aes256GcmSiv,
+            key_id: key_id.clone(),
+            nonce: vec![0x31; AES_256_GCM_SIV_NONCE_LEN],
+            aad: serialize_bound_aad(&aad, &key_id).expect("bound AAD"),
+            ciphertext_and_tag: vec![0x7A; AEAD_TAG_LEN],
+        }
+        .encode()
+        .expect("canonical envelope");
+        EncryptedSessionPayload::try_envelope(encoded).expect("valid envelope")
+    }
+
+    fn sealed_authoritative_record() -> StoredSessionRecord {
+        let mut record = StoredSessionRecord {
+            key: key(),
+            generation: Generation::new(1),
+            owner: OwnerId::new("replication-v2-owner").expect("owner"),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("replication-v2-state"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([]),
+        };
+        record.payload = sealed_payload_for(&record);
+        record
+    }
+
+    fn established_create(record: StoredSessionRecord) -> ReplicationOp {
+        ReplicationOp::ProtectedRosterEstablishedCreate {
+            key: record.key.clone(),
+            owner: record.owner.clone(),
+            fence: record.fence,
+            record,
+            credential_id: 1,
+            guard_acquired_at: timestamp(1),
+            guard_expires_at: timestamp(2),
+        }
+    }
+
+    fn assert_create_preflight_rejected(record: StoredSessionRecord) {
+        assert!(
+            validate_replication_payloads(&established_create(record), 4096).is_err(),
+            "invalid V2 protected-roster create must fail replication preflight"
+        );
+    }
+
+    #[test]
+    fn protected_roster_v2_create_preflight_accepts_strict_authoritative_record() {
+        validate_replication_payloads(&established_create(sealed_authoritative_record()), 4096)
+            .expect("strict V2 protected-roster create record is accepted");
+    }
+
+    #[test]
+    fn protected_roster_v2_create_preflight_rejects_non_authoritative_record() {
+        let mut record = sealed_authoritative_record();
+        record.state_class = StateClass::ReplicatedDr;
+
+        assert_create_preflight_rejected(record);
+    }
+
+    #[test]
+    fn protected_roster_v2_create_preflight_rejects_expiring_record() {
+        let mut record = sealed_authoritative_record();
+        record.expires_at = Some(timestamp(3));
+
+        assert_create_preflight_rejected(record);
+    }
+
+    #[test]
+    fn protected_roster_v2_create_preflight_rejects_record_with_wrong_bound_aad() {
+        let mut record = sealed_authoritative_record();
+        record.state_type = StateType::from_static("replication-v2-other-state");
+
+        assert_create_preflight_rejected(record);
+    }
 }

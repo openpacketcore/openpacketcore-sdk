@@ -2164,10 +2164,21 @@ fn collect_cache_changes(
                     }
                 }
             }
+            ReplicationOp::ProtectedRosterEstablishedCreate { key, record, .. }
+                if namespace.owns_session_key(key) =>
+            {
+                if &record.key != key || record.generation != crate::Generation::new(1) {
+                    return Err(FencedOwnershipError::InvalidRecord);
+                }
+                changes.push(CacheChange::Upsert(
+                    decode_record(namespace, record)?.public,
+                ));
+            }
             ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
             ReplicationOp::CompareAndSet { .. }
             | ReplicationOp::DeleteFenced { .. }
             | ReplicationOp::ProtectedRosterEstablished { .. }
+            | ReplicationOp::ProtectedRosterEstablishedCreate { .. }
             | ReplicationOp::RefreshTtl { .. }
             | ReplicationOp::AcquireLease { .. }
             | ReplicationOp::RenewLease { .. }
