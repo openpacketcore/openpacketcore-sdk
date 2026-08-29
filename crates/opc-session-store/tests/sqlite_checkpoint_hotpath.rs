@@ -309,6 +309,24 @@ async fn write_one_proactive_checkpoint_cadence_batch(
     write_proactive_checkpoint_operations(stores, leader, batch).await;
 }
 
+async fn wait_for_all_voters_to_apply(stores: &[ConsensusSessionStore], target_applied_index: u64) {
+    tokio::time::timeout(FIXED_QUORUM_OPERATION_TIMEOUT, async {
+        loop {
+            if stores.iter().all(|store| {
+                store
+                    .status()
+                    .applied_index
+                    .is_some_and(|applied_index| applied_index >= target_applied_index)
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("every voter applies the cadence prefill within the operation deadline");
+}
+
 async fn shutdown_fixed_quorum(stores: &[ConsensusSessionStore], peers: &[Arc<LoopbackPeer>]) {
     for peer in peers {
         peer.clear().await;
@@ -418,6 +436,16 @@ async fn green_proactive_checkpoint_main_sync_does_not_block_accepted_fixed_quor
     );
     let prefill_operations = (cadence_batch - 1) / DURABLE_WRITE_SIGNALS_PER_LOGICAL_TIME_OPERATION;
     write_proactive_checkpoint_operations(&stores, leader, prefill_operations).await;
+    // A successful Openraft client response proves a quorum has applied the
+    // write, not that the final follower has already applied it. Observe that
+    // follower's in-memory progress within the existing operation deadline;
+    // this adds no durable write signal and makes the exact per-voter cadence
+    // precondition explicit under scheduler contention.
+    let target_applied_index = stores[leader]
+        .status()
+        .applied_index
+        .expect("the accepted prefill has a leader applied index");
+    wait_for_all_voters_to_apply(&stores, target_applied_index).await;
     for store in &stores {
         assert_eq!(
             store.proactive_checkpoint_cadence_remaining_for_test(),

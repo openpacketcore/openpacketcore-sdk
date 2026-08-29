@@ -6627,23 +6627,6 @@ impl ConsensusSessionStore {
             {
                 return ConsensusSubmissionEffect::NotTransmitted(error);
             }
-            // A fixed replica's durable recovery latch is local authority.
-            // Before this replica can forward an ordinary mutation, bind its
-            // initial authority observation to a fresh quorum barrier and
-            // re-read that latch. Otherwise a latch published while route
-            // discovery/read-index is in flight could leave the remote leader
-            // free to propose on this replica's behalf.
-            if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum {
-                if self.linearizable_barrier_before(deadline).await.is_err() {
-                    return ConsensusSubmissionEffect::NotTransmitted(consensus_unavailable());
-                }
-                if let Err(error) = self
-                    .require_application_traffic_authority_before(deadline)
-                    .await
-                {
-                    return ConsensusSubmissionEffect::NotTransmitted(error);
-                }
-            }
         }
         let request = ForwardMutationRequest {
             request_id,
@@ -6665,6 +6648,28 @@ impl ConsensusSessionStore {
                     Err(error) => return ConsensusSubmissionEffect::NotTransmitted(error),
                 },
             };
+            // Fixed recovery is replica-local durable authority. Re-read it
+            // after route discovery or refresh and immediately before every
+            // remote forwarding attempt. The local-leader path already
+            // revalidates authority at its proposal boundary, so an earlier
+            // local read here cannot close that path's barrier window. A prior
+            // possibly delivered remote attempt retains ambiguity; otherwise
+            // this failure is still proven pre-transmission.
+            if !fixed_raw_v2_consumer_warm_route
+                && leader != self.inner.local_node_id
+                && self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum
+            {
+                if let Err(error) = self
+                    .require_application_traffic_authority_before(deadline)
+                    .await
+                {
+                    return if outcome_may_be_unavailable {
+                        ConsensusSubmissionEffect::OutcomeUnknown
+                    } else {
+                        ConsensusSubmissionEffect::NotTransmitted(error)
+                    };
+                }
+            }
             let reply = if leader == self.inner.local_node_id {
                 self.apply_on_local_leader(request.clone(), self.inner.local_node_id, deadline)
                     .await
