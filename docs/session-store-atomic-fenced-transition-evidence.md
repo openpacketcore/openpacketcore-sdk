@@ -494,13 +494,15 @@ The immutable schema digests are:
 3ce5f0e622508ba89820742514eddfd2c0575265754c0bdd1a726e5b3335ecca  qualification/v7/session-ha-profile.schema.json
 0b02633f0118283f425c4b60d8540de4503023d3759b7c6939ebaf2d16365772  qualification/v7/session-ha-evidence.schema.json
 5e3becf5094f3e222b94799e0fb7b6b77c3398aeabae743fc65b409c4cd4adfd  qualification/v8/session-ha-persistent-consumer-head-evidence.schema.json
-ecb42383a02a4704988139aafe2f59dfb95988b1e57cdaf05438a664500f2b41  qualification/v9/session-ha-persistent-consumer-head-evidence.schema.json
+65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018  qualification/v9/session-ha-persistent-consumer-head-evidence.schema.json
 ```
 
 The closed V9 external-pair contract records canonical absolute raw paths for
-the producer Cargo target and owner-private evidence root, plus the pair
-directory derived from that root; all three have separate domain-separated
-commitments. It separately binds the exact normalized absolute Cargo invocation
+the producer Cargo target, owner-private evidence root, owner-private fs-verity
+snapshot base, and the pair directory derived from the evidence root; each path
+has a separate domain-separated commitment. The snapshot base also records its
+descriptor-captured device/inode, so a same-path replacement is rejected. It
+separately binds the exact normalized absolute Cargo invocation
 alias, its canonical backing executable path, a SHA-256 of the backing content,
 and executable mode. The alias (including a rustup-managed `.../cargo`
 spelling), not the backing path, is `argv[0]` followed by 14 canonical tail
@@ -511,13 +513,14 @@ characters and NUL; the standard POSIX single-quote rendering is covered only
 by its exact regression and makes no broader shell-injection claim. The pair
 still contains only the unchanged exact leaves
 `batch-release-gate-v1.json` and `persistent-consumer-v9.json`; its symmetric
-run-ID uses the v3 domain and binds canonical V1, existing provenance/invocation
+run-ID uses the v4 domain and binds canonical V1, existing provenance/invocation
 fields, and the canonical full V9 claims preimage whose only replacement is
 `run_id_sha256 = sha256:` plus 64 zeroes—not final self-containing V9 bytes.
 The command digest orders backing path, alias, backing SHA-256, u16-BE
-executable mode, then argv. Run-ID v3 retains its pre-existing 16 provenance
-bindings, ending alias, backing path, backing SHA-256, `cargo_profile`, and
-`opt_level`; it then binds u16-BE mode before the existing
+executable mode, then argv. Run-ID v4 binds 20 ordered provenance strings: the
+prior 16 ending alias, backing path, backing SHA-256, `cargo_profile`, and
+`opt_level`, plus the fs-verity snapshot path, commitment, device, and inode.
+It then binds u16-BE mode before the existing
 V1/V9/argv/recipe/canonical-V1/claims-preimage material. The pair cannot be
 transplanted. The downstream wrapper consumes that pair
 with a fresh target distinct from the producer target. Its Python parent retains the

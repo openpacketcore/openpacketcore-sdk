@@ -293,6 +293,10 @@ struct ReleaseEvidenceArtifact {
 #[serde(deny_unknown_fields)]
 struct ReleaseEvidenceExecution {
     cargo_target_dir_id: String,
+    fs_verity_snapshot_base_id: String,
+    fs_verity_snapshot_root_id: String,
+    fs_verity_snapshot_root_device: u64,
+    fs_verity_snapshot_root_inode: u64,
     current_exe_relative_to_target_id: String,
     current_exe_sha256: String,
     current_exe_device: u64,
@@ -1602,6 +1606,19 @@ async fn fixed_cluster(
     Vec<std::path::PathBuf>,
     Vec<Arc<ScopedLoopbackPeer>>,
 ) {
+    fixed_cluster_with_snapshot_root(directory, directory, clock).await
+}
+
+async fn fixed_cluster_with_snapshot_root(
+    directory: &Path,
+    snapshot_root: &Path,
+    clock: Arc<dyn Clock>,
+) -> (
+    Vec<ConsensusSessionStore>,
+    Vec<std::path::PathBuf>,
+    Vec<std::path::PathBuf>,
+    Vec<Arc<ScopedLoopbackPeer>>,
+) {
     let placement_policy = PlacementResiliencePolicy::default();
     let members = members();
     let identity = fixed_identity(&members, placement_policy);
@@ -1616,7 +1633,7 @@ async fn fixed_cluster(
         .map(|index| directory.join(format!("voter-{index}.sqlite")))
         .collect::<Vec<_>>();
     let snapshot_paths = (0..VOTERS)
-        .map(|index| directory.join(format!("snapshots-{index}")))
+        .map(|index| snapshot_root.join(format!("snapshots-{index}")))
         .collect::<Vec<_>>();
     let mut paths = BTreeMap::new();
     for source in 0..VOTERS {
@@ -1666,6 +1683,195 @@ async fn fixed_cluster(
     }
     let peer_slots = paths.into_values().collect();
     (stores, database_paths, snapshot_paths, peer_slots)
+}
+
+const FS_VERITY_QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
+const FS_VERITY_SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+
+fn release_fs_verity_snapshot_root_from_environment(
+    qualification: Option<&OsStr>,
+    snapshot_root: Option<&OsStr>,
+    expected_path_id: &str,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<PathBuf, &'static str> {
+    if qualification != Some(OsStr::new("required")) {
+        return Err("release qualification requires the fixed fs-verity marker");
+    }
+    let requested_snapshot_root = snapshot_root
+        .map(|value| (value.as_encoded_bytes().to_vec(), PathBuf::from(value)))
+        .ok_or("release qualification requires an fs-verity snapshot root")?;
+    let requested_snapshot_root_bytes = requested_snapshot_root.0;
+    let requested_snapshot_root = requested_snapshot_root.1;
+    if !requested_snapshot_root.is_absolute() {
+        return Err("release fs-verity snapshot root must be absolute");
+    }
+    let snapshot_metadata = std::fs::symlink_metadata(&requested_snapshot_root)
+        .map_err(|_| "release fs-verity snapshot root is unavailable")?;
+    if snapshot_metadata.file_type().is_symlink() || !snapshot_metadata.is_dir() {
+        return Err("release fs-verity snapshot root is not a directory");
+    }
+    #[cfg(unix)]
+    if snapshot_metadata.uid() != nix::unistd::Uid::current().as_raw()
+        || snapshot_metadata.permissions().mode() & 0o7777 != 0o700
+    {
+        return Err("release fs-verity snapshot root is not owner-private");
+    }
+    #[cfg(not(unix))]
+    return Err("release fs-verity qualification requires Unix private-directory checks");
+    let snapshot_root = std::fs::canonicalize(&requested_snapshot_root)
+        .map_err(|_| "release fs-verity snapshot root is not canonical")?;
+    if snapshot_root != requested_snapshot_root
+        || snapshot_root.as_os_str().as_encoded_bytes() != requested_snapshot_root_bytes
+        || !is_sha256_path_id(expected_path_id)
+        || expected_device == 0
+        || expected_inode == 0
+        || redacted_path_id(&snapshot_root) != expected_path_id
+        || snapshot_metadata.dev() != expected_device
+        || snapshot_metadata.ino() != expected_inode
+    {
+        return Err("release fs-verity snapshot root is not the attested wrapper-owned namespace");
+    }
+    Ok(snapshot_root)
+}
+
+fn required_release_fs_verity_snapshot_root(execution: &ReleaseEvidenceExecution) -> PathBuf {
+    release_fs_verity_snapshot_root_from_environment(
+        std::env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref(),
+        std::env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV).as_deref(),
+        &execution.fs_verity_snapshot_root_id,
+        execution.fs_verity_snapshot_root_device,
+        execution.fs_verity_snapshot_root_inode,
+    )
+    .expect("release qualification requires the attested wrapper-owned fs-verity snapshot root")
+}
+
+#[cfg(unix)]
+#[test]
+fn release_snapshot_root_requires_the_private_attested_identity() {
+    let workspace = tempfile::tempdir().expect("snapshot-root workspace");
+    let snapshot_root = workspace.path().join("snapshot-root");
+    std::fs::create_dir(&snapshot_root).expect("create snapshot root");
+    std::fs::set_permissions(&snapshot_root, std::fs::Permissions::from_mode(0o700))
+        .expect("private snapshot root");
+    let metadata = std::fs::metadata(&snapshot_root).expect("snapshot metadata");
+    let expected_id = redacted_path_id(&snapshot_root);
+
+    assert_eq!(
+        release_fs_verity_snapshot_root_from_environment(
+            Some(OsStr::new("required")),
+            Some(snapshot_root.as_os_str()),
+            &expected_id,
+            metadata.dev(),
+            metadata.ino(),
+        )
+        .expect("accept attested wrapper snapshot child"),
+        std::fs::canonicalize(&snapshot_root).expect("canonical snapshot root")
+    );
+    assert!(release_fs_verity_snapshot_root_from_environment(
+        Some(OsStr::new("required")),
+        Some(workspace.path().as_os_str()),
+        &expected_id,
+        metadata.dev(),
+        metadata.ino(),
+    )
+    .is_err());
+    assert!(release_fs_verity_snapshot_root_from_environment(
+        Some(OsStr::new("hostile")),
+        Some(snapshot_root.as_os_str()),
+        &expected_id,
+        metadata.dev(),
+        metadata.ino(),
+    )
+    .is_err());
+    assert!(release_fs_verity_snapshot_root_from_environment(
+        Some(OsStr::new("required")),
+        Some(snapshot_root.as_os_str()),
+        &expected_id,
+        metadata.dev(),
+        metadata.ino().saturating_add(1),
+    )
+    .is_err());
+    let aliased = OsString::from(format!("{}/.", snapshot_root.display()));
+    assert!(release_fs_verity_snapshot_root_from_environment(
+        Some(OsStr::new("required")),
+        Some(aliased.as_os_str()),
+        &expected_id,
+        metadata.dev(),
+        metadata.ino(),
+    )
+    .is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_snapshot_child_must_join_the_live_v9_shared_base() {
+    let workspace = tempfile::tempdir().expect("shared fs-verity base workspace");
+    let base = workspace.path().join("fs-verity-base");
+    std::fs::create_dir(&base).expect("create shared fs-verity base");
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+        .expect("make shared fs-verity base private");
+    let child = base.join("sdk702-release-snapshots-test");
+    std::fs::create_dir(&child).expect("create wrapper snapshot child");
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700))
+        .expect("make wrapper snapshot child private");
+    let canonical_base = base.canonicalize().expect("canonical shared base");
+    let canonical_child = child.canonicalize().expect("canonical wrapper child");
+    let base_metadata = std::fs::metadata(&canonical_base).expect("stat shared base");
+    let child_metadata = std::fs::metadata(&canonical_child).expect("stat wrapper child");
+    let mut execution = release_evidence_test_fixture().execution;
+    execution.fs_verity_snapshot_base_id = redacted_path_id(&canonical_base);
+    execution.fs_verity_snapshot_root_id = redacted_path_id(&canonical_child);
+    execution.fs_verity_snapshot_root_device = child_metadata.dev();
+    execution.fs_verity_snapshot_root_inode = child_metadata.ino();
+    let source = release_evidence_test_fixture().source;
+    let mut bindings = process_loss_v9_test_fixture(&source).bindings;
+    let base_text = canonical_base
+        .to_str()
+        .expect("UTF-8 shared fs-verity base")
+        .to_owned();
+    bindings.fs_verity_snapshot_root_directory = base_text.clone();
+    bindings.fs_verity_snapshot_root_directory_sha256 = process_loss_path_commitment(
+        b"opc-session-ha-persistent-consumer-v9-fs-verity-snapshot-root/v1\0",
+        b"canonical-fs-verity-snapshot-root",
+        &base_text,
+    )
+    .expect("shared-base commitment");
+    bindings.fs_verity_snapshot_root_device = base_metadata.dev();
+    bindings.fs_verity_snapshot_root_inode = base_metadata.ino();
+    assert!(validate_shared_fs_verity_snapshot_base_for_child(
+        &canonical_child,
+        &execution,
+        &bindings,
+    )
+    .is_ok());
+
+    let mut mismatched_base = execution.clone();
+    mismatched_base.fs_verity_snapshot_base_id = redacted_path_id(&canonical_child);
+    assert!(validate_shared_fs_verity_snapshot_base_for_child(
+        &canonical_child,
+        &mismatched_base,
+        &bindings,
+    )
+    .is_err());
+
+    std::fs::rename(&base, workspace.path().join("replaced-base-original"))
+        .expect("replace shared base pathname");
+    std::fs::create_dir(&base).expect("create replacement base");
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+        .expect("make replacement base private");
+    let replacement_child = base.join("sdk702-release-snapshots-test");
+    std::fs::create_dir(&replacement_child).expect("create replacement wrapper child");
+    std::fs::set_permissions(&replacement_child, std::fs::Permissions::from_mode(0o700))
+        .expect("make replacement wrapper child private");
+    assert!(validate_shared_fs_verity_snapshot_base_for_child(
+        &replacement_child
+            .canonicalize()
+            .expect("canonical replacement child"),
+        &execution,
+        &bindings,
+    )
+    .is_err());
 }
 
 async fn shutdown_fixed_cluster(
@@ -4321,7 +4527,7 @@ fn require_release_qualification_profile() -> QualificationBuildProfile {
     profile
 }
 
-const RELEASE_EVIDENCE_MAX_BYTES: usize = 16 * 1024;
+const RELEASE_EVIDENCE_MAX_BYTES: usize = 128 * 1024;
 const RELEASE_BUILD_ATTESTATION_MAX_BYTES: usize = 16 * 1024;
 const RELEASE_EVIDENCE_RECIPE_MAX_BYTES: usize = 1_024;
 const RELEASE_GIT_STDOUT_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -4330,7 +4536,7 @@ const RELEASE_GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const RELEASE_GIT_COMMAND_TERMINATE_GRACE: Duration = Duration::from_millis(250);
 const RELEASE_EXECUTABLE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 static RELEASE_EVIDENCE_TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-const RELEASE_EVIDENCE_REQUIRED_REPRODUCTION_RECIPE: &str = "/usr/bin/python3 ci/sdk702-release-attest.py --cargo <absolute-trusted-cargo> --target-dir <absent-absolute-external-target> --attestation-namespace <absent-absolute-external-namespace> --evidence <absent-absolute-external-namespace> --process-loss-evidence <absolute-external-testkit-v9-json> --lease <absolute-external-lock-file>";
+const RELEASE_EVIDENCE_REQUIRED_REPRODUCTION_RECIPE: &str = "OPC_FS_VERITY_QUALIFICATION=required OPC_FS_VERITY_SNAPSHOT_ROOT=<existing-absolute-external-fs-verity-root> /usr/bin/python3 ci/sdk702-release-attest.py --cargo <absolute-trusted-cargo> --target-dir <absent-absolute-external-target> --snapshot-root <existing-absolute-external-fs-verity-root> --attestation-namespace <absent-absolute-external-namespace> --evidence <absent-absolute-external-namespace> --process-loss-evidence <absolute-external-testkit-v9-json> --lease <absolute-external-lock-file>";
 const RELEASE_EVIDENCE_LIBTEST_ARGS: [&str; 4] = [
     "--ignored",
     "--exact",
@@ -4339,8 +4545,9 @@ const RELEASE_EVIDENCE_LIBTEST_ARGS: [&str; 4] = [
 ];
 const RELEASE_EVIDENCE_EXISTING_ARTIFACT_VALIDATION_RECIPE: &str = "OPC_QUAL_EVIDENCE_VALIDATE=<absolute-external-evidence-namespace> CARGO_TARGET_DIR=<absolute-external-target> cargo test --locked -p opc-session-store --release --test fenced_transition_v2_qualification -- --ignored --exact validate_existing_release_evidence_artifact --nocapture";
 const PROCESS_LOSS_V9_SCHEMA_SHA256: &str =
-    "sha256:ecb42383a02a4704988139aafe2f59dfb95988b1e57cdaf05438a664500f2b41";
+    "sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018";
 const PROCESS_LOSS_V9_PAIR_DIRECTORY: &str = "session-ha-persistent-consumer-v9";
+const PROCESS_LOSS_REPRODUCTION_COMMAND_MAX_CHARS: usize = 16 * 1024;
 const PROCESS_LOSS_CANONICAL_CARGO_ARGV: [&str; 15] = [
     "cargo",
     "test",
@@ -4368,10 +4575,11 @@ const PROCESS_LOSS_V1_EVIDENCE_SCHEMA: &str = include_str!(
 );
 const PROCESS_LOSS_V9_PRODUCER_SOURCE: &str =
     include_str!("../../opc-session-testkit/tests/qualification_mtls_multiprocess.rs");
-const PROCESS_LOSS_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
+const PROCESS_LOSS_V9_EVIDENCE_MAX_BYTES: usize = 128 * 1024;
+const PROCESS_LOSS_V1_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
 const PROCESS_LOSS_V1_LEAF: &str = "batch-release-gate-v1.json";
 const PROCESS_LOSS_V9_LEAF: &str = "persistent-consumer-v9.json";
-const RELEASE_BUILD_ATTESTATION_KIND: &str = "sdk702_trusted_release_attestation_wrapper/v1";
+const RELEASE_BUILD_ATTESTATION_KIND: &str = "sdk702_trusted_release_attestation_wrapper/v2";
 const RELEASE_BUILD_ATTESTATION_LEAF: &str = "sdk702-release-build-attestation.json";
 const QUALIFICATION_WRAPPER_LEASE_PIN_DOMAIN: &str =
     "sdk702_trusted_release_attestation_wrapper/lease-procfd/v1";
@@ -5078,6 +5286,10 @@ struct ReleaseBuildAttestation {
     cargo_lock_sha256: String,
     release_schema_sha256: String,
     cargo_target_dir_id: String,
+    fs_verity_snapshot_base_id: String,
+    fs_verity_snapshot_root_id: String,
+    fs_verity_snapshot_root_device: u64,
+    fs_verity_snapshot_root_inode: u64,
     executable_sha256: String,
     executable_device: u64,
     executable_inode: u64,
@@ -5137,6 +5349,10 @@ fn validate_release_build_attestation(
         || attestation.cargo_lock_sha256 != provenance.runtime_cargo_lock_sha256
         || attestation.release_schema_sha256 != provenance.compiled_schema_sha256
         || attestation.cargo_target_dir_id != redacted_path_id(target_dir)
+        || !is_sha256_path_id(&attestation.fs_verity_snapshot_base_id)
+        || !is_sha256_path_id(&attestation.fs_verity_snapshot_root_id)
+        || attestation.fs_verity_snapshot_root_device == 0
+        || attestation.fs_verity_snapshot_root_inode == 0
         || attestation.executable_sha256 != executable_sha256
         || attestation.executable_device != executable_identity.device
         || attestation.executable_inode != executable_identity.inode
@@ -5229,7 +5445,7 @@ fn required_release_build_attestation(
     executable_sha256: &str,
     executable_identity: EvidenceArtifactIdentity,
     observed_libtest_argv: &[String],
-) -> Result<(PathBuf, String), &'static str> {
+) -> Result<(PathBuf, String, ReleaseBuildAttestation), &'static str> {
     let supplied = PathBuf::from(
         std::env::var_os("OPC_QUAL_BUILD_ATTESTATION")
             .ok_or("OPC_QUAL_BUILD_ATTESTATION must name trusted wrapper output")?,
@@ -5274,7 +5490,11 @@ fn required_release_build_attestation(
         executable_identity,
         observed_libtest_argv,
     )?;
-    Ok((canonical_path, format!("{:x}", Sha256::digest(encoded))))
+    Ok((
+        canonical_path,
+        format!("{:x}", Sha256::digest(encoded)),
+        attestation,
+    ))
 }
 
 fn release_evidence_execution_identity(
@@ -5327,7 +5547,7 @@ fn release_evidence_execution_identity(
     }
     let (executable_sha256, executable_identity) =
         hash_pinned_regular_file_streaming(&mut executable, RELEASE_EXECUTABLE_MAX_BYTES)?;
-    let (attestation_path, attestation_sha256) = required_release_build_attestation(
+    let (attestation_path, attestation_sha256, attestation) = required_release_build_attestation(
         provenance,
         &target_dir,
         evidence_namespace,
@@ -5339,9 +5559,20 @@ fn release_evidence_execution_identity(
     if !enabled_features.is_empty() {
         return Err("exact release reproduction recipe enables no store features");
     }
+    release_fs_verity_snapshot_root_from_environment(
+        std::env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref(),
+        std::env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV).as_deref(),
+        &attestation.fs_verity_snapshot_root_id,
+        attestation.fs_verity_snapshot_root_device,
+        attestation.fs_verity_snapshot_root_inode,
+    )?;
     Ok((
         ReleaseEvidenceExecution {
             cargo_target_dir_id: redacted_path_id(&target_dir),
+            fs_verity_snapshot_base_id: attestation.fs_verity_snapshot_base_id,
+            fs_verity_snapshot_root_id: attestation.fs_verity_snapshot_root_id,
+            fs_verity_snapshot_root_device: attestation.fs_verity_snapshot_root_device,
+            fs_verity_snapshot_root_inode: attestation.fs_verity_snapshot_root_inode,
             current_exe_relative_to_target_id: redacted_path_id(relative),
             current_exe_sha256: executable_sha256,
             current_exe_device: executable_identity.device,
@@ -6210,6 +6441,10 @@ struct ProcessLossCompanionBindings {
     cargo_target_directory_sha256: String,
     evidence_root_directory: String,
     evidence_root_directory_sha256: String,
+    fs_verity_snapshot_root_directory: String,
+    fs_verity_snapshot_root_directory_sha256: String,
+    fs_verity_snapshot_root_device: u64,
+    fs_verity_snapshot_root_inode: u64,
     pair_directory: String,
     pair_directory_sha256: String,
 }
@@ -6317,19 +6552,22 @@ fn process_loss_shell_quote(value: &str) -> String {
 fn process_loss_v9_reproduction_command(
     target: &str,
     root: &str,
+    snapshot_root: &str,
     cargo_alias: &str,
 ) -> Result<String, &'static str> {
     if !process_loss_canonical_absolute_path(target)
         || !process_loss_canonical_absolute_path(root)
+        || !process_loss_canonical_absolute_path(snapshot_root)
         || !process_loss_canonical_absolute_path(cargo_alias)
     {
         return Err("V9 reproduction command path is not canonical");
     }
     let mut command = format!(
-        "CARGO={} CARGO_TARGET_DIR={} OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY={} {}",
+        "CARGO={} CARGO_TARGET_DIR={} OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY={} OPC_FS_VERITY_QUALIFICATION='required' OPC_FS_VERITY_SNAPSHOT_ROOT={} {}",
         process_loss_shell_quote(cargo_alias),
         process_loss_shell_quote(target),
         process_loss_shell_quote(root),
+        process_loss_shell_quote(snapshot_root),
         process_loss_shell_quote(cargo_alias),
     );
     for argument in PROCESS_LOSS_CANONICAL_CARGO_ARGV.iter().skip(1) {
@@ -6349,6 +6587,8 @@ fn process_loss_reproduction_command_has_canonical_argv(command: &str) -> bool {
     command.starts_with("CARGO='")
         && command.contains("' CARGO_TARGET_DIR='")
         && command.contains("' OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY='")
+        && command
+            .contains("' OPC_FS_VERITY_QUALIFICATION='required' OPC_FS_VERITY_SNAPSHOT_ROOT='")
         && command.ends_with(&format!(" {expected_tail}"))
 }
 
@@ -6474,7 +6714,7 @@ fn strict_decode_process_loss_companion(
     encoded: &[u8],
     expected_source: &ReleaseEvidenceSource,
 ) -> Result<ProcessLossCompanionEvidence, &'static str> {
-    if encoded.len() > PROCESS_LOSS_EVIDENCE_MAX_BYTES {
+    if encoded.len() > PROCESS_LOSS_V9_EVIDENCE_MAX_BYTES {
         return Err("testkit process-loss companion exceeds its bounded decoder limit");
     }
     let evidence: ProcessLossCompanionEvidence =
@@ -6520,7 +6760,8 @@ fn strict_decode_process_loss_companion(
                 .map(|argument| (*argument).to_owned())
                 .collect::<Vec<_>>()
         || evidence.invocation.reproduction_command.is_empty()
-        || evidence.invocation.reproduction_command.len() > 16 * 1024
+        || evidence.invocation.reproduction_command.chars().count()
+            > PROCESS_LOSS_REPRODUCTION_COMMAND_MAX_CHARS
         || evidence.bindings.v9_schema_sha256 != expected_schema_sha256
         || [
             &evidence.bindings.harness_sha256,
@@ -6529,12 +6770,18 @@ fn strict_decode_process_loss_companion(
             &evidence.bindings.v1_canonical_sha256,
             &evidence.bindings.cargo_target_directory_sha256,
             &evidence.bindings.evidence_root_directory_sha256,
+            &evidence.bindings.fs_verity_snapshot_root_directory_sha256,
             &evidence.bindings.pair_directory_sha256,
         ]
         .into_iter()
         .any(|digest| !is_sha256_path_id(digest))
         || !process_loss_canonical_absolute_path(&evidence.bindings.cargo_target_directory)
         || !process_loss_canonical_absolute_path(&evidence.bindings.evidence_root_directory)
+        || !process_loss_canonical_absolute_path(
+            &evidence.bindings.fs_verity_snapshot_root_directory,
+        )
+        || evidence.bindings.fs_verity_snapshot_root_device == 0
+        || evidence.bindings.fs_verity_snapshot_root_inode == 0
         || !process_loss_canonical_absolute_path(&evidence.bindings.pair_directory)
         || evidence.process_ledger.initial_processes != 3
         || evidence.process_ledger.unclean_process_losses != 2
@@ -6603,6 +6850,12 @@ fn strict_decode_process_loss_companion(
                 b"canonical-evidence-root",
                 &evidence.bindings.evidence_root_directory,
             )?
+        || evidence.bindings.fs_verity_snapshot_root_directory_sha256
+            != process_loss_path_commitment(
+                b"opc-session-ha-persistent-consumer-v9-fs-verity-snapshot-root/v1\0",
+                b"canonical-fs-verity-snapshot-root",
+                &evidence.bindings.fs_verity_snapshot_root_directory,
+            )?
         || evidence.bindings.pair_directory
             != process_loss_v9_pair_directory(&evidence.bindings.evidence_root_directory)?
         || evidence.bindings.pair_directory_sha256
@@ -6615,6 +6868,7 @@ fn strict_decode_process_loss_companion(
             != process_loss_v9_reproduction_command(
                 &evidence.bindings.cargo_target_directory,
                 &evidence.bindings.evidence_root_directory,
+                &evidence.bindings.fs_verity_snapshot_root_directory,
                 &evidence.invocation.cargo_executable_alias,
             )?
     {
@@ -6691,7 +6945,9 @@ fn v1_v9_pair_run_id(
         .and_then(serde_json::Value::as_str)
         .ok_or("testkit V1/V9 opt level is absent")?;
     let mut hasher = Sha256::new();
-    hasher.update(b"opc-session-ha-persistent-consumer-v9-pair-run/v3\0");
+    hasher.update(b"opc-session-ha-persistent-consumer-v9-pair-run/v4\0");
+    let fs_verity_snapshot_root_device = v9.bindings.fs_verity_snapshot_root_device.to_string();
+    let fs_verity_snapshot_root_inode = v9.bindings.fs_verity_snapshot_root_inode.to_string();
     for value in [
         v1_pair_binding(v1, "source_revision")?,
         v1_pair_binding(v1, "source_tree")?,
@@ -6701,6 +6957,10 @@ fn v1_v9_pair_run_id(
         &v9.bindings.cargo_target_directory_sha256,
         &v9.bindings.evidence_root_directory,
         &v9.bindings.evidence_root_directory_sha256,
+        &v9.bindings.fs_verity_snapshot_root_directory,
+        &v9.bindings.fs_verity_snapshot_root_directory_sha256,
+        fs_verity_snapshot_root_device.as_str(),
+        fs_verity_snapshot_root_inode.as_str(),
         &v9.bindings.pair_directory,
         &v9.bindings.pair_directory_sha256,
         v1_pair_binding(v1, "command_argv_sha256")?,
@@ -6790,7 +7050,7 @@ fn strict_decode_canonical_json_value(
 fn strict_decode_process_loss_v1(encoded: &[u8]) -> Result<serde_json::Value, &'static str> {
     let value = strict_decode_canonical_json_value(
         encoded,
-        PROCESS_LOSS_EVIDENCE_MAX_BYTES,
+        PROCESS_LOSS_V1_EVIDENCE_MAX_BYTES,
         "testkit V1 process-loss companion",
     )?;
     let v1_schema: serde_json::Value = serde_json::from_str(PROCESS_LOSS_V1_EVIDENCE_SCHEMA)
@@ -6829,6 +7089,29 @@ fn strict_process_loss_pair_target_topology(
     ) {
         return Err("V9 producer Cargo target overlaps the wrapper Cargo target");
     }
+    let producer_snapshot_root_directory =
+        process_loss_canonical_path_at(Path::new(&v9.bindings.fs_verity_snapshot_root_directory))?;
+    let producer_snapshot_root_metadata = std::fs::metadata(&producer_snapshot_root_directory)
+        .map_err(|_| "stat V9 producer fs-verity snapshot root")?;
+    if producer_snapshot_root_directory != v9.bindings.fs_verity_snapshot_root_directory
+        || producer_snapshot_root_metadata.uid() != nix::unistd::Uid::current().as_raw()
+        || producer_snapshot_root_metadata.mode() & 0o7777 != 0o700
+        || producer_snapshot_root_metadata.dev() != v9.bindings.fs_verity_snapshot_root_device
+        || producer_snapshot_root_metadata.ino() != v9.bindings.fs_verity_snapshot_root_inode
+    {
+        return Err("V9 producer fs-verity snapshot root is not its recorded private identity");
+    }
+    if [
+        Path::new(&wrapper_target_directory),
+        Path::new(&producer_target_directory),
+        evidence_root_directory,
+        pair_directory,
+    ]
+    .into_iter()
+    .any(|path| paths_overlap(path, Path::new(&producer_snapshot_root_directory)))
+    {
+        return Err("V9 producer fs-verity snapshot root overlaps an unrelated namespace");
+    }
 
     let pair_metadata =
         std::fs::metadata(pair_directory).map_err(|_| "stat V9 process-loss pair directory")?;
@@ -6843,6 +7126,7 @@ fn strict_process_loss_pair_target_topology(
     for path in [
         Path::new(&wrapper_target_directory),
         Path::new(&producer_target_directory),
+        Path::new(&producer_snapshot_root_directory),
         pair_directory,
         evidence_root_directory,
     ] {
@@ -6909,6 +7193,7 @@ fn strict_decode_process_loss_pair(
             != process_loss_v9_reproduction_command(
                 &producer_target_directory,
                 &evidence_root_directory,
+                &v9.bindings.fs_verity_snapshot_root_directory,
                 &v9.invocation.cargo_executable_alias,
             )?
         || v9.bindings.v1_canonical_sha256 != format!("sha256:{:x}", Sha256::digest(v1_encoded))
@@ -6932,6 +7217,7 @@ fn strict_decode_process_loss_pair(
 
 struct PinnedProcessLossCompanion {
     evidence: ReleaseEvidenceProcessLoss,
+    companion: ProcessLossCompanionEvidence,
     producer_target_directory: PathBuf,
     producer_evidence_root_directory: PathBuf,
     canonical_parent: PathBuf,
@@ -6949,6 +7235,7 @@ struct PinnedProcessLossCompanion {
 
 fn required_wrapper_process_loss_identity(
     prefix: &str,
+    maximum: usize,
 ) -> Result<(String, EvidenceArtifactIdentity), &'static str> {
     let variable = |suffix: &str| format!("OPC_QUAL_PROCESS_LOSS_{}_{}", prefix, suffix);
     let digest = std::env::var(variable("SHA256"))
@@ -6965,11 +7252,7 @@ fn required_wrapper_process_loss_identity(
         .map_err(|_| "trusted wrapper must provide process-loss descriptor size")?
         .parse::<u64>()
         .map_err(|_| "trusted wrapper process-loss size is invalid")?;
-    if !is_lower_hex_exact(&digest, 64)
-        || device == 0
-        || inode == 0
-        || size > PROCESS_LOSS_EVIDENCE_MAX_BYTES as u64
-    {
+    if !is_lower_hex_exact(&digest, 64) || device == 0 || inode == 0 || size > maximum as u64 {
         return Err("trusted wrapper process-loss descriptor identity is invalid");
     }
     Ok((
@@ -7080,7 +7363,7 @@ fn required_process_loss_companion(
     let (bytes, identity) = read_bounded_current_user_private_regular_file_with_identity(
         &parent,
         &leaf,
-        PROCESS_LOSS_EVIDENCE_MAX_BYTES,
+        PROCESS_LOSS_V9_EVIDENCE_MAX_BYTES,
         "process-loss companion",
     )
     .expect("read bounded no-follow process-loss companion");
@@ -7088,14 +7371,16 @@ fn required_process_loss_companion(
     let (v1_bytes, v1_identity) = read_bounded_current_user_private_regular_file_with_identity(
         &parent,
         &v1_leaf,
-        PROCESS_LOSS_EVIDENCE_MAX_BYTES,
+        PROCESS_LOSS_V1_EVIDENCE_MAX_BYTES,
         "process-loss V1 pair companion",
     )
     .expect("read bounded no-follow process-loss V1 pair companion");
-    let (wrapper_sha256, wrapper_identity) = required_wrapper_process_loss_identity("EVIDENCE")
-        .expect("trusted wrapper process-loss descriptor identity");
-    let (wrapper_v1_sha256, wrapper_v1_identity) = required_wrapper_process_loss_identity("V1")
-        .expect("trusted wrapper process-loss V1 descriptor identity");
+    let (wrapper_sha256, wrapper_identity) =
+        required_wrapper_process_loss_identity("EVIDENCE", PROCESS_LOSS_V9_EVIDENCE_MAX_BYTES)
+            .expect("trusted wrapper process-loss descriptor identity");
+    let (wrapper_v1_sha256, wrapper_v1_identity) =
+        required_wrapper_process_loss_identity("V1", PROCESS_LOSS_V1_EVIDENCE_MAX_BYTES)
+            .expect("trusted wrapper process-loss V1 descriptor identity");
     assert_eq!(
         identity, wrapper_identity,
         "process-loss leaf changed after wrapper pinning"
@@ -7131,6 +7416,7 @@ fn required_process_loss_companion(
     let bound = release_process_loss_binding(&path, &bytes, &companion);
     PinnedProcessLossCompanion {
         evidence: bound,
+        companion,
         producer_target_directory,
         producer_evidence_root_directory,
         canonical_parent,
@@ -7147,12 +7433,73 @@ fn required_process_loss_companion(
     }
 }
 
+/// Bind the wrapper-created snapshot child back to the one stable fs-verity
+/// base captured by the independently validated V9 producer. The child has a
+/// distinct inode; its direct parent is the intentionally shared authority.
+fn validate_shared_fs_verity_snapshot_base(
+    execution: &ReleaseEvidenceExecution,
+    process_loss: &PinnedProcessLossCompanion,
+) -> Result<(), &'static str> {
+    let snapshot_child = release_fs_verity_snapshot_root_from_environment(
+        std::env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref(),
+        std::env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV).as_deref(),
+        &execution.fs_verity_snapshot_root_id,
+        execution.fs_verity_snapshot_root_device,
+        execution.fs_verity_snapshot_root_inode,
+    )?;
+    validate_shared_fs_verity_snapshot_base_for_child(
+        &snapshot_child,
+        execution,
+        &process_loss.companion.bindings,
+    )
+}
+
+fn validate_shared_fs_verity_snapshot_base_for_child(
+    snapshot_child: &Path,
+    execution: &ReleaseEvidenceExecution,
+    bindings: &ProcessLossCompanionBindings,
+) -> Result<(), &'static str> {
+    let snapshot_base = snapshot_child
+        .parent()
+        .ok_or("wrapper fs-verity snapshot child has no stable base")?
+        .canonicalize()
+        .map_err(|_| "wrapper fs-verity snapshot base is not canonical")?;
+    let base_metadata = std::fs::symlink_metadata(&snapshot_base)
+        .map_err(|_| "stat wrapper fs-verity snapshot base")?;
+    let snapshot_base_text = snapshot_base
+        .to_str()
+        .ok_or("wrapper fs-verity snapshot base is not UTF-8")?;
+    let snapshot_base_commitment = process_loss_path_commitment(
+        b"opc-session-ha-persistent-consumer-v9-fs-verity-snapshot-root/v1\0",
+        b"canonical-fs-verity-snapshot-root",
+        snapshot_base_text,
+    )?;
+    if snapshot_base == snapshot_child
+        || base_metadata.file_type().is_symlink()
+        || !base_metadata.is_dir()
+        || base_metadata.uid() != nix::unistd::Uid::current().as_raw()
+        || base_metadata.mode() & 0o7777 != 0o700
+        || redacted_path_id(&snapshot_base) != execution.fs_verity_snapshot_base_id
+        || snapshot_base_text != bindings.fs_verity_snapshot_root_directory
+        || snapshot_base_commitment != bindings.fs_verity_snapshot_root_directory_sha256
+        || base_metadata.dev() != bindings.fs_verity_snapshot_root_device
+        || base_metadata.ino() != bindings.fs_verity_snapshot_root_inode
+    {
+        return Err("wrapper fs-verity snapshot base does not bind the V9 shared root");
+    }
+    Ok(())
+}
+
 /// The testkit producer publishes one intentionally nested root/pair/leaves
-/// hierarchy.  Check that root against every *unrelated* wrapper namespace
-/// and their canonical parents without comparing it to its own pair/leaves.
+/// hierarchy. Check that root against every actual *unrelated* wrapper
+/// namespace without comparing it to its own pair/leaves. Canonical parents
+/// are authority boundaries checked against the protected roots, but they are
+/// not occupied wrapper namespaces: disjoint leaves may share one external
+/// parent with the producer.
 fn validate_process_loss_root_external_topology_before_mkdir(
     producer_root: &Path,
-    unrelated_paths_and_parents: &[(&Path, &str)],
+    unrelated_namespaces: &[(&Path, &str)],
+    unrelated_parents: &[(&Path, &str)],
     repository_root: &Path,
     gitdir: &Path,
     common_gitdir: &Path,
@@ -7165,20 +7512,22 @@ fn validate_process_loss_root_external_topology_before_mkdir(
             return Err("V9 producer evidence root overlaps a protected Git boundary");
         }
     }
-    for (path, label) in unrelated_paths_and_parents {
+    for (path, label) in unrelated_namespaces.iter().chain(unrelated_parents) {
         if !path.is_absolute() {
             let _ = label;
             return Err("V9 producer evidence external path is not absolute");
-        }
-        if paths_overlap(producer_root, path) {
-            let _ = label;
-            return Err("V9 producer evidence root overlaps an unrelated external namespace");
         }
         for protected in [repository_root, gitdir, common_gitdir] {
             if paths_overlap(path, protected) {
                 let _ = label;
                 return Err("V9 producer evidence external path overlaps a protected Git boundary");
             }
+        }
+    }
+    for (path, label) in unrelated_namespaces {
+        if paths_overlap(producer_root, path) {
+            let _ = label;
+            return Err("V9 producer evidence root overlaps an unrelated external namespace");
         }
     }
     Ok(())
@@ -7209,13 +7558,13 @@ fn revalidate_pinned_process_loss_companion(
     let (bytes, identity) = read_bounded_current_user_private_regular_file_with_identity(
         &pinned.parent,
         &pinned.leaf,
-        PROCESS_LOSS_EVIDENCE_MAX_BYTES,
+        PROCESS_LOSS_V9_EVIDENCE_MAX_BYTES,
         "process-loss companion revalidation",
     )?;
     let (v1_bytes, v1_identity) = read_bounded_current_user_private_regular_file_with_identity(
         &pinned.parent,
         &pinned.v1_leaf,
-        PROCESS_LOSS_EVIDENCE_MAX_BYTES,
+        PROCESS_LOSS_V1_EVIDENCE_MAX_BYTES,
         "process-loss V1 pair revalidation",
     )?;
     if identity != pinned.identity || format!("{:x}", Sha256::digest(&bytes)) != pinned.sha256 {
@@ -7305,20 +7654,22 @@ fn required_release_evidence_artifact(
         &process_loss.producer_evidence_root_directory,
         &[
             (&target_dir, "CARGO_TARGET_DIR"),
+            (&canonical_namespace, "OPC_QUAL_EVIDENCE"),
+            (&build_attestation_path, "OPC_QUAL_BUILD_ATTESTATION"),
+            (&lease_path, "OPC_QUAL_LEASE"),
+        ],
+        &[
             (
                 target_dir.parent().expect("CARGO_TARGET_DIR has a parent"),
                 "CARGO_TARGET_DIR parent",
             ),
-            (&canonical_namespace, "OPC_QUAL_EVIDENCE"),
             (&canonical_parent, "OPC_QUAL_EVIDENCE parent"),
-            (&build_attestation_path, "OPC_QUAL_BUILD_ATTESTATION"),
             (
                 build_attestation_path
                     .parent()
                     .expect("build attestation has a parent"),
                 "OPC_QUAL_BUILD_ATTESTATION parent",
             ),
-            (&lease_path, "OPC_QUAL_LEASE"),
             (
                 lease_path.parent().expect("lease has a parent"),
                 "OPC_QUAL_LEASE parent",
@@ -7346,6 +7697,21 @@ fn required_release_evidence_artifact(
         &provenance.canonical_common_gitdir,
     )
     .expect("all external release evidence paths must validate before namespace creation");
+    let (execution, bound_build_attestation_path) = release_evidence_execution_identity(
+        provenance,
+        &canonical_namespace,
+        observed_libtest_argv,
+    )
+    .expect(
+        "bind trusted release build attestation to pinned executable before namespace creation",
+    );
+    validate_shared_fs_verity_snapshot_base(&execution, &process_loss).expect(
+        "wrapper snapshot child must bind the V9 shared fs-verity base before namespace creation",
+    );
+    assert!(
+        !paths_overlap(&bound_build_attestation_path, &process_loss.canonical_path),
+        "release build attestation and process-loss companion must be distinct external leaves"
+    );
     let qualification_host_lease = acquire_qualification_host_lease(
         provenance,
         &target_dir,
@@ -7391,16 +7757,6 @@ fn required_release_evidence_artifact(
     );
     let namespace_identity =
         rustix_identity(fstat(&namespace_parent).expect("fstat private evidence namespace"));
-    let (execution, build_attestation_path) = release_evidence_execution_identity(
-        provenance,
-        &canonical_namespace,
-        observed_libtest_argv,
-    )
-    .expect("bind trusted release build attestation to pinned executable");
-    assert!(
-        !paths_overlap(&build_attestation_path, &process_loss.canonical_path),
-        "release build attestation and process-loss companion must be distinct external leaves"
-    );
     let artifact = PinnedReleaseEvidenceArtifact {
         evidence: ReleaseEvidenceArtifact {
             mechanism: "rustix_private_namespace_dirfd_noreplace_fsync".to_owned(),
@@ -8203,6 +8559,10 @@ fn validate_release_evidence(evidence: &ReleaseQualificationEvidence) -> Result<
         || evidence.artifact.cooperative_same_uid_boundary
             != "private_mode_0700_namespace_no_shared_path_authority"
         || !is_sha256_path_id(&evidence.execution.cargo_target_dir_id)
+        || !is_sha256_path_id(&evidence.execution.fs_verity_snapshot_base_id)
+        || !is_sha256_path_id(&evidence.execution.fs_verity_snapshot_root_id)
+        || evidence.execution.fs_verity_snapshot_root_device == 0
+        || evidence.execution.fs_verity_snapshot_root_inode == 0
         || !is_sha256_path_id(&evidence.execution.current_exe_relative_to_target_id)
         || evidence.execution.current_exe_sha256.len() != 64
         || evidence.execution.current_exe_device == 0
@@ -8248,6 +8608,12 @@ fn validate_release_evidence(evidence: &ReleaseQualificationEvidence) -> Result<
         || !is_sha256_path_id(&evidence.process_loss.companion_harness_sha256)
         || !is_sha256_path_id(&evidence.process_loss.companion_child_sha256)
         || !is_sha256_path_id(&evidence.process_loss.companion_executable_sha256)
+        || evidence
+            .process_loss
+            .strict_validation_command
+            .chars()
+            .count()
+            > PROCESS_LOSS_REPRODUCTION_COMMAND_MAX_CHARS
         || !process_loss_reproduction_command_has_canonical_argv(
             &evidence.process_loss.strict_validation_command,
         )
@@ -8900,6 +9266,10 @@ fn release_evidence_test_fixture() -> ReleaseQualificationEvidence {
         },
         execution: ReleaseEvidenceExecution {
             cargo_target_dir_id: format!("sha256:{}", "f".repeat(64)),
+            fs_verity_snapshot_base_id: format!("sha256:{}", "6".repeat(64)),
+            fs_verity_snapshot_root_id: format!("sha256:{}", "7".repeat(64)),
+            fs_verity_snapshot_root_device: 1,
+            fs_verity_snapshot_root_inode: 1,
             current_exe_relative_to_target_id: format!("sha256:{}", "0".repeat(64)),
             current_exe_sha256: "d".repeat(64),
             current_exe_device: 1,
@@ -8947,6 +9317,7 @@ fn release_evidence_test_fixture() -> ReleaseQualificationEvidence {
             strict_validation_command: process_loss_v9_reproduction_command(
                 "/var/lib/opc-testkit/target",
                 "/var/lib/opc-testkit/evidence",
+                "/var/lib/opc-testkit/fs-verity-snapshots",
                 "/usr/bin/cargo",
             )
             .expect("fixture V9 reproduction command"),
@@ -9100,6 +9471,7 @@ fn process_loss_v9_test_fixture(source: &ReleaseEvidenceSource) -> ProcessLossCo
             reproduction_command: process_loss_v9_reproduction_command(
                 "/var/lib/opc-testkit/target",
                 "/var/lib/opc-testkit/evidence",
+                "/var/lib/opc-testkit/fs-verity-snapshots",
                 "/usr/bin/cargo",
             )
             .expect("fixture V9 reproduction command"),
@@ -9124,6 +9496,16 @@ fn process_loss_v9_test_fixture(source: &ReleaseEvidenceSource) -> ProcessLossCo
                 "/var/lib/opc-testkit/evidence",
             )
             .expect("fixture root commitment"),
+            fs_verity_snapshot_root_directory: "/var/lib/opc-testkit/fs-verity-snapshots"
+                .to_owned(),
+            fs_verity_snapshot_root_directory_sha256: process_loss_path_commitment(
+                b"opc-session-ha-persistent-consumer-v9-fs-verity-snapshot-root/v1\0",
+                b"canonical-fs-verity-snapshot-root",
+                "/var/lib/opc-testkit/fs-verity-snapshots",
+            )
+            .expect("fixture fs-verity snapshot-root commitment"),
+            fs_verity_snapshot_root_device: 17,
+            fs_verity_snapshot_root_inode: 19,
             pair_directory: "/var/lib/opc-testkit/evidence/session-ha-persistent-consumer-v9"
                 .to_owned(),
             pair_directory_sha256: process_loss_path_commitment(
@@ -9363,12 +9745,16 @@ fn process_loss_exact_pair_test_fixture(
     let wrapper_target = workspace.join("store-wrapper-target");
     let producer_target = workspace.join("testkit-producer-target");
     let evidence_root = workspace.join("testkit-evidence-root");
+    let snapshot_root = workspace.join("testkit-fs-verity-snapshots");
     let pair_directory = evidence_root.join(PROCESS_LOSS_V9_PAIR_DIRECTORY);
     let backing = workspace.join("rustup-cargo-backing");
     let alias = workspace.join("cargo");
     std::fs::create_dir(&wrapper_target).expect("create wrapper target");
     std::fs::create_dir(&producer_target).expect("create producer target");
     std::fs::create_dir(&evidence_root).expect("create producer evidence root");
+    std::fs::create_dir(&snapshot_root).expect("create producer fs-verity snapshot root");
+    std::fs::set_permissions(&snapshot_root, std::fs::Permissions::from_mode(0o700))
+        .expect("make producer fs-verity snapshot root private");
     std::fs::create_dir(&pair_directory).expect("create producer pair directory");
     std::fs::set_permissions(&pair_directory, std::fs::Permissions::from_mode(0o700))
         .expect("make producer pair directory private");
@@ -9387,6 +9773,7 @@ fn process_loss_exact_pair_test_fixture(
     };
     let producer_target_text = canonical(&producer_target);
     let evidence_root_text = canonical(&evidence_root);
+    let snapshot_root_text = canonical(&snapshot_root);
     let pair_directory_text = canonical(&pair_directory);
     v9.bindings.cargo_target_directory = producer_target_text.clone();
     v9.bindings.cargo_target_directory_sha256 = process_loss_path_commitment(
@@ -9402,6 +9789,16 @@ fn process_loss_exact_pair_test_fixture(
         &evidence_root_text,
     )
     .expect("producer root commitment");
+    v9.bindings.fs_verity_snapshot_root_directory = snapshot_root_text.clone();
+    v9.bindings.fs_verity_snapshot_root_directory_sha256 = process_loss_path_commitment(
+        b"opc-session-ha-persistent-consumer-v9-fs-verity-snapshot-root/v1\0",
+        b"canonical-fs-verity-snapshot-root",
+        &snapshot_root_text,
+    )
+    .expect("producer fs-verity snapshot-root commitment");
+    let snapshot_metadata = std::fs::metadata(&snapshot_root).expect("stat producer snapshot root");
+    v9.bindings.fs_verity_snapshot_root_device = snapshot_metadata.dev();
+    v9.bindings.fs_verity_snapshot_root_inode = snapshot_metadata.ino();
     v9.bindings.pair_directory = pair_directory_text.clone();
     v9.bindings.pair_directory_sha256 = process_loss_path_commitment(
         b"opc-session-ha-persistent-consumer-v9-pair-directory/v1\0",
@@ -9422,6 +9819,7 @@ fn process_loss_exact_pair_test_fixture(
     v9.invocation.reproduction_command = process_loss_v9_reproduction_command(
         &producer_target_text,
         &evidence_root_text,
+        &snapshot_root_text,
         &v9.invocation.cargo_executable_alias,
     )
     .expect("producer-rendered alias recipe");
@@ -9462,6 +9860,7 @@ fn strict_decode_process_loss_pair_uses_the_rustup_alias_and_distinct_producer_t
     backing_recipe.invocation.reproduction_command = process_loss_v9_reproduction_command(
         &backing_recipe.bindings.cargo_target_directory,
         &backing_recipe.bindings.evidence_root_directory,
+        &backing_recipe.bindings.fs_verity_snapshot_root_directory,
         &backing_recipe.invocation.cargo_executable,
     )
     .expect("backing-rendered recipe");
@@ -9618,6 +10017,72 @@ fn process_loss_companion_rejects_incomplete_schema_source_and_shape_only_pairs(
 }
 
 #[test]
+fn process_loss_companion_accepts_the_mirrored_128_kib_v9_envelope() {
+    let escaped_path = |label: &str| format!("/{label}{}", "\\".repeat(2_990));
+    let source = release_evidence_test_fixture().source;
+    let mut evidence = process_loss_v9_test_fixture(&source);
+    evidence.bindings.cargo_target_directory = escaped_path("target");
+    evidence.bindings.cargo_target_directory_sha256 = process_loss_path_commitment(
+        b"opc-session-mtls-release-gate-cargo-target/v1\0",
+        b"canonical-target-directory",
+        &evidence.bindings.cargo_target_directory,
+    )
+    .expect("commit escaped target path");
+    evidence.bindings.evidence_root_directory = escaped_path("evidence");
+    evidence.bindings.evidence_root_directory_sha256 = process_loss_path_commitment(
+        b"opc-session-ha-persistent-consumer-v9-evidence-root/v1\0",
+        b"canonical-evidence-root",
+        &evidence.bindings.evidence_root_directory,
+    )
+    .expect("commit escaped evidence root");
+    evidence.bindings.fs_verity_snapshot_root_directory = escaped_path("snapshots");
+    evidence.bindings.fs_verity_snapshot_root_directory_sha256 = process_loss_path_commitment(
+        b"opc-session-ha-persistent-consumer-v9-fs-verity-snapshot-root/v1\0",
+        b"canonical-fs-verity-snapshot-root",
+        &evidence.bindings.fs_verity_snapshot_root_directory,
+    )
+    .expect("commit escaped snapshot root");
+    evidence.bindings.pair_directory = format!(
+        "{}/{}",
+        evidence.bindings.evidence_root_directory, PROCESS_LOSS_V9_PAIR_DIRECTORY
+    );
+    evidence.bindings.pair_directory_sha256 = process_loss_path_commitment(
+        b"opc-session-ha-persistent-consumer-v9-pair-directory/v1\0",
+        b"canonical-pair-directory",
+        &evidence.bindings.pair_directory,
+    )
+    .expect("commit escaped pair directory");
+    evidence.invocation.cargo_executable_alias = escaped_path("cargo");
+    evidence.invocation.cargo_executable = escaped_path("rustup");
+    evidence.invocation.reproduction_command = process_loss_v9_reproduction_command(
+        &evidence.bindings.cargo_target_directory,
+        &evidence.bindings.evidence_root_directory,
+        &evidence.bindings.fs_verity_snapshot_root_directory,
+        &evidence.invocation.cargo_executable_alias,
+    )
+    .expect("regenerate escaped V9 command");
+
+    let encoded = serde_json::to_vec(&evidence).expect("encode escaped V9 evidence");
+    assert!(
+        encoded.len() > 64 * 1024,
+        "the fixture causally exceeds the retired store-consumer boundary"
+    );
+    assert!(encoded.len() <= PROCESS_LOSS_V9_EVIDENCE_MAX_BYTES);
+    assert_eq!(
+        strict_decode_process_loss_companion(&encoded, &source),
+        Ok(evidence)
+    );
+    assert!(strict_decode_process_loss_companion(
+        &vec![b' '; PROCESS_LOSS_V9_EVIDENCE_MAX_BYTES + 1],
+        &source,
+    )
+    .is_err());
+    assert!(
+        strict_decode_process_loss_v1(&vec![b' '; PROCESS_LOSS_V1_EVIDENCE_MAX_BYTES + 1]).is_err()
+    );
+}
+
+#[test]
 fn process_loss_v9_rejects_target_root_pair_recipe_and_argv_mutations() {
     let source = release_evidence_test_fixture().source;
     let evidence = process_loss_v9_test_fixture(&source);
@@ -9695,14 +10160,16 @@ fn process_loss_v9_recipe_quotes_apostrophe_semicolon_and_substitution_paths() {
     let injection = "'$(touch $RECIPE_MARKER);semicolon";
     let target = workspace.path().join(format!("target{injection}"));
     let root = workspace.path().join(format!("evidence{injection}"));
+    let snapshot_root = workspace.path().join(format!("snapshots{injection}"));
     let backing = workspace.path().join("rustup-backing");
     let alias = workspace.path().join(format!("cargo{injection}"));
     let recorded = workspace.path().join("recorded-arguments");
     std::fs::create_dir(&target).expect("create quoted target path");
     std::fs::create_dir(&root).expect("create quoted evidence root");
+    std::fs::create_dir(&snapshot_root).expect("create quoted snapshot root");
     std::fs::write(
         &backing,
-        "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$CARGO\" \"$CARGO_TARGET_DIR\" \"$OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY\" \"$@\" > \"$RECIPE_RECORD\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$CARGO\" \"$CARGO_TARGET_DIR\" \"$OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY\" \"$OPC_FS_VERITY_QUALIFICATION\" \"$OPC_FS_VERITY_SNAPSHOT_ROOT\" \"$@\" > \"$RECIPE_RECORD\"\n",
     )
     .expect("write quoted Cargo backing script");
     std::fs::set_permissions(&backing, std::fs::Permissions::from_mode(0o700))
@@ -9712,8 +10179,14 @@ fn process_loss_v9_recipe_quotes_apostrophe_semicolon_and_substitution_paths() {
     let alias_text = alias.to_str().expect("quoted alias UTF-8");
     let target_text = target.to_str().expect("quoted target UTF-8");
     let root_text = root.to_str().expect("quoted root UTF-8");
-    let recipe = process_loss_v9_reproduction_command(target_text, root_text, alias_text)
-        .expect("render shell-safe V9 recipe");
+    let snapshot_root_text = snapshot_root.to_str().expect("quoted snapshot root UTF-8");
+    let recipe = process_loss_v9_reproduction_command(
+        target_text,
+        root_text,
+        snapshot_root_text,
+        alias_text,
+    )
+    .expect("render shell-safe V9 recipe");
     assert!(Command::new("/bin/sh")
         .arg("-c")
         .arg(&recipe)
@@ -9736,6 +10209,8 @@ fn process_loss_v9_recipe_quotes_apostrophe_semicolon_and_substitution_paths() {
             alias_text.to_owned(),
             target_text.to_owned(),
             root_text.to_owned(),
+            "required".to_owned(),
+            snapshot_root_text.to_owned(),
         ])
         .chain(
             PROCESS_LOSS_CANONICAL_CARGO_ARGV
@@ -9748,9 +10223,13 @@ fn process_loss_v9_recipe_quotes_apostrophe_semicolon_and_substitution_paths() {
         observed, expected,
         "the replay executes the alias exactly once"
     );
-    assert!(
-        process_loss_v9_reproduction_command("/tmp/cargo\n", "/tmp/root", "/tmp/cargo").is_err()
-    );
+    assert!(process_loss_v9_reproduction_command(
+        "/tmp/cargo\n",
+        "/tmp/root",
+        "/tmp/snapshots",
+        "/tmp/cargo"
+    )
+    .is_err());
 }
 
 #[test]
@@ -9864,7 +10343,7 @@ fn process_loss_v9_run_id_binds_namespace_recipe_and_argv_material() {
         assert_ne!(
             v1_v9_pair_run_id(&v1, &v1_canonical, &replaced).expect("mutated V2 run ID material"),
             run_id,
-            "the V3 run ID binds executable mode and every canonical V9 claims-preimage mutation"
+            "the V4 run ID binds executable mode and every canonical V9 claims-preimage mutation"
         );
     }
 }
@@ -9922,6 +10401,10 @@ fn release_build_attestation_test_fixture(target_dir: &Path) -> ReleaseBuildAtte
         cargo_lock_sha256: provenance.runtime_cargo_lock_sha256,
         release_schema_sha256: provenance.compiled_schema_sha256,
         cargo_target_dir_id: redacted_path_id(target_dir),
+        fs_verity_snapshot_base_id: format!("sha256:{}", "a".repeat(64)),
+        fs_verity_snapshot_root_id: format!("sha256:{}", "b".repeat(64)),
+        fs_verity_snapshot_root_device: 13,
+        fs_verity_snapshot_root_inode: 14,
         executable_sha256: "e".repeat(64),
         executable_device: 11,
         executable_inode: 12,
@@ -10134,8 +10617,67 @@ fn quiet_host_observer_detects_a_short_lived_nonancestor_cargo_process() {
 #[test]
 fn release_evidence_is_closed_canonical_and_has_exact_totals() {
     let evidence = release_evidence_test_fixture();
+    assert!(
+        evidence
+            .process_loss
+            .strict_validation_command
+            .chars()
+            .count()
+            > 512,
+        "the real V9 replay command exercises the retired 512-character release-schema ceiling"
+    );
     let encoded = canonical_release_evidence_bytes(&evidence);
     assert_eq!(strict_decode_release_evidence(&encoded), Ok(evidence));
+}
+
+#[test]
+fn release_process_loss_command_bound_matches_the_v9_companion_schema() {
+    let schema: serde_json::Value =
+        serde_json::from_str(RELEASE_EVIDENCE_SCHEMA).expect("release evidence schema");
+    assert_eq!(
+        schema.pointer("/$defs/process_loss/properties/strict_validation_command/maxLength"),
+        Some(&serde_json::Value::from(
+            PROCESS_LOSS_REPRODUCTION_COMMAND_MAX_CHARS as u64
+        )),
+        "the final release schema must retain the full V9 replay-command contract"
+    );
+
+    let mut maximum = release_evidence_test_fixture();
+    let fixture_chars = maximum
+        .process_loss
+        .strict_validation_command
+        .chars()
+        .count();
+    assert!(fixture_chars > 512 && fixture_chars < PROCESS_LOSS_REPRODUCTION_COMMAND_MAX_CHARS);
+    maximum.process_loss.strict_validation_command.insert_str(
+        "CARGO='".len(),
+        &"é".repeat(PROCESS_LOSS_REPRODUCTION_COMMAND_MAX_CHARS - fixture_chars),
+    );
+    assert_eq!(
+        maximum
+            .process_loss
+            .strict_validation_command
+            .chars()
+            .count(),
+        PROCESS_LOSS_REPRODUCTION_COMMAND_MAX_CHARS,
+        "the typed bound counts Unicode scalar values exactly like JSON Schema"
+    );
+    let maximum_value = serde_json::to_value(&maximum).expect("maximum command evidence");
+    assert!(opc_schema_validate::validate(&schema, &maximum_value).is_ok());
+    assert!(validate_release_evidence(&maximum).is_ok());
+    assert!(strict_decode_release_evidence(
+        &serde_json::to_vec(&maximum).expect("maximum command JSON")
+    )
+    .is_ok());
+
+    let mut oversized = maximum;
+    oversized
+        .process_loss
+        .strict_validation_command
+        .insert("CARGO='".len(), 'é');
+    let oversized_value = serde_json::to_value(&oversized).expect("oversized command evidence");
+    assert!(opc_schema_validate::validate(&schema, &oversized_value).is_err());
+    assert!(validate_release_evidence(&oversized).is_err());
 }
 
 #[test]
@@ -10157,7 +10699,7 @@ fn release_evidence_rejects_unknown_trailing_duplicate_and_invalid_totals() {
     );
     assert!(
         strict_decode_release_evidence(&vec![b' '; RELEASE_EVIDENCE_MAX_BYTES + 1]).is_err(),
-        "the strict decoder rejects a real payload beyond 16 KiB before parsing"
+        "the strict decoder rejects a real payload beyond 128 KiB before parsing"
     );
     assert!(strict_decode_release_evidence(
         text.replacen("{\"version\":1", "{\"version\":1,\"unknown\":0", 1)
@@ -10415,10 +10957,12 @@ fn process_loss_root_topology_rejects_unrelated_wrapper_namespaces_before_mkdir(
     let protected_worktree = root.path().join("worktree");
     let protected_gitdir = root.path().join("gitdir");
     let protected_common = root.path().join("common-gitdir");
-    let producer_root = root.path().join("producer-evidence");
+    let external = root.path().join("external");
+    let producer_root = external.join("producer-evidence");
     std::fs::create_dir(&protected_worktree).expect("create worktree boundary");
     std::fs::create_dir(&protected_gitdir).expect("create gitdir boundary");
     std::fs::create_dir(&protected_common).expect("create common boundary");
+    std::fs::create_dir(&external).expect("create external parent");
     std::fs::create_dir(&producer_root).expect("create producer root");
 
     for (unrelated, label) in [
@@ -10432,6 +10976,10 @@ fn process_loss_root_topology_rejects_unrelated_wrapper_namespaces_before_mkdir(
             validate_process_loss_root_external_topology_before_mkdir(
                 &producer_root,
                 &[(unrelated.as_path(), label)],
+                &[(
+                    unrelated.parent().expect("unrelated parent"),
+                    "unrelated parent"
+                )],
                 &protected_worktree,
                 &protected_gitdir,
                 &protected_common,
@@ -10443,6 +10991,80 @@ fn process_loss_root_topology_rejects_unrelated_wrapper_namespaces_before_mkdir(
             "{label} topology rejection runs before any publisher mkdir residue"
         );
     }
+    for (unrelated, label) in [
+        (producer_root.as_path(), "producer root itself"),
+        (
+            producer_root.parent().expect("producer root parent"),
+            "producer root ancestor",
+        ),
+    ] {
+        assert_eq!(
+            validate_process_loss_root_external_topology_before_mkdir(
+                &producer_root,
+                &[(unrelated, label)],
+                &[],
+                &protected_worktree,
+                &protected_gitdir,
+                &protected_common,
+            ),
+            Err("V9 producer evidence root overlaps an unrelated external namespace"),
+        );
+    }
+}
+
+#[test]
+fn process_loss_root_topology_allows_disjoint_siblings_under_one_external_parent() {
+    let root = tempfile::tempdir().expect("producer-root sibling topology workspace");
+    let protected_worktree = root.path().join("worktree");
+    let protected_gitdir = root.path().join("gitdir");
+    let protected_common = root.path().join("common-gitdir");
+    let external = root.path().join("external");
+    let producer_root = external.join("testkit-v9-root");
+    std::fs::create_dir(&protected_worktree).expect("create worktree boundary");
+    std::fs::create_dir(&protected_gitdir).expect("create gitdir boundary");
+    std::fs::create_dir(&protected_common).expect("create common boundary");
+    std::fs::create_dir(&external).expect("create shared external parent");
+    std::fs::create_dir(&producer_root).expect("create producer root");
+
+    let target = external.join("wrapper-target");
+    let evidence = external.join("store-evidence");
+    let attestation = external
+        .join("attestation")
+        .join("sdk702-release-build-attestation.json");
+    let lease = external.join("lease").join("sdk702.lock");
+    assert_eq!(
+        validate_process_loss_root_external_topology_before_mkdir(
+            &producer_root,
+            &[
+                (&target, "CARGO_TARGET_DIR"),
+                (&evidence, "OPC_QUAL_EVIDENCE"),
+                (&attestation, "OPC_QUAL_BUILD_ATTESTATION"),
+                (&lease, "OPC_QUAL_LEASE"),
+            ],
+            &[
+                (
+                    target.parent().expect("target parent"),
+                    "CARGO_TARGET_DIR parent"
+                ),
+                (
+                    evidence.parent().expect("evidence parent"),
+                    "OPC_QUAL_EVIDENCE parent"
+                ),
+                (
+                    attestation.parent().expect("attestation parent"),
+                    "OPC_QUAL_BUILD_ATTESTATION parent",
+                ),
+                (
+                    lease.parent().expect("lease parent"),
+                    "OPC_QUAL_LEASE parent"
+                ),
+            ],
+            &protected_worktree,
+            &protected_gitdir,
+            &protected_common,
+        ),
+        Ok(())
+    );
 }
 
 #[test]
@@ -10975,12 +11597,13 @@ fn process_loss_v9_recipe_matches_the_producer_canonical_argv() {
     let recipe = process_loss_v9_reproduction_command(
         "/var/lib/opc testkit/target",
         "/var/lib/opc testkit/evidence",
+        "/var/lib/opc testkit/fs-verity-snapshots",
         "/usr/local/bin/cargo",
     )
     .expect("canonical producer recipe");
     assert_eq!(
         recipe,
-        "CARGO='/usr/local/bin/cargo' CARGO_TARGET_DIR='/var/lib/opc testkit/target' OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY='/var/lib/opc testkit/evidence' '/usr/local/bin/cargo' 'test' '--locked' '--release' '-p' 'opc-session-testkit' '--test' 'qualification_mtls_multiprocess' '--no-default-features' 'three_process_projected_mtls_persistent_v2_batch_release_gate' '--' '--ignored' '--exact' '--test-threads=1' '--nocapture'"
+        "CARGO='/usr/local/bin/cargo' CARGO_TARGET_DIR='/var/lib/opc testkit/target' OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY='/var/lib/opc testkit/evidence' OPC_FS_VERITY_QUALIFICATION='required' OPC_FS_VERITY_SNAPSHOT_ROOT='/var/lib/opc testkit/fs-verity-snapshots' '/usr/local/bin/cargo' 'test' '--locked' '--release' '-p' 'opc-session-testkit' '--test' 'qualification_mtls_multiprocess' '--no-default-features' 'three_process_projected_mtls_persistent_v2_batch_release_gate' '--' '--ignored' '--exact' '--test-threads=1' '--nocapture'"
     );
     assert!(
         PROCESS_LOSS_V9_PRODUCER_SOURCE.contains(
@@ -10989,7 +11612,7 @@ fn process_loss_v9_recipe_matches_the_producer_canonical_argv() {
         "the local strict recipe is cross-checked against the testkit producer's canonical argv metadata"
     );
     assert!(PROCESS_LOSS_V9_PRODUCER_SOURCE
-        .contains("b\"opc-session-ha-persistent-consumer-v9-pair-run/v3\\0\""));
+        .contains("b\"opc-session-ha-persistent-consumer-v9-pair-run/v4\\0\""));
     assert!(PROCESS_LOSS_V9_PRODUCER_SOURCE.contains("b\"cargo-executable-alias\""));
     assert!(PROCESS_LOSS_V9_PRODUCER_SOURCE.contains("b\"cargo-executable-sha256\""));
     assert!(PROCESS_LOSS_V9_PRODUCER_SOURCE.contains("b\"cargo-executable-mode\""));
@@ -10997,6 +11620,10 @@ fn process_loss_v9_recipe_matches_the_producer_canonical_argv() {
     assert!(PROCESS_LOSS_V9_PRODUCER_SOURCE.contains("b\"v9-claims-preimage\""));
     assert!(RELEASE_EVIDENCE_REQUIRED_REPRODUCTION_RECIPE
         .contains("--target-dir <absent-absolute-external-target>"));
+    assert!(RELEASE_EVIDENCE_REQUIRED_REPRODUCTION_RECIPE
+        .starts_with("OPC_FS_VERITY_QUALIFICATION=required OPC_FS_VERITY_SNAPSHOT_ROOT=<existing-absolute-external-fs-verity-root> "));
+    assert!(RELEASE_EVIDENCE_REQUIRED_REPRODUCTION_RECIPE
+        .contains("--snapshot-root <existing-absolute-external-fs-verity-root>"));
     assert!(RELEASE_EVIDENCE_REQUIRED_REPRODUCTION_RECIPE
         .contains("--process-loss-evidence <absolute-external-testkit-v9-json>"));
 }
@@ -11686,14 +12313,28 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
     let quiet_host_monitor = QualificationQuietHostMonitor::start()
         .expect("quiet host must be observed before qualification work begins");
     let started = Instant::now();
+    // Keep mutable SQLite files, WALs, and general test scratch on the normal
+    // tempfile filesystem. Only immutable fixed-quorum snapshots use the
+    // wrapper-created fs-verity namespace.
     let directory = tempfile::tempdir().expect("SDK-702 release qualification directory");
+    let snapshot_root = required_release_fs_verity_snapshot_root(&execution);
+    #[cfg(unix)]
+    assert_ne!(
+        std::fs::metadata(directory.path())
+            .expect("stat SDK-702 ordinary workspace")
+            .dev(),
+        std::fs::metadata(&snapshot_root)
+            .expect("stat attested fs-verity snapshot root")
+            .dev(),
+        "mutable SQLite/WAL workspace must not share the fs-verity snapshot filesystem"
+    );
     let start = Timestamp::from_offset_datetime(
         time::OffsetDateTime::from_unix_timestamp(1_900_000_000)
             .expect("SDK-702 release qualification start"),
     );
     let clock = Arc::new(MutableClock::new(start));
     let (mut stores, database_paths, snapshot_paths, mut peer_slots) =
-        fixed_cluster(directory.path(), clock.clone()).await;
+        fixed_cluster_with_snapshot_root(directory.path(), &snapshot_root, clock.clone()).await;
     let provider = sealing_provider();
     let transient_retries = Arc::new(AtomicU64::new(0));
     // Keep every permitted retry in a causally distinct ledger: immutable
@@ -12126,7 +12767,7 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
         QUALIFICATION_PER_VOTER_SNAPSHOT_CEILING_BYTES,
     );
     let (stores_after_restart, _, _, peer_slots_after_restart) =
-        fixed_cluster(directory.path(), clock.clone()).await;
+        fixed_cluster_with_snapshot_root(directory.path(), &snapshot_root, clock.clone()).await;
     stores = stores_after_restart;
     peer_slots = peer_slots_after_restart;
     let leader = ready_leader(&stores).await;

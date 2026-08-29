@@ -80,7 +80,7 @@ revision 5, digest
 `sha256:5e3becf5094f3e222b94799e0fb7b6b77c3398aeabae743fc65b409c4cd4adfd`.
 The current v9 schema binds `/1` transport revision 6 and application revision
 4, digest
-`sha256:ecb42383a02a4704988139aafe2f59dfb95988b1e57cdaf05438a664500f2b41`.
+`sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018`.
 The ordinary fenced `/2` wire remains revision 5 and the protected-roster `/3`
 wire is independently revision 5; general `/1` is revision 6. When roster
 support is enabled, the listener deliberately advertises all three consumer
@@ -96,8 +96,11 @@ procedure, not a preclaimed result.
 
 The closed V9 contract binds more than source provenance and artifact digests.
 It records the canonical absolute testkit `CARGO_TARGET_DIR`, the canonical
-absolute external V9 evidence root, and the pair directory derived from that
-root; each raw path has its own domain-separated commitment. It separately
+absolute external V9 evidence root, the canonical owner-private fs-verity
+snapshot base, and the pair directory derived from the evidence root; each raw
+path has its own domain-separated commitment. The snapshot base additionally
+commits its descriptor-captured device/inode so a same-path replacement cannot
+reuse the release identity. It separately
 records the exact normalized absolute Cargo invocation alias (for example, a
 rustup-managed `.../cargo`), the canonical backing executable path resolved
 from that alias, and a SHA-256 commitment to that backing file's content. The
@@ -109,15 +112,16 @@ two exact leaves, `batch-release-gate-v1.json` and
 `persistent-consumer-v9.json`.
 
 Its symmetric pair run-ID uses domain
-`opc-session-ha-persistent-consumer-v9-pair-run/v3\0`. It binds canonical V1,
+`opc-session-ha-persistent-consumer-v9-pair-run/v4\0`. It binds canonical V1,
 the existing provenance/invocation fields, and a canonical full V9 claims
 preimage in which only `invocation.run_id_sha256` is replaced with
 `sha256:` plus 64 zeroes. It therefore does not hash the final,
 self-containing V9 bytes. The command digest orders backing path, alias,
 backing-content SHA-256, executable mode as unsigned 16-bit big-endian, then
-argv. Run-ID v3 first retains its pre-existing 16 provenance bindings, ending
-alias, backing path, backing-content SHA-256, `cargo_profile`, and `opt_level`;
-it then binds the u16-BE executable mode, followed by the existing
+argv. Run-ID v4 binds 20 ordered provenance strings: the prior 16 ending
+alias, backing path, backing-content SHA-256, `cargo_profile`, and `opt_level`,
+plus the fs-verity snapshot-base path, commitment, device, and inode. It then
+binds the u16-BE executable mode, followed by the existing
 V1/V9/argv/recipe/canonical-V1/claims-preimage material. Neither leaf can be
 transferred to a different qualifying pair.
 
@@ -169,26 +173,32 @@ may run while this release/latency gate runs. The fixed Git, build, and release
 deadlines are correctness boundaries, not latency relaxations. Do not increase
 them or use a busy-host observation as a performance claim.
 
-Prepare absolute canonical external paths on a private, external
-fs-verity-capable filesystem. The SDK worktree, actual linked-worktree gitdir,
-common gitdir, testkit Cargo target, wrapper Cargo target, V9 evidence root,
-fs-verity work root, attestation namespace, store-evidence namespace, and
-lease leaf must be pairwise disjoint; the V9 pair child is contained only by
-its V9 evidence root. The testkit target must already exist as a canonical
-external `CARGO_TARGET_DIR`. The wrapper target, attestation namespace, and
-store-evidence namespace must each be absent. Provision an owner-private
-external V9 root (mode `0700`) whose
+Prepare absolute canonical external paths. The SDK worktree, actual
+linked-worktree gitdir, common gitdir, testkit Cargo target, V9 evidence root,
+wrapper Cargo target, attestation namespace, store-evidence namespace, lease
+leaf, and fs-verity snapshot base must be pairwise disjoint; the V9 pair child
+is contained only by its V9 evidence root. One canonical owner-private (mode
+`0700`) external fs-verity snapshot base may be shared as a parent authority by
+the V9 producer and wrapper, but each creates and descriptor-pins its own fresh
+private direct child below that base. Neither producer uses the base itself as
+an actual snapshot namespace.
+The base must support the fixed fs-verity profile. The testkit and wrapper
+Cargo targets, V9 ordinary workspace, and store `tempfile` workspace must be
+on filesystems distinct from the snapshot base, so build, SQLite, WAL, socket,
+and general scratch I/O remain ordinary. The wrapper target, attestation
+namespace, and store-evidence namespace must each be absent and external; no
+unpassed wrapper work-root exists. Provision an owner-private external V9 evidence root
+whose
 `session-ha-persistent-consumer-v9` child is absent; it will become the exact
-two-leaf pair. The fs-verity work root is external as well. Creating `target/`,
-evidence, a lease, fs-verity data, or logs inside the source tree poisons the
-clean-source gate.
+two-leaf pair. Creating `target/`, evidence, a lease, temporary fs-verity
+data, or logs inside the source tree poisons the clean-source gate.
 
 First produce the V9 pair in that owner-private root. The environment prefixes
 are part of the invocation environment, not Cargo argv; retain the following
 Cargo arguments exactly:
 
 ```text
-CARGO_TARGET_DIR=/external/testkit-target OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY=/external/testkit-v9-root cargo test --locked --release -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_persistent_v2_batch_release_gate -- --ignored --exact --test-threads=1 --nocapture
+CARGO_TARGET_DIR=/external/testkit-target OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY=/external/testkit-v9-root OPC_FS_VERITY_QUALIFICATION=required OPC_FS_VERITY_SNAPSHOT_ROOT=/external/testkit-fsverity-snapshots cargo test --locked --release -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features three_process_projected_mtls_persistent_v2_batch_release_gate -- --ignored --exact --test-threads=1 --nocapture
 ```
 
 Here `cargo` is the illustrative command token; an actual closed record binds
@@ -205,9 +215,10 @@ stderr, or an `eprintln!` line.
 
 The V9 record's reproduction field is stricter than the display recipe: it is
 the POSIX-escaped command with `CARGO=<absolute-cargo-alias>`, the canonical
-target and evidence-root environment prefixes, and that same absolute Cargo
-alias followed by the 14 canonical tail arguments; its normalized recorded
-vector has 15 elements beginning `cargo`. It does not execute the canonical
+target, evidence-root, required fs-verity marker, and snapshot-root environment
+prefixes, and that same absolute Cargo alias followed by the 14 canonical tail
+arguments; its normalized recorded vector has 15 elements beginning `cargo`.
+It does not execute the canonical
 backing path. The rendering uses
 standard POSIX single-quote escaping, while every bound path rejects control
 characters and NUL. Consumers recompute it rather than accepting a look-alike
@@ -219,12 +230,19 @@ alias (the illustrative placeholder below is the executable to invoke, not a
 claim that its canonical backing path is invoked):
 
 ```text
-/usr/bin/python3 ci/sdk702-release-attest.py --cargo /absolute/trusted/cargo --target-dir /absent/external/wrapper-target --attestation-namespace /absent/external/attestation --evidence /absent/external/store-evidence --process-loss-evidence /external/testkit-v9-root/session-ha-persistent-consumer-v9/persistent-consumer-v9.json --lease /external/lease/sdk702.lock
+OPC_FS_VERITY_QUALIFICATION=required OPC_FS_VERITY_SNAPSHOT_ROOT=/external/testkit-fsverity-snapshots /usr/bin/python3 ci/sdk702-release-attest.py --cargo /absolute/trusted/cargo --target-dir /absent/external/wrapper-target --snapshot-root /external/testkit-fsverity-snapshots --attestation-namespace /absent/external/attestation --evidence /absent/external/store-evidence --process-loss-evidence /external/testkit-v9-root/session-ha-persistent-consumer-v9/persistent-consumer-v9.json --lease /external/lease/sdk702.lock
 ```
 
 The wrapper consumes that exact V1/V9 pair while creating and pinning a fresh
-external wrapper target distinct from the producer's testkit target. It sets
-its canonical absolute `CARGO_TARGET_DIR` to that target, builds the exact
+external wrapper target distinct from the producer's testkit target. Its
+required canonical `--snapshot-root` must byte-match the ambient
+`OPC_FS_VERITY_SNAPSHOT_ROOT`, and the ambient
+`OPC_FS_VERITY_QUALIFICATION=required` marker is mandatory. It sets only its
+canonical absolute `CARGO_TARGET_DIR` for the build, then creates, pins, and
+gives the release child only a fresh deterministic direct child of that
+explicit fs-verity root. The release fixture keeps its ordinary
+`tempfile` database, WAL, and general scratch paths untouched and routes only
+fixed-quorum snapshots through that wrapper-owned root. It builds the exact
 release test there, writes a create-new fsynced build attestation, and executes
 the pinned test descriptor directly. It deliberately handles libtest
 `--nocapture` itself;
@@ -235,6 +253,14 @@ assertions, graceful shutdown, provenance rechecks, and typed/schema/canonical
 validation; only then is its `qualification_complete:true` meaningful. Preserve
 its generated artifacts, wrapper output, raw logs, SHA-256 digests, and exit
 status without clobbering any existing path.
+
+V9 deliberately calls `TempDir::keep()` for each random fs-verity campaign
+child, and the wrapper preserves its create-new target and deterministic
+snapshot child on both success and failure. This prevents an identity-failure
+unwind from recursively deleting a replacement pathname. Cleanup is deferred
+to trusted loop teardown or operator action only after descriptors and child
+processes have closed. Each wrapper rerun therefore needs a fresh target and
+the 4G loop can accumulate preserved snapshot children.
 
 The lease is also a pinned-inode contract, not a pathname lock. The Python
 wrapper retains the exact nofollow private lease inode through

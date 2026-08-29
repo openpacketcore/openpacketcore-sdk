@@ -121,6 +121,10 @@
         "cargo_target_directory_sha256",
         "evidence_root_directory",
         "evidence_root_directory_sha256",
+        "fs_verity_snapshot_root_directory",
+        "fs_verity_snapshot_root_directory_sha256",
+        "fs_verity_snapshot_root_device",
+        "fs_verity_snapshot_root_inode",
         "pair_directory",
         "pair_directory_sha256"
       ],
@@ -134,6 +138,10 @@
         "cargo_target_directory_sha256": {"$ref": "#/$defs/sha256"},
         "evidence_root_directory": {"$ref": "#/$defs/absolute_path"},
         "evidence_root_directory_sha256": {"$ref": "#/$defs/sha256"},
+        "fs_verity_snapshot_root_directory": {"$ref": "#/$defs/absolute_path"},
+        "fs_verity_snapshot_root_directory_sha256": {"$ref": "#/$defs/sha256"},
+        "fs_verity_snapshot_root_device": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "fs_verity_snapshot_root_inode": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
         "pair_directory": {"$ref": "#/$defs/absolute_path"},
         "pair_directory_sha256": {"$ref": "#/$defs/sha256"}
       }

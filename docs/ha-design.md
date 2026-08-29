@@ -964,10 +964,11 @@ limits, soak, production payload-key operation, supported platforms, and signed
 candidate-release evidence remain under #164/#143 and related gates.
 
 The closed V9 contract uses schema digest
-`sha256:ecb42383a02a4704988139aafe2f59dfb95988b1e57cdaf05438a664500f2b41`.
-It binds canonical absolute producer Cargo-target and external evidence-root
-paths, the root-derived pair directory, and domain-separated commitments for
-those raw paths. It separately binds the exact normalized absolute Cargo
+`sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018`.
+It binds canonical absolute producer Cargo-target, external evidence-root, and
+owner-private fs-verity snapshot-base paths, the root-derived pair directory,
+domain-separated commitments for those raw paths, and the snapshot-base
+device/inode. It separately binds the exact normalized absolute Cargo
 invocation alias, canonical backing executable path, and backing-content
 SHA-256 and executable mode. The alias (for example a rustup-managed
 `.../cargo` spelling), not the backing path, is `argv[0]` followed by 14
@@ -977,14 +978,15 @@ command executes that alias. Bound paths reject control
 characters and NUL; standard POSIX single-quote escaping is covered only by its
 exact regression and is not a general shell-injection claim.
 The V1/V9 pair still has only `batch-release-gate-v1.json` and
-`persistent-consumer-v9.json`. Its symmetric pair run-ID uses the v3 domain,
+`persistent-consumer-v9.json`. Its symmetric pair run-ID uses the v4 domain,
 canonical V1, existing provenance/invocation fields, and canonical full V9
 claims preimage with only `run_id_sha256` replaced by `sha256:` plus 64 zeroes;
 it does not hash final self-containing V9 bytes. The command digest orders
 backing path, alias, backing-content SHA-256, u16-BE executable mode, then
-argv. Run-ID v3 retains its pre-existing 16 provenance bindings, ending alias,
-backing path, backing-content SHA-256, `cargo_profile`, and `opt_level`; it
-then binds u16-BE mode before the existing
+argv. Run-ID v4 binds 20 ordered provenance strings: the prior 16 ending alias,
+backing path, backing-content SHA-256, `cargo_profile`, and `opt_level`, plus
+the fs-verity snapshot path, commitment, device, and inode. It then binds
+u16-BE mode before the existing
 V1/V9/argv/recipe/canonical-V1/claims-preimage material. The wrapper consumes
 it with a fresh, distinct target.
 Python retains the exact nofollow private lease inode via

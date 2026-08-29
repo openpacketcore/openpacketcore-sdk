@@ -5062,6 +5062,99 @@ fn load_config(path: &Path) -> Result<QualificationNodeConfig, NodeFailure> {
     Ok(config)
 }
 
+const FS_VERITY_QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
+const FS_VERITY_SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
+
+#[cfg(unix)]
+fn canonical_private_directory(path: &Path) -> Result<PathBuf, NodeFailure> {
+    if !path.is_absolute() {
+        return Err(NodeFailure);
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| NodeFailure)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+    {
+        return Err(NodeFailure);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| NodeFailure)?;
+    if canonical != path {
+        return Err(NodeFailure);
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn canonical_private_directory_with_identity(
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<PathBuf, NodeFailure> {
+    let canonical = canonical_private_directory(path)?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|_| NodeFailure)?;
+    if metadata.dev() != expected_device || metadata.ino() != expected_inode {
+        return Err(NodeFailure);
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn canonical_private_snapshot_leaf(
+    path: &Path,
+    snapshot_root: &Path,
+) -> Result<PathBuf, NodeFailure> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| NodeFailure)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o7777 != 0o700
+    {
+        return Err(NodeFailure);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| NodeFailure)?;
+    if canonical.parent() != Some(snapshot_root) {
+        return Err(NodeFailure);
+    }
+    Ok(canonical)
+}
+
+#[cfg(not(unix))]
+fn canonical_private_snapshot_leaf(
+    _path: &Path,
+    _snapshot_root: &Path,
+) -> Result<PathBuf, NodeFailure> {
+    Err(NodeFailure)
+}
+
+#[cfg(not(unix))]
+fn canonical_private_directory_with_identity(
+    _path: &Path,
+    _expected_device: u64,
+    _expected_inode: u64,
+) -> Result<PathBuf, NodeFailure> {
+    Err(NodeFailure)
+}
+
+#[cfg(not(unix))]
+fn canonical_private_directory(_path: &Path) -> Result<PathBuf, NodeFailure> {
+    Err(NodeFailure)
+}
+
+fn configured_fs_verity_snapshot_root() -> Result<PathBuf, NodeFailure> {
+    if env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref() != Some(std::ffi::OsStr::new("required"))
+    {
+        return Err(NodeFailure);
+    }
+    let root = env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV).ok_or(NodeFailure)?;
+    let raw = root.as_encoded_bytes().to_vec();
+    let canonical = canonical_private_directory(&PathBuf::from(root))?;
+    if raw != canonical.as_os_str().as_encoded_bytes() {
+        return Err(NodeFailure);
+    }
+    Ok(canonical)
+}
+
 fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<(), NodeFailure> {
     let workspace = fs::canonicalize(&config.workspace_directory).map_err(|_| NodeFailure)?;
     if workspace.parent().is_none() {
@@ -5081,11 +5174,52 @@ fn secure_qualification_paths(config: &QualificationNodeConfig) -> Result<(), No
             return Err(NodeFailure);
         }
     }
-    fs::create_dir_all(&config.snapshot_directory).map_err(|_| NodeFailure)?;
-    let snapshots = fs::canonicalize(&config.snapshot_directory).map_err(|_| NodeFailure)?;
-    if !snapshots.starts_with(&workspace) {
-        return Err(NodeFailure);
-    }
+    let snapshot_root = match &config.snapshot_root_directory {
+        Some(campaign_root) => {
+            // Reject lexical escapes before `create_dir_all` can touch the
+            // filesystem. The external namespace is release-only and has one
+            // fixed child per projected-mTLS node.
+            let expected_snapshot_leaf = format!("node-{}", config.node_index);
+            if !matches!(
+                config.transport,
+                QualificationTransportConfig::ProjectedMtls(_)
+            ) || config.snapshot_directory.parent() != Some(campaign_root.as_path())
+                || config
+                    .snapshot_directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    != Some(expected_snapshot_leaf.as_str())
+            {
+                return Err(NodeFailure);
+            }
+            let configured_root = configured_fs_verity_snapshot_root()?;
+            let expected_device = config.snapshot_root_device.ok_or(NodeFailure)?;
+            let expected_inode = config.snapshot_root_inode.ok_or(NodeFailure)?;
+            let campaign_root = canonical_private_directory_with_identity(
+                campaign_root,
+                expected_device,
+                expected_inode,
+            )?;
+            if campaign_root.parent() != Some(configured_root.as_path()) {
+                return Err(NodeFailure);
+            }
+            campaign_root
+        }
+        None => workspace.clone(),
+    };
+    let _snapshots = if config.snapshot_root_directory.is_some() {
+        // The release harness creates this one leaf before the child starts.
+        // Do not create through an attacker-controlled pathname here: require
+        // a real, private direct child before canonicalization.
+        canonical_private_snapshot_leaf(&config.snapshot_directory, &snapshot_root)?
+    } else {
+        fs::create_dir_all(&config.snapshot_directory).map_err(|_| NodeFailure)?;
+        let snapshots = fs::canonicalize(&config.snapshot_directory).map_err(|_| NodeFailure)?;
+        if !snapshots.starts_with(&snapshot_root) || snapshots == snapshot_root {
+            return Err(NodeFailure);
+        }
+        snapshots
+    };
     if let QualificationTransportConfig::ProjectedMtls(projected) = &config.transport {
         let metadata =
             fs::symlink_metadata(&projected.projected_volume_root).map_err(|_| NodeFailure)?;
@@ -5819,6 +5953,35 @@ mod tests {
         ] {
             assert!(!is_control_socket_cli_path(Path::new(rejected)));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_snapshot_leaf_rejects_a_direct_child_symlink_before_use() {
+        let workspace = tempfile::tempdir().expect("create snapshot-leaf workspace");
+        let root = workspace.path().join("campaign");
+        fs::create_dir(&root).expect("create campaign root");
+        fs::set_permissions(&root, Permissions::from_mode(0o700))
+            .expect("make campaign root private");
+        let leaf = root.join("node-0");
+        fs::create_dir(&leaf).expect("create snapshot leaf");
+        fs::set_permissions(&leaf, Permissions::from_mode(0o700))
+            .expect("make snapshot leaf private");
+        assert_eq!(
+            canonical_private_snapshot_leaf(&leaf, &root).expect("accept private direct child"),
+            leaf
+        );
+
+        let redirect = root.join("redirect");
+        fs::create_dir(&redirect).expect("create redirect target");
+        fs::set_permissions(&redirect, Permissions::from_mode(0o700))
+            .expect("make redirect target private");
+        let linked_leaf = root.join("node-1");
+        symlink(&redirect, &linked_leaf).expect("create hostile direct-child symlink");
+        assert!(
+            canonical_private_snapshot_leaf(&linked_leaf, &root).is_err(),
+            "a direct child symlink must fail before snapshot initialization"
+        );
     }
 
     #[cfg(unix)]

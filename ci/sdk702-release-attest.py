@@ -26,14 +26,18 @@ from typing import Iterable
 
 
 TRUSTED_GIT = pathlib.Path("/usr/bin/git")
-ATTESTATION_KIND = "sdk702_trusted_release_attestation_wrapper/v1"
+ATTESTATION_KIND = "sdk702_trusted_release_attestation_wrapper/v2"
 ATTESTATION_LEAF = "sdk702-release-build-attestation.json"
 MAX_OUTPUT = 4 * 1024 * 1024
 MAX_DIAGNOSTICS = 64 * 1024
 MAX_EXECUTABLE = 512 * 1024 * 1024
-MAX_PROCESS_LOSS_EVIDENCE = 64 * 1024
+MAX_PROCESS_LOSS_V9_EVIDENCE = 128 * 1024
+MAX_PROCESS_LOSS_V1_EVIDENCE = 64 * 1024
 PROCESS_LOSS_V9_LEAF = "persistent-consumer-v9.json"
 PROCESS_LOSS_V1_LEAF = "batch-release-gate-v1.json"
+FS_VERITY_SNAPSHOT_NAMESPACE_PREFIX = "sdk702-release-snapshots-"
+FS_VERITY_SNAPSHOT_ROOT_ENV = "OPC_FS_VERITY_SNAPSHOT_ROOT"
+FS_VERITY_QUALIFICATION_ENV = "OPC_FS_VERITY_QUALIFICATION"
 GIT_TIMEOUT_SECONDS = 30
 BUILD_TIMEOUT_SECONDS = 20 * 60
 PROCESS_TERM_GRACE_SECONDS = 2
@@ -50,7 +54,10 @@ LIBTEST_ARGS = (
     "--nocapture",
 )
 RECIPE = (
+    "OPC_FS_VERITY_QUALIFICATION=required "
+    "OPC_FS_VERITY_SNAPSHOT_ROOT=<existing-absolute-external-fs-verity-root> "
     "/usr/bin/python3 ci/sdk702-release-attest.py --cargo <absolute-trusted-cargo> --target-dir <absent-absolute-external-target> "
+    "--snapshot-root <existing-absolute-external-fs-verity-root> "
     "--attestation-namespace <absent-absolute-external-namespace> "
     "--evidence <absent-absolute-external-namespace> "
     "--process-loss-evidence <absolute-external-testkit-v9-json> "
@@ -234,18 +241,37 @@ class PinnedProcessLossPair:
         if directory_identity(descriptor_stat) != self.parent_identity or directory_identity(pathname_stat) != self.parent_identity:
             raise QualificationError("process-loss pair parent identity changed")
 
-    def _revalidate_leaf(self, name: str, descriptor: int, identity: tuple[int, int, int], label: str) -> None:
-        pathname_stat = private_leaf_stat_at(self.parent_descriptor, name, label, MAX_PROCESS_LOSS_EVIDENCE)
+    def _revalidate_leaf(
+        self,
+        name: str,
+        descriptor: int,
+        identity: tuple[int, int, int],
+        label: str,
+        maximum: int,
+    ) -> None:
+        pathname_stat = private_leaf_stat_at(self.parent_descriptor, name, label, maximum)
         descriptor_stat = os.fstat(descriptor)
-        require_private_regular_file(descriptor_stat, label, MAX_PROCESS_LOSS_EVIDENCE)
+        require_private_regular_file(descriptor_stat, label, maximum)
         if descriptor_identity(pathname_stat) != identity or descriptor_identity(descriptor_stat) != identity:
             raise QualificationError(f"{label} identity changed")
 
     def revalidate(self) -> None:
         self._revalidate_parent()
         self._require_exact_names()
-        self._revalidate_leaf(PROCESS_LOSS_V9_LEAF, self.v9_descriptor, self.v9_identity, "process-loss evidence")
-        self._revalidate_leaf(PROCESS_LOSS_V1_LEAF, self.v1_descriptor, self.v1_identity, "process-loss V1 pair evidence")
+        self._revalidate_leaf(
+            PROCESS_LOSS_V9_LEAF,
+            self.v9_descriptor,
+            self.v9_identity,
+            "process-loss evidence",
+            MAX_PROCESS_LOSS_V9_EVIDENCE,
+        )
+        self._revalidate_leaf(
+            PROCESS_LOSS_V1_LEAF,
+            self.v1_descriptor,
+            self.v1_identity,
+            "process-loss V1 pair evidence",
+            MAX_PROCESS_LOSS_V1_EVIDENCE,
+        )
         self._require_exact_names()
         self._revalidate_parent()
 
@@ -259,8 +285,12 @@ class PinnedProcessLossPair:
 
     def read(self) -> tuple[tuple[bytes, os.stat_result, str], tuple[bytes, os.stat_result, str]]:
         self.revalidate()
-        v9 = read_bounded_private_descriptor(self.v9_descriptor, "process-loss evidence", MAX_PROCESS_LOSS_EVIDENCE)
-        v1 = read_bounded_private_descriptor(self.v1_descriptor, "process-loss V1 pair evidence", MAX_PROCESS_LOSS_EVIDENCE)
+        v9 = read_bounded_private_descriptor(
+            self.v9_descriptor, "process-loss evidence", MAX_PROCESS_LOSS_V9_EVIDENCE
+        )
+        v1 = read_bounded_private_descriptor(
+            self.v1_descriptor, "process-loss V1 pair evidence", MAX_PROCESS_LOSS_V1_EVIDENCE
+        )
         self.revalidate()
         return v9, v1
 
@@ -463,10 +493,12 @@ def pin_lease_leaf(value: str) -> PinnedLeaseLeaf:
         raise
 
 
-def verify_pinned_directory(path: pathlib.Path, descriptor: int, identity: tuple[int, int, int], label: str) -> None:
+def verify_pinned_directory(path: pathlib.Path, descriptor: int, identity: tuple[int, ...], label: str) -> None:
     current = os.fstat(descriptor)
     pathname = os.stat(path, follow_symlinks=False)
-    if not stat.S_ISDIR(current.st_mode) or descriptor_identity(current) != identity or descriptor_identity(pathname) != identity:
+    require_private_directory(current, label)
+    require_private_directory(pathname, label)
+    if directory_identity(current) != identity[:2] or directory_identity(pathname) != identity[:2]:
         raise QualificationError(f"{label} identity changed")
 
 
@@ -477,15 +509,120 @@ def create_private_target(path: pathlib.Path) -> tuple[int, tuple[int, int, int]
         os.fsync(parent_fd)
         target_fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
         try:
-            identity = descriptor_identity(os.fstat(target_fd))
-            if os.fstat(target_fd).st_mode & 0o077:
-                raise QualificationError("fresh target namespace is not private")
+            target_stat = os.fstat(target_fd)
+            require_private_directory(target_stat, "fresh target namespace")
+            identity = descriptor_identity(target_stat)
             return target_fd, identity
         except BaseException:
             os.close(target_fd)
             raise
     finally:
         os.close(parent_fd)
+
+
+def open_private_absolute_directory(value: str, label: str) -> tuple[pathlib.Path, int, tuple[int, int]]:
+    path = pathlib.Path(value)
+    if (
+        os.fsencode(value) != os.fsencode(str(path))
+        or not path.is_absolute()
+        or any(not isinstance(component, str) or component in ("", ".", "..") for component in path.parts[1:])
+    ):
+        raise QualificationError(f"{label} must be a canonical absolute directory")
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        for component in path.parts[1:]:
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        descriptor_stat = os.fstat(descriptor)
+        require_private_directory(descriptor_stat, label)
+        canonical = pathlib.Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        if canonical != path:
+            raise QualificationError(f"{label} must be canonical")
+        pathname_stat = os.stat(path, follow_symlinks=False)
+        require_private_directory(pathname_stat, label)
+        identity = directory_identity(descriptor_stat)
+        if directory_identity(pathname_stat) != identity:
+            raise QualificationError(f"{label} identity changed while opening")
+        return canonical, descriptor, identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def create_private_snapshot_namespace(
+    snapshot_base: pathlib.Path,
+    snapshot_base_descriptor: int,
+    snapshot_base_identity: tuple[int, int],
+    target: pathlib.Path,
+) -> tuple[pathlib.Path, int, tuple[int, int]]:
+    """Create a fresh fixed-name child below the explicit pinned snapshot base."""
+    verify_pinned_directory(
+        snapshot_base, snapshot_base_descriptor, snapshot_base_identity, "fs-verity snapshot root"
+    )
+    name = FS_VERITY_SNAPSHOT_NAMESPACE_PREFIX + digest_bytes(os.fsencode(target))[:32]
+    snapshot_root = snapshot_base / name
+    try:
+        os.mkdir(name, 0o700, dir_fd=snapshot_base_descriptor)
+    except FileExistsError as error:
+        raise QualificationError("fresh fs-verity snapshot namespace already exists") from error
+    os.fsync(snapshot_base_descriptor)
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=snapshot_base_descriptor,
+        )
+    except OSError as error:
+        raise QualificationError("fresh target snapshot namespace cannot be opened") from error
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        pathname_stat = os.stat(name, dir_fd=snapshot_base_descriptor, follow_symlinks=False)
+        require_private_directory(descriptor_stat, "fresh fs-verity snapshot namespace")
+        require_private_directory(pathname_stat, "fresh fs-verity snapshot namespace")
+        identity = directory_identity(descriptor_stat)
+        if directory_identity(pathname_stat) != identity:
+            raise QualificationError("fresh fs-verity snapshot namespace identity changed")
+        if snapshot_root.resolve(strict=True) != snapshot_root:
+            raise QualificationError("fresh fs-verity snapshot namespace is not canonical")
+        return snapshot_root, descriptor, identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def verify_pinned_snapshot_namespace(
+    snapshot_base: pathlib.Path,
+    snapshot_base_descriptor: int,
+    snapshot_base_identity: tuple[int, int],
+    snapshot_root: pathlib.Path,
+    snapshot_descriptor: int,
+    snapshot_identity: tuple[int, int],
+) -> None:
+    verify_pinned_directory(
+        snapshot_base, snapshot_base_descriptor, snapshot_base_identity, "fs-verity snapshot root"
+    )
+    if snapshot_root.parent != snapshot_base or not snapshot_root.name.startswith(FS_VERITY_SNAPSHOT_NAMESPACE_PREFIX):
+        raise QualificationError("fresh fs-verity snapshot namespace is not the fixed direct child")
+    current = os.fstat(snapshot_descriptor)
+    pathname = os.stat(snapshot_root.name, dir_fd=snapshot_base_descriptor, follow_symlinks=False)
+    require_private_directory(current, "fresh fs-verity snapshot namespace")
+    require_private_directory(pathname, "fresh fs-verity snapshot namespace")
+    if directory_identity(current) != snapshot_identity or directory_identity(pathname) != snapshot_identity:
+        raise QualificationError("fresh fs-verity snapshot namespace identity changed")
+
+
+def require_distinct_snapshot_filesystem(
+    target_identity: tuple[int, int, int], snapshot_base_identity: tuple[int, int]
+) -> None:
+    if target_identity[0] == snapshot_base_identity[0]:
+        raise QualificationError(
+            "Cargo target/build namespace must not share the fs-verity snapshot filesystem"
+        )
 
 
 def canonical_directory(value: str, label: str) -> pathlib.Path:
@@ -540,18 +677,20 @@ def require_process_loss_root_external_topology(
     """Keep the producer's root/pair/leaves hierarchy separate from wrapper I/O.
 
     The pair leaves are deliberately nested below ``producer_root`` and must
-    not enter the generic pairwise set.  Each unrelated wrapper path and its
-    canonical parent is still rejected when it is a sibling, ancestor, or
-    descendant of that producer root before the wrapper opens its lease or
-    creates its target.
+    not enter the generic pairwise set.  Each actual unrelated wrapper path is
+    rejected when it is an ancestor or descendant of that producer root.  Its
+    canonical parent is an authority boundary checked against the protected
+    source roots, not a namespace occupied by the wrapper: disjoint wrapper
+    leaves may intentionally share one external parent with the producer.
     """
     protected = list(protected)
+    unrelated_namespaces = list(unrelated_namespaces)
     unrelated = [*unrelated_namespaces, *unrelated_parents]
     if any(overlaps(producer_root, boundary) for boundary in protected):
         raise QualificationError("process-loss evidence root overlaps source or git metadata")
     if any(overlaps(candidate, boundary) for candidate in unrelated for boundary in protected):
         raise QualificationError("qualification external path overlaps source or git metadata")
-    if any(overlaps(producer_root, candidate) for candidate in unrelated):
+    if any(overlaps(producer_root, candidate) for candidate in unrelated_namespaces):
         raise QualificationError("process-loss evidence root overlaps an unrelated external namespace")
 
 
@@ -832,6 +971,7 @@ def release_arguments() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--cargo", required=True)
     parser.add_argument("--target-dir", required=True)
+    parser.add_argument("--snapshot-root", required=True)
     parser.add_argument("--attestation-namespace", required=True)
     parser.add_argument("--evidence", required=True)
     parser.add_argument("--process-loss-evidence", required=True)
@@ -847,13 +987,28 @@ def main(argv: list[str]) -> int:
         raise QualificationError("wrapper must execute its canonical checked-in path")
     cargo = trusted_cargo_executable(arguments.cargo)
     target = absent_namespace(arguments.target_dir, "target directory")
-    attestation_namespace = absent_namespace(arguments.attestation_namespace, "attestation namespace")
-    evidence_namespace = absent_namespace(arguments.evidence, "evidence namespace")
-    process_loss_pair = pin_process_loss_pair(arguments.process_loss_evidence)
+    snapshot_base, snapshot_base_fd, snapshot_base_identity = open_private_absolute_directory(
+        arguments.snapshot_root, "fs-verity snapshot root"
+    )
+    if os.environ.get(FS_VERITY_QUALIFICATION_ENV) != "required":
+        os.close(snapshot_base_fd)
+        raise QualificationError("wrapper requires the fixed fs-verity qualification marker")
+    supplied_snapshot_base = os.environ.get(FS_VERITY_SNAPSHOT_ROOT_ENV)
+    if supplied_snapshot_base is None or os.fsencode(supplied_snapshot_base) != os.fsencode(str(snapshot_base)):
+        os.close(snapshot_base_fd)
+        raise QualificationError("wrapper fs-verity snapshot root environment does not bind the canonical argument")
+    try:
+        attestation_namespace = absent_namespace(arguments.attestation_namespace, "attestation namespace")
+        evidence_namespace = absent_namespace(arguments.evidence, "evidence namespace")
+        process_loss_pair = pin_process_loss_pair(arguments.process_loss_evidence)
+    except BaseException:
+        os.close(snapshot_base_fd)
+        raise
     try:
         lease = pin_lease_leaf(arguments.lease)
     except BaseException:
         process_loss_pair.close()
+        os.close(snapshot_base_fd)
         raise
     try:
         gitdir = pathlib.Path(one_git_line(repo, "rev-parse", "--absolute-git-dir")).resolve(strict=True)
@@ -862,13 +1017,13 @@ def main(argv: list[str]) -> int:
         protected = [repo, gitdir, common_gitdir]
         require_external_disjoint_from_protected(
             protected,
-            [target, attestation_namespace, evidence_namespace, lease.path],
+            [target, snapshot_base, attestation_namespace, evidence_namespace, lease.path],
         )
         require_process_loss_root_external_topology(
             protected,
             process_loss_pair.evidence_root_path,
-            [target, attestation_namespace, evidence_namespace, lease.path],
-            [target.parent, attestation_namespace.parent, evidence_namespace.parent, lease.parent_path],
+            [target, snapshot_base, attestation_namespace, evidence_namespace, lease.path],
+            [target.parent, snapshot_base.parent, attestation_namespace.parent, evidence_namespace.parent, lease.parent_path],
         )
         snapshot = source_snapshot(repo, gitdir)
         if arguments.check:
@@ -876,7 +1031,21 @@ def main(argv: list[str]) -> int:
             return 0
         lease.open_for_child()
         target_fd, target_identity = create_private_target(target)
+        snapshot_fd: int | None = None
         try:
+            snapshot_root, snapshot_fd, snapshot_identity = create_private_snapshot_namespace(
+                snapshot_base, snapshot_base_fd, snapshot_base_identity, target
+            )
+            require_distinct_snapshot_filesystem(target_identity, snapshot_base_identity)
+            verify_pinned_directory(target, target_fd, target_identity, "fresh target namespace")
+            verify_pinned_snapshot_namespace(
+                snapshot_base,
+                snapshot_base_fd,
+                snapshot_base_identity,
+                snapshot_root,
+                snapshot_fd,
+                snapshot_identity,
+            )
             executable = build_exact_test(repo, cargo, target, snapshot)
             verify_pinned_directory(target, target_fd, target_identity, "fresh target namespace")
             if source_snapshot(repo, gitdir) != snapshot:
@@ -895,6 +1064,10 @@ def main(argv: list[str]) -> int:
                     "cargo_lock_sha256": snapshot["lock"],
                     "release_schema_sha256": snapshot["schema"],
                     "cargo_target_dir_id": "sha256:" + digest_bytes(os.fsencode(target)),
+                    "fs_verity_snapshot_base_id": "sha256:" + digest_bytes(os.fsencode(snapshot_base)),
+                    "fs_verity_snapshot_root_id": "sha256:" + digest_bytes(os.fsencode(snapshot_root)),
+                    "fs_verity_snapshot_root_device": snapshot_identity[0],
+                    "fs_verity_snapshot_root_inode": snapshot_identity[1],
                     "executable_sha256": executable_digest,
                     "executable_device": identity.st_dev,
                     "executable_inode": identity.st_ino,
@@ -917,9 +1090,19 @@ def main(argv: list[str]) -> int:
                         "OPC_QUAL_PROCESS_LOSS_V1_DEVICE": str(process_loss_v1_identity.st_dev),
                         "OPC_QUAL_PROCESS_LOSS_V1_INODE": str(process_loss_v1_identity.st_ino),
                         "OPC_QUAL_PROCESS_LOSS_V1_SIZE": str(process_loss_v1_identity.st_size),
+                        FS_VERITY_SNAPSHOT_ROOT_ENV: str(snapshot_root),
+                        FS_VERITY_QUALIFICATION_ENV: "required",
                     }
                 )
                 verify_pinned_directory(target, target_fd, target_identity, "fresh target namespace")
+                verify_pinned_snapshot_namespace(
+                    snapshot_base,
+                    snapshot_base_fd,
+                    snapshot_base_identity,
+                    snapshot_root,
+                    snapshot_fd,
+                    snapshot_identity,
+                )
                 # Re-read descriptor-pinned evidence and revalidate the leaf
                 # paths immediately before the child is allowed to consume it.
                 (final_process_loss, final_process_loss_identity, final_process_loss_digest), (final_process_loss_v1, final_process_loss_v1_identity, final_process_loss_v1_digest) = process_loss_pair.read()
@@ -954,15 +1137,26 @@ def main(argv: list[str]) -> int:
                 if status != 0:
                     raise QualificationError("exact pinned release test failed")
                 verify_pinned_directory(target, target_fd, target_identity, "fresh target namespace")
+                verify_pinned_snapshot_namespace(
+                    snapshot_base,
+                    snapshot_base_fd,
+                    snapshot_base_identity,
+                    snapshot_root,
+                    snapshot_fd,
+                    snapshot_identity,
+                )
                 sys.stdout.buffer.write(output)
                 return 0
             finally:
                 os.close(descriptor)
         finally:
+            if snapshot_fd is not None:
+                os.close(snapshot_fd)
             os.close(target_fd)
     finally:
         lease.close()
         process_loss_pair.close()
+        os.close(snapshot_base_fd)
 
 
 if __name__ == "__main__":

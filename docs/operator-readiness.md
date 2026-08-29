@@ -1201,9 +1201,10 @@ gate succeeds and validates its strict artifacts; this document records no
 such result. Neither schema converts historical loopback samples into a
 production SLO claim.
 
-The closed V9 pair records canonical absolute producer-target and external
-evidence-root paths, the pair directory derived from that root, and separate
-domain-separated commitments for each raw path. It separately fixes the exact
+The closed V9 pair records canonical absolute producer-target, external
+evidence-root, and owner-private fs-verity snapshot-base paths, the pair
+directory derived from the evidence root, separate domain-separated commitments
+for each raw path, and the snapshot-base device/inode. It separately fixes the exact
 normalized absolute Cargo invocation alias, canonical backing path, and
 backing-content SHA-256. The alias (including a rustup-managed `.../cargo`
 spelling), rather than the backing path, is `argv[0]` followed by 14 canonical
@@ -1213,13 +1214,14 @@ alias. Bound paths reject control
 characters and NUL; standard POSIX single-quote escaping is an exact-regression
 property, not a general shell-injection claim. The exact pair leaves remain
 `batch-release-gate-v1.json` and `persistent-consumer-v9.json`; symmetric
-pair run-ID uses the v3 domain. It binds canonical V1, the existing
+pair run-ID uses the v4 domain. It binds canonical V1, the existing
 provenance/invocation fields, and a canonical full V9 claims preimage with only
 `run_id_sha256` replaced by `sha256:` plus 64 zeroes; it does not hash final
 self-containing V9 bytes. The command digest orders backing path, alias,
-backing SHA-256, u16-BE executable mode, then argv. Run-ID v3 retains its
-pre-existing 16 provenance bindings, ending alias, backing path, backing
-SHA-256, `cargo_profile`, and `opt_level`; it then binds u16-BE mode before the
+backing SHA-256, u16-BE executable mode, then argv. Run-ID v4 binds 20 ordered
+provenance strings: the prior 16 ending alias, backing path, backing SHA-256,
+`cargo_profile`, and `opt_level`, plus the fs-verity snapshot path,
+commitment, device, and inode. It then binds u16-BE mode before the
 existing V1/V9/argv/recipe/canonical-V1/claims-preimage material. The wrapper
 consumes the pair using a fresh distinct target. Its private lease is
 held by the Python wrapper as the exact nofollow inode via
@@ -1227,7 +1229,7 @@ held by the Python wrapper as the exact nofollow inode via
 inheritance; Rust opens/locks that inode and revalidates procfd, parent, name,
 and path before mkdir, publication, and completion to close the A-to-B
 split-lock seam. The V9 schema digest is
-`sha256:ecb42383a02a4704988139aafe2f59dfb95988b1e57cdaf05438a664500f2b41`.
+`sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018`.
 
 The protected `/3` pool is rebound to a readiness-proven live leader after each
 loss/restart. Its tenant-negative evidence is exactly three per-voter,

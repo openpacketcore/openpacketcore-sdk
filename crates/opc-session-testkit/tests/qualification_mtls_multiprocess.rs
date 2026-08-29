@@ -6,7 +6,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::num::NonZeroUsize;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -92,9 +92,10 @@ use opc_session_testkit::qualification::{
     QualificationTlsMaterialReason, QualificationTlsMaterialStatus, QualificationTrafficErrorClass,
     QualificationTrafficFailureCode, QualificationTrafficFailureStage, QualificationTrafficState,
     QualificationTrafficStatus, QualificationTransportConfig,
-    SessionHaPersistentConsumerHeadEvidenceV9, SessionMtlsBatchReleaseGateBindingsV1,
-    SessionMtlsBatchReleaseGateEvidenceV1, SessionMtlsBatchReleaseGatePoolEvidenceV1,
-    SessionMtlsBatchReleaseGatePoolRoleV1, SessionMtlsBatchReleaseGateResourceGenerationV1,
+    SessionHaPersistentConsumerHeadEvidenceV9, SessionHaPersistentConsumerHeadEvidenceV9Error,
+    SessionMtlsBatchReleaseGateBindingsV1, SessionMtlsBatchReleaseGateEvidenceV1,
+    SessionMtlsBatchReleaseGatePoolEvidenceV1, SessionMtlsBatchReleaseGatePoolRoleV1,
+    SessionMtlsBatchReleaseGateResourceGenerationV1,
     SessionMtlsBatchReleaseGateServerQueueDepthScopeV1, SessionMtlsCandidateCampaign,
     SessionMtlsCandidateEvidenceV2, SessionMtlsCandidateSourceTreeStatus,
     QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS, QUALIFICATION_CONSENSUS_CONNECTION_LANES_PER_PEER,
@@ -133,6 +134,7 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS,
     QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS,
+    SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_MAX_BYTES,
     SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_JSON,
     SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_ATTEMPT_CEILING,
     SESSION_MTLS_BATCH_RELEASE_GATE_AGGREGATE_SETUP_FAILURE_CEILING,
@@ -197,6 +199,8 @@ const PLAINTEXT_CANARY_PREFIXES: [&[u8]; 2] = [
     TRAFFIC_PLAINTEXT_CANARY_PREFIX,
 ];
 const EVIDENCE_OUTPUT_DIRECTORY_ENV: &str = "OPC_SESSION_HA_EVIDENCE_DIR";
+const FS_VERITY_QUALIFICATION_ENV: &str = "OPC_FS_VERITY_QUALIFICATION";
+const FS_VERITY_SNAPSHOT_ROOT_ENV: &str = "OPC_FS_VERITY_SNAPSHOT_ROOT";
 const MAX_CANDIDATE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CANDIDATE_EVIDENCE_BYTES: u64 = 256 * 1024;
 const MAX_CANDIDATE_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -2817,6 +2821,10 @@ struct ReleaseGateProvenance {
     cargo_target_directory_sha256: String,
     evidence_root_directory: String,
     evidence_root_directory_sha256: String,
+    fs_verity_snapshot_root_directory: String,
+    fs_verity_snapshot_root_directory_sha256: String,
+    fs_verity_snapshot_root_device: u64,
+    fs_verity_snapshot_root_inode: u64,
     pair_directory: String,
     pair_directory_sha256: String,
     command_argv_sha256: String,
@@ -2963,6 +2971,9 @@ struct Fleet {
     nodes: Vec<ChildNode>,
     // Keep the workspace alive until every child has been killed on panic.
     workspace: TempDir,
+    // The immutable snapshot namespace has a distinct lifecycle from mutable
+    // workspace files, but must survive until every child has stopped.
+    _snapshot_namespace: Option<PinnedV9SnapshotNamespace>,
     config_paths: Vec<PathBuf>,
     stderr_paths: Vec<PathBuf>,
     projected_roots: Vec<PathBuf>,
@@ -2975,6 +2986,69 @@ struct Fleet {
     candidate_evidence_inputs: CandidateEvidenceInputs,
     candidate_public_material_manifest: CandidatePublicMaterialManifest,
     readiness_probe_commands: usize,
+}
+
+/// Retain no-follow descriptors for both the configured fs-verity base and
+/// the fresh campaign child. The child configs carry the child identity, so
+/// the node cannot accept a substituted namespace merely because its path and
+/// inherited environment still look plausible.
+struct PinnedV9SnapshotNamespace {
+    // Kept rather than recursively removed on Drop: after a failed identity
+    // check, pathname cleanup could otherwise delete a same-UID replacement.
+    namespace: PathBuf,
+    base: PathBuf,
+    base_descriptor: OwnedFd,
+    base_device: u64,
+    base_inode: u64,
+    descriptor: OwnedFd,
+    device: u64,
+    inode: u64,
+}
+
+impl PinnedV9SnapshotNamespace {
+    fn path(&self) -> &Path {
+        &self.namespace
+    }
+
+    fn device(&self) -> u64 {
+        self.device
+    }
+
+    fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        let base = fstat(&self.base_descriptor)?;
+        let namespace = fstat(&self.descriptor)?;
+        let base_metadata = fs::symlink_metadata(&self.base)?;
+        let namespace_metadata = fs::symlink_metadata(self.path())?;
+        let private_directory = |metadata: &fs::Metadata| {
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == rustix::process::geteuid().as_raw()
+                && metadata.permissions().mode() & 0o7777 == 0o700
+        };
+        if !private_directory(&base_metadata)
+            || !private_directory(&namespace_metadata)
+            || base.st_dev as u64 != self.base_device
+            || base.st_ino as u64 != self.base_inode
+            || base_metadata.dev() != self.base_device
+            || base_metadata.ino() != self.base_inode
+            || namespace.st_dev as u64 != self.device
+            || namespace.st_ino as u64 != self.inode
+            || namespace_metadata.dev() != self.device
+            || namespace_metadata.ino() != self.inode
+            || fs::canonicalize(&self.base)? != self.base
+            || fs::canonicalize(self.path())? != self.path()
+            || self.path().parent() != Some(self.base.as_path())
+        {
+            return Err(io::Error::other(
+                "V9 fs-verity snapshot namespace identity changed",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn stateless_consumer_voter_topology_for_configuration(
@@ -3077,22 +3151,119 @@ fn stateless_consumer_voter_topology_binds_fixed_root_and_epoch_scope() {
 }
 
 impl Fleet {
+    fn fs_verity_snapshot_campaign_namespace(
+        release_provenance: Option<&ReleaseGateProvenance>,
+    ) -> Option<PinnedV9SnapshotNamespace> {
+        let root = match env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV) {
+            Some(root) => root,
+            None => {
+                assert_ne!(
+                    env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref(),
+                    Some(std::ffi::OsStr::new("required")),
+                    "required fs-verity qualification needs {FS_VERITY_SNAPSHOT_ROOT_ENV}"
+                );
+                return None;
+            }
+        };
+        assert_eq!(
+            env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref(),
+            Some(std::ffi::OsStr::new("required")),
+            "{FS_VERITY_SNAPSHOT_ROOT_ENV} is accepted only for required fs-verity qualification"
+        );
+        let root = v9_canonical_fs_verity_snapshot_root_directory(Some(root))
+            .expect("canonical private fs-verity snapshot root");
+        if let Some(provenance) = release_provenance {
+            assert!(
+                root.directory.to_str()
+                    == Some(provenance.fs_verity_snapshot_root_directory.as_str())
+                    && root.device == provenance.fs_verity_snapshot_root_device
+                    && root.inode == provenance.fs_verity_snapshot_root_inode,
+                "V9 fs-verity snapshot root differs from captured release provenance"
+            );
+        }
+        let base_descriptor = v9_open_private_external_root(&root.directory)
+            .expect("open canonical private fs-verity snapshot root");
+        let base_metadata = fstat(&base_descriptor).expect("fstat fs-verity snapshot root");
+        assert_eq!(base_metadata.st_dev as u64, root.device);
+        assert_eq!(base_metadata.st_ino as u64, root.inode);
+        let namespace = tempfile::Builder::new()
+            .prefix("opc-v9-snapshots-")
+            .tempdir_in(&root.directory)
+            .expect("create private V9 fs-verity snapshot namespace");
+        let namespace_name = namespace
+            .path()
+            .file_name()
+            .expect("fresh V9 fs-verity namespace direct name");
+        let descriptor = openat(
+            &base_descriptor,
+            namespace_name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open no-follow V9 fs-verity snapshot namespace");
+        let descriptor_metadata =
+            fstat(&descriptor).expect("fstat V9 fs-verity snapshot namespace");
+        let namespace = namespace.keep();
+        let metadata =
+            fs::symlink_metadata(&namespace).expect("stat private V9 fs-verity snapshot namespace");
+        assert!(
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == rustix::process::geteuid().as_raw()
+                && metadata.permissions().mode() & 0o7777 == 0o700
+                && fs::canonicalize(&namespace)
+                    .expect("canonical private V9 fs-verity snapshot namespace")
+                    .starts_with(&root.directory),
+            "V9 fs-verity snapshot namespace must remain private below its configured root"
+        );
+        let pinned = PinnedV9SnapshotNamespace {
+            namespace,
+            base: root.directory,
+            base_descriptor,
+            base_device: base_metadata.st_dev as u64,
+            base_inode: base_metadata.st_ino as u64,
+            descriptor,
+            device: descriptor_metadata.st_dev as u64,
+            inode: descriptor_metadata.st_ino as u64,
+        };
+        pinned
+            .verify()
+            .expect("pin V9 fs-verity snapshot namespace identity");
+        Some(pinned)
+    }
+
     fn start(member_count: usize) -> Self {
         let schedule = session_mtls_candidate_schedule_sha256(
             SessionMtlsCandidateCampaign::RotationCore,
             member_count,
         )
         .expect("supported rotation-core candidate topology");
-        Self::start_with_schedule(member_count, schedule)
+        Self::start_with_schedule(member_count, schedule, None)
     }
 
     fn start_traffic(member_count: usize) -> Self {
         let schedule = qualification_traffic_schedule_sha256(member_count)
             .expect("supported traffic qualification topology");
-        Self::start_with_schedule(member_count, schedule)
+        Self::start_with_schedule(member_count, schedule, None)
     }
 
-    fn start_with_schedule(member_count: usize, workload_schedule_sha256: String) -> Self {
+    fn start_with_release_provenance(
+        member_count: usize,
+        release_provenance: &ReleaseGateProvenance,
+    ) -> Self {
+        let schedule = session_mtls_candidate_schedule_sha256(
+            SessionMtlsCandidateCampaign::RotationCore,
+            member_count,
+        )
+        .expect("supported rotation-core candidate topology");
+        Self::start_with_schedule(member_count, schedule, Some(release_provenance))
+    }
+
+    fn start_with_schedule(
+        member_count: usize,
+        workload_schedule_sha256: String,
+        release_provenance: Option<&ReleaseGateProvenance>,
+    ) -> Self {
         assert!(matches!(member_count, 3 | 5));
         let (source_revision, source_tree_status, source_worktree_sha256) =
             candidate_source_provenance().expect("capture candidate source provenance");
@@ -3105,6 +3276,21 @@ impl Fleet {
         let harness_sha256 = candidate_sha256_file(&harness_path, MAX_CANDIDATE_ARTIFACT_BYTES)
             .expect("hash candidate harness before execution");
         let workspace = tempfile::tempdir().expect("create mTLS qualification workspace");
+        let snapshot_namespace = Self::fs_verity_snapshot_campaign_namespace(release_provenance);
+        if let Some(namespace) = &snapshot_namespace {
+            assert_ne!(
+                fs::metadata(workspace.path())
+                    .expect("stat ordinary V9 qualification workspace")
+                    .dev(),
+                fs::metadata(namespace.path())
+                    .expect("stat V9 fs-verity snapshot namespace")
+                    .dev(),
+                "V9 mutable workspace must not share the fs-verity snapshot filesystem"
+            );
+            namespace
+                .verify()
+                .expect("revalidate V9 fs-verity snapshot namespace before child configuration");
+        }
         let root = workspace.path();
         let mut configs = Vec::with_capacity(member_count);
         let mut nodes = Vec::with_capacity(member_count);
@@ -3144,10 +3330,17 @@ impl Fleet {
         for (node_index, config_path) in configs.iter().enumerate() {
             let node_root = root.join(format!("node-{node_index}"));
             let projected_root = node_root.join("projected");
-            let snapshots = node_root.join("snapshots");
+            let snapshots = snapshot_namespace
+                .as_ref()
+                .map(|namespace| namespace.path().join(format!("node-{node_index}")))
+                .unwrap_or_else(|| node_root.join("snapshots"));
             let database_path = node_root.join("session.sqlite");
             fs::create_dir(&projected_root).expect("create projected root");
             fs::create_dir(&snapshots).expect("create snapshots root");
+            if snapshot_namespace.is_some() {
+                fs::set_permissions(&snapshots, Permissions::from_mode(0o700))
+                    .expect("make V9 fs-verity snapshot leaf owner private");
+            }
             let initial_credential = pki.credential(node_index, CredentialGeneration::Initial);
             let initial_trust = pki.trust_bundle(TrustGeneration::OldOnly);
             candidate_public_material_manifest
@@ -3177,6 +3370,15 @@ impl Fleet {
                 workspace_directory: root.to_path_buf(),
                 database_path: database_path.clone(),
                 snapshot_directory: snapshots,
+                snapshot_root_directory: snapshot_namespace
+                    .as_ref()
+                    .map(|namespace| namespace.path().to_path_buf()),
+                snapshot_root_device: snapshot_namespace
+                    .as_ref()
+                    .map(PinnedV9SnapshotNamespace::device),
+                snapshot_root_inode: snapshot_namespace
+                    .as_ref()
+                    .map(PinnedV9SnapshotNamespace::inode),
                 operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
                 transport: QualificationTransportConfig::ProjectedMtls(
                     QualificationProjectedMtlsConfig {
@@ -3208,6 +3410,11 @@ impl Fleet {
             configuration_sha256: candidate_configuration_sha256(&configs)
                 .expect("hash candidate configurations before execution"),
         };
+        if let Some(namespace) = &snapshot_namespace {
+            namespace
+                .verify()
+                .expect("revalidate V9 fs-verity snapshot namespace before child startup");
+        }
 
         // Bound the process-heavy store/transport startup to one child at a
         // time. All listeners are already bound and all immutable
@@ -3240,6 +3447,7 @@ impl Fleet {
         let mut fleet = Self {
             nodes,
             workspace,
+            _snapshot_namespace: snapshot_namespace,
             config_paths: configs,
             stderr_paths,
             projected_roots,
@@ -3255,6 +3463,7 @@ impl Fleet {
         };
         fleet.wait_ready();
         fleet.assert_all_material_ready();
+        fleet.verify_snapshot_namespace();
         assert!(matches!(
             fleet.nodes[0].invoke(&QualificationNodeCommand::DirectedHandshake {
                 remote_node_index: 1,
@@ -3266,6 +3475,14 @@ impl Fleet {
         fleet.acquire_canary_lease();
         fleet.advance_canary("initial-old-chain");
         fleet
+    }
+
+    fn verify_snapshot_namespace(&self) {
+        if let Some(namespace) = &self._snapshot_namespace {
+            namespace
+                .verify()
+                .expect("V9 fs-verity snapshot namespace changed during campaign");
+        }
     }
 
     fn member_count(&self) -> usize {
@@ -3623,6 +3840,7 @@ impl Fleet {
         previous_process_id: u32,
         deadline: Instant,
     ) {
+        self.verify_snapshot_namespace();
         let (node, actual_address) = ChildNode::spawn_bound_until(
             &self.config_paths[node_index],
             node_index,
@@ -6768,9 +6986,11 @@ impl Fleet {
     }
 
     fn shutdown(&mut self) {
+        self.verify_snapshot_namespace();
         for node in &mut self.nodes {
             node.shutdown();
         }
+        self.verify_snapshot_namespace();
     }
 
     fn assert_plaintext_canaries_absent_from_sqlite(&self) {
@@ -7600,6 +7820,11 @@ fn release_gate_provenance_at(repository: &Path) -> io::Result<ReleaseGateProven
         cargo_target_directory_sha256: external_namespaces.cargo_target_directory_sha256,
         evidence_root_directory: external_namespaces.evidence_root_directory,
         evidence_root_directory_sha256: external_namespaces.evidence_root_directory_sha256,
+        fs_verity_snapshot_root_directory: external_namespaces.fs_verity_snapshot_root_directory,
+        fs_verity_snapshot_root_directory_sha256: external_namespaces
+            .fs_verity_snapshot_root_directory_sha256,
+        fs_verity_snapshot_root_device: external_namespaces.fs_verity_snapshot_root_device,
+        fs_verity_snapshot_root_inode: external_namespaces.fs_verity_snapshot_root_inode,
         pair_directory: external_namespaces.pair_directory,
         pair_directory_sha256: external_namespaces.pair_directory_sha256,
         command_argv_sha256: format!("sha256:{:x}", command_hasher.finalize()),
@@ -7846,17 +8071,19 @@ fn v9_reproduction_recipe_is_env_prefixed_shell_safe_and_exact() {
         session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
             "/var/lib/opc testkit/target",
             "/var/lib/opc testkit/evidence",
+            "/var/lib/opc testkit/fs-verity-snapshots",
             "/usr/local/bin/cargo",
         )
         .expect("render canonical V9 reproduction command");
     assert_eq!(
         recipe,
-        "CARGO='/usr/local/bin/cargo' CARGO_TARGET_DIR='/var/lib/opc testkit/target' OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY='/var/lib/opc testkit/evidence' '/usr/local/bin/cargo' 'test' '--locked' '--release' '-p' 'opc-session-testkit' '--test' 'qualification_mtls_multiprocess' '--no-default-features' 'three_process_projected_mtls_persistent_v2_batch_release_gate' '--' '--ignored' '--exact' '--test-threads=1' '--nocapture'"
+        "CARGO='/usr/local/bin/cargo' CARGO_TARGET_DIR='/var/lib/opc testkit/target' OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY='/var/lib/opc testkit/evidence' OPC_FS_VERITY_QUALIFICATION='required' OPC_FS_VERITY_SNAPSHOT_ROOT='/var/lib/opc testkit/fs-verity-snapshots' '/usr/local/bin/cargo' 'test' '--locked' '--release' '-p' 'opc-session-testkit' '--test' 'qualification_mtls_multiprocess' '--no-default-features' 'three_process_projected_mtls_persistent_v2_batch_release_gate' '--' '--ignored' '--exact' '--test-threads=1' '--nocapture'"
     );
     assert!(opc_session_testkit::qualification::
         session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
             "/var/lib/opc/../target",
             "/var/lib/opc/evidence",
+            "/var/lib/opc/fs-verity-snapshots",
             "/usr/local/bin/cargo",
         )
         .is_none());
@@ -7864,6 +8091,7 @@ fn v9_reproduction_recipe_is_env_prefixed_shell_safe_and_exact() {
         session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
             "/var/lib/opc\ntarget",
             "/var/lib/opc/evidence",
+            "/var/lib/opc/fs-verity-snapshots",
             "/usr/local/bin/cargo",
         )
         .is_none());
@@ -7876,14 +8104,16 @@ fn v9_reproduction_recipe_shell_round_trips_quoted_alias_and_namespaces() {
     let injection = "'$(touch $RECIPE_MARKER);semicolon";
     let target = workspace.path().join(format!("target{injection}"));
     let root = workspace.path().join(format!("evidence{injection}"));
+    let snapshot_root = workspace.path().join(format!("snapshots{injection}"));
     let backing = workspace.path().join("rustup-backing");
     let alias = workspace.path().join(format!("cargo{injection}"));
     let recorded = workspace.path().join("recorded-arguments");
     fs::create_dir(&target).expect("create quoted target path");
     fs::create_dir(&root).expect("create quoted evidence root");
+    fs::create_dir(&snapshot_root).expect("create quoted snapshot root");
     fs::write(
         &backing,
-        "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$CARGO\" \"$CARGO_TARGET_DIR\" \"$OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY\" \"$@\" > \"$RECIPE_RECORD\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$CARGO\" \"$CARGO_TARGET_DIR\" \"$OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY\" \"$OPC_FS_VERITY_QUALIFICATION\" \"$OPC_FS_VERITY_SNAPSHOT_ROOT\" \"$@\" > \"$RECIPE_RECORD\"\n",
     )
     .expect("write quoted Cargo backing script");
     fs::set_permissions(&backing, Permissions::from_mode(0o700))
@@ -7893,8 +8123,9 @@ fn v9_reproduction_recipe_shell_round_trips_quoted_alias_and_namespaces() {
     let alias = alias.to_str().expect("quoted alias UTF-8");
     let target = target.to_str().expect("quoted target UTF-8");
     let root = root.to_str().expect("quoted evidence root UTF-8");
+    let snapshot_root = snapshot_root.to_str().expect("quoted snapshot root UTF-8");
     let recipe = opc_session_testkit::qualification::
-        session_ha_persistent_consumer_head_evidence_v9_reproduction_command(target, root, alias)
+        session_ha_persistent_consumer_head_evidence_v9_reproduction_command(target, root, snapshot_root, alias)
             .expect("render quoted V9 reproduction command");
     let status = Command::new("/bin/sh")
         .arg("-c")
@@ -7917,7 +8148,13 @@ fn v9_reproduction_recipe_shell_round_trips_quoted_alias_and_namespaces() {
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let expected = std::iter::once(alias.to_owned())
-        .chain([alias.to_owned(), target.to_owned(), root.to_owned()])
+        .chain([
+            alias.to_owned(),
+            target.to_owned(),
+            root.to_owned(),
+            "required".to_owned(),
+            snapshot_root.to_owned(),
+        ])
         .chain(
             opc_session_testkit::qualification::
                 SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_CARGO_ARGV
@@ -7928,7 +8165,7 @@ fn v9_reproduction_recipe_shell_round_trips_quoted_alias_and_namespaces() {
         .collect::<Vec<_>>();
     assert_eq!(
         observed, expected,
-        "the recipe must execute the alias (not its backing) and round-trip argv[0], CARGO, both external namespace variables, and every Cargo argument exactly once"
+        "the recipe must execute the alias (not its backing) and round-trip argv[0], CARGO, all external namespace variables, and every Cargo argument exactly once"
     );
 }
 
@@ -8379,7 +8616,7 @@ fn v9_sha256(bytes: &[u8]) -> String {
 
 /// Recompute the opaque run identity from both canonical artifacts' shared
 /// release provenance. Keeping the V1 digest in this input makes a valid V9
-/// document non-transferable to another V1 release-gate result. The V3
+/// document non-transferable to another V1 release-gate result. The V4
 /// domain additionally binds a canonical V9 claims preimage, with the
 /// run-ID field replaced by a fixed digest placeholder to keep the contract
 /// noncircular.
@@ -8440,7 +8677,9 @@ fn v9_pair_run_id_material(
         ));
     }
     let mut hasher = Sha256::new();
-    hasher.update(b"opc-session-ha-persistent-consumer-v9-pair-run/v3\0");
+    hasher.update(b"opc-session-ha-persistent-consumer-v9-pair-run/v4\0");
+    let fs_verity_snapshot_root_device = provenance.fs_verity_snapshot_root_device.to_string();
+    let fs_verity_snapshot_root_inode = provenance.fs_verity_snapshot_root_inode.to_string();
     for value in [
         provenance.source_revision.as_str(),
         provenance.source_tree.as_str(),
@@ -8450,6 +8689,10 @@ fn v9_pair_run_id_material(
         provenance.cargo_target_directory_sha256.as_str(),
         provenance.evidence_root_directory.as_str(),
         provenance.evidence_root_directory_sha256.as_str(),
+        provenance.fs_verity_snapshot_root_directory.as_str(),
+        provenance.fs_verity_snapshot_root_directory_sha256.as_str(),
+        fs_verity_snapshot_root_device.as_str(),
+        fs_verity_snapshot_root_inode.as_str(),
         provenance.pair_directory.as_str(),
         provenance.pair_directory_sha256.as_str(),
         provenance.command_argv_sha256.as_str(),
@@ -8479,6 +8722,7 @@ fn v9_pair_run_id_material(
         session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
             &provenance.cargo_target_directory,
             &provenance.evidence_root_directory,
+            &provenance.fs_verity_snapshot_root_directory,
             &provenance.cargo_executable_alias,
         )
         .ok_or_else(|| io::Error::other("V9 canonical reproduction command is invalid"))?;
@@ -8543,6 +8787,14 @@ fn validate_v1_v9_pair(
         || v9.bindings.cargo_target_directory_sha256 != provenance.cargo_target_directory_sha256
         || v9.bindings.evidence_root_directory != provenance.evidence_root_directory
         || v9.bindings.evidence_root_directory_sha256 != provenance.evidence_root_directory_sha256
+        || v9.bindings.fs_verity_snapshot_root_directory
+            != provenance.fs_verity_snapshot_root_directory
+        || v9.bindings.fs_verity_snapshot_root_directory_sha256
+            != provenance.fs_verity_snapshot_root_directory_sha256
+        || v9.bindings.fs_verity_snapshot_root_device
+            != provenance.fs_verity_snapshot_root_device
+        || v9.bindings.fs_verity_snapshot_root_inode
+            != provenance.fs_verity_snapshot_root_inode
         || v9.bindings.pair_directory != provenance.pair_directory
         || v9.bindings.pair_directory_sha256 != provenance.pair_directory_sha256
         || v9.invocation.cargo_executable_alias != provenance.cargo_executable_alias
@@ -8554,6 +8806,7 @@ fn validate_v1_v9_pair(
             != opc_session_testkit::qualification::session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
                 &provenance.cargo_target_directory,
                 &provenance.evidence_root_directory,
+                &provenance.fs_verity_snapshot_root_directory,
                 &provenance.cargo_executable_alias,
             )
             .ok_or_else(|| io::Error::other("V9 canonical reproduction command is invalid"))?
@@ -8717,6 +8970,7 @@ fn build_v9_external_evidence(
                 session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
                     &gate.release_provenance.cargo_target_directory,
                     &gate.release_provenance.evidence_root_directory,
+                    &gate.release_provenance.fs_verity_snapshot_root_directory,
                     &gate.release_provenance.cargo_executable_alias,
                 )
                 .ok_or_else(|| io::Error::other("V9 canonical reproduction command is invalid"))?,
@@ -8737,6 +8991,20 @@ fn build_v9_external_evidence(
                 .release_provenance
                 .evidence_root_directory_sha256
                 .clone(),
+            fs_verity_snapshot_root_directory: gate
+                .release_provenance
+                .fs_verity_snapshot_root_directory
+                .clone(),
+            fs_verity_snapshot_root_directory_sha256: gate
+                .release_provenance
+                .fs_verity_snapshot_root_directory_sha256
+                .clone(),
+            fs_verity_snapshot_root_device: gate
+                .release_provenance
+                .fs_verity_snapshot_root_device,
+            fs_verity_snapshot_root_inode: gate
+                .release_provenance
+                .fs_verity_snapshot_root_inode,
             pair_directory: gate.release_provenance.pair_directory.clone(),
             pair_directory_sha256: gate.release_provenance.pair_directory_sha256.clone(),
         },
@@ -8896,8 +9164,65 @@ fn v9_canonical_evidence_root_directory(value: Option<OsString>) -> io::Result<P
     }
     let root_fd = v9_open_private_external_root(&root)?;
     let canonical = fs::canonicalize(format!("/proc/self/fd/{}", root_fd.as_raw_fd()))?;
+    if canonical != root {
+        return Err(io::Error::other(
+            "OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY is not canonical",
+        ));
+    }
     v9_canonical_path_string(&canonical, "V9 external evidence root")?;
     Ok(canonical)
+}
+
+struct V9FsVeritySnapshotRoot {
+    directory: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+fn v9_require_distinct_snapshot_filesystem(
+    target: &Path,
+    snapshot_root: &V9FsVeritySnapshotRoot,
+) -> io::Result<()> {
+    if fs::metadata(target)?.dev() == snapshot_root.device {
+        return Err(io::Error::other(
+            "V9 Cargo target must not share the fs-verity snapshot filesystem",
+        ));
+    }
+    Ok(())
+}
+
+fn v9_canonical_fs_verity_snapshot_root_directory(
+    value: Option<OsString>,
+) -> io::Result<V9FsVeritySnapshotRoot> {
+    if env::var_os(FS_VERITY_QUALIFICATION_ENV).as_deref() != Some(std::ffi::OsStr::new("required"))
+    {
+        return Err(io::Error::other(
+            "V9 fs-verity snapshots require the fixed qualification marker",
+        ));
+    }
+    let root = value
+        .ok_or_else(|| io::Error::other("V9 evidence requires OPC_FS_VERITY_SNAPSHOT_ROOT"))?;
+    let root_bytes = root.as_encoded_bytes().to_vec();
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err(io::Error::other(
+            "OPC_FS_VERITY_SNAPSHOT_ROOT is not absolute",
+        ));
+    }
+    let root_fd = v9_open_private_external_root(&root)?;
+    let identity = fstat(&root_fd)?;
+    let canonical = fs::canonicalize(format!("/proc/self/fd/{}", root_fd.as_raw_fd()))?;
+    if root_bytes != canonical.as_os_str().as_encoded_bytes() {
+        return Err(io::Error::other(
+            "OPC_FS_VERITY_SNAPSHOT_ROOT is not canonical",
+        ));
+    }
+    v9_canonical_path_string(&canonical, "V9 fs-verity snapshot root")?;
+    Ok(V9FsVeritySnapshotRoot {
+        directory: canonical,
+        device: identity.st_dev as u64,
+        inode: identity.st_ino as u64,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8906,14 +9231,18 @@ struct V9ExternalNamespaceBindings {
     cargo_target_directory_sha256: String,
     evidence_root_directory: String,
     evidence_root_directory_sha256: String,
+    fs_verity_snapshot_root_directory: String,
+    fs_verity_snapshot_root_directory_sha256: String,
+    fs_verity_snapshot_root_device: u64,
+    fs_verity_snapshot_root_inode: u64,
     pair_directory: String,
     pair_directory_sha256: String,
 }
 
 /// Capture both operator-provisioned external namespaces before either
 /// campaign starts. The V9 envelope and its run identity carry these exact
-/// canonical strings plus domain-separated commitments, so a separate store
-/// consumer can descriptor-pin the exact published pair root.
+/// canonical strings, path commitments, and the snapshot-base device/inode,
+/// so a separate store consumer can distinguish a same-path replacement.
 fn v9_external_namespace_bindings() -> io::Result<V9ExternalNamespaceBindings> {
     let repository = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
     let gitdir = v9_git_directory(&repository, "--absolute-git-dir")?;
@@ -8922,14 +9251,37 @@ fn v9_external_namespace_bindings() -> io::Result<V9ExternalNamespaceBindings> {
     let root = v9_canonical_evidence_root_directory(env::var_os(
         "OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY",
     ))?;
+    let snapshot_root =
+        v9_canonical_fs_verity_snapshot_root_directory(env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV))?;
+    v9_require_distinct_snapshot_filesystem(&target, &snapshot_root)?;
     v9_require_external_disjointness(
         &target,
         &[repository.clone(), gitdir.clone(), common_gitdir.clone()],
     )?;
-    v9_require_external_disjointness(&root, &[repository, gitdir, common_gitdir, target.clone()])?;
+    v9_require_external_disjointness(
+        &root,
+        &[
+            repository.clone(),
+            gitdir.clone(),
+            common_gitdir.clone(),
+            target.clone(),
+        ],
+    )?;
+    v9_require_external_disjointness(
+        &snapshot_root.directory,
+        &[
+            repository,
+            gitdir,
+            common_gitdir,
+            target.clone(),
+            root.clone(),
+        ],
+    )?;
 
     let cargo_target_directory = v9_canonical_path_string(&target, "CARGO_TARGET_DIR")?;
     let evidence_root_directory = v9_canonical_path_string(&root, "V9 external evidence root")?;
+    let fs_verity_snapshot_root_directory =
+        v9_canonical_path_string(&snapshot_root.directory, "V9 fs-verity snapshot root")?;
     let pair_directory = opc_session_testkit::qualification::
         session_ha_persistent_consumer_head_evidence_v9_pair_directory(&evidence_root_directory)
         .ok_or_else(|| io::Error::other("V9 pair directory cannot be derived from evidence root"))?;
@@ -8943,6 +9295,11 @@ fn v9_external_namespace_bindings() -> io::Result<V9ExternalNamespaceBindings> {
             &evidence_root_directory,
         )
         .ok_or_else(|| io::Error::other("V9 evidence root commitment is invalid"))?;
+    let fs_verity_snapshot_root_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+            &fs_verity_snapshot_root_directory,
+        )
+        .ok_or_else(|| io::Error::other("V9 fs-verity snapshot root commitment is invalid"))?;
     let pair_directory_sha256 = opc_session_testkit::qualification::
         session_ha_persistent_consumer_head_evidence_v9_pair_directory_sha256(&pair_directory)
         .ok_or_else(|| io::Error::other("V9 pair directory commitment is invalid"))?;
@@ -8951,6 +9308,10 @@ fn v9_external_namespace_bindings() -> io::Result<V9ExternalNamespaceBindings> {
         cargo_target_directory_sha256,
         evidence_root_directory,
         evidence_root_directory_sha256,
+        fs_verity_snapshot_root_directory,
+        fs_verity_snapshot_root_directory_sha256,
+        fs_verity_snapshot_root_device: snapshot_root.device,
+        fs_verity_snapshot_root_inode: snapshot_root.inode,
         pair_directory,
         pair_directory_sha256,
     })
@@ -10601,9 +10962,54 @@ fn v9_requires_explicit_canonical_cargo_target_directory() {
     );
 }
 
+#[test]
+fn v9_canonical_path_parser_rejects_snapshot_root_aliases() {
+    assert!(v9_canonical_path_string(
+        Path::new("/external/fs-verity-snapshots/."),
+        "V9 fs-verity snapshot root"
+    )
+    .is_err());
+    assert!(v9_canonical_path_string(
+        Path::new("/external//fs-verity-snapshots"),
+        "V9 fs-verity snapshot root"
+    )
+    .is_err());
+    assert!(v9_canonical_path_string(
+        Path::new("/external/fs-verity-snapshots"),
+        "V9 fs-verity snapshot root"
+    )
+    .is_ok());
+}
+
+#[test]
+fn v9_target_rejects_snapshot_root_on_the_same_filesystem() {
+    let workspace = tempfile::tempdir().expect("same-device V9 workspace");
+    let target = workspace.path().join("target");
+    let snapshot_root = workspace.path().join("fs-verity-snapshots");
+    fs::create_dir(&target).expect("create same-device V9 target");
+    fs::create_dir(&snapshot_root).expect("create same-device V9 snapshot root");
+    let snapshot_metadata = fs::metadata(&snapshot_root).expect("stat V9 snapshot root");
+    let binding = V9FsVeritySnapshotRoot {
+        directory: snapshot_root,
+        device: snapshot_metadata.dev(),
+        inode: snapshot_metadata.ino(),
+    };
+    assert_eq!(
+        fs::metadata(&target).expect("stat V9 target").dev(),
+        binding.device
+    );
+    assert_eq!(
+        v9_require_distinct_snapshot_filesystem(&target, &binding)
+            .expect_err("same-device V9 target must fail closed")
+            .to_string(),
+        "V9 Cargo target must not share the fs-verity snapshot filesystem"
+    );
+}
+
 fn v9_test_release_provenance() -> ReleaseGateProvenance {
     let cargo_target_directory = "/var/lib/opc-testkit/target".to_owned();
     let evidence_root_directory = "/var/lib/opc-testkit/evidence".to_owned();
+    let fs_verity_snapshot_root_directory = "/var/lib/opc-testkit/fs-verity-snapshots".to_owned();
     let pair_directory = opc_session_testkit::qualification::
         session_ha_persistent_consumer_head_evidence_v9_pair_directory(&evidence_root_directory)
         .expect("derive fixed V9 pair root");
@@ -10624,6 +11030,14 @@ fn v9_test_release_provenance() -> ReleaseGateProvenance {
             )
             .expect("commit test evidence root"),
         evidence_root_directory,
+        fs_verity_snapshot_root_directory_sha256: opc_session_testkit::qualification::
+            session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+                &fs_verity_snapshot_root_directory,
+            )
+            .expect("commit test fs-verity snapshot root"),
+        fs_verity_snapshot_root_device: 17,
+        fs_verity_snapshot_root_inode: 19,
+        fs_verity_snapshot_root_directory,
         pair_directory_sha256: opc_session_testkit::qualification::
             session_ha_persistent_consumer_head_evidence_v9_pair_directory_sha256(&pair_directory)
                 .expect("commit test pair root"),
@@ -10699,6 +11113,7 @@ fn v9_test_claims(provenance: &ReleaseGateProvenance) -> SessionHaPersistentCons
                 session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
                     &provenance.cargo_target_directory,
                     &provenance.evidence_root_directory,
+                    &provenance.fs_verity_snapshot_root_directory,
                     &provenance.cargo_executable_alias,
                 )
                 .expect("render V9 test recipe"),
@@ -10714,6 +11129,12 @@ fn v9_test_claims(provenance: &ReleaseGateProvenance) -> SessionHaPersistentCons
             cargo_target_directory_sha256: provenance.cargo_target_directory_sha256.clone(),
             evidence_root_directory: provenance.evidence_root_directory.clone(),
             evidence_root_directory_sha256: provenance.evidence_root_directory_sha256.clone(),
+            fs_verity_snapshot_root_directory: provenance.fs_verity_snapshot_root_directory.clone(),
+            fs_verity_snapshot_root_directory_sha256: provenance
+                .fs_verity_snapshot_root_directory_sha256
+                .clone(),
+            fs_verity_snapshot_root_device: provenance.fs_verity_snapshot_root_device,
+            fs_verity_snapshot_root_inode: provenance.fs_verity_snapshot_root_inode,
             pair_directory: provenance.pair_directory.clone(),
             pair_directory_sha256: provenance.pair_directory_sha256.clone(),
         },
@@ -10752,6 +11173,70 @@ fn v9_test_claims(provenance: &ReleaseGateProvenance) -> SessionHaPersistentCons
         fixed_labels_only: true,
         identifying_values_recorded: false,
     }
+}
+
+#[test]
+fn v9_backslash_heavy_paths_fit_the_mirrored_closed_document_envelope() {
+    let escaped_path = |label: &str| format!("/{label}{}", "\\".repeat(2_990));
+    let mut provenance = v9_test_release_provenance();
+    provenance.cargo_target_directory = escaped_path("target");
+    provenance.cargo_target_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_cargo_target_directory_sha256(
+            &provenance.cargo_target_directory,
+        )
+        .expect("commit escaped target path");
+    provenance.evidence_root_directory = escaped_path("evidence");
+    provenance.evidence_root_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_evidence_root_directory_sha256(
+            &provenance.evidence_root_directory,
+        )
+        .expect("commit escaped evidence root");
+    provenance.fs_verity_snapshot_root_directory = escaped_path("snapshots");
+    provenance.fs_verity_snapshot_root_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+            &provenance.fs_verity_snapshot_root_directory,
+        )
+        .expect("commit escaped fs-verity root");
+    provenance.pair_directory = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_pair_directory(
+            &provenance.evidence_root_directory,
+        )
+        .expect("derive escaped pair directory");
+    provenance.pair_directory_sha256 = opc_session_testkit::qualification::
+        session_ha_persistent_consumer_head_evidence_v9_pair_directory_sha256(
+            &provenance.pair_directory,
+        )
+        .expect("commit escaped pair directory");
+    provenance.cargo_executable_alias = escaped_path("cargo");
+    provenance.cargo_executable = escaped_path("rustup");
+
+    let mut evidence = v9_test_claims(&provenance);
+    evidence.invocation.run_id_sha256 = v9_test_run_id(&provenance, &evidence);
+    assert!(
+        evidence.invocation.reproduction_command.chars().count() <= 16 * 1024,
+        "the exact regenerated recipe stays within its closed schema bound"
+    );
+    let canonical = evidence
+        .to_canonical_json()
+        .expect("escaped real-path evidence fits the producer bound");
+    assert!(
+        canonical.len() > 64 * 1024,
+        "the fixture causally exceeds the retired late-failure boundary"
+    );
+    assert!(canonical.len() <= SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_MAX_BYTES);
+    assert_eq!(
+        SessionHaPersistentConsumerHeadEvidenceV9::from_json(&canonical),
+        Ok(evidence),
+        "the producer and consumer must share one exact escaped-path envelope"
+    );
+    assert_eq!(
+        SessionHaPersistentConsumerHeadEvidenceV9::from_json(&vec![
+            b' ';
+            SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_MAX_BYTES
+                + 1
+        ]),
+        Err(SessionHaPersistentConsumerHeadEvidenceV9Error::DocumentTooLarge)
+    );
 }
 
 fn v9_test_run_id(
@@ -10854,6 +11339,47 @@ fn v9_run_identity_binds_reconstructible_external_namespaces_and_recipe() {
         .expect("construct cross-root V9 run identity"),
         run_id,
         "a complete replacement root/pair cannot cross-bind to the original V1 artifact"
+    );
+
+    let mut snapshot_root_replacement = provenance.clone();
+    snapshot_root_replacement.fs_verity_snapshot_root_directory =
+        "/var/lib/opc-testkit/other-fs-verity-snapshots".to_owned();
+    snapshot_root_replacement.fs_verity_snapshot_root_directory_sha256 =
+        opc_session_testkit::qualification::
+            session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+                &snapshot_root_replacement.fs_verity_snapshot_root_directory,
+            )
+            .expect("commit replacement fs-verity snapshot root");
+    assert_ne!(
+        v9_pair_run_id_material(
+            &snapshot_root_replacement,
+            &v1_binding_refs,
+            &opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            &format!("sha256:{}", "7".repeat(64)),
+            b"canonical-v1",
+            b"canonical-v9-claims",
+        )
+        .expect("construct replacement-snapshot-root V9 run identity"),
+        run_id,
+        "a replacement fs-verity snapshot root cannot inherit the original V1/V9 run ID"
+    );
+
+    let mut snapshot_root_identity_replacement = provenance.clone();
+    snapshot_root_identity_replacement.fs_verity_snapshot_root_inode += 1;
+    assert_ne!(
+        v9_pair_run_id_material(
+            &snapshot_root_identity_replacement,
+            &v1_binding_refs,
+            &opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_schema_sha256(),
+            &format!("sha256:{}", "7".repeat(64)),
+            b"canonical-v1",
+            b"canonical-v9-claims",
+        )
+        .expect("construct replaced-snapshot-identity V9 run identity"),
+        run_id,
+        "a same-path fs-verity snapshot-root inode replacement cannot inherit the original V1/V9 run ID"
     );
 
     let mut alias_replacement = provenance.clone();
@@ -10973,7 +11499,7 @@ fn v9_run_identity_binds_every_mutable_campaign_claim() {
 }
 
 #[test]
-fn v1_v9_generation_cross_equality_rejects_a_recomputed_v3_contradiction() {
+fn v1_v9_generation_cross_equality_rejects_a_recomputed_v4_contradiction() {
     let provenance = v9_test_release_provenance();
     let mut v9 = v9_test_claims(&provenance);
     v9.invocation.run_id_sha256 = v9_test_run_id(&provenance, &v9);
@@ -10998,7 +11524,7 @@ fn v1_v9_generation_cross_equality_rejects_a_recomputed_v3_contradiction() {
     );
     assert_ne!(
         contradictory.invocation.run_id_sha256, v9.invocation.run_id_sha256,
-        "the V3 claims preimage correctly changes the pair run ID"
+        "the V4 claims preimage correctly changes the pair run ID"
     );
     assert!(
         v1_v9_release_gate_process_generations_agree(
@@ -13523,7 +14049,10 @@ fn run_consumer_multiprocess_qualification(
             .verify_unchanged()
             .expect("release provenance is clean before the first dual-lane campaign");
     }
-    let mut fleet = Fleet::start(member_count);
+    let mut fleet = match release_provenance.as_ref() {
+        Some(provenance) => Fleet::start_with_release_provenance(member_count, provenance),
+        None => Fleet::start(member_count),
+    };
     let mut process_ledger = PersistentConsumerProcessLedger::default();
     for (node_index, node) in fleet.nodes.iter().enumerate() {
         process_ledger.record_initial(node_index, node.process_id());
@@ -15272,6 +15801,7 @@ fn run_persistent_consumer_v2_batch_release_gate(
     let mut fleet = Fleet::start_with_schedule(
         MEMBER_COUNT,
         session_mtls_batch_release_gate_schedule_sha256(),
+        Some(&release_provenance),
     );
     let consumer_identities = (0..V2_BATCH_RELEASE_GATE_CLIENTS)
         .map(stateless_consumer_identity)

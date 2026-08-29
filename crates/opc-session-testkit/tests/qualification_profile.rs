@@ -1315,6 +1315,7 @@ fn current_persistent_consumer_head_attestation_binds_the_compiled_revision() {
     };
     let cargo_target_directory = "/var/lib/opc-testkit/target";
     let evidence_root_directory = "/var/lib/opc-testkit/v9-evidence";
+    let fs_verity_snapshot_root_directory = "/var/lib/opc-testkit/fs-verity-snapshots";
     let pair_directory = opc_session_testkit::qualification::
         session_ha_persistent_consumer_head_evidence_v9_pair_directory(evidence_root_directory)
         .expect("derive fixed V9 pair directory");
@@ -1348,6 +1349,7 @@ fn current_persistent_consumer_head_attestation_binds_the_compiled_revision() {
                 session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
                     cargo_target_directory,
                     evidence_root_directory,
+                    fs_verity_snapshot_root_directory,
                     cargo_executable_alias,
                 )
                 .expect("render V9 reproduction command"),
@@ -1370,6 +1372,14 @@ fn current_persistent_consumer_head_attestation_binds_the_compiled_revision() {
                     evidence_root_directory,
                 )
                 .expect("commit canonical V9 evidence root"),
+            fs_verity_snapshot_root_directory: fs_verity_snapshot_root_directory.into(),
+            fs_verity_snapshot_root_directory_sha256: opc_session_testkit::qualification::
+                session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+                    fs_verity_snapshot_root_directory,
+                )
+                .expect("commit canonical V9 fs-verity snapshot root"),
+            fs_verity_snapshot_root_device: 17,
+            fs_verity_snapshot_root_inode: 19,
             pair_directory: pair_directory.clone(),
             pair_directory_sha256: opc_session_testkit::qualification::
                 session_ha_persistent_consumer_head_evidence_v9_pair_directory_sha256(

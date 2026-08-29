@@ -22,10 +22,16 @@ mkfs.ext4 -q -b 4096 -O verity "${image}"
 sudo mount -o loop,nosuid,nodev "${image}" "${mountpoint}"
 sudo chown "$(id -u):$(id -g)" "${mountpoint}"
 install -d -m 700 "${snapshot_root}"
+snapshot_root="$(realpath -e -- "${snapshot_root}")"
+if [[ "$(stat -c '%u:%a' -- "${snapshot_root}")" != "$(id -u):700" ]]; then
+  printf '%s\n' "fs-verity snapshot root must remain current-user private mode 0700" >&2
+  exit 1
+fi
 
-# Immutable snapshot fixtures opt into this private root explicitly. Keep
-# TMPDIR on the runner filesystem: SQLite databases, WALs, and general test
-# scratch are mutable and should not amplify loop-backed ext4 I/O.
+# Immutable snapshot fixtures opt into this private root explicitly. The V9
+# producer and the SDK-702 wrapper each create a private per-run child below
+# it. Keep TMPDIR on the runner filesystem: SQLite databases, WALs, and general
+# test scratch are mutable and should not amplify loop-backed ext4 I/O.
 printf 'OPC_FS_VERITY_SNAPSHOT_ROOT=%s\n' "${snapshot_root}" >> "${GITHUB_ENV}"
 # The fs-verity sys crate keeps a portable unit-test path for developer
 # machines. CI sets this marker only after mounting the dedicated ext4 image,

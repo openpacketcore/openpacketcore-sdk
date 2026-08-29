@@ -95,7 +95,7 @@ pub const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_JSON: &str =
     include_str!("../qualification/v9/session-ha-persistent-consumer-head-evidence.schema.json");
 /// SHA-256 binding for the exact tracked v9 evidence schema bytes.
 pub const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_SHA256: &str =
-    "sha256:ecb42383a02a4704988139aafe2f59dfb95988b1e57cdaf05438a664500f2b41";
+    "sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018";
 
 /// SHA-256 binding for the exact current v9 evidence schema bytes.
 pub fn session_ha_persistent_consumer_head_evidence_v9_schema_sha256() -> String {
@@ -108,7 +108,7 @@ pub fn session_ha_persistent_consumer_head_evidence_v9_schema_sha256() -> String
 }
 
 /// Maximum accepted size of one current-head persistent-consumer evidence record.
-pub const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_MAX_BYTES: usize = 64 * 1024;
+pub const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_MAX_BYTES: usize = 128 * 1024;
 
 /// The create-new directory published directly below the V9 evidence root.
 /// Consumers must derive the pair directory from the disclosed root rather
@@ -146,6 +146,8 @@ const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_CARGO_TARGET_DIRECTORY_DOM
     b"opc-session-mtls-release-gate-cargo-target/v1\0";
 const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_EVIDENCE_ROOT_DOMAIN: &[u8] =
     b"opc-session-ha-persistent-consumer-v9-evidence-root/v1\0";
+const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_FS_VERITY_SNAPSHOT_ROOT_DOMAIN: &[u8] =
+    b"opc-session-ha-persistent-consumer-v9-fs-verity-snapshot-root/v1\0";
 const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_PAIR_DIRECTORY_DOMAIN: &[u8] =
     b"opc-session-ha-persistent-consumer-v9-pair-directory/v1\0";
 
@@ -218,6 +220,20 @@ pub fn session_ha_persistent_consumer_head_evidence_v9_evidence_root_directory_s
     })
 }
 
+/// Domain-separated commitment to the external root that holds only the
+/// V9 campaign's immutable fs-verity snapshots.
+pub fn session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+    canonical_snapshot_root_directory: &str,
+) -> Option<String> {
+    persistent_consumer_v9_canonical_absolute_path(canonical_snapshot_root_directory).then(|| {
+        persistent_consumer_v9_path_binding_sha256(
+            SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_FS_VERITY_SNAPSHOT_ROOT_DOMAIN,
+            b"canonical-fs-verity-snapshot-root",
+            canonical_snapshot_root_directory,
+        )
+    })
+}
+
 /// Derive the only accepted pair root from the disclosed evidence root.
 pub fn session_ha_persistent_consumer_head_evidence_v9_pair_directory(
     canonical_evidence_root_directory: &str,
@@ -262,19 +278,24 @@ fn persistent_consumer_v9_shell_quote(value: &str) -> String {
 pub fn session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
     canonical_target_directory: &str,
     canonical_evidence_root_directory: &str,
+    canonical_fs_verity_snapshot_root_directory: &str,
     canonical_cargo_executable_alias: &str,
 ) -> Option<String> {
     if !persistent_consumer_v9_canonical_absolute_path(canonical_target_directory)
         || !persistent_consumer_v9_canonical_absolute_path(canonical_evidence_root_directory)
+        || !persistent_consumer_v9_canonical_absolute_path(
+            canonical_fs_verity_snapshot_root_directory,
+        )
         || !persistent_consumer_v9_canonical_absolute_path(canonical_cargo_executable_alias)
     {
         return None;
     }
     let mut command = format!(
-        "CARGO={} CARGO_TARGET_DIR={} OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY={} {}",
+        "CARGO={} CARGO_TARGET_DIR={} OPC_SESSION_TESTKIT_V9_EVIDENCE_DIRECTORY={} OPC_FS_VERITY_QUALIFICATION='required' OPC_FS_VERITY_SNAPSHOT_ROOT={} {}",
         persistent_consumer_v9_shell_quote(canonical_cargo_executable_alias),
         persistent_consumer_v9_shell_quote(canonical_target_directory),
         persistent_consumer_v9_shell_quote(canonical_evidence_root_directory),
+        persistent_consumer_v9_shell_quote(canonical_fs_verity_snapshot_root_directory),
         persistent_consumer_v9_shell_quote(canonical_cargo_executable_alias),
     );
     for argument in SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_CARGO_ARGV
@@ -372,6 +393,13 @@ pub struct QualificationPersistentConsumerBindingsV9 {
     /// Canonical external evidence root and the only accepted pair root below it.
     pub evidence_root_directory: String,
     pub evidence_root_directory_sha256: String,
+    /// Canonical external root for immutable V9 fs-verity snapshot fixtures.
+    pub fs_verity_snapshot_root_directory: String,
+    pub fs_verity_snapshot_root_directory_sha256: String,
+    /// Device/inode captured from the private fs-verity base descriptor.
+    /// A canonical pathname alone cannot distinguish a same-path replacement.
+    pub fs_verity_snapshot_root_device: u64,
+    pub fs_verity_snapshot_root_inode: u64,
     pub pair_directory: String,
     pub pair_directory_sha256: String,
 }
@@ -481,6 +509,9 @@ impl SessionHaPersistentConsumerHeadEvidenceV9 {
         self.validate()?;
         let document = serde_json::to_vec(self)
             .map_err(|_| SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument)?;
+        if document.len() > SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_MAX_BYTES {
+            return Err(SessionHaPersistentConsumerHeadEvidenceV9Error::DocumentTooLarge);
+        }
         let schema: serde_json::Value =
             serde_json::from_str(SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_JSON)
                 .map_err(|_| SessionHaPersistentConsumerHeadEvidenceV9Error::InvalidDocument)?;
@@ -541,6 +572,7 @@ impl SessionHaPersistentConsumerHeadEvidenceV9 {
             &self.bindings.v1_canonical_sha256,
             &self.bindings.cargo_target_directory_sha256,
             &self.bindings.evidence_root_directory_sha256,
+            &self.bindings.fs_verity_snapshot_root_directory_sha256,
             &self.bindings.pair_directory_sha256,
         ]
         .into_iter()
@@ -560,6 +592,13 @@ impl SessionHaPersistentConsumerHeadEvidenceV9 {
             )
             .as_deref()
                 != Some(self.bindings.evidence_root_directory_sha256.as_str())
+            || session_ha_persistent_consumer_head_evidence_v9_fs_verity_snapshot_root_directory_sha256(
+                &self.bindings.fs_verity_snapshot_root_directory,
+            )
+            .as_deref()
+                != Some(self.bindings.fs_verity_snapshot_root_directory_sha256.as_str())
+            || self.bindings.fs_verity_snapshot_root_device == 0
+            || self.bindings.fs_verity_snapshot_root_inode == 0
             || session_ha_persistent_consumer_head_evidence_v9_pair_directory(
                 &self.bindings.evidence_root_directory,
             )
@@ -573,6 +612,7 @@ impl SessionHaPersistentConsumerHeadEvidenceV9 {
             || session_ha_persistent_consumer_head_evidence_v9_reproduction_command(
                 &self.bindings.cargo_target_directory,
                 &self.bindings.evidence_root_directory,
+                &self.bindings.fs_verity_snapshot_root_directory,
                 &self.invocation.cargo_executable_alias,
             )
             .as_deref()
@@ -4357,6 +4397,18 @@ pub struct QualificationNodeConfig {
     pub workspace_directory: PathBuf,
     pub database_path: PathBuf,
     pub snapshot_directory: PathBuf,
+    /// Optional owner-private campaign namespace for immutable snapshots.
+    /// Mutable database and control paths remain under `workspace_directory`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_root_directory: Option<PathBuf>,
+    /// Pinned device identity for `snapshot_root_directory` when snapshots
+    /// live outside the ordinary workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_root_device: Option<u64>,
+    /// Pinned inode identity for `snapshot_root_directory` when snapshots
+    /// live outside the ordinary workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_root_inode: Option<u64>,
     pub operation_timeout_millis: u64,
     #[serde(default)]
     pub transport: QualificationTransportConfig,
@@ -4365,6 +4417,8 @@ pub struct QualificationNodeConfig {
 impl QualificationNodeConfig {
     /// Validate all allocation, path, topology, and transport boundaries.
     pub fn validate(&self) -> Result<(), QualificationConfigError> {
+        let expected_external_snapshot_leaf = format!("node-{}", self.node_index);
+        let has_external_snapshot_namespace = self.snapshot_root_directory.is_some();
         if self.schema_version != QUALIFICATION_NODE_SCHEMA_VERSION {
             return Err(QualificationConfigError::Schema);
         }
@@ -4382,12 +4436,40 @@ impl QualificationNodeConfig {
             || !self.workspace_directory.is_absolute()
             || !self.database_path.is_absolute()
             || !self.snapshot_directory.is_absolute()
+            || self
+                .snapshot_root_directory
+                .as_ref()
+                .is_some_and(|root| !root.is_absolute())
+            || match (
+                self.snapshot_root_directory.as_ref(),
+                self.snapshot_root_device,
+                self.snapshot_root_inode,
+            ) {
+                (None, None, None) => false,
+                (Some(_), Some(device), Some(inode)) => device == 0 || inode == 0,
+                _ => true,
+            }
+            // The release-only fs-verity namespace is a closed projected-mTLS
+            // path. Its snapshot leaf is one direct, node-specific child so a
+            // lexical `..` or nested path cannot gain a pre-canonicalization
+            // side effect outside the pinned campaign directory.
+            || (has_external_snapshot_namespace
+                && (!matches!(
+                    &self.transport,
+                    QualificationTransportConfig::ProjectedMtls(_)
+                )
+                    || self.snapshot_directory.parent()
+                        != self.snapshot_root_directory.as_deref()
+                    || self.snapshot_directory.file_name().and_then(|name| name.to_str())
+                        != Some(expected_external_snapshot_leaf.as_str())))
             || self.workspace_directory.parent().is_none()
             || self.database_path == self.snapshot_directory
             || !self.database_path.starts_with(&self.workspace_directory)
-            || !self
-                .snapshot_directory
-                .starts_with(&self.workspace_directory)
+            || !self.snapshot_directory.starts_with(
+                self.snapshot_root_directory
+                    .as_ref()
+                    .unwrap_or(&self.workspace_directory),
+            )
             || self
                 .transport
                 .validate(&self.workspace_directory, self.operation_timeout_millis)
@@ -4501,6 +4583,9 @@ impl fmt::Debug for QualificationNodeConfig {
             .field("workspace_directory", &"<redacted>")
             .field("database_path", &"<redacted>")
             .field("snapshot_directory", &"<redacted>")
+            .field("snapshot_root_directory", &"<redacted>")
+            .field("snapshot_root_device", &self.snapshot_root_device)
+            .field("snapshot_root_inode", &self.snapshot_root_inode)
             .field("operation_timeout_millis", &self.operation_timeout_millis)
             .field("transport", &self.transport)
             .finish()
@@ -8895,6 +8980,9 @@ mod tests {
             workspace_directory: PathBuf::from("/qualification"),
             database_path: PathBuf::from("/qualification/node.sqlite"),
             snapshot_directory: PathBuf::from("/qualification/snapshots"),
+            snapshot_root_directory: None,
+            snapshot_root_device: None,
+            snapshot_root_inode: None,
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
             transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
         };
@@ -8932,9 +9020,65 @@ mod tests {
             workspace_directory: PathBuf::from("/qualification"),
             database_path: PathBuf::from("/qualification/node.sqlite"),
             snapshot_directory: PathBuf::from("/qualification/snapshots"),
+            snapshot_root_directory: None,
+            snapshot_root_device: None,
+            snapshot_root_inode: None,
             operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
             transport: QualificationTransportConfig::LoopbackPlaintextTestOnly,
         }
+    }
+
+    #[test]
+    fn config_allows_only_projected_mtls_snapshots_to_use_a_direct_declared_external_namespace() {
+        let mut config = valid_config();
+        config.transport =
+            QualificationTransportConfig::ProjectedMtls(QualificationProjectedMtlsConfig {
+                projected_volume_root: PathBuf::from("/qualification/projected"),
+                certificate_file: PathBuf::from("tls.crt"),
+                private_key_file: PathBuf::from("tls.key"),
+                trust_bundle_files: vec![PathBuf::from("ca.crt")],
+                poll_interval_millis: 100,
+                lifecycle: QualificationConnectionLifecycleConfig {
+                    maximum_authentication_age_millis: 60_000,
+                    rotation_drain_window_millis: 5_000,
+                    reconnect_backoff_min_millis: 25,
+                    reconnect_backoff_max_millis: 250,
+                    rotation_jitter_millis: 1_000,
+                },
+                peer_routing: QualificationPeerRouting::PinnedLoopbackTestOnly,
+            });
+        config.snapshot_root_directory = Some(PathBuf::from("/fs-verity-campaign"));
+        config.snapshot_directory = PathBuf::from("/fs-verity-campaign/node-0");
+        config.snapshot_root_device = Some(1);
+        config.snapshot_root_inode = Some(2);
+        assert!(config.validate().is_ok());
+
+        config.database_path = PathBuf::from("/fs-verity-campaign/node-0.sqlite");
+        assert_eq!(
+            config.validate(),
+            Err(QualificationConfigError::Configuration),
+            "mutable SQLite paths remain confined to the ordinary workspace"
+        );
+        config.database_path = PathBuf::from("/qualification/node.sqlite");
+
+        let mut plaintext = valid_config();
+        plaintext.snapshot_root_directory = Some(PathBuf::from("/fs-verity-campaign"));
+        plaintext.snapshot_directory = PathBuf::from("/fs-verity-campaign/node-0");
+        plaintext.snapshot_root_device = Some(1);
+        plaintext.snapshot_root_inode = Some(2);
+        assert_eq!(
+            plaintext.validate(),
+            Err(QualificationConfigError::Configuration),
+            "plaintext/control configurations cannot opt into external snapshots"
+        );
+
+        let mut escape = config;
+        escape.snapshot_directory = PathBuf::from("/fs-verity-campaign/../outside/node-0");
+        assert_eq!(
+            escape.validate(),
+            Err(QualificationConfigError::Configuration),
+            "external snapshot paths must be the one direct node leaf"
+        );
     }
 
     #[test]
