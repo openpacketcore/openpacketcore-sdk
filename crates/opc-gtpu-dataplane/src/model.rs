@@ -1,9 +1,11 @@
 //! Safe model types for Linux GTP-U dataplane backend operations.
 
 use std::fmt;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use opc_gtpu_ebpf_common::GtpuEndpointAddress;
 pub use opc_gtpu_ebpf_common::{
@@ -12,11 +14,75 @@ pub use opc_gtpu_ebpf_common::{
     GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
 };
 use opc_types::DscpCodepoint;
+use sha2::{Digest, Sha256};
 
 /// Default GTP-U UDP port.
 pub const GTPU_PORT: u16 = 2152;
 /// Default PDP context hash size used by libgtpnl examples.
 pub const DEFAULT_PDP_HASHSIZE: u32 = 131_072;
+
+/// Fixed external-fence contract for current-schema eBPF graph retirement.
+///
+/// This is deliberately distinct from the frozen shipped-25 historical
+/// recovery contract.  Both contracts consume the same kind of live node
+/// authority, but a current graph must never be mistaken for a historical
+/// compatibility target.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID: &str =
+    "opc.gtpu.current-ebpf-graph-recovery-authority.r1";
+/// Wire-compatible version of [`CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID`].
+pub const CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION: u16 = 1;
+
+/// Stable codec identity of the fsynced current-terminal WAL.
+///
+/// The WAL is retained outside the deleted graph and is the only durable
+/// current-graph terminal evidence.  A legacy outcome alone is never a
+/// terminal receipt.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID: &str =
+    "opc.gtpu.current-ebpf-recovery-terminal-wal.r2";
+
+/// Stable codec identity of the redaction-safe current terminal receipt
+/// commitment used by an external broker's retired-to-new authority CAS.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID: &str =
+    "opc.gtpu.current-ebpf-recovery-terminal-receipt.r2";
+/// Stable codec identity of a complete broker-durable authenticated terminal
+/// receipt record.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_CODEC_ID: &str =
+    "opc.gtpu.current-ebpf-recovery-terminal-receipt-record.r1";
+/// Fixed width of one complete broker-durable authenticated terminal receipt.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_ENCODED_LEN: usize = 544;
+
+/// Stable codec identity of an authenticated current terminal transfer.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_CODEC_ID: &str =
+    "opc.gtpu.current-ebpf-recovery-terminal-transfer.r2";
+/// Fixed width of one broker-durable authenticated terminal transfer.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_ENCODED_LEN: usize = 264;
+/// Stable codec identity of an authenticated sealed-successor receipt.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_CODEC_ID: &str =
+    "opc.gtpu.current-ebpf-recovery-successor-receipt.r1";
+/// Fixed width of one broker-durable sealed-successor receipt.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN: usize = 416;
+
+/// Closed provenance of the graph evidence retained by an authenticated
+/// current-terminal WAL.
+///
+/// The `HistoricalR5Handoff` variant is deliberately separate from the
+/// current graph commitment: its 25-map commitment is never interpreted as a
+/// current 34-map inventory. The terminal WAL retains the sealed R5 record
+/// codec/KAT binding and revalidates that source receipt under the same
+/// target locks before it can issue this projection.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryTerminalSource {
+    /// The terminal retired only an exact current-schema graph.
+    CurrentGraph,
+    /// The current terminal was created in a namespace whose authenticated
+    /// shipped-25 R5 handoff remains retained in the target authority leaf.
+    HistoricalR5Handoff {
+        /// The sealed exact shipped-25 graph commitment. This is opaque and
+        /// comparable; it contains no map IDs or paths.
+        exact_historical_graph_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    },
+}
 
 /// GTP Tunnel Endpoint Identifier.
 ///
@@ -321,11 +387,1200 @@ impl fmt::Debug for CurrentEbpfGraphRecoveryRequest {
     }
 }
 
+/// Cloneable, non-authorizing plan for current-schema graph retirement.
+///
+/// A retry recreates an affine live authority and combines it with this value
+/// through [`CurrentEbpfGraphRecoveryIntent::into_request_with_authority`].
+/// Keeping the intent separate prevents a cached request from standing in for
+/// a live node-fence check.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CurrentEbpfGraphRecoveryIntent {
+    pin_namespace: String,
+    replacement_device: Option<GtpDevice>,
+    writer_proof: CurrentEbpfGraphWriterProof,
+    drain_proof: Option<CurrentEbpfGraphDrainProof>,
+}
+
+impl CurrentEbpfGraphRecoveryIntent {
+    /// Build a current-schema recovery plan which requires empty forwarding
+    /// maps unless a drain proof is explicitly supplied.
+    #[must_use]
+    pub fn new(
+        pin_namespace: impl Into<String>,
+        writer_proof: CurrentEbpfGraphWriterProof,
+    ) -> Self {
+        Self {
+            pin_namespace: pin_namespace.into(),
+            replacement_device: None,
+            writer_proof,
+            drain_proof: None,
+        }
+    }
+
+    /// Require the replacement interface to retain this exact identity.
+    #[must_use]
+    pub fn with_replacement_device(mut self, replacement_device: GtpDevice) -> Self {
+        self.replacement_device = Some(replacement_device);
+        self
+    }
+
+    /// Permit a graph with forwarding state only after explicit draining.
+    #[must_use]
+    pub const fn with_drain_proof(mut self, drain_proof: CurrentEbpfGraphDrainProof) -> Self {
+        self.drain_proof = Some(drain_proof);
+        self
+    }
+
+    /// Bind this retryable plan to one newly acquired live external authority.
+    #[must_use]
+    pub fn into_request_with_authority(
+        self,
+        authority: CurrentEbpfGraphRecoveryAuthority,
+    ) -> CurrentEbpfGraphRecoveryAuthorizedRequest {
+        CurrentEbpfGraphRecoveryAuthorizedRequest {
+            intent: self,
+            authority,
+        }
+    }
+
+    #[must_use]
+    pub fn pin_namespace(&self) -> &str {
+        &self.pin_namespace
+    }
+
+    #[must_use]
+    pub const fn replacement_device(&self) -> Option<&GtpDevice> {
+        self.replacement_device.as_ref()
+    }
+
+    #[must_use]
+    pub const fn writer_proof(&self) -> CurrentEbpfGraphWriterProof {
+        self.writer_proof
+    }
+
+    #[must_use]
+    pub const fn drain_proof(&self) -> Option<CurrentEbpfGraphDrainProof> {
+        self.drain_proof
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoveryIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoveryIntent")
+            .field("pin_namespace", &"<redacted-pin-namespace>")
+            .field(
+                "replacement_device",
+                &self
+                    .replacement_device
+                    .as_ref()
+                    .map(|_| "<redacted-interface-identity>"),
+            )
+            .field("writer_proof", &self.writer_proof)
+            .field("drain_proof", &self.drain_proof)
+            .finish()
+    }
+}
+
+impl From<CurrentEbpfGraphRecoveryRequest> for CurrentEbpfGraphRecoveryIntent {
+    fn from(request: CurrentEbpfGraphRecoveryRequest) -> Self {
+        Self {
+            pin_namespace: request.pin_namespace,
+            replacement_device: request.replacement_device,
+            writer_proof: request.writer_proof,
+            drain_proof: request.drain_proof,
+        }
+    }
+}
+
+/// Bounded construction failures for current-schema external authority.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryAuthorityError {
+    /// A fixed-width commitment was all zeroes.
+    ZeroCommitment,
+    /// The fixed-width operation identifier was all zeroes.
+    ZeroOperationId,
+}
+
+impl fmt::Display for CurrentEbpfGraphRecoveryAuthorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroCommitment => f.write_str("current recovery commitment is invalid"),
+            Self::ZeroOperationId => f.write_str("current recovery operation is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for CurrentEbpfGraphRecoveryAuthorityError {}
+
+/// Opaque nonzero external scope, predecessor-basis, or target commitment for
+/// current-schema graph retirement.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphRecoveryCommitment([u8; 32]);
+
+impl CurrentEbpfGraphRecoveryCommitment {
+    /// Construct a fixed-width nonzero commitment without exposing its source.
+    pub fn new(value: [u8; 32]) -> Result<Self, CurrentEbpfGraphRecoveryAuthorityError> {
+        if value == [0; 32] {
+            Err(CurrentEbpfGraphRecoveryAuthorityError::ZeroCommitment)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub(crate) const fn from_fixed_digest(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub(crate) const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoveryCommitment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CurrentEbpfGraphRecoveryCommitment(<opaque>)")
+    }
+}
+
+/// Opaque nonzero operation identifier for one current-schema recovery
+/// attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphRecoveryOperationId([u8; 16]);
+
+impl CurrentEbpfGraphRecoveryOperationId {
+    /// Construct a fixed-width nonzero operation identifier.
+    pub fn new(value: [u8; 16]) -> Result<Self, CurrentEbpfGraphRecoveryAuthorityError> {
+        if value == [0; 16] {
+            Err(CurrentEbpfGraphRecoveryAuthorityError::ZeroOperationId)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoveryOperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CurrentEbpfGraphRecoveryOperationId(<opaque>)")
+    }
+}
+
+/// Opaque host, bpffs-root, and graph-leaf commitments for current recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphRecoveryHostCommitments {
+    host: CurrentEbpfGraphRecoveryCommitment,
+    root: CurrentEbpfGraphRecoveryCommitment,
+    leaf: CurrentEbpfGraphRecoveryCommitment,
+}
+
+impl CurrentEbpfGraphRecoveryHostCommitments {
+    /// Bind this authority to one committed host, bpffs root, and graph leaf.
+    #[must_use]
+    pub const fn new(
+        host: CurrentEbpfGraphRecoveryCommitment,
+        root: CurrentEbpfGraphRecoveryCommitment,
+        leaf: CurrentEbpfGraphRecoveryCommitment,
+    ) -> Self {
+        Self { host, root, leaf }
+    }
+
+    #[must_use]
+    pub const fn host(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.host
+    }
+
+    #[must_use]
+    pub const fn root(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.root
+    }
+
+    #[must_use]
+    pub const fn leaf(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.leaf
+    }
+}
+
+/// Stable result of one mandatory live current-schema authority check.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryAuthorityCurrentness {
+    /// The external node authority is no longer held by this attempt.
+    Changed,
+    /// The live authority now names a different exact binding.
+    Mismatch,
+    /// The external authority could not be read conclusively.
+    Unavailable,
+}
+
+/// Object-safe asynchronous source of current external authority.
+///
+/// The SDK awaits this check after its current root and graph locks and before
+/// and after every irreversible proof, pin, and directory effect. A
+/// successful check must also prove that the caller holds a host-global,
+/// target-scoped maintenance exclusion covering every SDK creator of the
+/// target graph and its target authority leaves for the whole authority
+/// lifetime. It must perform a fresh live authority read for every invocation;
+/// cached currentness, construction-time attestation, or a lock that permits a
+/// concurrent creator is not sufficient.
+pub trait CurrentEbpfGraphRecoveryCurrentnessGuard: Send + Sync {
+    /// Prove that the exact authority remains current at this instant.
+    fn verify_current(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), CurrentEbpfGraphRecoveryAuthorityCurrentness>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    /// Prove that the exact SDK-issued successor receipt was durably retained
+    /// by the external broker under this same live authority.
+    ///
+    /// A successful implementation must perform a fresh authoritative read
+    /// and compare the complete receipt commitment. The broker record must be
+    /// immutable for the lifetime of this authority. A checksum-valid caller
+    /// value, cached acknowledgement, or partial-field comparison is not
+    /// sufficient. Backends that cannot provide this proof fail closed.
+    fn verify_brokered_successor_receipt(
+        &self,
+        _expected: CurrentEbpfGraphRecoveryCommitment,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), CurrentEbpfGraphRecoveryAuthorityCurrentness>>
+                + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async { Err(CurrentEbpfGraphRecoveryAuthorityCurrentness::Unavailable) })
+    }
+}
+
+/// Copyable receipt/proof projection of an affine current recovery authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphRecoveryAuthorityBinding {
+    contract_version: u16,
+    scope_commitment: CurrentEbpfGraphRecoveryCommitment,
+    predecessor_basis_commitment: CurrentEbpfGraphRecoveryCommitment,
+    fence_epoch: NonZeroU64,
+    operation_id: CurrentEbpfGraphRecoveryOperationId,
+    host_commitments: CurrentEbpfGraphRecoveryHostCommitments,
+}
+
+impl CurrentEbpfGraphRecoveryAuthorityBinding {
+    /// Recreate a receipt-safe expected binding from the fixed-width
+    /// commitments retained by an external terminal broker.
+    ///
+    /// This constructor does not authorize mutation. It can only be consumed
+    /// by [`CurrentEbpfGraphRecoveryTerminalTransfer`], whose runtime path
+    /// compares every component with an SDK-authenticated retained WAL while
+    /// a newly live affine authority is held. It therefore lets a
+    /// cross-language broker carry an old terminal binding without exposing
+    /// paths, map IDs, or private SDK record bytes.
+    #[must_use]
+    pub const fn new(
+        scope_commitment: CurrentEbpfGraphRecoveryCommitment,
+        predecessor_basis_commitment: CurrentEbpfGraphRecoveryCommitment,
+        fence_epoch: NonZeroU64,
+        operation_id: CurrentEbpfGraphRecoveryOperationId,
+        host_commitments: CurrentEbpfGraphRecoveryHostCommitments,
+    ) -> Self {
+        Self {
+            contract_version: CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION,
+            scope_commitment,
+            predecessor_basis_commitment,
+            fence_epoch,
+            operation_id,
+            host_commitments,
+        }
+    }
+
+    #[must_use]
+    pub const fn contract_version(self) -> u16 {
+        self.contract_version
+    }
+
+    #[must_use]
+    pub const fn scope_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.scope_commitment
+    }
+
+    #[must_use]
+    pub const fn predecessor_basis_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.predecessor_basis_commitment
+    }
+
+    #[must_use]
+    pub const fn fence_epoch(self) -> NonZeroU64 {
+        self.fence_epoch
+    }
+
+    #[must_use]
+    pub const fn operation_id(self) -> CurrentEbpfGraphRecoveryOperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn host_commitments(self) -> CurrentEbpfGraphRecoveryHostCommitments {
+        self.host_commitments
+    }
+}
+
+/// Affine live external authority for one current-schema recovery attempt.
+///
+/// This type is intentionally not `Clone`. A bounded retry retains the
+/// cloneable intent and acquires a fresh authority/guard before each call.
+pub struct CurrentEbpfGraphRecoveryAuthority {
+    binding: CurrentEbpfGraphRecoveryAuthorityBinding,
+    guard: Box<dyn CurrentEbpfGraphRecoveryCurrentnessGuard>,
+}
+
+impl CurrentEbpfGraphRecoveryAuthority {
+    /// Construct one current-schema authority binding and its live guard.
+    #[must_use]
+    pub fn new(
+        scope_commitment: CurrentEbpfGraphRecoveryCommitment,
+        predecessor_basis_commitment: CurrentEbpfGraphRecoveryCommitment,
+        fence_epoch: NonZeroU64,
+        operation_id: CurrentEbpfGraphRecoveryOperationId,
+        host_commitments: CurrentEbpfGraphRecoveryHostCommitments,
+        guard: Box<dyn CurrentEbpfGraphRecoveryCurrentnessGuard>,
+    ) -> Self {
+        Self {
+            binding: CurrentEbpfGraphRecoveryAuthorityBinding {
+                contract_version: CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION,
+                scope_commitment,
+                predecessor_basis_commitment,
+                fence_epoch,
+                operation_id,
+                host_commitments,
+            },
+            guard,
+        }
+    }
+
+    /// Return the immutable binding persisted in the current proof record.
+    #[must_use]
+    pub const fn binding(&self) -> CurrentEbpfGraphRecoveryAuthorityBinding {
+        self.binding
+    }
+
+    pub(crate) fn verify_current(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), CurrentEbpfGraphRecoveryAuthorityCurrentness>>
+                + Send
+                + 'static,
+        >,
+    > {
+        self.guard.verify_current()
+    }
+
+    pub(crate) fn verify_brokered_successor_receipt(
+        &self,
+        expected: CurrentEbpfGraphRecoveryCommitment,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), CurrentEbpfGraphRecoveryAuthorityCurrentness>>
+                + Send
+                + 'static,
+        >,
+    > {
+        self.guard.verify_brokered_successor_receipt(expected)
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoveryAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoveryAuthority")
+            .field("binding", &self.binding)
+            .field("guard", &"<affine-live-guard>")
+            .finish()
+    }
+}
+
+/// Authority-bearing current-schema recovery request.
+///
+/// This value is non-cloneable because it owns the live guard. Create it from
+/// a [`CurrentEbpfGraphRecoveryIntent`] for each retry.
+pub struct CurrentEbpfGraphRecoveryAuthorizedRequest {
+    intent: CurrentEbpfGraphRecoveryIntent,
+    authority: CurrentEbpfGraphRecoveryAuthority,
+}
+
+impl CurrentEbpfGraphRecoveryAuthorizedRequest {
+    /// Return the retryable non-authorizing request plan.
+    #[must_use]
+    pub const fn intent(&self) -> &CurrentEbpfGraphRecoveryIntent {
+        &self.intent
+    }
+
+    /// Return the receipt-safe external authority binding.
+    #[must_use]
+    pub const fn authority_binding(&self) -> CurrentEbpfGraphRecoveryAuthorityBinding {
+        self.authority.binding()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CurrentEbpfGraphRecoveryIntent,
+        CurrentEbpfGraphRecoveryAuthority,
+    ) {
+        (self.intent, self.authority)
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoveryAuthorizedRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoveryAuthorizedRequest")
+            .field("intent", &self.intent)
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+/// Fixed-width redaction-safe commitment of an authenticated current terminal
+/// receipt.
+///
+/// The bytes are deliberately public: they are derived only from fixed SDK
+/// contract labels, opaque commitments, the fence epoch, operation ID, and
+/// the SDK-computed graph commitment. They contain no path, map ID, endpoint,
+/// object ID, key, or payload and are intended for an external durable CAS.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphRecoveryTerminalReceiptCommitment([u8; 32]);
+
+impl CurrentEbpfGraphRecoveryTerminalReceiptCommitment {
+    /// Recreate a nonzero retained terminal receipt commitment supplied by an
+    /// external broker. This value is an expected checksum only; it cannot
+    /// create or authorize a terminal state.
+    pub fn new(value: [u8; 32]) -> Result<Self, CurrentEbpfGraphRecoveryAuthorityError> {
+        if value == [0; 32] {
+            Err(CurrentEbpfGraphRecoveryAuthorityError::ZeroCommitment)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Return the fixed-width, redaction-safe canonical receipt commitment.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub(crate) fn for_terminal(
+        authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+        graph: CurrentEbpfGraphRecoveryCommitment,
+        source: CurrentEbpfGraphRecoveryTerminalSource,
+        adoption: Option<CurrentEbpfGraphRecoveryTerminalAdoption>,
+    ) -> Self {
+        let host = authority.host_commitments();
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-receipt\0r2");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(authority.contract_version().to_be_bytes());
+        digest.update(authority.scope_commitment().bytes());
+        digest.update(authority.predecessor_basis_commitment().bytes());
+        digest.update(authority.fence_epoch().get().to_be_bytes());
+        digest.update(authority.operation_id().bytes());
+        digest.update(host.host().bytes());
+        digest.update(host.root().bytes());
+        digest.update(host.leaf().bytes());
+        digest.update(graph.bytes());
+        match source {
+            CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph => {
+                digest.update([0]);
+            }
+            CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                exact_historical_graph_commitment,
+            } => {
+                digest.update([1]);
+                digest.update(HISTORICAL_EBPF_GRAPH_RECOVERY_RECORD_CODEC_ID.as_bytes());
+                digest.update(HISTORICAL_EBPF_GRAPH_RECOVERY_KAT_ID.as_bytes());
+                digest.update(exact_historical_graph_commitment.bytes());
+            }
+        }
+        match adoption {
+            None => digest.update([0]),
+            Some(adoption) => {
+                digest.update([1]);
+                let prior = adoption.prior_authority();
+                let prior_host = prior.host_commitments();
+                digest.update(prior.contract_version().to_be_bytes());
+                digest.update(prior.scope_commitment().bytes());
+                digest.update(prior.predecessor_basis_commitment().bytes());
+                digest.update(prior.fence_epoch().get().to_be_bytes());
+                digest.update(prior.operation_id().bytes());
+                digest.update(prior_host.host().bytes());
+                digest.update(prior_host.root().bytes());
+                digest.update(prior_host.leaf().bytes());
+                digest.update(adoption.prior_terminal_receipt_commitment().as_bytes());
+            }
+        }
+        Self(digest.finalize().into())
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoveryTerminalReceiptCommitment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CurrentEbpfGraphRecoveryTerminalReceiptCommitment(<redaction-safe>)")
+    }
+}
+
+/// Authenticated immediate predecessor of a current-terminal transfer.
+///
+/// This is a bounded projection of a durable terminal WAL. It lets a worker
+/// prove exactly which retired authority it consumed without reconstructing
+/// SDK-private map identities or accepting a loose `Removed` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphRecoveryTerminalAdoption {
+    prior_authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+    prior_terminal_receipt_commitment: CurrentEbpfGraphRecoveryTerminalReceiptCommitment,
+}
+
+impl CurrentEbpfGraphRecoveryTerminalAdoption {
+    pub(crate) const fn new(
+        prior_authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+        prior_terminal_receipt_commitment: CurrentEbpfGraphRecoveryTerminalReceiptCommitment,
+    ) -> Self {
+        Self {
+            prior_authority,
+            prior_terminal_receipt_commitment,
+        }
+    }
+
+    /// Return the exact prior terminal authority binding retained by the WAL.
+    #[must_use]
+    pub const fn prior_authority(self) -> CurrentEbpfGraphRecoveryAuthorityBinding {
+        self.prior_authority
+    }
+
+    /// Return the prior canonical terminal receipt commitment.
+    #[must_use]
+    pub const fn prior_terminal_receipt_commitment(
+        self,
+    ) -> CurrentEbpfGraphRecoveryTerminalReceiptCommitment {
+        self.prior_terminal_receipt_commitment
+    }
+}
+
+/// Broker-retained exact predecessor required to transfer a durable current
+/// terminal WAL to a new affine authority.
+///
+/// Constructing this value has no kernel effect. The transfer operation
+/// requires the retained WAL to authenticate this exact binding and receipt
+/// commitment, prove the graph remains absent, and then bind the new live
+/// authority. A stale, forged, missing, or ambiguous predecessor is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphRecoveryTerminalTransfer {
+    prior_authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+    prior_terminal_receipt_commitment: CurrentEbpfGraphRecoveryTerminalReceiptCommitment,
+}
+
+impl CurrentEbpfGraphRecoveryTerminalTransfer {
+    /// Build a transfer expectation from the exact authority and receipt
+    /// commitment retained by the external terminal broker.
+    #[must_use]
+    pub const fn new(
+        prior_authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+        prior_terminal_receipt_commitment: CurrentEbpfGraphRecoveryTerminalReceiptCommitment,
+    ) -> Self {
+        Self {
+            prior_authority,
+            prior_terminal_receipt_commitment,
+        }
+    }
+
+    /// Project an authenticated terminal receipt into the only transferable
+    /// predecessor form. Pristine read-only absence has no durable WAL and
+    /// therefore deliberately returns `None`.
+    #[must_use]
+    pub const fn from_authenticated_receipt(
+        receipt: CurrentEbpfGraphRecoveryReceipt,
+    ) -> Option<Self> {
+        match (
+            receipt.terminal_kind,
+            receipt.terminal_absence_proof,
+            receipt.outcome,
+            receipt.exact_graph_commitment,
+            receipt.terminal_receipt_commitment,
+        ) {
+            (
+                Some(CurrentEbpfGraphRecoveryTerminalKind::AuthenticatedTerminal),
+                CurrentEbpfGraphTerminalAbsenceProof::Proven,
+                CurrentEbpfGraphRecoveryOutcome::Removed
+                | CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+                Some(_),
+                Some(commitment),
+            ) => Some(Self::new(receipt.authority, commitment)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn prior_authority(self) -> CurrentEbpfGraphRecoveryAuthorityBinding {
+        self.prior_authority
+    }
+
+    #[must_use]
+    pub const fn prior_terminal_receipt_commitment(
+        self,
+    ) -> CurrentEbpfGraphRecoveryTerminalReceiptCommitment {
+        self.prior_terminal_receipt_commitment
+    }
+
+    /// Return the domain-separated commitment a newly issued transfer
+    /// authority must carry as its predecessor basis.
+    ///
+    /// This binds the fresh affine authority to the complete broker-durable
+    /// transfer envelope, including the exact prior authority, terminal
+    /// receipt, codec identities, and record checksum. A merely target-equal
+    /// authority cannot relabel a retained terminal.
+    #[must_use]
+    pub fn predecessor_basis_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-transfer-basis\0r2");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_CODEC_ID.as_bytes());
+        digest.update(self.encode());
+        CurrentEbpfGraphRecoveryCommitment(digest.finalize().into())
+    }
+
+    /// Return the fixed-width redaction-safe predecessor basis for a durable
+    /// cross-language authority CAS.
+    ///
+    /// These bytes reveal only a domain-separated digest of the already
+    /// redaction-safe transfer record. They contain no path, interface,
+    /// object ID, endpoint, key, or payload. A broker can persist them and
+    /// reconstruct the opaque commitment with
+    /// [`CurrentEbpfGraphRecoveryCommitment::new`].
+    #[must_use]
+    pub fn predecessor_basis_commitment_bytes(self) -> [u8; 32] {
+        self.predecessor_basis_commitment().bytes()
+    }
+
+    /// Encode the exact predecessor as a fixed-width, redaction-safe broker
+    /// record. The record contains only opaque commitments, one fence epoch,
+    /// one operation nonce, and a checksum; it contains no path, interface,
+    /// map/program ID, endpoint, key, or payload. Decoding does not authorize
+    /// mutation: the live runtime still authenticates every component against
+    /// the retained terminal WAL under a separate affine authority.
+    #[must_use]
+    pub fn encode(self) -> [u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_ENCODED_LEN] {
+        const CHECKSUM_OFFSET: usize = 232;
+        let mut encoded = [0_u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_ENCODED_LEN];
+        encoded[..8].copy_from_slice(b"OPCTRXR2");
+        encoded[8..10]
+            .copy_from_slice(&CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION.to_be_bytes());
+        let authority = self.prior_authority;
+        encoded[16..48].copy_from_slice(&authority.scope_commitment().bytes());
+        encoded[48..80].copy_from_slice(&authority.predecessor_basis_commitment().bytes());
+        encoded[80..88].copy_from_slice(&authority.fence_epoch().get().to_be_bytes());
+        encoded[88..104].copy_from_slice(&authority.operation_id().bytes());
+        let host = authority.host_commitments();
+        encoded[104..136].copy_from_slice(&host.host().bytes());
+        encoded[136..168].copy_from_slice(&host.root().bytes());
+        encoded[168..200].copy_from_slice(&host.leaf().bytes());
+        encoded[200..CHECKSUM_OFFSET]
+            .copy_from_slice(&self.prior_terminal_receipt_commitment.as_bytes());
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-transfer-record\0r2");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_CODEC_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        encoded[CHECKSUM_OFFSET..].copy_from_slice(&digest.finalize());
+        encoded
+    }
+
+    /// Decode one exact broker record. Malformed, zero, wrong-version, or
+    /// checksum-invalid bytes are rejected before any runtime call.
+    #[must_use]
+    pub fn decode(
+        encoded: [u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_ENCODED_LEN],
+    ) -> Option<Self> {
+        const CHECKSUM_OFFSET: usize = 232;
+        if encoded[..8] != *b"OPCTRXR2"
+            || u16::from_be_bytes(encoded[8..10].try_into().ok()?)
+                != CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION
+            || encoded[10..16] != [0; 6]
+        {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-transfer-record\0r2");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_CODEC_ID.as_bytes());
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        if encoded[CHECKSUM_OFFSET..] != digest.finalize()[..] {
+            return None;
+        }
+        let commitment = |range: std::ops::Range<usize>| {
+            CurrentEbpfGraphRecoveryCommitment::new(encoded[range].try_into().ok()?).ok()
+        };
+        let prior_authority = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+            commitment(16..48)?,
+            commitment(48..80)?,
+            NonZeroU64::new(u64::from_be_bytes(encoded[80..88].try_into().ok()?))?,
+            CurrentEbpfGraphRecoveryOperationId::new(encoded[88..104].try_into().ok()?).ok()?,
+            CurrentEbpfGraphRecoveryHostCommitments::new(
+                commitment(104..136)?,
+                commitment(136..168)?,
+                commitment(168..200)?,
+            ),
+        );
+        let prior_terminal_receipt_commitment =
+            CurrentEbpfGraphRecoveryTerminalReceiptCommitment::new(
+                encoded[200..CHECKSUM_OFFSET].try_into().ok()?,
+            )
+            .ok()?;
+        Some(Self::new(
+            prior_authority,
+            prior_terminal_receipt_commitment,
+        ))
+    }
+}
+
+/// Read-only classification of a retained current terminal WAL.
+///
+/// `NoAuthenticatedTerminal` is deliberately not an absence proof. Only the
+/// normal receipt API can return a guarded pristine-absence receipt. An
+/// authenticated result is safe to persist and later present to the separate
+/// affine transfer operation, but it grants no mutation authority by itself.
+#[non_exhaustive]
+#[allow(clippy::large_enum_variant)] // Preserve the authenticated transfer-by-value public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryTerminalInspectionOutcome {
+    /// One exact graph-free WAL was authenticated under the requested target.
+    Authenticated(CurrentEbpfGraphRecoveryTerminalTransfer),
+    /// No transferable terminal was observed; target absence is not proven.
+    NoAuthenticatedTerminal,
+    /// Complete stable target authority could not be established.
+    Refused(CurrentEbpfGraphRecoveryRefusal),
+}
+
+/// Exact ordinary-create target expected behind a retained successor WAL.
+///
+/// The SDK consumes the complete typed request so it can bind the immutable
+/// successor record to legacy versus grouped authority, stable pin namespace,
+/// replacement ifindex, local endpoint configuration, and PMTU policy. Debug
+/// output remains redacted through the request types' bounded projections.
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoverySuccessorTarget {
+    Legacy(CreateGtpDeviceRequest),
+    Grouped(CreateGtpDeviceEndpointSetRequest),
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoverySuccessorTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Legacy(_) => {
+                f.write_str("CurrentEbpfGraphRecoverySuccessorTarget::Legacy(<redacted>)")
+            }
+            Self::Grouped(_) => {
+                f.write_str("CurrentEbpfGraphRecoverySuccessorTarget::Grouped(<redacted>)")
+            }
+        }
+    }
+}
+
+/// Affine, read-only request to authenticate one exact retained successor.
+pub struct CurrentEbpfGraphRecoverySuccessorInspectionRequest {
+    intent: CurrentEbpfGraphRecoveryIntent,
+    target: CurrentEbpfGraphRecoverySuccessorTarget,
+    authority: CurrentEbpfGraphRecoveryAuthority,
+}
+
+impl CurrentEbpfGraphRecoveryIntent {
+    /// Bind this exact recovery intent and ordinary-create target to the
+    /// unchanged live authority recorded by a retained successor WAL.
+    #[must_use]
+    pub fn into_successor_inspection_request(
+        self,
+        target: CurrentEbpfGraphRecoverySuccessorTarget,
+        authority: CurrentEbpfGraphRecoveryAuthority,
+    ) -> CurrentEbpfGraphRecoverySuccessorInspectionRequest {
+        CurrentEbpfGraphRecoverySuccessorInspectionRequest {
+            intent: self,
+            target,
+            authority,
+        }
+    }
+}
+
+impl CurrentEbpfGraphRecoverySuccessorInspectionRequest {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CurrentEbpfGraphRecoveryIntent,
+        CurrentEbpfGraphRecoverySuccessorTarget,
+        CurrentEbpfGraphRecoveryAuthority,
+    ) {
+        (self.intent, self.target, self.authority)
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoverySuccessorInspectionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoverySuccessorInspectionRequest")
+            .field("intent", &self.intent)
+            .field("target", &self.target)
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+/// Opaque authentication of one exact sealed successor publication.
+///
+/// The receipt binds the unchanged authority, the consumed predecessor
+/// terminal receipt, target/configuration commitments, the sealed graph
+/// commitment, and a digest of the complete canonical successor WAL. Callers
+/// cannot construct it and must durably acknowledge the exact value before
+/// presenting it through the separate affine admission request.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphRecoverySuccessorReceipt {
+    authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+    target_kind: u8,
+    predecessor_receipt_commitment: CurrentEbpfGraphRecoveryTerminalReceiptCommitment,
+    record_commitment: CurrentEbpfGraphRecoveryCommitment,
+    target_commitment: CurrentEbpfGraphRecoveryCommitment,
+    configuration_commitment: CurrentEbpfGraphRecoveryCommitment,
+    graph_commitment: CurrentEbpfGraphRecoveryCommitment,
+}
+
+impl CurrentEbpfGraphRecoverySuccessorReceipt {
+    pub(crate) const fn authenticated(
+        authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+        target_kind: u8,
+        predecessor_receipt_commitment: CurrentEbpfGraphRecoveryTerminalReceiptCommitment,
+        record_commitment: CurrentEbpfGraphRecoveryCommitment,
+        target_commitment: CurrentEbpfGraphRecoveryCommitment,
+        configuration_commitment: CurrentEbpfGraphRecoveryCommitment,
+        graph_commitment: CurrentEbpfGraphRecoveryCommitment,
+    ) -> Self {
+        Self {
+            authority,
+            target_kind,
+            predecessor_receipt_commitment,
+            record_commitment,
+            target_commitment,
+            configuration_commitment,
+            graph_commitment,
+        }
+    }
+
+    #[must_use]
+    pub const fn authority(self) -> CurrentEbpfGraphRecoveryAuthorityBinding {
+        self.authority
+    }
+
+    #[must_use]
+    pub(crate) const fn target_kind(self) -> u8 {
+        self.target_kind
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn predecessor_receipt_commitment(
+        self,
+    ) -> CurrentEbpfGraphRecoveryTerminalReceiptCommitment {
+        self.predecessor_receipt_commitment
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn target_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.target_commitment
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn configuration_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.configuration_commitment
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn graph_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        self.graph_commitment
+    }
+
+    /// Stable redaction-safe commitment an external broker can persist before
+    /// a separate admission attempt. Admission still reauthenticates the live
+    /// WAL; this digest alone never grants mutation authority.
+    #[must_use]
+    pub fn commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-successor-receipt\0r1");
+        digest.update(self.authority.scope_commitment().bytes());
+        digest.update(self.authority.predecessor_basis_commitment().bytes());
+        digest.update(self.authority.fence_epoch().get().to_be_bytes());
+        digest.update(self.authority.operation_id().bytes());
+        let host = self.authority.host_commitments();
+        digest.update(host.host().bytes());
+        digest.update(host.root().bytes());
+        digest.update(host.leaf().bytes());
+        digest.update([self.target_kind]);
+        digest.update(self.predecessor_receipt_commitment.as_bytes());
+        digest.update(self.record_commitment.bytes());
+        digest.update(self.target_commitment.bytes());
+        digest.update(self.configuration_commitment.bytes());
+        digest.update(self.graph_commitment.bytes());
+        CurrentEbpfGraphRecoveryCommitment::from_fixed_digest(digest.finalize().into())
+    }
+
+    /// Encode this broker token without exposing paths, map/program IDs,
+    /// interface names, endpoints, or raw WAL bytes.
+    #[must_use]
+    pub fn encode(self) -> [u8; CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN] {
+        const CHECKSUM_OFFSET: usize = 384;
+        let mut encoded = [0_u8; CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN];
+        encoded[..8].copy_from_slice(b"OPCSUCR1");
+        encoded[8..10]
+            .copy_from_slice(&CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION.to_be_bytes());
+        encoded[10] = self.target_kind;
+        encoded[11] = 4;
+        encoded[16..48].copy_from_slice(&self.authority.scope_commitment().bytes());
+        encoded[48..80].copy_from_slice(&self.authority.predecessor_basis_commitment().bytes());
+        encoded[80..88].copy_from_slice(&self.authority.fence_epoch().get().to_be_bytes());
+        encoded[88..104].copy_from_slice(&self.authority.operation_id().bytes());
+        let host = self.authority.host_commitments();
+        encoded[104..136].copy_from_slice(&host.host().bytes());
+        encoded[136..168].copy_from_slice(&host.root().bytes());
+        encoded[168..200].copy_from_slice(&host.leaf().bytes());
+        encoded[200..232].copy_from_slice(&self.predecessor_receipt_commitment.as_bytes());
+        encoded[232..264].copy_from_slice(&self.record_commitment.bytes());
+        encoded[264..296].copy_from_slice(&self.target_commitment.bytes());
+        encoded[296..328].copy_from_slice(&self.configuration_commitment.bytes());
+        encoded[328..360].copy_from_slice(&self.graph_commitment.bytes());
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-successor-receipt-codec\0r1");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        encoded[CHECKSUM_OFFSET..].copy_from_slice(&digest.finalize());
+        encoded
+    }
+
+    /// Decode one canonical redaction-safe broker token. Decoding never
+    /// grants authority; every admission reopens and reauthenticates the exact
+    /// live target under a fresh affine guard.
+    pub fn decode(
+        encoded: [u8; CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN],
+    ) -> Option<Self> {
+        const CHECKSUM_OFFSET: usize = 384;
+        if encoded[..8] != *b"OPCSUCR1"
+            || u16::from_be_bytes(encoded[8..10].try_into().ok()?)
+                != CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION
+            || !matches!(encoded[10], 1 | 2)
+            || encoded[11] != 4
+            || encoded[12..16] != [0; 4]
+            || encoded[360..CHECKSUM_OFFSET] != [0; 24]
+        {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-successor-receipt-codec\0r1");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        if encoded[CHECKSUM_OFFSET..] != digest.finalize()[..] {
+            return None;
+        }
+        let commitment = |range: std::ops::Range<usize>| {
+            CurrentEbpfGraphRecoveryCommitment::new(encoded[range].try_into().ok()?).ok()
+        };
+        let authority = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+            commitment(16..48)?,
+            commitment(48..80)?,
+            NonZeroU64::new(u64::from_be_bytes(encoded[80..88].try_into().ok()?))?,
+            CurrentEbpfGraphRecoveryOperationId::new(encoded[88..104].try_into().ok()?).ok()?,
+            CurrentEbpfGraphRecoveryHostCommitments::new(
+                commitment(104..136)?,
+                commitment(136..168)?,
+                commitment(168..200)?,
+            ),
+        );
+        Some(Self::authenticated(
+            authority,
+            encoded[10],
+            CurrentEbpfGraphRecoveryTerminalReceiptCommitment::new(
+                encoded[200..232].try_into().ok()?,
+            )
+            .ok()?,
+            commitment(232..264)?,
+            commitment(264..296)?,
+            commitment(296..328)?,
+            commitment(328..360)?,
+        ))
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoverySuccessorReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CurrentEbpfGraphRecoverySuccessorReceipt(<opaque>)")
+    }
+}
+
+/// Read-only classification of one retained current-successor publication.
+#[non_exhaustive]
+#[allow(clippy::large_enum_variant)] // Preserve the opaque affine receipt-by-value public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoverySuccessorInspectionOutcome {
+    /// One exact sealed successor was authenticated under the unchanged
+    /// authority binding.
+    Authenticated(CurrentEbpfGraphRecoverySuccessorReceipt),
+    /// No same-authority successor was observed; target absence is not proven.
+    NoAuthenticatedSuccessor,
+    /// Complete stable successor authority could not be established.
+    Refused(CurrentEbpfGraphRecoveryRefusal),
+}
+
+/// Affine acknowledgement of one broker-durable successor receipt.
+pub struct CurrentEbpfGraphRecoverySuccessorAdmissionRequest {
+    intent: CurrentEbpfGraphRecoveryIntent,
+    target: CurrentEbpfGraphRecoverySuccessorTarget,
+    receipt: CurrentEbpfGraphRecoverySuccessorReceipt,
+    authority: CurrentEbpfGraphRecoveryAuthority,
+}
+
+impl CurrentEbpfGraphRecoveryIntent {
+    #[must_use]
+    pub fn into_successor_admission_request(
+        self,
+        target: CurrentEbpfGraphRecoverySuccessorTarget,
+        receipt: CurrentEbpfGraphRecoverySuccessorReceipt,
+        authority: CurrentEbpfGraphRecoveryAuthority,
+    ) -> CurrentEbpfGraphRecoverySuccessorAdmissionRequest {
+        CurrentEbpfGraphRecoverySuccessorAdmissionRequest {
+            intent: self,
+            target,
+            receipt,
+            authority,
+        }
+    }
+}
+
+impl CurrentEbpfGraphRecoverySuccessorAdmissionRequest {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CurrentEbpfGraphRecoveryIntent,
+        CurrentEbpfGraphRecoverySuccessorTarget,
+        CurrentEbpfGraphRecoverySuccessorReceipt,
+        CurrentEbpfGraphRecoveryAuthority,
+    ) {
+        (self.intent, self.target, self.receipt, self.authority)
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoverySuccessorAdmissionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoverySuccessorAdmissionRequest")
+            .field("intent", &self.intent)
+            .field("target", &self.target)
+            .field("receipt", &self.receipt)
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoverySuccessorAdmissionOutcome {
+    /// The exact authority WAL was retired after reauthentication.
+    Admitted,
+    /// The authority WAL was already absent and the broker token still
+    /// matched the exact sealed successor graph.
+    AlreadyFinalized,
+    Refused(CurrentEbpfGraphRecoveryRefusal),
+}
+
+/// Affine request to authenticate and transfer a retained current-terminal
+/// WAL to a newly live authority.
+///
+/// Retrying retains the cloneable intent and transfer expectation but always
+/// recreates the new authority/guard. The operation never deletes the WAL.
+pub struct CurrentEbpfGraphRecoveryTerminalTransferRequest {
+    intent: CurrentEbpfGraphRecoveryIntent,
+    transfer: CurrentEbpfGraphRecoveryTerminalTransfer,
+    authority: CurrentEbpfGraphRecoveryAuthority,
+}
+
+impl CurrentEbpfGraphRecoveryIntent {
+    /// Bind a retained terminal expectation to one newly acquired live
+    /// authority for a broker-authorized transfer.
+    #[must_use]
+    pub fn into_terminal_transfer_request(
+        self,
+        transfer: CurrentEbpfGraphRecoveryTerminalTransfer,
+        authority: CurrentEbpfGraphRecoveryAuthority,
+    ) -> CurrentEbpfGraphRecoveryTerminalTransferRequest {
+        CurrentEbpfGraphRecoveryTerminalTransferRequest {
+            intent: self,
+            transfer,
+            authority,
+        }
+    }
+}
+
+impl CurrentEbpfGraphRecoveryTerminalTransferRequest {
+    #[must_use]
+    pub const fn intent(&self) -> &CurrentEbpfGraphRecoveryIntent {
+        &self.intent
+    }
+
+    #[must_use]
+    pub const fn transfer(&self) -> CurrentEbpfGraphRecoveryTerminalTransfer {
+        self.transfer
+    }
+
+    #[must_use]
+    pub const fn authority_binding(&self) -> CurrentEbpfGraphRecoveryAuthorityBinding {
+        self.authority.binding()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CurrentEbpfGraphRecoveryIntent,
+        CurrentEbpfGraphRecoveryTerminalTransfer,
+        CurrentEbpfGraphRecoveryAuthority,
+    ) {
+        (self.intent, self.transfer, self.authority)
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoveryTerminalTransferRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoveryTerminalTransferRequest")
+            .field("intent", &self.intent)
+            .field("transfer", &self.transfer)
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
 /// Stable reason current-schema orphan recovery was refused before graph
 /// deletion was committed.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CurrentEbpfGraphRecoveryRefusal {
+    /// No affine live external node authority was supplied. The legacy
+    /// unbound recovery entrypoint refuses before observing or mutating the
+    /// graph.
+    AuthorityRequired,
+    /// The persisted current recovery proof binds a different exact external
+    /// authority tuple.
+    AuthorityMismatch,
+    /// The live external authority changed or could not be established at an
+    /// irreversible effect boundary.
+    AuthorityChanged,
     /// The replacement interface name no longer resolves to its requested
     /// ifindex.
     ReplacementInterfaceIdentityChanged,
@@ -341,6 +1596,10 @@ pub enum CurrentEbpfGraphRecoveryRefusal {
     PopulatedState,
     /// A pin, loaded program, or replacement tc hook is foreign or replaced.
     IdentityMismatch,
+    /// A retained terminal WAL did not authenticate the exact brokered prior
+    /// Maintenance binding, receipt commitment, source union, or target.
+    /// This includes an attempted transfer from a pristine receipt.
+    TerminalTransferMismatch,
     /// Complete stable kernel state could not be established.
     IndeterminateState,
 }
@@ -376,6 +1635,2319 @@ pub enum CurrentEbpfGraphRecoveryOutcome {
     Refused(CurrentEbpfGraphRecoveryRefusal),
     /// Cleanup was committed but is incomplete; retry the exact request.
     Partial(CurrentEbpfGraphRecoveryProgress),
+}
+
+/// Stable terminal classification for authority-bound current recovery.
+///
+/// Callers must consume this typed classification rather than inferring a
+/// terminal proof from `Removed` or `AlreadyAbsent` on the legacy outcome
+/// API. `PristineAbsence` is read-only; `AuthenticatedTerminal` is backed by
+/// the fsynced current-terminal WAL outside the deleted graph.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryTerminalKind {
+    /// A live-guarded, two-snapshot read-only observation proved the target
+    /// was never created. No SDK authority leaf, proof, or marker was made.
+    PristineAbsence,
+    /// The exact current graph was retired under an authenticated durable
+    /// terminal WAL which remains in the target authority leaf for retry and
+    /// broker-acknowledged handoff.
+    AuthenticatedTerminal,
+}
+
+/// Whether the current terminal receipt proves the requested target absent.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphTerminalAbsenceProof {
+    /// The guarded terminal observation conclusively proved target absence.
+    Proven,
+    /// The result is refused or partial; terminal absence is not claimed.
+    NotProven,
+}
+
+/// Redaction-safe terminal/current progress receipt for one affine authority
+/// attempt.
+///
+/// This receipt is intentionally the product verification surface for
+/// current-first maintenance. It binds the external authority and either a
+/// nonpersistent pristine observation or an exact graph commitment recovered
+/// from the fsynced terminal WAL. It never renders paths, map IDs, or tenant
+/// identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrentEbpfGraphRecoveryReceipt {
+    authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+    outcome: CurrentEbpfGraphRecoveryOutcome,
+    terminal_kind: Option<CurrentEbpfGraphRecoveryTerminalKind>,
+    terminal_absence_proof: CurrentEbpfGraphTerminalAbsenceProof,
+    exact_graph_commitment: Option<CurrentEbpfGraphRecoveryCommitment>,
+    terminal_source: Option<CurrentEbpfGraphRecoveryTerminalSource>,
+    terminal_adoption: Option<CurrentEbpfGraphRecoveryTerminalAdoption>,
+    terminal_receipt_commitment: Option<CurrentEbpfGraphRecoveryTerminalReceiptCommitment>,
+}
+
+impl CurrentEbpfGraphRecoveryReceipt {
+    pub(crate) const fn nonterminal(
+        authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+        outcome: CurrentEbpfGraphRecoveryOutcome,
+    ) -> Self {
+        Self {
+            authority,
+            outcome,
+            terminal_kind: None,
+            terminal_absence_proof: CurrentEbpfGraphTerminalAbsenceProof::NotProven,
+            exact_graph_commitment: None,
+            terminal_source: None,
+            terminal_adoption: None,
+            terminal_receipt_commitment: None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn pristine_absence(authority: CurrentEbpfGraphRecoveryAuthorityBinding) -> Self {
+        Self {
+            authority,
+            outcome: CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+            terminal_kind: Some(CurrentEbpfGraphRecoveryTerminalKind::PristineAbsence),
+            terminal_absence_proof: CurrentEbpfGraphTerminalAbsenceProof::Proven,
+            exact_graph_commitment: None,
+            terminal_source: None,
+            terminal_adoption: None,
+            terminal_receipt_commitment: None,
+        }
+    }
+
+    pub(crate) fn authenticated_terminal(
+        authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+        outcome: CurrentEbpfGraphRecoveryOutcome,
+        exact_graph_commitment: CurrentEbpfGraphRecoveryCommitment,
+        terminal_source: CurrentEbpfGraphRecoveryTerminalSource,
+        terminal_adoption: Option<CurrentEbpfGraphRecoveryTerminalAdoption>,
+    ) -> Self {
+        debug_assert!(matches!(
+            outcome,
+            CurrentEbpfGraphRecoveryOutcome::Removed
+                | CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+        ));
+        Self {
+            authority,
+            outcome,
+            terminal_kind: Some(CurrentEbpfGraphRecoveryTerminalKind::AuthenticatedTerminal),
+            terminal_absence_proof: CurrentEbpfGraphTerminalAbsenceProof::Proven,
+            exact_graph_commitment: Some(exact_graph_commitment),
+            terminal_source: Some(terminal_source),
+            terminal_adoption,
+            terminal_receipt_commitment: Some(
+                CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
+                    authority,
+                    exact_graph_commitment,
+                    terminal_source,
+                    terminal_adoption,
+                ),
+            ),
+        }
+    }
+
+    /// Return the immutable external authority binding for this attempt.
+    #[must_use]
+    pub const fn authority(self) -> CurrentEbpfGraphRecoveryAuthorityBinding {
+        self.authority
+    }
+
+    /// Return the classified current recovery result.
+    #[must_use]
+    pub const fn outcome(self) -> CurrentEbpfGraphRecoveryOutcome {
+        self.outcome
+    }
+
+    /// Return the non-inferable terminal kind, if terminal absence is proven.
+    #[must_use]
+    pub const fn terminal_kind(self) -> Option<CurrentEbpfGraphRecoveryTerminalKind> {
+        self.terminal_kind
+    }
+
+    /// Return whether this receipt proves terminal target absence.
+    #[must_use]
+    pub const fn terminal_absence_proof(self) -> CurrentEbpfGraphTerminalAbsenceProof {
+        self.terminal_absence_proof
+    }
+
+    /// Return the opaque exact graph/map commitment only for an authenticated
+    /// WAL-backed terminal. It is never manufactured for pristine absence.
+    #[must_use]
+    pub const fn exact_graph_commitment(self) -> Option<CurrentEbpfGraphRecoveryCommitment> {
+        self.exact_graph_commitment
+    }
+
+    /// Return the sealed source domain for an authenticated terminal WAL.
+    /// `None` distinguishes nonterminal progress and read-only pristine
+    /// absence from a durable source-bound terminal.
+    #[must_use]
+    pub const fn terminal_source(self) -> Option<CurrentEbpfGraphRecoveryTerminalSource> {
+        self.terminal_source
+    }
+
+    /// Return the immediate predecessor when this receipt transferred a
+    /// previously authenticated terminal WAL to a new authority.
+    #[must_use]
+    pub const fn terminal_adoption(self) -> Option<CurrentEbpfGraphRecoveryTerminalAdoption> {
+        self.terminal_adoption
+    }
+
+    /// Return the stable redaction-safe commitment of an authenticated
+    /// terminal receipt. `None` distinguishes both nonterminal progress and
+    /// read-only pristine absence from a broker-transferable WAL terminal.
+    #[must_use]
+    pub const fn terminal_receipt_commitment(
+        self,
+    ) -> Option<CurrentEbpfGraphRecoveryTerminalReceiptCommitment> {
+        self.terminal_receipt_commitment
+    }
+
+    /// Return the terminal receipt codec identity used to derive
+    /// [`Self::terminal_receipt_commitment`].
+    #[must_use]
+    pub const fn terminal_receipt_codec_identity(self) -> &'static str {
+        CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID
+    }
+
+    /// Return the durable current-terminal WAL codec identity.
+    #[must_use]
+    pub const fn terminal_wal_codec_identity(self) -> &'static str {
+        CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID
+    }
+
+    /// Encode a complete authenticated terminal receipt for durable broker
+    /// persistence across process loss.
+    ///
+    /// The record contains only opaque commitments, epochs, operation
+    /// nonces, closed source discriminators, and a checksum. It contains no
+    /// path, interface name, map/program ID, endpoint, key, or payload.
+    /// Pristine absence and nonterminal progress deliberately return `None`:
+    /// neither is backed by the retained terminal WAL required by admission.
+    #[must_use]
+    pub fn encode_authenticated_terminal(
+        self,
+    ) -> Option<[u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_ENCODED_LEN]> {
+        const CHECKSUM_OFFSET: usize = 512;
+        if !matches!(
+            (
+                self.outcome,
+                self.terminal_kind,
+                self.terminal_absence_proof,
+            ),
+            (
+                CurrentEbpfGraphRecoveryOutcome::Removed
+                    | CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+                Some(CurrentEbpfGraphRecoveryTerminalKind::AuthenticatedTerminal),
+                CurrentEbpfGraphTerminalAbsenceProof::Proven,
+            )
+        ) {
+            return None;
+        }
+        let graph = self.exact_graph_commitment?;
+        let source = self.terminal_source?;
+        let receipt_commitment = self.terminal_receipt_commitment?;
+        if CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
+            self.authority,
+            graph,
+            source,
+            self.terminal_adoption,
+        ) != receipt_commitment
+        {
+            return None;
+        }
+
+        let mut encoded = [0_u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_ENCODED_LEN];
+        encoded[..8].copy_from_slice(b"OPCTRRR1");
+        encoded[8..10]
+            .copy_from_slice(&CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION.to_be_bytes());
+        encoded[10] = match self.outcome {
+            CurrentEbpfGraphRecoveryOutcome::Removed => 1,
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent => 2,
+            CurrentEbpfGraphRecoveryOutcome::Refused(_)
+            | CurrentEbpfGraphRecoveryOutcome::Partial(_) => return None,
+        };
+        encoded[11] = match source {
+            CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph => 1,
+            CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                exact_historical_graph_commitment,
+            } => {
+                encoded[232..264].copy_from_slice(&exact_historical_graph_commitment.bytes());
+                2
+            }
+        };
+        encoded[12] = u8::from(self.terminal_adoption.is_some());
+        let authority = self.authority;
+        encoded[16..48].copy_from_slice(&authority.scope_commitment().bytes());
+        encoded[48..80].copy_from_slice(&authority.predecessor_basis_commitment().bytes());
+        encoded[80..88].copy_from_slice(&authority.fence_epoch().get().to_be_bytes());
+        encoded[88..104].copy_from_slice(&authority.operation_id().bytes());
+        let host = authority.host_commitments();
+        encoded[104..136].copy_from_slice(&host.host().bytes());
+        encoded[136..168].copy_from_slice(&host.root().bytes());
+        encoded[168..200].copy_from_slice(&host.leaf().bytes());
+        encoded[200..232].copy_from_slice(&graph.bytes());
+        encoded[264..296].copy_from_slice(&receipt_commitment.as_bytes());
+        if let Some(adoption) = self.terminal_adoption {
+            let prior = adoption.prior_authority();
+            encoded[296..328].copy_from_slice(&prior.scope_commitment().bytes());
+            encoded[328..360].copy_from_slice(&prior.predecessor_basis_commitment().bytes());
+            encoded[360..368].copy_from_slice(&prior.fence_epoch().get().to_be_bytes());
+            encoded[368..384].copy_from_slice(&prior.operation_id().bytes());
+            let prior_host = prior.host_commitments();
+            encoded[384..416].copy_from_slice(&prior_host.host().bytes());
+            encoded[416..448].copy_from_slice(&prior_host.root().bytes());
+            encoded[448..480].copy_from_slice(&prior_host.leaf().bytes());
+            encoded[480..512]
+                .copy_from_slice(&adoption.prior_terminal_receipt_commitment().as_bytes());
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-receipt-record\0r1");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        encoded[CHECKSUM_OFFSET..].copy_from_slice(&digest.finalize());
+        Some(encoded)
+    }
+
+    /// Decode one canonical authenticated terminal receipt retained by an
+    /// external broker. Decoding grants no authority: terminal admission
+    /// still reopens the live WAL and checks a fresh affine guard.
+    pub fn decode_authenticated_terminal(
+        encoded: [u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_ENCODED_LEN],
+    ) -> Option<Self> {
+        const CHECKSUM_OFFSET: usize = 512;
+        if encoded[..8] != *b"OPCTRRR1"
+            || u16::from_be_bytes(encoded[8..10].try_into().ok()?)
+                != CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION
+            || !matches!(encoded[10], 1 | 2)
+            || !matches!(encoded[11], 1 | 2)
+            || !matches!(encoded[12], 0 | 1)
+            || encoded[13..16] != [0; 3]
+            || (encoded[11] == 1 && encoded[232..264] != [0; 32])
+            || (encoded[12] == 0 && encoded[296..512] != [0; 216])
+        {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-receipt-record\0r1");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        if encoded[CHECKSUM_OFFSET..] != digest.finalize()[..] {
+            return None;
+        }
+        let commitment = |range: std::ops::Range<usize>| {
+            CurrentEbpfGraphRecoveryCommitment::new(encoded[range].try_into().ok()?).ok()
+        };
+        let authority = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+            commitment(16..48)?,
+            commitment(48..80)?,
+            NonZeroU64::new(u64::from_be_bytes(encoded[80..88].try_into().ok()?))?,
+            CurrentEbpfGraphRecoveryOperationId::new(encoded[88..104].try_into().ok()?).ok()?,
+            CurrentEbpfGraphRecoveryHostCommitments::new(
+                commitment(104..136)?,
+                commitment(136..168)?,
+                commitment(168..200)?,
+            ),
+        );
+        let graph = commitment(200..232)?;
+        let source = match encoded[11] {
+            1 => CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
+            2 => CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                exact_historical_graph_commitment: HistoricalEbpfGraphRecoveryCommitment::new(
+                    encoded[232..264].try_into().ok()?,
+                )
+                .ok()?,
+            },
+            _ => return None,
+        };
+        let encoded_receipt = CurrentEbpfGraphRecoveryTerminalReceiptCommitment::new(
+            encoded[264..296].try_into().ok()?,
+        )
+        .ok()?;
+        let adoption = match encoded[12] {
+            0 => None,
+            1 => {
+                let prior = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+                    commitment(296..328)?,
+                    commitment(328..360)?,
+                    NonZeroU64::new(u64::from_be_bytes(encoded[360..368].try_into().ok()?))?,
+                    CurrentEbpfGraphRecoveryOperationId::new(encoded[368..384].try_into().ok()?)
+                        .ok()?,
+                    CurrentEbpfGraphRecoveryHostCommitments::new(
+                        commitment(384..416)?,
+                        commitment(416..448)?,
+                        commitment(448..480)?,
+                    ),
+                );
+                Some(CurrentEbpfGraphRecoveryTerminalAdoption::new(
+                    prior,
+                    CurrentEbpfGraphRecoveryTerminalReceiptCommitment::new(
+                        encoded[480..512].try_into().ok()?,
+                    )
+                    .ok()?,
+                ))
+            }
+            _ => return None,
+        };
+        let outcome = match encoded[10] {
+            1 => CurrentEbpfGraphRecoveryOutcome::Removed,
+            2 => CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+            _ => return None,
+        };
+        let receipt = Self::authenticated_terminal(authority, outcome, graph, source, adoption);
+        (receipt.terminal_receipt_commitment == Some(encoded_receipt)
+            && receipt.encode_authenticated_terminal() == Some(encoded))
+        .then_some(receipt)
+    }
+}
+
+/// Affine post-persistence admission for one authenticated current-terminal
+/// receipt.
+///
+/// The caller must construct this request only after its external recovery
+/// broker has durably committed the exact [`CurrentEbpfGraphRecoveryReceipt`].
+/// Supplying the receipt is not sufficient by itself: the SDK reopens the
+/// retained authority leaf, requires the sole graph-free `AuthorityOnly`
+/// publication cut, compares the complete canonical receipt commitment, and
+/// checks this fresh live authority at every observation boundary.  A
+/// successful admission authorizes one later ordinary creation of the exact
+/// replacement graph in this backend process; it does not delete bpffs state
+/// or authorize a terminal transfer.
+pub struct CurrentEbpfGraphRecoveryTerminalAdmissionRequest {
+    intent: CurrentEbpfGraphRecoveryIntent,
+    receipt: CurrentEbpfGraphRecoveryReceipt,
+    authority: CurrentEbpfGraphRecoveryAuthority,
+}
+
+impl CurrentEbpfGraphRecoveryIntent {
+    /// Bind a broker-durable authenticated terminal receipt to a fresh live
+    /// authority for one ordinary-graph admission attempt.
+    #[must_use]
+    pub fn into_terminal_admission_request(
+        self,
+        receipt: CurrentEbpfGraphRecoveryReceipt,
+        authority: CurrentEbpfGraphRecoveryAuthority,
+    ) -> CurrentEbpfGraphRecoveryTerminalAdmissionRequest {
+        CurrentEbpfGraphRecoveryTerminalAdmissionRequest {
+            intent: self,
+            receipt,
+            authority,
+        }
+    }
+}
+
+impl CurrentEbpfGraphRecoveryTerminalAdmissionRequest {
+    /// Return the retryable non-authorizing request plan.
+    #[must_use]
+    pub const fn intent(&self) -> &CurrentEbpfGraphRecoveryIntent {
+        &self.intent
+    }
+
+    /// Return the exact broker-durable terminal receipt being acknowledged.
+    #[must_use]
+    pub const fn receipt(&self) -> CurrentEbpfGraphRecoveryReceipt {
+        self.receipt
+    }
+
+    /// Return the receipt-safe binding of the fresh live authority.
+    #[must_use]
+    pub const fn authority_binding(&self) -> CurrentEbpfGraphRecoveryAuthorityBinding {
+        self.authority.binding()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CurrentEbpfGraphRecoveryIntent,
+        CurrentEbpfGraphRecoveryReceipt,
+        CurrentEbpfGraphRecoveryAuthority,
+    ) {
+        (self.intent, self.receipt, self.authority)
+    }
+}
+
+impl fmt::Debug for CurrentEbpfGraphRecoveryTerminalAdmissionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CurrentEbpfGraphRecoveryTerminalAdmissionRequest")
+            .field("intent", &self.intent)
+            .field("receipt", &self.receipt)
+            .field("authority", &self.authority)
+            .finish()
+    }
+}
+
+/// Bounded result of acknowledging one broker-durable current terminal.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CurrentEbpfGraphRecoveryTerminalAdmissionOutcome {
+    /// The exact authenticated `AuthorityOnly` terminal is admitted for one
+    /// later ordinary graph creation in this backend process.
+    Admitted,
+    /// Admission did not change kernel state or authorize ordinary creation.
+    Refused(CurrentEbpfGraphRecoveryRefusal),
+}
+
+/// A frozen eBPF datapath generation that this SDK can recover only through a
+/// dedicated maintenance operation.
+///
+/// Historical graphs are never adopted by ordinary startup or cleanup-only
+/// recovery. Their authority layout and map/program ABI are a separate
+/// compatibility boundary, so callers must name the exact generation they
+/// intend to retire.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphGeneration {
+    /// The 25-map graph shipped before selector stamps and traffic-observation
+    /// maps were added.
+    PreSessionSelectorStampTrafficObservationV1,
+}
+
+impl HistoricalEbpfGraphGeneration {
+    /// Stable public identity of this frozen shipped graph generation.
+    #[must_use]
+    pub const fn identity(self) -> &'static str {
+        match self {
+            Self::PreSessionSelectorStampTrafficObservationV1 => {
+                "pre-session-selector-stamp-traffic-observation-v1"
+            }
+        }
+    }
+}
+
+/// Explicit caller attestation that the writer of a historical eBPF graph has
+/// stopped.
+///
+/// This caller attestation is not removal authority by itself. Historical
+/// recovery independently takes both kernel-backed authority locks and proves
+/// the exact generation, legacy and current authority domains,
+/// map/program/hook identity, graph directory identity, and replacement
+/// identity before any effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphWriterProof {
+    _private: (),
+}
+
+impl HistoricalEbpfGraphWriterProof {
+    /// Attest that the process which previously owned the historical graph is
+    /// stopped.
+    #[must_use]
+    pub const fn previous_writer_stopped() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Explicit caller attestation that all forwarding/session state represented
+/// by a historical eBPF graph has been drained.
+///
+/// This caller attestation is not evidence that the kernel graph is empty.
+/// Supplying it never bypasses the live map, hook, program, identity, and
+/// authority checks; any populated or ambiguous graph remains fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphDrainProof {
+    _private: (),
+}
+
+/// Fixed public identity of the historical eBPF graph-recovery authority
+/// contract.  The value identifies an SDK contract, not a tenant, node, pin
+/// path, endpoint, or recovery payload.
+pub const HISTORICAL_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID: &str =
+    "opc.gtpu.historical-ebpf-graph-recovery-authority.r5";
+
+/// Fixed version of [`HISTORICAL_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID`].
+pub const HISTORICAL_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION: u16 = 5;
+
+/// Stable public R5 recovery-contract identity for cross-language parity.
+pub const HISTORICAL_EBPF_GRAPH_RECOVERY_CONTRACT_ID: &str =
+    "opc.gtpu.historical-ebpf-graph-recovery.r5";
+
+/// Stable public R5 durable-record codec identity for cross-language parity.
+pub const HISTORICAL_EBPF_GRAPH_RECOVERY_RECORD_CODEC_ID: &str =
+    "opc.gtpu.historical-recovery-record.r5";
+
+/// Stable public identity of the pure shipped-25 compatibility KAT.
+pub const HISTORICAL_EBPF_GRAPH_RECOVERY_KAT_ID: &str = "opc.gtpu.historical-ebpf-recovery-kat.r5";
+
+/// Stable identity of the immutable object bundled with shipped generation
+/// 25. This is an artifact label, not a claim about a loaded kernel object.
+pub const HISTORICAL_EBPF_GRAPH_SHIPPED_25_ARTIFACT_ID: &str = "opc.gtpu.shipped-25-artifact.v1";
+
+/// Stable identity of the exact 25-map ABI bundled with shipped generation
+/// 25. This is an artifact label, not a live-kernel assertion.
+pub const HISTORICAL_EBPF_GRAPH_SHIPPED_25_MAP_ABI_ID: &str = "opc.gtpu.shipped-25-map-abi.v1";
+
+/// Exact fixed control-root entry used by the shipped-25 authority layout.
+/// It contains no tenant or node data; callers use it when committing their
+/// externally fenced maintenance scope rather than mirroring a private SDK
+/// literal.
+pub const HISTORICAL_EBPF_GRAPH_RECOVERY_CONTROL_ROOT_ID: &str = "GTPU_RECONCILER_LOCKS";
+
+/// Fixed identity of the live external evidence which proves that the former
+/// attachment/netns is destroyed, or that this target was never created.
+///
+/// The evidence itself remains opaque.  Its value is bound to every R5
+/// authority, persisted before historical effects, and must be re-proved by
+/// the live guard at every effect boundary.  It is deliberately not a global
+/// host scan: it names only the former target committed by the caller.
+pub const HISTORICAL_EBPF_GRAPH_RECOVERY_FORMER_LINK_EVIDENCE_ID: &str =
+    "opc.gtpu.historical-ebpf-former-link-evidence.v1";
+
+/// Fixed identity of the external provenance attestation required before a
+/// detached shipped-25 graph can be retired.  Exact map shape alone is not
+/// provenance; this commitment binds the caller's product/SDK artifact proof
+/// to the authority target and the sealed shipped generation.
+pub const HISTORICAL_EBPF_GRAPH_RECOVERY_ARTIFACT_PROVENANCE_ID: &str =
+    "opc.gtpu.historical-ebpf-artifact-provenance.v1";
+
+/// Opaque fixed-width commitment used by historical graph recovery authority.
+///
+/// The SDK deliberately does not provide a formatter or raw-byte accessor for
+/// this value.  A caller keeps any sensitive source material outside this
+/// contract and commits to it before constructing authority.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryCommitment([u8; 32]);
+
+impl HistoricalEbpfGraphRecoveryCommitment {
+    /// Construct a nonzero opaque commitment.
+    pub fn new(value: [u8; 32]) -> Result<Self, HistoricalEbpfGraphRecoveryAuthorityError> {
+        if value == [0; 32] {
+            Err(HistoricalEbpfGraphRecoveryAuthorityError::ZeroCommitment)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Internal construction from a SHA-256-derived fixed artifact value.
+    /// Callers of the public API must use [`Self::new`].
+    pub(crate) const fn from_fixed_digest(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryCommitment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HistoricalEbpfGraphRecoveryCommitment(<opaque>)")
+    }
+}
+
+/// SDK-issued, target-scoped evidence that the exact inspected shipped-25
+/// graph was detached.
+///
+/// This is intentionally not an arbitrary external attestation.  For a
+/// present graph, the SDK obtains it only from an
+/// [`HistoricalEbpfGraphRecoveryGraphInspection`] after it has locked the
+/// graph and proved that no program or tc hook references its exact map-ID
+/// inventory. Recovery recomputes the same value while its effect locks are
+/// held. The external guard still proves exclusive live authority; it does
+/// not make a kernel/netns detachment claim it cannot inspect.
+///
+/// ```compile_fail
+/// use opc_gtpu_dataplane::{
+///     HistoricalEbpfGraphRecoveryCommitment,
+///     HistoricalEbpfGraphRecoveryFormerLinkEvidence,
+/// };
+///
+/// let arbitrary = HistoricalEbpfGraphRecoveryCommitment::new([1; 32]).unwrap();
+/// // Only `ExactDetached(...).former_link_evidence()` can issue this proof.
+/// let _ = HistoricalEbpfGraphRecoveryFormerLinkEvidence::new(arbitrary);
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryFormerLinkEvidence(HistoricalEbpfGraphRecoveryCommitment);
+
+impl HistoricalEbpfGraphRecoveryFormerLinkEvidence {
+    fn for_exact_graph(exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.historical-ebpf-former-link-evidence\\0r1");
+        digest.update(HISTORICAL_EBPF_GRAPH_RECOVERY_FORMER_LINK_EVIDENCE_ID.as_bytes());
+        digest.update(HISTORICAL_EBPF_GRAPH_SHIPPED_25_ARTIFACT_ID.as_bytes());
+        digest.update(HISTORICAL_EBPF_GRAPH_SHIPPED_25_MAP_ABI_ID.as_bytes());
+        digest.update(exact_graph_commitment.bytes());
+        Self(HistoricalEbpfGraphRecoveryCommitment::from_fixed_digest(
+            digest.finalize().into(),
+        ))
+    }
+
+    /// Project the only detached former-link proof accepted for an exact
+    /// SDK-issued inspection challenge.
+    #[must_use]
+    pub fn from_inspection(inspection: HistoricalEbpfGraphRecoveryGraphInspection) -> Self {
+        Self::for_exact_graph(inspection.exact_graph_commitment())
+    }
+
+    /// Rebuild an already checksum-authenticated record projection. This is
+    /// crate-private so callers cannot turn an arbitrary commitment into
+    /// former-link evidence.
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn from_persisted(commitment: HistoricalEbpfGraphRecoveryCommitment) -> Self {
+        Self(commitment)
+    }
+
+    #[must_use]
+    pub const fn commitment(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.0
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryFormerLinkEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HistoricalEbpfGraphRecoveryFormerLinkEvidence(<opaque>)")
+    }
+}
+
+/// Opaque external provenance for a detached shipped-25 graph.
+///
+/// It commits to product/SDK artifact provenance in the caller's authority
+/// system. The SDK persists and compares it with the scope, host/root/leaf,
+/// sealed generation, and exact graph commitment; a lookalike graph with the
+/// same map ABI but a different provenance is refused before mutation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryArtifactProvenance {
+    artifact_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    observed_graph_commitment: HistoricalEbpfGraphRecoveryCommitment,
+}
+
+impl HistoricalEbpfGraphRecoveryArtifactProvenance {
+    /// Bind nonzero opaque artifact provenance and the exact graph commitment
+    /// observed by the external product authority. The SDK independently
+    /// recomputes the latter from the locked shipped-25 graph before any
+    /// effect; it is therefore not a caller assertion that a same-shape
+    /// lookalike is acceptable.
+    #[must_use]
+    pub(crate) const fn new(
+        artifact_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        observed_graph_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    ) -> Self {
+        Self {
+            artifact_commitment,
+            observed_graph_commitment,
+        }
+    }
+
+    #[must_use]
+    pub const fn artifact_commitment(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.artifact_commitment
+    }
+
+    /// Return the external authority's exact observed-graph commitment. This
+    /// is opaque but comparable; callers do not need raw pins or map IDs.
+    #[must_use]
+    pub const fn observed_graph_commitment(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.observed_graph_commitment
+    }
+
+    /// Bind product artifact provenance to an expected SDK inspection
+    /// challenge that an external broker retained durably. This constructor
+    /// intentionally accepts no local inspection object: recovery must
+    /// re-inspect under its effect locks and the guard must freshly prove the
+    /// broker still binds this expectation.
+    #[must_use]
+    pub const fn from_brokered_challenge(
+        artifact_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        expected: HistoricalEbpfGraphRecoveryExpectedInspectionChallenge,
+    ) -> Self {
+        Self::new(artifact_commitment, expected.exact_graph_commitment)
+    }
+}
+
+/// Serializable, redaction-safe expected result of a read-only shipped-25
+/// inspection.
+///
+/// This is not destructive authority. A product obtains it from
+/// [`HistoricalEbpfGraphRecoveryGraphInspection`], persists its exact bytes
+/// in its broker's maintenance record, then rehydrates it through
+/// [`Self::from_serialized`] for a later affine recovery attempt. The live
+/// recovery guard must prove that retained broker binding at every effect
+/// boundary. It contains no path, map ID, endpoint, key, or payload.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryExpectedInspectionChallenge {
+    exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    generation: HistoricalEbpfGraphGeneration,
+    compatibility_contract_digest: HistoricalEbpfGraphRecoveryKatContractDigest,
+}
+
+impl HistoricalEbpfGraphRecoveryExpectedInspectionChallenge {
+    fn sealed(exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment) -> Self {
+        Self {
+            exact_graph_commitment,
+            generation: HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+            compatibility_contract_digest: crate::historical_ebpf_recovery_compatibility_kat(
+                [0; 32],
+            )
+            .compatibility_contract_digest(),
+        }
+    }
+
+    /// Rehydrate only a broker-retained expected challenge. The KAT digest is
+    /// checked against this SDK build; stale/foreign generation material is
+    /// rejected before it can construct recovery authority.
+    pub fn from_serialized(
+        exact_graph_commitment: [u8; 32],
+        compatibility_contract_digest: [u8; 32],
+    ) -> Result<Self, HistoricalEbpfGraphRecoveryAuthorityError> {
+        let exact_graph_commitment =
+            HistoricalEbpfGraphRecoveryCommitment::new(exact_graph_commitment)?;
+        let expected = Self::sealed(exact_graph_commitment);
+        (expected.compatibility_contract_digest.as_bytes() == compatibility_contract_digest)
+            .then_some(expected)
+            .ok_or(HistoricalEbpfGraphRecoveryAuthorityError::CompatibilityContractMismatch)
+    }
+
+    /// Return the fixed-width opaque bytes that a broker must retain. They
+    /// bind the exact SDK-computed graph/map-ID challenge; callers must carry
+    /// the accompanying [`Self::compatibility_contract_digest`] too.
+    #[must_use]
+    pub const fn exact_graph_commitment_bytes(self) -> [u8; 32] {
+        self.exact_graph_commitment.bytes()
+    }
+
+    /// Return the sealed shipped generation. This variant is fixed rather
+    /// than caller selected, so a serialized challenge cannot be relabelled.
+    #[must_use]
+    pub const fn generation(self) -> HistoricalEbpfGraphGeneration {
+        self.generation
+    }
+
+    /// Return the sealed R5 KAT/record compatibility digest the broker must
+    /// bind with the challenge.
+    #[must_use]
+    pub const fn compatibility_contract_digest(
+        self,
+    ) -> HistoricalEbpfGraphRecoveryKatContractDigest {
+        self.compatibility_contract_digest
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryExpectedInspectionChallenge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistoricalEbpfGraphRecoveryExpectedInspectionChallenge")
+            .field("generation", &self.generation)
+            .field("exact_graph_commitment", &"<opaque>")
+            .field(
+                "compatibility_contract_digest",
+                &self.compatibility_contract_digest,
+            )
+            .finish()
+    }
+}
+
+/// Read-only, SDK-computed challenge for one exact detached shipped-25 graph.
+///
+/// A caller obtains this value before constructing
+/// [`HistoricalEbpfGraphRecoveryArtifactProvenance`].  The SDK computes it
+/// while holding the predecessor graph lock and revalidating the exact graph
+/// identity; it deliberately exposes neither paths nor map IDs.  The caller's
+/// external product/SDK attestation binds this opaque challenge, and recovery
+/// recomputes it under its effect locks before publishing any proof.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryGraphInspection {
+    generation: HistoricalEbpfGraphGeneration,
+    exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    artifact_identity: &'static str,
+    abi_identity: &'static str,
+}
+
+impl HistoricalEbpfGraphRecoveryGraphInspection {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn exact_shipped_25(
+        exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    ) -> Self {
+        Self {
+            generation: HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+            exact_graph_commitment,
+            artifact_identity: HISTORICAL_EBPF_GRAPH_SHIPPED_25_ARTIFACT_ID,
+            abi_identity: HISTORICAL_EBPF_GRAPH_SHIPPED_25_MAP_ABI_ID,
+        }
+    }
+
+    /// Return the sealed shipped generation observed by the SDK.
+    #[must_use]
+    pub const fn generation(self) -> HistoricalEbpfGraphGeneration {
+        self.generation
+    }
+
+    /// Return the redaction-safe, SDK-computed exact graph/map-ID commitment.
+    #[must_use]
+    pub const fn exact_graph_commitment(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.exact_graph_commitment
+    }
+
+    /// Project the serializable expected challenge a broker must persist
+    /// before a separate destructive recovery authority is constructed.
+    #[must_use]
+    pub fn expected_challenge(self) -> HistoricalEbpfGraphRecoveryExpectedInspectionChallenge {
+        HistoricalEbpfGraphRecoveryExpectedInspectionChallenge::sealed(self.exact_graph_commitment)
+    }
+
+    /// Return the SDK-issued detached former-link proof for this exact
+    /// inspection. This is the only present-graph former-link evidence that
+    /// may be supplied to an R5 authority.
+    #[must_use]
+    pub fn former_link_evidence(self) -> HistoricalEbpfGraphRecoveryFormerLinkEvidence {
+        HistoricalEbpfGraphRecoveryFormerLinkEvidence::from_inspection(self)
+    }
+
+    #[must_use]
+    pub const fn artifact_identity(self) -> &'static str {
+        self.artifact_identity
+    }
+
+    #[must_use]
+    pub const fn abi_identity(self) -> &'static str {
+        self.abi_identity
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryGraphInspection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistoricalEbpfGraphRecoveryGraphInspection")
+            .field("generation", &self.generation)
+            .field("exact_graph_commitment", &"<opaque>")
+            .field("artifact_identity", &self.artifact_identity)
+            .field("abi_identity", &self.abi_identity)
+            .finish()
+    }
+}
+
+/// Unforgeable SDK result for a clean, guard-backed historical inspection.
+///
+/// This token contains no path or graph identity and can only be produced by
+/// the SDK after two read-only target snapshots agree while its inspection
+/// guard is current. It is required to construct the distinct pristine
+/// authority; callers never infer pristine absence from a missing file or an
+/// I/O result.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryPristineInspection {
+    _private: (),
+}
+
+impl HistoricalEbpfGraphRecoveryPristineInspection {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn observed() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryPristineInspection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HistoricalEbpfGraphRecoveryPristineInspection(<sdk-observed>)")
+    }
+}
+
+/// Closed, read-only historical graph inspection result.
+///
+/// `ExactDetached` supplies the SDK-computed challenge required for external
+/// artifact provenance. `PristineAbsence` is the only clean-node result and
+/// is deliberately distinct from missing/partial/malformed observations,
+/// which remain errors or typed recovery refusals.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphRecoveryInspectionOutcome {
+    /// The exact shipped-25 detached graph was locked and revalidated.
+    ExactDetached(HistoricalEbpfGraphRecoveryGraphInspection),
+    /// The target graph and both target authority leaves were re-proved absent
+    /// under the inspection guard without creating any SDK state.
+    PristineAbsence(HistoricalEbpfGraphRecoveryPristineInspection),
+    /// The inspector observed a bounded, redaction-safe reason it could not
+    /// issue either a detached challenge or a pristine token.
+    Refused(HistoricalEbpfGraphRecoveryRefusal),
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryArtifactProvenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HistoricalEbpfGraphRecoveryArtifactProvenance(<opaque>)")
+    }
+}
+
+/// Opaque nonzero operation/attempt identifier bound to one recovery attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryOperationId([u8; 16]);
+
+impl HistoricalEbpfGraphRecoveryOperationId {
+    /// Construct a fixed-width, nonzero operation identifier.
+    pub fn new(value: [u8; 16]) -> Result<Self, HistoricalEbpfGraphRecoveryAuthorityError> {
+        if value == [0; 16] {
+            Err(HistoricalEbpfGraphRecoveryAuthorityError::ZeroOperationId)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    #[must_use]
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryOperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HistoricalEbpfGraphRecoveryOperationId(<opaque>)")
+    }
+}
+
+/// Opaque host/root/leaf identity commitments bound to recovery authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryHostCommitments {
+    host: HistoricalEbpfGraphRecoveryCommitment,
+    root: HistoricalEbpfGraphRecoveryCommitment,
+    leaf: HistoricalEbpfGraphRecoveryCommitment,
+}
+
+impl HistoricalEbpfGraphRecoveryHostCommitments {
+    /// Bind the authority to one committed host, authority root, and leaf.
+    #[must_use]
+    pub const fn new(
+        host: HistoricalEbpfGraphRecoveryCommitment,
+        root: HistoricalEbpfGraphRecoveryCommitment,
+        leaf: HistoricalEbpfGraphRecoveryCommitment,
+    ) -> Self {
+        Self { host, root, leaf }
+    }
+
+    #[must_use]
+    pub const fn host(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.host
+    }
+
+    #[must_use]
+    pub const fn root(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.root
+    }
+
+    #[must_use]
+    pub const fn leaf(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.leaf
+    }
+}
+
+/// Bounded construction failures for external historical recovery authority.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphRecoveryAuthorityError {
+    /// A fixed-width commitment was all zeroes.
+    ZeroCommitment,
+    /// The fixed-width operation identifier was all zeroes.
+    ZeroOperationId,
+    /// A broker-supplied inspection challenge did not bind this SDK's sealed
+    /// shipped-25 generation and compatibility KAT contract.
+    CompatibilityContractMismatch,
+}
+
+impl fmt::Display for HistoricalEbpfGraphRecoveryAuthorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroCommitment => f.write_str("historical recovery commitment is invalid"),
+            Self::ZeroOperationId => f.write_str("historical recovery operation is invalid"),
+            Self::CompatibilityContractMismatch => {
+                f.write_str("historical recovery compatibility contract is invalid")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HistoricalEbpfGraphRecoveryAuthorityError {}
+
+/// Stable result of one mandatory live currentness check.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphRecoveryAuthorityCurrentness {
+    /// The external authority is no longer held by this recovery attempt.
+    Changed,
+    /// The external authority resolved to a different scope, predecessor
+    /// basis, host/root/leaf, epoch, or operation than the bound request.
+    Mismatch,
+    /// The authority source could not establish currentness.
+    Unavailable,
+}
+
+/// Affine external authority guard for historical graph recovery.
+///
+/// The SDK calls this method after taking authority locks, immediately before
+/// and after every irreversible recovery effect, and before it returns a
+/// successful receipt. A successful check must additionally mean that the
+/// caller holds a host-global, target-scoped maintenance exclusion covering
+/// every SDK creator of the target graph and both target authority leaves for
+/// the full lifetime of this authority. Implementations must consult that live
+/// source on every call; returning success at construction time, cached
+/// currentness, or a lock that does not exclude a concurrent creator is not a
+/// substitute for currentness at an effect boundary. Detached graph proof is
+/// intentionally different: the external authority service binds the
+/// SDK-issued inspection challenge into the authority, while the SDK alone
+/// rechecks exact map-ID program references and hook absence under its locks.
+/// A Lease-only guard cannot manufacture or replace that provenance. No
+/// implementation may replace these target-scoped facts with a host-global
+/// program scan.
+pub trait HistoricalEbpfGraphRecoveryCurrentnessGuard: Send + Sync {
+    /// Prove that this exact authority remains current at this instant.
+    fn verify_current(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), HistoricalEbpfGraphRecoveryAuthorityCurrentness>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    /// Prove that the live broker authority still binds this exact SDK-issued
+    /// detached-graph challenge. The value must have been persisted by the
+    /// broker between read-only inspection and destructive recovery; a local
+    /// KAT result or a freshly fabricated expected challenge is not enough.
+    ///
+    /// The SDK invokes this with every recovery currentness check, including
+    /// all effect-adjacent checks. Inspection-only authorities never invoke
+    /// this method because they cannot mutate a graph.
+    fn verify_brokered_challenge(
+        &self,
+        expected: HistoricalEbpfGraphRecoveryExpectedInspectionChallenge,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), HistoricalEbpfGraphRecoveryAuthorityCurrentness>>
+                + Send
+                + 'static,
+        >,
+    >;
+}
+
+/// Copyable public binding projected from an affine recovery authority.
+///
+/// It is safe to retain in a receipt, but cannot be used to authorize an
+/// effect: the live guard remains private and non-cloneable in
+/// [`HistoricalEbpfGraphRecoveryAuthority`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryAuthorityBinding {
+    contract_version: u16,
+    scope_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    predecessor_basis_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    former_link_evidence: HistoricalEbpfGraphRecoveryFormerLinkEvidence,
+    artifact_provenance: HistoricalEbpfGraphRecoveryArtifactProvenance,
+    fence_epoch: NonZeroU64,
+    operation_id: HistoricalEbpfGraphRecoveryOperationId,
+    host_commitments: HistoricalEbpfGraphRecoveryHostCommitments,
+}
+
+/// Redaction-safe provenance for a terminal R5 authority transfer.
+///
+/// It is populated only when a fully terminal, exact SDK-authored R5 handoff
+/// was rebound under a newly live authority for the same committed
+/// host/root/leaf. The new receipt's [`HistoricalEbpfGraphRecoveryReceipt::authority`]
+/// remains the authority that performed the transfer; this value records only
+/// the immediately preceding scope and predecessor-basis commitments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryTerminalAdoption {
+    prior_scope_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    prior_predecessor_basis_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    prior_authority: Option<HistoricalEbpfGraphRecoveryAuthorityBinding>,
+}
+
+impl HistoricalEbpfGraphRecoveryTerminalAdoption {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn with_full_prior_authority(
+        prior_authority: HistoricalEbpfGraphRecoveryAuthorityBinding,
+    ) -> Self {
+        Self {
+            prior_scope_commitment: prior_authority.scope_commitment,
+            prior_predecessor_basis_commitment: prior_authority.predecessor_basis_commitment,
+            prior_authority: Some(prior_authority),
+        }
+    }
+
+    /// Return the scope commitment from the immediately preceding terminal
+    /// authority. This is opaque and contains no namespace or tenant text.
+    #[must_use]
+    pub const fn prior_scope_commitment(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.prior_scope_commitment
+    }
+
+    /// Return the predecessor-basis commitment from the immediately preceding
+    /// terminal authority.
+    #[must_use]
+    pub const fn prior_predecessor_basis_commitment(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.prior_predecessor_basis_commitment
+    }
+
+    /// Return the complete immediate prior binding preserved by the R5
+    /// terminal transfer record.
+    #[must_use]
+    pub const fn prior_authority(self) -> Option<HistoricalEbpfGraphRecoveryAuthorityBinding> {
+        self.prior_authority
+    }
+}
+
+impl HistoricalEbpfGraphRecoveryAuthorityBinding {
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn from_parts(
+        scope_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        predecessor_basis_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        former_link_evidence: HistoricalEbpfGraphRecoveryFormerLinkEvidence,
+        artifact_provenance: HistoricalEbpfGraphRecoveryArtifactProvenance,
+        fence_epoch: NonZeroU64,
+        operation_id: HistoricalEbpfGraphRecoveryOperationId,
+        host_commitments: HistoricalEbpfGraphRecoveryHostCommitments,
+    ) -> Self {
+        Self {
+            contract_version: HISTORICAL_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION,
+            scope_commitment,
+            predecessor_basis_commitment,
+            former_link_evidence,
+            artifact_provenance,
+            fence_epoch,
+            operation_id,
+            host_commitments,
+        }
+    }
+
+    #[must_use]
+    pub const fn contract_version(self) -> u16 {
+        self.contract_version
+    }
+
+    #[must_use]
+    pub const fn scope_commitment(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.scope_commitment
+    }
+
+    #[must_use]
+    pub const fn predecessor_basis_commitment(self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.predecessor_basis_commitment
+    }
+
+    /// Return the opaque former-link/never-created evidence commitment.
+    #[must_use]
+    pub const fn former_link_evidence(self) -> HistoricalEbpfGraphRecoveryFormerLinkEvidence {
+        self.former_link_evidence
+    }
+
+    /// Return the opaque detached-artifact provenance commitment.
+    #[must_use]
+    pub const fn artifact_provenance(self) -> HistoricalEbpfGraphRecoveryArtifactProvenance {
+        self.artifact_provenance
+    }
+
+    #[must_use]
+    pub const fn fence_epoch(self) -> NonZeroU64 {
+        self.fence_epoch
+    }
+
+    #[must_use]
+    pub const fn operation_id(self) -> HistoricalEbpfGraphRecoveryOperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn host_commitments(self) -> HistoricalEbpfGraphRecoveryHostCommitments {
+        self.host_commitments
+    }
+}
+
+/// Typed external authority for one historical recovery attempt.
+///
+/// This value is intentionally not `Clone`: the guard is affine and is
+/// consumed with the request so a retry must obtain a newly live guard.
+pub struct HistoricalEbpfGraphRecoveryAuthority {
+    binding: HistoricalEbpfGraphRecoveryAuthorityBinding,
+    expected_challenge: Option<HistoricalEbpfGraphRecoveryExpectedInspectionChallenge>,
+    guard: Box<dyn HistoricalEbpfGraphRecoveryCurrentnessGuard>,
+}
+
+/// Private discriminator for the mutually exclusive authority sources.
+///
+/// A graph-bound authority may resume its exact retained R5 transaction, but
+/// it can never authorize the graph-free pristine terminal.  Only the opaque
+/// SDK-issued pristine inspection token can select that read-only path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoricalEbpfGraphRecoveryAuthorityKind {
+    ExactDetached,
+    PristineAbsence,
+}
+
+impl HistoricalEbpfGraphRecoveryAuthority {
+    /// Construct one R5 authority for an exact SDK-inspected detached graph.
+    ///
+    /// `expected_challenge` must be the broker-retained serialization of a
+    /// prior read-only `ExactDetached` result. It is deliberately not a local
+    /// inspection object: the live guard must prove this exact challenge is
+    /// still bound by the broker on every currentness check. Recovery then
+    /// recomputes it while its effect locks are held before any mutation.
+    // Each argument is one independently typed dimension of the affine
+    // authority tuple; collapsing them into positional primitives would
+    // weaken the public construction boundary.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        scope_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        predecessor_basis_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        artifact_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        expected_challenge: HistoricalEbpfGraphRecoveryExpectedInspectionChallenge,
+        fence_epoch: NonZeroU64,
+        operation_id: HistoricalEbpfGraphRecoveryOperationId,
+        host_commitments: HistoricalEbpfGraphRecoveryHostCommitments,
+        guard: Box<dyn HistoricalEbpfGraphRecoveryCurrentnessGuard>,
+    ) -> Self {
+        let former_link_evidence = HistoricalEbpfGraphRecoveryFormerLinkEvidence::for_exact_graph(
+            expected_challenge.exact_graph_commitment,
+        );
+        let artifact_provenance =
+            HistoricalEbpfGraphRecoveryArtifactProvenance::from_brokered_challenge(
+                artifact_commitment,
+                expected_challenge,
+            );
+        Self {
+            binding: HistoricalEbpfGraphRecoveryAuthorityBinding {
+                contract_version: HISTORICAL_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION,
+                scope_commitment,
+                predecessor_basis_commitment,
+                former_link_evidence,
+                artifact_provenance,
+                fence_epoch,
+                operation_id,
+                host_commitments,
+            },
+            expected_challenge: Some(expected_challenge),
+            guard,
+        }
+    }
+
+    /// Return the immutable binding retained in a receipt or R5 record.
+    #[must_use]
+    pub const fn binding(&self) -> HistoricalEbpfGraphRecoveryAuthorityBinding {
+        self.binding
+    }
+
+    pub(crate) const fn kind(&self) -> HistoricalEbpfGraphRecoveryAuthorityKind {
+        if self.expected_challenge.is_some() {
+            HistoricalEbpfGraphRecoveryAuthorityKind::ExactDetached
+        } else {
+            HistoricalEbpfGraphRecoveryAuthorityKind::PristineAbsence
+        }
+    }
+
+    pub(crate) fn verify_current(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), HistoricalEbpfGraphRecoveryAuthorityCurrentness>>
+                + Send
+                + 'static,
+        >,
+    > {
+        let current = self.guard.verify_current();
+        match self.expected_challenge {
+            Some(expected_challenge) => {
+                let brokered = self.guard.verify_brokered_challenge(expected_challenge);
+                Box::pin(async move {
+                    current.await?;
+                    brokered.await
+                })
+            }
+            None => current,
+        }
+    }
+
+    /// Construct authority for the only non-persistent clean-node terminal:
+    /// a caller must present the SDK-issued pristine inspection token and a
+    /// newly live guard. No synthetic graph provenance is created or stored.
+    #[must_use]
+    pub fn new_pristine_absence(
+        scope_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        predecessor_basis_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        _inspection: HistoricalEbpfGraphRecoveryPristineInspection,
+        fence_epoch: NonZeroU64,
+        operation_id: HistoricalEbpfGraphRecoveryOperationId,
+        host_commitments: HistoricalEbpfGraphRecoveryHostCommitments,
+        guard: Box<dyn HistoricalEbpfGraphRecoveryCurrentnessGuard>,
+    ) -> Self {
+        // This private nonzero placeholder is never persisted: pristine
+        // recovery returns a read-only receipt with no graph commitment and
+        // does not create an R5 record. It prevents a caller from having to
+        // invent an observed map-ID commitment for a graph that never existed.
+        let pristine = HistoricalEbpfGraphRecoveryCommitment::from_fixed_digest([0xa5; 32]);
+        Self {
+            binding: HistoricalEbpfGraphRecoveryAuthorityBinding {
+                contract_version: HISTORICAL_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION,
+                scope_commitment,
+                predecessor_basis_commitment,
+                // This is a private never-created placeholder. Pristine
+                // recovery is read-only and never persists it; an external
+                // caller cannot provide arbitrary former-link evidence.
+                former_link_evidence:
+                    HistoricalEbpfGraphRecoveryFormerLinkEvidence::for_exact_graph(pristine),
+                artifact_provenance: HistoricalEbpfGraphRecoveryArtifactProvenance::new(
+                    pristine, pristine,
+                ),
+                fence_epoch,
+                operation_id,
+                host_commitments,
+            },
+            // Pristine absence is a read-only observation of a target for
+            // which no graph challenge exists. Requiring the destructive
+            // broker-challenge callback here would force a conforming guard
+            // either to fabricate `ExactDetached` provenance or to reject
+            // every genuine fresh target. The SDK still performs every live
+            // currentness check, but deliberately has no detached challenge
+            // to ask the broker to attest.
+            expected_challenge: None,
+            guard,
+        }
+    }
+}
+
+/// Affine live authority used only for a no-effect historical inspection.
+///
+/// It deliberately has no artifact/map provenance field: that evidence is
+/// created only after an exact SDK graph challenge is returned. Consuming this
+/// authority never permits mutation; recovery requires a newly constructed
+/// [`HistoricalEbpfGraphRecoveryAuthority`].
+pub struct HistoricalEbpfGraphRecoveryInspectionAuthority {
+    scope_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    predecessor_basis_commitment: HistoricalEbpfGraphRecoveryCommitment,
+    fence_epoch: NonZeroU64,
+    operation_id: HistoricalEbpfGraphRecoveryOperationId,
+    host_commitments: HistoricalEbpfGraphRecoveryHostCommitments,
+    guard: Box<dyn HistoricalEbpfGraphRecoveryCurrentnessGuard>,
+}
+
+impl HistoricalEbpfGraphRecoveryInspectionAuthority {
+    /// Construct one no-effect inspection authority with a live target fence.
+    #[must_use]
+    pub fn new(
+        scope_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        predecessor_basis_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        fence_epoch: NonZeroU64,
+        operation_id: HistoricalEbpfGraphRecoveryOperationId,
+        host_commitments: HistoricalEbpfGraphRecoveryHostCommitments,
+        guard: Box<dyn HistoricalEbpfGraphRecoveryCurrentnessGuard>,
+    ) -> Self {
+        Self {
+            scope_commitment,
+            predecessor_basis_commitment,
+            fence_epoch,
+            operation_id,
+            host_commitments,
+            guard,
+        }
+    }
+
+    fn into_internal(self) -> HistoricalEbpfGraphRecoveryAuthority {
+        let inspection = HistoricalEbpfGraphRecoveryCommitment::from_fixed_digest([0x5a; 32]);
+        HistoricalEbpfGraphRecoveryAuthority {
+            binding: HistoricalEbpfGraphRecoveryAuthorityBinding {
+                contract_version: HISTORICAL_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION,
+                scope_commitment: self.scope_commitment,
+                predecessor_basis_commitment: self.predecessor_basis_commitment,
+                former_link_evidence:
+                    HistoricalEbpfGraphRecoveryFormerLinkEvidence::for_exact_graph(inspection),
+                artifact_provenance: HistoricalEbpfGraphRecoveryArtifactProvenance::new(
+                    inspection, inspection,
+                ),
+                fence_epoch: self.fence_epoch,
+                operation_id: self.operation_id,
+                host_commitments: self.host_commitments,
+            },
+            expected_challenge: None,
+            guard: self.guard,
+        }
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryInspectionAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HistoricalEbpfGraphRecoveryInspectionAuthority(<affine-live-guard>)")
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistoricalEbpfGraphRecoveryAuthority")
+            .field("binding", &self.binding)
+            .field("guard", &"<affine-live-guard>")
+            .finish()
+    }
+}
+
+/// Whether a receipt contains the terminal proof that the exact historical
+/// graph and predecessor authority leaf are absent.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphTerminalAbsenceProof {
+    /// The exact graph, proof pin, and predecessor authority leaf were
+    /// authoritatively absent under the R5 receipt fence.
+    Proven,
+    /// Recovery is refused or still partial; no terminal absence is claimed.
+    NotProven,
+}
+
+/// The provenance of a terminal historical-recovery receipt.
+///
+/// This explicit discriminator prevents a consumer from inferring pristine
+/// absence from a loose combination of optional receipt fields. A pristine
+/// observation is read-only and has no durable R5 record; an authenticated
+/// historical terminal was sealed from an exact shipped graph (and may have
+/// been transferred under a new live authority).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphRecoveryTerminalKind {
+    /// No terminal absence was established by this attempt.
+    NotTerminal,
+    /// A fresh, read-only externally fenced observation found the exact target
+    /// graph and target authority leaves genuinely absent.
+    PristineAbsence,
+    /// An exact shipped historical graph was removed or an authenticated R5
+    /// terminal handoff was verified/adopted.
+    AuthenticatedHistoricalTerminal,
+}
+
+/// Typed receipt returned by every historical recovery attempt.
+///
+/// It binds the caller's authority contract and the authenticated exact-graph
+/// commitment.  It carries no path, endpoint, tenant, object identifier, or
+/// payload material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalEbpfGraphRecoveryReceipt {
+    authority: Option<HistoricalEbpfGraphRecoveryAuthorityBinding>,
+    terminal_adoption: Option<HistoricalEbpfGraphRecoveryTerminalAdoption>,
+    generation: HistoricalEbpfGraphGeneration,
+    exact_graph_commitment: Option<HistoricalEbpfGraphRecoveryCommitment>,
+    recovery_contract_id: &'static str,
+    kat_identity: &'static str,
+    control_root_identity: &'static str,
+    artifact_identity: &'static str,
+    abi_identity: &'static str,
+    codec_identity: &'static str,
+    compatibility_contract_digest: HistoricalEbpfGraphRecoveryKatContractDigest,
+    outcome: HistoricalEbpfGraphRecoveryOutcome,
+    terminal_absence_proof: HistoricalEbpfGraphTerminalAbsenceProof,
+    terminal_kind: HistoricalEbpfGraphRecoveryTerminalKind,
+}
+
+impl HistoricalEbpfGraphRecoveryReceipt {
+    pub(crate) const fn new(
+        authority: HistoricalEbpfGraphRecoveryAuthorityBinding,
+        generation: HistoricalEbpfGraphGeneration,
+        exact_graph_commitment: Option<HistoricalEbpfGraphRecoveryCommitment>,
+        outcome: HistoricalEbpfGraphRecoveryOutcome,
+        terminal_absence_proof: HistoricalEbpfGraphTerminalAbsenceProof,
+    ) -> Self {
+        Self {
+            authority: Some(authority),
+            terminal_adoption: None,
+            generation,
+            exact_graph_commitment,
+            recovery_contract_id: HISTORICAL_EBPF_GRAPH_RECOVERY_CONTRACT_ID,
+            kat_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_KAT_ID,
+            control_root_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_CONTROL_ROOT_ID,
+            artifact_identity: HISTORICAL_EBPF_GRAPH_SHIPPED_25_ARTIFACT_ID,
+            abi_identity: HISTORICAL_EBPF_GRAPH_SHIPPED_25_MAP_ABI_ID,
+            codec_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_RECORD_CODEC_ID,
+            compatibility_contract_digest:
+                HistoricalEbpfGraphRecoveryKatContractDigest::from_fixed_digest([
+                    83, 10, 239, 24, 81, 115, 132, 128, 163, 203, 234, 133, 112, 25, 252, 13, 107,
+                    220, 223, 108, 126, 28, 200, 87, 244, 102, 57, 148, 215, 208, 231, 24,
+                ]),
+            outcome,
+            terminal_absence_proof,
+            terminal_kind: match terminal_absence_proof {
+                HistoricalEbpfGraphTerminalAbsenceProof::Proven => {
+                    HistoricalEbpfGraphRecoveryTerminalKind::AuthenticatedHistoricalTerminal
+                }
+                HistoricalEbpfGraphTerminalAbsenceProof::NotProven => {
+                    HistoricalEbpfGraphRecoveryTerminalKind::NotTerminal
+                }
+            },
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) const fn with_terminal_adoption(
+        authority: HistoricalEbpfGraphRecoveryAuthorityBinding,
+        terminal_adoption: HistoricalEbpfGraphRecoveryTerminalAdoption,
+        generation: HistoricalEbpfGraphGeneration,
+        exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment,
+        outcome: HistoricalEbpfGraphRecoveryOutcome,
+    ) -> Self {
+        Self {
+            authority: Some(authority),
+            terminal_adoption: Some(terminal_adoption),
+            generation,
+            exact_graph_commitment: Some(exact_graph_commitment),
+            recovery_contract_id: HISTORICAL_EBPF_GRAPH_RECOVERY_CONTRACT_ID,
+            kat_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_KAT_ID,
+            control_root_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_CONTROL_ROOT_ID,
+            artifact_identity: HISTORICAL_EBPF_GRAPH_SHIPPED_25_ARTIFACT_ID,
+            abi_identity: HISTORICAL_EBPF_GRAPH_SHIPPED_25_MAP_ABI_ID,
+            codec_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_RECORD_CODEC_ID,
+            compatibility_contract_digest:
+                HistoricalEbpfGraphRecoveryKatContractDigest::from_fixed_digest([
+                    83, 10, 239, 24, 81, 115, 132, 128, 163, 203, 234, 133, 112, 25, 252, 13, 107,
+                    220, 223, 108, 126, 28, 200, 87, 244, 102, 57, 148, 215, 208, 231, 24,
+                ]),
+            outcome,
+            terminal_absence_proof: HistoricalEbpfGraphTerminalAbsenceProof::Proven,
+            terminal_kind: HistoricalEbpfGraphRecoveryTerminalKind::AuthenticatedHistoricalTerminal,
+        }
+    }
+
+    pub(crate) const fn authority_required(generation: HistoricalEbpfGraphGeneration) -> Self {
+        Self {
+            authority: None,
+            terminal_adoption: None,
+            generation,
+            exact_graph_commitment: None,
+            recovery_contract_id: HISTORICAL_EBPF_GRAPH_RECOVERY_CONTRACT_ID,
+            kat_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_KAT_ID,
+            control_root_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_CONTROL_ROOT_ID,
+            artifact_identity: HISTORICAL_EBPF_GRAPH_SHIPPED_25_ARTIFACT_ID,
+            abi_identity: HISTORICAL_EBPF_GRAPH_SHIPPED_25_MAP_ABI_ID,
+            codec_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_RECORD_CODEC_ID,
+            compatibility_contract_digest:
+                HistoricalEbpfGraphRecoveryKatContractDigest::from_fixed_digest([
+                    83, 10, 239, 24, 81, 115, 132, 128, 163, 203, 234, 133, 112, 25, 252, 13, 107,
+                    220, 223, 108, 126, 28, 200, 87, 244, 102, 57, 148, 215, 208, 231, 24,
+                ]),
+            outcome: HistoricalEbpfGraphRecoveryOutcome::Refused(
+                HistoricalEbpfGraphRecoveryRefusal::AuthorityRequired,
+            ),
+            terminal_absence_proof: HistoricalEbpfGraphTerminalAbsenceProof::NotProven,
+            terminal_kind: HistoricalEbpfGraphRecoveryTerminalKind::NotTerminal,
+        }
+    }
+
+    /// Construct the only terminal receipt that deliberately carries no graph
+    /// commitment: a read-only, externally fenced observation that the exact
+    /// target graph and both authority leaves were pristine absent. It never
+    /// manufactures a durable R5 handoff or adoption provenance.
+    pub(crate) const fn pristine_absence(
+        authority: HistoricalEbpfGraphRecoveryAuthorityBinding,
+        generation: HistoricalEbpfGraphGeneration,
+    ) -> Self {
+        Self {
+            authority: Some(authority),
+            terminal_adoption: None,
+            generation,
+            exact_graph_commitment: None,
+            recovery_contract_id: HISTORICAL_EBPF_GRAPH_RECOVERY_CONTRACT_ID,
+            kat_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_KAT_ID,
+            control_root_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_CONTROL_ROOT_ID,
+            artifact_identity: HISTORICAL_EBPF_GRAPH_SHIPPED_25_ARTIFACT_ID,
+            abi_identity: HISTORICAL_EBPF_GRAPH_SHIPPED_25_MAP_ABI_ID,
+            codec_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_RECORD_CODEC_ID,
+            compatibility_contract_digest:
+                HistoricalEbpfGraphRecoveryKatContractDigest::from_fixed_digest([
+                    83, 10, 239, 24, 81, 115, 132, 128, 163, 203, 234, 133, 112, 25, 252, 13, 107,
+                    220, 223, 108, 126, 28, 200, 87, 244, 102, 57, 148, 215, 208, 231, 24,
+                ]),
+            outcome: HistoricalEbpfGraphRecoveryOutcome::AlreadyAbsent,
+            terminal_absence_proof: HistoricalEbpfGraphTerminalAbsenceProof::Proven,
+            terminal_kind: HistoricalEbpfGraphRecoveryTerminalKind::PristineAbsence,
+        }
+    }
+
+    #[must_use]
+    pub const fn authority(&self) -> Option<HistoricalEbpfGraphRecoveryAuthorityBinding> {
+        self.authority
+    }
+
+    /// Return terminal-transfer provenance when this receipt rebound an exact
+    /// terminal R5 handoff from a previous external authority.
+    #[must_use]
+    pub const fn terminal_adoption(&self) -> Option<HistoricalEbpfGraphRecoveryTerminalAdoption> {
+        self.terminal_adoption
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> HistoricalEbpfGraphGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn exact_graph_commitment(&self) -> Option<HistoricalEbpfGraphRecoveryCommitment> {
+        self.exact_graph_commitment
+    }
+
+    #[must_use]
+    pub const fn recovery_contract_id(&self) -> &'static str {
+        self.recovery_contract_id
+    }
+
+    #[must_use]
+    pub const fn kat_identity(&self) -> &'static str {
+        self.kat_identity
+    }
+
+    /// Return the fixed historical control-root layout identity bound by this
+    /// compatibility receipt.
+    #[must_use]
+    pub const fn control_root_identity(&self) -> &'static str {
+        self.control_root_identity
+    }
+
+    #[must_use]
+    pub const fn artifact_identity(&self) -> &'static str {
+        self.artifact_identity
+    }
+
+    #[must_use]
+    pub const fn abi_identity(&self) -> &'static str {
+        self.abi_identity
+    }
+
+    #[must_use]
+    pub const fn codec_identity(&self) -> &'static str {
+        self.codec_identity
+    }
+
+    /// Return the KAT-bound compatibility digest that was persisted by R5
+    /// records and verified before this receipt was issued.
+    #[must_use]
+    pub const fn compatibility_contract_digest(
+        &self,
+    ) -> HistoricalEbpfGraphRecoveryKatContractDigest {
+        self.compatibility_contract_digest
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> HistoricalEbpfGraphRecoveryOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn terminal_absence_proof(&self) -> HistoricalEbpfGraphTerminalAbsenceProof {
+        self.terminal_absence_proof
+    }
+
+    /// Return the typed terminal provenance, if this attempt reached a
+    /// terminal result. Consumers must use this rather than infer pristine
+    /// absence from optional commitment or adoption fields.
+    #[must_use]
+    pub const fn terminal_kind(&self) -> HistoricalEbpfGraphRecoveryTerminalKind {
+        self.terminal_kind
+    }
+}
+
+impl PartialEq<HistoricalEbpfGraphRecoveryOutcome> for HistoricalEbpfGraphRecoveryReceipt {
+    fn eq(&self, other: &HistoricalEbpfGraphRecoveryOutcome) -> bool {
+        self.outcome == *other
+    }
+}
+
+/// One sealed program-section expectation in the unprivileged historical
+/// compatibility KAT. Program tags identify frozen artifact expectations;
+/// they are not a claim about any loaded kernel program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryKatProgramExpectation {
+    section: &'static str,
+    tag: u64,
+}
+
+/// Fixed-width, non-sensitive compatibility identity for the public shipped-25
+/// KAT contract. This is intentionally comparable and serializable by callers
+/// that need to pin exact SDK behavior across language boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HistoricalEbpfGraphRecoveryKatContractDigest([u8; 32]);
+
+impl HistoricalEbpfGraphRecoveryKatContractDigest {
+    pub(crate) const fn from_fixed_digest(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+
+    /// Return the stable SHA-256 contract digest bytes. These bytes contain no
+    /// tenant, host, path, endpoint, key, or runtime object information.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl HistoricalEbpfGraphRecoveryKatProgramExpectation {
+    pub(crate) const fn new(section: &'static str, tag: u64) -> Self {
+        Self { section, tag }
+    }
+
+    #[must_use]
+    pub const fn section(self) -> &'static str {
+        self.section
+    }
+
+    #[must_use]
+    pub const fn tag(self) -> u64 {
+        self.tag
+    }
+}
+
+/// Pure compatibility KAT receipt for the shipped 25-map historical artifact.
+///
+/// It derives only build-time artifact and contract commitments. It neither
+/// opens bpffs nor makes a statement about a running kernel, pinned object, or
+/// external authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalEbpfGraphRecoveryCompatibilityKatReceipt {
+    shipped_generation: HistoricalEbpfGraphGeneration,
+    embedded_object_sha256: HistoricalEbpfGraphRecoveryCommitment,
+    exact_map_abi_digest: HistoricalEbpfGraphRecoveryCommitment,
+    program_expectations: [HistoricalEbpfGraphRecoveryKatProgramExpectation; 2],
+    namespace_commitment_vector: [HistoricalEbpfGraphRecoveryCommitment; 25],
+    authority_contract_id: &'static str,
+    recovery_contract_id: &'static str,
+    record_codec_id: &'static str,
+    kat_identity: &'static str,
+    control_root_identity: &'static str,
+    compatibility_contract_digest: HistoricalEbpfGraphRecoveryKatContractDigest,
+    challenge_response: HistoricalEbpfGraphRecoveryCommitment,
+}
+
+impl HistoricalEbpfGraphRecoveryCompatibilityKatReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        embedded_object_sha256: HistoricalEbpfGraphRecoveryCommitment,
+        exact_map_abi_digest: HistoricalEbpfGraphRecoveryCommitment,
+        program_expectations: [HistoricalEbpfGraphRecoveryKatProgramExpectation; 2],
+        namespace_commitment_vector: [HistoricalEbpfGraphRecoveryCommitment; 25],
+        compatibility_contract_digest: HistoricalEbpfGraphRecoveryKatContractDigest,
+        challenge_response: HistoricalEbpfGraphRecoveryCommitment,
+    ) -> Self {
+        Self {
+            shipped_generation:
+                HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+            embedded_object_sha256,
+            exact_map_abi_digest,
+            program_expectations,
+            namespace_commitment_vector,
+            authority_contract_id: HISTORICAL_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID,
+            recovery_contract_id: HISTORICAL_EBPF_GRAPH_RECOVERY_CONTRACT_ID,
+            record_codec_id: HISTORICAL_EBPF_GRAPH_RECOVERY_RECORD_CODEC_ID,
+            kat_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_KAT_ID,
+            control_root_identity: HISTORICAL_EBPF_GRAPH_RECOVERY_CONTROL_ROOT_ID,
+            compatibility_contract_digest,
+            challenge_response,
+        }
+    }
+
+    #[must_use]
+    pub const fn shipped_generation(&self) -> HistoricalEbpfGraphGeneration {
+        self.shipped_generation
+    }
+
+    #[must_use]
+    pub const fn embedded_object_sha256(&self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.embedded_object_sha256
+    }
+
+    #[must_use]
+    pub const fn exact_map_abi_digest(&self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.exact_map_abi_digest
+    }
+
+    #[must_use]
+    pub const fn program_expectations(
+        &self,
+    ) -> [HistoricalEbpfGraphRecoveryKatProgramExpectation; 2] {
+        self.program_expectations
+    }
+
+    #[must_use]
+    pub const fn namespace_commitment_vector(&self) -> [HistoricalEbpfGraphRecoveryCommitment; 25] {
+        self.namespace_commitment_vector
+    }
+
+    #[must_use]
+    pub const fn authority_contract_id(&self) -> &'static str {
+        self.authority_contract_id
+    }
+
+    #[must_use]
+    pub const fn recovery_contract_id(&self) -> &'static str {
+        self.recovery_contract_id
+    }
+
+    #[must_use]
+    pub const fn record_codec_id(&self) -> &'static str {
+        self.record_codec_id
+    }
+
+    #[must_use]
+    pub const fn kat_identity(&self) -> &'static str {
+        self.kat_identity
+    }
+
+    /// Return the fixed historical control-root layout identity bound by this
+    /// compatibility receipt.
+    #[must_use]
+    pub const fn control_root_identity(&self) -> &'static str {
+        self.control_root_identity
+    }
+
+    /// Return the stable cross-language compatibility contract digest.
+    #[must_use]
+    pub const fn compatibility_contract_digest(
+        &self,
+    ) -> HistoricalEbpfGraphRecoveryKatContractDigest {
+        self.compatibility_contract_digest
+    }
+
+    #[must_use]
+    pub const fn challenge_response(&self) -> HistoricalEbpfGraphRecoveryCommitment {
+        self.challenge_response
+    }
+
+    /// Verify the domain-separated response for a caller-provided challenge.
+    /// This verifies only sealed SDK compatibility material; it makes no
+    /// statement about live kernel state or external recovery authority.
+    #[must_use]
+    pub fn verify_challenge_response(&self, challenge: [u8; 32]) -> bool {
+        self.challenge_response
+            == Self::challenge_response_for(self.compatibility_contract_digest, challenge)
+    }
+
+    pub(crate) fn contract_digest_for(
+        embedded_object_sha256: HistoricalEbpfGraphRecoveryCommitment,
+        exact_map_abi_digest: HistoricalEbpfGraphRecoveryCommitment,
+        program_expectations: [HistoricalEbpfGraphRecoveryKatProgramExpectation; 2],
+        namespace_commitment_vector: [HistoricalEbpfGraphRecoveryCommitment; 25],
+    ) -> HistoricalEbpfGraphRecoveryKatContractDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"opc.gtpu.historical-ebpf-recovery-kat\0compatibility-contract\0r5");
+        hasher.update(HISTORICAL_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_ID.as_bytes());
+        hasher.update([0]);
+        hasher.update(HISTORICAL_EBPF_GRAPH_RECOVERY_CONTRACT_ID.as_bytes());
+        hasher.update([0]);
+        hasher.update(HISTORICAL_EBPF_GRAPH_RECOVERY_RECORD_CODEC_ID.as_bytes());
+        hasher.update([0]);
+        hasher.update(HISTORICAL_EBPF_GRAPH_RECOVERY_KAT_ID.as_bytes());
+        hasher.update([0]);
+        hasher.update(HISTORICAL_EBPF_GRAPH_RECOVERY_CONTROL_ROOT_ID.as_bytes());
+        hasher.update([0]);
+        hasher.update(HISTORICAL_EBPF_GRAPH_RECOVERY_FORMER_LINK_EVIDENCE_ID.as_bytes());
+        hasher.update([0]);
+        hasher.update(HISTORICAL_EBPF_GRAPH_RECOVERY_ARTIFACT_PROVENANCE_ID.as_bytes());
+        hasher.update([0]);
+        hasher.update([5]);
+        hasher.update(embedded_object_sha256.bytes());
+        hasher.update(exact_map_abi_digest.bytes());
+        for expectation in program_expectations {
+            hasher.update(expectation.section.as_bytes());
+            hasher.update([0]);
+            hasher.update(expectation.tag.to_be_bytes());
+        }
+        for namespace in namespace_commitment_vector {
+            hasher.update(namespace.bytes());
+        }
+        HistoricalEbpfGraphRecoveryKatContractDigest(hasher.finalize().into())
+    }
+
+    pub(crate) fn challenge_response_for(
+        contract_digest: HistoricalEbpfGraphRecoveryKatContractDigest,
+        challenge: [u8; 32],
+    ) -> HistoricalEbpfGraphRecoveryCommitment {
+        let mut hasher = Sha256::new();
+        hasher.update(b"opc.gtpu.historical-ebpf-recovery-kat\0challenge-response\0r5");
+        hasher.update(contract_digest.0);
+        hasher.update(challenge);
+        HistoricalEbpfGraphRecoveryCommitment::from_fixed_digest(hasher.finalize().into())
+    }
+}
+
+impl HistoricalEbpfGraphDrainProof {
+    /// Attest that every historical session and its traffic have been drained.
+    #[must_use]
+    pub const fn sessions_and_traffic_drained() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Cloneable, non-authorizing description of one historical graph recovery.
+///
+/// Retry loops retain this intent and obtain a new
+/// [`HistoricalEbpfGraphRecoveryAuthority`] for each attempt with
+/// [`Self::into_request_with_authority`].  The intent has no guard and cannot
+/// itself authorize a kernel or bpffs effect.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HistoricalEbpfGraphRecoveryIntent {
+    generation: HistoricalEbpfGraphGeneration,
+    pin_namespace: String,
+    replacement_device: Option<GtpDevice>,
+    writer_proof: Option<HistoricalEbpfGraphWriterProof>,
+    drain_proof: Option<HistoricalEbpfGraphDrainProof>,
+}
+
+impl HistoricalEbpfGraphRecoveryIntent {
+    /// Build an unprivileged, reusable recovery intent.
+    #[must_use]
+    pub fn new(
+        generation: HistoricalEbpfGraphGeneration,
+        pin_namespace: impl Into<String>,
+    ) -> Self {
+        Self {
+            generation,
+            pin_namespace: pin_namespace.into(),
+            replacement_device: None,
+            writer_proof: None,
+            drain_proof: None,
+        }
+    }
+
+    /// Attach the stopped-writer attestation to this reusable intent.
+    #[must_use]
+    pub const fn with_writer_proof(mut self, writer_proof: HistoricalEbpfGraphWriterProof) -> Self {
+        self.writer_proof = Some(writer_proof);
+        self
+    }
+
+    /// Bind this intent to one exact replacement name and ifindex.
+    #[must_use]
+    pub fn with_replacement_device(mut self, replacement_device: GtpDevice) -> Self {
+        self.replacement_device = Some(replacement_device);
+        self
+    }
+
+    /// Attach the drained-session/traffic attestation to this reusable intent.
+    #[must_use]
+    pub const fn with_drain_proof(mut self, drain_proof: HistoricalEbpfGraphDrainProof) -> Self {
+        self.drain_proof = Some(drain_proof);
+        self
+    }
+
+    /// Return the exact frozen generation the inspection/recovery targets.
+    #[must_use]
+    pub const fn generation(&self) -> HistoricalEbpfGraphGeneration {
+        self.generation
+    }
+
+    /// Return the redacted stable pin namespace selected by this intent.
+    #[must_use]
+    pub fn pin_namespace(&self) -> &str {
+        &self.pin_namespace
+    }
+
+    /// Return the exact replacement identity used for detached observation.
+    #[must_use]
+    pub const fn replacement_device(&self) -> Option<&GtpDevice> {
+        self.replacement_device.as_ref()
+    }
+
+    /// Consume this intent into one affine request with a newly live guard.
+    #[must_use]
+    pub fn into_request_with_authority(
+        self,
+        authority: HistoricalEbpfGraphRecoveryAuthority,
+    ) -> HistoricalEbpfGraphRecoveryRequest {
+        HistoricalEbpfGraphRecoveryRequest {
+            generation: self.generation,
+            pin_namespace: self.pin_namespace,
+            replacement_device: self.replacement_device,
+            writer_proof: self.writer_proof,
+            drain_proof: self.drain_proof,
+            authority: Some(authority),
+        }
+    }
+
+    /// Consume this intent into a no-effect, affine graph-inspection request.
+    /// The inspection authority supplies the live target exclusion needed to
+    /// distinguish a stable pristine observation from absence observed during
+    /// a concurrent creator race. It cannot authorize removal.
+    #[must_use]
+    pub fn into_inspection_request(
+        self,
+        authority: HistoricalEbpfGraphRecoveryInspectionAuthority,
+    ) -> HistoricalEbpfGraphRecoveryInspectionRequest {
+        HistoricalEbpfGraphRecoveryInspectionRequest {
+            intent: self,
+            authority,
+        }
+    }
+
+    fn into_unbound_request(self) -> HistoricalEbpfGraphRecoveryRequest {
+        HistoricalEbpfGraphRecoveryRequest {
+            generation: self.generation,
+            pin_namespace: self.pin_namespace,
+            replacement_device: self.replacement_device,
+            writer_proof: self.writer_proof,
+            drain_proof: self.drain_proof,
+            authority: None,
+        }
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistoricalEbpfGraphRecoveryIntent")
+            .field("generation", &self.generation)
+            .field("pin_namespace", &"<redacted-pin-namespace>")
+            .field(
+                "replacement_device",
+                &self
+                    .replacement_device
+                    .as_ref()
+                    .map(|_| "<redacted-interface-identity>"),
+            )
+            .field("writer_proof", &self.writer_proof)
+            .field("drain_proof", &self.drain_proof)
+            .finish()
+    }
+}
+
+/// Affine no-effect request for the SDK graph/provenance inspection step.
+pub struct HistoricalEbpfGraphRecoveryInspectionRequest {
+    intent: HistoricalEbpfGraphRecoveryIntent,
+    authority: HistoricalEbpfGraphRecoveryInspectionAuthority,
+}
+
+impl HistoricalEbpfGraphRecoveryInspectionRequest {
+    /// Return the non-authorizing intent retained by this inspection request.
+    #[must_use]
+    pub const fn intent(&self) -> &HistoricalEbpfGraphRecoveryIntent {
+        &self.intent
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        HistoricalEbpfGraphRecoveryIntent,
+        HistoricalEbpfGraphRecoveryAuthority,
+    ) {
+        (self.intent, self.authority.into_internal())
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryInspectionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistoricalEbpfGraphRecoveryInspectionRequest")
+            .field("intent", &self.intent)
+            .field("authority", &"<affine-live-inspection-authority>")
+            .finish()
+    }
+}
+
+/// Request to recover one exact historical eBPF graph.
+///
+/// This is maintenance-only. It is intentionally distinct from
+/// [`CurrentEbpfGraphRecoveryRequest`] so a normal restart cannot turn an
+/// authenticated old graph into an automatic deletion request.
+pub struct HistoricalEbpfGraphRecoveryRequest {
+    generation: HistoricalEbpfGraphGeneration,
+    pin_namespace: String,
+    replacement_device: Option<GtpDevice>,
+    writer_proof: Option<HistoricalEbpfGraphWriterProof>,
+    drain_proof: Option<HistoricalEbpfGraphDrainProof>,
+    authority: Option<HistoricalEbpfGraphRecoveryAuthority>,
+}
+
+impl HistoricalEbpfGraphRecoveryRequest {
+    /// Build an unprivileged maintenance request.
+    ///
+    /// Callers must add both independent quiescence attestations before the
+    /// backend can remove anything. Keeping incomplete requests representable
+    /// lets policy code prepare a request before its drain controller has
+    /// completed; it does not make a missing proof an implicit assertion.
+    #[must_use]
+    pub fn new(
+        generation: HistoricalEbpfGraphGeneration,
+        pin_namespace: impl Into<String>,
+    ) -> Self {
+        HistoricalEbpfGraphRecoveryIntent::new(generation, pin_namespace).into_unbound_request()
+    }
+
+    /// Attach the explicit stopped-writer attestation required for removal.
+    #[must_use]
+    pub const fn with_writer_proof(mut self, writer_proof: HistoricalEbpfGraphWriterProof) -> Self {
+        self.writer_proof = Some(writer_proof);
+        self
+    }
+
+    /// Bind recovery to this exact replacement name and ifindex.
+    ///
+    /// Recovery independently proves that the replacement retains this
+    /// identity and that the historical hook state is conclusively detached.
+    /// An attached or ambiguous occupant is never maintenance authority.
+    #[must_use]
+    pub fn with_replacement_device(mut self, replacement_device: GtpDevice) -> Self {
+        self.replacement_device = Some(replacement_device);
+        self
+    }
+
+    /// Authorize removal after all represented traffic and sessions have been
+    /// drained by the caller.
+    #[must_use]
+    pub const fn with_drain_proof(mut self, drain_proof: HistoricalEbpfGraphDrainProof) -> Self {
+        self.drain_proof = Some(drain_proof);
+        self
+    }
+
+    /// Attach the mandatory live external authority for this recovery
+    /// attempt.  The authority is affine; an incomplete or retried request
+    /// must receive a newly live guard.
+    #[must_use]
+    pub fn with_authority(mut self, authority: HistoricalEbpfGraphRecoveryAuthority) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    /// Return the requested historical generation.
+    #[must_use]
+    pub const fn generation(&self) -> HistoricalEbpfGraphGeneration {
+        self.generation
+    }
+
+    /// Return the stable pin namespace below the backend's configured root.
+    #[must_use]
+    pub fn pin_namespace(&self) -> &str {
+        &self.pin_namespace
+    }
+
+    /// Return the independently validated replacement interface identity.
+    #[must_use]
+    pub const fn replacement_device(&self) -> Option<&GtpDevice> {
+        self.replacement_device.as_ref()
+    }
+
+    /// Return the optional prior-writer stop attestation.
+    #[must_use]
+    pub const fn writer_proof(&self) -> Option<HistoricalEbpfGraphWriterProof> {
+        self.writer_proof
+    }
+
+    /// Return the optional populated-graph drain attestation.
+    #[must_use]
+    pub const fn drain_proof(&self) -> Option<HistoricalEbpfGraphDrainProof> {
+        self.drain_proof
+    }
+
+    /// Return the non-authorizing binding, if a live authority was supplied.
+    #[must_use]
+    pub fn authority_binding(&self) -> Option<HistoricalEbpfGraphRecoveryAuthorityBinding> {
+        self.authority
+            .as_ref()
+            .map(HistoricalEbpfGraphRecoveryAuthority::binding)
+    }
+
+    /// Project a cloneable non-authorizing intent for a future retry.  A
+    /// caller must bind that intent to a new authority guard; this method
+    /// never duplicates the current guard.
+    #[must_use]
+    pub fn retry_intent(&self) -> HistoricalEbpfGraphRecoveryIntent {
+        HistoricalEbpfGraphRecoveryIntent {
+            generation: self.generation,
+            pin_namespace: self.pin_namespace.clone(),
+            replacement_device: self.replacement_device.clone(),
+            writer_proof: self.writer_proof,
+            drain_proof: self.drain_proof,
+        }
+    }
+
+    pub(crate) fn take_authority(&mut self) -> Option<HistoricalEbpfGraphRecoveryAuthority> {
+        self.authority.take()
+    }
+}
+
+impl fmt::Debug for HistoricalEbpfGraphRecoveryRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistoricalEbpfGraphRecoveryRequest")
+            .field("generation", &self.generation)
+            .field("pin_namespace", &"<redacted-pin-namespace>")
+            .field(
+                "replacement_device",
+                &self
+                    .replacement_device
+                    .as_ref()
+                    .map(|_| "<redacted-interface-identity>"),
+            )
+            .field("writer_proof", &self.writer_proof)
+            .field("drain_proof", &self.drain_proof)
+            .field(
+                "authority",
+                &self.authority.as_ref().map(|_| "<affine-live-authority>"),
+            )
+            .finish()
+    }
+}
+
+/// Stable reason historical eBPF graph recovery was refused.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphRecoveryRefusal {
+    /// No live external R5 authority accompanied the request.
+    AuthorityRequired,
+    /// The current request does not exactly match the authority commitment
+    /// persisted by an in-progress R5 recovery.
+    AuthorityMismatch,
+    /// The mandatory external authority guard changed, mismatched, or became
+    /// unavailable at an effect boundary.
+    AuthorityChanged,
+    /// The caller did not attest that the historical writer is stopped.
+    WriterProofRequired,
+    /// The caller did not attest that all historical sessions and traffic are
+    /// drained.
+    DrainProofRequired,
+    /// The replacement interface name no longer resolves to the requested
+    /// ifindex.
+    ReplacementInterfaceIdentityChanged,
+    /// This backend instance already manages the requested replacement or pin
+    /// namespace.
+    ManagedAttachment,
+    /// A legacy leaf-hash authority holder remains live.
+    ActiveLegacyOwner,
+    /// A current root-bound authority holder remains live.
+    ActiveCurrentOwner,
+    /// One or both historical tc hooks remain attached, so maintenance lacks
+    /// conclusive detached-hook authority.
+    ActiveHistoricalAttachment,
+    /// The graph does not match the named frozen historical generation.
+    HistoricalGenerationMismatch,
+    /// The independently recomputed locked graph commitment differs from the
+    /// typed external shipped-artifact provenance. Exact map shape alone is
+    /// never accepted as product provenance.
+    ArtifactProvenanceMismatch,
+    /// Retained forwarding/session state is populated or cannot be proven
+    /// drained.
+    PopulatedState,
+    /// A pin, program, hook, control directory, or replacement identity is
+    /// foreign, replaced, malformed, or ambiguous.
+    IdentityMismatch,
+    /// Complete stable kernel state, durable proof state, or authority
+    /// migration could not be established.
+    IndeterminateState,
+}
+
+/// Stable progress classification for committed historical graph recovery.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphRecoveryProgress {
+    /// A proof bound to the exact historical graph and authority identities
+    /// was committed before map-pin removal.
+    ProofCommitted,
+    /// At least one recorded historical map pin was removed; retry the exact
+    /// request to continue the durable cleanup.
+    PinCleanupStarted,
+    /// Durable recovery state may have committed before the live external
+    /// authority reported that it no longer matched this exact operation.
+    /// Only a retry carrying the matching durable authority may resume it.
+    AuthorityMismatch,
+    /// Durable recovery state may have committed before the live external
+    /// authority changed or became unavailable. The retained proof remains
+    /// the mandatory fence for an exact authorized retry.
+    AuthorityChanged,
+    /// A committed cleanup could not establish its exact final state.
+    Indeterminate,
+}
+
+/// Classified result of maintenance-only historical eBPF graph recovery.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoricalEbpfGraphRecoveryOutcome {
+    /// The exact historical graph and legacy authority child were retired;
+    /// an exact current-compatible terminal receipt remains as durable
+    /// authority for retries and ordinary startup.
+    Removed,
+    /// The exact retained terminal receipt proves that the historical graph
+    /// and legacy authority are already absent.
+    AlreadyAbsent,
+    /// Recovery was refused before deletion was committed.
+    Refused(HistoricalEbpfGraphRecoveryRefusal),
+    /// Cleanup was committed but incomplete; retry the exact request.
+    Partial(HistoricalEbpfGraphRecoveryProgress),
 }
 
 /// Request to acquire cleanup-only recovery authority over a retained
@@ -488,6 +4060,14 @@ pub enum RetainedGraphCleanupRefusal {
     /// required. Malformed PDP state can be diagnosed after safety fencing or
     /// exact interrupted-commit reduction.
     NotCurrentSchema,
+    /// Read-only qualification proved the exact frozen historical graph
+    /// generation. Ordinary cleanup-only acquisition never adopts or removes
+    /// that generation; a dedicated maintenance recovery request is required.
+    HistoricalGeneration,
+    /// Read-only qualification proved a legacy leaf-hash authority layout.
+    /// Ordinary cleanup-only acquisition never migrates or retires that
+    /// authority; a dedicated maintenance recovery request is required.
+    LegacyAuthorityLayout,
     /// A pin, loaded program, or tc hook is foreign, replaced, or no longer
     /// has the exact SDK-owned identity. Structural repair is required.
     IdentityMismatch,
@@ -3541,6 +7121,311 @@ mod tests {
         assert!(!debug.contains("tenant-sensitive-pin"));
         assert!(!debug.contains("tenant-sensitive-interface"));
         assert!(!debug.contains("41"));
+    }
+
+    #[test]
+    fn current_terminal_transfer_requires_an_authenticated_wal_receipt() {
+        use std::num::NonZeroU64;
+
+        let commitment = |byte| CurrentEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
+        let binding = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+            commitment(0x51),
+            commitment(0x52),
+            NonZeroU64::new(7).unwrap(),
+            CurrentEbpfGraphRecoveryOperationId::new([0x53; 16]).unwrap(),
+            CurrentEbpfGraphRecoveryHostCommitments::new(
+                commitment(0x54),
+                commitment(0x55),
+                commitment(0x56),
+            ),
+        );
+        let pristine = CurrentEbpfGraphRecoveryReceipt::pristine_absence(binding);
+        assert_eq!(
+            CurrentEbpfGraphRecoveryTerminalTransfer::from_authenticated_receipt(pristine),
+            None,
+            "read-only pristine absence has no durable WAL to transfer"
+        );
+        let partial = CurrentEbpfGraphRecoveryReceipt::nonterminal(
+            binding,
+            CurrentEbpfGraphRecoveryOutcome::Partial(
+                CurrentEbpfGraphRecoveryProgress::Indeterminate,
+            ),
+        );
+        assert_eq!(
+            CurrentEbpfGraphRecoveryTerminalTransfer::from_authenticated_receipt(partial),
+            None,
+            "partial outcomes cannot become a broker predecessor"
+        );
+        let terminal = CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
+            binding,
+            CurrentEbpfGraphRecoveryOutcome::Removed,
+            commitment(0x57),
+            CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
+            None,
+        );
+        let transfer =
+            CurrentEbpfGraphRecoveryTerminalTransfer::from_authenticated_receipt(terminal)
+                .expect("only a WAL-backed exact graph terminal is transferable");
+        assert_eq!(transfer.prior_authority(), binding);
+        assert_eq!(
+            transfer.prior_terminal_receipt_commitment(),
+            terminal
+                .terminal_receipt_commitment()
+                .expect("authenticated terminal has a canonical commitment")
+        );
+        let encoded = transfer.encode();
+        let kat_hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        const EXPECTED_RECEIPT: &str =
+            "12de6a11ffbd257e646c71e73edfaf1a8401537db00a26d7f8e263020fdad38f";
+        const EXPECTED_TRANSFER: &str = concat!(
+            "4f504354525852320001000000000000",
+            "5151515151515151515151515151515151515151515151515151515151515151",
+            "5252525252525252525252525252525252525252525252525252525252525252",
+            "0000000000000007",
+            "53535353535353535353535353535353",
+            "5454545454545454545454545454545454545454545454545454545454545454",
+            "5555555555555555555555555555555555555555555555555555555555555555",
+            "5656565656565656565656565656565656565656565656565656565656565656",
+            "12de6a11ffbd257e646c71e73edfaf1a8401537db00a26d7f8e263020fdad38f",
+            "9af15c8bfce72de4d271ac331ae946b5e29fd6ebda5e08b37cfce67340773e14",
+        );
+        const EXPECTED_BASIS: &str =
+            "08e77c78b6df941304ca8599d5315e304f0574a3fe680098826b321291f1eadb";
+        assert_eq!(
+            kat_hex(&transfer.prior_terminal_receipt_commitment().as_bytes()),
+            EXPECTED_RECEIPT,
+            "r2 terminal receipt KAT"
+        );
+        assert_eq!(kat_hex(&encoded), EXPECTED_TRANSFER, "r2 transfer KAT");
+        assert_eq!(
+            kat_hex(&transfer.predecessor_basis_commitment_bytes()),
+            EXPECTED_BASIS,
+            "r2 fresh-authority predecessor basis KAT"
+        );
+        assert_eq!(
+            CurrentEbpfGraphRecoveryTerminalTransfer::decode(encoded),
+            Some(transfer)
+        );
+        assert_eq!(
+            CurrentEbpfGraphRecoveryTerminalTransfer::decode(encoded)
+                .expect("decoded transfer")
+                .predecessor_basis_commitment(),
+            transfer.predecessor_basis_commitment(),
+            "the authority predecessor basis is stable across broker persistence"
+        );
+        for offset in 0..CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_ENCODED_LEN {
+            let mut tampered = encoded;
+            tampered[offset] ^= 1;
+            assert_eq!(
+                CurrentEbpfGraphRecoveryTerminalTransfer::decode(tampered),
+                None,
+                "tampered broker transfer byte {offset}"
+            );
+        }
+
+        let adopted = CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
+            binding,
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+            commitment(0x57),
+            CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
+            Some(CurrentEbpfGraphRecoveryTerminalAdoption::new(
+                binding,
+                transfer.prior_terminal_receipt_commitment(),
+            )),
+        );
+        assert_ne!(
+            adopted.terminal_receipt_commitment(),
+            terminal.terminal_receipt_commitment(),
+            "the r2 receipt must bind the complete transfer-adoption envelope"
+        );
+        let adopted_transfer =
+            CurrentEbpfGraphRecoveryTerminalTransfer::from_authenticated_receipt(adopted)
+                .expect("adopted terminal remains transferable");
+        assert_ne!(
+            adopted_transfer.predecessor_basis_commitment(),
+            transfer.predecessor_basis_commitment(),
+            "the fresh authority basis changes with the authenticated predecessor receipt"
+        );
+    }
+
+    #[test]
+    fn current_successor_receipt_is_canonical_tamper_evident_and_redacted() {
+        use std::num::NonZeroU64;
+
+        let commitment = |byte| CurrentEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
+        let binding = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+            commitment(0x61),
+            commitment(0x62),
+            NonZeroU64::new(11).unwrap(),
+            CurrentEbpfGraphRecoveryOperationId::new([0x63; 16]).unwrap(),
+            CurrentEbpfGraphRecoveryHostCommitments::new(
+                commitment(0x64),
+                commitment(0x65),
+                commitment(0x66),
+            ),
+        );
+        let historical_commitment = HistoricalEbpfGraphRecoveryCommitment::new([0x67; 32]).unwrap();
+        let predecessor_receipt = CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
+            binding,
+            commitment(0x68),
+            CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                exact_historical_graph_commitment: historical_commitment,
+            },
+            None,
+        );
+        let receipt = CurrentEbpfGraphRecoverySuccessorReceipt::authenticated(
+            binding,
+            1,
+            predecessor_receipt,
+            commitment(0x69),
+            commitment(0x6a),
+            commitment(0x6b),
+            commitment(0x6c),
+        );
+        let encoded = receipt.encode();
+        let decoded = CurrentEbpfGraphRecoverySuccessorReceipt::decode(encoded)
+            .expect("canonical successor receipt decodes");
+        assert_eq!(decoded, receipt);
+        assert_eq!(decoded.commitment(), receipt.commitment());
+        assert_eq!(
+            decoded.predecessor_receipt_commitment(),
+            predecessor_receipt
+        );
+
+        for offset in 0..CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN {
+            let mut tampered = encoded;
+            tampered[offset] ^= 1;
+            assert_eq!(
+                CurrentEbpfGraphRecoverySuccessorReceipt::decode(tampered),
+                None,
+                "tampered successor receipt byte {offset}"
+            );
+        }
+
+        assert_eq!(
+            format!("{receipt:?}"),
+            "CurrentEbpfGraphRecoverySuccessorReceipt(<opaque>)"
+        );
+        let target = CurrentEbpfGraphRecoverySuccessorTarget::Legacy(CreateGtpDeviceRequest::new(
+            "tenant-sensitive-up0",
+        ));
+        let rendered = format!("{target:?}");
+        assert_eq!(
+            rendered,
+            "CurrentEbpfGraphRecoverySuccessorTarget::Legacy(<redacted>)"
+        );
+        assert!(!rendered.contains("tenant-sensitive-up0"));
+    }
+
+    #[test]
+    fn current_terminal_receipt_round_trips_across_process_loss_without_reconstruction() {
+        use std::num::NonZeroU64;
+
+        let commitment = |byte| CurrentEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
+        let binding = |base: u8, epoch: u64| {
+            CurrentEbpfGraphRecoveryAuthorityBinding::new(
+                commitment(base),
+                commitment(base + 1),
+                NonZeroU64::new(epoch).unwrap(),
+                CurrentEbpfGraphRecoveryOperationId::new([base + 2; 16]).unwrap(),
+                CurrentEbpfGraphRecoveryHostCommitments::new(
+                    commitment(base + 3),
+                    commitment(base + 4),
+                    commitment(base + 5),
+                ),
+            )
+        };
+        let prior = binding(0x21, 7);
+        let authority = binding(0x31, 8);
+        let prior_receipt = CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
+            prior,
+            commitment(0x41),
+            CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
+            None,
+        );
+        let receipt = CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
+            authority,
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+            commitment(0x42),
+            CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                exact_historical_graph_commitment: HistoricalEbpfGraphRecoveryCommitment::new(
+                    [0x43; 32],
+                )
+                .unwrap(),
+            },
+            Some(CurrentEbpfGraphRecoveryTerminalAdoption::new(
+                prior,
+                prior_receipt,
+            )),
+        );
+
+        let encoded = receipt
+            .encode_authenticated_terminal()
+            .expect("authenticated terminal receipt is broker-persistable");
+        assert_eq!(
+            CurrentEbpfGraphRecoveryReceipt::decode_authenticated_terminal(encoded),
+            Some(receipt),
+            "a new process reconstructs the complete receipt without trusting caller fields"
+        );
+        for offset in 0..CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_ENCODED_LEN {
+            let mut tampered = encoded;
+            tampered[offset] ^= 1;
+            assert_eq!(
+                CurrentEbpfGraphRecoveryReceipt::decode_authenticated_terminal(tampered),
+                None,
+                "tampered terminal receipt byte {offset}"
+            );
+        }
+        assert!(CurrentEbpfGraphRecoveryReceipt::pristine_absence(authority)
+            .encode_authenticated_terminal()
+            .is_none());
+        assert!(CurrentEbpfGraphRecoveryReceipt::nonterminal(
+            authority,
+            CurrentEbpfGraphRecoveryOutcome::Refused(
+                CurrentEbpfGraphRecoveryRefusal::IndeterminateState
+            )
+        )
+        .encode_authenticated_terminal()
+        .is_none());
+    }
+
+    #[test]
+    fn historical_graph_recovery_request_requires_explicit_proofs_and_redacts_identity() {
+        let request = HistoricalEbpfGraphRecoveryRequest::new(
+            HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+            "tenant-sensitive-historical-pin",
+        )
+        .with_replacement_device(GtpDevice {
+            name: "tenant-sensitive-historical-interface".to_string(),
+            ifindex: 47,
+        });
+        assert_eq!(
+            request.generation(),
+            HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1
+        );
+        assert!(request.writer_proof().is_none());
+        assert!(request.drain_proof().is_none());
+        let complete = request
+            .with_writer_proof(HistoricalEbpfGraphWriterProof::previous_writer_stopped())
+            .with_drain_proof(HistoricalEbpfGraphDrainProof::sessions_and_traffic_drained());
+        assert!(complete.writer_proof().is_some());
+        assert!(complete.drain_proof().is_some());
+        let debug = format!("{complete:?}");
+        for sensitive in [
+            "tenant-sensitive-historical-pin",
+            "tenant-sensitive-historical-interface",
+            "47",
+        ] {
+            assert!(
+                !debug.contains(sensitive),
+                "historical recovery request debug leaked {sensitive}: {debug}"
+            );
+        }
     }
 
     #[test]
