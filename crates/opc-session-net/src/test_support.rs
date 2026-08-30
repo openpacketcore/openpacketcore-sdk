@@ -112,6 +112,18 @@ impl RotatableClientMaterial {
         self.config.clone()
     }
 
+    pub(crate) fn trusted_server_config(
+        &self,
+        spiffe_id: impl Into<String>,
+    ) -> opc_tls::AuthenticatedServerConfig {
+        let state = identity_state(&self.ca, &spiffe_id.into());
+        let (_source, receiver) = tokio::sync::watch::channel(Some(state));
+        opc_tls::TlsConfigBuilder::new(receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_server_config()
+            .expect("build server config trusted by test client material")
+    }
+
     pub(crate) fn rotate(&self) {
         let previous = self.config.material_status().epoch();
         self.source
@@ -125,6 +137,21 @@ impl RotatableClientMaterial {
         assert_eq!(
             current.availability(),
             opc_tls::TlsMaterialAvailability::Ready
+        );
+    }
+
+    pub(crate) fn publish_rejected_update(&self) {
+        let previous = self.config.material_status().epoch();
+        self.source.send_replace(None);
+        let current = self.config.material_status();
+        assert_eq!(
+            current.epoch(),
+            previous,
+            "a rejected test publication must retain the admitted epoch"
+        );
+        assert_eq!(
+            current.availability(),
+            opc_tls::TlsMaterialAvailability::RetainingLastGood
         );
     }
 }
@@ -155,6 +182,18 @@ impl RotatableServerMaterial {
 
     pub(crate) fn config(&self) -> opc_tls::AuthenticatedServerConfig {
         self.config.clone()
+    }
+
+    pub(crate) fn trusted_client_config(
+        &self,
+        spiffe_id: impl Into<String>,
+    ) -> opc_tls::AuthenticatedClientConfig {
+        let state = identity_state(&self.ca, &spiffe_id.into());
+        let (_source, receiver) = tokio::sync::watch::channel(Some(state));
+        opc_tls::TlsConfigBuilder::new(receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .expect("build client config trusted by test server material")
     }
 
     pub(crate) fn rotate(&self) {

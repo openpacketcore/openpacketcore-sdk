@@ -138,9 +138,10 @@ local socket access, including Kubernetes `pods/exec` access used to launch
 the client, is node-administrator-equivalent qualification authority and must
 be restricted and audited accordingly.
 
-Its strict private node configuration/control schema is version 4. Version 3
-is explicitly rejected because it predates the bounded v5 collector command
-inventory. Version 2 is rejected because it predates the routing-aware
+Its strict private node configuration/control schema is version 5. Version 4
+is explicitly rejected because it predates the distinct availability-episode
+counter in traffic-status evidence. Version 3 is rejected because it predates
+the bounded v5 collector command inventory. Version 2 is rejected because it predates the routing-aware
 optional `dial_addr` representation; version 1 is also rejected because
 lifecycle replies did not carry the fixed `superseded` and `abandoned`
 terminal outcomes. Node config accepts `projected_mtls` with an absolute
@@ -220,7 +221,9 @@ ledger must remain unchanged for the final 2.5-second
 cold-connect/maximum-reconnect-backoff tail. Each survivor may record at most
 one availability episode while the expired member rejoins; that episode must
 recover inside the existing 26-second SLO and be fully settled before the
-clean baseline. A second or late episode fails closed. The half-SLO pulse
+clean baseline. Consecutive typed retry outcomes remain individually counted
+against the unchanged eight-outcome ceiling but do not manufacture additional
+episodes. A second or late episode fails closed. The half-SLO pulse
 cadence and independent full-key coverage clock resume immediately after
 recovery.
 Only after bounded fault-era transport/authentication/timeout/reconnect
@@ -236,7 +239,7 @@ binds this accounting as `new-attempts-plus-baseline-outstanding/v1`.
 Cancellation-classified `abandoned` outcomes, protocol/backend outcomes, and
 drain overruns retain a zero budget throughout the fault and clean intervals.
 The private Schedule v6 binds this procedure as
-`member-scoped-reauth-settled-baseline/v3` with progress profile
+`member-scoped-reauth-settled-baseline/v4` with progress profile
 `common-key-pulse-all-active-key-coverage/v1`. Every epoch-changing interval
 allows `superseded` only up to the existing per-node connection-attempt bound
 `8 * (member_count - 1) + 8`; non-epoch intervals require zero. Actual timeout,
@@ -388,12 +391,26 @@ backend operation after joining their owned task. Normal status commands remain
 authoritative, and a recovered watcher must still reconcile the bounded durable
 journal before subscribing at `head + 1`.
 
-`qualification/v6/session-ha-profile.json` is the current experimental
-foundation inventory. It binds consensus transport and wire-schema revision 4
-and deterministic error-set revision 6. All earlier v1 through v5 profile and
-evidence artifacts remain byte-for-byte frozen; new runtime contract revisions
-receive a new profile namespace instead of rewriting retained qualification
-evidence.
+`qualification/v6/session-ha-profile.json` and its schema are the published,
+byte-for-byte frozen stateless-consumer contract: consumer transport revision
+1, one request per connection, and no revision-2 persistent-consumer fields.
+The explicit `SESSION_HA_PROFILE_V6_*` exports retain that contract for
+existing qualification and evidence tooling.
+
+`qualification/v7/session-ha-profile.json` is the separate experimental
+revision-2 persistent-consumer inventory. Its distinct schema `$id`, profile
+identifier, and `persistent_consumer` field close the revision-2 field set,
+including correlation IDs,
+per-connection in-flight bounds, and persistent request/watch pool limits.
+It routes to a separate closed v7 foundation-evidence schema, which is bound
+only to profile v7. The retained v6 evidence schema remains bound only to the
+v6 profile, so neither artifact can be presented as evidence for the other.
+
+`qualification/v8/session-ha-persistent-consumer-head-evidence.schema.json`
+is a separate exact-head attestation for the live persistent-consumer wire
+revision. It records the compiled revision and bounded generic harness counters
+without claiming conformance to the frozen v7 revision-2 profile or any
+downstream production SLO.
 
 Schedule v6 also binds `terminal-stage-elapsed-millis/v1`. If an accepted
 recovery operation finishes after its fixed deadline, the campaign remains

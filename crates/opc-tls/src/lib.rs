@@ -441,6 +441,17 @@ impl AuthenticatedClientConfig {
         self.controller.status()
     }
 
+    /// Return the opaque fixed-domain commitment for this configuration's
+    /// pinned local SPIFFE identity.
+    ///
+    /// This is suitable only for SDK-internal durable binding. It is stable
+    /// across certificate/key rotation for the same identity and never reveals
+    /// the identity text, certificates, or private key material.
+    #[doc(hidden)]
+    pub fn local_spiffe_identity_commitment(&self) -> Option<[u8; 32]> {
+        self.controller.local_spiffe_identity_commitment()
+    }
+
     /// Drive source changes and expose only reconciled redaction-safe status.
     pub fn subscribe_material_changes(&self) -> TlsMaterialStatusReceiver {
         self.controller.subscribe_material_changes()

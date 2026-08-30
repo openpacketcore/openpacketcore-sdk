@@ -1346,6 +1346,120 @@ where
     }
 }
 
+/// Apply every member effect, then stop at the last member's durable
+/// `Issuing` witness instead of publishing `Applied`.
+///
+/// This is the narrow response-activation cut: all prior members are durably
+/// `Acquired`, the final member is durably `Pending` with its own immediately
+/// adjacent `Absent` proof, and its install has acknowledged success.  If the
+/// process or affine completion is lost at this point, ordinary unresolved
+/// recovery uses that final per-member proof to reconcile and exactly roll
+/// back the roster; it never replays a mutation.  No group-wide sweep is used
+/// as deletion authority.
+///
+/// The caller must use [`finish_durable_object_roster_effect_quiesced`] under
+/// the same serialized actor to publish `Applied` once its response has been
+/// activated.  This function is crate-private because the namespace boundary
+/// owns the affine completion token that makes that pairing non-replayable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn issue_durable_object_roster_effect_quiesced<B>(
+    store: &XfrmObjectRosterRecoveryStore,
+    prepared: &XfrmObjectRosterRecoveryHandle,
+    group_id: XfrmObjectRosterGroupId,
+    generation: XfrmObjectRosterOperationGeneration,
+    roster: &XfrmObjectRosterRequest,
+    backend: &B,
+) -> Result<XfrmObjectRosterRecoveryHandle, XfrmObjectRosterIssueError>
+where
+    B: XfrmBackend + ?Sized,
+{
+    let ordinal = roster
+        .arity()
+        .checked_sub(1)
+        .ok_or(XfrmObjectRosterIssueError::Durable(
+            XfrmObjectRosterDurableError::Malformed,
+        ))?;
+    match issue_roster(
+        store,
+        prepared,
+        group_id,
+        generation,
+        roster,
+        backend,
+        Some(IssuingCut {
+            ordinal,
+            admit_backend_effect: true,
+        }),
+    )
+    .await?
+    {
+        Issued::Cut(handle) => Ok(handle),
+        Issued::Terminal(_) => Err(XfrmObjectRosterIssueError::Durable(
+            XfrmObjectRosterDurableError::InvalidTransition,
+        )),
+    }
+}
+
+/// Publish `Applied` from the exact all-effects-quiesced `Issuing` cut.
+///
+/// This performs no backend operation.  Its input must name the current
+/// authenticated record whose lower members are acquired and whose final
+/// member remains pending with an `Absent` adjacent proof.  That exact shape
+/// is only returned by [`issue_durable_object_roster_effect_quiesced`].  The
+/// namespace boundary keeps the corresponding move-only token live until this
+/// function consumes it, preventing same-process recovery from racing the
+/// post-response publication.
+pub(crate) fn finish_durable_object_roster_effect_quiesced(
+    store: &XfrmObjectRosterRecoveryStore,
+    issuing: &XfrmObjectRosterRecoveryHandle,
+    group_id: XfrmObjectRosterGroupId,
+    generation: XfrmObjectRosterOperationGeneration,
+    roster: &XfrmObjectRosterRequest,
+) -> Result<XfrmObjectRosterDurableOutcome, XfrmObjectRosterDurableError> {
+    let fingerprint = roster_digest(store, group_id, generation, roster)?;
+    let record = store.restore_handle(issuing, fingerprint)?;
+    let arity = roster.arity();
+    let last = arity
+        .checked_sub(1)
+        .ok_or(XfrmObjectRosterDurableError::Malformed)?;
+    if record.group_id != group_id
+        || record.group_generation != generation
+        || record.phase != XfrmObjectRosterDurablePhase::Issuing
+        || usize::from(record.cursor) != last
+    {
+        return Err(XfrmObjectRosterDurableError::InvalidTransition);
+    }
+    for ordinal in 0..last {
+        let slot = record
+            .member(ordinal)
+            .ok_or(XfrmObjectRosterDurableError::Malformed)?;
+        if slot.phase != XfrmObjectRosterMemberPhase::Acquired {
+            return Err(XfrmObjectRosterDurableError::InvalidTransition);
+        }
+    }
+    let slot = record
+        .member(last)
+        .ok_or(XfrmObjectRosterDurableError::Malformed)?;
+    if slot.phase != XfrmObjectRosterMemberPhase::Pending
+        || slot.adjacent_proof != Some(XfrmObjectRosterAdjacentProof::Absent)
+    {
+        return Err(XfrmObjectRosterDurableError::InvalidTransition);
+    }
+    let applied = publish(
+        store,
+        &record,
+        XfrmObjectRosterTransition::new(XfrmObjectRosterDurablePhase::Applied, cursor_of(arity)?)
+            .with_member(
+                last,
+                advance_slot(slot, XfrmObjectRosterMemberPhase::Acquired),
+            ),
+    )?;
+    Ok(XfrmObjectRosterDurableOutcome::Applied {
+        handle: store.handle_for_record(&applied)?,
+        members: dispositions_for(&applied),
+    })
+}
+
 /// Outcome of one member reconciliation.
 enum MemberReconcile {
     /// The member is durably resolved and compensation may descend past it.
@@ -2217,11 +2331,26 @@ mod tests {
         /// Number of durable roster record files, excluding the control record
         /// and the epoch witnesses.
         fn record_files(&self) -> usize {
-            fs::read_dir(&self.0)
+            let records = fs::read_dir(&self.0)
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|name| name != "control" && !name.starts_with("epoch-"))
-                .count()
+                .filter(|name| {
+                    name != "control" && name != "journal" && !name.starts_with("epoch-")
+                })
+                .count();
+            if records != 0 {
+                return records;
+            }
+            let journal = self.0.join("journal");
+            if journal
+                .metadata()
+                .ok()
+                .is_some_and(|metadata| metadata.len() > 80)
+            {
+                1
+            } else {
+                0
+            }
         }
     }
 
@@ -4111,6 +4240,145 @@ mod tests {
         serial_lifecycles.await;
         let after = object_store.advance_writer_epoch().unwrap().get();
         assert_eq!(after - before - 1, u64::try_from(MEMBER_COUNT).unwrap());
+    }
+
+    /// The happy five-member roster has eight logical publications, but each
+    /// must become durable through only one physical barrier.  The six
+    /// pre-response publications are the non-negotiable pre-effect proofs;
+    /// `Applied` and `Committed` stay separate logical states so recovery and
+    /// adoption retain their existing contracts.
+    #[tokio::test]
+    async fn five_member_happy_path_uses_one_physical_barrier_per_publication() {
+        let root = TestRoot::new();
+        let roster = roster_of(&CHILD_SA_ROSTER);
+        let backend = ScriptedBackend::for_roster(&roster);
+        let store = open_store(&root);
+        store.tests_reset_physical_barriers().unwrap();
+
+        let prepared = prepare_object_roster(&store, group(0xa9), generation(1), &roster).unwrap();
+        assert_eq!(
+            issue_durable_object_roster(
+                &store,
+                &prepared,
+                group(0xa9),
+                generation(1),
+                &roster,
+                &backend,
+            )
+            .await
+            .unwrap()
+            .as_str(),
+            "applied"
+        );
+        assert_eq!(
+            finalize_durable_object_roster(&store, group(0xa9), generation(1), &roster).unwrap(),
+            XfrmObjectRosterDurablePhase::Committed
+        );
+
+        assert_eq!(
+            store.tests_physical_barriers().unwrap(),
+            8,
+            "one group-commit barrier per logical publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn effect_quiesced_cut_defers_only_applied_and_preserves_exact_rollback() {
+        let root = TestRoot::new();
+        let roster = roster_of(&CHILD_SA_ROSTER);
+        let backend = ScriptedBackend::for_roster(&roster);
+        let store = open_store(&root);
+        store.tests_reset_physical_barriers().unwrap();
+
+        let prepared = prepare_object_roster(&store, group(0xaa), generation(1), &roster).unwrap();
+        let issuing = issue_durable_object_roster_effect_quiesced(
+            &store,
+            &prepared,
+            group(0xaa),
+            generation(1),
+            &roster,
+            &backend,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.inspect(&issuing),
+            Ok(XfrmObjectRosterDurablePhase::Issuing)
+        );
+        assert_eq!(
+            store.tests_physical_barriers().unwrap(),
+            6,
+            "prepare, issuing/member0, and four adjacent pre-effect witnesses"
+        );
+        for ordinal in 0..CHILD_SA_ROSTER.len() {
+            assert!(
+                backend
+                    .is_present(roster.member(ordinal).unwrap().request())
+                    .await
+            );
+        }
+
+        let applied = finish_durable_object_roster_effect_quiesced(
+            &store,
+            &issuing,
+            group(0xaa),
+            generation(1),
+            &roster,
+        )
+        .unwrap();
+        assert_eq!(applied.as_str(), "applied");
+        assert_eq!(store.tests_physical_barriers().unwrap(), 7);
+        assert_eq!(
+            finalize_durable_object_roster(&store, group(0xaa), generation(1), &roster).unwrap(),
+            XfrmObjectRosterDurablePhase::Committed
+        );
+        assert_eq!(store.tests_physical_barriers().unwrap(), 8);
+
+        // A dropped completion is the same durable final-member cut after a
+        // process loss.  Recovery must use that member's own adjacent proof
+        // and reverse the full owned prefix, never replaying installation.
+        let dropped_root = TestRoot::new();
+        let dropped_store = open_store(&dropped_root);
+        let dropped_backend = ScriptedBackend::for_roster(&roster);
+        let dropped_prepared =
+            prepare_object_roster(&dropped_store, group(0xab), generation(1), &roster).unwrap();
+        issue_durable_object_roster_effect_quiesced(
+            &dropped_store,
+            &dropped_prepared,
+            group(0xab),
+            generation(1),
+            &roster,
+            &dropped_backend,
+        )
+        .await
+        .unwrap();
+        dropped_backend.clear_log();
+        drop(dropped_store);
+        let reopened = open_store(&dropped_root);
+        assert_eq!(
+            recover_durable_object_roster(
+                &reopened,
+                group(0xab),
+                generation(1),
+                &roster,
+                &dropped_backend,
+            )
+            .await
+            .unwrap()
+            .as_str(),
+            "rolled_back"
+        );
+        assert_eq!(
+            dropped_backend.ordinals(OpKind::Remove),
+            (0..CHILD_SA_ROSTER.len()).rev().collect::<Vec<_>>()
+        );
+        for ordinal in 0..CHILD_SA_ROSTER.len() {
+            assert!(
+                !dropped_backend
+                    .is_present(roster.member(ordinal).unwrap().request())
+                    .await
+            );
+        }
     }
 
     #[tokio::test]

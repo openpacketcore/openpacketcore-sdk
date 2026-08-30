@@ -3054,6 +3054,7 @@ mod tests {
 
     #[test]
     fn malformed_peer_public_values_fail_closed() {
+        crate::test_support::ensure_ike_crypto();
         for group in [
             Ikev2DhGroup::Modp768,
             Ikev2DhGroup::Modp1024,

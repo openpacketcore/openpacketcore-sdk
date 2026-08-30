@@ -14,6 +14,7 @@ opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
+opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 opc-session-net = { path = "../opc-session-net", version = "0.2.0", default-features = false }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
@@ -30,9 +31,9 @@ time = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 zeroize = { workspace = true }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
 
 [dev-dependencies]
-opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 rcgen = { workspace = true }
 rustls-pki-types = { workspace = true }
 

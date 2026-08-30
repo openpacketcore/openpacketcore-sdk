@@ -398,9 +398,11 @@ fail closed even if an outer layer omitted validation.
 The new errors are public enum variants, so external exhaustive matches MUST be
 updated. Protocol v4 introduced their private fixed-width DTOs in error
 revision 1; current v5 error revision 9 retains those encodings and adds
-bounded expiry-preflight and topology-authority outcomes. An error-revision-8 or older decoder is rejected
-during the exact handshake;
-deployments MUST use the coordinated v5 rollout in §12.3.
+bounded expiry-preflight and topology-authority outcomes. The exact direct v5
+profile is wire-schema revision 7/error-set revision 9; every non-current direct
+profile combination (including error revision 8 or older) MUST be rejected
+during the exact handshake. Deployments MUST use the coordinated v5 rollout in
+§12.3.
 
 ### 7.2 Absolute Record Expiry Authority
 
@@ -767,6 +769,16 @@ crate, owns election, voting, log matching, commit, membership, snapshot
 coordination, and linearizable-read authority. The SDK state machine owns only
 deterministic session semantics.
 
+Public dynamic consensus construction, including membership-candidate
+construction, MUST be supported only on Linux. On every other platform it MUST
+return `DynamicConsensusUnsupportedPlatform` before topology or durable-state
+inspection and before creating a snapshot directory, consensus schema, or
+other consensus-owned filesystem state. The core initializer MUST independently
+return its typed `UnsupportedPlatform` storage error before those effects.
+Internal path-based snapshot helpers MUST NOT be treated as a portable
+consensus fallback. Standalone `SqliteSessionBackend` use remains
+cross-platform.
+
 HA topology admission MUST start from the complete descriptor set and one
 explicit logical self `ReplicaId`. It MUST bind a cluster ID, the exact
 order-independent configuration digest over the cluster, epoch, and complete
@@ -794,6 +806,24 @@ only payloads already admitted by the protection wrapper described in §14.1.
 Automatic current-format reconciliation is supplied by #128. Pre-#127
 persisted forks use #129's full-fleet, backup-before-mutation procedure and
 remain readiness-fenced until Openraft commits the recovery epoch.
+
+The Linux snapshot namespace is a cooperative-service-UID trust boundary. The
+adapter MUST retain an `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK`
+directory descriptor at admission, require `fstat` ownership by the effective
+UID and `mode & 022 == 0`, and reject an insecure pre-existing directory. A
+missing namespace MUST be created `0700`; SDK snapshot files MUST be created
+`0600`. Post-admission namespace operations MUST be directory-FD-relative so a
+parent-path replacement cannot redirect accepted work. Durable snapshot rows
+name logical basenames, not a mutable parent path.
+
+Supported writers are cooperative SDK processes under one dedicated service
+UID, serialized by the snapshot/database leases. Operators MUST use a private
+parent directory, must not share that UID with untrusted workloads, and MUST
+fail closed on owner or mode mismatch. POSIX ACL group-class masks MUST not
+restore group-class write authority. This contract excludes `root`,
+`CAP_DAC_OVERRIDE`, `CAP_FOWNER`, non-cooperating same-eUID actors, and
+writable aliases of the retained directory. It does not claim universal
+unlink-by-FD semantics or privileged-attacker resistance.
 
 `probe_durable_readiness` MUST use the same bounded authority path as an
 authoritative read: discover or follow the current leader, execute Openraft's
@@ -842,7 +872,8 @@ after the Openraft barrier and local apply. One absolute deadline MUST begin at
 the public restore entry and cover the barrier/apply path, blocking-worker and
 asynchronous connection admission, SQLite progress, and blocking-task join.
 Each page MUST examine no more than 4,096 live candidates plus one non-decoded
-lookahead, return no more than 1,024 records, 4 MiB of payload, or 8 MiB of
+lookahead, return no more than 1,024 records, an aggregate local 4 MiB + 64 KiB
+of stored-envelope payload, or 8 MiB of
 retained record/key/metadata/payload/cursor bytes, examine no more than 8 MiB
 of key/filter metadata, and obey the SQLite VM-step, wall-time, and cancellation
 budgets. Candidate/lookahead SQL MUST NOT select payload blobs; admitted
@@ -877,6 +908,18 @@ epoch-derived and do not include the fixed-profile or placement-policy binding.
 `ConsensusSessionStore::open_fixed_durable_quorum` is supported only on Linux,
 where descriptor-pinned SQLite snapshots are available; other platforms MUST
 return `FixedQuorumUnsupportedPlatform` before durable initialization.
+Linux alone is insufficient for the fixed profile: the snapshot filesystem
+MUST support the exact fs-verity v1 profile (SHA-256, 4 KiB block size, no salt,
+and no signature). Build, installation, startup, and recovery MUST reject an
+unsupported filesystem or an unsealed fixed-profile artifact before it can be
+accepted as durable state. The dynamic profile remains available without this
+fixed artifact requirement, but MUST retain its bounded corruption detection
+and fail closed on invalid snapshot evidence.
+This is not an online migration: an existing pre-fixed or unsealed
+metadata-referenced artifact is not auto-sealed, auto-repaired, or accepted on
+open. Operators MUST preserve it and use the reviewed offline
+reseed/recovery/migration procedure before reopening; a startup retry,
+metadata edit, or byte-identical replacement does not cross this boundary.
 Fixed membership does not authorize dynamic membership transitions, a second
 consensus engine, a controller feed, or a new packet-core protocol path.
 `try_from_fixed_durable_quorum_with_authenticated_placement` may additionally
@@ -1052,8 +1095,9 @@ Serde boundary MUST delegate to private fixed-width v5 DTOs. `Hello` and
 `HelloAck` add an optional `contract_profile`; `HelloAck` also carries the
 server's optional `cas_idempotency_epoch`, and direct CAS carries an optional
 `idempotency_epoch`. Exhaustive Rust construction and matching MUST account for
-the new fields. The profile pins wire-schema revision 6 and error-set revision
-8; owner, custom-key, and state-type
+the new fields. The profile pins wire-schema revision 7 and error-set revision
+9; `max_restore_scan_page_payload_bytes = 2096128`; owner, custom-key, and
+state-type
 bounds of 128 UTF-8 bytes; `min_frame_size = 8192`;
 `max_frame_size = 16777216`;
 `stable_id_max_bytes = 64`; `replication_tx_id_max_bytes = 128`;
@@ -1127,10 +1171,12 @@ Every post-bootstrap response and watch item MUST be fully bounded-encoded into
 retained byte storage capped at the accepted response size before a length
 prefix is written.
 The common non-pageable and complete-page success path MUST perform one bounded
-encode without a separate sizing serialization. If the complete pageable
-response is oversized, that direct encode MUST emit no prefix; prefix selection
-MAY then perform bounded logarithmic sizing probes followed by one final bounded
-encode. No retained encoded-JSON byte storage may exceed the negotiated cap.
+encode without a separate sizing serialization. For a replication-log page, if
+the complete pageable response is oversized, that direct encode MUST emit no
+prefix; prefix selection MAY then perform bounded logarithmic sizing probes
+followed by one final bounded encode. Restore pages MUST be validated as whole
+backend results and MUST NOT be transport-shaped. No retained encoded-JSON byte
+storage may exceed the negotiated cap.
 The retained/requested encoded-JSON byte storage MUST remain no greater than the
 cap, including for non-power-of-two budgets. An implementation MUST NOT
 coalesce or create a temporary payload buffer when doing so would exceed that
@@ -1162,10 +1208,12 @@ Outbound behavior is family-specific:
 - Batch results MUST preserve exact request cardinality and order. They MUST NOT
   be truncated; an oversized complete result becomes one fixed batch error or a
   connection close.
-- Restore results MAY return a complete record prefix that fits, but
-  MUST preserve `next_cursor` and excluded-count semantics. A record MUST NOT be
-  split. When the first record cannot fit, the server MUST return the fixed
-  restore-size error if representable or close.
+- Restore backends MAY independently return a shorter cursor-correct page under
+  their count, payload, or work budgets. The transport MUST validate the entire
+  returned page against the fixed 2,096,128-byte wire-payload cap and the
+  negotiated frame; it MUST NOT trim or rewrite records or cursors. If the whole
+  page is oversized, the server MUST return typed
+  `RestoreScanResponseTooLarge` if representable or close.
 - Replication-log results MAY return only the largest complete contiguous entry
   prefix that fits. An entry MUST NOT be split, reordered, or skipped. If no
   requested entry fits, the server MUST use its fixed fallback or close.
@@ -1192,9 +1240,10 @@ fit maximum-profile metadata/envelopes but does not promise a non-zero
 application payload. Capability evidence remains descriptive and MUST NOT
 authorize quorum or traffic readiness.
 The 1 MiB default yields 130,048 payload bytes and the 16 MiB ceiling yields
-2,096,128. Advertising SQLite's full 1 MiB value limit requires at least
-8,396,800 frame bytes; 16 MiB is the recommended configured frame size for that
-profile. This is a per-frame limit, not aggregate admission: at the server's
+2,096,128. The wire ceiling is intentionally below standalone SQLite's local
+4 MiB + 64 KiB stored-envelope restore capacity, which is not a session-net
+wire capability. This is a per-frame limit, not aggregate admission: at the
+server's
 default 128 connection slots, simultaneous ceiling-sized encoded stores can
 retain about 2 GiB before chunk metadata, TLS, and runtime overhead. The
 aggregate scales with the configured connection limit. #143 owns aggregate
@@ -1307,7 +1356,7 @@ or traffic admission. A cache MUST be keyed by the exact profile and negotiated
 directional limits and cleared when a successful reconnect changes either
 limit. Callers MUST use fresh bounded quorum evidence.
 
-The transition to v5 wire-schema revision 6 and error-set revision 9 is a
+The transition to v5 wire-schema revision 7 and error-set revision 9 is a
 coordinated stop/upgrade/start boundary, not a rolling deployment. Operators
 MUST drain traffic and writers; run the #135 identity
 audit; inventory every retained record, replication log, snapshot, restore
@@ -1345,7 +1394,7 @@ across the independent `OPCH`/#135 boundary retains its checkpoint/reverse-
 migration requirement.
 
 That compatibility cutover is distinct from credential rotation. Only after
-every participant is admitted on the same revision-6 profile MAY operators use
+every participant is admitted on the same revision-7 profile MAY operators use
 material-epoch or explicit reauthentication to recycle connections without
 draining application traffic. The lifecycle MUST NOT be used to mix protocol
 profiles, negotiate a downgrade, or turn a binary rollback into a rolling
@@ -1413,12 +1462,15 @@ replication append, or rebuild request. The consensus ALPN and legacy
 `opc-session-net/5` ALPN MUST NOT be multiplexed as equivalent authority on one
 production listener.
 
-The exact consensus contract profile MUST use transport/wire-schema revision 4
-and error-set revision 6. Revision 4 makes the forwarded consumer scope
-explicit, so a peer cannot silently downgrade a consumer-scoped operation to
-an internal call; error revision 6 binds that semantic boundary into the
-exact profile. Revision 3/error revision 5 or older MUST fail before engine
-dispatch.
+The exact consensus contract profile MUST use transport/wire-schema revision 5,
+application revision 4, and error-set revision 6. The revision-5 transport
+profile retains the explicit forwarded consumer scope, so a peer cannot
+silently downgrade a consumer-scoped operation to an internal call; application
+revision 4 fences the former 728bc5 application-revision-3 Postcard tag-27
+`FinalizeOperatorRecoveryV2` encoding, which conflicts with the merged roster
+profile's tags 27 through 30. Error revision 6 binds that semantic boundary
+into the exact profile. Any other transport, application, or error-set revision
+MUST fail before engine dispatch.
 Operators MUST drain traffic and writers, stop every consensus member, upgrade
 the full membership together, verify exact-profile handshakes, and only then
 restore traffic. Mixed-profile rolling operation is unsupported.
@@ -1559,7 +1611,8 @@ from checked `last_delivered_sequence + 1`. Cursor overflow, compaction or
 another permanent backend error, cancellation, and bounded slow-consumer
 failure MUST terminate explicitly rather than reconnect forever.
 
-This bootstrap behavior admits the already-frozen direct revision-6 variant and
+This bootstrap behavior was introduced for the then-frozen direct revision-6
+variant and is retained by the current revision-7 profile, alongside the
 existing consensus error value in their restricted bootstrap contexts. It
 changes no public API, direct or consensus profile revision, persisted
 SQLite/journal/snapshot format, Openraft commit authority, payload envelope,
@@ -1587,17 +1640,42 @@ resources, soak, remote HKMS, deployed CNFs, and signed release evidence under
 certificate/identity-denylist revocation MUST remain explicit. #158 remains the
 umbrella until that fleet evidence passes.
 
-### 12.5 Stateless Session-Quorum Consumer Transport
+### 12.5 Typed Session-Quorum Consumer Transport
 
-`StatelessSessionConsumerClient` and `SessionQuorumConsumerServer` provide the
-only production application-consumer boundary. They MUST use mutual TLS and
-the dedicated `opc-session-consumer/1` ALPN with transport revision 1. This is
-a separate exact protocol from both `opc-session-consensus/2` and the
-quarantined `opc-session-net/5` compatibility protocol. A listener MUST NOT
-offer a fallback, negotiate a common revision, or multiplex either other
-protocol as equivalent consumer authority. Because this SDK is unreleased,
-deployments MUST make a coordinated cutover to this final boundary; dual-mode
-or compatibility consumer operation is unsupported.
+`StatelessSessionConsumerClient`, `PersistentSessionConsumerClient`, and
+`SessionQuorumConsumerServer` provide the typed least-authority
+application-consumer boundary. They MUST use mutual TLS and three independent
+exact lanes: the general `opc-session-consumer/1` ALPN at transport revision 6,
+the epoch-fenced V2 `opc-session-consumer/2` ALPN at transport revision 5, and
+the protected-roster `opc-session-consumer/3` ALPN at transport revision 5.
+These are separate exact protocols from both `opc-session-consensus/2` and the
+quarantined `opc-session-net/5` compatibility protocol. `/2` MUST NOT fall back
+to `/1`, and a lane authenticated for one ALPN MUST NOT carry or be reused for
+another lane's Hello or request envelope. When protected-roster ingress is
+enabled, the listener advertises `/3` before `/2` and `/1`; each client offers
+exactly one ALPN. `/3` admits only its protected roster operation set under its
+tenant/scope/fence authority, and `/2` MUST NOT count or reclaim `/3` lanes.
+The server MUST reject every `/2` Hello revision other than 5 before dispatch.
+
+General revision 6 does not interoperate with older general revisions. Because
+this SDK is unreleased, a general-lane revision cutover MUST drain consumer
+clients and listeners; fallback, general-lane dual mode, and mixed-revision
+operation are unsupported. Deployment MUST provision revision-5 `/2` listener
+support, V2-capable store authority, and the required protected-wrapper V2
+journal before enabling an explicit V2 client call. `/1`, `/2`, and `/3`
+coexist only as independently authenticated and decoded lanes, never as common
+or dual-revision authority. Removing either additive lane requires draining its
+callers first. General revision-6 and V2 revision-5 private JSON DTO bytes are
+canonical; reordered or otherwise noncanonical encodings, aliases, omissions,
+and unknown fields MUST fail closed.
+
+`StatelessSessionConsumerClient` remains a public, source-compatible
+production/compatibility fresh-authentication typed least-authority surface
+required by #649, #688, and #691; it is neither hidden, deprecated, nor
+test-only. `PersistentSessionConsumerClient` remains the required warm
+fixed-pool primitive for #695/ePDG latency, so production deployments requiring
+warm reuse should use it. This distinction is not an API-removal or
+feature-gating claim.
 
 The consumer listener authenticates the peer from the live mTLS connection and
 authorizes it only through the store-issued current-member manifest and the
@@ -1609,46 +1687,276 @@ security-sensitive: diagnostics, profile inventories, and observability MUST
 record only redaction-safe status/count information, never their concrete
 values.
 
-The API exposes typed session reads, bounded mutation/lease operations,
-bounded restore scans, capability discovery, and a coarse committed-change
-watch. It does not expose membership, voting, peer discovery, replication-log
-read/append, raw replication operation trees, snapshots, rebuild/recovery, or
-any topology/consensus authority. The server constructor accepts only the
-`SessionQuorumConsumer` port, and all accepted mutations route through the
-durable quorum leader path.
+The V1 API exposes typed session reads, bounded mutation/lease operations,
+bounded restore scans, capability discovery, a coarse committed-change watch,
+and #696's generic one-record atomic fenced transition. The latter includes an
+exact-key observation, one lease-acquire or lease-renew action plus one bounded
+record mutation, and exact retained-status readback. V2 exposes only typed V2
+capability, V2 history state, one epoch-fenced transition,
+`SessionConsumerV2Operation::FencedTransitionV2Batch`, and exact V2 transition
+status. The batch is an ordered, same-epoch `1..=256` transition batch and is
+not all-or-nothing: each item has its own outcome and earlier items may have
+effects when a later item does not. V2 does not add raw consensus or replication
+operations, membership/voting authority, or product-specific roster/policy
+semantics.
+Before V1 activation for
+the exact current voter scope, capability, observation, status, and first
+transition admission require fresh authenticated replies from every exact
+voter; an unavailable or incompatible voter fails closed. A quorum is not a
+mixed-version proof. It does not expose membership, voting, peer discovery,
+replication-log read/append, raw replication operation trees, snapshots,
+rebuild/recovery, product composition, or any topology/consensus authority.
+It also excludes every legacy `RemoteSessionBackend` API and all
+consensus/replication/snapshot/rebuild/membership/admin APIs. The server
+constructor accepts only the existing least-authority `SessionQuorumConsumer`
+port, and all accepted mutations route through the durable quorum leader path.
 
-Each normal connection processes exactly one application request. The default
-listener limit is 256 live connections and its retained connection-task set is
-bounded by that limit; each watch owns one delivery task. Consumer frames are
-at most 16 MiB and a configured listener frame limit cannot be lower than the
-8 MiB batch-response limit plus 4 KiB framing allowance. The default bootstrap
-and active-frame idle bound is 5 seconds and one complete request/response
-operation has a 10-second deadline. A watch has a 64-item, 512 KiB transport
-queue, rechecks cancellation at least every 50 ms, and is also bounded by the
-256 KiB store-side projection buffer. The fixed request identity is 16 bytes;
-consumer identity input is capped at 253 UTF-8 bytes; one batch has at most
-256 operations and retains at most 8 MiB of serialized response data.
+The raw physical store and authenticated-consumer transport advertise exactly
+`AtomicFencedTransitionCapability::V1`. A protected
+`EncryptingSessionBackend` or `RemoteSealingSessionBackend` advertises the
+separate `FencedTransitionV2Capability::V2` only when it owns the separately
+scoped SDK caller-side `FencedTransitionV2PreparedJournal` and its exact inner
+physical boundary supports V2 history. That journal binds the stable backend
+authority, protection mode, and payload namespace; it is distinct from the
+permanent capped V1 prepared-transition journal. The session-store
+documentation defines its provision/open/recovery rules. V2 transport neither
+creates nor substitutes for this durable recovery boundary, and MUST NOT fall
+back to V1. A legacy protection wrapper without that journal, an older binary,
+and raw V1 transport MUST fail closed for the V2 history path.
 
-Every client and listener applies the finite `ConnectionLifecyclePolicy`: by
-default authentication age is at most 15 minutes, retirement drain is at most
-30 seconds, reconnect backoff is 50 ms through 1 second, and material-rotation
-jitter is at most 30 seconds. Reauthentication, material changes, certificate
-expiry, idle retirement, cancellation, malformed frames, EOF, or an uncertain
-stream position terminate the connection/watch and release its transport task
-slot; they do not create another request on that connection.
+The first authorized transition after that unanimous proof carries the scope
+identity and canonical voter-set commitment inside its same single user command
+and application position. Apply atomically installs its receipt/effects, the
+one-way persistent schema-version downgrade fence, and an optional single-row
+exact-current-scope activation certificate; it creates no separate user
+mutation or log position. Those internal proof fields are not consumer-wire
+semantics. After this command commits, normal linearizable Raft quorum
+availability suffices for capability, observation, execution, and status; a
+leader change or minority loss does not require another all-voter probe. A
+topology cutover deletes only the old scope certificate, retaining the schema
+fence and receipt bindings. Its successor scope must repeat the every-voter
+proof and first activating or recovery transition, while stable request-ID/body
+receipt recovery survives the rollover.
 
-The caller owns the request ID for every mutation or lease operation. If a
-request can have crossed the durable effect point without a complete response,
-the outcome is ambiguous. The SDK MUST NOT automatically replay it or mint a
-new request ID. Recovery may retry only the identical request body under the
-retained ID, which resolves through the durable request binding; reuse of that
-ID for a different request is a closed conflict. Applications otherwise must
-perform authoritative readback and apply the existing fencing/idempotency
+The exact #684 layout has no ledger. A current writable open may add the exact
+empty Prepared ledger and zero marker without changing the predecessor schema
+version, so no V1 authority exists and predecessor readers remain safe until
+activation. Activated main databases, snapshots, and recovery preserve the
+schema fence and receipt bindings plus any exact-current certificate; snapshot
+install never regresses Activated to Prepared or erases/substitutes a
+same-scope certificate. A legitimately unactivated successor scope may have no
+certificate pending its new proof. Exact predecessor binaries reject the
+higher schema fence. An offline pre-V1 minority is not safe
+to catch up merely because it did not acknowledge activation: an old reader
+could silently omit new snapshot state, which the persistent fence prevents by
+rejecting the activated image.
+
+Each V2 request connection carries a connection-local, nonzero `u32` sequence
+that increases monotonically and never wraps, paired with a fresh full-width
+128-bit OS-CSPRNG nonce and the fixed 32-byte request commitment. The
+commitment is SHA-256 of `opc-session-consumer-v2-call-phase`, the big-endian
+`/2` revision 5, and the exact serialized V2 request bytes. The server admits
+only the exact next sequence and the client accepts only the exact composite
+response tuple. A V2 lane retires after at most 4,096 sequential calls. There is
+exactly one in-flight call per connection, with no multiplexing. This is
+structural: it isolates cancellation and pre-staged/late responses and removes
+write-position ambiguity.
+
+The `/2` HelloAck request-frame ceiling is independent from the client's
+response-frame capacity: any nonzero request ceiling through the fixed 16 MiB
+maximum is valid, and the exact bounded encoder MUST reject an oversized Call
+before writing its length prefix. The response-frame capacity retains the
+larger fixed minimum required by bounded batch responses.
+
+The client uses a
+fixed, fair pool of four request connections by default (at most 16 when
+configured), with 64 pending calls by default and a hard maximum of 256. A
+pending call may wait or age for at most 250 ms. The retained Watch transport
+uses two reserved slots by default (at most 16 when configured), but typed
+tenant/NF consumer Watch does not acquire them while its cursor is global.
+
+`PersistentSessionConsumerClient` has an ALPN-specific V2 idle pool while V1
+and V2 share one configured request width, pending queue, and prewarm gate.
+`prewarm_v2` establishes revision-5 lanes within that aggregate width without
+dispatching an operation, `execute_v2` dispatches only on a V2 lane, and
+`v2_diagnostics` reports only V2 redaction-safe pool state. V1 and V2 idle
+sockets and authenticated Hello exchanges are never cross-reused; their
+logical lane and pending-call admission is aggregate. Their
+aggregate persistent width is the configured request width (at most 16), and
+may rebalance only by retiring an opposite-protocol idle lane (never active
+work or V2 poison debt) before the existing setup deadline; it does not
+allocate a connection, task, channel, or pool per subscriber. DNS resolution,
+TCP, TLS, and Hello are
+performed only on establishment or re-establishment of the relevant lane, not
+on reuse.
+
+Stateless-client clones share bounded physical admission per clone lineage.
+The V1 family, including protected-roster `/3`, has exactly 16 request
+connections, and ordinary V2 `/2` has an independent 16, for at most 32
+request connections in total. Watch admission remains separately capped at
+16. The respective
+permit MUST be acquired before resolve/TCP and held for the complete physical
+connection lifetime, including by a persistent client derived from that
+stateless lineage. Independently constructed stateless clients define
+independent logical clients, as independently constructed persistent clients do.
+The typed persistent watch surface MUST preserve exhaustion of either bound as
+`Overloaded` and record that bounded outcome; it MUST NOT relabel intentional
+load shedding as endpoint unavailability.
+
+The hard listener limit is 256 live connections and its retained
+connection-task set is bounded by that limit; each watch owns one delivery
+task. Consumer frames are at most 16 MiB and a configured listener frame limit
+cannot be lower than the 8 MiB batch-response limit plus 4 KiB framing
+allowance. The bootstrap and active-frame idle bound remains 5 seconds and one
+complete request/response operation remains bounded to 10 seconds. A watch has
+a 64-item, 512 KiB transport queue, rechecks cancellation at least every 50
+ms, and is also bounded by the 256 KiB store-side projection buffer. The fixed
+V1 request identity is 16 bytes; a V2 singleton or V2 batch item identity is
+56 bytes; consumer identity input is capped at 253 UTF-8 bytes. One V1 generic
+batch has at most 256 operations and retains at most 8 MiB of serialized
+response data. A V2 batch has at most 256 operations and separately limits its
+fully Postcard-encoded request vector and outcome vector to 1 MiB each; the
+outer authenticated-consumer JSON frame remains subject to its negotiated
+frame bound.
+
+The complete operation timeout MUST validate strictly greater than zero and no
+greater than 10 seconds. The configured idle timeout is at most 5 seconds and
+caps every active partial frame on all client bootstrap and unary reads; partial
+bytes do not reset that bound. Each discarded checked-out request lane MUST have
+exactly one reconnect/replacement accounting outcome. Under concurrent
+shutdown callers, phase progression is monotonic from running to draining to
+forced and MUST NOT regress.
+
+Every client and listener retains the existing finite TLS lifecycle bounds: by
+default authentication age is at most 15 minutes, connection-retirement drain
+is at most 30 seconds, and material-rotation jitter is at most 30 seconds. A
+consumer shutdown drains for at most 5 seconds. An establishment attempt has a
+1,500 ms setup limit and a call makes at most two pre-write establishment
+attempts. Resolution occurs only for establishment or re-establishment, never
+for a reused connection. Every cold request and rolling-prewarm setup MUST enter
+one pool-wide recovery lane after bounded physical admission. One
+failed setup or proven cached-lane loss publishes the shared exponential
+lifecycle backoff floor (50 ms by default) plus at most 25 ms jitter, clipped to
+each logical deadline;
+concurrent waiters MUST NOT start independent resolver/TCP/TLS/Hello attempts.
+Reauthentication, material
+changes, certificate expiry, idle retirement, cancellation, malformed frames,
+EOF, or an uncertain stream position terminate the connection and release its
+transport task slot; they do not create another request on that connection.
+"Material changes" here means an accepted material-epoch change. It MUST
+schedule each already-admitted lane at a stable directed authenticated-edge
+deadline no later than the configured rotation-jitter maximum; admitted work
+and reuse remain permitted before that deadline and retire at it. An explicit
+generation change MUST invalidate cached admission immediately. A fresh client
+or server handshake MUST exactly match the current generation and material
+epoch at its final pre-publication sample and MUST NOT use the cooperative
+jitter exception. TLS MUST expose only the single fixed-domain, fixed-range
+consumer jitter duration needed by session-net. It MUST NOT expose a comparable
+edge-key object, caller-selected digest range, identity, or digest bytes to
+callers or session-net diagnostics. A rejected publication
+that retains the admitted epoch MUST NOT interrupt an active frame. Each
+logical request pool MUST use exactly one maintenance task to
+remove cached lanes autonomously at the earliest idle/lifecycle deadline.
+Maintenance task/table cardinality MUST NOT scale with lanes, subscribers, or
+records.
+
+The caller owns the request ID for every mutation or lease operation. Only a
+failure classified as `NotTransmitted` may be automatically retried, and then
+only with the identical request ID and body. Positive ciphertext acceptance
+MUST be observed below TLS as well as at the framed plaintext writer, so a later
+outer TLS error cannot relabel an accepted prefix as `NotTransmitted`. Anything
+possibly written is `OutcomeUnknown`: the client evicts that lane and MUST NOT
+replay the request.
+The SDK MUST NOT mint a new request ID. Recovery may retry only the identical
+request body under the retained ID through the durable request binding; reuse
+of that ID for a different request is a closed conflict. Applications otherwise
+must perform authoritative readback and apply the existing fencing/idempotency
 contract.
 
-The v6 qualification profile records this dedicated ALPN/revision and the
-connection, frame, request/response, watch, task, and lifecycle limits beside
-the consensus profile. It records no consumer identity or scope material.
+For persistent V2 calls, `NotTransmitted` is a pre-write result. A
+`ReadUnavailable` result is a post-write read loss for a non-effectful V2
+capability, history, or status operation and may be retried as that read.
+`OutcomeUnknown { request_id }` is returned when an epoch-fenced V2 transition
+may have been delivered; the exact caller-owned `FencedTransitionV2RequestId`
+and complete body remain the recovery identity. The client MUST discard that
+lane and MUST NOT mint a successor ID or automatically replay the transition;
+recovery uses exact V2 status under the same ID/body and the durable V2 journal
+where protection is present. `OutcomeUnknownBatch { request_ids }` is returned
+when a V2 batch may have been delivered; `request_ids` preserves input order,
+and the client MUST use each matching ID for exact V2 status recovery rather
+than blindly replaying any mutation.
+
+`FencedTransitionStorageExhausted` is a retained, complete-body-bound,
+deterministic no-effect receipt, returned only after ordinary stale-fence,
+CAS, and lease admission for an otherwise successful transition. Its SQLite
+representability check covers requested generation/fence, exact acquire fence
+and global successors, credential allocation, application/watch sequences, and
+restore-scan revision. While retained, exact ID/body replay and status return
+`Recorded(Err(StorageExhausted))`; another body conflicts. No lease, record,
+watch, restore, or ordinary mutation effect occurs. Existing fenced receipts,
+generic-ID conflicts, `HistoryFull`, and `RetentionExhausted` precede this
+decision, and revoked authority masks storage state. At maximum application
+sequence it binds with the current nonzero sequence/digest and advances only
+logical time, the applied pointer, and the receipt; later blank or membership
+entries may still apply, without promising normal mutations remain available.
+
+For a fenced transition the public consumer request ID MUST be byte-identical
+to its nested `FencedTransitionRequestId`. The quorum adapter namespaces the
+internal receipt ID by authenticated consumer identity and stable cluster
+identity, enforces the exact current cluster/configuration/epoch scope under the
+activation lifecycle above, and submits no separate `BindConsumerRequest` or
+binding log entry. The transition receipt therefore binds the complete
+canonical body in the same single consensus entry as the lease and record
+effect. A changing authorized configuration scope does not change that internal
+receipt ID, so an authorized successor can recover the same retained result; a
+revoked predecessor cannot observe it. Status is read-only, and `NotFound` does
+not prove that an earlier delayed proposal cannot still commit, does not permit
+deletion, and does not permit reuse of the stable transition ID.
+
+Each explicit prewarm MUST perform a rolling resolver/TCP/TLS/Hello refresh of
+every configured request lane and preserve refreshed plus unprocessed healthy
+capacity after a partial failure. Prewarm and readiness may prove authenticated
+consumer transport capacity only;
+they never prove quorum or product readiness. Readiness deliberately becomes
+false while a request lane is leased; reserved Watch transport slots are
+non-gating.
+Diagnostics are fixed and
+nonidentifying: setup phase, pool wait, active/maximum/idle counts,
+reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They
+MUST NOT include endpoints, identities, scope values, credentials, keys,
+payloads, request or correlation IDs, owners, or fences. Any performance
+evidence for this transport is synthetic only and makes no ePDG production-SLO
+claim.
+
+Reauthentication, accepted material rotation, idle/lifecycle retirement, and
+the bounded public shutdown apply to both ALPN-isolated persistent pools.
+Shutdown begins both drain paths together so V2 cannot extend the bounded V1
+shutdown window. Per-pool maintenance remains constant; no lane-, subscriber-,
+or record-scaled maintenance state is introduced.
+
+The v7 qualification profile remains the revision-2 persistent-transport
+inventory and records its connection, frame, request/response, watch, task,
+and lifecycle limits beside the consensus profile. The published v6 profile
+remains the unchanged revision-1 contract. General `/1` revision 6 retains the
+bounded transport properties, the revision-3 generic #696 family, and
+revision-4 exact retained status recovery for ordinary leases. V2 `/2`
+revision 5 retains its fixed full-width attempt tuple, exact request commitment,
+exact below-TLS write observation, rolling fresh prewarm, and pool-wide
+cold-setup serialization. Protected-roster `/3` remains an isolated revision-5
+roster-only lane. The live v8 exact-head schema remains
+experimental and fixes `qualification_complete=false`. No profile or evidence
+records consumer identity or scope material. Synthetic warm accept/reuse checks
+gate only their transport method; elapsed samples are non-gating and are not an
+SLO.
+
+V2 is an additive protocol family; it neither changes the V1 revision-6 wire
+enum nor upgrades a V1 request. Its exact capability, history, execution, and
+status outcomes remain on the separate ALPN and V2 identity described above.
+
+Revision 5 retains revision 4's `StorageExhausted` only inside the closed
+fenced-transition `Recorded` status result. Frozen session-net v5 maps this outcome fail-closed as
+an unknown capability; its wire enum and revision remain unchanged. Product and
+ePDG composition remain outside this generic API.
 
 ## 13. Local Cache
 
@@ -1695,6 +2003,121 @@ the wrapper, using the envelope key ID for historical-key selection. Provider
 unavailability MAY block new protection or plaintext reads, but MUST NOT cause
 provider I/O during deterministic apply or make already sealed Raft replay and
 quorum formation depend on provider availability.
+
+The following protected-transition rules apply only to #701's protected V2
+composition. Its raw physical store and authenticated-consumer transport execute
+only the V1 `fenced_transition` protocol. This is distinct from #702's
+epoch-fenced V2 protocol, which has its separate
+`FencedTransitionV2Capability::V2`, `FencedTransitionV2PreparedJournal`,
+56-byte identity, and `/2` consumer lane.
+
+For #701 protected transitions, the outer `EncryptingSessionBackend` or
+`RemoteSealingSessionBackend` advertises
+`AtomicFencedTransitionCapability::V2` only when it owns an SDK caller-side
+durable `PreparedFencedTransitionJournal` and composes over an exact V1 physical
+boundary that explicitly witnesses unchanged protected bytes. This #701
+journal, rather than a legacy prepared token or application-persisted request
+state, is the durable recovery authority. The application retains only the
+caller-stable `FencedTransitionRequestId`, which it MUST reuse for that same
+logical operation after restart.
+
+Protected preparation validates the request, capability-gates the exact inner
+V1 boundary, and checks that the journal has no binding for the ID before
+effects. It obtains record-expiry preflight before provider work, seals each
+create/update body exactly once, leaves delete and refresh provider-free,
+obtains the inner physical token, and durably inserts the complete outer token
+with create-only semantics before returning success. Execution, status, and
+recovery reload and authenticate the exact journal token; execution and status
+may dispatch only its retained physical bytes. They MUST NOT reseal, unseal,
+read back, reconstruct, or consult the current active key/provider. Missing,
+incompatible, corrupt, or byte-mismatched journal state fails closed with no
+provider or transport I/O; execute reports the known-local case as
+`NotTransmitted`, while status and recovery return their typed local
+fail-closed result. Any may-have-sent result remains `OutcomeUnknown` under the
+expected request ID. `NotFound` is non-exclusion: it never permits deletion or
+reuse of the ID and does not prove a delayed proposal cannot commit.
+
+The consumer physical bridge is only for use underneath such a protected
+journaled wrapper. It is atomic-subset-only, fails every unrelated
+`SessionBackend` operation locally without I/O, and does not implement
+`SessionLeaseManager`. Its opaque local marker commits only the authenticated
+consumer SPIFFE identity and stable cluster ID; it excludes endpoint/address,
+TLS server identity, leader, configuration ID/epoch, certificate/key, and
+material epoch. Authorized endpoint, leader, topology, TLS-leaf, server, and
+provider/key rotation can therefore use the same durable journal path, key,
+and volume. This does not claim host failover, host/volume-loss recovery,
+journal replication, or a second consensus transition.
+
+Journal provisioning and reopening are distinct. A deployment MUST call
+`PreparedFencedTransitionJournal::create_new` exactly once for a missing path
+and `open_existing` on every restart. Reopening never creates or initializes a
+missing, pristine, truncated, reset, or partial database; the deprecated
+`open` alias is reopen-only. The independent stable integrity key is unique to
+that exact journal path/storage boundary, MUST NOT be reused for another
+journal, and MUST NOT be logged. On Unix the SDK descriptor-walks and retains
+the full path chain, requires a private effective-user-owned `0700` parent and
+regular single-link `0600` file, and revalidates the path, file, and SQLite
+main-file movement state around each operation. The deployment MUST give that
+effective user exclusive writer authority over the durable path; an actor with
+equivalent same-user replacement authority is part of the trusted storage
+boundary. The containing directory MUST reserve the database leaf and its
+SQLite sidecar names exclusively for this journal, on a local filesystem with
+truthful POSIX locking, `fsync`, directory-sync, and storage-barrier semantics;
+NFS-like mounts are unsupported. Within one process, callers MUST clone the
+admitted SDK journal handle instead of reopening the same inode or opening it
+directly through SQLite. The SDK enforces one live SQLite connection per
+admitted inode so its pre-open header check cannot release another connection's
+process-scoped POSIX locks. Platforms without those checks fail closed for the
+#701 protected V2 composition.
+
+The #701 journal uses zeroize-on-drop HMAC-SHA-256 state, SQLite WAL, a fixed
+pre-open page/cache-header profile, `synchronous=EXTRA`, bounded SQLite limits
+and catalog/membership scans, and bounded opaque rows containing no plaintext.
+A full authenticated journal
+rejects a new ID before expiry, provider, or inner-prepare work. Payloads,
+identities, request IDs, paths, keys, provider material, token bytes, and
+journal contents MUST NOT appear in examples, fixtures, logs, diagnostics, or
+evidence. The #701 prepared-token and `PreparedFencedTransitionJournal` schemas
+are downgrade fences: unknown versions, raw V1, and older binaries MUST NOT
+operate this protected journaled path. #702's separate
+`FencedTransitionV2Capability::V2` and `FencedTransitionV2PreparedJournal` do
+not upgrade, replace, or share the #701 protocol or journal. The #701 journal
+layer makes no journal GC, retention, ledger-lifetime, or capacity-lifecycle
+claim.
+
+The schema-3 journal also commits a fresh per-journal incarnation, bounded
+membership count, and root over the exact retained request-ID/tag set with a
+separate HMAC. Health, lookup/recovery, and insertion verify that complete
+small bounded set; lookup authenticates the selected token, and insertion
+verifies its new row and updates the membership commitment in its single
+transaction before commit. A fixed covering index keeps the proof independent
+of token size. That authenticated index is the presence authority; the bounded
+proof cross-validates every index rowid, request ID, and fixed tag against the
+table, and compares independently bounded table and primary-index scans. The
+schema stores the fixed tag before the potentially overflowing body, so the
+global proof never reads retained bodies. A selected row then validates its
+body against the authenticated tag. Divergent table, primary, or
+secondary-index state therefore fails closed instead of becoming absence. A
+finite VDBE-work budget applies before schema initialization and to every
+journal operation, in addition to bounded SQL, catalog, and membership limits.
+The SQLite catalog is an exact whitelist of the SDK tables, generated
+primary-key autoindex, and membership index, rejecting every other object,
+including reserved-prefix catalog entries, before setup. This detects offline
+row deletion, addition, primary-key replacement, index divergence, and tag
+corruption inside the same durable file. A corrupt selected body fails its
+exact row authentication and cannot be treated as absent or rebound. It cannot
+detect restoration of an older complete valid database snapshot: that rollback is
+outside the same-durable-file guarantee unless deployment provides an external
+monotonic anti-rollback anchor.
+
+The token wire form begins with a fixed magic, schema version, and body length;
+version dispatch precedes decoding the frozen V1 body. A golden compatibility
+corpus pins both lease forms, every mutation, no-expiry and finite-expiry record
+shapes, and every supported local/remote/consensus protection-stack shape and
+order. SDK-owned canonical and complete-body scratch allocations wipe on drop.
+External serialization and persistence buffers remain the caller's
+responsibility and inherit the same prohibition on diagnostic or metric
+emission.
 
 Remote unseal MUST pass the canonical envelope key ID through the provider
 boundary after validating envelope shape and record AAD. The active remote key
@@ -1929,7 +2352,7 @@ fencing.
   fail-closed revision-1/revision-2 profile mismatch.
 - Exact-limit and one-byte-over outbound encoding for every response/watch
   family; no oversized allocation or emitted prefix on rejection; non-truncated
-  record/batch behavior; contiguous log and cursor-correct restore prefixes;
+  record/batch behavior; contiguous log and cursor-correct restore pages;
   fixed fallback redaction; and iterative consuming rejection of nested trees.
 - One absolute write deadline for prefix/payload/flush; authenticated slow-reader
   reaping; handler/connection-slot return to baseline; repeated reconnect bounds
@@ -2001,7 +2424,7 @@ fencing.
   unrelated survivor explicit/material-epoch retirement counters unchanged,
   and settles all lifecycle drains plus survivor availability episodes before
   the next traffic baseline. The schedule-bound
-  `member-scoped-reauth-settled-baseline/v3` checkpoint starts its 86-second
+  `member-scoped-reauth-settled-baseline/v4` checkpoint starts its 86-second
   absolute bound and 60-second two-stage server tail at the atomic
   projected-data rename, then requires a final 2.5-second outbound-ledger quiet
   tail. A prepublication common-key pulse and conservative 13-second
@@ -2009,9 +2432,11 @@ fencing.
   and bound that pulse's worst-case actual event gap to 26 seconds. An
   independent 26-second checkpoint requires every active key on every observer
   and cannot be reset by a faster key.
-  Each survivor may record at most one interruption/recovery pair while the
-  expired member rejoins; it must settle inside the 26-second SLO, and a second
-  or late episode fails closed. Fault-era new-attempt and reconnect deltas
+  Each survivor may record at most one availability episode while the expired
+  member rejoins. Consecutive typed retry outcomes inside that episode remain
+  separately bounded by the unchanged eight-outcome ceiling; all must settle
+  inside the 26-second SLO, and a second or late episode fails closed.
+  Fault-era new-attempt and reconnect deltas
   retain a fixed 85/161 per-node bound: ordinary 24/40, fifteen five-second
   refresh rounds over four/eight incident paths, and one scheduled
   post-hard-expiry survivor-to-expired network-negative attempt per involved

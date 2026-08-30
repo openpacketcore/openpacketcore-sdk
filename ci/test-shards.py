@@ -16,7 +16,9 @@ selection builds it with ``all-apps``.
 
 Cargo launches the test binaries itself, so the harness argv, working
 directory and every ``CARGO_*`` variable a test may read stay exactly what the
-single-job run provided.
+single-job run provided, except for the explicitly enumerated protected-roster
+and snapshot/restart proofs that compile at test profile O1 without changing
+their literal authority bounds.
 
 Usage:
     test-shards.py ids                 # shard ids, one per line (CI matrix)
@@ -54,9 +56,47 @@ SELECTION = ["cargo", "test", *PACKAGES, "--quiet"]
 EXAMPLES = ["cargo", "build", *PACKAGES, "--quiet", "--examples"]
 HARNESS = ["--test-threads=4"]
 
+# These tests intentionally prove literal authority or operation budgets.
+# Running them beside unrelated Tokio runtimes makes the assertion measure
+# process scheduling and fixture teardown instead of the request path. Keep
+# the production bounds exact and give each timing contract its own process.
+QUIESCENT_INTEGRATION_TARGET = "stateless_quorum_consumer"
+QUIESCENT_INTEGRATION_TESTS = (
+    "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
+    "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
+    "persistent_three_voter_first_transition_has_one_leader_activation_proof",
+    "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
+    "persistent_three_voter_protected_roster_survives_real_os_process_loss",
+    "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
+    "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
+    "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
+    "persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running",
+    "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
+)
+QUIESCENT_CONSENSUS_OPENRAFT_TARGET = "consensus_openraft"
+QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
+    "lagging_replica_installs_compacted_snapshot_without_losing_committed_state",
+    "fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect",
+)
+OPTIMIZED_QUIESCENT_INTEGRATION_TESTS = frozenset(
+    {
+        "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
+        "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
+        "persistent_three_voter_protected_roster_commits_maximum_plan_and_result_then_established_terminal",
+        "persistent_three_voter_snapshot_maintenance_with_concurrent_read_barriers_keeps_engines_running",
+        "persistent_three_voter_protected_roster_exact_bytes_survive_snapshot_and_full_restart",
+    }
+)
+if not OPTIMIZED_QUIESCENT_INTEGRATION_TESTS.issubset(QUIESCENT_INTEGRATION_TESTS):
+    raise RuntimeError("optimized timing tests must also be isolated timing tests")
+# Keep O1 confined to the snapshot/restart roster proofs.
+# Applying it to unrelated expiry/fault tests changes their lifecycle timing
+# and would no longer qualify the repository's ordinary test profile.
+
 # A partition that collapses to a handful of targets would still be "total and
 # disjoint" if metadata were misread, so hold a floor on the real inventory
-# (249 today).
+# (verify the live inventory with `test-shards.py verify`; keep this floor
+# deliberately below it).
 MIN_INTEGRATION_TARGETS = 240
 
 
@@ -130,6 +170,51 @@ def shard_ids(plan: dict) -> list[str]:
     return ids
 
 
+def quiescent_integration_command(name: str) -> list[str]:
+    """Run one wall-time-sensitive contract in its exact isolated profile."""
+    profile = (
+        ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"]
+        if name in OPTIMIZED_QUIESCENT_INTEGRATION_TESTS
+        else []
+    )
+    return profile + SELECTION + [
+        "--test",
+        QUIESCENT_INTEGRATION_TARGET,
+        "--",
+        "--test-threads=1",
+        "--exact",
+        name,
+    ]
+
+
+def quiescent_consensus_openraft_command(name: str) -> list[str]:
+    """Run one snapshot contract alone with no competing test runtime."""
+    return SELECTION + [
+        "--test",
+        QUIESCENT_CONSENSUS_OPENRAFT_TARGET,
+        "--",
+        "--test-threads=1",
+        "--exact",
+        name,
+    ]
+
+
+def quiescent_contracts() -> tuple:
+    """The target-specific contracts that require a fresh test process."""
+    return (
+        (
+            QUIESCENT_INTEGRATION_TARGET,
+            QUIESCENT_INTEGRATION_TESTS,
+            quiescent_integration_command,
+        ),
+        (
+            QUIESCENT_CONSENSUS_OPENRAFT_TARGET,
+            QUIESCENT_CONSENSUS_OPENRAFT_TESTS,
+            quiescent_consensus_openraft_command,
+        ),
+    )
+
+
 def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
     """The cargo invocations for one shard."""
     heavy = plan["heavy"]
@@ -166,7 +251,34 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
     selected = [arg for name in buckets[shard] for arg in ("--test", name)]
     if not selected:
         sys.exit(f"shard {shard} selected no targets; the plan is broken")
-    return [SELECTION + selected + ["--", *HARNESS]]
+    contracts = [
+        contract
+        for contract in quiescent_contracts()
+        if contract[0] in buckets[shard]
+    ]
+    if not contracts:
+        return [SELECTION + selected + ["--", *HARNESS]]
+
+    # libtest's skip filter is substring-based unless --exact is present. The
+    # ordinary invocation still runs every other test in this target, while a
+    # fresh process runs each timing contract alone with no competing runtime.
+    skips = [
+        arg
+        for _, names, _ in contracts
+        for name in names
+        for arg in ("--skip", name)
+    ]
+    ordinary = (
+        SELECTION
+        + selected
+        + ["--", *HARNESS, "--exact", *skips]
+    )
+    isolated = [
+        command(name)
+        for _, names, command in contracts
+        for name in names
+    ]
+    return [ordinary, *isolated]
 
 
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -236,6 +348,59 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
             # `--exact` with no names disables filtering, so an empty group
             # would silently re-run the entire heavy target.
             sys.exit(f"heavy-{index} names no tests; remove the group instead")
+
+    buckets = assign(plan, targets)
+    declared_names: set[str] = set()
+    for target, names, _ in quiescent_contracts():
+        if not names:
+            sys.exit(f"{target!r} has no isolated timing contracts")
+        if len(names) != len(set(names)):
+            sys.exit(f"{target!r} repeats an isolated timing contract")
+        if target not in targets:
+            sys.exit(f"isolated timing-contract target {target!r} does not exist")
+        duplicate = declared_names & set(names)
+        if duplicate:
+            sys.exit(f"isolated timing contracts are duplicated: {sorted(duplicate)}")
+        declared_names.update(names)
+
+        owners = [
+            bucket_shard
+            for bucket_shard, bucket_targets in buckets.items()
+            if target in bucket_targets
+        ]
+        if len(owners) != 1:
+            sys.exit(
+                f"{target!r} must belong to exactly one integration shard, "
+                f"found {owners}"
+            )
+        owner = owners[0]
+        owner_contracts = [
+            contract
+            for contract in quiescent_contracts()
+            if contract[0] in buckets[owner]
+        ]
+        owner_commands = commands(plan, owner, targets)
+        expected_isolated = [
+            command(name)
+            for _, contract_names, command in owner_contracts
+            for name in contract_names
+        ]
+        if owner_commands[1:] != expected_isolated:
+            sys.exit(
+                f"{owner} must run isolated timing contracts once each, in "
+                "their declared target and name order"
+            )
+        skip = ["--exact"] + [
+            arg
+            for _, contract_names, _ in owner_contracts
+            for name in contract_names
+            for arg in ("--skip", name)
+        ]
+        if owner_commands[0][-len(skip) :] != skip:
+            sys.exit(
+                f"{owner} must skip every isolated timing contract exactly "
+                "once in its ordinary multi-test process"
+            )
     print(f"shard commands ok: misc issues {len(misc)} invocations")
 
 
@@ -298,6 +463,26 @@ def list_heavy_tests(plan: dict, extra: list[str]) -> set[str]:
     }
 
 
+def list_quiescent_test(target: str, name: str) -> list[str]:
+    """Resolve the isolated timing contract using its exact CI invocation."""
+    command = SELECTION + [
+        "--test",
+        target,
+        "--",
+        "--list",
+        "--exact",
+        name,
+    ]
+    out = subprocess.run(
+        command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
+    ).stdout
+    return [
+        line.rsplit(":", 1)[0]
+        for line in out.splitlines()
+        if line.endswith(": test")
+    ]
+
+
 def precheck(plan: dict, shard: str) -> None:
     """Fail a heavy shard whose named tests no longer resolve.
 
@@ -310,7 +495,26 @@ def precheck(plan: dict, shard: str) -> None:
     # Every shard re-checks the plan itself: rust-tests legs start alongside
     # rust-gates rather than after it, so without this a broken plan would
     # burn six runners before the gates job reported it.
-    verify(plan, integration_targets())
+    targets = integration_targets()
+    verify(plan, targets)
+    buckets = assign(plan, targets)
+    if shard in buckets:
+        contracts = [
+            contract
+            for contract in quiescent_contracts()
+            if contract[0] in buckets[shard]
+        ]
+        for target, names, _ in contracts:
+            for name in names:
+                selected = list_quiescent_test(target, name)
+                if selected != [name]:
+                    sys.exit(
+                        f"{shard} cannot resolve isolated test {name!r} in "
+                        f"{target!r} exactly once; selected {selected}"
+                    )
+        if contracts:
+            count = sum(len(names) for _, names, _ in contracts)
+            print(f"{shard} isolated timing contracts resolve exactly once: {count}")
     if not shard.startswith("heavy-"):
         return
     group = plan["heavy"]["shards"][int(shard.split("-", 1)[1])]

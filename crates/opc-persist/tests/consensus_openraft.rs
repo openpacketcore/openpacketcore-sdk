@@ -14,13 +14,14 @@ use opc_key::{
     ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose, Zeroizing, AES_256_GCM_SIV_KEY_LEN,
     AES_256_GCM_SIV_NONCE_LEN,
 };
+#[cfg(feature = "dangerous-test-hooks")]
+use opc_persist::ConfirmedCommitResolution;
 use opc_persist::{
     ApprovedLegacyConfigRecovery, AttestedConfigCommit, AuditKey, AuditOpType, AuditRecord,
     CommitRecord, CommitSource, ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch,
     ConfigConsensusConfigurationId, ConfigConsensusIdentity, ConfigConsensusNodeId,
-    ConfigConsensusRequestId, ConfigConsensusTopology, ConfigStore, ConfirmedCommitResolution,
-    ConsensusConfigStore, LegacyConfigTailDisposition, PersistErrorKind, RollbackTarget,
-    SqliteBackend,
+    ConfigConsensusRequestId, ConfigConsensusTopology, ConfigStore, ConsensusConfigStore,
+    LegacyConfigTailDisposition, PersistErrorKind, RollbackTarget, SqliteBackend,
 };
 use opc_types::{ConfigVersion, SchemaDigest, Timestamp, TxId};
 use sha2::{Digest, Sha256};
@@ -411,6 +412,7 @@ fn attested(record: CommitRecord, audit: Vec<AuditRecord>) -> AttestedConfigComm
         .expect("attested config commit")
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
 fn fenced_attested(mut record: CommitRecord, audit: Vec<AuditRecord>) -> AttestedConfigCommit {
     let seed = record.schema_digest.as_bytes()[0];
     let aad_principal = record.principal.clone();
@@ -432,6 +434,7 @@ fn fenced_attested(mut record: CommitRecord, audit: Vec<AuditRecord>) -> Atteste
         .expect("attested fenced config commit")
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
 fn attested_resolving(
     record: CommitRecord,
     audit: Vec<AuditRecord>,
@@ -1540,6 +1543,7 @@ async fn follower_committed_history_is_served_from_local_applied_state() {
     cluster.shutdown().await;
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
 #[tokio::test]
 async fn leader_change_never_exposes_a_fenced_committed_tail() {
     let cluster = ThreeNodeCluster::start().await;
@@ -1612,6 +1616,10 @@ async fn leader_change_never_exposes_a_fenced_committed_tail() {
     let survivors = (0..3)
         .filter(|node| *node != old_leader)
         .collect::<Vec<_>>();
+    cluster.stores[survivors[0]]
+        .trigger_election_for_test()
+        .await
+        .expect("caught-up survivor starts a normal Openraft campaign");
     tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
         loop {
             let statuses = survivors
@@ -1689,6 +1697,7 @@ async fn leader_change_never_exposes_a_fenced_committed_tail() {
     cluster.shutdown().await;
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
 #[tokio::test]
 async fn lost_commit_ack_is_outcome_unknown_and_same_id_replays_after_leader_loss() {
     let cluster = ThreeNodeCluster::start().await;
@@ -1735,6 +1744,10 @@ async fn lost_commit_ack_is_outcome_unknown_and_same_id_replays_after_leader_los
         }
     }
     let survivors = (0..3).filter(|node| *node != leader).collect::<Vec<_>>();
+    cluster.stores[follower]
+        .trigger_election_for_test()
+        .await
+        .expect("caught-up survivor starts a normal Openraft campaign");
     tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
         loop {
             let statuses = survivors
@@ -1785,6 +1798,7 @@ async fn lost_commit_ack_is_outcome_unknown_and_same_id_replays_after_leader_los
     cluster.shutdown().await;
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
 #[tokio::test]
 async fn replacement_leader_cannot_flip_an_atomic_confirmed_commit_decision() {
     let cluster = ThreeNodeCluster::start().await;
@@ -1819,6 +1833,11 @@ async fn replacement_leader_cannot_flip_an_atomic_confirmed_commit_decision() {
             ))
             .await
     });
+
+    cluster.stores[survivors[0]]
+        .trigger_election_for_test()
+        .await
+        .expect("caught-up survivor starts a normal Openraft campaign");
 
     let replacement = tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
         loop {

@@ -244,8 +244,9 @@ backend dispatch or caller exposure. It omits restore `loaded_count` and
 `complete` and recomputes them after decode. Independent limits admit 256 batch
 operations, 1,024 restore records, 65,536 replication-log entries, and 65,536
 rebuild entries, in addition to the configured frame-size bound. The exact
-profile pins wire-schema revision 6, error-set revision 9, a 4 MiB restore
-payload bound, 8 MiB retained-page and examined key/filter-metadata bounds,
+profile pins wire-schema revision 7, error-set revision 9, a 2,096,128-byte
+restore wire-payload bound, 8 MiB retained-page and examined key/filter-metadata
+bounds,
 `max_restore_scan_examined_rows = 4096`, 128-byte
 owner/custom-key/state-type bounds, depth-16/256-node replication trees, and the
 31,536,000-second TTL maximum. Revision 2 additionally pins
@@ -259,8 +260,9 @@ lowercase hyphenated UUIDs with the exact 36-byte encoding. Error-set revision
 compacted-cursor outcomes; revision 5 adds non-CAS backend and lease ambiguity
 outcomes; revision 6 adds bounded-watch catch-up; and revision 7 adds
 absolute-record-expiry rejection. Revision 8 adds the bounded expiry-preflight
-limit outcome. Wire revision 4/error revision 7 or older peers are
-incompatible.
+limit outcome. The exact direct v5 profile is wire-schema revision 7/error-set
+revision 9; every non-current direct profile combination is incompatible.
+Deployments require a coordinated drained stop/upgrade/start.
 Public
 `Request`/`Response` remain, but `Hello`/`HelloAck` gain an optional
 `contract_profile`; exhaustive construction and matching must account for the
@@ -286,16 +288,19 @@ independent request-frame size. Each is a checked `u32` between
 `MIN_RESTORE_SCAN_RESPONSE_FRAME_SIZE` aliases that same minimum.
 This makes unequal client/server limits explicit. The directional fields were
 introduced by wire-schema revision 2 and are retained by the current
-wire-schema revision 6/error-set revision 9 profile. Older exact profiles,
-including error revision 8 or older, are incompatible; the
-current ALPN is `opc-session-net/5`.
+wire-schema revision 7/error-set revision 9 profile. Every non-current direct
+profile combination, including error revision 8 or older, is incompatible; the
+current ALPN is `opc-session-net/5`. Deployments require a coordinated drained
+stop/upgrade/start.
 
 Every response and watch item is fully bounded-encoded before any frame prefix
 is emitted. Common non-pageable and complete-page successes use one bounded
-encode without a sizing preflight. An oversized pageable direct attempt emits
-no prefix; bounded logarithmic sizing probes and the final encode reuse one
-absolute deadline established before the first encode/probe and continuing
-through prefix, payload, and flush. Lazy exact-length boxed chunks are not
+encode without a sizing preflight. For a replication-log page, an oversized
+pageable direct attempt emits no prefix; bounded logarithmic sizing probes and
+the final encode reuse one absolute deadline established before the first
+encode/probe and continuing
+through prefix, payload, and flush. Restore pages are validated as whole
+backend results and are never transport-shaped. Lazy exact-length boxed chunks are not
 coalesced; their total retained encoded-JSON byte storage never exceeds the
 negotiated cap. Chunk metadata and allocator slab/RSS overhead remain separate.
 The synchronous storage/sizing sinks check deadline and server-abort
@@ -313,8 +318,12 @@ sent once and return typed non-retryable ambiguity after transmission when an
 exact result cannot be confirmed. Pre-transmission failure remains known not
 applied. Backend adapters own cancellation: blocking/spawned work must be
 bounded and supervised rather than detached on async-wrapper drop.
-Records and positional batch results are never truncated. Restore and log reads
-may return only complete cursor/contiguous-sequence prefixes. Watch never skips
+Records and positional batch results are never truncated. Restore backends may
+independently return shorter cursor-correct pages under their count, payload, or
+work budgets; transport validates each complete page against the fixed wire cap
+and negotiated frame and never trims or rewrites it. Log reads may return only
+complete contiguous-sequence prefixes. An oversize restore page returns typed
+`RestoreScanResponseTooLarge` when representable or closes. Watch never skips
 an oversized entry; a fixed SDK-owned redaction-safe error is emitted when it
 fits and the stream ends, otherwise the connection closes. Nested rejected
 entries retain iterative consuming disposal.
@@ -328,8 +337,9 @@ limits. It is zero at the exact 8 KiB minimum; that minimum fits bounded
 metadata/envelopes, not a non-zero application payload. It remains
 static/descriptive evidence, not quorum readiness.
 The 1 MiB default advertises 130,048 bytes and the 16 MiB ceiling advertises
-2,096,128. SQLite's full 1 MiB value limit requires at least 8,396,800 frame
-bytes, so 16 MiB is the recommended setting for that profile. This remains a
+2,096,128. The wire ceiling is intentionally below standalone SQLite's local
+4 MiB + 64 KiB stored-envelope restore capacity, which is not a session-net
+wire capability. This remains a
 per-frame limit: at the default 128 connection slots, simultaneous
 ceiling-sized encodes can retain about 2 GiB before metadata/TLS/runtime
 overhead. The aggregate scales with `with_max_connections`; aggregate byte
@@ -354,10 +364,10 @@ integer operations rather than floating point or panicking timestamp
   unwinding a process; Openraft supplies commit proof independently.
 
 The new public error variants require exhaustive callers. Protocol v4
-introduced their private fixed-width DTOs in error revision 1; current error
-revision 8 retains those encodings, adds the bounded expiry-preflight outcome,
-and rejects an error-revision-7 or older
-peer during negotiation.
+introduced their private fixed-width DTOs in error revision 1; current v5 error
+revision 9 retains those encodings and adds the bounded expiry-preflight and
+topology-authority outcomes. Every non-current direct profile combination is
+rejected during negotiation.
 Operators must first audit persisted legacy
 replication logs: a TTL-bearing entry above 365 days now fails closed during
 replay/rebuild and is neither clamped nor rewritten automatically. Replicated

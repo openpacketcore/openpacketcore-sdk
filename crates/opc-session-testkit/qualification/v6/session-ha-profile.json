@@ -171,7 +171,7 @@
     "max_replication_log_page_entries": 65536,
     "max_watch_backlog_entries": 64,
     "max_restore_page_records": 1024,
-    "max_restore_page_payload_bytes": 4194304,
+    "max_restore_page_payload_bytes": 2096128,
     "max_restore_examined_rows": 4096,
     "max_restore_sqlite_work_millis": 1000
   },

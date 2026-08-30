@@ -1,0 +1,1077 @@
+//! Boundary contracts for the bounded persistent consumer transport.
+//!
+//! These tests use only the public typed consumer boundary.  The small
+//! in-process service records dispatch after the authenticated server has
+//! checked the fixed scope and identity; it does not expose a backend,
+//! consensus RPC, or replication operation to the client.
+
+use std::io;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::stream::{self, BoxStream, StreamExt};
+use opc_consensus::{derive_configuration_id, ConsensusClusterId, ConsensusConfigurationEpoch};
+use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
+use opc_session_net::{
+    session_consumer_payload_budget, ConnectionLifecyclePolicy, PersistentSessionConsumerClient,
+    PersistentSessionConsumerConfig, PersistentSessionConsumerExecuteError, RemoteAddrResolver,
+    SessionConsumerAuthorizer, SessionConsumerClientError, SessionQuorumConsumerServer,
+    StatelessSessionConsumerClient, MAX_NEGOTIATED_FRAME_SIZE, SESSION_QUORUM_CONSUMER_ALPN,
+    SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+};
+use opc_session_store::{
+    BackendCapabilities, ConsensusSessionStore, OwnerId, QuorumReplicaDescriptor,
+    ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
+    SessionConsensusIdentity, SessionConsumerAuthorization, SessionConsumerAuthorizationGrant,
+    SessionConsumerChange, SessionConsumerLeaseError, SessionConsumerOperation,
+    SessionConsumerRejection, SessionConsumerRequest, SessionConsumerRequestId,
+    SessionConsumerResponse, SessionConsumerScope, SessionConsumerStoreError,
+    SessionConsumerTenantNfScope, SessionConsumerVoterAuthority, SessionKey, SessionKeyType,
+    SessionQuorumConsumer, SqliteSessionBackend, ValidatedQuorumTopology,
+};
+use opc_tls::{AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder};
+use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::watch;
+
+fn transported_capabilities() -> BackendCapabilities {
+    BackendCapabilities {
+        max_value_bytes: session_consumer_payload_budget(
+            MAX_NEGOTIATED_FRAME_SIZE,
+            MAX_NEGOTIATED_FRAME_SIZE,
+        ),
+        ..BackendCapabilities::all_enabled()
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", content = "body", rename_all = "snake_case")]
+enum CanonicalConsumerBootstrapRequest {
+    Hello(CanonicalConsumerHello),
+}
+
+#[derive(serde::Serialize)]
+struct CanonicalConsumerHello {
+    transport_revision: u16,
+    scope: SessionConsumerScope,
+    expected_server_node_id: u64,
+    voter_count: u16,
+    roster_commitment: [u8; 32],
+    response_frame_size: u32,
+}
+
+struct TestPki {
+    ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
+}
+
+impl TestPki {
+    fn new() -> Self {
+        let key = rcgen::KeyPair::generate().expect("test CA key");
+        let mut parameters = rcgen::CertificateParams::default();
+        parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        parameters
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "persistent boundary test CA");
+        Self {
+            ca: rcgen::CertifiedIssuer::self_signed(parameters, key).expect("test CA certificate"),
+        }
+    }
+
+    fn identity_state(&self, spiffe_id: &str) -> opc_identity::IdentityState {
+        let mut parameters = rcgen::CertificateParams::default();
+        parameters.subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(spiffe_id).expect("test SPIFFE URI"),
+        ));
+        let now = time::OffsetDateTime::now_utc();
+        parameters.not_before = now - time::Duration::days(1);
+        parameters.not_after = now + time::Duration::days(1);
+        let key = rcgen::KeyPair::generate().expect("test leaf key");
+        let certificate = parameters
+            .signed_by(&key, &self.ca)
+            .expect("test leaf certificate");
+        let certificates =
+            parse_certs_pem(&(certificate.pem() + &self.ca.pem())).expect("test certificate chain");
+        let private_key = parse_key_pem(&key.serialize_pem()).expect("test private key");
+        let mut bundles = opc_identity::TrustBundleSet::new();
+        bundles.insert(TrustBundle {
+            trust_domain: opc_identity::TrustDomain::new("test.example").expect("trust domain"),
+            certificates: parse_certs_pem(&self.ca.pem()).expect("test trust bundle"),
+        });
+        build_identity_state(certificates, private_key, bundles).expect("test identity state")
+    }
+
+    fn client_config(&self, spiffe_id: &str) -> AuthenticatedClientConfig {
+        let (_source, receiver) = watch::channel(Some(self.identity_state(spiffe_id)));
+        TlsConfigBuilder::new(receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .expect("test client TLS config")
+    }
+
+    fn rotating_client_config(
+        &self,
+        spiffe_id: &str,
+    ) -> (
+        AuthenticatedClientConfig,
+        watch::Sender<Option<opc_identity::IdentityState>>,
+    ) {
+        let (source, receiver) = watch::channel(Some(self.identity_state(spiffe_id)));
+        let config = TlsConfigBuilder::new(receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_client_config()
+            .expect("rotating client TLS config");
+        (config, source)
+    }
+
+    fn server_config(&self, spiffe_id: &str) -> AuthenticatedServerConfig {
+        let (_source, receiver) = watch::channel(Some(self.identity_state(spiffe_id)));
+        TlsConfigBuilder::new(receiver)
+            .allow_any_trusted_peer()
+            .build_authenticated_server_config()
+            .expect("test server TLS config")
+    }
+}
+
+#[derive(Default)]
+struct RecordingConsumer {
+    calls: AtomicUsize,
+    committed: AtomicUsize,
+    block_after_commit: AtomicBool,
+    requests: Mutex<Vec<SessionConsumerRequest>>,
+}
+
+impl RecordingConsumer {
+    async fn wait_for_calls(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while self.calls.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("consumer dispatch reaches the bounded fixture deadline");
+    }
+
+    fn requests(&self) -> Vec<SessionConsumerRequest> {
+        self.requests
+            .lock()
+            .expect("request recording lock")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl SessionQuorumConsumer for RecordingConsumer {
+    async fn execute(
+        &self,
+        _identity: &SessionConsumerAuthorization,
+        request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests
+            .lock()
+            .expect("request recording lock")
+            .push(request.clone());
+        if matches!(
+            request.operation(),
+            SessionConsumerOperation::AcquireLease { .. }
+        ) {
+            // This is the fixture's durable-effect boundary.  It is recorded
+            // before intentionally withholding a response below.
+            self.committed.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.block_after_commit.load(Ordering::SeqCst) {
+            std::future::pending().await
+        }
+        match request.operation() {
+            SessionConsumerOperation::AcquireLease { .. } => SessionConsumerResponse::AcquireLease(
+                Err(SessionConsumerLeaseError::OutcomeUnavailable),
+            ),
+            _ => SessionConsumerResponse::Capabilities(BackendCapabilities::all_enabled()),
+        }
+    }
+
+    async fn watch(
+        &self,
+        _identity: &SessionConsumerAuthorization,
+        _scope: SessionConsumerScope,
+        _start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        Ok(stream::pending().boxed())
+    }
+}
+
+fn spiffe(name: &str) -> String {
+    format!("spiffe://test.example/tenant/test/ns/default/sa/session/nf/consumer/instance/{name}")
+}
+
+async fn authorizer_and_scope(
+    client_spiffe: &str,
+    server_spiffe: &str,
+) -> (
+    SessionConsumerAuthorizer,
+    SessionConsumerScope,
+    SessionConsumerVoterAuthority,
+) {
+    let snapshots = tempfile::tempdir().expect("snapshot directory");
+    let replica_id = ReplicaId::new("persistent-boundary-test").expect("replica ID");
+    let descriptor = QuorumReplicaDescriptor::new(
+        replica_id.clone(),
+        ReplicaEndpoint::new("persistent-boundary.test.invalid", 7443).expect("endpoint"),
+        ReplicaTlsIdentity::new(server_spiffe).expect("member TLS identity"),
+        ReplicaFailureDomain::new("persistent-boundary-zone").expect("failure domain"),
+        ReplicaBackingIdentity::new("persistent-boundary-disk").expect("backing identity"),
+    );
+    let cluster = ConsensusClusterId::new("persistent-boundary-test").expect("cluster ID");
+    let epoch = ConsensusConfigurationEpoch::new(1).expect("configuration epoch");
+    let configuration =
+        derive_configuration_id(cluster, epoch, &[descriptor.configuration_fingerprint()]);
+    let topology = ValidatedQuorumTopology::try_new_consensus_lab_singleton(
+        replica_id,
+        vec![descriptor],
+        SessionConsensusIdentity::new(cluster, configuration, epoch),
+    )
+    .expect("singleton topology");
+    let voter_authority = topology
+        .session_consumer_roster()
+        .expect("consumer roster")
+        .voter(topology.local_consensus_node_id().expect("local node ID"))
+        .expect("local voter authority");
+    let store = ConsensusSessionStore::open(
+        topology,
+        SqliteSessionBackend::open(snapshots.path().join("sessions.sqlite"))
+            .expect("file-backed SQLite backend"),
+        snapshots.path(),
+        Default::default(),
+    )
+    .await
+    .expect("open store");
+    store.initialize_cluster().await.expect("initialize store");
+    let manifest = store
+        .consumer_authorization_manifest([SessionConsumerAuthorizationGrant::try_new(
+            SpiffeId::new(client_spiffe).expect("client SPIFFE"),
+            [SessionConsumerTenantNfScope::new(
+                TenantId::new("persistent-boundary").expect("tenant"),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("explicit consumer grant")])
+        .await
+        .expect("consumer authorization manifest");
+    let scope = manifest.scope();
+    let authorizer = SessionConsumerAuthorizer::try_new(manifest).expect("consumer authorizer");
+    store.shutdown().await.expect("shutdown store");
+    (authorizer, scope, voter_authority)
+}
+
+fn config(request_connections: usize) -> PersistentSessionConsumerConfig {
+    PersistentSessionConsumerConfig::try_new(
+        request_connections,
+        4,
+        Duration::from_millis(250),
+        1,
+        Duration::from_millis(1_500),
+        2,
+        Duration::ZERO,
+        Duration::from_secs(1),
+    )
+    .expect("bounded persistent config")
+}
+
+fn persistent_client(
+    resolver: RemoteAddrResolver,
+    server_name: rustls_pki_types::ServerName<'static>,
+    voter_authority: SessionConsumerVoterAuthority,
+    tls: AuthenticatedClientConfig,
+    config: PersistentSessionConsumerConfig,
+) -> PersistentSessionConsumerClient {
+    persistent_client_with_lifecycle(
+        resolver,
+        server_name,
+        voter_authority.clone(),
+        tls,
+        config,
+        ConnectionLifecyclePolicy::default(),
+    )
+}
+
+fn persistent_client_with_lifecycle(
+    resolver: RemoteAddrResolver,
+    server_name: rustls_pki_types::ServerName<'static>,
+    voter_authority: SessionConsumerVoterAuthority,
+    tls: AuthenticatedClientConfig,
+    config: PersistentSessionConsumerConfig,
+    lifecycle: ConnectionLifecyclePolicy,
+) -> PersistentSessionConsumerClient {
+    PersistentSessionConsumerClient::try_from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            server_name,
+            voter_authority,
+            tls,
+        )
+        .with_operation_timeout(Duration::from_secs(2))
+        .with_connection_lifecycle(lifecycle),
+        config,
+    )
+    .expect("persistent client")
+}
+
+fn lease_request(
+    scope: SessionConsumerScope,
+    request_id: SessionConsumerRequestId,
+) -> SessionConsumerRequest {
+    SessionConsumerRequest::new(
+        scope,
+        request_id,
+        SessionConsumerOperation::AcquireLease {
+            key: SessionKey {
+                tenant: TenantId::new("persistent-boundary").expect("tenant"),
+                nf_kind: NetworkFunctionKind::smf(),
+                key_type: SessionKeyType::PduSession,
+                stable_id: Bytes::from_static(b"opaque-persistent-boundary")
+                    .try_into()
+                    .expect("stable ID"),
+            },
+            owner: OwnerId::new("persistent-boundary-owner").expect("owner"),
+            ttl: Duration::from_secs(30),
+        },
+    )
+}
+
+#[tokio::test]
+async fn reestablished_lanes_reresolve_exact_endpoint_without_resolving_warm_calls() {
+    const LANES: usize = 2;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("resolver-server");
+    let client_spiffe = spiffe("resolver-client");
+    let (first_authorizer, scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let first_service = Arc::new(RecordingConsumer::default());
+    let (first_handle, first_address) = SessionQuorumConsumerServer::new(
+        first_service.clone(),
+        pki.server_config(&server_spiffe),
+        first_authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start first listener");
+
+    let resolved = Arc::new(RwLock::new(first_address));
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolved = Arc::clone(&resolved);
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolved = Arc::clone(&resolved);
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Ok(*resolved.read().expect("resolver address lock"))
+            })
+        })
+    };
+    let client = persistent_client(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
+        voter_authority.clone(),
+        pki.client_config(&client_spiffe),
+        config(LANES),
+    );
+    assert_eq!(client.scope(), scope);
+    assert_eq!(
+        client
+            .prewarm()
+            .await
+            .expect("first prewarm")
+            .ready_request_connections,
+        LANES
+    );
+    for _ in 0..3 {
+        assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
+    }
+    assert_eq!(resolutions.load(Ordering::SeqCst), LANES);
+
+    first_handle.abort_and_wait().await;
+    let (second_authorizer, second_scope, second_voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    assert_eq!(second_scope, scope, "the replacement keeps the exact scope");
+    assert_eq!(
+        second_voter_authority.roster_commitment().as_bytes(),
+        voter_authority.roster_commitment().as_bytes(),
+        "the replacement keeps the canonical roster"
+    );
+    let second_service = Arc::new(RecordingConsumer::default());
+    let (second_handle, second_address) = SessionQuorumConsumerServer::new(
+        second_service.clone(),
+        pki.server_config(&server_spiffe),
+        second_authorizer,
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("replacement listen address"),
+    )
+    .await
+    .expect("start replacement listener");
+    *resolved.write().expect("resolver address lock") = second_address;
+    client
+        .request_reauthentication()
+        .expect("drain stale lanes");
+    assert_eq!(
+        client
+            .prewarm()
+            .await
+            .expect("replacement prewarm")
+            .ready_request_connections,
+        LANES
+    );
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        LANES * 2,
+        "each new physical lane resolves; warm logical calls do not"
+    );
+    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
+    assert_eq!(second_service.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        client.diagnostics().await.setup_successes,
+        (LANES * 2) as u64
+    );
+
+    client.shutdown().await;
+    second_handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn prewarm_reresolves_and_reauthenticates_all_lanes_after_server_replacement() {
+    const LANES: usize = 2;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("prewarm-replacement-server");
+    let client_spiffe = spiffe("prewarm-replacement-client");
+    let (first_authorizer, scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let first_service = Arc::new(RecordingConsumer::default());
+    let (first_handle, first_address) = SessionQuorumConsumerServer::new(
+        first_service,
+        pki.server_config(&server_spiffe),
+        first_authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start first listener");
+
+    let resolved = Arc::new(RwLock::new(first_address));
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolved = Arc::clone(&resolved);
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolved = Arc::clone(&resolved);
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Ok(*resolved.read().expect("resolver address lock"))
+            })
+        })
+    };
+    let client = persistent_client(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(first_address.ip().into()),
+        voter_authority.clone(),
+        pki.client_config(&client_spiffe),
+        config(LANES),
+    );
+
+    let first_readiness = client.prewarm().await.expect("first prewarm");
+    assert!(first_readiness.ready);
+    assert_eq!(first_readiness.ready_request_connections, LANES);
+    assert_eq!(resolutions.load(Ordering::SeqCst), LANES);
+    assert_eq!(client.diagnostics().await.setup_successes, LANES as u64);
+
+    first_handle.abort_and_wait().await;
+    let (second_authorizer, second_scope, second_voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    assert_eq!(
+        second_scope, scope,
+        "replacement preserves the client scope"
+    );
+    assert_eq!(
+        second_voter_authority.roster_commitment().as_bytes(),
+        voter_authority.roster_commitment().as_bytes(),
+        "replacement preserves the client voter authority"
+    );
+    let second_service = Arc::new(RecordingConsumer::default());
+    let (second_handle, second_address) = SessionQuorumConsumerServer::new(
+        second_service.clone(),
+        pki.server_config(&server_spiffe),
+        second_authorizer,
+    )
+    .listen(
+        "127.0.0.1:0"
+            .parse::<SocketAddr>()
+            .expect("replacement listen address"),
+    )
+    .await
+    .expect("start replacement listener");
+    *resolved.write().expect("resolver address lock") = second_address;
+
+    let replacement_readiness = client.prewarm().await.expect("replacement prewarm");
+    assert!(replacement_readiness.ready);
+    assert_eq!(replacement_readiness.ready_request_connections, LANES);
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        LANES * 2,
+        "replacement prewarm resolves every replacement lane"
+    );
+    assert_eq!(
+        client.diagnostics().await.setup_successes,
+        (LANES * 2) as u64,
+        "replacement prewarm completes authenticated Hello for every lane"
+    );
+    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
+    assert_eq!(second_service.calls.load(Ordering::SeqCst), 1);
+
+    client.shutdown().await;
+    second_handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn failed_rolling_prewarm_preserves_unprocessed_authenticated_siblings() {
+    const LANES: usize = 3;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("rolling-prewarm-server");
+    let client_spiffe = spiffe("rolling-prewarm-client");
+    let (authorizer, _scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(RecordingConsumer::default());
+    let (handle, address) =
+        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
+            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+            .await
+            .expect("start rolling-prewarm listener");
+
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                let attempt = resolutions.fetch_add(1, Ordering::SeqCst);
+                if attempt == LANES + 1 {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "one bounded rolling replacement fails",
+                    ))
+                } else {
+                    Ok(address)
+                }
+            })
+        })
+    };
+    let client = persistent_client(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        voter_authority,
+        pki.client_config(&client_spiffe),
+        config(LANES),
+    );
+
+    assert!(client.prewarm().await.expect("initial prewarm").ready);
+    assert_eq!(
+        client.prewarm().await,
+        Err(SessionConsumerClientError::Unavailable),
+        "the second rolling replacement fails through the typed setup boundary"
+    );
+    let partial = client.readiness().await;
+    assert!(!partial.ready);
+    assert_eq!(
+        partial.ready_request_connections,
+        LANES - 1,
+        "one successful replacement and one unprocessed original sibling remain usable"
+    );
+
+    let recovered = client.prewarm().await.expect("bounded recovery prewarm");
+    assert!(recovered.ready);
+    assert_eq!(recovered.ready_request_connections, LANES);
+    assert_eq!(resolutions.load(Ordering::SeqCst), LANES + 2 + LANES);
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn prewrite_retry_retains_one_request_and_postwrite_disconnect_is_unknown_once() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("mutation-server");
+    let client_spiffe = spiffe("mutation-client");
+    let (authorizer, scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(RecordingConsumer::default());
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let attempts = Arc::clone(&attempts);
+        Arc::new(move || {
+            let attempts = Arc::clone(&attempts);
+            Box::pin(async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "test resolution failure",
+                    ))
+                } else {
+                    Ok(address)
+                }
+            })
+        })
+    };
+    let client = persistent_client(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        voter_authority.clone(),
+        pki.client_config(&client_spiffe),
+        config(1),
+    );
+
+    let first_id = SessionConsumerRequestId::new();
+    let first_request = lease_request(scope, first_id);
+    assert!(matches!(
+        client.execute(&first_request).await,
+        Ok(SessionConsumerResponse::AcquireLease(Err(
+            SessionConsumerLeaseError::OutcomeUnavailable
+        )))
+    ));
+    service.wait_for_calls(1).await;
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(diagnostics.setup_attempts, 2);
+    assert_eq!(diagnostics.resolve_attempts, 2);
+    assert_eq!(diagnostics.resolve_failures, 1);
+    assert_eq!(diagnostics.tcp_attempts, 1);
+    assert_eq!(diagnostics.successes, 0);
+    assert_eq!(diagnostics.failures, 1);
+    assert_eq!(diagnostics.outcome_unknown, 1);
+    assert!(
+        service.requests() == vec![first_request],
+        "the safe pre-write retry must dispatch one byte-identical request"
+    );
+
+    service.block_after_commit.store(true, Ordering::SeqCst);
+    let postwrite_id = SessionConsumerRequestId::new();
+    let postwrite = lease_request(scope, postwrite_id);
+    let pending = {
+        let client = client.clone();
+        let retained_request = postwrite.clone();
+        tokio::spawn(async move { client.execute(&retained_request).await })
+    };
+    service.wait_for_calls(2).await;
+    assert_eq!(service.committed.load(Ordering::SeqCst), 2);
+    handle.abort_and_wait().await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(500), pending)
+            .await
+            .expect("connection abort wakes caller")
+            .expect("caller task"),
+        Err(PersistentSessionConsumerExecuteError::OutcomeUnknown {
+            request_id: postwrite_id,
+        })
+    );
+    assert_eq!(
+        service.calls.load(Ordering::SeqCst),
+        2,
+        "a post-write unknown outcome is never automatically replayed"
+    );
+    let recorded = service.requests();
+    assert!(
+        recorded.get(1) == Some(&postwrite),
+        "the uncertain call must retain its exact request identity and body"
+    );
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.successes, 0);
+    assert_eq!(diagnostics.failures, 2);
+    assert_eq!(diagnostics.outcome_unknown, 2);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn expired_prewarmed_idle_lane_is_replaced_before_the_next_logical_call() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("idle-server");
+    let client_spiffe = spiffe("idle-client");
+    let (authorizer, _scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(RecordingConsumer::default());
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start short-idle listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            let resolutions = Arc::clone(&resolutions);
+            Box::pin(async move {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Ok(address)
+            })
+        })
+    };
+    let stateless = StatelessSessionConsumerClient::new_with_resolver(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        voter_authority,
+        pki.client_config(&client_spiffe),
+    )
+    .with_idle_timeout(Duration::from_millis(20))
+    .with_operation_timeout(Duration::from_secs(2));
+    let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config(1))
+        .expect("persistent client");
+    client.prewarm().await.expect("prewarm one lane");
+    // The listener retains its normal bounded idle deadline. This fixture
+    // waits for the client's already-published lane to be reaped at its own
+    // 20 ms idle contract, so it tests local idle replacement rather than a
+    // race between cross-target TLS setup and a peer EOF.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.diagnostics().await.idle != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("client idle reaper retires the prewarmed lane");
+    assert_eq!(client.capabilities().await, Ok(transported_capabilities()));
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+    assert_eq!(diagnostics.setup_successes, 2);
+    assert_eq!(diagnostics.reused, 0);
+    assert!(diagnostics.reconnects >= 1);
+    assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn server_bootstrap_distinguishes_no_byte_setup_from_active_partial_hello() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("server-bootstrap-idle-server");
+    let client_spiffe = spiffe("server-bootstrap-idle-client");
+    let (authorizer, scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(RecordingConsumer::default());
+    let (handle, address) =
+        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
+            .with_idle_timeout(Duration::from_millis(20))
+            .with_operation_timeout(Duration::from_millis(500))
+            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+            .await
+            .expect("start short active-idle listener");
+
+    let mut tls_config = pki
+        .client_config(&client_spiffe)
+        .rustls_config()
+        .as_ref()
+        .clone();
+    tls_config.alpn_protocols = vec![SESSION_QUORUM_CONSUMER_ALPN.to_vec()];
+    let tcp = TcpStream::connect(address)
+        .await
+        .expect("connect authenticated raw consumer");
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(tls_config))
+        .connect(
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            tcp,
+        )
+        .await
+        .expect("complete authenticated TLS before delayed Hello");
+
+    // This exceeds the active lane idle interval, but the server must still
+    // accept the authenticated value-free bootstrap within its operation cap.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let payload = serde_json::to_vec(&CanonicalConsumerBootstrapRequest::Hello(
+        CanonicalConsumerHello {
+            transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+            scope,
+            expected_server_node_id: voter_authority.node_id().get(),
+            voter_count: u16::try_from(voter_authority.voter_count())
+                .expect("singleton voter count"),
+            roster_commitment: *voter_authority.roster_commitment().as_bytes(),
+            response_frame_size: u32::try_from(MAX_NEGOTIATED_FRAME_SIZE)
+                .expect("consumer frame cap fits u32"),
+        },
+    ))
+    .expect("canonical Hello JSON encodes");
+    let length = u32::try_from(payload.len()).expect("Hello frame length");
+    tls.write_all(&length.to_be_bytes())
+        .await
+        .expect("write delayed Hello length");
+    tls.write_all(&payload)
+        .await
+        .expect("write delayed Hello payload");
+    tls.flush().await.expect("flush delayed Hello");
+    let mut length = [0_u8; 4];
+    tls.read_exact(&mut length)
+        .await
+        .expect("HelloAck length after delayed authenticated setup");
+    let mut payload = vec![0_u8; usize::try_from(u32::from_be_bytes(length)).expect("frame size")];
+    tls.read_exact(&mut payload)
+        .await
+        .expect("HelloAck payload after delayed authenticated setup");
+    let response: serde_json::Value = serde_json::from_slice(&payload).expect("HelloAck JSON");
+    assert_eq!(response["kind"], "hello_ack");
+    assert_eq!(
+        response["body"]["scope"],
+        serde_json::to_value(scope).expect("scope JSON")
+    );
+
+    drop(tls);
+
+    for boundary in ["prefix", "payload"] {
+        let mut tls_config = pki
+            .client_config(&client_spiffe)
+            .rustls_config()
+            .as_ref()
+            .clone();
+        tls_config.alpn_protocols = vec![SESSION_QUORUM_CONSUMER_ALPN.to_vec()];
+        let tcp = TcpStream::connect(address)
+            .await
+            .expect("connect partial authenticated consumer");
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(tls_config))
+            .connect(
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                tcp,
+            )
+            .await
+            .expect("complete TLS before the partial Hello");
+        let payload = serde_json::to_vec(&CanonicalConsumerBootstrapRequest::Hello(
+            CanonicalConsumerHello {
+                transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+                scope,
+                expected_server_node_id: voter_authority.node_id().get(),
+                voter_count: u16::try_from(voter_authority.voter_count())
+                    .expect("singleton voter count"),
+                roster_commitment: *voter_authority.roster_commitment().as_bytes(),
+                response_frame_size: u32::try_from(MAX_NEGOTIATED_FRAME_SIZE)
+                    .expect("consumer frame cap fits u32"),
+            },
+        ))
+        .expect("canonical partial Hello encodes");
+        let length = u32::try_from(payload.len())
+            .expect("partial Hello frame length")
+            .to_be_bytes();
+        match boundary {
+            "prefix" => tls
+                .write_all(&length[..1])
+                .await
+                .expect("write one Hello prefix byte"),
+            "payload" => {
+                tls.write_all(&length)
+                    .await
+                    .expect("write complete Hello prefix");
+                tls.write_all(&payload[..1])
+                    .await
+                    .expect("write one Hello payload byte");
+            }
+            _ => unreachable!("fixed test boundary"),
+        }
+        tls.flush().await.expect("flush partial Hello");
+        let closed = tokio::time::timeout(Duration::from_millis(300), tls.read_u8())
+            .await
+            .expect("partial Hello is bounded by the 20ms active-frame deadline");
+        assert!(
+            closed.is_err(),
+            "the server closes a stalled authenticated {boundary} frame without a response"
+        );
+    }
+
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn server_rejects_v6_hello_identity_mismatches_before_any_consumer_effect() {
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("hello-identity-server");
+    let client_spiffe = spiffe("hello-identity-client");
+    let (authorizer, scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(RecordingConsumer::default());
+    let (handle, address) = SessionQuorumConsumerServer::new(
+        service.clone(),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+    .await
+    .expect("start consumer listener");
+
+    for mismatch in ["server-node-id", "voter-count", "roster-commitment"] {
+        let mut hello = CanonicalConsumerHello {
+            transport_revision: SESSION_QUORUM_CONSUMER_TRANSPORT_REVISION,
+            scope,
+            expected_server_node_id: voter_authority.node_id().get(),
+            voter_count: u16::try_from(voter_authority.voter_count())
+                .expect("singleton voter count"),
+            roster_commitment: *voter_authority.roster_commitment().as_bytes(),
+            response_frame_size: u32::try_from(MAX_NEGOTIATED_FRAME_SIZE)
+                .expect("consumer frame cap fits u32"),
+        };
+        match mismatch {
+            "server-node-id" => {
+                hello.expected_server_node_id = hello.expected_server_node_id.wrapping_add(1)
+            }
+            "voter-count" => hello.voter_count = 2,
+            "roster-commitment" => hello.roster_commitment = [7; 32],
+            _ => unreachable!("fixed mismatch cases"),
+        }
+        let payload = serde_json::to_vec(&CanonicalConsumerBootstrapRequest::Hello(hello))
+            .expect("mismatched Hello encodes");
+        let mut tls_config = pki
+            .client_config(&client_spiffe)
+            .rustls_config()
+            .as_ref()
+            .clone();
+        tls_config.alpn_protocols = vec![SESSION_QUORUM_CONSUMER_ALPN.to_vec()];
+        let tcp = TcpStream::connect(address)
+            .await
+            .expect("connect authenticated raw consumer");
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(tls_config))
+            .connect(
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                tcp,
+            )
+            .await
+            .expect("complete TLS before mismatched Hello");
+        tls.write_all(
+            &u32::try_from(payload.len())
+                .expect("Hello frame length")
+                .to_be_bytes(),
+        )
+        .await
+        .expect("write mismatched Hello length");
+        tls.write_all(&payload)
+            .await
+            .expect("write mismatched Hello payload");
+        tls.flush().await.expect("flush mismatched Hello");
+        let mut length = [0_u8; 4];
+        tokio::time::timeout(Duration::from_millis(250), tls.read_exact(&mut length))
+            .await
+            .expect("server rejects mismatched Hello promptly")
+            .expect("Hello rejection frame length");
+        let mut rejection =
+            vec![0_u8; usize::try_from(u32::from_be_bytes(length)).expect("frame size")];
+        tls.read_exact(&mut rejection)
+            .await
+            .expect("Hello rejection frame payload");
+        let rejection: serde_json::Value =
+            serde_json::from_slice(&rejection).expect("Hello rejection JSON");
+        assert_eq!(
+            rejection["kind"], "hello_rejected",
+            "{mismatch} is rejected"
+        );
+        assert_eq!(
+            rejection["body"], "Unauthorized",
+            "identity mismatch is not admitted as a consumer"
+        );
+    }
+    assert_eq!(
+        service.calls.load(Ordering::SeqCst),
+        0,
+        "every mismatched Hello is rejected before an application effect"
+    );
+    handle.abort_and_wait().await;
+}
+
+#[tokio::test]
+async fn reauthentication_and_svid_rotation_drain_idle_lanes_then_prewarm_within_capacity() {
+    const LANES: usize = 2;
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("rotation-server");
+    let client_spiffe = spiffe("rotation-client");
+    let (authorizer, _scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let service = Arc::new(RecordingConsumer::default());
+    let lifecycle = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        Duration::ZERO,
+    )
+    .expect("deterministic lifecycle policy");
+    let (handle, address) =
+        SessionQuorumConsumerServer::new(service, pki.server_config(&server_spiffe), authorizer)
+            .with_connection_lifecycle(lifecycle)
+            .listen("127.0.0.1:0".parse::<SocketAddr>().expect("listen address"))
+            .await
+            .expect("start consumer listener");
+    let resolver: RemoteAddrResolver = Arc::new(move || Box::pin(async move { Ok(address) }));
+    let (tls, material_source) = pki.rotating_client_config(&client_spiffe);
+    let client = persistent_client_with_lifecycle(
+        resolver,
+        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+        voter_authority,
+        tls,
+        config(LANES),
+        lifecycle,
+    );
+
+    assert_eq!(
+        client
+            .prewarm()
+            .await
+            .expect("first prewarm")
+            .ready_request_connections,
+        LANES
+    );
+    client
+        .request_reauthentication()
+        .expect("explicit reauthentication");
+    assert_eq!(client.readiness().await.ready_request_connections, 0);
+    assert_eq!(
+        client
+            .prewarm()
+            .await
+            .expect("reauth prewarm")
+            .ready_request_connections,
+        LANES
+    );
+
+    let previous_epoch = client.credential_health().epoch();
+    material_source
+        .send(Some(pki.identity_state(&client_spiffe)))
+        .expect("publish rotated SVID material");
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while client.credential_health().epoch() <= previous_epoch {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("material controller publishes the new SVID epoch");
+    assert_eq!(client.readiness().await.ready_request_connections, 0);
+    let readiness = client.prewarm().await.expect("rotation prewarm");
+    assert!(readiness.ready);
+    assert_eq!(readiness.configured_request_connections, LANES);
+    assert_eq!(readiness.ready_request_connections, LANES);
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_successes, (LANES * 3) as u64);
+    assert!(diagnostics.idle <= LANES as u64);
+
+    client.shutdown().await;
+    handle.abort_and_wait().await;
+}

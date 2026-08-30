@@ -2376,6 +2376,8 @@ struct EbpfGtpuDataplaneBackendInner {
     #[cfg(test)]
     traffic_proof_worker_return_pause:
         Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    traffic_proof_boottime_override: Mutex<Option<std::time::Duration>>,
     backend_incarnation: u64,
     clock_origin: u128,
     config: EbpfGtpuDataplaneBackendConfig,
@@ -2777,6 +2779,8 @@ impl EbpfGtpuDataplaneBackend {
                 traffic_observation_sequences: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 traffic_proof_worker_return_pause: Mutex::new(None),
+                #[cfg(test)]
+                traffic_proof_boottime_override: Mutex::new(None),
                 backend_incarnation,
                 clock_origin,
                 config,
@@ -9135,6 +9139,28 @@ impl TrafficContinuitySource for EbpfTrafficRecordSource {
 }
 
 impl EbpfGtpuDataplaneBackend {
+    fn traffic_proof_boottime(&self) -> Result<MonotonicTime, GtpuError> {
+        #[cfg(test)]
+        if let Some(now) = *self
+            .inner
+            .traffic_proof_boottime_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Ok(MonotonicTime::from_duration_since_origin(now));
+        }
+        traffic_boottime()
+    }
+
+    #[cfg(test)]
+    fn set_traffic_proof_boottime_for_test(&self, now: std::time::Duration) {
+        *self
+            .inner
+            .traffic_proof_boottime_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
+    }
+
     #[cfg(test)]
     fn pause_next_traffic_proof_worker_return(
         &self,
@@ -10257,7 +10283,7 @@ impl EbpfGtpuDataplaneBackend {
             }
         };
         self.drain_traffic_hub(ifindex)?;
-        let now = match traffic_boottime() {
+        let now = match self.traffic_proof_boottime() {
             Ok(now) => now,
             Err(error) => {
                 self.invalidate_traffic_attempt_by_token(
@@ -10499,7 +10525,7 @@ impl EbpfGtpuDataplaneBackend {
             }
         };
         self.drain_traffic_hub(ifindex)?;
-        let now = traffic_boottime()?;
+        let now = self.traffic_proof_boottime()?;
         let mut attempts = self.traffic_attempts()?;
         let Some(attempt) = attempts.get_mut(&attempt_id) else {
             return Ok(GtpuTrafficProofPoll::Invalidated(
@@ -10637,7 +10663,7 @@ impl EbpfGtpuDataplaneBackend {
                 GtpuTrafficProofInvalidation::ObservationBindingChanged,
             ));
         }
-        let now = match traffic_boottime() {
+        let now = match self.traffic_proof_boottime() {
             Ok(now) => now,
             Err(error) => {
                 Self::invalidate_traffic_attempt(
@@ -48239,11 +48265,17 @@ mod tests {
             .state()
             .traffic_observation_events
             .insert(S2BU_IFINDEX, events);
+        let proof_time = traffic_boottime_duration().unwrap();
+        backend.set_traffic_proof_boottime_for_test(proof_time);
         let proof = match backend.poll_gtpu_traffic_proof(&mut session).await.unwrap() {
             GtpuTrafficProofPoll::Proven(proof) => proof,
             other => panic!("test expected proof, got {other:?}"),
         };
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        backend.set_traffic_proof_boottime_for_test(
+            proof_time
+                .checked_add(std::time::Duration::from_millis(1))
+                .unwrap(),
+        );
         for _ in 0..2 {
             assert_eq!(
                 validate_traffic_proof_with_authority(&backend, &proof, &authority)
@@ -48283,6 +48315,62 @@ mod tests {
             .close_gtpu_traffic_proof(drift_session)
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn traffic_proof_expiring_during_worker_handoff_is_never_delivered() {
+        let (backend, runtime, group, authority) = traffic_proof_fixture(0x7d).await;
+        let expiring_policy = opc_dataplane_observation::TrafficContinuityPolicy::new(
+            2,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(1),
+            8,
+        )
+        .unwrap();
+        let authority = GtpuTrafficProofAuthority::new(
+            group.clone(),
+            authority.product_owner_generation(),
+            authority.reconcile_fence(),
+            authority.reconcile_revision(),
+            expiring_policy,
+        )
+        .unwrap();
+        let mut session = begin_traffic_proof(&backend, &authority).await.unwrap();
+        let events = enqueue_public_request_and_private_return_traffic(&runtime, &group);
+        runtime
+            .state()
+            .traffic_observation_events
+            .insert(S2BU_IFINDEX, events);
+        let proof_time = traffic_boottime_duration().unwrap();
+        backend.set_traffic_proof_boottime_for_test(proof_time);
+
+        let (worker_entered, worker_release) = backend.pause_next_traffic_proof_worker_return();
+        let entered_wait = tokio::task::spawn_blocking(move || worker_entered.wait());
+        let mut poll = Box::pin(backend.poll_gtpu_traffic_proof(&mut session));
+        tokio::select! {
+            result = &mut poll => panic!("poll returned before the handoff boundary: {result:?}"),
+            result = entered_wait => {
+                result.unwrap();
+            }
+        }
+        backend.set_traffic_proof_boottime_for_test(
+            proof_time
+                .checked_add(std::time::Duration::from_millis(1))
+                .unwrap(),
+        );
+        worker_release.wait();
+
+        assert!(matches!(
+            poll.await.unwrap(),
+            GtpuTrafficProofPoll::Invalidated(GtpuTrafficProofInvalidation::Expired)
+        ));
+        assert!(matches!(
+            backend.poll_gtpu_traffic_proof(&mut session).await.unwrap(),
+            GtpuTrafficProofPoll::Invalidated(GtpuTrafficProofInvalidation::Expired)
+        ));
+        backend.close_gtpu_traffic_proof(session).await.unwrap();
     }
 
     #[tokio::test]

@@ -14,6 +14,16 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-session-store"
 keywords = ["5g", "cnf", "session", "telecom", "packet-core"]
 categories = ["network-programming", "data-structures"]
+
+[features]
+default = []
+# Enables non-production consensus election controls used only by integration
+# tests that must deterministically exercise a real authenticated campaign.
+test-control = []
+# Test-only VFS hooks used to qualify SQLite durability boundaries with the
+# bundled SQLite build. This feature is never enabled by production crates.
+test-vfs = ["opc-sqlite-file-control-sys/test-vfs"]
+
 [dependencies]
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
@@ -22,8 +32,10 @@ opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
 opc-mgmt-audit = { path = "../opc-mgmt-audit", version = "0.2.0" }
+opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+postcard = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "io-util", "fs", "rt"] }
 tracing = { workspace = true }
@@ -32,22 +44,36 @@ uuid = { workspace = true }
 time = { workspace = true, features = ["serde"] }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
+sha2-zeroize = { workspace = true }
 hmac = { workspace = true }
+subtle = { workspace = true }
 zeroize = { workspace = true }
 libc = "0.2"
-nix = { workspace = true, features = ["fs"] }
+nix = { workspace = true, features = ["fs", "socket", "user"] }
+rustix = { version = "1", features = ["fs"] }
 aes-gcm-siv = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
 # rusqlite 0.40 pulls libsqlite3-sys 0.38, whose build script needs cfg_select!
 # (Rust 1.91); held at 0.32 while the workspace MSRV is 1.88.
-rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled", "hooks", "limits"] }
+
+[target.'cfg(unix)'.dependencies]
+opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0" }
 
 [dev-dependencies]
+opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
+opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0", features = ["test-vfs"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "test-util"] }
 tempfile = "3"
 proptest = "1.9"
+
+[[test]]
+name = "sqlite_checkpoint_hotpath"
+path = "tests/sqlite_checkpoint_hotpath.rs"
+required-features = ["test-vfs"]
 
 [lints]
 workspace = true

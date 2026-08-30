@@ -20,7 +20,8 @@ use opc_session_store::{
     ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity,
     SessionBackend, SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionConsumerIdentity, SessionKey, SessionKeyType, SessionLeaseManager,
+    SessionConsumerAuthorizationGrant, SessionConsumerIdentity, SessionConsumerRejection,
+    SessionConsumerTenantNfScope, SessionKey, SessionKeyType, SessionLeaseManager,
     SessionQuorumConsumer, SessionTopologyAbortAdmissionProof,
     SessionTopologyCandidateRetirementProof, SessionTopologyJointCommitAdmissionProof,
     SessionTopologyPrePrepareUnstageProof, SessionTopologyTransitionError,
@@ -31,7 +32,28 @@ use opc_session_store::{
     TopologyAttestationTime, TopologyAttestationVerificationError,
     TopologyAttestationVerificationInput, TopologyCollectorId, ValidatedQuorumTopology,
 };
-use opc_types::{NetworkFunctionKind, TenantId};
+use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
+
+fn fixed_consumer_identity() -> SessionConsumerIdentity {
+    SessionConsumerIdentity::new(
+        "spiffe://test/tenant/fixed-consumer/ns/default/sa/store/nf/smf/instance/one",
+    )
+    .expect("canonical fixed consumer identity")
+}
+
+fn fixed_consumer_grant() -> SessionConsumerAuthorizationGrant {
+    SessionConsumerAuthorizationGrant::try_new(
+        SpiffeId::new(
+            "spiffe://test/tenant/fixed-consumer/ns/default/sa/store/nf/smf/instance/one",
+        )
+        .expect("canonical fixed consumer SPIFFE ID"),
+        [SessionConsumerTenantNfScope::new(
+            TenantId::from_static("fixed-consumer"),
+            NetworkFunctionKind::smf(),
+        )],
+    )
+    .expect("fixed consumer grant")
+}
 
 #[derive(Debug)]
 struct UnscopedPeer {
@@ -72,6 +94,10 @@ impl ScopedLoopbackPeer {
 
     async fn install(&self, handler: Arc<dyn SessionConsensusRpcHandler>) {
         *self.handler.write().await = Some(handler);
+    }
+
+    async fn clear(&self) {
+        *self.handler.write().await = None;
     }
 
     fn set_enabled(&self, enabled: bool) {
@@ -340,12 +366,17 @@ async fn fixed_durable_quorum_rejects_unsupported_platform_before_durable_initia
     let members = fixed_members(3);
     let topology = fixed_topology(members).expect("fixed topology admission");
     let directory = tempfile::tempdir().expect("fixed platform test directory");
-    let database_path = directory.path().join("voter.sqlite");
+    let snapshot_dir = directory.path().join("must-not-exist");
+    // A file-backed backend performs Linux-only recovery-latch admission
+    // before the public fixed-quorum platform guard. Use the ephemeral
+    // backend so this test reaches that public guard and still proves that
+    // unsupported construction creates no snapshot or durable Raft state.
+    let backend = SqliteSessionBackend::in_memory().expect("ephemeral backend");
 
     let result = ConsensusSessionStore::open_fixed_durable_quorum(
         topology.clone(),
-        SqliteSessionBackend::open(&database_path).expect("file-backed voter store"),
-        directory.path().join("snapshots"),
+        backend,
+        snapshot_dir.clone(),
         scoped_peers(&topology),
     )
     .await;
@@ -353,18 +384,9 @@ async fn fixed_durable_quorum_rejects_unsupported_platform_before_durable_initia
         result,
         Err(ConsensusSessionStoreOpenError::FixedQuorumUnsupportedPlatform)
     ));
-
-    let connection = rusqlite::Connection::open(database_path).expect("open voter database");
-    let durable_raft_rows: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'consensus_identity'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("query durable raft schema");
-    assert_eq!(
-        durable_raft_rows, 0,
-        "unsupported fixed quorum must fail before durable Raft initialization"
+    assert!(
+        !snapshot_dir.exists(),
+        "unsupported fixed quorum must fail before snapshot initialization"
     );
 }
 
@@ -487,16 +509,6 @@ async fn open_fixed_cluster_with_paths(
     (directory, database_paths, stores, paths)
 }
 
-async fn open_fixed_cluster_in(
-    directory: &std::path::Path,
-    member_count: usize,
-    placement_policy: PlacementResiliencePolicy,
-) -> (Vec<PathBuf>, Vec<ConsensusSessionStore>) {
-    let (database_paths, stores, _) =
-        open_fixed_cluster_in_with_paths(directory, member_count, placement_policy).await;
-    (database_paths, stores)
-}
-
 async fn open_fixed_cluster_in_with_paths(
     directory: &std::path::Path,
     member_count: usize,
@@ -569,6 +581,20 @@ async fn open_fixed_cluster_in_with_paths(
         result.expect("initialize fixed cluster membership");
     }
     (database_paths, stores, paths)
+}
+
+async fn shutdown_fixed_cluster_for_reopen(
+    stores: &[ConsensusSessionStore],
+    paths: &BTreeMap<(usize, usize), Arc<ScopedLoopbackPeer>>,
+) {
+    for path in paths.values() {
+        path.clear().await;
+    }
+    for result in
+        futures_util::future::join_all(stores.iter().map(ConsensusSessionStore::shutdown)).await
+    {
+        result.expect("fully drain fixed consensus engine before durable reopen");
+    }
 }
 
 fn successor_request(identity: ConsensusIdentity) -> SessionTopologyTransitionRequest {
@@ -944,12 +970,13 @@ async fn file_backed_fixed_five_voter_quorum_reaches_granted_authority() {
 
 #[tokio::test]
 async fn initialized_fixed_three_voter_cluster_reopens_with_durable_authority_and_rpc_readiness() {
-    let (directory, _database_paths, stores) =
-        open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    let (directory, _database_paths, stores, paths) =
+        open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
+    shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
     drop(stores);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(paths);
 
-    let (_database_paths, reopened) = open_fixed_cluster_in(
+    let (_database_paths, reopened, reopened_paths) = open_fixed_cluster_in_with_paths(
         directory.path(),
         3,
         PlacementResiliencePolicy::AllowReducedResilience,
@@ -967,6 +994,7 @@ async fn initialized_fixed_three_voter_cluster_reopens_with_durable_authority_an
             .is_granted(),
         "reopened fixed quorum RPC path must recover durable traffic authority"
     );
+    shutdown_fixed_cluster_for_reopen(&reopened, &reopened_paths).await;
 }
 
 #[tokio::test]
@@ -981,8 +1009,11 @@ async fn fixed_durable_quorum_reopen_rejects_placement_policy_mismatch() {
             PlacementResiliencePolicy::RequireIndependentFailureDomains,
         ),
     ] {
-        let (directory, database_paths, stores) = open_fixed_cluster(3, initial).await;
+        let (directory, database_paths, stores, paths) =
+            open_fixed_cluster_with_paths(3, initial).await;
+        shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
         drop(stores);
+        drop(paths);
         let members = fixed_members(3);
         let topology = fixed_topology_for_local(0, members, reopened).expect("reopen topology");
         let error = ConsensusSessionStore::open_fixed_durable_quorum(
@@ -1029,11 +1060,48 @@ async fn fixed_five_voter_store_without_a_majority_reports_no_quorum() {
 }
 
 #[tokio::test]
+async fn store_issued_consumer_manifest_retains_authoritative_node_to_tls_pairs() {
+    let placement_policy = PlacementResiliencePolicy::AllowReducedResilience;
+    let members = fixed_members(3);
+    let topology = fixed_topology_for_local(0, members, placement_policy)
+        .expect("fixed topology with canonical node IDs");
+    let expected_scope = topology
+        .consensus_identity()
+        .expect("fixed consensus identity");
+    let expected_pairs = topology
+        .members()
+        .iter()
+        .map(|descriptor| {
+            (
+                topology
+                    .consensus_node_id(descriptor.replica_id())
+                    .expect("canonical topology node ID")
+                    .get(),
+                descriptor.tls_identity().as_str().to_owned(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let (_directory, _database_paths, stores) = open_fixed_cluster(3, placement_policy).await;
+
+    let manifest = stores[0]
+        .consumer_authorization_manifest([fixed_consumer_grant()])
+        .await
+        .expect("admitted fixed store issues its consumer roster");
+    let actual_pairs = manifest
+        .consensus_members()
+        .map(|member| (member.node_id().get(), member.tls_identity().to_owned()))
+        .collect::<BTreeMap<_, _>>();
+
+    assert_eq!(manifest.scope().consensus_identity(), expected_scope);
+    assert_eq!(actual_pairs, expected_pairs);
+}
+
+#[tokio::test]
 async fn persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority() {
     let (_directory, database_paths, stores) =
         open_fixed_cluster(3, PlacementResiliencePolicy::AllowReducedResilience).await;
     stores[0]
-        .consumer_authorization_manifest()
+        .consumer_authorization_manifest([fixed_consumer_grant()])
         .await
         .expect("exact fixed store grants consumer authorization");
 
@@ -1072,7 +1140,10 @@ async fn persisted_fixed_binding_drift_revokes_consumer_and_traffic_authority() 
         .expect("persist fixed binding drift");
     drop(connection);
 
-    assert!(stores[0].consumer_authorization_manifest().await.is_err());
+    assert!(stores[0]
+        .consumer_authorization_manifest([fixed_consumer_grant()])
+        .await
+        .is_err());
     let readiness = stores[0]
         .probe_fixed_durable_quorum_readiness_at(TopologyAttestationTime::from_unix_seconds(1))
         .await;
@@ -1120,7 +1191,10 @@ async fn running_fixed_profile_drift_revokes_traffic_authority() {
     }
 
     assert!(
-        stores[0].consumer_authorization_manifest().await.is_err(),
+        stores[0]
+            .consumer_authorization_manifest([fixed_consumer_grant()])
+            .await
+            .is_err(),
         "consumer authority must fail closed after fixed-profile drift"
     );
     assert!(
@@ -1154,7 +1228,7 @@ async fn running_fixed_placement_policy_drift_revokes_live_authority() {
     ] {
         let (_directory, database_paths, stores) = open_fixed_cluster(3, configured_policy).await;
         stores[0]
-            .consumer_authorization_manifest()
+            .consumer_authorization_manifest([fixed_consumer_grant()])
             .await
             .expect("exact fixed policy grants consumer authority");
         assert!(
@@ -1189,7 +1263,10 @@ async fn running_fixed_placement_policy_drift_revokes_live_authority() {
             "status must revoke admission after fixed policy drift"
         );
         assert!(
-            stores[0].consumer_authorization_manifest().await.is_err(),
+            stores[0]
+                .consumer_authorization_manifest([fixed_consumer_grant()])
+                .await
+                .is_err(),
             "consumer authority must fail closed after fixed policy drift"
         );
         assert!(
@@ -1363,8 +1440,8 @@ async fn fixed_majority_loss_terminates_an_idle_generic_watch_without_an_event()
 }
 
 #[tokio::test]
-async fn fixed_majority_loss_terminates_an_idle_consumer_watch_without_an_event() {
-    let (_directory, _database_paths, stores, paths) =
+async fn fixed_scoped_consumer_watch_is_rejected_before_stream_admission() {
+    let (_directory, _database_paths, stores, _paths) =
         open_fixed_cluster_with_paths(3, PlacementResiliencePolicy::AllowReducedResilience).await;
     let scope = stores[0]
         .consumer_scope()
@@ -1373,29 +1450,26 @@ async fn fixed_majority_loss_terminates_an_idle_consumer_watch_without_an_event(
         .status()
         .last_log_index
         .map_or(0, |index| index.saturating_add(1));
-    let identity = SessionConsumerIdentity::new("spiffe://test/fixed-consumer")
-        .expect("test consumer identity");
-    let mut watch = stores[0]
-        .consumer_service()
-        .watch(&identity, scope, start_sequence)
+    let identity = fixed_consumer_identity();
+    let manifest = stores[0]
+        .consumer_authorization_manifest([fixed_consumer_grant()])
         .await
-        .expect("open idle consumer watch before majority loss");
-
-    paths
-        .get(&(0, 1))
-        .expect("fixed voter one path")
-        .set_enabled(false);
-    paths
-        .get(&(0, 2))
-        .expect("fixed voter two path")
-        .set_enabled(false);
-
-    assert!(
-        tokio::time::timeout(Duration::from_secs(12), watch.next())
-            .await
-            .expect("idle consumer watch must re-establish majority authority within one bounded operation")
-            .is_none(),
-        "an idle fixed consumer watch must terminate after majority loss without a queued event"
+        .expect("fixed consumer authorization manifest");
+    let authorization = manifest
+        .authorize(&identity)
+        .expect("fixed consumer authorization");
+    let rejection = match stores[0]
+        .consumer_service()
+        .watch(&authorization, scope, start_sequence)
+        .await
+    {
+        Ok(_) => panic!("a global watch must not be admitted for a scoped consumer"),
+        Err(rejection) => rejection,
+    };
+    assert_eq!(
+        rejection,
+        SessionConsumerRejection::Unauthorized,
+        "denial occurs before a stream can expose foreign-tenant timing or sequence movement"
     );
 }
 
@@ -1772,6 +1846,10 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     )
     .await
     .expect("open fixed store");
+    fixed_store
+        .shutdown()
+        .await
+        .expect("drain fixed store before durable reopen");
     drop(fixed_store);
     let fixed_reopened = ConsensusSessionStore::open_fixed_durable_quorum(
         fixed.clone(),
@@ -1781,6 +1859,10 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     )
     .await
     .expect("reopen fixed store with its persisted authority profile");
+    fixed_reopened
+        .shutdown()
+        .await
+        .expect("drain reopened fixed store before profile mismatch probe");
     drop(fixed_reopened);
     let fixed_as_dynamic = ConsensusSessionStore::open(
         dynamic.clone(),
@@ -1802,6 +1884,10 @@ async fn fixed_authority_profile_persists_across_reopen_and_rejects_profile_chan
     )
     .await
     .expect("open dynamic store");
+    dynamic_store
+        .shutdown()
+        .await
+        .expect("drain dynamic store before profile mismatch probe");
     drop(dynamic_store);
     let dynamic_as_fixed = ConsensusSessionStore::open_fixed_durable_quorum(
         fixed.clone(),

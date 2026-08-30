@@ -410,6 +410,33 @@ impl OwnedSessionMutationError {
             StoreError::CasIdempotencyOutcomeUnavailable => Self::StoreRejected {
                 code: "cas-idempotency-outcome-unavailable",
             },
+            StoreError::FencedTransitionRequestConflict => Self::StoreRejected {
+                code: "fenced-transition-request-conflict",
+            },
+            StoreError::FencedTransitionOutcomeUnknown => Self::StoreRejected {
+                code: "fenced-transition-outcome-unknown",
+            },
+            StoreError::FencedTransitionRequestExpired => Self::StoreRejected {
+                code: "fenced-transition-request-expired",
+            },
+            StoreError::FencedTransitionHistoryFull => Self::StoreRejected {
+                code: "fenced-transition-history-full",
+            },
+            StoreError::FencedTransitionHistoryEpochRetired => Self::StoreRejected {
+                code: "fenced-transition-history-epoch-retired",
+            },
+            StoreError::FencedTransitionHistoryEpochNotActive => Self::StoreRejected {
+                code: "fenced-transition-history-epoch-not-active",
+            },
+            StoreError::FencedTransitionRetentionExhausted => Self::StoreRejected {
+                code: "fenced-transition-retention-exhausted",
+            },
+            StoreError::FencedTransitionStorageExhausted => Self::StoreRejected {
+                code: "fenced-transition-storage-exhausted",
+            },
+            StoreError::SessionRecordReserved => Self::StoreRejected {
+                code: "session-record-reserved",
+            },
             StoreError::BackendOperationOutcomeUnavailable => Self::StoreRejected {
                 code: "backend-operation-outcome-unavailable",
             },
@@ -725,6 +752,25 @@ mod tests {
         assert_eq!(
             OwnedSessionMutationError::from_store_error(StoreError::TopologyAuthorityRevoked),
             OwnedSessionMutationError::LeaseLost
+        );
+    }
+
+    #[test]
+    fn fenced_transition_storage_exhaustion_has_a_fixed_safe_error_code() {
+        assert_eq!(
+            OwnedSessionMutationError::from_store_error(
+                StoreError::FencedTransitionStorageExhausted
+            )
+            .code(),
+            "fenced-transition-storage-exhausted"
+        );
+    }
+
+    #[test]
+    fn session_record_reservation_has_a_fixed_safe_error_code() {
+        assert_eq!(
+            OwnedSessionMutationError::from_store_error(StoreError::SessionRecordReserved).code(),
+            "session-record-reserved"
         );
     }
 }

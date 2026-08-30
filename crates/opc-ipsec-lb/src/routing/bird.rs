@@ -2389,11 +2389,25 @@ mod tests {
     }
 
     fn test_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("opc-ipsec-lb-bird-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        use std::os::unix::fs::PermissionsExt;
+
+        // `TMPDIR` may be intentionally long, while Unix socket paths are
+        // bounded by `sockaddr_un.sun_path`.  These tests bind `bird.ctl`
+        // beneath this directory, so use a short, private root independent of
+        // `TMPDIR`.
+        for attempt in 0..128 {
+            let dir = PathBuf::from("/tmp")
+                .join(format!("opc-bird-{}-{tag}-{attempt}", std::process::id()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+                    return dir;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create short BIRD test directory: {error}"),
+            }
+        }
+        panic!("exhausted short BIRD test directory names");
     }
 
     fn config(dir: &std::path::Path) -> BirdAdapterConfig {
