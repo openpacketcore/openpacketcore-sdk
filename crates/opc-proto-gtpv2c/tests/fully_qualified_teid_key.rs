@@ -11,6 +11,23 @@ const IPV4_B: [u8; 4] = [192, 0, 2, 2];
 const IPV6_A: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 const IPV6_B: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 
+type CanonicalKey = (u8, u32, Option<[u8; 4]>, Option<[u8; 16]>);
+
+#[derive(Default)]
+struct RecordingHasher {
+    bytes: Vec<u8>,
+}
+
+impl Hasher for RecordingHasher {
+    fn finish(&self) -> u64 {
+        0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+}
+
 fn f_teid(
     interface_type: u8,
     teid: u32,
@@ -31,6 +48,16 @@ fn hash(value: &FullyQualifiedTeid) -> u64 {
     hasher.finish()
 }
 
+fn hash_input<T: Hash>(value: &T) -> Vec<u8> {
+    let mut hasher = RecordingHasher::default();
+    value.hash(&mut hasher);
+    hasher.bytes
+}
+
+fn canonical_key(value: &FullyQualifiedTeid) -> CanonicalKey {
+    (value.interface_type, value.teid, value.ipv4, value.ipv6)
+}
+
 #[test]
 fn identical_f_teids_are_equal_hash_and_order_keys() {
     let key = f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_A));
@@ -46,6 +73,13 @@ fn identical_f_teids_are_equal_hash_and_order_keys() {
 
     let ordered = BTreeSet::from([key, identical]);
     assert_eq!(ordered.len(), 1);
+}
+
+#[test]
+fn f_teid_hashes_the_exact_canonical_key() {
+    let key = f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_A));
+
+    assert_eq!(hash_input(&key), hash_input(&canonical_key(&key)));
 }
 
 #[test]
@@ -111,9 +145,14 @@ fn f_teid_equality_and_total_order_obey_the_same_laws() {
         f_teid(INTERFACE_TYPE, TEID, Some(IPV4_B), Some(IPV6_A)),
     ];
 
+    for pair in keys.windows(2) {
+        assert!(pair[0] < pair[1]);
+    }
+
     for left in &keys {
         for right in &keys {
             let ordering = left.cmp(right);
+            assert_eq!(ordering, canonical_key(left).cmp(&canonical_key(right)));
             assert_eq!(left == right, ordering == Ordering::Equal);
             assert_eq!(left.partial_cmp(right), Some(ordering));
             assert_eq!(ordering.reverse(), right.cmp(left));
