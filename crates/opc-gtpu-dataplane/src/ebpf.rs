@@ -90,6 +90,7 @@ use crate::traffic_observation::{
     GtpuTrafficProofAuthorityToken, GtpuTrafficProofDispatchAuthority, GtpuTrafficProofRevoker,
     GtpuTrafficProofSessionSnapshot, GtpuTrafficProofValidationSnapshot,
 };
+use crate::RetainedGraphCleanupRefusal;
 use crate::{
     CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryAuthority,
     CurrentEbpfGraphRecoveryAuthorityBinding, CurrentEbpfGraphRecoveryAuthorityCurrentness,
@@ -121,14 +122,17 @@ use crate::{
     TftUplinkClassifierRemovalOutcome,
 };
 #[cfg(any(target_os = "linux", test))]
-use crate::{
-    RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
-};
+use crate::{RetainedGraphCleanupClassification, RetainedGraphCleanupRequest};
 
 /// Default bpffs directory under which per-interface map pins are created.
 pub const DEFAULT_BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/opc-gtpu";
 /// Default tc filter priority for the datapath programs.
 pub const DEFAULT_TC_PRIORITY: u16 = 50;
+/// Number of map pins in the current eBPF GTP-U graph.
+///
+/// The Linux manifest uses this constant as its array length, so changing the
+/// manifest without changing the cross-platform fake is a compile-time error.
+const CURRENT_EBPF_GRAPH_PIN_COUNT: usize = 34;
 /// Maximum number of managed-device identities returned by one inventory.
 ///
 /// The backend always returns the identities with the lowest interface
@@ -15596,7 +15600,7 @@ mod aya_runtime {
         },
     ];
 
-    pub(super) const CURRENT_MAP_NAMES: [&str; 34] = [
+    pub(super) const CURRENT_MAP_NAMES: [&str; super::CURRENT_EBPF_GRAPH_PIN_COUNT] = [
         MAP_UPLINK_FAR,
         MAP_UPLINK_MARK_FAR,
         MAP_UPLINK_DSCP,
@@ -16294,11 +16298,9 @@ mod aya_runtime {
         control_dir_name: String,
         control_dir_device: u64,
         control_dir_inode: u64,
-        control_dir_created: bool,
         operation_lock_name: String,
         operation_lock_device: u64,
         operation_lock_inode: u64,
-        operation_lock_created: bool,
         // A predecessor root created by `e7db129d` can be shared and have an
         // ordinary umask-derived mode.  In that case normal ownership is
         // authorized only by the exact immutable hand-off marker in this
@@ -20000,7 +20002,6 @@ mod aya_runtime {
                 control_dir_name.push(char::from(HEX[usize::from(byte >> 4)]));
                 control_dir_name.push(char::from(HEX[usize::from(byte & 0x0f)]));
             }
-            let mut control_dir_created = false;
             if !predecessor_handoff && allow_create {
                 Self::current_recovery_optional_effect_currentness(
                     currentness,
@@ -20016,8 +20017,7 @@ mod aya_runtime {
                     "ebpf_reconciler_ownership_create",
                 )?;
                 match ownership_create {
-                    Ok(()) => control_dir_created = true,
-                    Err(rustix::io::Errno::EXIST) => {}
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                     Err(error) => {
                         return Err(GtpuError::io(
                             "ebpf_reconciler_ownership_create",
@@ -20218,7 +20218,6 @@ mod aya_runtime {
             } else {
                 &current_control_root
             };
-            let mut operation_lock_created = false;
             if historical_25_handoff.is_none() && allow_create {
                 Self::current_recovery_optional_effect_currentness(
                     currentness,
@@ -20234,8 +20233,7 @@ mod aya_runtime {
                     "ebpf_reconciler_operation_lock_create",
                 )?;
                 match operation_lock_create {
-                    Ok(()) => operation_lock_created = true,
-                    Err(rustix::io::Errno::EXIST) => {}
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                     Err(error) => {
                         return Err(GtpuError::io(
                             "ebpf_reconciler_operation_lock_create",
@@ -20271,11 +20269,9 @@ mod aya_runtime {
                 control_dir_name,
                 control_dir_device: control_dir_metadata.dev(),
                 control_dir_inode: control_dir_metadata.ino(),
-                control_dir_created,
                 operation_lock_name,
                 operation_lock_device: operation_lock_metadata.dev(),
                 operation_lock_inode: operation_lock_metadata.ino(),
-                operation_lock_created,
                 historical_25_handoff,
                 canonical_pin_dir: pin_dir.to_path_buf(),
                 namespace_hash,
@@ -20860,11 +20856,22 @@ mod aya_runtime {
                             entry == LEGACY_V2_TEARDOWN_PROOF_MAP
                                 || CURRENT_MAP_NAMES.contains(&entry.as_str())
                         });
-                    // Empty is the only unmaterialised current graph shape.
-                    // Every non-empty, non-current inventory—including any
-                    // complete or partial shipped-25 graph—is kept outside the
-                    // current authority constructor.
-                    if !entries.is_empty() && !exact_current_layout && !admitted_successor_layout {
+                    let exact_historical_25_layout = entries.len()
+                        == PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()
+                        && PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES
+                            .iter()
+                            .all(|name| entries.contains(*name));
+                    // The complete sealed shipped-25 manifest is the one
+                    // graph shape this compatibility preflight owns. Partial,
+                    // foreign, and other known historical layouts retain the
+                    // precise generation/ABI/schema classification performed
+                    // by their existing read-only guards; none is made
+                    // admissible here. Dedicated maintenance remains the only
+                    // path allowed to take shipped-25 recovery authority.
+                    if exact_historical_25_layout
+                        && !exact_current_layout
+                        && !admitted_successor_layout
+                    {
                         return Err(state_indeterminate(OPERATION));
                     }
                     Some(metadata)
@@ -30594,6 +30601,54 @@ mod aya_runtime {
                 && (ownership.historical_25_handoff.is_some() || native_operation_lock_present))
         }
 
+        /// Re-prove only the current target's root-level authority for an
+        /// ordinary graph operation. Unlike terminal retirement, ordinary
+        /// publication never removes a control-root sibling, so a disjoint
+        /// namespace does not need to authenticate its own graph merely to be
+        /// preserved. The target's legacy leaf, current staging prefix, and
+        /// operation lock remain exact fail-closed boundaries.
+        fn ordinary_current_root_layout_is_exact(
+            ownership: &ReconcilerOwnership,
+            operation: &'static str,
+        ) -> Result<bool, GtpuError> {
+            let bpffs_root = Self::open_current_bpffs_root(ownership, operation)?;
+            let control_root = rustix::fs::openat(
+                &bpffs_root,
+                ownership.control_root_name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| GtpuError::io(operation, error.into()))?;
+            Self::verify_reconciler_control_root(ownership, &control_root, operation)?;
+            let leaf = ownership
+                .canonical_pin_dir
+                .file_name()
+                .ok_or_else(|| state_indeterminate(operation))?;
+            let legacy_leaf = Self::historical_25_legacy_leaf_name(leaf)?;
+            let target_prefix = ownership.control_dir_name.as_str();
+            let native_operation_lock = ownership
+                .historical_25_handoff
+                .is_none()
+                .then_some(ownership.operation_lock_name.as_str());
+            let mut target_leaf_present = false;
+            let mut native_operation_lock_present = false;
+            for entry in Self::historical_25_control_root_entries(&control_root, operation)? {
+                if entry == target_prefix {
+                    target_leaf_present = true;
+                } else if native_operation_lock == Some(entry.as_str()) {
+                    native_operation_lock_present = true;
+                } else if entry == legacy_leaf || entry.starts_with(target_prefix) {
+                    return Ok(false);
+                }
+            }
+            Ok(target_leaf_present
+                && (ownership.historical_25_handoff.is_some() || native_operation_lock_present))
+        }
+
         fn current_terminal_publication_candidate(
             ownership: &ReconcilerOwnership,
             operation: &'static str,
@@ -30864,6 +30919,91 @@ mod aya_runtime {
                 }) == receipt.terminal_receipt_commitment()
         }
 
+        /// Prove that an ordinary current-generation publisher is reopening
+        /// an exact, authority-free control namespace rather than interpreting
+        /// a merely empty graph path as fresh provenance. A previous probe,
+        /// failed publication, or clean device removal may legitimately leave
+        /// the private lease and operation-lock directories behind. Their
+        /// creation flags are process-local history and therefore cannot be
+        /// the durable discriminator on a later attempt.
+        ///
+        /// The proof is intentionally narrower than current-graph adoption:
+        /// every selector marker, recovery WAL/receipt, historical handoff,
+        /// malformed leaf, staging namespace, or replaced authority path
+        /// keeps an absent graph indeterminate. The complete observation is
+        /// repeated under the operation flock around the graph read so an
+        /// uncooperative concurrent replacement cannot manufacture freshness.
+        fn ordinary_pristine_graph_absence_is_exact(
+            ownership: &ReconcilerOwnership,
+            operation_lock: &OperationControlLock,
+            operation: &'static str,
+        ) -> Result<bool, GtpuError> {
+            if ownership.historical_25_handoff.is_some() {
+                return Ok(false);
+            }
+
+            let control_is_pristine = || -> Result<bool, GtpuError> {
+                let current =
+                    Self::revalidate_current_control_path(ownership, operation_lock, operation)?;
+                let (authority, decommissioned) = Self::marker_inventory(&current)?;
+                let main_absent = Self::read_current_recovery_proof(ownership)?.is_none();
+                let terminal_absent = Self::read_current_terminal_proof(ownership)?.is_none();
+                let finalized_absent =
+                    Self::read_current_finalized_successor_record(ownership, operation)?.is_none();
+                let root_exact = Self::ordinary_current_root_layout_is_exact(ownership, operation)?;
+                Ok(authority.is_empty()
+                    && decommissioned.is_empty()
+                    && main_absent
+                    && terminal_absent
+                    && finalized_absent
+                    && root_exact)
+            };
+            let graph_is_unmaterialized = || -> Result<bool, GtpuError> {
+                match fs::symlink_metadata(&ownership.canonical_pin_dir) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                    Err(error) => Err(GtpuError::io(operation, error)),
+                    Ok(metadata)
+                        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+                    {
+                        Ok(
+                            Self::current_directory_entries(&ownership.canonical_pin_dir)?
+                                .is_empty(),
+                        )
+                    }
+                    Ok(_) => Ok(false),
+                }
+            };
+
+            if !control_is_pristine()? || !graph_is_unmaterialized()? {
+                return Ok(false);
+            }
+            if !control_is_pristine()? || !graph_is_unmaterialized()? {
+                return Ok(false);
+            }
+            control_is_pristine()
+        }
+
+        /// Revalidate the persistent control hierarchy for an exact current
+        /// graph. Selector authority may legitimately be present here, but
+        /// every entry and recovery receipt must still be structurally valid
+        /// and every authority-bearing path must remain the one under lock.
+        fn ordinary_current_graph_control_is_exact(
+            ownership: &ReconcilerOwnership,
+            operation_lock: &OperationControlLock,
+            operation: &'static str,
+        ) -> Result<bool, GtpuError> {
+            let control_is_exact = || -> Result<bool, GtpuError> {
+                let current =
+                    Self::revalidate_current_control_path(ownership, operation_lock, operation)?;
+                let _ = Self::marker_inventory(&current)?;
+                let _ = Self::read_current_finalized_successor_record(ownership, operation)?;
+                Ok(Self::read_current_recovery_proof(ownership)?.is_none()
+                    && Self::read_current_terminal_proof(ownership)?.is_none()
+                    && Self::ordinary_current_root_layout_is_exact(ownership, operation)?)
+            };
+            Ok(control_is_exact()? && control_is_exact()?)
+        }
+
         /// Gate every ordinary attach/adopt path against current recovery
         /// state while the exact namespace lease and operation flock are
         /// held. A broker admission authorizes only creation from the sole
@@ -30885,27 +31025,48 @@ mod aya_runtime {
                 if main.is_some() || terminal.is_some() {
                     return Err(state_indeterminate(OPERATION));
                 }
-                return match fs::symlink_metadata(&ownership.canonical_pin_dir) {
+                let allowed = match fs::symlink_metadata(&ownership.canonical_pin_dir) {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        if ownership.control_dir_created && ownership.operation_lock_created {
-                            Ok(())
-                        } else {
-                            Err(state_indeterminate(OPERATION))
-                        }
+                        Self::ordinary_pristine_graph_absence_is_exact(
+                            ownership,
+                            operation_lock,
+                            OPERATION,
+                        )?
                     }
-                    Err(_) => Err(state_indeterminate(OPERATION)),
+                    Err(_) => false,
                     Ok(metadata)
                         if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
                     {
                         let entries =
                             Self::current_directory_entries(&ownership.canonical_pin_dir)?;
-                        (entries.len() == CURRENT_MAP_NAMES.len()
-                            && CURRENT_MAP_NAMES.iter().all(|name| entries.contains(*name)))
-                        .then_some(())
-                        .ok_or_else(|| state_indeterminate(OPERATION))
+                        if entries.is_empty() {
+                            Self::ordinary_pristine_graph_absence_is_exact(
+                                ownership,
+                                operation_lock,
+                                OPERATION,
+                            )?
+                        } else if entries.len() == CURRENT_MAP_NAMES.len()
+                            && CURRENT_MAP_NAMES.iter().all(|name| entries.contains(*name))
+                        {
+                            let control_is_exact = Self::ordinary_current_graph_control_is_exact(
+                                ownership,
+                                operation_lock,
+                                OPERATION,
+                            )?;
+                            let entries =
+                                Self::current_directory_entries(&ownership.canonical_pin_dir)?;
+                            control_is_exact
+                                && entries.len() == CURRENT_MAP_NAMES.len()
+                                && CURRENT_MAP_NAMES.iter().all(|name| entries.contains(*name))
+                        } else {
+                            false
+                        }
                     }
-                    Ok(_) => Err(state_indeterminate(OPERATION)),
+                    Ok(_) => false,
                 };
+                return allowed
+                    .then_some(())
+                    .ok_or_else(|| state_indeterminate(OPERATION));
             };
 
             if admission.authority != admission.receipt.authority()
@@ -36108,16 +36269,6 @@ mod aya_runtime {
             let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir)?;
             let _graph_lock =
                 Self::acquire_operation_control_lock(&reconciler_ownership, "ebpf_attach")?;
-            if terminal_admission.is_none() {
-                Self::ensure_current_recovery_allows_ordinary_graph(
-                    &reconciler_ownership,
-                    &_graph_lock,
-                    (interface, ifindex),
-                    tc_priority,
-                    None,
-                    None,
-                )?;
-            }
             let pins_preexisted =
                 match fs::symlink_metadata(&reconciler_ownership.canonical_pin_dir) {
                     Ok(metadata)
@@ -36161,6 +36312,16 @@ mod aya_runtime {
             Self::require_current_program_pin_graph(&current_programs, &graph_pin_dir)?;
             Self::classify_pinned_map_layout(&graph_pin_dir)?;
             Self::require_current_pin_capacity(&graph_pin_dir)?;
+            if terminal_admission.is_none() {
+                Self::ensure_current_recovery_allows_ordinary_graph(
+                    &reconciler_ownership,
+                    &_graph_lock,
+                    (interface, ifindex),
+                    tc_priority,
+                    None,
+                    None,
+                )?;
+            }
             let schema_state = Self::bearer_schema_preflight(&graph_pin_dir, successor.as_ref())?;
             Self::tft_schema_preflight(&graph_pin_dir)?;
             // Prove ownership from the pins before the loader publishes any
@@ -36496,16 +36657,6 @@ mod aya_runtime {
             let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir)?;
             let _graph_lock =
                 Self::acquire_operation_control_lock(&reconciler_ownership, "ebpf_attach_grouped")?;
-            if terminal_admission.is_none() {
-                Self::ensure_current_recovery_allows_ordinary_graph(
-                    &reconciler_ownership,
-                    &_graph_lock,
-                    (interface, ifindex),
-                    tc_priority,
-                    None,
-                    None,
-                )?;
-            }
             let pins_preexisted =
                 match fs::symlink_metadata(&reconciler_ownership.canonical_pin_dir) {
                     Ok(metadata)
@@ -36545,6 +36696,16 @@ mod aya_runtime {
             Self::require_current_program_pin_graph(&current_programs, &graph_pin_dir)?;
             Self::classify_pinned_map_layout(&graph_pin_dir)?;
             Self::require_current_pin_capacity(&graph_pin_dir)?;
+            if terminal_admission.is_none() {
+                Self::ensure_current_recovery_allows_ordinary_graph(
+                    &reconciler_ownership,
+                    &_graph_lock,
+                    (interface, ifindex),
+                    tc_priority,
+                    None,
+                    None,
+                )?;
+            }
             let bearer_state = Self::bearer_schema_preflight(&graph_pin_dir, successor.as_ref())?;
             let grouped_state = Self::grouped_schema_preflight(&graph_pin_dir, bearer_state)?;
             // Exclude live legacy authority before the loader materializes the
@@ -37065,14 +37226,6 @@ mod aya_runtime {
             let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir)?;
             let _graph_lock =
                 Self::acquire_operation_control_lock(&reconciler_ownership, "ebpf_adopt")?;
-            Self::ensure_current_recovery_allows_ordinary_graph(
-                &reconciler_ownership,
-                &_graph_lock,
-                (interface, ifindex),
-                tc_priority,
-                None,
-                None,
-            )?;
             let canonical_pin_dir =
                 match Self::existing_canonical_pin_dir(&reconciler_ownership, "ebpf_adopt_pin_dir")
                 {
@@ -37094,6 +37247,14 @@ mod aya_runtime {
             Self::require_current_program_pin_graph(&current_programs, &canonical_pin_dir)?;
             Self::classify_pinned_map_layout(&canonical_pin_dir)?;
             Self::require_current_pin_capacity(&canonical_pin_dir)?;
+            Self::ensure_current_recovery_allows_ordinary_graph(
+                &reconciler_ownership,
+                &_graph_lock,
+                (interface, ifindex),
+                tc_priority,
+                None,
+                None,
+            )?;
             let schema_state = Self::bearer_schema_preflight(&canonical_pin_dir, None)?;
             Self::tft_schema_preflight(&canonical_pin_dir)?;
             // ---- mutation boundary ----
@@ -37281,14 +37442,6 @@ mod aya_runtime {
                 &reconciler_ownership,
                 "ebpf_adopt_cleanup_only",
             )?;
-            Self::ensure_current_recovery_allows_ordinary_graph(
-                &reconciler_ownership,
-                &_graph_lock,
-                (interface, ifindex),
-                tc_priority,
-                None,
-                None,
-            )?;
             // Classify the pin namespace path with `symlink_metadata` so a
             // symlinked or non-directory entry is refused as an identity
             // mismatch, mirroring orphaned recovery and drained-v2 teardown.
@@ -37310,13 +37463,20 @@ mod aya_runtime {
                     // inventory are authoritatively empty. A live off-slot
                     // hook with no retained pins is orphaned state, never
                     // absence, and nothing is manufactured to prove either.
-                    return if Self::cleanup_only_absence_proven(ifindex, tc_priority)? {
-                        Ok(EbpfCleanupOnlyAdoption::Absent)
-                    } else {
-                        Ok(EbpfCleanupOnlyAdoption::Refused(
+                    if !Self::cleanup_only_absence_proven(ifindex, tc_priority)? {
+                        return Ok(EbpfCleanupOnlyAdoption::Refused(
                             RetainedGraphCleanupRefusal::IdentityMismatch,
-                        ))
-                    };
+                        ));
+                    }
+                    Self::ensure_current_recovery_allows_ordinary_graph(
+                        &reconciler_ownership,
+                        &_graph_lock,
+                        (interface, ifindex),
+                        tc_priority,
+                        None,
+                        None,
+                    )?;
+                    return Ok(EbpfCleanupOnlyAdoption::Absent);
                 }
                 Err(_) => return Err(state_indeterminate("ebpf_pin_dir_identity")),
             }
@@ -37338,13 +37498,20 @@ mod aya_runtime {
             let recorded_local_ip = match Self::cleanup_only_pin_graph_preflight(&canonical_pin_dir)
             {
                 Ok(CleanupOnlyPinGraph::Absent) => {
-                    return if Self::cleanup_only_absence_proven(ifindex, tc_priority)? {
-                        Ok(EbpfCleanupOnlyAdoption::Absent)
-                    } else {
-                        Ok(EbpfCleanupOnlyAdoption::Refused(
+                    if !Self::cleanup_only_absence_proven(ifindex, tc_priority)? {
+                        return Ok(EbpfCleanupOnlyAdoption::Refused(
                             RetainedGraphCleanupRefusal::IdentityMismatch,
-                        ))
-                    };
+                        ));
+                    }
+                    Self::ensure_current_recovery_allows_ordinary_graph(
+                        &reconciler_ownership,
+                        &_graph_lock,
+                        (interface, ifindex),
+                        tc_priority,
+                        None,
+                        None,
+                    )?;
+                    return Ok(EbpfCleanupOnlyAdoption::Absent);
                 }
                 Ok(CleanupOnlyPinGraph::Current { local_ip }) => local_ip,
                 Err(refusal) => return Ok(EbpfCleanupOnlyAdoption::Refused(refusal)),
@@ -37354,6 +37521,14 @@ mod aya_runtime {
                     RetainedGraphCleanupRefusal::LocalEndpointMismatch,
                 ));
             }
+            Self::ensure_current_recovery_allows_ordinary_graph(
+                &reconciler_ownership,
+                &_graph_lock,
+                (interface, ifindex),
+                tc_priority,
+                None,
+                None,
+            )?;
             // Generation and ABI guards run before any load/fence mutation.
             let current_programs = match Self::require_no_foreign_generation(
                 ifindex,
@@ -48728,6 +48903,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn historical_25_disjoint_sibling_names_are_bounded_and_orphan_lock_is_not_a_leaf() {
         let namespace = "ab".repeat(32);
@@ -48857,7 +49033,7 @@ mod tests {
     const LEGACY_V2_PIN_COUNT: usize = 9;
     const HISTORICAL_25_PIN_COUNT: usize = 25;
     // The fake models the production schema, never a stale literal subset.
-    const CURRENT_PIN_COUNT: usize = aya_runtime::CURRENT_MAP_NAMES.len();
+    const CURRENT_PIN_COUNT: usize = CURRENT_EBPF_GRAPH_PIN_COUNT;
 
     struct HistoricalRecoveryEffectPause {
         operation: &'static str,
