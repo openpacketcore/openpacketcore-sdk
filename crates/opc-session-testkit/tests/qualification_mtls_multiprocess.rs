@@ -12806,6 +12806,16 @@ const V2_BATCH_RELEASE_GATE_PRELOAD_CREATES: usize = 50_000;
 const V2_BATCH_RELEASE_GATE_PACED_MUTATIONS: usize = 60_000;
 const V2_BATCH_RELEASE_GATE_MUTATIONS_PER_SECOND: usize = 1_000;
 const V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES: usize = 1_008;
+/// Qualification ceiling, not a production identity. The node-local worker
+/// may freeze more than one cohort for a concurrent wave because arrivals on
+/// distinct authenticated lanes are scheduler ordered. Requiring no more
+/// than two still rejects a singleton-cohort attempt storm without pretending
+/// every run has exactly one scheduler-independent cohort.
+const V2_BATCH_RELEASE_GATE_MAX_STATUS_COHORTS_PER_VOTER_WAVE: u64 = 2;
+/// Qualification ceiling for leader-side fragmentation. Every accepted
+/// proposal must cover at least this many voter representatives on average;
+/// the exact cohort cardinality remains scheduler dependent.
+const V2_BATCH_RELEASE_GATE_MIN_STATUS_REPRESENTATIVES_PER_PROPOSAL: u64 = 2;
 const V2_BATCH_RELEASE_GATE_P99: Duration = Duration::from_millis(25);
 const V2_BATCH_RELEASE_GATE_P999: Duration = Duration::from_millis(100);
 const V2_BATCH_RELEASE_GATE_AMBIGUITY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -12821,6 +12831,175 @@ const V2_BATCH_RELEASE_GATE_HOLD_ACK_TIMEOUT: Duration = Duration::from_secs(10)
 /// the immutable family deadline remains the existing 30-second bound.
 const V2_BATCH_RELEASE_GATE_CAUSAL_AMBIGUITY_OPERATION_TIMEOUT: Duration =
     Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct V2StatusCohortAccountingDelta {
+    local: u64,
+    ingress: u64,
+    representatives: u64,
+    leader: u64,
+    proposals: u64,
+}
+
+fn verify_v2_status_cohort_accounting(
+    expected_local_per_voter: u64,
+    wave_count: u64,
+    maximum_cohorts_per_voter_wave: u64,
+    minimum_representatives_per_proposal: u64,
+    per_voter: &[V2StatusCohortAccountingDelta],
+) -> Result<(), String> {
+    if per_voter.is_empty()
+        || wave_count == 0
+        || maximum_cohorts_per_voter_wave == 0
+        || minimum_representatives_per_proposal == 0
+    {
+        return Err("V2 status cohort accounting profile is empty".to_owned());
+    }
+    let maximum_cohorts_per_voter = wave_count
+        .checked_mul(maximum_cohorts_per_voter_wave)
+        .ok_or_else(|| "V2 status cohort ceiling overflowed".to_owned())?;
+    let mut local = 0_u64;
+    let mut ingress = 0_u64;
+    let mut representatives = 0_u64;
+    let mut leader = 0_u64;
+    let mut proposals = 0_u64;
+    for (voter_index, delta) in per_voter.iter().enumerate() {
+        if delta.local != expected_local_per_voter {
+            return Err(format!(
+                "V2 status local dispatch is not exact: voter_index={voter_index}, observed={}, expected={expected_local_per_voter}",
+                delta.local
+            ));
+        }
+        if !(wave_count..=maximum_cohorts_per_voter).contains(&delta.ingress) {
+            return Err(format!(
+                "V2 status node-local cohort bound failed: voter_index={voter_index}, observed={}, minimum={wave_count}, maximum={maximum_cohorts_per_voter}",
+                delta.ingress
+            ));
+        }
+        if delta.representatives != delta.ingress {
+            return Err(format!(
+                "V2 status node-local representative accounting is not conserved: voter_index={voter_index}, ingress={}, representatives={}",
+                delta.ingress, delta.representatives
+            ));
+        }
+        local = local
+            .checked_add(delta.local)
+            .ok_or_else(|| "V2 status local accounting overflowed".to_owned())?;
+        ingress = ingress
+            .checked_add(delta.ingress)
+            .ok_or_else(|| "V2 status ingress accounting overflowed".to_owned())?;
+        representatives = representatives
+            .checked_add(delta.representatives)
+            .ok_or_else(|| "V2 status representative accounting overflowed".to_owned())?;
+        leader = leader
+            .checked_add(delta.leader)
+            .ok_or_else(|| "V2 status leader accounting overflowed".to_owned())?;
+        proposals = proposals
+            .checked_add(delta.proposals)
+            .ok_or_else(|| "V2 status proposal accounting overflowed".to_owned())?;
+    }
+    if ingress > local {
+        return Err(format!(
+            "V2 status ingress amplified local dispatch: local={local}, ingress={ingress}"
+        ));
+    }
+    if representatives != ingress || leader != representatives {
+        return Err(format!(
+            "V2 status voter-to-leader accounting is not conserved: ingress={ingress}, representatives={representatives}, leader={leader}"
+        ));
+    }
+    if proposals > leader {
+        return Err(format!(
+            "V2 status proposals amplified leader arrivals: leader={leader}, proposals={proposals}"
+        ));
+    }
+    let voter_count = u64::try_from(per_voter.len())
+        .map_err(|_| "V2 status voter count does not fit u64".to_owned())?;
+    let minimum_proposals = leader.div_ceil(voter_count);
+    if proposals < minimum_proposals {
+        return Err(format!(
+            "V2 status proposal accounting is incomplete: leader={leader}, voters={voter_count}, proposals={proposals}, minimum={minimum_proposals}"
+        ));
+    }
+    let proposal_storm_ceiling = leader / minimum_representatives_per_proposal;
+    if proposals > proposal_storm_ceiling {
+        return Err(format!(
+            "V2 status proposal storm ceiling exceeded: leader={leader}, proposals={proposals}, maximum={proposal_storm_ceiling}, minimum_representatives_per_proposal={minimum_representatives_per_proposal}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn v2_status_cohort_accounting_accepts_fragmentation_and_rejects_attempt_storms() {
+    let qualified = [
+        V2StatusCohortAccountingDelta {
+            local: 336,
+            ingress: 42,
+            representatives: 42,
+            leader: 126,
+            proposals: 44,
+        },
+        V2StatusCohortAccountingDelta {
+            local: 336,
+            ingress: 42,
+            representatives: 42,
+            leader: 0,
+            proposals: 0,
+        },
+        V2StatusCohortAccountingDelta {
+            local: 336,
+            ingress: 42,
+            representatives: 42,
+            leader: 0,
+            proposals: 0,
+        },
+    ];
+    verify_v2_status_cohort_accounting(336, 21, 2, 2, &qualified)
+        .expect("scheduler-fragmented but bounded status cohorts qualify");
+
+    for (failure, mutate) in [
+        (
+            "local dispatch mismatch",
+            (|deltas: &mut [V2StatusCohortAccountingDelta; 3]| deltas[1].local -= 1)
+                as fn(&mut [V2StatusCohortAccountingDelta; 3]),
+        ),
+        (
+            "node-local singleton storm",
+            |deltas: &mut [V2StatusCohortAccountingDelta; 3]| {
+                deltas[1].ingress = 43;
+                deltas[1].representatives = 43;
+                deltas[0].leader = 127;
+            },
+        ),
+        (
+            "representative amplification",
+            |deltas: &mut [V2StatusCohortAccountingDelta; 3]| {
+                deltas[1].representatives += 1;
+                deltas[0].leader += 1;
+            },
+        ),
+        (
+            "leader amplification",
+            |deltas: &mut [V2StatusCohortAccountingDelta; 3]| deltas[0].leader += 1,
+        ),
+        (
+            "proposal amplification",
+            |deltas: &mut [V2StatusCohortAccountingDelta; 3]| deltas[0].proposals = 127,
+        ),
+        (
+            "proposal singleton storm",
+            |deltas: &mut [V2StatusCohortAccountingDelta; 3]| deltas[0].proposals = 64,
+        ),
+    ] {
+        let mut invalid = qualified;
+        mutate(&mut invalid);
+        assert!(
+            verify_v2_status_cohort_accounting(336, 21, 2, 2, &invalid).is_err(),
+            "status cohort verifier accepted {failure}"
+        );
+    }
+}
 
 fn assert_v2_batch_release_profile() {
     let cargo_profile = env!("OPC_SESSION_TESTKIT_CARGO_PROFILE_FAMILY");
@@ -17037,79 +17216,95 @@ fn run_persistent_consumer_v2_batch_release_gate(
         .last()
         .expect("warm status request spread is nonempty");
     let consensus_diagnostics_after_warm_reads = fleet.all_consensus_diagnostics();
-    let status_local_delta = consensus_diagnostics_after_warm_reads
-        .iter()
-        .zip(&consensus_diagnostics_before_warm_reads)
-        .map(|(after, before)| {
-            after
-                .status_local_requests
-                .checked_sub(before.status_local_requests)
-                .expect("status-local counter is monotonic")
-        })
-        .sum::<u64>();
-    let status_ingress_delta = consensus_diagnostics_after_warm_reads
-        .iter()
-        .zip(&consensus_diagnostics_before_warm_reads)
-        .map(|(after, before)| {
-            after
-                .status_ingress_requests
-                .checked_sub(before.status_ingress_requests)
-                .expect("status-ingress counter is monotonic")
-        })
-        .sum::<u64>();
-    let status_leader_delta = consensus_diagnostics_after_warm_reads
-        .iter()
-        .zip(&consensus_diagnostics_before_warm_reads)
-        .map(|(after, before)| {
-            after
-                .status_leader_cohort_requests
-                .checked_sub(before.status_leader_cohort_requests)
-                .expect("status-leader counter is monotonic")
-        })
-        .sum::<u64>();
-    let status_representative_delta = consensus_diagnostics_after_warm_reads
-        .iter()
-        .zip(&consensus_diagnostics_before_warm_reads)
-        .map(|(after, before)| {
-            after
-                .status_representatives
-                .checked_sub(before.status_representatives)
-                .expect("status-representative counter is monotonic")
-        })
-        .sum::<u64>();
-    let status_proposal_delta = consensus_diagnostics_after_warm_reads
-        .iter()
-        .zip(&consensus_diagnostics_before_warm_reads)
-        .map(|(after, before)| {
-            after
-                .status_proposals
-                .checked_sub(before.status_proposals)
-                .expect("status-proposal counter is monotonic")
-        })
-        .sum::<u64>();
     assert_eq!(
-        status_local_delta, V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES as u64,
-        "every recorded warm read enters exactly one bounded node-local batch",
+        consensus_diagnostics_after_warm_reads.len(),
+        consensus_diagnostics_before_warm_reads.len(),
+        "warm-read consensus diagnostic cardinality is stable"
     );
-    let expected_voter_representatives = u64::try_from(
-        MEMBER_COUNT
-            * (V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY),
+    assert_eq!(
+        consensus_diagnostics_after_warm_reads.len(),
+        MEMBER_COUNT,
+        "warm-read consensus diagnostics cover every fixed voter"
+    );
+    let status_accounting = consensus_diagnostics_after_warm_reads
+        .iter()
+        .zip(&consensus_diagnostics_before_warm_reads)
+        .enumerate()
+        .map(|(voter_index, (after, before))| {
+            let delta = |counter: &str, before: u64, after: u64| {
+                after.checked_sub(before).unwrap_or_else(|| {
+                    panic!(
+                        "warm-read consensus diagnostic regressed: voter_index={voter_index}, counter={counter}, before={before}, after={after}"
+                    )
+                })
+            };
+            V2StatusCohortAccountingDelta {
+                local: delta(
+                    "status_local_requests",
+                    before.status_local_requests,
+                    after.status_local_requests,
+                ),
+                ingress: delta(
+                    "status_ingress_requests",
+                    before.status_ingress_requests,
+                    after.status_ingress_requests,
+                ),
+                representatives: delta(
+                    "status_representatives",
+                    before.status_representatives,
+                    after.status_representatives,
+                ),
+                leader: delta(
+                    "status_leader_cohort_requests",
+                    before.status_leader_cohort_requests,
+                    after.status_leader_cohort_requests,
+                ),
+                proposals: delta(
+                    "status_proposals",
+                    before.status_proposals,
+                    after.status_proposals,
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    let status_local_delta = status_accounting
+        .iter()
+        .map(|delta| delta.local)
+        .sum::<u64>();
+    let status_ingress_delta = status_accounting
+        .iter()
+        .map(|delta| delta.ingress)
+        .sum::<u64>();
+    let status_representative_delta = status_accounting
+        .iter()
+        .map(|delta| delta.representatives)
+        .sum::<u64>();
+    let status_leader_delta = status_accounting
+        .iter()
+        .map(|delta| delta.leader)
+        .sum::<u64>();
+    let status_proposal_delta = status_accounting
+        .iter()
+        .map(|delta| delta.proposals)
+        .sum::<u64>();
+    let status_wave_count = u64::try_from(
+        V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
     )
-    .expect("bounded voter representative count");
+    .expect("bounded warm-read wave count");
+    let expected_local_per_voter =
+        u64::try_from(V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / MEMBER_COUNT)
+            .expect("bounded per-voter warm-read count");
     println!(
-        "V2_BATCH_RELEASE_GATE_STATUS_COHORTS local={status_local_delta} ingress={status_ingress_delta} representatives={status_representative_delta} leader={status_leader_delta} proposals={status_proposal_delta} ideal_voter_representatives={expected_voter_representatives}",
+        "V2_BATCH_RELEASE_GATE_STATUS_COHORTS local={status_local_delta} ingress={status_ingress_delta} representatives={status_representative_delta} leader={status_leader_delta} proposals={status_proposal_delta} per_voter={status_accounting:?}",
     );
-    assert_eq!(status_ingress_delta, expected_voter_representatives);
-    assert_eq!(status_representative_delta, expected_voter_representatives);
-    assert_eq!(status_leader_delta, expected_voter_representatives);
-    assert_eq!(
-        status_proposal_delta,
-        u64::try_from(
-            V2_BATCH_RELEASE_GATE_WARM_READ_SAMPLES / V2_BATCH_RELEASE_GATE_WAVE_CONCURRENCY,
-        )
-        .expect("bounded status proposal count"),
-        "each 48-reader wave has exactly one consensus linearization point",
-    );
+    verify_v2_status_cohort_accounting(
+        expected_local_per_voter,
+        status_wave_count,
+        V2_BATCH_RELEASE_GATE_MAX_STATUS_COHORTS_PER_VOTER_WAVE,
+        V2_BATCH_RELEASE_GATE_MIN_STATUS_REPRESENTATIVES_PER_PROPOSAL,
+        &status_accounting,
+    )
+    .unwrap_or_else(|error| panic!("V2 warm-status consensus attempt bound failed: {error}"));
 
     // Take a public capacity snapshot immediately before the paced phase.
     // The scheduler below supplies the complementary caller-side bound: no
