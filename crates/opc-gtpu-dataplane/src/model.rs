@@ -44,6 +44,12 @@ pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID: &str =
 /// commitment used by an external broker's retired-to-new authority CAS.
 pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_CODEC_ID: &str =
     "opc.gtpu.current-ebpf-recovery-terminal-receipt.r2";
+/// Stable codec identity of a complete broker-durable authenticated terminal
+/// receipt record.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_CODEC_ID: &str =
+    "opc.gtpu.current-ebpf-recovery-terminal-receipt-record.r1";
+/// Fixed width of one complete broker-durable authenticated terminal receipt.
+pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_ENCODED_LEN: usize = 544;
 
 /// Stable codec identity of an authenticated current terminal transfer.
 pub const CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_TRANSFER_CODEC_ID: &str =
@@ -633,6 +639,27 @@ pub trait CurrentEbpfGraphRecoveryCurrentnessGuard: Send + Sync {
                 + 'static,
         >,
     >;
+
+    /// Prove that the exact SDK-issued successor receipt was durably retained
+    /// by the external broker under this same live authority.
+    ///
+    /// A successful implementation must perform a fresh authoritative read
+    /// and compare the complete receipt commitment. The broker record must be
+    /// immutable for the lifetime of this authority. A checksum-valid caller
+    /// value, cached acknowledgement, or partial-field comparison is not
+    /// sufficient. Backends that cannot provide this proof fail closed.
+    fn verify_brokered_successor_receipt(
+        &self,
+        _expected: CurrentEbpfGraphRecoveryCommitment,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), CurrentEbpfGraphRecoveryAuthorityCurrentness>>
+                + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async { Err(CurrentEbpfGraphRecoveryAuthorityCurrentness::Unavailable) })
+    }
 }
 
 /// Copyable receipt/proof projection of an affine current recovery authority.
@@ -754,6 +781,19 @@ impl CurrentEbpfGraphRecoveryAuthority {
         >,
     > {
         self.guard.verify_current()
+    }
+
+    pub(crate) fn verify_brokered_successor_receipt(
+        &self,
+        expected: CurrentEbpfGraphRecoveryCommitment,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), CurrentEbpfGraphRecoveryAuthorityCurrentness>>
+                + Send
+                + 'static,
+        >,
+    > {
+        self.guard.verify_brokered_successor_receipt(expected)
     }
 }
 
@@ -1770,6 +1810,190 @@ impl CurrentEbpfGraphRecoveryReceipt {
     pub const fn terminal_wal_codec_identity(self) -> &'static str {
         CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_WAL_CODEC_ID
     }
+
+    /// Encode a complete authenticated terminal receipt for durable broker
+    /// persistence across process loss.
+    ///
+    /// The record contains only opaque commitments, epochs, operation
+    /// nonces, closed source discriminators, and a checksum. It contains no
+    /// path, interface name, map/program ID, endpoint, key, or payload.
+    /// Pristine absence and nonterminal progress deliberately return `None`:
+    /// neither is backed by the retained terminal WAL required by admission.
+    #[must_use]
+    pub fn encode_authenticated_terminal(
+        self,
+    ) -> Option<[u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_ENCODED_LEN]> {
+        const CHECKSUM_OFFSET: usize = 512;
+        if !matches!(
+            (
+                self.outcome,
+                self.terminal_kind,
+                self.terminal_absence_proof,
+            ),
+            (
+                CurrentEbpfGraphRecoveryOutcome::Removed
+                    | CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+                Some(CurrentEbpfGraphRecoveryTerminalKind::AuthenticatedTerminal),
+                CurrentEbpfGraphTerminalAbsenceProof::Proven,
+            )
+        ) {
+            return None;
+        }
+        let graph = self.exact_graph_commitment?;
+        let source = self.terminal_source?;
+        let receipt_commitment = self.terminal_receipt_commitment?;
+        if CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
+            self.authority,
+            graph,
+            source,
+            self.terminal_adoption,
+        ) != receipt_commitment
+        {
+            return None;
+        }
+
+        let mut encoded = [0_u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_ENCODED_LEN];
+        encoded[..8].copy_from_slice(b"OPCTRRR1");
+        encoded[8..10]
+            .copy_from_slice(&CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION.to_be_bytes());
+        encoded[10] = match self.outcome {
+            CurrentEbpfGraphRecoveryOutcome::Removed => 1,
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent => 2,
+            CurrentEbpfGraphRecoveryOutcome::Refused(_)
+            | CurrentEbpfGraphRecoveryOutcome::Partial(_) => return None,
+        };
+        encoded[11] = match source {
+            CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph => 1,
+            CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                exact_historical_graph_commitment,
+            } => {
+                encoded[232..264].copy_from_slice(&exact_historical_graph_commitment.bytes());
+                2
+            }
+        };
+        encoded[12] = u8::from(self.terminal_adoption.is_some());
+        let authority = self.authority;
+        encoded[16..48].copy_from_slice(&authority.scope_commitment().bytes());
+        encoded[48..80].copy_from_slice(&authority.predecessor_basis_commitment().bytes());
+        encoded[80..88].copy_from_slice(&authority.fence_epoch().get().to_be_bytes());
+        encoded[88..104].copy_from_slice(&authority.operation_id().bytes());
+        let host = authority.host_commitments();
+        encoded[104..136].copy_from_slice(&host.host().bytes());
+        encoded[136..168].copy_from_slice(&host.root().bytes());
+        encoded[168..200].copy_from_slice(&host.leaf().bytes());
+        encoded[200..232].copy_from_slice(&graph.bytes());
+        encoded[264..296].copy_from_slice(&receipt_commitment.as_bytes());
+        if let Some(adoption) = self.terminal_adoption {
+            let prior = adoption.prior_authority();
+            encoded[296..328].copy_from_slice(&prior.scope_commitment().bytes());
+            encoded[328..360].copy_from_slice(&prior.predecessor_basis_commitment().bytes());
+            encoded[360..368].copy_from_slice(&prior.fence_epoch().get().to_be_bytes());
+            encoded[368..384].copy_from_slice(&prior.operation_id().bytes());
+            let prior_host = prior.host_commitments();
+            encoded[384..416].copy_from_slice(&prior_host.host().bytes());
+            encoded[416..448].copy_from_slice(&prior_host.root().bytes());
+            encoded[448..480].copy_from_slice(&prior_host.leaf().bytes());
+            encoded[480..512]
+                .copy_from_slice(&adoption.prior_terminal_receipt_commitment().as_bytes());
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-receipt-record\0r1");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        encoded[CHECKSUM_OFFSET..].copy_from_slice(&digest.finalize());
+        Some(encoded)
+    }
+
+    /// Decode one canonical authenticated terminal receipt retained by an
+    /// external broker. Decoding grants no authority: terminal admission
+    /// still reopens the live WAL and checks a fresh affine guard.
+    pub fn decode_authenticated_terminal(
+        encoded: [u8; CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_ENCODED_LEN],
+    ) -> Option<Self> {
+        const CHECKSUM_OFFSET: usize = 512;
+        if encoded[..8] != *b"OPCTRRR1"
+            || u16::from_be_bytes(encoded[8..10].try_into().ok()?)
+                != CURRENT_EBPF_GRAPH_RECOVERY_AUTHORITY_CONTRACT_VERSION
+            || !matches!(encoded[10], 1 | 2)
+            || !matches!(encoded[11], 1 | 2)
+            || !matches!(encoded[12], 0 | 1)
+            || encoded[13..16] != [0; 3]
+            || (encoded[11] == 1 && encoded[232..264] != [0; 32])
+            || (encoded[12] == 0 && encoded[296..512] != [0; 216])
+        {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"opc.gtpu.current-ebpf-terminal-receipt-record\0r1");
+        digest.update(CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_CODEC_ID.as_bytes());
+        digest.update(&encoded[..CHECKSUM_OFFSET]);
+        if encoded[CHECKSUM_OFFSET..] != digest.finalize()[..] {
+            return None;
+        }
+        let commitment = |range: std::ops::Range<usize>| {
+            CurrentEbpfGraphRecoveryCommitment::new(encoded[range].try_into().ok()?).ok()
+        };
+        let authority = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+            commitment(16..48)?,
+            commitment(48..80)?,
+            NonZeroU64::new(u64::from_be_bytes(encoded[80..88].try_into().ok()?))?,
+            CurrentEbpfGraphRecoveryOperationId::new(encoded[88..104].try_into().ok()?).ok()?,
+            CurrentEbpfGraphRecoveryHostCommitments::new(
+                commitment(104..136)?,
+                commitment(136..168)?,
+                commitment(168..200)?,
+            ),
+        );
+        let graph = commitment(200..232)?;
+        let source = match encoded[11] {
+            1 => CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
+            2 => CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                exact_historical_graph_commitment: HistoricalEbpfGraphRecoveryCommitment::new(
+                    encoded[232..264].try_into().ok()?,
+                )
+                .ok()?,
+            },
+            _ => return None,
+        };
+        let encoded_receipt = CurrentEbpfGraphRecoveryTerminalReceiptCommitment::new(
+            encoded[264..296].try_into().ok()?,
+        )
+        .ok()?;
+        let adoption = match encoded[12] {
+            0 => None,
+            1 => {
+                let prior = CurrentEbpfGraphRecoveryAuthorityBinding::new(
+                    commitment(296..328)?,
+                    commitment(328..360)?,
+                    NonZeroU64::new(u64::from_be_bytes(encoded[360..368].try_into().ok()?))?,
+                    CurrentEbpfGraphRecoveryOperationId::new(encoded[368..384].try_into().ok()?)
+                        .ok()?,
+                    CurrentEbpfGraphRecoveryHostCommitments::new(
+                        commitment(384..416)?,
+                        commitment(416..448)?,
+                        commitment(448..480)?,
+                    ),
+                );
+                Some(CurrentEbpfGraphRecoveryTerminalAdoption::new(
+                    prior,
+                    CurrentEbpfGraphRecoveryTerminalReceiptCommitment::new(
+                        encoded[480..512].try_into().ok()?,
+                    )
+                    .ok()?,
+                ))
+            }
+            _ => return None,
+        };
+        let outcome = match encoded[10] {
+            1 => CurrentEbpfGraphRecoveryOutcome::Removed,
+            2 => CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+            _ => return None,
+        };
+        let receipt = Self::authenticated_terminal(authority, outcome, graph, source, adoption);
+        (receipt.terminal_receipt_commitment == Some(encoded_receipt)
+            && receipt.encode_authenticated_terminal() == Some(encoded))
+        .then_some(receipt)
+    }
 }
 
 /// Affine post-persistence admission for one authenticated current-terminal
@@ -2729,9 +2953,14 @@ impl HistoricalEbpfGraphRecoveryAuthority {
                 operation_id,
                 host_commitments,
             },
-            expected_challenge: Some(
-                HistoricalEbpfGraphRecoveryExpectedInspectionChallenge::sealed(pristine),
-            ),
+            // Pristine absence is a read-only observation of a target for
+            // which no graph challenge exists. Requiring the destructive
+            // broker-challenge callback here would force a conforming guard
+            // either to fabricate `ExactDetached` provenance or to reject
+            // every genuine fresh target. The SDK still performs every live
+            // currentness check, but deliberately has no detached challenge
+            // to ask the broker to attest.
+            expected_challenge: None,
             guard,
         }
     }
@@ -7048,6 +7277,78 @@ mod tests {
             "CurrentEbpfGraphRecoverySuccessorTarget::Legacy(<redacted>)"
         );
         assert!(!rendered.contains("tenant-sensitive-up0"));
+    }
+
+    #[test]
+    fn current_terminal_receipt_round_trips_across_process_loss_without_reconstruction() {
+        use std::num::NonZeroU64;
+
+        let commitment = |byte| CurrentEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
+        let binding = |base: u8, epoch: u64| {
+            CurrentEbpfGraphRecoveryAuthorityBinding::new(
+                commitment(base),
+                commitment(base + 1),
+                NonZeroU64::new(epoch).unwrap(),
+                CurrentEbpfGraphRecoveryOperationId::new([base + 2; 16]).unwrap(),
+                CurrentEbpfGraphRecoveryHostCommitments::new(
+                    commitment(base + 3),
+                    commitment(base + 4),
+                    commitment(base + 5),
+                ),
+            )
+        };
+        let prior = binding(0x21, 7);
+        let authority = binding(0x31, 8);
+        let prior_receipt = CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
+            prior,
+            commitment(0x41),
+            CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
+            None,
+        );
+        let receipt = CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
+            authority,
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+            commitment(0x42),
+            CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                exact_historical_graph_commitment: HistoricalEbpfGraphRecoveryCommitment::new(
+                    [0x43; 32],
+                )
+                .unwrap(),
+            },
+            Some(CurrentEbpfGraphRecoveryTerminalAdoption::new(
+                prior,
+                prior_receipt,
+            )),
+        );
+
+        let encoded = receipt
+            .encode_authenticated_terminal()
+            .expect("authenticated terminal receipt is broker-persistable");
+        assert_eq!(
+            CurrentEbpfGraphRecoveryReceipt::decode_authenticated_terminal(encoded),
+            Some(receipt),
+            "a new process reconstructs the complete receipt without trusting caller fields"
+        );
+        for offset in 0..CURRENT_EBPF_GRAPH_RECOVERY_TERMINAL_RECEIPT_RECORD_ENCODED_LEN {
+            let mut tampered = encoded;
+            tampered[offset] ^= 1;
+            assert_eq!(
+                CurrentEbpfGraphRecoveryReceipt::decode_authenticated_terminal(tampered),
+                None,
+                "tampered terminal receipt byte {offset}"
+            );
+        }
+        assert!(CurrentEbpfGraphRecoveryReceipt::pristine_absence(authority)
+            .encode_authenticated_terminal()
+            .is_none());
+        assert!(CurrentEbpfGraphRecoveryReceipt::nonterminal(
+            authority,
+            CurrentEbpfGraphRecoveryOutcome::Refused(
+                CurrentEbpfGraphRecoveryRefusal::IndeterminateState
+            )
+        )
+        .encode_authenticated_terminal()
+        .is_none());
     }
 
     #[test]

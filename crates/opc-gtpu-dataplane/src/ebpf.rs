@@ -896,6 +896,11 @@ impl ScriptedCurrentEbpfGraphRecoveryCurrentness {
 struct TestCurrentEbpfGraphRecoveryAuthorityGuard;
 
 #[cfg(test)]
+struct ExactBrokeredSuccessorReceiptGuard {
+    expected: crate::CurrentEbpfGraphRecoveryCommitment,
+}
+
+#[cfg(test)]
 struct FailCurrentEbpfGraphRecoveryAuthorityGuard {
     fail_on_check: usize,
     checks: std::sync::atomic::AtomicUsize,
@@ -927,6 +932,57 @@ impl crate::CurrentEbpfGraphRecoveryCurrentnessGuard
     > {
         Box::pin(async { Ok(()) })
     }
+
+    fn verify_brokered_successor_receipt(
+        &self,
+        _expected: crate::CurrentEbpfGraphRecoveryCommitment,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::CurrentEbpfGraphRecoveryAuthorityCurrentness>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[cfg(test)]
+impl crate::CurrentEbpfGraphRecoveryCurrentnessGuard for ExactBrokeredSuccessorReceiptGuard {
+    fn verify_current(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::CurrentEbpfGraphRecoveryAuthorityCurrentness>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn verify_brokered_successor_receipt(
+        &self,
+        expected: crate::CurrentEbpfGraphRecoveryCommitment,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::CurrentEbpfGraphRecoveryAuthorityCurrentness>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        let matches = expected == self.expected;
+        Box::pin(async move {
+            if matches {
+                Ok(())
+            } else {
+                Err(crate::CurrentEbpfGraphRecoveryAuthorityCurrentness::Mismatch)
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -954,6 +1010,20 @@ impl crate::CurrentEbpfGraphRecoveryCurrentnessGuard
                 Ok(())
             }
         })
+    }
+
+    fn verify_brokered_successor_receipt(
+        &self,
+        _expected: crate::CurrentEbpfGraphRecoveryCommitment,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::CurrentEbpfGraphRecoveryAuthorityCurrentness>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -1016,11 +1086,19 @@ fn test_current_ebpf_graph_recovery_authority_binding(
 #[cfg(test)]
 fn test_historical_ebpf_graph_recovery_authority_binding(
 ) -> crate::HistoricalEbpfGraphRecoveryAuthorityBinding {
-    use std::num::NonZeroU64;
-
     let commitment = |byte| crate::HistoricalEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
     let inspection =
         crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(commitment(0x89));
+    test_historical_ebpf_graph_recovery_authority_binding_for_inspection(inspection)
+}
+
+#[cfg(test)]
+fn test_historical_ebpf_graph_recovery_authority_binding_for_inspection(
+    inspection: crate::HistoricalEbpfGraphRecoveryGraphInspection,
+) -> crate::HistoricalEbpfGraphRecoveryAuthorityBinding {
+    use std::num::NonZeroU64;
+
+    let commitment = |byte| crate::HistoricalEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
     crate::HistoricalEbpfGraphRecoveryAuthorityBinding::from_parts(
         commitment(0x81),
         commitment(0x82),
@@ -1379,6 +1457,7 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         _configuration: CurrentTerminalSuccessorConfiguration,
         _managed_state: CurrentRecoveryManagedState,
         _receipt: crate::CurrentEbpfGraphRecoverySuccessorReceipt,
+        _brokered_receipt_commitment: crate::CurrentEbpfGraphRecoveryCommitment,
         _authority: CurrentEbpfGraphRecoveryAuthorityBinding,
         _currentness: &dyn CurrentEbpfGraphRecoveryCurrentnessProbe,
     ) -> Result<crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome, GtpuError> {
@@ -1387,6 +1466,21 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
                 CurrentEbpfGraphRecoveryRefusal::IndeterminateState,
             ),
         )
+    }
+
+    /// Lift only the process-local ordinary-runtime fence after durable
+    /// successor admission and its external receipt proof both completed.
+    /// This never changes bpffs state and must reject any non-exact loaded
+    /// replacement identity.
+    fn activate_current_recovery_successor(
+        &self,
+        _replacement: (&str, u32),
+        _pin_dir: &Path,
+        _tc_priority: u16,
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::StateIndeterminate {
+            operation: "ebpf_current_successor_activation",
+        })
     }
 
     /// Atomically authenticate a retained terminal WAL against the exact
@@ -3580,6 +3674,21 @@ impl EbpfGtpuDataplaneBackend {
         ))
     }
 
+    fn await_brokered_current_successor_receipt(
+        authority: &CurrentEbpfGraphRecoveryAuthority,
+        expected: crate::CurrentEbpfGraphRecoveryCommitment,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<(), CurrentEbpfGraphRecoveryAuthorityCurrentness> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let currentness = authority.verify_brokered_successor_receipt(expected);
+        runtime.spawn(async move {
+            let _ = sender.send(currentness.await);
+        });
+        receiver.recv().unwrap_or(Err(
+            CurrentEbpfGraphRecoveryAuthorityCurrentness::Unavailable,
+        ))
+    }
+
     fn pin_dir(&self, interface: &str) -> PathBuf {
         self.inner.config.bpffs_pin_root.join(interface)
     }
@@ -3716,9 +3825,16 @@ impl EbpfGtpuDataplaneBackend {
         match self.devices() {
             Ok(devices)
                 if devices.iter().any(|(ifindex, managed)| {
-                    replacement.is_some_and(|replacement| {
+                    let overlaps = replacement.is_some_and(|replacement| {
                         *ifindex == replacement.ifindex || managed.name == replacement.name
-                    }) || managed.name == pin_namespace
+                    }) || managed.name == pin_namespace;
+                    let exact_pending_successor = replacement.is_some_and(|replacement| {
+                        managed.successor_pending
+                            && *ifindex == replacement.ifindex
+                            && managed.name == replacement.name
+                            && managed.name == pin_namespace
+                    });
+                    overlaps && !exact_pending_successor
                 }) =>
             {
                 CurrentRecoveryManagedState::Conflict
@@ -8006,12 +8122,10 @@ impl EbpfGtpuDataplaneBackend {
                     operation: "ebpf_current_terminal_successor_finalize",
                 });
             }
-            devices
-                .get_mut(&ifindex)
-                .ok_or(GtpuError::StateIndeterminate {
-                    operation: "ebpf_current_terminal_successor_registration",
-                })?
-                .successor_pending = false;
+            // Sealing is not broker admission. Keep the process-local device
+            // fenced until `admit_current_ebpf_graph_successor` proves that
+            // the exact successor receipt is durably retained and retires
+            // both WAL records.
         }
         Ok(GtpDevice {
             name: request.name,
@@ -8169,12 +8283,9 @@ impl EbpfGtpuDataplaneBackend {
                     operation: "ebpf_current_terminal_successor_grouped_finalize",
                 });
             }
-            devices
-                .get_mut(&ifindex)
-                .ok_or(GtpuError::StateIndeterminate {
-                    operation: "ebpf_current_terminal_successor_grouped_registration",
-                })?
-                .successor_pending = false;
+            // Sealing is not broker admission. The exact pending grouped
+            // successor remains unavailable to ordinary runtime operations
+            // until separate authenticated successor admission completes.
         }
         Ok(GtpDevice {
             name: request.name,
@@ -8777,6 +8888,14 @@ impl EbpfGtpuDataplaneBackend {
                 CurrentEbpfGraphRecoveryRefusal::TerminalTransferMismatch,
             ));
         }
+        let brokered_receipt_commitment = receipt.commitment();
+        if let Err(currentness) = Self::await_brokered_current_successor_receipt(
+            &authority,
+            brokered_receipt_commitment,
+            authority_runtime,
+        ) {
+            return Ok(currentness_refusal(currentness));
+        }
         let outcome = match self.inner.runtime.admit_current_recovery_successor(
             Some((resolved.name.as_str(), resolved.ifindex)),
             &resolved.pin_dir,
@@ -8784,6 +8903,7 @@ impl EbpfGtpuDataplaneBackend {
             resolved.configuration,
             managed_state,
             receipt,
+            brokered_receipt_commitment,
             binding,
             &currentness,
         ) {
@@ -8800,8 +8920,39 @@ impl EbpfGtpuDataplaneBackend {
             return Ok(currentness_refusal(currentness));
         }
         if matches!(outcome, Outcome::Admitted | Outcome::AlreadyFinalized) {
+            if let Err(currentness) = Self::await_brokered_current_successor_receipt(
+                &authority,
+                brokered_receipt_commitment,
+                authority_runtime,
+            ) {
+                return Ok(currentness_refusal(currentness));
+            }
             if let Err(currentness) = currentness.verify_current() {
                 return Ok(currentness_refusal(currentness));
+            }
+            self.inner.runtime.activate_current_recovery_successor(
+                (resolved.name.as_str(), resolved.ifindex),
+                &resolved.pin_dir,
+                self.inner.config.tc_priority,
+            )?;
+            if let Err(currentness) = Self::await_brokered_current_successor_receipt(
+                &authority,
+                brokered_receipt_commitment,
+                authority_runtime,
+            ) {
+                return Ok(currentness_refusal(currentness));
+            }
+            if let Err(currentness) = currentness.verify_current() {
+                return Ok(currentness_refusal(currentness));
+            }
+            let mut devices = self.devices()?;
+            if let Some(device) = devices.get_mut(&resolved.ifindex) {
+                if device.name != resolved.name || device.cleanup_only {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_current_successor_registration",
+                    });
+                }
+                device.successor_pending = false;
             }
         }
         Ok(outcome)
@@ -17049,7 +17200,8 @@ mod aya_runtime {
         }
 
         /// A completed R5 handoff may be transferred to a new external
-        /// authority only when it remains bound to the same physical target.
+        /// authority only when it remains bound to the same physical target
+        /// and the same immutable inspected-graph provenance.
         /// Scope, predecessor evidence, epoch, and operation intentionally do
         /// not participate here: those are the new authority's values. This
         /// predicate never authorizes an in-progress record; callers must
@@ -17066,6 +17218,18 @@ mod aya_runtime {
                 && self.host_commitment == host_commitments.host().bytes()
                 && self.root_commitment == host_commitments.root().bytes()
                 && self.leaf_commitment == host_commitments.leaf().bytes()
+                && self.former_link_evidence
+                    == authority.former_link_evidence().commitment().bytes()
+                && self.artifact_provenance
+                    == authority
+                        .artifact_provenance()
+                        .artifact_commitment()
+                        .bytes()
+                && self.external_graph_commitment
+                    == authority
+                        .artifact_provenance()
+                        .observed_graph_commitment()
+                        .bytes()
         }
 
         /// Rebind only a fully terminal R5 handoff. This is a terminal-state
@@ -17077,7 +17241,6 @@ mod aya_runtime {
             self,
             authority: crate::HistoricalEbpfGraphRecoveryAuthorityBinding,
         ) -> Option<Self> {
-            let host_commitments = authority.host_commitments();
             (self.is_terminal() && self.matches_authority_target(authority)).then_some(Self {
                 prior_scope_commitment: self.scope_commitment,
                 prior_predecessor_basis_commitment: self.predecessor_basis_commitment,
@@ -17091,18 +17254,6 @@ mod aya_runtime {
                 prior_external_graph_commitment: self.external_graph_commitment,
                 scope_commitment: authority.scope_commitment().bytes(),
                 predecessor_basis_commitment: authority.predecessor_basis_commitment().bytes(),
-                former_link_evidence: authority.former_link_evidence().commitment().bytes(),
-                artifact_provenance: authority
-                    .artifact_provenance()
-                    .artifact_commitment()
-                    .bytes(),
-                external_graph_commitment: authority
-                    .artifact_provenance()
-                    .observed_graph_commitment()
-                    .bytes(),
-                host_commitment: host_commitments.host().bytes(),
-                root_commitment: host_commitments.root().bytes(),
-                leaf_commitment: host_commitments.leaf().bytes(),
                 fence_epoch: authority.fence_epoch().get(),
                 operation_id: authority.operation_id().bytes(),
                 ..self
@@ -19311,6 +19462,53 @@ mod aya_runtime {
             currentness: &dyn super::CurrentEbpfGraphRecoveryCurrentnessProbe,
         ) -> Result<Arc<ReconcilerOwnership>, GtpuError> {
             Self::acquire_reconciler_ownership_inner(pin_dir, Some(currentness), false)
+        }
+
+        /// Reuse only this process's exact fenced successor lease; every
+        /// other managed overlap remains a live-owner refusal. This is the
+        /// sole path that lets a just-sealed graph be inspected and admitted
+        /// without forcing a process restart merely to release its lease.
+        fn current_successor_ownership(
+            &self,
+            replacement: (&str, u32),
+            pin_dir: &Path,
+            tc_priority: u16,
+            currentness: &dyn super::CurrentEbpfGraphRecoveryCurrentnessProbe,
+        ) -> Result<Arc<ReconcilerOwnership>, GtpuError> {
+            let devices = self.devices.lock().map_err(|_| {
+                GtpuError::io("ebpf_current_successor_ownership", super::poisoned_lock())
+            })?;
+            let mut exact_pending = None;
+            for (ifindex, device) in devices.iter() {
+                let overlaps = *ifindex == replacement.1
+                    || device.interface == replacement.0
+                    || device.pin_dir == pin_dir;
+                if !overlaps {
+                    continue;
+                }
+                if exact_pending.is_some()
+                    || *ifindex != replacement.1
+                    || device.interface != replacement.0
+                    || device.pin_dir != pin_dir
+                    || device.tc_priority != tc_priority
+                    || device.cleanup_only
+                    || !device.successor_pending
+                    || device._reconciler_ownership.canonical_pin_dir != pin_dir
+                {
+                    return Err(GtpuError::AlreadyExists);
+                }
+                exact_pending = Some(Arc::clone(&device._reconciler_ownership));
+            }
+            drop(devices);
+            exact_pending.map_or_else(
+                || {
+                    Self::acquire_existing_reconciler_ownership_with_currentness(
+                        pin_dir,
+                        currentness,
+                    )
+                },
+                Ok,
+            )
         }
 
         fn acquire_reconciler_ownership_inner(
@@ -23502,6 +23700,7 @@ mod aya_runtime {
             configuration: super::CurrentTerminalSuccessorConfiguration,
             identity: &SelectorNamespaceGraphIdentity,
             receipt: crate::CurrentEbpfGraphRecoverySuccessorReceipt,
+            brokered_receipt_commitment: crate::CurrentEbpfGraphRecoveryCommitment,
             authority: crate::CurrentEbpfGraphRecoveryAuthorityBinding,
             operation: &'static str,
         ) -> Result<bool, GtpuError> {
@@ -23548,7 +23747,8 @@ mod aya_runtime {
             else {
                 return Ok(false);
             };
-            Ok(receipt.authority() == authority
+            Ok(receipt.commitment() == brokered_receipt_commitment
+                && receipt.authority() == authority
                 && receipt.target_kind() == configuration.target_kind()
                 && receipt.target_commitment().bytes() == target_commitment
                 && receipt.configuration_commitment().bytes() == configuration.commitment()
@@ -30313,6 +30513,7 @@ mod aya_runtime {
             path: PathBuf,
             expected: CurrentRecoveryProof,
             replacement: CurrentRecoveryRecord,
+            admission: &super::CurrentTerminalAdmissionExecution<'_>,
             operation: &'static str,
         ) -> Result<CurrentRecoveryProof, GtpuError> {
             let data = MapData::from_pin(&path).map_err(|_| state_indeterminate(operation))?;
@@ -30340,8 +30541,14 @@ mod aya_runtime {
             {
                 return Err(state_indeterminate(operation));
             }
+            // This map write is the durable successor state transition. A
+            // caller-side check leaves an authority-turnover window between
+            // the last read and this effect, so the live guard belongs on
+            // both sides of the actual update.
+            Self::require_current_terminal_admission_current(admission, operation)?;
             map.set(0, replacement.encode(), 0)
                 .map_err(|_| state_indeterminate(operation))?;
+            Self::require_current_terminal_admission_current(admission, operation)?;
             let rewritten = CurrentRecoveryProof {
                 record: replacement,
                 map_id: expected.map_id,
@@ -30497,6 +30704,7 @@ mod aya_runtime {
                     Self::current_recovery_terminal_proof_path(ownership)?,
                     proof,
                     prepared,
+                    admission,
                     OPERATION,
                 )?;
                 Self::sync_control_directory(&ownership._lease, OPERATION)?;
@@ -30611,6 +30819,7 @@ mod aya_runtime {
                     Self::current_recovery_terminal_proof_path(ownership)?,
                     proof,
                     bound,
+                    admission,
                     OPERATION,
                 )?;
                 Self::sync_control_directory(&ownership._lease, OPERATION)?;
@@ -30739,6 +30948,7 @@ mod aya_runtime {
                     Self::current_recovery_terminal_proof_path(ownership)?,
                     preparation.proof,
                     bound,
+                    admission,
                     OPERATION,
                 )?;
                 Self::sync_control_directory(&ownership._lease, OPERATION)?;
@@ -30927,6 +31137,7 @@ mod aya_runtime {
                     Self::current_recovery_terminal_proof_path(ownership)?,
                     preparation.proof,
                     sealed,
+                    admission,
                     OPERATION,
                 )?;
                 Self::sync_control_directory(&ownership._lease, OPERATION)?;
@@ -36034,75 +36245,14 @@ mod aya_runtime {
             )?;
             proof = preparation.proof;
             Self::require_current_terminal_admission_current(&terminal_admission, OPERATION)?;
-
-            match Self::read_current_recovery_proof(&ownership)? {
-                Some(main) if main == proof => {
-                    Self::unlink_current_successor_graph_proof_leaf(
-                        &ownership,
-                        &graph_lock,
-                        (
-                            proof.record.successor_graph_device,
-                            proof.record.successor_graph_inode,
-                        ),
-                        proof,
-                        &graph_identity,
-                        (interface, ifindex),
-                        tc_priority,
-                        configuration,
-                        terminal_admission.currentness,
-                        OPERATION,
-                    )?;
-                    let (_, canonical) = Self::open_current_pin_cleanup_descriptors(
-                        &ownership,
-                        Some((
-                            proof.record.successor_graph_device,
-                            proof.record.successor_graph_inode,
-                        )),
-                        OPERATION,
-                    )?;
-                    Self::sync_control_directory(&canonical, OPERATION)?;
-                }
-                None if proof.record.phase == CurrentRecoveryPhase::SuccessorSealed => {}
-                Some(_) | None => return Err(state_indeterminate(OPERATION)),
-            }
-            let (_, canonical) = Self::open_current_pin_cleanup_descriptors(
-                &ownership,
-                Some((
-                    proof.record.successor_graph_device,
-                    proof.record.successor_graph_inode,
-                )),
-                OPERATION,
-            )?;
-            let entries = Self::current_directory_entries_at(&canonical, OPERATION)?;
-            if entries.len() != CURRENT_MAP_NAMES.len()
-                || !CURRENT_MAP_NAMES.iter().all(|name| entries.contains(*name))
-                || Self::read_current_recovery_proof(&ownership)?.is_some()
-                || Self::selector_namespace_graph_identity(
-                    ifindex,
-                    device,
-                    &ownership,
-                    &graph_lock,
-                    OPERATION,
-                )? != graph_identity
-            {
-                return Err(state_indeterminate(OPERATION));
-            }
-
-            Self::revalidate_current_control_path(&ownership, &graph_lock, OPERATION)?;
-            Self::unlink_current_terminal_proof_leaf(
-                &ownership,
-                &graph_lock,
-                proof,
-                &graph_identity,
-                (interface, ifindex),
-                tc_priority,
-                configuration,
-                terminal_admission.currentness,
-                OPERATION,
-            )?;
-            Self::revalidate_current_control_path(&ownership, &graph_lock, OPERATION)?;
-            if Self::read_current_recovery_proof(&ownership)?.is_some()
-                || Self::read_current_terminal_proof(&ownership)?.is_some()
+            // Sealing is intentionally not admission. Keep both identical
+            // WAL pins and the authority leaf durable until a caller has
+            // inspected, persisted, and separately acknowledged the exact
+            // successor receipt. This makes a lost create response
+            // recoverable by a fresh process without guessing from the live
+            // graph or deleting either authority pin.
+            if Self::read_current_recovery_proof(&ownership)? != Some(proof)
+                || Self::read_current_terminal_proof(&ownership)? != Some(proof)
                 || !Self::current_terminal_root_layout_is_exact(&ownership, OPERATION)?
                 || Self::selector_namespace_graph_identity(
                     ifindex,
@@ -36115,7 +36265,6 @@ mod aya_runtime {
                 return Err(state_indeterminate(OPERATION));
             }
             Self::require_current_terminal_admission_current(&terminal_admission, OPERATION)?;
-            device.successor_pending = false;
             Ok(())
         }
 
@@ -39162,8 +39311,10 @@ mod aya_runtime {
             let Some(replacement) = replacement else {
                 return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
             };
-            let ownership = match Self::acquire_existing_reconciler_ownership_with_currentness(
+            let ownership = match self.current_successor_ownership(
+                replacement,
                 pin_dir,
+                tc_priority,
                 currentness,
             ) {
                 Ok(ownership) => ownership,
@@ -39303,6 +39454,7 @@ mod aya_runtime {
             configuration: super::CurrentTerminalSuccessorConfiguration,
             managed_state: CurrentRecoveryManagedState,
             receipt: crate::CurrentEbpfGraphRecoverySuccessorReceipt,
+            brokered_receipt_commitment: crate::CurrentEbpfGraphRecoveryCommitment,
             authority: crate::CurrentEbpfGraphRecoveryAuthorityBinding,
             currentness: &dyn super::CurrentEbpfGraphRecoveryCurrentnessProbe,
         ) -> Result<crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome, GtpuError> {
@@ -39310,6 +39462,9 @@ mod aya_runtime {
 
             const OPERATION: &str = "ebpf_current_successor_admission";
             let refused = |reason| Outcome::Refused(reason);
+            if receipt.commitment() != brokered_receipt_commitment {
+                return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
+            }
             if managed_state != CurrentRecoveryManagedState::Clear {
                 return Ok(refused(match managed_state {
                     CurrentRecoveryManagedState::Conflict => {
@@ -39332,8 +39487,10 @@ mod aya_runtime {
             let Some(replacement) = replacement else {
                 return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
             };
-            let ownership = match Self::acquire_existing_reconciler_ownership_with_currentness(
+            let ownership = match self.current_successor_ownership(
+                replacement,
                 pin_dir,
+                tc_priority,
                 currentness,
             ) {
                 Ok(ownership) => ownership,
@@ -39407,6 +39564,7 @@ mod aya_runtime {
                         configuration,
                         &first,
                         receipt,
+                        brokered_receipt_commitment,
                         authority,
                         OPERATION,
                     ),
@@ -39441,6 +39599,7 @@ mod aya_runtime {
                             configuration,
                             &second,
                             receipt,
+                            brokered_receipt_commitment,
                             authority,
                             OPERATION,
                         ),
@@ -39605,6 +39764,34 @@ mod aya_runtime {
                 )));
             }
             Ok(Outcome::Admitted)
+        }
+
+        fn activate_current_recovery_successor(
+            &self,
+            replacement: (&str, u32),
+            pin_dir: &Path,
+            tc_priority: u16,
+        ) -> Result<(), GtpuError> {
+            const OPERATION: &str = "ebpf_current_successor_activation";
+            let mut devices = self
+                .devices
+                .lock()
+                .map_err(|_| GtpuError::io(OPERATION, super::poisoned_lock()))?;
+            let Some(device) = devices.get_mut(&replacement.1) else {
+                // A restarted process inspected the retained graph without
+                // loading it. There is no process-local runtime fence to lift.
+                return Ok(());
+            };
+            if device.interface != replacement.0
+                || device.pin_dir != pin_dir
+                || device.tc_priority != tc_priority
+                || device.cleanup_only
+                || device._reconciler_ownership.canonical_pin_dir != pin_dir
+            {
+                return Err(state_indeterminate(OPERATION));
+            }
+            device.successor_pending = false;
+            Ok(())
         }
 
         fn transfer_current_recovery_terminal(
@@ -44368,6 +44555,26 @@ mod aya_runtime {
             assert_ne!(old_up0_ifindex, replacement_ifindex);
             run_ip(&["link", "set", "up0", "up"]);
             let runtime = AyaGtpuRuntime::new();
+            let exact_historical_inspection = match runtime
+                .inspect_orphaned_historical_graph(
+                    HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+                    Some(("up0", replacement_ifindex)),
+                    &pin_dir,
+                    50,
+                    super::super::test_historical_ebpf_graph_recovery_authority_binding(),
+                    &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
+                )
+                .expect("inspect the authentic detached shipped-25 graph before recovery")
+            {
+                HistoricalEbpfGraphRecoveryInspectionOutcome::ExactDetached(inspection) => {
+                    inspection
+                }
+                outcome => panic!("expected exact detached shipped-25 inspection, got {outcome:?}"),
+            };
+            let exact_historical_authority =
+                super::super::test_historical_ebpf_graph_recovery_authority_binding_for_inspection(
+                    exact_historical_inspection,
+                );
             let control_inventory = || {
                 let mut entries = fs::read_dir(&control_root)
                     .expect("inventory predecessor authority root")
@@ -44415,7 +44622,7 @@ mod aya_runtime {
                         50,
                         true,
                         CurrentRecoveryManagedState::Clear,
-                        super::super::test_historical_ebpf_graph_recovery_authority_binding(),
+                        exact_historical_authority,
                         &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
                     )
                     .expect("wrong-mode graph pin must fail closed as a typed refusal"),
@@ -44441,7 +44648,7 @@ mod aya_runtime {
                         50,
                         true,
                         CurrentRecoveryManagedState::Clear,
-                        super::super::test_historical_ebpf_graph_recovery_authority_binding(),
+                        exact_historical_authority,
                         &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
                     )
                     .expect("reach the exact post-Installed pre-rename crash cut")
@@ -44494,7 +44701,7 @@ mod aya_runtime {
                         50,
                         true,
                         CurrentRecoveryManagedState::Clear,
-                        super::super::test_historical_ebpf_graph_recovery_authority_binding(),
+                        exact_historical_authority,
                         &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
                     )
                     .expect("wrong-mode receipt must remain a typed fail-closed outcome");
@@ -44527,7 +44734,7 @@ mod aya_runtime {
                     50,
                     true,
                     CurrentRecoveryManagedState::Clear,
-                    super::super::test_historical_ebpf_graph_recovery_authority_binding(),
+                    exact_historical_authority,
                     &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
                 )
                 .expect("recover exact detached historical graph");
@@ -44546,7 +44753,7 @@ mod aya_runtime {
                         50,
                         true,
                         CurrentRecoveryManagedState::Clear,
-                        super::super::test_historical_ebpf_graph_recovery_authority_binding(),
+                        exact_historical_authority,
                         &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
                     )
                     .expect("repeat terminal detached recovery"),
@@ -44556,18 +44763,14 @@ mod aya_runtime {
                 crate::HistoricalEbpfGraphRecoveryCommitment::new([byte; 32])
                     .expect("fixed test commitment")
             };
-            let transferred_inspection =
-                crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(commitment(
-                    0x99,
-                ));
             let transferred_authority =
                 crate::HistoricalEbpfGraphRecoveryAuthorityBinding::from_parts(
                     commitment(0x91),
                     commitment(0x92),
-                    transferred_inspection.former_link_evidence(),
+                    exact_historical_inspection.former_link_evidence(),
                     crate::HistoricalEbpfGraphRecoveryArtifactProvenance::from_brokered_challenge(
-                        commitment(0x98),
-                        transferred_inspection.expected_challenge(),
+                        commitment(0x88),
+                        exact_historical_inspection.expected_challenge(),
                     ),
                     std::num::NonZeroU64::new(2).expect("nonzero transfer epoch"),
                     crate::HistoricalEbpfGraphRecoveryOperationId::new([0x93; 16])
@@ -46927,6 +47130,44 @@ mod tests {
         results: Arc<Mutex<VecDeque<Result<(), HistoricalEbpfGraphRecoveryAuthorityCurrentness>>>>,
     }
 
+    struct PristineChallengeRejectingHistoricalRecoveryGuard {
+        current_checks: Arc<AtomicUsize>,
+        challenge_checks: Arc<AtomicUsize>,
+    }
+
+    impl HistoricalEbpfGraphRecoveryCurrentnessGuard
+        for PristineChallengeRejectingHistoricalRecoveryGuard
+    {
+        fn verify_current(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), HistoricalEbpfGraphRecoveryAuthorityCurrentness>,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            self.current_checks.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn verify_brokered_challenge(
+            &self,
+            _expected: crate::HistoricalEbpfGraphRecoveryExpectedInspectionChallenge,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), HistoricalEbpfGraphRecoveryAuthorityCurrentness>,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            self.challenge_checks.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(HistoricalEbpfGraphRecoveryAuthorityCurrentness::Mismatch) })
+        }
+    }
+
     impl HistoricalEbpfGraphRecoveryCurrentnessGuard for ScriptedHistoricalRecoveryGuard {
         fn verify_current(
             &self,
@@ -46979,9 +47220,34 @@ mod tests {
         leaf: u8,
         guard: Box<dyn HistoricalEbpfGraphRecoveryCurrentnessGuard>,
     ) -> HistoricalEbpfGraphRecoveryAuthority {
+        historical_25_authority_with_values_and_graph(
+            scope,
+            predecessor_basis,
+            epoch,
+            operation,
+            host,
+            root,
+            leaf,
+            0x19,
+            guard,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn historical_25_authority_with_values_and_graph(
+        scope: u8,
+        predecessor_basis: u8,
+        epoch: u64,
+        operation: u8,
+        host: u8,
+        root: u8,
+        leaf: u8,
+        graph: u8,
+        guard: Box<dyn HistoricalEbpfGraphRecoveryCurrentnessGuard>,
+    ) -> HistoricalEbpfGraphRecoveryAuthority {
         let commitment = |byte| HistoricalEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
         let inspection =
-            crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(commitment(0x19));
+            crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(commitment(graph));
         HistoricalEbpfGraphRecoveryAuthority::new(
             commitment(scope),
             commitment(predecessor_basis),
@@ -50059,41 +50325,12 @@ mod tests {
                 return Err(state_indeterminate(OPERATION));
             }
             state.successor_pending.insert(ifindex);
-            Self::fail_if_requested(&mut state, "current_terminal_successor_main_unpin")?;
-            state.current_recovery_successor_main_leaves.remove(pin_dir);
-            Self::fail_after_if_requested(&mut state, "current_terminal_successor_main_unpin")?;
-            Self::crash_if_requested(&mut state, "current_terminal_successor_main_unpin");
-            if state
-                .current_recovery_successor_main_leaves
-                .contains_key(pin_dir)
-                || state.current_recovery_terminal_leaves.get(pin_dir) != Some(&sealed)
+            if state.current_recovery_terminal_leaves.get(pin_dir) != Some(&sealed)
+                || state.current_recovery_successor_main_leaves.get(pin_dir) != Some(&sealed)
+                || !state.current_recovery_authority_leaves.contains(pin_dir)
             {
                 return Err(state_indeterminate(OPERATION));
             }
-            Self::fail_if_requested(&mut state, "current_terminal_successor_authority_unpin")?;
-            state.current_recovery_terminal_leaves.remove(pin_dir);
-            Self::fail_after_if_requested(
-                &mut state,
-                "current_terminal_successor_authority_unpin",
-            )?;
-            Self::crash_if_requested(&mut state, "current_terminal_successor_authority_unpin");
-            if state.current_recovery_terminal_leaves.contains_key(pin_dir) {
-                return Err(state_indeterminate(OPERATION));
-            }
-            Self::fail_if_requested(&mut state, "current_terminal_successor_control_retire")?;
-            state.current_recovery_authority_leaves.remove(pin_dir);
-            Self::fail_after_if_requested(&mut state, "current_terminal_successor_control_retire")?;
-            Self::crash_if_requested(&mut state, "current_terminal_successor_control_retire");
-            state.operations.push("current_terminal_successor_finalize");
-            if terminal_admission.currentness.verify_current().is_err()
-                || terminal_admission.currentness.first_failure().is_some()
-            {
-                return Err(state_indeterminate(OPERATION));
-            }
-            if state.current_recovery_authority_leaves.contains(pin_dir) {
-                return Err(state_indeterminate(OPERATION));
-            }
-            state.successor_pending.remove(&ifindex);
             Ok(())
         }
 
@@ -50681,7 +50918,11 @@ mod tests {
                             Some(stored)
                                 if stored.contract_version() == authority.contract_version()
                                     && stored.host_commitments()
-                                        == authority.host_commitments() =>
+                                        == authority.host_commitments()
+                                    && stored.former_link_evidence()
+                                        == authority.former_link_evidence()
+                                    && stored.artifact_provenance()
+                                        == authority.artifact_provenance() =>
                             {
                                 // Model the sole legal cross-scope mutation:
                                 // an exact terminal handoff remains, with no
@@ -51333,12 +51574,16 @@ mod tests {
             configuration: CurrentTerminalSuccessorConfiguration,
             managed_state: CurrentRecoveryManagedState,
             receipt: crate::CurrentEbpfGraphRecoverySuccessorReceipt,
+            brokered_receipt_commitment: crate::CurrentEbpfGraphRecoveryCommitment,
             authority: CurrentEbpfGraphRecoveryAuthorityBinding,
             currentness: &dyn CurrentEbpfGraphRecoveryCurrentnessProbe,
         ) -> Result<crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome, GtpuError> {
             use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Outcome;
 
             let refused = |reason| Outcome::Refused(reason);
+            if receipt.commitment() != brokered_receipt_commitment {
+                return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
+            }
             if managed_state != CurrentRecoveryManagedState::Clear {
                 return Ok(refused(match managed_state {
                     CurrentRecoveryManagedState::Conflict => {
@@ -51476,6 +51721,38 @@ mod tests {
                 return Ok(refused(current_recovery_currentness_refusal(currentness)));
             }
             Ok(Outcome::Admitted)
+        }
+
+        fn activate_current_recovery_successor(
+            &self,
+            replacement: (&str, u32),
+            pin_dir: &Path,
+            tc_priority: u16,
+        ) -> Result<(), GtpuError> {
+            const OPERATION: &str = "fake_current_successor_activation";
+            let mut state = self.state();
+            let mut exact = false;
+            for (ifindex, attached) in &state.attached {
+                let overlaps = *ifindex == replacement.1
+                    || attached.interface == replacement.0
+                    || attached.pin_dir == pin_dir;
+                if !overlaps {
+                    continue;
+                }
+                if exact
+                    || *ifindex != replacement.1
+                    || attached.interface != replacement.0
+                    || attached.pin_dir != pin_dir
+                    || attached.tc_priority != tc_priority
+                {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                exact = true;
+            }
+            if exact {
+                state.successor_pending.remove(&replacement.1);
+            }
+            Ok(())
         }
 
         fn transfer_current_recovery_terminal(
@@ -60614,6 +60891,20 @@ mod tests {
         current_recovery_authority_with_values(0x91, 0x92, 1, 0x93)
     }
 
+    fn current_recovery_authority_for_successor_receipt(
+        receipt: crate::CurrentEbpfGraphRecoverySuccessorReceipt,
+    ) -> crate::CurrentEbpfGraphRecoveryAuthority {
+        current_recovery_authority_with_guard(
+            0x91,
+            0x92,
+            1,
+            0x93,
+            Box::new(ExactBrokeredSuccessorReceiptGuard {
+                expected: receipt.commitment(),
+            }),
+        )
+    }
+
     fn current_recovery_authorized_request(
         pin_namespace: &str,
     ) -> crate::CurrentEbpfGraphRecoveryAuthorizedRequest {
@@ -60720,11 +61011,9 @@ mod tests {
         crate::CurrentEbpfGraphRecoverySuccessorTarget::Legacy(request)
     }
 
-    /// Build the exact lab failure successor cut: the shipped-25 graph is
-    /// detached from the deleted old `up0`, maintenance retires it under the
-    /// recreated `up0` ifindex, and a process dies after sealing the new graph
-    /// and unlinking its main proof but before retiring the authority WAL.
-    async fn sealed_historical_25_successor_after_process_loss() -> (
+    /// Build the exact lab failure successor cut through a sealed successor
+    /// that is still fenced in the creating process.
+    async fn sealed_historical_25_successor() -> (
         EbpfGtpuDataplaneBackend,
         Arc<FakeRuntime>,
         crate::CurrentEbpfGraphRecoverySuccessorReceipt,
@@ -60780,18 +61069,27 @@ mod tests {
                 .expect("admit the exact broker-durable terminal"),
             Admission::Admitted
         );
-        runtime.fail_after_in_order(["current_terminal_successor_main_unpin"]);
         let mut create = CreateGtpDeviceRequest::new("up0");
         create.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        assert!(backend.create_device(create).await.is_err());
-        drop(backend);
+        backend
+            .create_device(create)
+            .await
+            .expect("seal the exact shipped-25 successor without admitting it");
         {
-            let mut state = runtime.state();
-            state.attached.remove(&REPLACEMENT_IFINDEX);
-            state.successor_pending.remove(&REPLACEMENT_IFINDEX);
+            let state = runtime.state();
+            let terminal = state
+                .current_recovery_terminal_leaves
+                .get(&pin_dir)
+                .expect("sealed terminal WAL survives create success");
+            assert_eq!(
+                state.current_recovery_successor_main_leaves.get(&pin_dir),
+                Some(terminal),
+                "both sealed WAL records survive until broker admission"
+            );
+            assert!(state.current_recovery_authority_leaves.contains(&pin_dir));
+            assert!(state.successor_pending.contains(&REPLACEMENT_IFINDEX));
         }
-        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
-        let receipt = match restarted
+        let receipt = match backend
             .inspect_current_ebpf_graph_successor(
                 historical_25_successor_intent().into_successor_inspection_request(
                     historical_25_successor_target(),
@@ -60806,6 +61104,43 @@ mod tests {
             }
             outcome => panic!("sealed historical successor was not authenticated: {outcome:?}"),
         };
+        let receipt = crate::CurrentEbpfGraphRecoverySuccessorReceipt::decode(receipt.encode())
+            .expect("the broker decodes the complete successor receipt");
+        (backend, runtime, receipt)
+    }
+
+    /// Model loss of the successful create response. Both sealed WAL records
+    /// and the exact graph survive, while every process-owned registration is
+    /// discarded before a fresh process re-inspects the same receipt.
+    async fn sealed_historical_25_successor_after_process_loss() -> (
+        EbpfGtpuDataplaneBackend,
+        Arc<FakeRuntime>,
+        crate::CurrentEbpfGraphRecoverySuccessorReceipt,
+    ) {
+        let (backend, runtime, receipt) = sealed_historical_25_successor().await;
+        drop(backend);
+        {
+            let mut state = runtime.state();
+            state.attached.remove(&REPLACEMENT_IFINDEX);
+            state.successor_pending.remove(&REPLACEMENT_IFINDEX);
+        }
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let restarted_receipt = match restarted
+            .inspect_current_ebpf_graph_successor(
+                historical_25_successor_intent().into_successor_inspection_request(
+                    historical_25_successor_target(),
+                    current_recovery_authority(),
+                ),
+            )
+            .await
+            .expect("fresh process inspects the sealed shipped-25 successor")
+        {
+            crate::CurrentEbpfGraphRecoverySuccessorInspectionOutcome::Authenticated(receipt) => {
+                receipt
+            }
+            outcome => panic!("sealed historical successor was not authenticated: {outcome:?}"),
+        };
+        assert_eq!(restarted_receipt, receipt);
         (restarted, runtime, receipt)
     }
 
@@ -61129,6 +61464,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_25_pristine_absence_never_requires_a_fabricated_graph_challenge() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu-historical");
+        let inspection = backend
+            .inspect_orphaned_historical_ebpf_graph(historical_25_inspection_request())
+            .await
+            .expect("clean target inspection is typed");
+        let pristine = match inspection {
+            crate::HistoricalEbpfGraphRecoveryInspectionOutcome::PristineAbsence(pristine) => {
+                pristine
+            }
+            outcome => panic!("expected pristine target inspection, got {outcome:?}"),
+        };
+        let current_checks = Arc::new(AtomicUsize::new(0));
+        let challenge_checks = Arc::new(AtomicUsize::new(0));
+        let commitment = |byte| HistoricalEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
+        let authority = HistoricalEbpfGraphRecoveryAuthority::new_pristine_absence(
+            commitment(0x11),
+            commitment(0x12),
+            pristine,
+            NonZeroU64::new(7).unwrap(),
+            HistoricalEbpfGraphRecoveryOperationId::new([0x13; 16]).unwrap(),
+            HistoricalEbpfGraphRecoveryHostCommitments::new(
+                commitment(0x14),
+                commitment(0x15),
+                commitment(0x16),
+            ),
+            Box::new(PristineChallengeRejectingHistoricalRecoveryGuard {
+                current_checks: current_checks.clone(),
+                challenge_checks: challenge_checks.clone(),
+            }),
+        );
+
+        let receipt = backend
+            .recover_orphaned_historical_ebpf_graph(
+                historical_25_recovery_request_for_with_authority("s2bu", authority),
+            )
+            .await
+            .expect("pristine recovery remains a read-only typed receipt");
+        assert_eq!(
+            receipt.terminal_kind(),
+            crate::HistoricalEbpfGraphRecoveryTerminalKind::PristineAbsence
+        );
+        assert_eq!(receipt.exact_graph_commitment(), None);
+        assert!(current_checks.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            challenge_checks.load(Ordering::SeqCst),
+            0,
+            "a never-created graph has no brokered detached-graph challenge to verify"
+        );
+        assert!(!runtime
+            .state()
+            .historical_25_receipts
+            .contains_key(&pin_dir));
+        assert!(!runtime
+            .state()
+            .historical_25_authorities
+            .contains_key(&pin_dir));
+    }
+
+    #[tokio::test]
     async fn historical_25_terminal_handoff_transfers_only_to_a_live_same_target_authority() {
         let (backend, runtime) = backend_with_fake();
         let pin_dir = seed_historical_25(&runtime);
@@ -61215,6 +61611,35 @@ mod tests {
         assert_eq!(
             runtime.state().historical_25_authorities[&pin_dir],
             new_binding
+        );
+
+        let wrong_graph = historical_25_authority_with_values_and_graph(
+            0x41,
+            0x42,
+            10,
+            0x43,
+            0x14,
+            0x15,
+            0x16,
+            0x2a,
+            Box::new(AlwaysCurrentHistoricalRecoveryGuard),
+        );
+        let refused = backend
+            .recover_orphaned_historical_ebpf_graph(
+                historical_25_recovery_request_for_with_authority("s2bu", wrong_graph),
+            )
+            .await
+            .expect("same target with different graph provenance is a typed refusal");
+        assert_eq!(
+            refused,
+            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
+                crate::HistoricalEbpfGraphRecoveryRefusal::AuthorityMismatch
+            )
+        );
+        assert_eq!(
+            runtime.state().historical_25_authorities[&pin_dir],
+            new_binding,
+            "a mismatched graph challenge must not rewrite the sole terminal R5 authority"
         );
     }
 
@@ -63820,82 +64245,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_25_successor_finalizes_and_restarts_without_new_recovery_identity() {
-        use crate::CurrentEbpfGraphRecoveryTerminalAdmissionOutcome as Admission;
+    async fn historical_25_sealed_successor_is_fenced_until_same_process_broker_admission() {
+        use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Outcome;
 
-        let (backend, runtime) = backend_with_fake();
-        let pin_namespace = "s2bu-new";
-        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join(pin_namespace);
-        {
-            let mut state = runtime.state();
-            state
-                .historical_25_graphs
-                .insert(pin_dir.clone(), FakeHistorical25Graph::default());
-            state.historical_25_legacy_leaves.insert(pin_dir.clone());
-            state.historical_25_control_root_mode =
-                FakeHistorical25ControlRootMode::Predecessor0755;
-        }
+        let (backend, runtime, receipt) = sealed_historical_25_successor().await;
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
+        assert!(matches!(
+            backend.resolve_device("up0").await,
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_terminal_successor_pending"
+            })
+        ));
         assert_eq!(
             backend
-                .recover_orphaned_historical_ebpf_graph(
-                    historical_25_recovery_request_for_namespace_with_authority(
-                        pin_namespace,
-                        "s2bu-new",
-                        REPLACEMENT_IFINDEX,
-                        historical_25_authority(),
+                .admit_current_ebpf_graph_successor(
+                    historical_25_successor_intent().into_successor_admission_request(
+                        historical_25_successor_target(),
+                        receipt,
+                        current_recovery_authority_for_successor_receipt(receipt),
                     ),
                 )
                 .await
-                .expect("retire exact shipped-25 graph"),
-            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+                .expect("same process admits only its exact brokered successor"),
+            Outcome::Admitted
         );
-        let intent = || {
-            crate::CurrentEbpfGraphRecoveryIntent::new(
-                pin_namespace,
-                crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
-            )
-            .with_replacement_device(GtpDevice {
-                name: "s2bu-new".to_string(),
-                ifindex: REPLACEMENT_IFINDEX,
-            })
-            .with_drain_proof(crate::CurrentEbpfGraphDrainProof::sessions_and_traffic_drained())
-        };
-        let terminal = backend
-            .recover_orphaned_current_ebpf_graph_with_authority_receipt(
-                intent().into_request_with_authority(current_recovery_authority()),
-            )
-            .await
-            .expect("publish authenticated current terminal");
         assert_eq!(
             backend
-                .admit_current_ebpf_graph_terminal(
-                    intent()
-                        .into_terminal_admission_request(terminal, current_recovery_authority(),),
-                )
+                .resolve_device("up0")
                 .await
-                .expect("admit broker-durable terminal"),
-            Admission::Admitted
+                .expect("ordinary runtime becomes usable after broker admission")
+                .ifindex,
+            REPLACEMENT_IFINDEX
         );
-        let request = || {
-            let mut request = CreateGtpDeviceRequest::new("s2bu-new");
-            request.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-            request.uplink_mtu_policy = Some(
-                GtpuUplinkMtuPolicy::new(1280, crate::GtpuOuterFragmentPolicy::SignalPacketTooBig)
-                    .expect("test PMTU policy is canonical"),
-            );
-            request
-        };
-        backend
-            .create_device(request())
-            .await
-            .expect("publish and finalize exact successor");
+        let state = runtime.state();
+        assert!(!state.successor_pending.contains(&REPLACEMENT_IFINDEX));
+        assert!(!state
+            .current_recovery_successor_main_leaves
+            .contains_key(&pin_dir));
+        assert!(!state
+            .current_recovery_terminal_leaves
+            .contains_key(&pin_dir));
+        assert!(!state.current_recovery_authority_leaves.contains(&pin_dir));
+        assert!(state.historical_25_receipts.contains_key(&pin_dir));
+        assert!(state.historical_25_authorities.contains_key(&pin_dir));
+        assert!(state.historical_25_operation_markers.contains(&pin_dir));
+    }
+
+    #[tokio::test]
+    async fn historical_25_successor_finalizes_and_restarts_without_new_recovery_identity() {
+        use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Outcome;
+
+        let (backend, runtime, receipt) = sealed_historical_25_successor_after_process_loss().await;
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
 
         let identity = {
             let state = runtime.state();
-            assert!(!state
+            assert!(state
                 .current_recovery_terminal_leaves
                 .contains_key(&pin_dir));
-            assert!(!state.current_recovery_authority_leaves.contains(&pin_dir));
+            assert!(state
+                .current_recovery_successor_main_leaves
+                .contains_key(&pin_dir));
+            assert!(state.current_recovery_authority_leaves.contains(&pin_dir));
             assert!(state.historical_25_receipts.contains_key(&pin_dir));
             assert!(state.historical_25_authorities.contains_key(&pin_dir));
             assert!(state.historical_25_operation_markers.contains(&pin_dir));
@@ -63905,14 +64316,39 @@ mod tests {
                 state.historical_25_terminal_graph_commitments[&pin_dir],
             )
         };
+        assert_eq!(
+            backend
+                .admit_current_ebpf_graph_successor(
+                    historical_25_successor_intent().into_successor_admission_request(
+                        historical_25_successor_target(),
+                        receipt,
+                        current_recovery_authority_for_successor_receipt(receipt),
+                    ),
+                )
+                .await
+                .expect("admit the exact freshly read broker receipt"),
+            Outcome::Admitted
+        );
+        {
+            let state = runtime.state();
+            assert!(!state
+                .current_recovery_terminal_leaves
+                .contains_key(&pin_dir));
+            assert!(!state
+                .current_recovery_successor_main_leaves
+                .contains_key(&pin_dir));
+            assert!(!state.current_recovery_authority_leaves.contains(&pin_dir));
+        }
 
         for _ in 0..3 {
             runtime.state().attached.remove(&REPLACEMENT_IFINDEX);
             let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+            let mut request = CreateGtpDeviceRequest::new("up0");
+            request.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
             restarted
-                .create_device(request())
+                .create_device(request)
                 .await
-                .expect("ordinary retained restart converges without terminal admission");
+                .expect("ordinary retained restart converges after exact successor admission");
             let state = runtime.state();
             assert_eq!(state.historical_25_receipts[&pin_dir], identity.0);
             assert_eq!(state.historical_25_authorities[&pin_dir], identity.1);
@@ -63922,6 +64358,9 @@ mod tests {
             );
             assert!(!state
                 .current_recovery_terminal_leaves
+                .contains_key(&pin_dir));
+            assert!(!state
+                .current_recovery_successor_main_leaves
                 .contains_key(&pin_dir));
             assert!(!state.current_recovery_authority_leaves.contains(&pin_dir));
         }
@@ -63986,28 +64425,17 @@ mod tests {
             Admission::Admitted
         );
 
-        runtime.fail_after_in_order(["current_terminal_successor_main_unpin"]);
         let mut request = CreateGtpDeviceRequest::new("s2bu-new");
         request.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        let error = backend
+        backend
             .create_device(request)
             .await
-            .expect_err("lost main-proof acknowledgement must fail closed");
-        assert!(
-            matches!(
-                error,
-                GtpuError::Io {
-                    operation: "current_terminal_successor_main_unpin",
-                    ..
-                }
-            ),
-            "unexpected successor finalization error: {error:?}"
-        );
+            .expect("creation seals both records without retiring broker authority");
 
         {
             let state = runtime.state();
             assert!(state.successor_pending.contains(&REPLACEMENT_IFINDEX));
-            assert!(!state
+            assert!(state
                 .current_recovery_successor_main_leaves
                 .contains_key(&pin_dir));
             assert!(state
@@ -64096,24 +64524,55 @@ mod tests {
             crate::CurrentEbpfGraphRecoverySuccessorReceipt::decode(successor_receipt.encode()),
             Some(successor_receipt)
         );
+        runtime.fail_after_in_order(["current_terminal_successor_main_unpin"]);
+        let error = restarted
+            .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
+                successor_target(),
+                successor_receipt,
+                current_recovery_authority_for_successor_receipt(successor_receipt),
+            ))
+            .await
+            .expect_err("lost main-WAL removal response must fail closed");
+        assert!(
+            matches!(
+                error,
+                GtpuError::Io {
+                    operation: "current_terminal_successor_main_unpin",
+                    ..
+                }
+            ),
+            "unexpected successor admission error: {error:?}"
+        );
+        {
+            let state = runtime.state();
+            assert!(!state
+                .current_recovery_successor_main_leaves
+                .contains_key(&pin_dir));
+            assert!(state
+                .current_recovery_terminal_leaves
+                .contains_key(&pin_dir));
+            assert!(state.current_recovery_authority_leaves.contains(&pin_dir));
+        }
+        drop(restarted);
+        let resumed = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
         assert_eq!(
-            restarted
+            resumed
                 .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
                     successor_target(),
                     successor_receipt,
-                    current_recovery_authority(),
-                ),)
+                    current_recovery_authority_for_successor_receipt(successor_receipt),
+                ))
                 .await
-                .expect("admit the authenticated retained successor"),
+                .expect("resume admission from the retained authority WAL"),
             SuccessorAdmission::Admitted
         );
         assert_eq!(
-            restarted
+            resumed
                 .admit_current_ebpf_graph_successor(
                     intent().into_successor_admission_request(
                         successor_target(),
                         successor_receipt,
-                        current_recovery_authority(),
+                        current_recovery_authority_for_successor_receipt(successor_receipt),
                     ),
                 )
                 .await
@@ -64123,7 +64582,7 @@ mod tests {
         );
         let mut retry = CreateGtpDeviceRequest::new("s2bu-new");
         retry.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        restarted
+        resumed
             .create_device(retry)
             .await
             .expect("same-authority successor retry must converge");
@@ -64147,6 +64606,7 @@ mod tests {
             "unknown_layout",
             "wrong_generation",
             "wrong_fence_generation",
+            "brokered_receipt_mismatch",
             "wrong_tenant",
             "wrong_configuration",
             "live_owner",
@@ -64196,6 +64656,7 @@ mod tests {
                         state.replacement_identity = FakeReplacementIdentity::IfindexChanged;
                     }
                     "wrong_fence_generation"
+                    | "brokered_receipt_mismatch"
                     | "wrong_tenant"
                     | "wrong_configuration"
                     | "cancellation" => {}
@@ -64241,6 +64702,16 @@ mod tests {
                 "wrong_fence_generation" => {
                     current_recovery_authority_with_values(0x91, 0x92, 2, 0x93)
                 }
+                "brokered_receipt_mismatch" => current_recovery_authority_with_guard(
+                    0x91,
+                    0x92,
+                    1,
+                    0x93,
+                    Box::new(ExactBrokeredSuccessorReceiptGuard {
+                        expected: crate::CurrentEbpfGraphRecoveryCommitment::new([0xee; 32])
+                            .expect("nonzero broker commitment"),
+                    }),
+                ),
                 "cancellation" => current_recovery_authority_with_guard(
                     0x91,
                     0x92,
@@ -64250,7 +64721,7 @@ mod tests {
                         0,
                     )),
                 ),
-                _ => current_recovery_authority(),
+                _ => current_recovery_authority_for_successor_receipt(receipt),
             };
             let outcome = backend
                 .admit_current_ebpf_graph_successor(
@@ -64270,7 +64741,7 @@ mod tests {
                 );
             } else {
                 let expected = match case {
-                    "wrong_fence_generation" => {
+                    "wrong_fence_generation" | "brokered_receipt_mismatch" => {
                         Outcome::Refused(CurrentEbpfGraphRecoveryRefusal::AuthorityMismatch)
                     }
                     "live_owner" => Outcome::Refused(CurrentEbpfGraphRecoveryRefusal::ActiveOwner),
@@ -64324,7 +64795,7 @@ mod tests {
                 historical_25_successor_intent().into_successor_admission_request(
                     historical_25_successor_target(),
                     receipt,
-                    current_recovery_authority(),
+                    current_recovery_authority_for_successor_receipt(receipt),
                 ),
             )
             .await;
@@ -64358,7 +64829,7 @@ mod tests {
                         historical_25_successor_intent().into_successor_admission_request(
                             historical_25_successor_target(),
                             receipt,
-                            current_recovery_authority(),
+                            current_recovery_authority_for_successor_receipt(receipt),
                         ),
                     )
                     .await
@@ -64383,6 +64854,70 @@ mod tests {
             .create_device(request)
             .await
             .expect("ordinary retained restart converges after exact successor admission");
+    }
+
+    #[tokio::test]
+    async fn historical_25_finalized_successor_rejects_checksum_valid_unbrokered_receipts() {
+        use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Outcome;
+
+        let (backend, runtime, receipt) = sealed_historical_25_successor_after_process_loss().await;
+        assert_eq!(
+            backend
+                .admit_current_ebpf_graph_successor(
+                    historical_25_successor_intent().into_successor_admission_request(
+                        historical_25_successor_target(),
+                        receipt,
+                        current_recovery_authority_for_successor_receipt(receipt),
+                    ),
+                )
+                .await
+                .expect("admit the authentic brokered successor"),
+            Outcome::Admitted
+        );
+        let snapshot = || {
+            let state = runtime.state();
+            (
+                state.current_recovery_terminal_leaves.clone(),
+                state.current_recovery_successor_main_leaves.clone(),
+                state.current_recovery_authority_leaves.clone(),
+                state.historical_25_receipts.clone(),
+                state.historical_25_authorities.clone(),
+                state.historical_25_operation_markers.clone(),
+                state.uplink_filter_ready.clone(),
+                state.downlink_filter_ready.clone(),
+                state.pinned_config.clone(),
+                state.operations.clone(),
+            )
+        };
+        let before = snapshot();
+
+        for (field, offset) in [("predecessor_receipt", 200), ("record_commitment", 232)] {
+            let mut encoded = receipt.encode();
+            encoded[offset] ^= 1;
+            let mut digest = Sha256::new();
+            digest.update(b"opc.gtpu.current-ebpf-successor-receipt-codec\0r1");
+            digest.update(crate::CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_CODEC_ID.as_bytes());
+            digest.update(&encoded[..384]);
+            encoded[384..].copy_from_slice(&digest.finalize());
+            let forged = crate::CurrentEbpfGraphRecoverySuccessorReceipt::decode(encoded)
+                .expect("checksum-valid receipt-shaped bytes decode without granting authority");
+            assert_ne!(forged.commitment(), receipt.commitment());
+            assert_eq!(
+                backend
+                    .admit_current_ebpf_graph_successor(
+                        historical_25_successor_intent().into_successor_admission_request(
+                            historical_25_successor_target(),
+                            forged,
+                            current_recovery_authority_for_successor_receipt(receipt),
+                        ),
+                    )
+                    .await
+                    .expect("unbrokered receipt is a bounded typed refusal"),
+                Outcome::Refused(CurrentEbpfGraphRecoveryRefusal::AuthorityMismatch),
+                "checksum-valid {field} forgery"
+            );
+            assert_eq!(snapshot(), before, "{field} forgery mutated retained state");
+        }
     }
 
     #[tokio::test]

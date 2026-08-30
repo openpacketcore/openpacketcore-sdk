@@ -123,7 +123,7 @@ jobs:
               cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1
               # All filters go after `--`: cargo accepts only one positional
               # TESTNAME, while libtest itself takes any number.
-              cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_installed_staging_on_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation
+              cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation
             ' 2>&1 | tee "${datapath_log}"
 
           # Every one of these tests returns Ok early when
@@ -330,7 +330,7 @@ jobs:
 
           if ! history_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_installed_staging_on_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation"' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation"' \
               2>&1
           )"; then
             printf '%s\n' "${history_output}"
@@ -579,7 +579,7 @@ jobs:
 
           if ! history_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_installed_staging_on_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation"' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation"' \
               2>&1
           )"; then
             printf '%s\n' "${history_output}"
