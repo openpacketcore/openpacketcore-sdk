@@ -10202,6 +10202,16 @@ async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_l
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let surviving_legacy_leaf = control_root.join(legacy_leaf_name);
+    // Ordinary serving now retains its exact historical exclusion beside the
+    // native terminal. Replace that owned one-child reservation with the
+    // synthetic foreign legacy leaf below, so this assertion still exercises
+    // an ambiguous target authority rather than the current writer's marker.
+    let ordinary_exclusion_marker =
+        surviving_legacy_leaf.join("GTPU_CURRENT_HISTORICAL_25_EXCLUSION_V1");
+    if ordinary_exclusion_marker.is_dir() {
+        fs::remove_dir(&ordinary_exclusion_marker)?;
+        fs::remove_dir(&surviving_legacy_leaf)?;
+    }
     fs::DirBuilder::new()
         .mode(0o755)
         .create(&surviving_legacy_leaf)?;

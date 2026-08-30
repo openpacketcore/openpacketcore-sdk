@@ -90,6 +90,7 @@ use crate::traffic_observation::{
     GtpuTrafficProofAuthorityToken, GtpuTrafficProofDispatchAuthority, GtpuTrafficProofRevoker,
     GtpuTrafficProofSessionSnapshot, GtpuTrafficProofValidationSnapshot,
 };
+#[cfg(any(target_os = "linux", test))]
 use crate::RetainedGraphCleanupRefusal;
 use crate::{
     CreateGtpDeviceEndpointSetRequest, CreateGtpDeviceRequest, CurrentEbpfGraphRecoveryAuthority,
@@ -132,6 +133,7 @@ pub const DEFAULT_TC_PRIORITY: u16 = 50;
 ///
 /// The Linux manifest uses this constant as its array length, so changing the
 /// manifest without changing the cross-platform fake is a compile-time error.
+#[cfg(any(target_os = "linux", test))]
 const CURRENT_EBPF_GRAPH_PIN_COUNT: usize = 34;
 /// Maximum number of managed-device identities returned by one inventory.
 ///
@@ -592,6 +594,7 @@ pub(crate) enum CurrentRecoveryManagedState {
 /// Private read-only pre-ownership snapshot for current maintenance.  It is
 /// deliberately not a public receipt: callers receive only the existing typed
 /// recovery outcome after the SDK has completed the two-snapshot proof.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CurrentRecoveryPristineObservation {
     PristineNoRoot,
@@ -640,9 +643,14 @@ pub(crate) enum CurrentRecoverySuccessorRegistration {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CurrentRecoverySuccessorActivation {
+    #[cfg(any(target_os = "linux", test))]
     Activated,
+    #[cfg(any(target_os = "linux", test))]
     AlreadyActive,
+    #[cfg(any(target_os = "linux", test))]
     NeedsTypedCreate,
+    #[cfg(not(target_os = "linux"))]
+    Unsupported,
 }
 
 /// One broker-durable receipt and fresh live guard presented at the exact
@@ -651,9 +659,38 @@ pub(crate) enum CurrentRecoverySuccessorActivation {
 /// authority or be cached by the runtime.
 #[derive(Clone, Copy)]
 pub(crate) struct CurrentTerminalAdmissionExecution<'authority> {
+    #[cfg(any(target_os = "linux", test))]
     receipt: crate::CurrentEbpfGraphRecoveryReceipt,
+    #[cfg(any(target_os = "linux", test))]
     authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+    #[cfg(any(target_os = "linux", test))]
     currentness: &'authority dyn CurrentEbpfGraphRecoveryCurrentnessProbe,
+    #[cfg(all(not(target_os = "linux"), not(test)))]
+    unavailable: std::marker::PhantomData<&'authority ()>,
+}
+
+impl<'authority> CurrentTerminalAdmissionExecution<'authority> {
+    fn new(
+        receipt: crate::CurrentEbpfGraphRecoveryReceipt,
+        authority: CurrentEbpfGraphRecoveryAuthorityBinding,
+        currentness: &'authority dyn CurrentEbpfGraphRecoveryCurrentnessProbe,
+    ) -> Self {
+        #[cfg(any(target_os = "linux", test))]
+        {
+            Self {
+                receipt,
+                authority,
+                currentness,
+            }
+        }
+        #[cfg(all(not(target_os = "linux"), not(test)))]
+        {
+            let _ = (receipt, authority, currentness);
+            Self {
+                unavailable: std::marker::PhantomData,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -676,6 +713,7 @@ impl CurrentTerminalSuccessorConfiguration {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn commitment(self) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update(b"opc.gtpu.current-ebpf-successor-configuration\0r1");
@@ -765,6 +803,7 @@ const fn historical_recovery_currentness_progress(
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HistoricalEbpfGraphRecoveryTerminalSnapshot {
+    #[cfg(any(target_os = "linux", test))]
     Persisted {
         exact_graph_commitment: crate::HistoricalEbpfGraphRecoveryCommitment,
         terminal_adoption: Option<crate::HistoricalEbpfGraphRecoveryTerminalAdoption>,
@@ -782,12 +821,16 @@ pub(crate) enum HistoricalEbpfGraphRecoveryTerminalSnapshot {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CurrentEbpfGraphRecoveryTerminalSnapshot {
+    #[cfg(any(target_os = "linux", test))]
     PristineAbsence,
+    #[cfg(any(target_os = "linux", test))]
     Authenticated {
         exact_graph_commitment: crate::CurrentEbpfGraphRecoveryCommitment,
         terminal_source: crate::CurrentEbpfGraphRecoveryTerminalSource,
         terminal_adoption: Option<crate::CurrentEbpfGraphRecoveryTerminalAdoption>,
     },
+    #[cfg(not(target_os = "linux"))]
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -906,10 +949,10 @@ impl HistoricalEbpfGraphRecoveryCurrentnessProbe
 #[cfg(test)]
 struct TestHistoricalEbpfGraphRecoveryCurrentness;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct TestHistoricalEbpfGraphRecoveryAuthorityGuard;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl crate::HistoricalEbpfGraphRecoveryCurrentnessGuard
     for TestHistoricalEbpfGraphRecoveryAuthorityGuard
 {
@@ -1160,7 +1203,7 @@ fn test_current_ebpf_graph_recovery_authority_binding(
     .binding()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn test_historical_ebpf_graph_recovery_authority_binding(
 ) -> crate::HistoricalEbpfGraphRecoveryAuthorityBinding {
     let commitment = |byte| crate::HistoricalEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
@@ -1169,7 +1212,7 @@ fn test_historical_ebpf_graph_recovery_authority_binding(
     test_historical_ebpf_graph_recovery_authority_binding_for_inspection(inspection)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn test_historical_ebpf_graph_recovery_authority_binding_for_inspection(
     inspection: crate::HistoricalEbpfGraphRecoveryGraphInspection,
 ) -> crate::HistoricalEbpfGraphRecoveryAuthorityBinding {
@@ -1441,6 +1484,7 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
 
     /// Runtime-specific read-only observer for a pre-existing current recovery
     /// authority. Backends without a persistent host authority return absent.
+    #[cfg(target_os = "linux")]
     fn current_recovery_authority_is_present(&self, _pin_dir: &Path) -> Result<bool, GtpuError> {
         Ok(false)
     }
@@ -1448,6 +1492,7 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// First half of the production-only pristine observer. Test runtimes
     /// that do not own a descriptor-relative bpffs hierarchy keep the default
     /// graph-present result and model their read-only absence in recovery.
+    #[cfg(target_os = "linux")]
     fn current_recovery_pristine_observation(
         &self,
         _replacement: Option<(&str, u32)>,
@@ -1460,6 +1505,7 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Two-snapshot read-only current-maintenance absence proof. Runtimes
     /// without a real descriptor hierarchy return `None` and must not create
     /// authority state merely to emulate this path.
+    #[cfg(target_os = "linux")]
     fn current_recovery_pristine_absence(
         &self,
         _replacement: Option<(&str, u32)>,
@@ -1481,7 +1527,14 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         _authority: CurrentEbpfGraphRecoveryAuthorityBinding,
         _currentness: &dyn CurrentEbpfGraphRecoveryCurrentnessProbe,
     ) -> Result<Option<CurrentEbpfGraphRecoveryTerminalSnapshot>, GtpuError> {
-        Ok(None)
+        #[cfg(target_os = "linux")]
+        {
+            Ok(None)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Some(CurrentEbpfGraphRecoveryTerminalSnapshot::Unavailable))
+        }
     }
 
     /// Authenticate an already-retained terminal under a fresh live target
@@ -1558,9 +1611,16 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         _registration: CurrentRecoverySuccessorRegistration,
         _currentness: &dyn CurrentEbpfGraphRecoveryCurrentnessProbe,
     ) -> Result<CurrentRecoverySuccessorActivation, GtpuError> {
-        Err(GtpuError::StateIndeterminate {
-            operation: "ebpf_current_successor_activation",
-        })
+        #[cfg(target_os = "linux")]
+        {
+            Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_successor_activation",
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(CurrentRecoverySuccessorActivation::Unsupported)
+        }
     }
 
     /// Atomically authenticate a retained terminal WAL against the exact
@@ -1604,6 +1664,7 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
 
     /// Runtime-specific graph-generation discriminator executed before a
     /// current recovery authority may be created.
+    #[cfg(target_os = "linux")]
     fn current_recovery_generation_refusal(
         &self,
         _pin_dir: &Path,
@@ -1674,6 +1735,7 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Read-only ordinary-cleanup preflight for a historical graph. Returning
     /// `Some` is a bounded structural refusal; it never takes authority or
     /// mutates pins, hooks, directories, or maps.
+    #[cfg(any(target_os = "linux", test))]
     fn historical_cleanup_only_refusal(
         &self,
         _pin_dir: &Path,
@@ -8258,13 +8320,13 @@ impl EbpfGtpuDataplaneBackend {
         let terminal_execution = terminal_admission
             .as_ref()
             .zip(terminal_currentness.as_ref())
-            .map(
-                |(admission, currentness)| CurrentTerminalAdmissionExecution {
-                    receipt: admission.receipt,
-                    authority: admission.authority.binding(),
+            .map(|(admission, currentness)| {
+                CurrentTerminalAdmissionExecution::new(
+                    admission.receipt,
+                    admission.authority.binding(),
                     currentness,
-                },
-            );
+                )
+            });
         let successor_configuration = CurrentTerminalSuccessorConfiguration::Legacy {
             local_ip: local_ip.octets(),
             pmtu_policy: request
@@ -8480,13 +8542,13 @@ impl EbpfGtpuDataplaneBackend {
         let terminal_execution = terminal_admission
             .as_ref()
             .zip(terminal_currentness.as_ref())
-            .map(
-                |(admission, currentness)| CurrentTerminalAdmissionExecution {
-                    receipt: admission.receipt,
-                    authority: admission.authority.binding(),
+            .map(|(admission, currentness)| {
+                CurrentTerminalAdmissionExecution::new(
+                    admission.receipt,
+                    admission.authority.binding(),
                     currentness,
-                },
-            );
+                )
+            });
         let successor_configuration = CurrentTerminalSuccessorConfiguration::Grouped {
             config: config.encode(),
             pmtu_policy: request
@@ -8819,10 +8881,12 @@ impl EbpfGtpuDataplaneBackend {
             authority_runtime,
         )?;
         let receipt = match (result.outcome, result.terminal_snapshot) {
+            #[cfg(any(target_os = "linux", test))]
             (
                 CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
                 Some(CurrentEbpfGraphRecoveryTerminalSnapshot::PristineAbsence),
             ) => crate::CurrentEbpfGraphRecoveryReceipt::pristine_absence(result.authority),
+            #[cfg(any(target_os = "linux", test))]
             (
                 outcome @ (CurrentEbpfGraphRecoveryOutcome::Removed
                 | CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent),
@@ -8926,28 +8990,38 @@ impl EbpfGtpuDataplaneBackend {
         if let Some(currentness) = currentness.first_failure() {
             return Ok(refusal(current_recovery_currentness_refusal(currentness)));
         }
-        let Some(CurrentEbpfGraphRecoveryTerminalSnapshot::Authenticated {
-            exact_graph_commitment,
-            terminal_source,
-            terminal_adoption,
-        }) = snapshot
-        else {
-            return Ok(refusal(
-                CurrentEbpfGraphRecoveryRefusal::TerminalTransferMismatch,
-            ));
-        };
-        if let Err(currentness) = currentness.verify_current() {
-            return Ok(refusal(current_recovery_currentness_refusal(currentness)));
-        }
-        Ok(
-            crate::CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
-                binding,
-                CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+        #[cfg(any(target_os = "linux", test))]
+        {
+            let Some(CurrentEbpfGraphRecoveryTerminalSnapshot::Authenticated {
                 exact_graph_commitment,
                 terminal_source,
                 terminal_adoption,
-            ),
-        )
+            }) = snapshot
+            else {
+                return Ok(refusal(
+                    CurrentEbpfGraphRecoveryRefusal::TerminalTransferMismatch,
+                ));
+            };
+            if let Err(currentness) = currentness.verify_current() {
+                return Ok(refusal(current_recovery_currentness_refusal(currentness)));
+            }
+            Ok(
+                crate::CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
+                    binding,
+                    CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+                    exact_graph_commitment,
+                    terminal_source,
+                    terminal_adoption,
+                ),
+            )
+        }
+        #[cfg(all(not(target_os = "linux"), not(test)))]
+        {
+            let _ = snapshot;
+            Ok(refusal(
+                CurrentEbpfGraphRecoveryRefusal::TerminalTransferMismatch,
+            ))
+        }
     }
 
     fn admit_current_recovery_terminal_sync(
@@ -9289,6 +9363,7 @@ impl EbpfGtpuDataplaneBackend {
                 &currentness,
             )?;
             match (registration, activation, registration_entry) {
+                #[cfg(any(target_os = "linux", test))]
                 (
                     CurrentRecoverySuccessorRegistration::Pending,
                     CurrentRecoverySuccessorActivation::Activated,
@@ -9296,11 +9371,13 @@ impl EbpfGtpuDataplaneBackend {
                 ) => {
                     entry.get_mut().successor_pending = false;
                 }
+                #[cfg(any(target_os = "linux", test))]
                 (
                     CurrentRecoverySuccessorRegistration::Active,
                     CurrentRecoverySuccessorActivation::AlreadyActive,
                     std::collections::hash_map::Entry::Occupied(_),
                 ) => {}
+                #[cfg(any(target_os = "linux", test))]
                 (
                     _,
                     CurrentRecoverySuccessorActivation::NeedsTypedCreate,
@@ -9311,6 +9388,7 @@ impl EbpfGtpuDataplaneBackend {
                         operation: "ebpf_current_successor_typed_create",
                     });
                 }
+                #[cfg(any(target_os = "linux", test))]
                 (
                     CurrentRecoverySuccessorRegistration::Absent,
                     CurrentRecoverySuccessorActivation::NeedsTypedCreate,
@@ -9320,6 +9398,13 @@ impl EbpfGtpuDataplaneBackend {
                         operation: "ebpf_current_successor_typed_create",
                     });
                 }
+                #[cfg(not(target_os = "linux"))]
+                (_, CurrentRecoverySuccessorActivation::Unsupported, _) => {
+                    return Err(GtpuError::UnsupportedFeature {
+                        feature: "ebpf_current_successor_activation",
+                    });
+                }
+                #[cfg(any(target_os = "linux", test))]
                 _ => {
                     return Err(GtpuError::StateIndeterminate {
                         operation: "ebpf_current_successor_registration",
@@ -9712,6 +9797,7 @@ impl EbpfGtpuDataplaneBackend {
                     binding, generation,
                 ))
             }
+            #[cfg(any(target_os = "linux", test))]
             (
                 true,
                 HistoricalEbpfGraphRecoveryTerminalSnapshot::Persisted {
@@ -9725,6 +9811,7 @@ impl EbpfGtpuDataplaneBackend {
                 exact_graph_commitment,
                 outcome,
             )),
+            #[cfg(any(target_os = "linux", test))]
             (
                 true,
                 HistoricalEbpfGraphRecoveryTerminalSnapshot::Persisted {
@@ -14366,6 +14453,7 @@ fn validate_pin_namespace(name: &str) -> Result<(), GtpuError> {
 /// rendering it in durable recovery authority. The name and ifindex are
 /// independent identity axes: Linux may reuse an ifindex after a rename, so a
 /// receipt must bind both before any crash-resumed effect.
+#[cfg(any(target_os = "linux", test))]
 fn historical_25_replacement_name_commitment(name: &str) -> Result<[u8; 32], GtpuError> {
     const DOMAIN: &[u8] = b"opc/gtpu/historical-25/replacement-name/v1\0";
     validate_linux_name(name, "replacement_device.name")?;
@@ -20039,7 +20127,14 @@ mod aya_runtime {
             pin_dir: &Path,
             currentness: &dyn super::CurrentEbpfGraphRecoveryCurrentnessProbe,
         ) -> Result<Arc<ReconcilerOwnership>, GtpuError> {
-            Self::acquire_reconciler_ownership_inner(pin_dir, Some(currentness), true, None)
+            let historical_25_ordinary_exclusion =
+                Self::acquire_optional_existing_historical_25_ordinary_exclusion(pin_dir)?;
+            Self::acquire_reconciler_ownership_inner(
+                pin_dir,
+                Some(currentness),
+                true,
+                historical_25_ordinary_exclusion,
+            )
         }
 
         /// Lock an already-retained current authority hierarchy without
@@ -20051,7 +20146,14 @@ mod aya_runtime {
             pin_dir: &Path,
             currentness: &dyn super::CurrentEbpfGraphRecoveryCurrentnessProbe,
         ) -> Result<Arc<ReconcilerOwnership>, GtpuError> {
-            Self::acquire_reconciler_ownership_inner(pin_dir, Some(currentness), false, None)
+            let historical_25_ordinary_exclusion =
+                Self::acquire_optional_existing_historical_25_ordinary_exclusion(pin_dir)?;
+            Self::acquire_reconciler_ownership_inner(
+                pin_dir,
+                Some(currentness),
+                false,
+                historical_25_ordinary_exclusion,
+            )
         }
 
         /// Reuse only this process's exact fenced successor lease; every
@@ -20698,6 +20800,113 @@ mod aya_runtime {
                 false,
                 None,
             )
+        }
+
+        /// Current-terminal maintenance must carry an ordinary writer's
+        /// already-published exact exclusion through its terminal root
+        /// revalidation.  This reader path never creates a namespace root,
+        /// control root, staging leaf, or marker: absence remains absence,
+        /// while a present candidate is accepted only by the same exact
+        /// descriptor and flock acquisition used for historical recovery.
+        fn acquire_optional_existing_historical_25_ordinary_exclusion(
+            pin_dir: &Path,
+        ) -> Result<Option<Historical25OrdinaryExclusion>, GtpuError> {
+            const OPERATION: &str = "ebpf_historical_25_ordinary_exclusion";
+            let configured_root = pin_dir.parent().ok_or_else(|| {
+                GtpuError::invalid_config("ebpf.bpffs_pin_root", "pin directory must have a parent")
+            })?;
+            let leaf = pin_dir
+                .file_name()
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            let (root, _) = match Self::open_bpffs_namespace_root(configured_root, false, OPERATION)
+            {
+                Ok(root) => root,
+                Err(GtpuError::Io {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                }) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let control_root = match rustix::fs::openat(
+                &root,
+                RECONCILER_CONTROL_DIRECTORY,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => File::from(descriptor),
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
+            };
+            Self::verify_control_root(&control_root, None, OPERATION)?;
+            let legacy_name = Self::historical_25_legacy_leaf_name(leaf)?;
+            match rustix::fs::openat(
+                &control_root,
+                legacy_name.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(_) => {
+                    Self::acquire_existing_historical_25_ordinary_exclusion(pin_dir, true).map(Some)
+                }
+                Err(rustix::io::Errno::NOENT) => Ok(None),
+                Err(error) => Err(GtpuError::io(OPERATION, error.into())),
+            }
+        }
+
+        /// Classify conclusive live-generation, map-identity, and pin-ABI
+        /// conflicts before ordinary startup creates its historical exclusion.
+        /// This is rejection-only: the guarded ownership path repeats every
+        /// accepted observation before the mutation boundary, so a race can
+        /// only turn an apparent absence into a later fail-closed refusal.
+        fn ordinary_attachment_conflict_preflight(
+            pin_dir: &Path,
+            ifindex: u32,
+            tc_priority: u16,
+            operation: &'static str,
+        ) -> Result<(), GtpuError> {
+            let pins_preexisted = match fs::symlink_metadata(pin_dir) {
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+                {
+                    true
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                // The exact historical preflight remains the authoritative
+                // classifier for unknown path shapes.  Do not manufacture a
+                // different classification from this compatibility guard.
+                Ok(_) | Err(_) => return Ok(()),
+            };
+            let current_programs = Self::require_no_foreign_generation(
+                ifindex,
+                tc_priority,
+                operation,
+                pins_preexisted,
+            )?;
+            if pins_preexisted {
+                // A complete shipped-25 manifest is compatibility state,
+                // not a current pin ABI.  Its exact historical preflight
+                // must remain the next classifier after the hook-generation
+                // scan, before ordinary startup can create the exclusion.
+                let entries = Self::current_directory_entries(pin_dir)?;
+                let exact_historical_25_layout = entries.len()
+                    == PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()
+                    && PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES
+                        .iter()
+                        .all(|name| entries.contains(*name));
+                if exact_historical_25_layout {
+                    return Ok(());
+                }
+                Self::require_current_program_pin_graph(&current_programs, pin_dir)?;
+                Self::classify_pinned_map_layout(pin_dir)?;
+                Self::require_current_pin_capacity(pin_dir)?;
+            }
+            Ok(())
         }
 
         fn acquire_historical_25_ordinary_exclusion_inner(
@@ -37791,6 +38000,14 @@ mod aya_runtime {
             successor_pmtu_policy: Option<[u8; UPLINK_PMTU_VALUE_LEN]>,
             terminal_admission: Option<CurrentTerminalAdmissionExecution<'_>>,
         ) -> Result<EbpfAttachmentDisposition, GtpuError> {
+            if terminal_admission.is_none() {
+                Self::ordinary_attachment_conflict_preflight(
+                    pin_dir,
+                    ifindex,
+                    tc_priority,
+                    "ebpf_attach",
+                )?;
+            }
             let reconciler_ownership =
                 Self::acquire_reconciler_ownership(pin_dir, terminal_admission.as_ref())?;
             let _graph_lock =
@@ -38180,6 +38397,15 @@ mod aya_runtime {
                     }
                 },
             )?;
+
+            if terminal_admission.is_none() {
+                Self::ordinary_attachment_conflict_preflight(
+                    pin_dir,
+                    ifindex,
+                    tc_priority,
+                    "ebpf_attach_grouped",
+                )?;
+            }
 
             let reconciler_ownership =
                 Self::acquire_reconciler_ownership(pin_dir, terminal_admission.as_ref())?;
@@ -38764,6 +38990,12 @@ mod aya_runtime {
             pin_dir: &Path,
             tc_priority: u16,
         ) -> Result<[u8; 4], GtpuError> {
+            Self::ordinary_attachment_conflict_preflight(
+                pin_dir,
+                ifindex,
+                tc_priority,
+                "ebpf_adopt",
+            )?;
             let reconciler_ownership = Self::acquire_reconciler_ownership(pin_dir, None)?;
             let _graph_lock =
                 Self::acquire_operation_control_lock(&reconciler_ownership, "ebpf_adopt")?;
@@ -57089,11 +57321,7 @@ mod tests {
             let Some((_, ifindex)) = replacement else {
                 return Ok(refused());
             };
-            let execution = CurrentTerminalAdmissionExecution {
-                receipt,
-                authority,
-                currentness,
-            };
+            let execution = CurrentTerminalAdmissionExecution::new(receipt, authority, currentness);
             let state = self.state();
             if Self::current_terminal_allows_fake_attach(&state, pin_dir, ifindex, Some(&execution))
                 .is_err()

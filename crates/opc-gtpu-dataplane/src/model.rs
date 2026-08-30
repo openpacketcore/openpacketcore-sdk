@@ -1290,20 +1290,24 @@ impl CurrentEbpfGraphRecoverySuccessorReceipt {
         self.target_kind
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) const fn predecessor_receipt_commitment(
         self,
     ) -> CurrentEbpfGraphRecoveryTerminalReceiptCommitment {
         self.predecessor_receipt_commitment
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) const fn target_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
         self.target_commitment
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) const fn configuration_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
         self.configuration_commitment
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) const fn graph_commitment(self) -> CurrentEbpfGraphRecoveryCommitment {
         self.graph_commitment
     }
@@ -1698,6 +1702,7 @@ impl CurrentEbpfGraphRecoveryReceipt {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn pristine_absence(authority: CurrentEbpfGraphRecoveryAuthorityBinding) -> Self {
         Self {
             authority,
@@ -2276,6 +2281,7 @@ impl HistoricalEbpfGraphRecoveryFormerLinkEvidence {
     /// Rebuild an already checksum-authenticated record projection. This is
     /// crate-private so callers cannot turn an arbitrary commitment into
     /// former-link evidence.
+    #[cfg(target_os = "linux")]
     pub(crate) const fn from_persisted(commitment: HistoricalEbpfGraphRecoveryCommitment) -> Self {
         Self(commitment)
     }
@@ -2445,6 +2451,7 @@ pub struct HistoricalEbpfGraphRecoveryGraphInspection {
 }
 
 impl HistoricalEbpfGraphRecoveryGraphInspection {
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) const fn exact_shipped_25(
         exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment,
     ) -> Self {
@@ -2518,6 +2525,7 @@ pub struct HistoricalEbpfGraphRecoveryPristineInspection {
 }
 
 impl HistoricalEbpfGraphRecoveryPristineInspection {
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) const fn observed() -> Self {
         Self { _private: () }
     }
@@ -2569,6 +2577,7 @@ impl HistoricalEbpfGraphRecoveryOperationId {
     }
 
     #[must_use]
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) const fn bytes(self) -> [u8; 16] {
         self.0
     }
@@ -2736,6 +2745,7 @@ pub struct HistoricalEbpfGraphRecoveryTerminalAdoption {
 }
 
 impl HistoricalEbpfGraphRecoveryTerminalAdoption {
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) const fn with_full_prior_authority(
         prior_authority: HistoricalEbpfGraphRecoveryAuthorityBinding,
     ) -> Self {
@@ -2769,6 +2779,7 @@ impl HistoricalEbpfGraphRecoveryTerminalAdoption {
 }
 
 impl HistoricalEbpfGraphRecoveryAuthorityBinding {
+    #[cfg(target_os = "linux")]
     pub(crate) const fn from_parts(
         scope_commitment: HistoricalEbpfGraphRecoveryCommitment,
         predecessor_basis_commitment: HistoricalEbpfGraphRecoveryCommitment,
@@ -3150,6 +3161,7 @@ impl HistoricalEbpfGraphRecoveryReceipt {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) const fn with_terminal_adoption(
         authority: HistoricalEbpfGraphRecoveryAuthorityBinding,
         terminal_adoption: HistoricalEbpfGraphRecoveryTerminalAdoption,
@@ -7280,6 +7292,10 @@ mod tests {
             .expect("canonical successor receipt decodes");
         assert_eq!(decoded, receipt);
         assert_eq!(decoded.commitment(), receipt.commitment());
+        assert_eq!(
+            decoded.predecessor_receipt_commitment(),
+            predecessor_receipt
+        );
 
         for offset in 0..CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_ENCODED_LEN {
             let mut tampered = encoded;
