@@ -3,6 +3,12 @@ use std::sync::Arc;
 
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 
+// Retained for tests outside the #576 outcome-accounting seam that still assert
+// process-global metrics. Outcome assertions below use task-local accounting.
+pub(crate) static SESSION_CONNECTION_METRICS_TEST_LOCK: std::sync::LazyLock<
+    tokio::sync::Mutex<()>,
+> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[derive(Clone, Copy)]
 pub(crate) struct ConnectionOutcomeMetricSnapshot {
     pub(crate) idle_retirements: u64,
