@@ -1976,6 +1976,45 @@ pub(crate) mod protected_session_backend_seal {
 pub trait ProtectedSessionBackend:
     SessionBackend + SessionLeaseManager + protected_session_backend_seal::Sealed
 {
+    /// Project one caller-retained protected token to the exact physical
+    /// authenticated-consumer token after revalidating the wrapper journal.
+    /// This performs no dispatch and is intentionally available only through
+    /// the sealed protected-backend contract.
+    #[doc(hidden)]
+    async fn project_fenced_transition_for_authenticated_consumer_router(
+        &self,
+        _prepared: &PreparedFencedTransition,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "authenticated_consumer_prepared_fenced_transition".into(),
+        ))
+    }
+
+    /// Prepare and project one exact journaled protected V1 transition to its
+    /// authenticated-consumer physical token.  This sealed SDK hook verifies
+    /// the outer journal before removing only the wrapper's own marker.
+    #[doc(hidden)]
+    async fn prepare_fenced_transition_for_authenticated_consumer_router(
+        &self,
+        _request: FencedTransitionRequest,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "authenticated_consumer_prepared_fenced_transition".into(),
+        ))
+    }
+
+    /// Recover and project one exact journaled transition as a physical token.
+    /// The net layer grants the resulting handle receipt authority only.
+    #[doc(hidden)]
+    async fn recover_fenced_transition_for_authenticated_consumer_router(
+        &self,
+        _request_id: FencedTransitionRequestId,
+    ) -> Result<PreparedFencedTransitionLookup, StoreError> {
+        Err(StoreError::CapabilityNotSupported(
+            "authenticated_consumer_prepared_fenced_transition".into(),
+        ))
+    }
+
     /// Create one caller-provided-ID affine acquire request before any
     /// physical mutation poll. Implementations are restricted to SDK sealing
     /// wrappers.
@@ -3775,6 +3814,70 @@ where
     B: SessionBackend + SessionLeaseManager + Send + Sync + ?Sized + 'static,
     P: KeyProvider + Send + Sync + ?Sized + 'static,
 {
+    async fn project_fenced_transition_for_authenticated_consumer_router(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        let stored = journal
+            .require_exact(prepared)
+            .await?
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let inner =
+            stored.without_outer_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
+                scope_commitment,
+            })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        Ok(inner)
+    }
+
+    async fn prepare_fenced_transition_for_authenticated_consumer_router(
+        &self,
+        request: FencedTransitionRequest,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        let prepared = SessionBackend::prepare_fenced_transition(self, request).await?;
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        let stored = journal
+            .require_exact(&prepared)
+            .await?
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let inner =
+            stored.without_outer_protection(PreparedFencedTransitionProtection::LocalAeadV1 {
+                scope_commitment,
+            })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        Ok(inner)
+    }
+
+    async fn recover_fenced_transition_for_authenticated_consumer_router(
+        &self,
+        request_id: FencedTransitionRequestId,
+    ) -> Result<PreparedFencedTransitionLookup, StoreError> {
+        let prepared = SessionBackend::recover_prepared_fenced_transition(self, request_id).await?;
+        match prepared {
+            PreparedFencedTransitionLookup::Found(prepared) => {
+                let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+                    .ok_or_else(unsupported_protected_fenced_transition)?;
+                let journal =
+                    require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+                let stored = journal
+                    .require_exact(&prepared)
+                    .await?
+                    .ok_or_else(unsupported_protected_fenced_transition)?;
+                let inner = stored.without_outer_protection(
+                    PreparedFencedTransitionProtection::LocalAeadV1 { scope_commitment },
+                )?;
+                require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+                Ok(PreparedFencedTransitionLookup::Found(inner))
+            }
+            PreparedFencedTransitionLookup::Absent => Ok(PreparedFencedTransitionLookup::Absent),
+        }
+    }
+
     fn prepare_acquire_with_id(
         &self,
         scope: SessionConsumerScope,
@@ -4852,6 +4955,70 @@ where
     B: SessionBackend + SessionLeaseManager + Send + Sync + ?Sized + 'static,
     S: RemoteSealProvider + Send + Sync + ?Sized + 'static,
 {
+    async fn project_fenced_transition_for_authenticated_consumer_router(
+        &self,
+        prepared: &PreparedFencedTransition,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        let stored = journal
+            .require_exact(prepared)
+            .await?
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let inner =
+            stored.without_outer_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
+                scope_commitment,
+            })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        Ok(inner)
+    }
+
+    async fn prepare_fenced_transition_for_authenticated_consumer_router(
+        &self,
+        request: FencedTransitionRequest,
+    ) -> Result<PreparedFencedTransition, StoreError> {
+        let prepared = SessionBackend::prepare_fenced_transition(self, request).await?;
+        let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+        let stored = journal
+            .require_exact(&prepared)
+            .await?
+            .ok_or_else(unsupported_protected_fenced_transition)?;
+        let inner =
+            stored.without_outer_protection(PreparedFencedTransitionProtection::RemoteSealV1 {
+                scope_commitment,
+            })?;
+        require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+        Ok(inner)
+    }
+
+    async fn recover_fenced_transition_for_authenticated_consumer_router(
+        &self,
+        request_id: FencedTransitionRequestId,
+    ) -> Result<PreparedFencedTransitionLookup, StoreError> {
+        let prepared = SessionBackend::recover_prepared_fenced_transition(self, request_id).await?;
+        match prepared {
+            PreparedFencedTransitionLookup::Found(prepared) => {
+                let scope_commitment = protected_payload_scope_commitment(self.backend_namespace())
+                    .ok_or_else(unsupported_protected_fenced_transition)?;
+                let journal =
+                    require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
+                let stored = journal
+                    .require_exact(&prepared)
+                    .await?
+                    .ok_or_else(unsupported_protected_fenced_transition)?;
+                let inner = stored.without_outer_protection(
+                    PreparedFencedTransitionProtection::RemoteSealV1 { scope_commitment },
+                )?;
+                require_fenced_transition_physical_token(self.inner.as_ref(), &inner)?;
+                Ok(PreparedFencedTransitionLookup::Found(inner))
+            }
+            PreparedFencedTransitionLookup::Absent => Ok(PreparedFencedTransitionLookup::Absent),
+        }
+    }
+
     fn prepare_acquire_with_id(
         &self,
         scope: SessionConsumerScope,

@@ -5226,11 +5226,72 @@ where
     }
 }
 
+impl<B> SessionConsumerPreparedCheckpointBackend<B>
+where
+    B: ProtectedSessionBackend + 'static,
+{
+    /// Compose the exact persistent voter roster with a protected V1
+    /// backend. The sealed backend projection verifies its durable journal
+    /// before this router receives the opaque physical consumer token.
+    pub fn persistent_fenced_transition(
+        backend: Arc<B>,
+        clients: impl IntoIterator<Item = PersistentSessionConsumerClient>,
+    ) -> Result<Self, SessionConsumerPreparedCheckpointBackendError> {
+        Ok(Self {
+            backend,
+            router: Arc::new(PreparedConsumerRouter::persistent(clients)?),
+        })
+    }
+
+    /// Prepare one protected V1 fenced transition and retain its exact
+    /// physical token in a move-only, affine dispatch handle.
+    ///
+    /// The protected backend validates and journals its caller token before
+    /// projecting the exact authenticated-consumer V1 token to this router.
+    pub async fn prepare_fenced_transition(
+        &self,
+        request: FencedTransitionRequest,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<SessionConsumerPreparedFencedTransition, StoreError> {
+        let prepared = self.backend.prepare_fenced_transition(request).await?;
+        let projection: Arc<dyn ProtectedSessionBackend> = self.backend.clone();
+        self.router
+            .consume_fenced_transition(projection, prepared, budget)
+            .await
+    }
+
+    /// Reopen a durable prepared transition as a status-only handle.
+    ///
+    /// Deliberately returns no dispatch authority: a process that recovered a
+    /// token after a possible send may only observe its exact durable receipt.
+    pub async fn recover_fenced_transition_status(
+        &self,
+        request_id: FencedTransitionRequestId,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<Option<SessionConsumerRecoveredFencedTransitionStatus>, StoreError> {
+        match self
+            .backend
+            .recover_prepared_fenced_transition(request_id)
+            .await?
+        {
+            opc_session_store::PreparedFencedTransitionLookup::Found(prepared) => {
+                let projection: Arc<dyn ProtectedSessionBackend> = self.backend.clone();
+                self.router
+                    .consume_fenced_transition_status_only(projection, prepared, budget)
+                    .await
+                    .map(Some)
+            }
+            opc_session_store::PreparedFencedTransitionLookup::Absent => Ok(None),
+            _ => Err(invalid_authenticated_consumer_fenced_transition()),
+        }
+    }
+}
+
 impl PreparedConsumerRouter {
     fn persistent(
         clients: impl IntoIterator<Item = PersistentSessionConsumerClient>,
     ) -> Result<Self, SessionConsumerPreparedCheckpointBackendError> {
-        let clients: Vec<_> = clients.into_iter().collect();
+        let mut clients: Vec<_> = clients.into_iter().collect();
         if clients.is_empty() || clients.len() > MAX_PREPARED_CONSUMER_VOTERS {
             return Err(SessionConsumerPreparedCheckpointBackendError);
         }
@@ -5254,6 +5315,10 @@ impl PreparedConsumerRouter {
         {
             return Err(SessionConsumerPreparedCheckpointBackendError);
         }
+        // The caller's input order is not durable authority.  Sort by the
+        // canonical node ordinal before deriving any request's origin so a
+        // restarted worker reaches the same origin/successor sequence.
+        clients.sort_unstable_by_key(|client| client.pool.client.voter.node_id());
         Ok(Self {
             clients: clients.into(),
             scope,
@@ -14848,6 +14913,104 @@ impl PreparedConsumerRouter {
             },
         })
     }
+
+    fn fenced_transition_binding(&self) -> Result<[u8; 32], StoreError> {
+        let client = self
+            .clients
+            .first()
+            .ok_or_else(invalid_authenticated_consumer_fenced_transition)?;
+        authenticated_consumer_binding(
+            client
+                .pool
+                .client
+                .tls_config
+                .local_spiffe_identity_commitment(),
+            self.scope,
+        )
+        .map_err(|_| invalid_authenticated_consumer_fenced_transition())
+    }
+
+    fn fenced_transition_origin(&self, request_id: FencedTransitionRequestId) -> usize {
+        let identity = self.scope.consensus_identity();
+        let mut digest = Sha256::new();
+        digest.update(b"openpacketcore/session-consumer/prepared-fenced-transition-origin/v1\0");
+        digest.update(identity.cluster_id().as_bytes());
+        digest.update(identity.configuration_id().as_bytes());
+        digest.update(identity.configuration_epoch().get().to_be_bytes());
+        digest.update(self.clients[0].pool.client.voter.roster_commitment());
+        for client in self.clients.iter() {
+            digest.update(client.pool.client.voter.node_id().get().to_be_bytes());
+        }
+        digest.update(request_id.as_bytes());
+        let bytes: [u8; 32] = digest.finalize().into();
+        (u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]) as usize)
+            % self.clients.len()
+    }
+
+    async fn consume_fenced_transition(
+        self: &Arc<Self>,
+        projection: Arc<dyn ProtectedSessionBackend>,
+        prepared: PreparedFencedTransition,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<SessionConsumerPreparedFencedTransition, StoreError> {
+        let physical = projection
+            .project_fenced_transition_for_authenticated_consumer_router(&prepared)
+            .await?;
+        let request =
+            physical.request_for_authenticated_consumer(self.fenced_transition_binding()?)?;
+        opc_session_store::validate_consensus_physical_fenced_transition_request(&request)?;
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(StoreError::BackendUnavailable(
+                "prepared fenced transition deadline elapsed".into(),
+            ));
+        }
+        let request_id = prepared.request_id();
+        Ok(SessionConsumerPreparedFencedTransition {
+            inner: PersistentPreparedFencedTransitionToken {
+                router: Arc::clone(self),
+                projection,
+                _prepared: Arc::new(prepared),
+                request: Arc::new(request),
+                budget,
+                state: PreparedRequestState::new(self.fenced_transition_origin(request_id)),
+                terminal_receipt: StdMutex::new(None),
+            },
+        })
+    }
+
+    async fn consume_fenced_transition_status_only(
+        self: &Arc<Self>,
+        projection: Arc<dyn ProtectedSessionBackend>,
+        prepared: PreparedFencedTransition,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<SessionConsumerRecoveredFencedTransitionStatus, StoreError> {
+        let physical = projection
+            .project_fenced_transition_for_authenticated_consumer_router(&prepared)
+            .await?;
+        let request =
+            physical.request_for_authenticated_consumer(self.fenced_transition_binding()?)?;
+        opc_session_store::validate_consensus_physical_fenced_transition_request(&request)?;
+        if tokio::time::Instant::now() >= budget.original_deadline() {
+            return Err(StoreError::BackendUnavailable(
+                "prepared fenced transition deadline elapsed".into(),
+            ));
+        }
+        let state = PreparedRequestState::new(self.fenced_transition_origin(prepared.request_id()));
+        state.receipt_only();
+        Ok(SessionConsumerRecoveredFencedTransitionStatus {
+            inner: PersistentPreparedFencedTransitionToken {
+                router: Arc::clone(self),
+                projection,
+                _prepared: Arc::new(prepared),
+                request: Arc::new(request),
+                budget,
+                state,
+                terminal_receipt: StdMutex::new(None),
+            },
+        })
+    }
 }
 
 fn prepared_voter_index(cursor: usize, voter_count: usize) -> usize {
@@ -15043,6 +15206,329 @@ struct PreparedStatusAttempt<'a>(&'a AtomicBool);
 impl Drop for PreparedStatusAttempt<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Status-only failure for one exact prepared fenced transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SessionConsumerPreparedFencedTransitionStatusError {
+    #[error("prepared fenced transition was not dispatched")]
+    NotExecuted,
+    #[error("prepared fenced transition deadline elapsed")]
+    Deadline,
+    #[error("prepared fenced transition authority was revoked")]
+    TopologyAuthorityRevoked,
+    #[error("prepared fenced transition receipt is unavailable")]
+    Unavailable,
+}
+
+/// Affine dispatch authority for one exact protected V1 fenced transition.
+///
+/// It is intentionally not cloneable and does not expose its retained token.
+pub struct SessionConsumerPreparedFencedTransition {
+    inner: PersistentPreparedFencedTransitionToken,
+}
+
+impl fmt::Debug for SessionConsumerPreparedFencedTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerPreparedFencedTransition(<redacted>)")
+    }
+}
+
+impl SessionConsumerPreparedFencedTransition {
+    /// Dispatch the retained mutation once.  A possible send permanently
+    /// removes dispatch authority; use receipt recovery only afterwards.
+    pub async fn execute_once(
+        &mut self,
+    ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+        self.inner.execute_once().await
+    }
+
+    /// Try one read-only receipt lookup on the next deterministic voter.
+    pub async fn status_once(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError> {
+        self.inner.status_once(deadline).await
+    }
+
+    /// Rotate read-only receipt lookups over the admitted roster until a
+    /// terminal receipt is found or the caller's original absolute deadline
+    /// is reached.  It never re-enters mutation dispatch.
+    pub async fn status_until_terminal(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError> {
+        self.inner.status_until_terminal(deadline).await
+    }
+}
+
+/// A reopened transition has receipt authority only.  It deliberately has no
+/// `execute_once` method, preventing a crash-recovered token from replaying a
+/// mutation that may already have been sent.
+pub struct SessionConsumerRecoveredFencedTransitionStatus {
+    inner: PersistentPreparedFencedTransitionToken,
+}
+
+impl fmt::Debug for SessionConsumerRecoveredFencedTransitionStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionConsumerRecoveredFencedTransitionStatus(<redacted>)")
+    }
+}
+
+impl SessionConsumerRecoveredFencedTransitionStatus {
+    pub async fn status_once(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError> {
+        self.inner.status_once(deadline).await
+    }
+
+    pub async fn status_until_terminal(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError> {
+        self.inner.status_until_terminal(deadline).await
+    }
+}
+
+struct PersistentPreparedFencedTransitionToken {
+    router: Arc<PreparedConsumerRouter>,
+    projection: Arc<dyn ProtectedSessionBackend>,
+    // Retain the opaque prepared bytes as the immutable authority even though
+    // dispatch uses the one decoded, validated physical request below.
+    _prepared: Arc<PreparedFencedTransition>,
+    request: Arc<FencedTransitionRequest>,
+    budget: PreparedCheckpointBudget,
+    state: PreparedRequestState,
+    terminal_receipt: StdMutex<
+        Option<Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError>>,
+    >,
+}
+
+impl PersistentPreparedFencedTransitionToken {
+    async fn request_from_current_journal(&self) -> Result<FencedTransitionRequest, StoreError> {
+        let physical = self
+            .projection
+            .project_fenced_transition_for_authenticated_consumer_router(&self._prepared)
+            .await?;
+        let request = physical
+            .request_for_authenticated_consumer(self.router.fenced_transition_binding()?)?;
+        if request != *self.request {
+            return Err(invalid_authenticated_consumer_fenced_transition());
+        }
+        Ok(request)
+    }
+
+    fn cached_terminal_receipt(
+        &self,
+    ) -> Option<Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError>>
+    {
+        self.terminal_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn terminal_receipt(
+        &self,
+        result: Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError>,
+    ) -> Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError> {
+        let mut receipt = self
+            .terminal_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = receipt.clone() {
+            return cached;
+        }
+        *receipt = Some(result.clone());
+        self.state.terminal();
+        result
+    }
+
+    async fn execute_once(&self) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
+        let mut preparation = Some(
+            self.state
+                .begin_preparation()
+                .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?,
+        );
+        let mut dispatch: Option<PreparedDispatchGuard<'_>> = None;
+        for _ in 0..self.router.clients.len() {
+            if self.request_from_current_journal().await.is_err() {
+                terminal_prepared_execution(&mut preparation, &mut dispatch);
+                return Err(FencedTransitionExecuteError::NotTransmitted);
+            }
+            let client = self.router.mutation_client(&self.state.mutation_cursor);
+            match client
+                .ensure_warm_request_capacity_before(self.budget.original_deadline())
+                .await
+            {
+                Ok(()) => {}
+                Err(SessionConsumerClientError::Scope) => {
+                    terminal_prepared_execution(&mut preparation, &mut dispatch);
+                    return Err(FencedTransitionExecuteError::Rejected(
+                        StoreError::BackendUnavailable("consumer authority revoked".into()),
+                    ));
+                }
+                Err(_) => {
+                    self.state.not_transmitted();
+                    continue;
+                }
+            }
+            let now = tokio::time::Instant::now();
+            let Some(physical_deadline) = now.checked_add(self.budget.physical_attempt_timeout())
+            else {
+                terminal_prepared_execution(&mut preparation, &mut dispatch);
+                return Err(FencedTransitionExecuteError::NotTransmitted);
+            };
+            let deadline = self.budget.original_deadline().min(physical_deadline);
+            if deadline <= now {
+                terminal_prepared_execution(&mut preparation, &mut dispatch);
+                return Err(FencedTransitionExecuteError::NotTransmitted);
+            }
+            let dispatch = match dispatch.as_mut() {
+                Some(dispatch) => dispatch,
+                None => {
+                    let preparation = preparation
+                        .take()
+                        .ok_or(FencedTransitionExecuteError::NotTransmitted)?;
+                    dispatch.insert(
+                        preparation
+                            .begin_dispatch()
+                            .map_err(|_| FencedTransitionExecuteError::NotTransmitted)?,
+                    )
+                }
+            };
+            let request = SessionConsumerRequest::new(
+                self.router.scope,
+                consumer_fenced_transition_request_id(self.request.as_ref()),
+                SessionConsumerOperation::FencedTransition {
+                    request: Box::new((*self.request).clone()),
+                },
+            );
+            match consumer_execute_into_fenced_transition(
+                self.request.as_ref(),
+                fenced_transition_response(
+                    self.request.as_ref(),
+                    client
+                        .execute_classified_before(&request, deadline, 1)
+                        .await,
+                ),
+            ) {
+                Ok(outcome) => {
+                    dispatch.terminal();
+                    return Ok(outcome);
+                }
+                Err(FencedTransitionExecuteError::NotTransmitted) => {
+                    self.state.not_transmitted();
+                }
+                Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }) => {
+                    dispatch.receipt_only();
+                    return Err(FencedTransitionExecuteError::OutcomeUnknown { request_id });
+                }
+                Err(error) => {
+                    dispatch.terminal();
+                    return Err(error);
+                }
+            }
+        }
+        terminal_prepared_execution(&mut preparation, &mut dispatch);
+        Err(FencedTransitionExecuteError::NotTransmitted)
+    }
+
+    async fn status_once(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError> {
+        let _attempt = self
+            .state
+            .begin_status()
+            .map_err(|_| SessionConsumerPreparedFencedTransitionStatusError::Unavailable)?;
+        if let Some(result) = self.cached_terminal_receipt() {
+            return result;
+        }
+        if !self.state.status_allowed() {
+            return Err(SessionConsumerPreparedFencedTransitionStatusError::NotExecuted);
+        }
+        if self.request_from_current_journal().await.is_err() {
+            return Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable);
+        }
+        let now = tokio::time::Instant::now();
+        if deadline <= now || deadline > self.budget.original_deadline() {
+            return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+        }
+        let client = self.router.receipt_client(&self.state.status_cursor);
+        match client.ensure_warm_request_capacity_before(deadline).await {
+            Ok(()) => {}
+            Err(SessionConsumerClientError::Scope) => {
+                return self.terminal_receipt(Err(
+                    SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked,
+                ));
+            }
+            Err(SessionConsumerClientError::Deadline) => {
+                return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+            }
+            Err(_) => return Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
+        }
+        let now = tokio::time::Instant::now();
+        if deadline <= now {
+            return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+        }
+        let attempt_deadline = deadline.min(
+            now.checked_add(self.budget.physical_attempt_timeout())
+                .ok_or(SessionConsumerPreparedFencedTransitionStatusError::Deadline)?,
+        );
+        let request = SessionConsumerRequest::new(
+            self.router.scope,
+            consumer_fenced_transition_request_id(self.request.as_ref()),
+            SessionConsumerOperation::FencedTransitionStatus {
+                request: Box::new((*self.request).clone()),
+            },
+        );
+        let result = match client
+            .execute_classified_before(&request, attempt_deadline, 1)
+            .await
+        {
+            Ok(SessionConsumerResponse::FencedTransitionStatus(Ok(status))) => {
+                consumer_status_into_fenced_transition(status)
+                    .map_err(|_| SessionConsumerPreparedFencedTransitionStatusError::Unavailable)
+            }
+            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch))
+            | Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope)) => {
+                Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked)
+            }
+            Ok(_) | Err(_) => Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
+        };
+        match result {
+            Ok(FencedTransitionStatus::NotFound)
+            | Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable) => result,
+            Ok(_)
+            | Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked) => {
+                self.terminal_receipt(result)
+            }
+            Err(_) => result,
+        }
+    }
+
+    async fn status_until_terminal(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError> {
+        let mut last = Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable);
+        for _ in 0..self.router.clients.len() {
+            let result = self.status_once(deadline).await;
+            match result {
+                Ok(FencedTransitionStatus::NotFound)
+                | Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable) => {
+                    last = result;
+                }
+                _ => return result,
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+            }
+        }
+        last
     }
 }
 
