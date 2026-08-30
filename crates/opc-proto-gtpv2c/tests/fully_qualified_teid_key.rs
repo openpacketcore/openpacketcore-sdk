@@ -60,39 +60,8 @@ fn canonical_key(value: &FullyQualifiedTeid) -> CanonicalKey {
     (value.interface_type, value.teid, value.ipv4, value.ipv6)
 }
 
-#[test]
-fn identical_f_teids_are_equal_hash_and_order_keys() {
-    let key = f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_A));
-    let identical = key.clone();
-
-    assert_eq!(key, identical);
-    assert_eq!(hash(&key), hash(&identical));
-    assert_eq!(key.cmp(&identical), Ordering::Equal);
-    assert_eq!(key.partial_cmp(&identical), Some(Ordering::Equal));
-
-    let hashed = HashSet::from([key.clone(), identical.clone()]);
-    assert_eq!(hashed.len(), 1);
-
-    let ordered = BTreeSet::from([key, identical]);
-    assert_eq!(ordered.len(), 1);
-}
-
-#[test]
-fn f_teid_hashes_the_exact_canonical_key() {
-    let keys = [
-        f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_A)),
-        f_teid(INTERFACE_TYPE, TEID, None, Some(IPV6_A)),
-        f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), None),
-    ];
-
-    for key in &keys {
-        assert_eq!(hash_input(key), hash_input(&canonical_key(key)));
-    }
-}
-
-#[test]
-fn f_teid_collection_identity_retains_every_protocol_component() {
-    let cases = [
+fn distinct_keys() -> [(&'static str, FullyQualifiedTeid); 9] {
+    [
         (
             "dual stack",
             f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_A)),
@@ -129,7 +98,36 @@ fn f_teid_collection_identity_retains_every_protocol_component() {
             "IPv6-only family presence",
             f_teid(INTERFACE_TYPE, TEID, None, Some(IPV6_A)),
         ),
-    ];
+    ]
+}
+
+#[test]
+fn identical_f_teids_are_equal_hash_and_order_keys() {
+    let key = f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_A));
+    let identical = key.clone();
+
+    assert_eq!(key, identical);
+    assert_eq!(hash(&key), hash(&identical));
+    assert_eq!(key.cmp(&identical), Ordering::Equal);
+    assert_eq!(key.partial_cmp(&identical), Some(Ordering::Equal));
+
+    let hashed = HashSet::from([key.clone(), identical.clone()]);
+    assert_eq!(hashed.len(), 1);
+
+    let ordered = BTreeSet::from([key, identical]);
+    assert_eq!(ordered.len(), 1);
+}
+
+#[test]
+fn f_teid_hashes_the_exact_canonical_key() {
+    for (_, key) in distinct_keys() {
+        assert_eq!(hash_input(&key), hash_input(&canonical_key(&key)));
+    }
+}
+
+#[test]
+fn f_teid_collection_identity_retains_every_protocol_component() {
+    let cases = distinct_keys();
 
     for (left_index, (left_label, left)) in cases.iter().enumerate() {
         for (right_label, right) in cases.iter().skip(left_index + 1) {
