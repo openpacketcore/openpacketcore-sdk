@@ -16478,6 +16478,21 @@ fn run_persistent_consumer_v2_batch_release_gate(
         );
     }
     assert_eq!(clients.len(), V2_BATCH_RELEASE_GATE_CLIENTS);
+
+    // Establish the overlap generation on every server before creating the
+    // stable 48-lane baseline. `transition_member` advances the fleet-wide
+    // reauthentication generation; prewarming first would deliberately
+    // retire those lanes while this current-thread runtime is not being
+    // driven to observe their remote EOFs.
+    for node_index in 0..MEMBER_COUNT {
+        fleet.transition_member(
+            node_index,
+            CredentialGeneration::Initial,
+            TrustGeneration::Overlap,
+            &format!("v2-batch-initial-overlap-node-{node_index}"),
+        );
+    }
+
     runtime.block_on(async {
         let readiness = futures_util::future::join_all(clients.iter().map(|client| async {
             client.prewarm_v2().await.expect("prewarm fixed V2 lanes");
@@ -16508,29 +16523,52 @@ fn run_persistent_consumer_v2_batch_release_gate(
             && diagnostics.reconnects == 0
     }));
 
-    // Establish the overlap generation on every server before the measured
-    // workload. The later replacement is the only member that receives a
-    // new-root leaf, which makes the client trust routing below observable.
-    for node_index in 0..MEMBER_COUNT {
-        fleet.transition_member(
-            node_index,
-            CredentialGeneration::Initial,
-            TrustGeneration::Overlap,
-            &format!("v2-batch-initial-overlap-node-{node_index}"),
-        );
-    }
-
+    let capability_before = clients[0].v2_diagnostics();
+    let capability_response = runtime
+        .block_on(clients[0].execute_v2(&SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        )))
+        .expect("V2 batch capability response");
+    let capability_after = clients[0].v2_diagnostics();
     assert_eq!(
-        runtime
-            .block_on(clients[0].execute_v2(&SessionConsumerV2Request::new(
-                scope,
-                SessionConsumerV2Operation::FencedTransitionV2Capability,
-            )))
-            .expect("V2 batch capability response"),
+        capability_response,
         SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
             FencedTransitionV2Capability::V2
         )),
         "the release gate uses the V2 ALPN/Hello contract, not the V1 listener"
+    );
+    assert_eq!(
+        capability_after.setup_attempts, capability_before.setup_attempts,
+        "the first overlap-generation capability read reuses a prewarmed lane"
+    );
+    assert_eq!(
+        capability_after.setup_failures, capability_before.setup_failures,
+        "the first overlap-generation capability read has no hidden failed setup"
+    );
+    assert_eq!(
+        capability_after.setup_successes, capability_before.setup_successes,
+        "the first overlap-generation capability read opens no replacement lane"
+    );
+    assert_eq!(
+        capability_after.reconnects, capability_before.reconnects,
+        "the first overlap-generation capability read retires no lane"
+    );
+    assert_eq!(
+        capability_after.reused,
+        capability_before
+            .reused
+            .checked_add(1)
+            .expect("bounded capability reuse counter fits u64"),
+        "the first overlap-generation capability read uses exactly one warm lane"
+    );
+    assert_eq!(
+        (capability_after.active, capability_after.idle),
+        (
+            V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+            V2_BATCH_RELEASE_GATE_LANES_PER_CLIENT as u64,
+        ),
+        "the capability read returns the lane to the exact fixed-width idle pool"
     );
 
     let first = runtime.block_on(qualification_fenced_transition_v2_request(MEMBER_COUNT, 0));
