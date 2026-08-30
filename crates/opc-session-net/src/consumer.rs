@@ -5224,24 +5224,6 @@ where
         )?;
         self.router.consume_lease_acquire(request)
     }
-}
-
-impl<B> SessionConsumerPreparedCheckpointBackend<B>
-where
-    B: ProtectedSessionBackend + 'static,
-{
-    /// Compose the exact persistent voter roster with a protected V1
-    /// backend. The sealed backend projection verifies its durable journal
-    /// before this router receives the opaque physical consumer token.
-    pub fn persistent_fenced_transition(
-        backend: Arc<B>,
-        clients: impl IntoIterator<Item = PersistentSessionConsumerClient>,
-    ) -> Result<Self, SessionConsumerPreparedCheckpointBackendError> {
-        Ok(Self {
-            backend,
-            router: Arc::new(PreparedConsumerRouter::persistent(clients)?),
-        })
-    }
 
     /// Prepare one protected V1 fenced transition and retain its exact
     /// physical token in a move-only, affine dispatch handle.
@@ -5253,7 +5235,20 @@ where
         request: FencedTransitionRequest,
         budget: PreparedCheckpointBudget,
     ) -> Result<SessionConsumerPreparedFencedTransition, StoreError> {
-        let prepared = self.backend.prepare_fenced_transition(request).await?;
+        let deadline = budget.original_deadline();
+        if tokio::time::Instant::now() >= deadline {
+            return Err(StoreError::BackendUnavailable(
+                "prepared fenced transition deadline elapsed".into(),
+            ));
+        }
+        let prepared =
+            tokio::time::timeout_at(deadline, self.backend.prepare_fenced_transition(request))
+                .await
+                .map_err(|_| {
+                    StoreError::BackendUnavailable(
+                        "prepared fenced transition deadline elapsed".into(),
+                    )
+                })??;
         let projection: Arc<dyn ProtectedSessionBackend> = self.backend.clone();
         self.router
             .consume_fenced_transition(projection, prepared, budget)
@@ -15266,6 +15261,16 @@ impl SessionConsumerPreparedFencedTransition {
 /// A reopened transition has receipt authority only.  It deliberately has no
 /// `execute_once` method, preventing a crash-recovered token from replaying a
 /// mutation that may already have been sent.
+///
+/// ```compile_fail
+/// use opc_session_net::SessionConsumerRecoveredFencedTransitionStatus;
+///
+/// async fn cannot_replay(
+///     recovered: &mut SessionConsumerRecoveredFencedTransitionStatus,
+/// ) {
+///     let _ = recovered.execute_once().await;
+/// }
+/// ```
 pub struct SessionConsumerRecoveredFencedTransitionStatus {
     inner: PersistentPreparedFencedTransitionToken,
 }
@@ -15375,6 +15380,10 @@ impl PersistentPreparedFencedTransitionToken {
                     continue;
                 }
             }
+            if self.request_from_current_journal().await.is_err() {
+                terminal_prepared_execution(&mut preparation, &mut dispatch);
+                return Err(FencedTransitionExecuteError::NotTransmitted);
+            }
             let now = tokio::time::Instant::now();
             let Some(physical_deadline) = now.checked_add(self.budget.physical_attempt_timeout())
             else {
@@ -15470,6 +15479,9 @@ impl PersistentPreparedFencedTransitionToken {
             }
             Err(_) => return Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
         }
+        if self.request_from_current_journal().await.is_err() {
+            return Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable);
+        }
         let now = tokio::time::Instant::now();
         if deadline <= now {
             return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
@@ -15485,20 +15497,11 @@ impl PersistentPreparedFencedTransitionToken {
                 request: Box::new((*self.request).clone()),
             },
         );
-        let result = match client
-            .execute_classified_before(&request, attempt_deadline, 1)
-            .await
-        {
-            Ok(SessionConsumerResponse::FencedTransitionStatus(Ok(status))) => {
-                consumer_status_into_fenced_transition(status)
-                    .map_err(|_| SessionConsumerPreparedFencedTransitionStatusError::Unavailable)
-            }
-            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch))
-            | Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope)) => {
-                Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked)
-            }
-            Ok(_) | Err(_) => Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
-        };
+        let result = prepared_fenced_transition_status_response(
+            client
+                .execute_classified_before(&request, attempt_deadline, 1)
+                .await,
+        );
         match result {
             Ok(FencedTransitionStatus::NotFound)
             | Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable) => result,
@@ -15529,6 +15532,27 @@ impl PersistentPreparedFencedTransitionToken {
             }
         }
         last
+    }
+}
+
+fn prepared_fenced_transition_status_response(
+    response: Result<SessionConsumerResponse, SessionConsumerCallError>,
+) -> Result<FencedTransitionStatus, SessionConsumerPreparedFencedTransitionStatusError> {
+    match response {
+        Ok(SessionConsumerResponse::FencedTransitionStatus(Ok(status))) => {
+            consumer_status_into_fenced_transition(status)
+                .map_err(|_| SessionConsumerPreparedFencedTransitionStatusError::Unavailable)
+        }
+        Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch))
+        | Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope))
+        | Err(SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Scope)) => {
+            Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked)
+        }
+        Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Deadline))
+        | Err(SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Deadline)) => {
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline)
+        }
+        Ok(_) | Err(_) => Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
     }
 }
 
@@ -19144,10 +19168,11 @@ mod tests {
         lease_mutation_status_matches_request, lease_mutation_status_wire_matches_request,
         lease_response, mutation_response, persistent_execute_error,
         persistent_roster_execute_error_for_request, poll_persistent_consumer_setup_io,
-        poll_persistent_reconnect_setup, prepared_router_roster_is_distinct, prepared_voter_index,
-        publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
-        read_authenticated_consumer_frame_until, read_authenticated_consumer_frame_within,
-        response_is_outcome_unknown, response_matches_operation, response_matches_request,
+        poll_persistent_reconnect_setup, prepared_fenced_transition_status_response,
+        prepared_router_roster_is_distinct, prepared_voter_index, publish_monotonic_shutdown_phase,
+        queued_consumer_watch_stream, read_authenticated_consumer_frame_until,
+        read_authenticated_consumer_frame_within, response_is_outcome_unknown,
+        response_matches_operation, response_matches_request,
         response_retires_connection_authority, run_persistent_v2_lane, server_connection_current,
         store_error_matches_operation, v2_attempt_retryable_error, v2_persistent_error,
         v2_request_commitment, valid_consumer_operation_timeout, wait_for_forced_shutdown,
@@ -19177,10 +19202,11 @@ mod tests {
         SessionConsumerCallError, SessionConsumerChange, SessionConsumerClientError,
         SessionConsumerFencedTransitionBackend, SessionConsumerFencedTransitionMutationError,
         SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-        SessionConsumerPreparedCheckpointBackend, SessionConsumerRejection, SessionQuorumConsumer,
-        SessionQuorumConsumerServer, StatelessSessionConsumerClient, DEFAULT_CONSUMER_IDLE_TIMEOUT,
-        DEFAULT_CONSUMER_MAX_CONNECTIONS, DEFAULT_CONSUMER_OPERATION_TIMEOUT,
-        DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
+        SessionConsumerPreparedCheckpointBackend,
+        SessionConsumerPreparedFencedTransitionStatusError, SessionConsumerRejection,
+        SessionQuorumConsumer, SessionQuorumConsumerServer, StatelessSessionConsumerClient,
+        DEFAULT_CONSUMER_IDLE_TIMEOUT, DEFAULT_CONSUMER_MAX_CONNECTIONS,
+        DEFAULT_CONSUMER_OPERATION_TIMEOUT, DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_PENDING_CALLS,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
         DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
@@ -19273,6 +19299,22 @@ mod tests {
         assert!(state.begin_status().is_err());
         drop(first);
         assert!(state.begin_status().is_ok());
+    }
+
+    #[test]
+    fn prepared_fenced_transition_status_preserves_transport_deadline() {
+        assert_eq!(
+            prepared_fenced_transition_status_response(Err(
+                SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Deadline),
+            )),
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline)
+        );
+        assert_eq!(
+            prepared_fenced_transition_status_response(Err(SessionConsumerCallError::MayHaveSent(
+                SessionConsumerClientError::Deadline,
+            ))),
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline)
+        );
     }
 
     #[test]
