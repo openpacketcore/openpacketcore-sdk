@@ -94,8 +94,7 @@ use crate::{
     CurrentEbpfGraphRecoveryAuthorityBinding, CurrentEbpfGraphRecoveryAuthorityCurrentness,
     CurrentEbpfGraphRecoveryAuthorizedRequest, CurrentEbpfGraphRecoveryOutcome,
     CurrentEbpfGraphRecoveryProgress, CurrentEbpfGraphRecoveryReceipt,
-    CurrentEbpfGraphRecoveryRefusal,
-    CurrentEbpfGraphRecoveryRequest, DrainedV2TeardownOutcome,
+    CurrentEbpfGraphRecoveryRefusal, CurrentEbpfGraphRecoveryRequest, DrainedV2TeardownOutcome,
     DrainedV2TeardownRefusal, DrainedV2TeardownRequest, GtpAddressFamily, GtpBearerMark, GtpDevice,
     GtpPdpContext, GtpVersion, GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend,
     GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuError, GtpuIpFamilyCapabilities,
@@ -109,8 +108,8 @@ use crate::{
     GtpuTrafficProofDispatchError, GtpuTrafficProofDispatchPort, GtpuTrafficProofDispatchReceipt,
     GtpuTrafficProofInvalidation, GtpuTrafficProofPoll, GtpuTrafficProofSession,
     GtpuTrafficProofValidation, GtpuUplinkChecksumOffloadContract, HistoricalEbpfGraphGeneration,
-    HistoricalEbpfGraphRecoveryInspectionOutcome, HistoricalEbpfGraphRecoveryInspectionRequest,
     HistoricalEbpfGraphRecoveryAuthority, HistoricalEbpfGraphRecoveryCompatibilityKatReceipt,
+    HistoricalEbpfGraphRecoveryInspectionOutcome, HistoricalEbpfGraphRecoveryInspectionRequest,
     HistoricalEbpfGraphRecoveryOutcome, HistoricalEbpfGraphRecoveryReceipt,
     HistoricalEbpfGraphRecoveryRefusal, HistoricalEbpfGraphRecoveryRequest,
     HistoricalEbpfGraphTerminalAbsenceProof, PdpContextIndeterminateReason,
@@ -858,15 +857,15 @@ fn test_historical_ebpf_graph_recovery_authority_binding(
     use std::num::NonZeroU64;
 
     let commitment = |byte| crate::HistoricalEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
-    let inspection = crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(
-        commitment(0x89),
-    );
+    let inspection =
+        crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(commitment(0x89));
     crate::HistoricalEbpfGraphRecoveryAuthorityBinding::from_parts(
         commitment(0x81),
         commitment(0x82),
         inspection.former_link_evidence(),
         crate::HistoricalEbpfGraphRecoveryArtifactProvenance::from_brokered_challenge(
-            commitment(0x88), inspection.expected_challenge(),
+            commitment(0x88),
+            inspection.expected_challenge(),
         ),
         NonZeroU64::new(1).unwrap(),
         crate::HistoricalEbpfGraphRecoveryOperationId::new([0x83; 16]).unwrap(),
@@ -7794,8 +7793,11 @@ impl EbpfGtpuDataplaneBackend {
         request: CurrentEbpfGraphRecoveryAuthorizedRequest,
         authority_runtime: &tokio::runtime::Handle,
     ) -> Result<CurrentEbpfGraphRecoveryOutcome, GtpuError> {
-        self.recover_orphaned_current_graph_with_authority_execution_sync(request, authority_runtime)
-            .map(|result| result.outcome)
+        self.recover_orphaned_current_graph_with_authority_execution_sync(
+            request,
+            authority_runtime,
+        )
+        .map(|result| result.outcome)
     }
 
     fn recover_orphaned_current_graph_with_authority_receipt_sync(
@@ -7803,8 +7805,10 @@ impl EbpfGtpuDataplaneBackend {
         request: CurrentEbpfGraphRecoveryAuthorizedRequest,
         authority_runtime: &tokio::runtime::Handle,
     ) -> Result<crate::CurrentEbpfGraphRecoveryReceipt, GtpuError> {
-        let result = self
-            .recover_orphaned_current_graph_with_authority_execution_sync(request, authority_runtime)?;
+        let result = self.recover_orphaned_current_graph_with_authority_execution_sync(
+            request,
+            authority_runtime,
+        )?;
         let receipt = match (result.outcome, result.terminal_snapshot) {
             (
                 CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
@@ -7828,10 +7832,9 @@ impl EbpfGtpuDataplaneBackend {
             // A terminal legacy outcome without one re-proved snapshot is
             // deliberately reduced to nonterminal progress. Consumers must
             // never infer an absence proof from `Removed`/`AlreadyAbsent`.
-            (outcome, None) => crate::CurrentEbpfGraphRecoveryReceipt::nonterminal(
-                result.authority,
-                outcome,
-            ),
+            (outcome, None) => {
+                crate::CurrentEbpfGraphRecoveryReceipt::nonterminal(result.authority, outcome)
+            }
             _ => crate::CurrentEbpfGraphRecoveryReceipt::nonterminal(
                 result.authority,
                 CurrentEbpfGraphRecoveryOutcome::Partial(
@@ -7910,13 +7913,15 @@ impl EbpfGtpuDataplaneBackend {
         if let Err(currentness) = currentness.verify_current() {
             return Ok(refusal(current_recovery_currentness_refusal(currentness)));
         }
-        Ok(crate::CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
-            binding,
-            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
-            exact_graph_commitment,
-            terminal_source,
-            terminal_adoption,
-        ))
+        Ok(
+            crate::CurrentEbpfGraphRecoveryReceipt::authenticated_terminal(
+                binding,
+                CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+                exact_graph_commitment,
+                terminal_source,
+                terminal_adoption,
+            ),
+        )
     }
 
     fn recover_orphaned_current_graph_with_authority_execution_sync(
@@ -12489,12 +12494,15 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         request: CurrentEbpfGraphRecoveryAuthorizedRequest,
     ) -> Result<CurrentEbpfGraphRecoveryReceipt, GtpuError> {
         let authority_runtime = tokio::runtime::Handle::current();
-        self.run_blocking("ebpf_current_graph_recovery_authority_receipt", move |backend| {
-            backend.recover_orphaned_current_graph_with_authority_receipt_sync(
-                request,
-                &authority_runtime,
-            )
-        })
+        self.run_blocking(
+            "ebpf_current_graph_recovery_authority_receipt",
+            move |backend| {
+                backend.recover_orphaned_current_graph_with_authority_receipt_sync(
+                    request,
+                    &authority_runtime,
+                )
+            },
+        )
         .await
     }
 
@@ -14496,7 +14504,8 @@ mod aya_runtime {
     const CURRENT_RECOVERY_LEAF_OFFSET: usize = CURRENT_RECOVERY_ROOT_OFFSET + 32;
     const CURRENT_RECOVERY_FENCE_EPOCH_OFFSET: usize = CURRENT_RECOVERY_LEAF_OFFSET + 32;
     const CURRENT_RECOVERY_OPERATION_ID_OFFSET: usize = CURRENT_RECOVERY_FENCE_EPOCH_OFFSET + 8;
-    const CURRENT_RECOVERY_TERMINAL_SOURCE_OFFSET: usize = CURRENT_RECOVERY_OPERATION_ID_OFFSET + 16;
+    const CURRENT_RECOVERY_TERMINAL_SOURCE_OFFSET: usize =
+        CURRENT_RECOVERY_OPERATION_ID_OFFSET + 16;
     const CURRENT_RECOVERY_SOURCE_HISTORICAL_GRAPH_OFFSET: usize =
         CURRENT_RECOVERY_TERMINAL_SOURCE_OFFSET + 8;
     const CURRENT_RECOVERY_SOURCE_HISTORICAL_COMPATIBILITY_OFFSET: usize =
@@ -14509,7 +14518,8 @@ mod aya_runtime {
         CURRENT_RECOVERY_PRIOR_PREDECESSOR_BASIS_OFFSET + 32;
     const CURRENT_RECOVERY_PRIOR_ROOT_OFFSET: usize = CURRENT_RECOVERY_PRIOR_HOST_OFFSET + 32;
     const CURRENT_RECOVERY_PRIOR_LEAF_OFFSET: usize = CURRENT_RECOVERY_PRIOR_ROOT_OFFSET + 32;
-    const CURRENT_RECOVERY_PRIOR_FENCE_EPOCH_OFFSET: usize = CURRENT_RECOVERY_PRIOR_LEAF_OFFSET + 32;
+    const CURRENT_RECOVERY_PRIOR_FENCE_EPOCH_OFFSET: usize =
+        CURRENT_RECOVERY_PRIOR_LEAF_OFFSET + 32;
     const CURRENT_RECOVERY_PRIOR_OPERATION_ID_OFFSET: usize =
         CURRENT_RECOVERY_PRIOR_FENCE_EPOCH_OFFSET + 8;
     const CURRENT_RECOVERY_PRIOR_TERMINAL_RECEIPT_OFFSET: usize =
@@ -15845,7 +15855,10 @@ mod aya_runtime {
                 scope_commitment: authority.scope_commitment().bytes(),
                 predecessor_basis_commitment: authority.predecessor_basis_commitment().bytes(),
                 former_link_evidence: authority.former_link_evidence().commitment().bytes(),
-                artifact_provenance: authority.artifact_provenance().artifact_commitment().bytes(),
+                artifact_provenance: authority
+                    .artifact_provenance()
+                    .artifact_commitment()
+                    .bytes(),
                 external_graph_commitment: authority
                     .artifact_provenance()
                     .observed_graph_commitment()
@@ -15942,7 +15955,10 @@ mod aya_runtime {
                 && self.former_link_evidence
                     == authority.former_link_evidence().commitment().bytes()
                 && self.artifact_provenance
-                    == authority.artifact_provenance().artifact_commitment().bytes()
+                    == authority
+                        .artifact_provenance()
+                        .artifact_commitment()
+                        .bytes()
                 && self.external_graph_commitment
                     == authority
                         .artifact_provenance()
@@ -15999,7 +16015,10 @@ mod aya_runtime {
                 scope_commitment: authority.scope_commitment().bytes(),
                 predecessor_basis_commitment: authority.predecessor_basis_commitment().bytes(),
                 former_link_evidence: authority.former_link_evidence().commitment().bytes(),
-                artifact_provenance: authority.artifact_provenance().artifact_commitment().bytes(),
+                artifact_provenance: authority
+                    .artifact_provenance()
+                    .artifact_commitment()
+                    .bytes(),
                 external_graph_commitment: authority
                     .artifact_provenance()
                     .observed_graph_commitment()
@@ -16022,12 +16041,8 @@ mod aya_runtime {
                 crate::HistoricalEbpfGraphRecoveryCommitment::new(self.prior_host_commitment),
                 crate::HistoricalEbpfGraphRecoveryCommitment::new(self.prior_root_commitment),
                 crate::HistoricalEbpfGraphRecoveryCommitment::new(self.prior_leaf_commitment),
-                crate::HistoricalEbpfGraphRecoveryCommitment::new(
-                    self.prior_former_link_evidence,
-                ),
-                crate::HistoricalEbpfGraphRecoveryCommitment::new(
-                    self.prior_artifact_provenance,
-                ),
+                crate::HistoricalEbpfGraphRecoveryCommitment::new(self.prior_former_link_evidence),
+                crate::HistoricalEbpfGraphRecoveryCommitment::new(self.prior_artifact_provenance),
                 crate::HistoricalEbpfGraphRecoveryCommitment::new(
                     self.prior_external_graph_commitment,
                 ),
@@ -16234,9 +16249,8 @@ mod aya_runtime {
             encoded[HISTORICAL_25_RECOVERY_PRIOR_ROOT_OFFSET
                 ..HISTORICAL_25_RECOVERY_PRIOR_LEAF_OFFSET]
                 .copy_from_slice(&self.prior_root_commitment);
-            encoded
-                [HISTORICAL_25_RECOVERY_PRIOR_LEAF_OFFSET
-                    ..HISTORICAL_25_RECOVERY_FORMER_LINK_EVIDENCE_OFFSET]
+            encoded[HISTORICAL_25_RECOVERY_PRIOR_LEAF_OFFSET
+                ..HISTORICAL_25_RECOVERY_FORMER_LINK_EVIDENCE_OFFSET]
                 .copy_from_slice(&self.prior_leaf_commitment);
             encoded[HISTORICAL_25_RECOVERY_FORMER_LINK_EVIDENCE_OFFSET
                 ..HISTORICAL_25_RECOVERY_ARTIFACT_PROVENANCE_OFFSET]
@@ -16618,21 +16632,25 @@ mod aya_runtime {
             historical_handoff: Option<Historical25RecoveryRecord>,
         ) -> Self {
             let host_commitments = authority.host_commitments();
-            let (terminal_source, source_historical_generation, source_historical_graph_commitment, source_historical_compatibility_digest) =
-                match historical_handoff.filter(|record| record.is_terminal()) {
-                    Some(record) => (
-                        CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff,
-                        record.generation,
-                        record.graph_commitment,
-                        record.compatibility_contract_digest,
-                    ),
-                    None => (
-                        CurrentRecoveryTerminalSourceKind::CurrentGraph,
-                        0,
-                        [0; 32],
-                        [0; 32],
-                    ),
-                };
+            let (
+                terminal_source,
+                source_historical_generation,
+                source_historical_graph_commitment,
+                source_historical_compatibility_digest,
+            ) = match historical_handoff.filter(|record| record.is_terminal()) {
+                Some(record) => (
+                    CurrentRecoveryTerminalSourceKind::HistoricalR5Handoff,
+                    record.generation,
+                    record.graph_commitment,
+                    record.compatibility_contract_digest,
+                ),
+                None => (
+                    CurrentRecoveryTerminalSourceKind::CurrentGraph,
+                    0,
+                    [0; 32],
+                    [0; 32],
+                ),
+            };
             Self {
                 phase: CurrentRecoveryPhase::InProgress,
                 namespace_hash,
@@ -16725,10 +16743,8 @@ mod aya_runtime {
             let fence_epoch = std::num::NonZeroU64::new(self.fence_epoch)?;
             Some(crate::CurrentEbpfGraphRecoveryAuthorityBinding::new(
                 crate::CurrentEbpfGraphRecoveryCommitment::new(self.scope_commitment).ok()?,
-                crate::CurrentEbpfGraphRecoveryCommitment::new(
-                    self.predecessor_basis_commitment,
-                )
-                .ok()?,
+                crate::CurrentEbpfGraphRecoveryCommitment::new(self.predecessor_basis_commitment)
+                    .ok()?,
                 fence_epoch,
                 crate::CurrentEbpfGraphRecoveryOperationId::new(self.operation_id).ok()?,
                 crate::CurrentEbpfGraphRecoveryHostCommitments::new(
@@ -16757,12 +16773,16 @@ mod aya_runtime {
         fn terminal_receipt_commitment(
             self,
         ) -> Option<crate::CurrentEbpfGraphRecoveryTerminalReceiptCommitment> {
-            Some(crate::CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
-                self.authority_binding()?,
-                crate::CurrentEbpfGraphRecoveryCommitment::new(self.terminal_graph_commitment())
+            Some(
+                crate::CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
+                    self.authority_binding()?,
+                    crate::CurrentEbpfGraphRecoveryCommitment::new(
+                        self.terminal_graph_commitment(),
+                    )
                     .ok()?,
-                self.terminal_source()?,
-            ))
+                    self.terminal_source()?,
+                ),
+            )
         }
 
         fn terminal_adoption(self) -> Option<crate::CurrentEbpfGraphRecoveryTerminalAdoption> {
@@ -16889,7 +16909,8 @@ mod aya_runtime {
             encoded[CURRENT_RECOVERY_OPERATION_ID_OFFSET..CURRENT_RECOVERY_TERMINAL_SOURCE_OFFSET]
                 .copy_from_slice(&self.operation_id);
             encoded[CURRENT_RECOVERY_TERMINAL_SOURCE_OFFSET] = self.terminal_source as u8;
-            encoded[CURRENT_RECOVERY_TERMINAL_SOURCE_OFFSET + 1] = self.source_historical_generation;
+            encoded[CURRENT_RECOVERY_TERMINAL_SOURCE_OFFSET + 1] =
+                self.source_historical_generation;
             encoded[CURRENT_RECOVERY_SOURCE_HISTORICAL_GRAPH_OFFSET
                 ..CURRENT_RECOVERY_SOURCE_HISTORICAL_COMPATIBILITY_OFFSET]
                 .copy_from_slice(&self.source_historical_graph_commitment);
@@ -16899,7 +16920,8 @@ mod aya_runtime {
             encoded[CURRENT_RECOVERY_PRIOR_SCOPE_OFFSET
                 ..CURRENT_RECOVERY_PRIOR_PREDECESSOR_BASIS_OFFSET]
                 .copy_from_slice(&self.prior_scope_commitment);
-            encoded[CURRENT_RECOVERY_PRIOR_PREDECESSOR_BASIS_OFFSET..CURRENT_RECOVERY_PRIOR_HOST_OFFSET]
+            encoded[CURRENT_RECOVERY_PRIOR_PREDECESSOR_BASIS_OFFSET
+                ..CURRENT_RECOVERY_PRIOR_HOST_OFFSET]
                 .copy_from_slice(&self.prior_predecessor_basis_commitment);
             encoded[CURRENT_RECOVERY_PRIOR_HOST_OFFSET..CURRENT_RECOVERY_PRIOR_ROOT_OFFSET]
                 .copy_from_slice(&self.prior_host_commitment);
@@ -16913,7 +16935,8 @@ mod aya_runtime {
             encoded[CURRENT_RECOVERY_PRIOR_OPERATION_ID_OFFSET
                 ..CURRENT_RECOVERY_PRIOR_TERMINAL_RECEIPT_OFFSET]
                 .copy_from_slice(&self.prior_operation_id);
-            encoded[CURRENT_RECOVERY_PRIOR_TERMINAL_RECEIPT_OFFSET..CURRENT_RECOVERY_CHECKSUM_OFFSET]
+            encoded
+                [CURRENT_RECOVERY_PRIOR_TERMINAL_RECEIPT_OFFSET..CURRENT_RECOVERY_CHECKSUM_OFFSET]
                 .copy_from_slice(&self.prior_terminal_receipt_commitment);
             let checksum = teardown_record_checksum(&encoded[..CURRENT_RECOVERY_CHECKSUM_OFFSET]);
             encoded[CURRENT_RECOVERY_CHECKSUM_OFFSET..CURRENT_RECOVERY_PROOF_LEN]
@@ -17020,13 +17043,13 @@ mod aya_runtime {
                         ..CURRENT_RECOVERY_PRIOR_SCOPE_OFFSET]
                     .try_into()
                     .ok()?,
-                prior_scope_commitment: encoded
-                    [CURRENT_RECOVERY_PRIOR_SCOPE_OFFSET
-                        ..CURRENT_RECOVERY_PRIOR_PREDECESSOR_BASIS_OFFSET]
+                prior_scope_commitment: encoded[CURRENT_RECOVERY_PRIOR_SCOPE_OFFSET
+                    ..CURRENT_RECOVERY_PRIOR_PREDECESSOR_BASIS_OFFSET]
                     .try_into()
                     .ok()?,
                 prior_predecessor_basis_commitment: encoded
-                    [CURRENT_RECOVERY_PRIOR_PREDECESSOR_BASIS_OFFSET..CURRENT_RECOVERY_PRIOR_HOST_OFFSET]
+                    [CURRENT_RECOVERY_PRIOR_PREDECESSOR_BASIS_OFFSET
+                        ..CURRENT_RECOVERY_PRIOR_HOST_OFFSET]
                     .try_into()
                     .ok()?,
                 prior_host_commitment: encoded
@@ -17047,13 +17070,13 @@ mod aya_runtime {
                         .try_into()
                         .ok()?,
                 ),
-                prior_operation_id: encoded
-                    [CURRENT_RECOVERY_PRIOR_OPERATION_ID_OFFSET
-                        ..CURRENT_RECOVERY_PRIOR_TERMINAL_RECEIPT_OFFSET]
+                prior_operation_id: encoded[CURRENT_RECOVERY_PRIOR_OPERATION_ID_OFFSET
+                    ..CURRENT_RECOVERY_PRIOR_TERMINAL_RECEIPT_OFFSET]
                     .try_into()
                     .ok()?,
                 prior_terminal_receipt_commitment: encoded
-                    [CURRENT_RECOVERY_PRIOR_TERMINAL_RECEIPT_OFFSET..CURRENT_RECOVERY_CHECKSUM_OFFSET]
+                    [CURRENT_RECOVERY_PRIOR_TERMINAL_RECEIPT_OFFSET
+                        ..CURRENT_RECOVERY_CHECKSUM_OFFSET]
                     .try_into()
                     .ok()?,
             };
@@ -27196,15 +27219,11 @@ mod aya_runtime {
                 }
                 Ok(_) => {}
             }
-            let data = MapData::from_pin(&path)
-                .map_err(|_| state_indeterminate(operation))?;
-            let info = data
-                .info()
-                .map_err(|_| state_indeterminate(operation))?;
+            let data = MapData::from_pin(&path).map_err(|_| state_indeterminate(operation))?;
+            let info = data.info().map_err(|_| state_indeterminate(operation))?;
             let map_type = info
                 .map_type()
-                .map_err(|_| state_indeterminate(operation))?
-                as u32;
+                .map_err(|_| state_indeterminate(operation))? as u32;
             if map_type != bpf_map_type::BPF_MAP_TYPE_ARRAY as u32
                 || info.key_size() != 4
                 || info.value_size() != CURRENT_RECOVERY_PROOF_LEN as u32
@@ -27215,8 +27234,7 @@ mod aya_runtime {
             }
             let map_id = info.id();
             let proof = Array::<_, [u8; CURRENT_RECOVERY_PROOF_LEN]>::try_from(
-                Map::from_map_data(data)
-                    .map_err(|_| state_indeterminate(operation))?,
+                Map::from_map_data(data).map_err(|_| state_indeterminate(operation))?,
             )
             .map_err(|_| state_indeterminate(operation))?;
             let encoded = proof
@@ -27358,9 +27376,7 @@ mod aya_runtime {
                 Map::from_map_data(data).map_err(|_| state_indeterminate(OPERATION))?,
             )
             .map_err(|_| state_indeterminate(OPERATION))?;
-            let encoded = map
-                .get(&0, 0)
-                .map_err(|_| state_indeterminate(OPERATION))?;
+            let encoded = map.get(&0, 0).map_err(|_| state_indeterminate(OPERATION))?;
             if CurrentRecoveryRecord::decode(&encoded) != Some(expected.record) {
                 return Err(state_indeterminate(OPERATION));
             }
@@ -27395,11 +27411,8 @@ mod aya_runtime {
         ) -> Result<CurrentRecoveryProof, GtpuError> {
             const OPERATION: &str = "ebpf_current_terminal_proof_publish";
             Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
-            let expected = Self::promote_current_recovery_proof_to_terminal(
-                ownership,
-                expected,
-                currentness,
-            )?;
+            let expected =
+                Self::promote_current_recovery_proof_to_terminal(ownership, expected, currentness)?;
             match Self::read_current_terminal_proof(ownership) {
                 Ok(Some(existing)) if existing == expected => return Ok(expected),
                 Ok(Some(_)) | Err(_) => return Err(state_indeterminate(OPERATION)),
@@ -27621,7 +27634,8 @@ mod aya_runtime {
             let fence = Self::ensure_current_recovery_fence(ownership, proof, proof_data);
             match fence {
                 CurrentProofFenceState::Exact => {
-                    if Self::restore_current_map_pins(ownership, proof, held, removed, currentness) {
+                    if Self::restore_current_map_pins(ownership, proof, held, removed, currentness)
+                    {
                         CurrentEbpfGraphRecoveryOutcome::Partial(rollback_progress)
                     } else {
                         CurrentEbpfGraphRecoveryOutcome::Partial(
@@ -28006,7 +28020,8 @@ mod aya_runtime {
                     CurrentRecoveryManagedState::Conflict => {
                         CurrentEbpfGraphRecoveryRefusal::ManagedAttachment
                     }
-                    CurrentRecoveryManagedState::Indeterminate | CurrentRecoveryManagedState::Clear => {
+                    CurrentRecoveryManagedState::Indeterminate
+                    | CurrentRecoveryManagedState::Clear => {
                         CurrentEbpfGraphRecoveryRefusal::IndeterminateState
                     }
                 });
@@ -32708,7 +32723,11 @@ mod aya_runtime {
             currentness: &dyn HistoricalEbpfGraphRecoveryCurrentnessProbe,
         ) -> Result<HistoricalEbpfGraphRecoveryInspectionOutcome, GtpuError> {
             const OPERATION: &str = "ebpf_historical_25_graph_inspection";
-            let refused = |reason| Ok(HistoricalEbpfGraphRecoveryInspectionOutcome::Refused(reason));
+            let refused = |reason| {
+                Ok(HistoricalEbpfGraphRecoveryInspectionOutcome::Refused(
+                    reason,
+                ))
+            };
             if let Err(currentness) = currentness.verify_current() {
                 return refused(super::historical_recovery_currentness_refusal(currentness));
             }
@@ -32718,7 +32737,9 @@ mod aya_runtime {
             match Self::validate_replacement_identity(interface, ifindex) {
                 Ok(()) => {}
                 Err(ReplacementHookObservationError::IdentityChanged) => {
-                    return refused(HistoricalEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged);
+                    return refused(
+                        HistoricalEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                    );
                 }
                 Err(ReplacementHookObservationError::Indeterminate) => {
                     return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
@@ -32734,8 +32755,10 @@ mod aya_runtime {
                     return refused(HistoricalEbpfGraphRecoveryRefusal::ActiveLegacyOwner);
                 }
                 Ok(None) => return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState),
-                Err(GtpuError::Io { kind: io::ErrorKind::NotFound, .. })
-                    if matches!(fs::symlink_metadata(pin_dir), Err(error) if error.kind() == io::ErrorKind::NotFound) =>
+                Err(GtpuError::Io {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                }) if matches!(fs::symlink_metadata(pin_dir), Err(error) if error.kind() == io::ErrorKind::NotFound) =>
                 {
                     return match Self::historical_25_initialize_clean_absence(
                         pin_dir,
@@ -32758,8 +32781,8 @@ mod aya_runtime {
                 }
                 Err(_) => return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState),
             };
-            let graph_metadata = fs::symlink_metadata(pin_dir)
-                .map_err(|_| state_indeterminate(OPERATION))?;
+            let graph_metadata =
+                fs::symlink_metadata(pin_dir).map_err(|_| state_indeterminate(OPERATION))?;
             if !graph_metadata.file_type().is_dir() || graph_metadata.file_type().is_symlink() {
                 return Err(state_indeterminate(OPERATION));
             }
@@ -32769,8 +32792,7 @@ mod aya_runtime {
                 Ok(identity) => identity,
                 Err(_) => return Err(state_indeterminate(OPERATION)),
             };
-            match Self::historical_25_initial_attachment_identity(ifindex, tc_priority, &identity)
-            {
+            match Self::historical_25_initial_attachment_identity(ifindex, tc_priority, &identity) {
                 Ok(Historical25AttachmentIdentity::Detached) => {}
                 Ok(Historical25AttachmentIdentity::Attached) => {
                     return refused(HistoricalEbpfGraphRecoveryRefusal::ActiveHistoricalAttachment);
@@ -32824,7 +32846,9 @@ mod aya_runtime {
             match Self::validate_replacement_identity(interface, ifindex) {
                 Ok(()) => {}
                 Err(ReplacementHookObservationError::IdentityChanged) => {
-                    return refused(HistoricalEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged);
+                    return refused(
+                        HistoricalEbpfGraphRecoveryRefusal::ReplacementInterfaceIdentityChanged,
+                    );
                 }
                 Err(ReplacementHookObservationError::Indeterminate) => {
                     return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
@@ -34312,13 +34336,16 @@ mod aya_runtime {
             // shape remains indeterminate and never causes us to create an
             // ordinary operation lock merely to investigate it.
             let target_leaf_present = entries.iter().any(|entry| entry == &current_leaf);
-            let target_residue_absent = !entries.iter().any(|entry| {
-                entry == &legacy_leaf || entry.starts_with(&staging_prefix)
-            });
+            let target_residue_absent = !entries
+                .iter()
+                .any(|entry| entry == &legacy_leaf || entry.starts_with(&staging_prefix));
             let terminal_candidate = target_leaf_present
                 && target_residue_absent
                 && (entries.iter().any(|entry| entry == &operation_lock)
-                    || matches!(self.current_recovery_authority_is_present(pin_dir), Ok(true)));
+                    || matches!(
+                        self.current_recovery_authority_is_present(pin_dir),
+                        Ok(true)
+                    ));
             if terminal_candidate {
                 return CurrentRecoveryPristineObservation::GraphPresent;
             }
@@ -34457,16 +34484,14 @@ mod aya_runtime {
                 return Ok(None);
             }
 
-            let ownership = match Self::acquire_reconciler_ownership_with_currentness(
-                pin_dir,
-                currentness,
-            ) {
-                Ok(ownership) => ownership,
-                // The candidate leaf existed before this call. Any failure
-                // means it cannot be authenticated, not that it may be
-                // recreated or treated as pristine.
-                Err(_) => return Ok(None),
-            };
+            let ownership =
+                match Self::acquire_reconciler_ownership_with_currentness(pin_dir, currentness) {
+                    Ok(ownership) => ownership,
+                    // The candidate leaf existed before this call. Any failure
+                    // means it cannot be authenticated, not that it may be
+                    // recreated or treated as pristine.
+                    Err(_) => return Ok(None),
+                };
             let _graph_lock = match Self::acquire_operation_control_lock(
                 &ownership,
                 "ebpf_current_terminal_snapshot",
@@ -34518,8 +34543,13 @@ mod aya_runtime {
                 .record
                 .terminal_source()
                 .ok_or_else(|| state_indeterminate("ebpf_current_terminal_snapshot"))?;
-            if matches!(terminal_source, crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff { .. })
-                && !ownership.historical_25_handoff.as_ref().is_some_and(|handoff| {
+            if matches!(
+                terminal_source,
+                crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff { .. }
+            ) && !ownership
+                .historical_25_handoff
+                .as_ref()
+                .is_some_and(|handoff| {
                     handoff.receipt.proof.record.is_terminal()
                         && handoff.receipt.proof.record.generation
                             == terminal.record.source_historical_generation
@@ -34561,13 +34591,11 @@ mod aya_runtime {
             ) {
                 return Ok(None);
             }
-            let ownership = match Self::acquire_reconciler_ownership_with_currentness(
-                pin_dir,
-                currentness,
-            ) {
-                Ok(ownership) => ownership,
-                Err(_) => return Ok(None),
-            };
+            let ownership =
+                match Self::acquire_reconciler_ownership_with_currentness(pin_dir, currentness) {
+                    Ok(ownership) => ownership,
+                    Err(_) => return Ok(None),
+                };
             let _graph_lock = match Self::acquire_operation_control_lock(
                 &ownership,
                 "ebpf_current_terminal_transfer",
@@ -34610,15 +34638,19 @@ mod aya_runtime {
             if matches!(
                 terminal_source,
                 crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff { .. }
-            ) && !ownership.historical_25_handoff.as_ref().is_some_and(|handoff| {
-                handoff.receipt.proof.record.is_terminal()
-                    && handoff.receipt.proof.record.generation
-                        == terminal.record.source_historical_generation
-                    && handoff.receipt.proof.record.graph_commitment
-                        == terminal.record.source_historical_graph_commitment
-                    && handoff.receipt.proof.record.compatibility_contract_digest
-                        == terminal.record.source_historical_compatibility_digest
-            }) {
+            ) && !ownership
+                .historical_25_handoff
+                .as_ref()
+                .is_some_and(|handoff| {
+                    handoff.receipt.proof.record.is_terminal()
+                        && handoff.receipt.proof.record.generation
+                            == terminal.record.source_historical_generation
+                        && handoff.receipt.proof.record.graph_commitment
+                            == terminal.record.source_historical_graph_commitment
+                        && handoff.receipt.proof.record.compatibility_contract_digest
+                            == terminal.record.source_historical_compatibility_digest
+                })
+            {
                 return Ok(None);
             }
             if currentness.first_failure().is_some() || currentness.verify_current().is_err() {
@@ -39044,26 +39076,27 @@ mod aya_runtime {
                     .expect("fixed test commitment")
             };
             let transferred_inspection =
-                crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(
-                    commitment(0x99),
+                crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(commitment(
+                    0x99,
+                ));
+            let transferred_authority =
+                crate::HistoricalEbpfGraphRecoveryAuthorityBinding::from_parts(
+                    commitment(0x91),
+                    commitment(0x92),
+                    transferred_inspection.former_link_evidence(),
+                    crate::HistoricalEbpfGraphRecoveryArtifactProvenance::from_brokered_challenge(
+                        commitment(0x98),
+                        transferred_inspection.expected_challenge(),
+                    ),
+                    std::num::NonZeroU64::new(2).expect("nonzero transfer epoch"),
+                    crate::HistoricalEbpfGraphRecoveryOperationId::new([0x93; 16])
+                        .expect("fixed transfer operation"),
+                    crate::HistoricalEbpfGraphRecoveryHostCommitments::new(
+                        commitment(0x84),
+                        commitment(0x85),
+                        commitment(0x86),
+                    ),
                 );
-            let transferred_authority = crate::HistoricalEbpfGraphRecoveryAuthorityBinding::from_parts(
-                commitment(0x91),
-                commitment(0x92),
-                transferred_inspection.former_link_evidence(),
-                crate::HistoricalEbpfGraphRecoveryArtifactProvenance::from_brokered_challenge(
-                    commitment(0x98),
-                    transferred_inspection.expected_challenge(),
-                ),
-                std::num::NonZeroU64::new(2).expect("nonzero transfer epoch"),
-                crate::HistoricalEbpfGraphRecoveryOperationId::new([0x93; 16])
-                    .expect("fixed transfer operation"),
-                crate::HistoricalEbpfGraphRecoveryHostCommitments::new(
-                    commitment(0x84),
-                    commitment(0x85),
-                    commitment(0x86),
-                ),
-            );
             assert_eq!(
                 runtime
                     .recover_orphaned_historical_graph(
@@ -39351,16 +39384,16 @@ mod aya_runtime {
             // exact graph/map-ID tuple. A caller cannot choose a convenient
             // opaque value and make a same-shape graph resumable.
             unbound.external_graph_commitment = unbound.graph_commitment;
-            let exact_unbound_graph = crate::HistoricalEbpfGraphRecoveryCommitment::new(
-                unbound.graph_commitment,
-            )
-            .expect("derived graph challenge is nonzero");
-            unbound.former_link_evidence = crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(
-                exact_unbound_graph,
-            )
-            .former_link_evidence()
-            .commitment()
-            .bytes();
+            let exact_unbound_graph =
+                crate::HistoricalEbpfGraphRecoveryCommitment::new(unbound.graph_commitment)
+                    .expect("derived graph challenge is nonzero");
+            unbound.former_link_evidence =
+                crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(
+                    exact_unbound_graph,
+                )
+                .former_link_evidence()
+                .commitment()
+                .bytes();
             assert_eq!(Historical25RecoveryRecord::decode(&unbound.encode()), None);
             let record = unbound.bind_to_proof_map(301).unwrap();
             let encoded = record.encode();
@@ -39379,36 +39412,32 @@ mod aya_runtime {
                     .as_bytes(),
                 "durable R5 proof state must bind the same public KAT/ABI contract as its receipt"
             );
-            let authority = |scope,
-                             predecessor_basis,
-                             epoch,
-                             operation,
-                             host,
-                             root,
-                             leaf,
-                             observed_graph| {
-                let commitment =
-                    |byte| crate::HistoricalEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
-                let inspection =
-                    crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(
-                        observed_graph,
-                    );
-                crate::HistoricalEbpfGraphRecoveryAuthority::new(
-                    commitment(scope),
-                    commitment(predecessor_basis),
-                    commitment(0x88),
-                    inspection.expected_challenge(),
-                    std::num::NonZeroU64::new(epoch).unwrap(),
-                    crate::HistoricalEbpfGraphRecoveryOperationId::new([operation; 16]).unwrap(),
-                    crate::HistoricalEbpfGraphRecoveryHostCommitments::new(
-                        commitment(host),
-                        commitment(root),
-                        commitment(leaf),
-                    ),
-                    Box::new(super::super::TestHistoricalEbpfGraphRecoveryAuthorityGuard),
-                )
-                .binding()
-            };
+            let authority =
+                |scope, predecessor_basis, epoch, operation, host, root, leaf, observed_graph| {
+                    let commitment = |byte| {
+                        crate::HistoricalEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap()
+                    };
+                    let inspection =
+                        crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(
+                            observed_graph,
+                        );
+                    crate::HistoricalEbpfGraphRecoveryAuthority::new(
+                        commitment(scope),
+                        commitment(predecessor_basis),
+                        commitment(0x88),
+                        inspection.expected_challenge(),
+                        std::num::NonZeroU64::new(epoch).unwrap(),
+                        crate::HistoricalEbpfGraphRecoveryOperationId::new([operation; 16])
+                            .unwrap(),
+                        crate::HistoricalEbpfGraphRecoveryHostCommitments::new(
+                            commitment(host),
+                            commitment(root),
+                            commitment(leaf),
+                        ),
+                        Box::new(super::super::TestHistoricalEbpfGraphRecoveryAuthorityGuard),
+                    )
+                    .binding()
+                };
             let exact_record_graph =
                 crate::HistoricalEbpfGraphRecoveryCommitment::new(record.graph_commitment)
                     .expect("derived graph challenge is nonzero");
@@ -39429,7 +39458,17 @@ mod aya_runtime {
                 authority(0x81, 0x82, 1, 0x93, 0x84, 0x85, 0x86, exact_record_graph),
                 authority(0x81, 0x82, 1, 0x83, 0x84, 0x95, 0x86, exact_record_graph),
                 authority(0x81, 0x82, 1, 0x83, 0x84, 0x85, 0x96, exact_record_graph),
-                authority(0x81, 0x82, 1, 0x83, 0x84, 0x85, 0x86, crate::HistoricalEbpfGraphRecoveryCommitment::new([0x90; 32]).expect("nonzero wrong challenge")),
+                authority(
+                    0x81,
+                    0x82,
+                    1,
+                    0x83,
+                    0x84,
+                    0x85,
+                    0x86,
+                    crate::HistoricalEbpfGraphRecoveryCommitment::new([0x90; 32])
+                        .expect("nonzero wrong challenge"),
+                ),
             ] {
                 assert!(
                     !record.matches_authority(mismatched_authority),
@@ -39614,13 +39653,14 @@ mod aya_runtime {
             .bind_to_proof_map(302)
             .unwrap();
             detached.external_graph_commitment = detached.graph_commitment;
-            detached.former_link_evidence = crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(
-                crate::HistoricalEbpfGraphRecoveryCommitment::new(detached.graph_commitment)
-                    .expect("derived graph challenge is nonzero"),
-            )
-            .former_link_evidence()
-            .commitment()
-            .bytes();
+            detached.former_link_evidence =
+                crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(
+                    crate::HistoricalEbpfGraphRecoveryCommitment::new(detached.graph_commitment)
+                        .expect("derived graph challenge is nonzero"),
+                )
+                .former_link_evidence()
+                .commitment()
+                .bytes();
             assert_eq!(
                 Historical25RecoveryRecord::decode(&detached.encode()),
                 Some(detached)
@@ -39643,8 +39683,8 @@ mod aya_runtime {
                 Historical25RecoveryRecord::decode(&detached_terminal.encode()),
                 Some(detached_terminal)
             );
-            let terminal_graph = crate::HistoricalEbpfGraphRecoveryCommitment::new(
-                historical_25_graph_commitment(
+            let terminal_graph =
+                crate::HistoricalEbpfGraphRecoveryCommitment::new(historical_25_graph_commitment(
                     [0x61; 32],
                     (65, 66),
                     (
@@ -39654,9 +39694,8 @@ mod aya_runtime {
                     ),
                     ((0, 0), (0, 0)),
                     map_ids,
-                ),
-            )
-            .expect("derived terminal graph challenge is nonzero");
+                ))
+                .expect("derived terminal graph challenge is nonzero");
             let old_terminal_authority =
                 authority(0x41, 0x42, 7, 0x43, 0x44, 0x45, 0x46, terminal_graph);
             let new_terminal_authority =
@@ -41318,9 +41357,8 @@ mod tests {
         guard: Box<dyn HistoricalEbpfGraphRecoveryCurrentnessGuard>,
     ) -> HistoricalEbpfGraphRecoveryAuthority {
         let commitment = |byte| HistoricalEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
-        let inspection = crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(
-            commitment(0x19),
-        );
+        let inspection =
+            crate::HistoricalEbpfGraphRecoveryGraphInspection::exact_shipped_25(commitment(0x19));
         HistoricalEbpfGraphRecoveryAuthority::new(
             commitment(scope),
             commitment(predecessor_basis),
@@ -41341,8 +41379,8 @@ mod tests {
         historical_25_authority_with_guard(Box::new(AlwaysCurrentHistoricalRecoveryGuard))
     }
 
-    fn historical_25_inspection_authority(
-    ) -> crate::HistoricalEbpfGraphRecoveryInspectionAuthority {
+    fn historical_25_inspection_authority() -> crate::HistoricalEbpfGraphRecoveryInspectionAuthority
+    {
         let commitment = |byte| HistoricalEbpfGraphRecoveryCommitment::new([byte; 32]).unwrap();
         crate::HistoricalEbpfGraphRecoveryInspectionAuthority::new(
             commitment(0x11),
@@ -41378,8 +41416,7 @@ mod tests {
         )
     }
 
-    fn historical_25_inspection_request(
-    ) -> crate::HistoricalEbpfGraphRecoveryInspectionRequest {
+    fn historical_25_inspection_request() -> crate::HistoricalEbpfGraphRecoveryInspectionRequest {
         crate::HistoricalEbpfGraphRecoveryIntent::new(
             crate::HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
             "s2bu-historical",
@@ -41425,8 +41462,8 @@ mod tests {
         assert_eq!(
             first.compatibility_contract_digest().as_bytes(),
             [
-                83, 10, 239, 24, 81, 115, 132, 128, 163, 203, 234, 133, 112, 25, 252, 13, 107,
-                220, 223, 108, 126, 28, 200, 87, 244, 102, 57, 148, 215, 208, 231, 24,
+                83, 10, 239, 24, 81, 115, 132, 128, 163, 203, 234, 133, 112, 25, 252, 13, 107, 220,
+                223, 108, 126, 28, 200, 87, 244, 102, 57, 148, 215, 208, 231, 24,
             ]
         );
     }
@@ -44235,10 +44272,9 @@ mod tests {
             if graph.hooks_remaining != 0 {
                 return refused(Refusal::IdentityMismatch);
             }
-            let commitment = crate::HistoricalEbpfGraphRecoveryCommitment::new(
-                graph.observed_graph_commitment,
-            )
-            .map_err(|_| state_indeterminate("fake_historical_25_graph_inspection"))?;
+            let commitment =
+                crate::HistoricalEbpfGraphRecoveryCommitment::new(graph.observed_graph_commitment)
+                    .map_err(|_| state_indeterminate("fake_historical_25_graph_inspection"))?;
             drop(state);
             if let Err(currentness) = currentness.verify_current() {
                 return refused(super::historical_recovery_currentness_refusal(currentness));
@@ -44688,10 +44724,9 @@ mod tests {
                 };
                 Self::crash_if_requested(&mut state, cut);
             }
-            state.historical_25_terminal_graph_commitments.insert(
-                pin_dir.to_path_buf(),
-                graph.observed_graph_commitment,
-            );
+            state
+                .historical_25_terminal_graph_commitments
+                .insert(pin_dir.to_path_buf(), graph.observed_graph_commitment);
             state.historical_25_graphs.remove(pin_dir);
             Self::crash_if_requested(&mut state, "historical_25_graph_rmdir");
             let receipt = state
@@ -44785,10 +44820,9 @@ mod tests {
             }
             let snapshot = match state.current_recovery_terminal_leaves.get(pin_dir) {
                 Some(terminal) if terminal.authority == authority => {
-                    let graph = crate::CurrentEbpfGraphRecoveryCommitment::new(
-                        terminal.graph_commitment,
-                    )
-                    .map_err(|_| state_indeterminate("fake_current_terminal_snapshot"))?;
+                    let graph =
+                        crate::CurrentEbpfGraphRecoveryCommitment::new(terminal.graph_commitment)
+                            .map_err(|_| state_indeterminate("fake_current_terminal_snapshot"))?;
                     CurrentEbpfGraphRecoveryTerminalSnapshot::Authenticated {
                         exact_graph_commitment: graph,
                         terminal_source: terminal.source,
@@ -44796,8 +44830,7 @@ mod tests {
                     }
                 }
                 Some(_) => return Ok(None),
-                None
-                    if !state.current_recovery_authority_leaves.contains(pin_dir)
+                None if !state.current_recovery_authority_leaves.contains(pin_dir)
                         && !state.historical_25_legacy_leaves.contains(pin_dir)
                         && !state.historical_25_staging.contains_key(pin_dir)
                         // A terminal R5 handoff is a distinct 25-map codec,
@@ -44859,17 +44892,17 @@ mod tests {
             else {
                 return Ok(None);
             };
-            let graph = match crate::CurrentEbpfGraphRecoveryCommitment::new(
-                terminal.graph_commitment,
-            ) {
-                Ok(graph) => graph,
-                Err(_) => return Ok(None),
-            };
-            let expected_receipt = crate::CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
-                terminal.authority,
-                graph,
-                terminal.source,
-            );
+            let graph =
+                match crate::CurrentEbpfGraphRecoveryCommitment::new(terminal.graph_commitment) {
+                    Ok(graph) => graph,
+                    Err(_) => return Ok(None),
+                };
+            let expected_receipt =
+                crate::CurrentEbpfGraphRecoveryTerminalReceiptCommitment::for_terminal(
+                    terminal.authority,
+                    graph,
+                    terminal.source,
+                );
             if terminal.authority == authority {
                 if terminal.adoption
                     != Some(crate::CurrentEbpfGraphRecoveryTerminalAdoption::new(
@@ -44881,8 +44914,7 @@ mod tests {
                 }
             } else if terminal.authority != prior.prior_authority()
                 || expected_receipt != prior.prior_terminal_receipt_commitment()
-                || terminal.authority.host_commitments()
-                    != authority.host_commitments()
+                || terminal.authority.host_commitments() != authority.host_commitments()
             {
                 return Ok(None);
             } else {
@@ -44910,11 +44942,13 @@ mod tests {
             let Some(terminal) = terminal else {
                 return Ok(None);
             };
-            Ok(Some(CurrentEbpfGraphRecoveryTerminalSnapshot::Authenticated {
-                exact_graph_commitment: graph,
-                terminal_source: terminal.source,
-                terminal_adoption: terminal.adoption,
-            }))
+            Ok(Some(
+                CurrentEbpfGraphRecoveryTerminalSnapshot::Authenticated {
+                    exact_graph_commitment: graph,
+                    terminal_source: terminal.source,
+                    terminal_adoption: terminal.adoption,
+                },
+            ))
         }
 
         fn recover_orphaned_current_graph(
@@ -53898,7 +53932,10 @@ mod tests {
                 crate::HistoricalEbpfGraphRecoveryRefusal::IndeterminateState
             )
         );
-        assert!(!runtime.state().operations.contains(&"recover_orphaned_historical_graph"));
+        assert!(!runtime
+            .state()
+            .operations
+            .contains(&"recover_orphaned_historical_graph"));
     }
 
     #[tokio::test]
@@ -55306,6 +55343,7 @@ mod tests {
         ] {
             let runtime = FakeRuntime::new();
             let pin_dir = seed_historical_25(&runtime);
+            let authority = historical_25_authority().binding();
             runtime.crash_after_in_order([cut]);
             let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 runtime.recover_orphaned_historical_graph(
@@ -55315,7 +55353,7 @@ mod tests {
                     DEFAULT_TC_PRIORITY,
                     true,
                     CurrentRecoveryManagedState::Clear,
-                    test_historical_ebpf_graph_recovery_authority_binding(),
+                    authority,
                     &TestHistoricalEbpfGraphRecoveryCurrentness,
                 )
             }));
@@ -55330,7 +55368,7 @@ mod tests {
                     DEFAULT_TC_PRIORITY,
                     true,
                     CurrentRecoveryManagedState::Clear,
-                    test_historical_ebpf_graph_recovery_authority_binding(),
+                    authority,
                     &TestHistoricalEbpfGraphRecoveryCurrentness,
                 )
                 .expect("resume exact historical maintenance operation");
@@ -55351,7 +55389,7 @@ mod tests {
                         DEFAULT_TC_PRIORITY,
                         true,
                         CurrentRecoveryManagedState::Clear,
-                        test_historical_ebpf_graph_recovery_authority_binding(),
+                        authority,
                         &TestHistoricalEbpfGraphRecoveryCurrentness,
                     )
                     .expect("idempotent terminal historical maintenance operation"),
@@ -55650,9 +55688,67 @@ mod tests {
         assert!(!state.historical_25_staging.contains_key(&pin_dir));
         assert!(!state.historical_25_operation_markers.contains(&pin_dir));
         assert!(
-            !state.operations.contains(&"recover_orphaned_historical_graph"),
+            !state
+                .operations
+                .contains(&"recover_orphaned_historical_graph"),
             "only exact pre-mutation NotCurrentSchema may enter historical recovery"
         );
+    }
+
+    #[tokio::test]
+    async fn historical_25_terminal_handoff_publishes_source_tagged_current_wal_without_current_graph(
+    ) {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime.state().historical_25_control_root_mode =
+            FakeHistorical25ControlRootMode::Predecessor0755;
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .expect("retire the exact detached shipped-25 graph"),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Removed
+        );
+        assert!(!runtime.state().current_graphs.contains_key(&pin_dir));
+
+        let receipt = backend
+            .recover_orphaned_current_ebpf_graph_with_authority_receipt(
+                current_recovery_authorized_request("s2bu-historical"),
+            )
+            .await
+            .expect("bridge the retained R5 terminal into the current receipt domain");
+        assert_eq!(
+            receipt.outcome(),
+            CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+        assert_eq!(
+            receipt.terminal_kind(),
+            Some(crate::CurrentEbpfGraphRecoveryTerminalKind::AuthenticatedTerminal),
+            "an authentic R5 terminal is neither pristine absence nor nonterminal progress"
+        );
+        assert_eq!(
+            receipt.terminal_absence_proof(),
+            crate::CurrentEbpfGraphTerminalAbsenceProof::Proven
+        );
+        assert!(receipt.exact_graph_commitment().is_some());
+        assert!(receipt.terminal_receipt_commitment().is_some());
+        assert_eq!(
+            receipt.terminal_source(),
+            Some(
+                crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff {
+                    exact_historical_graph_commitment:
+                        crate::HistoricalEbpfGraphRecoveryCommitment::new([0x19; 32])
+                            .expect("fixed exact historical graph commitment"),
+                }
+            )
+        );
+
+        let state = runtime.state();
+        assert!(!state.current_graphs.contains_key(&pin_dir));
+        assert!(state
+            .current_recovery_terminal_leaves
+            .contains_key(&pin_dir));
     }
 
     #[tokio::test]
@@ -55727,7 +55823,10 @@ mod tests {
     async fn current_pristine_maintenance_refuses_an_off_slot_sdk_hook_without_writes() {
         let (backend, runtime) = backend_with_fake();
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu-off-slot");
-        runtime.state().off_slot_sdk_hooks.insert(REPLACEMENT_IFINDEX);
+        runtime
+            .state()
+            .off_slot_sdk_hooks
+            .insert(REPLACEMENT_IFINDEX);
         let before = {
             let state = runtime.state();
             (
@@ -55768,7 +55867,10 @@ mod tests {
             )
         };
         assert_eq!(after, before, "off-slot refusal is read-only");
-        assert!(runtime.state().off_slot_sdk_hooks.contains(&REPLACEMENT_IFINDEX));
+        assert!(runtime
+            .state()
+            .off_slot_sdk_hooks
+            .contains(&REPLACEMENT_IFINDEX));
         assert!(!runtime.state().current_graphs.contains_key(&pin_dir));
     }
 

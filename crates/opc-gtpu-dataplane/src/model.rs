@@ -949,7 +949,7 @@ impl CurrentEbpfGraphRecoveryTerminalTransfer {
                 Some(CurrentEbpfGraphRecoveryTerminalKind::AuthenticatedTerminal),
                 CurrentEbpfGraphTerminalAbsenceProof::Proven,
                 CurrentEbpfGraphRecoveryOutcome::Removed
-                    | CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
+                | CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent,
                 Some(_),
                 Some(commitment),
             ) => Some(Self::new(receipt.authority, commitment)),
@@ -1241,9 +1241,7 @@ impl CurrentEbpfGraphRecoveryReceipt {
     /// Return the opaque exact graph/map commitment only for an authenticated
     /// WAL-backed terminal. It is never manufactured for pristine absence.
     #[must_use]
-    pub const fn exact_graph_commitment(
-        self,
-    ) -> Option<CurrentEbpfGraphRecoveryCommitment> {
+    pub const fn exact_graph_commitment(self) -> Option<CurrentEbpfGraphRecoveryCommitment> {
         self.exact_graph_commitment
     }
 
@@ -1455,14 +1453,10 @@ impl fmt::Debug for HistoricalEbpfGraphRecoveryCommitment {
 /// let _ = HistoricalEbpfGraphRecoveryFormerLinkEvidence::new(arbitrary);
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HistoricalEbpfGraphRecoveryFormerLinkEvidence(
-    HistoricalEbpfGraphRecoveryCommitment,
-);
+pub struct HistoricalEbpfGraphRecoveryFormerLinkEvidence(HistoricalEbpfGraphRecoveryCommitment);
 
 impl HistoricalEbpfGraphRecoveryFormerLinkEvidence {
-    fn for_exact_graph(
-        exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment,
-    ) -> Self {
+    fn for_exact_graph(exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment) -> Self {
         let mut digest = Sha256::new();
         digest.update(b"opc.gtpu.historical-ebpf-former-link-evidence\\0r1");
         digest.update(HISTORICAL_EBPF_GRAPH_RECOVERY_FORMER_LINK_EVIDENCE_ID.as_bytes());
@@ -1484,9 +1478,7 @@ impl HistoricalEbpfGraphRecoveryFormerLinkEvidence {
     /// Rebuild an already checksum-authenticated record projection. This is
     /// crate-private so callers cannot turn an arbitrary commitment into
     /// former-link evidence.
-    pub(crate) const fn from_persisted(
-        commitment: HistoricalEbpfGraphRecoveryCommitment,
-    ) -> Self {
+    pub(crate) const fn from_persisted(commitment: HistoricalEbpfGraphRecoveryCommitment) -> Self {
         Self(commitment)
     }
 
@@ -1574,14 +1566,14 @@ pub struct HistoricalEbpfGraphRecoveryExpectedInspectionChallenge {
 }
 
 impl HistoricalEbpfGraphRecoveryExpectedInspectionChallenge {
-    fn sealed(
-        exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment,
-    ) -> Self {
+    fn sealed(exact_graph_commitment: HistoricalEbpfGraphRecoveryCommitment) -> Self {
         Self {
             exact_graph_commitment,
             generation: HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
-            compatibility_contract_digest: crate::historical_ebpf_recovery_compatibility_kat([0; 32])
-                .compatibility_contract_digest(),
+            compatibility_contract_digest: crate::historical_ebpf_recovery_compatibility_kat(
+                [0; 32],
+            )
+            .compatibility_contract_digest(),
         }
     }
 
@@ -1592,9 +1584,8 @@ impl HistoricalEbpfGraphRecoveryExpectedInspectionChallenge {
         exact_graph_commitment: [u8; 32],
         compatibility_contract_digest: [u8; 32],
     ) -> Result<Self, HistoricalEbpfGraphRecoveryAuthorityError> {
-        let exact_graph_commitment = HistoricalEbpfGraphRecoveryCommitment::new(
-            exact_graph_commitment,
-        )?;
+        let exact_graph_commitment =
+            HistoricalEbpfGraphRecoveryCommitment::new(exact_graph_commitment)?;
         let expected = Self::sealed(exact_graph_commitment);
         (expected.compatibility_contract_digest.as_bytes() == compatibility_contract_digest)
             .then_some(expected)
@@ -1631,7 +1622,10 @@ impl fmt::Debug for HistoricalEbpfGraphRecoveryExpectedInspectionChallenge {
         f.debug_struct("HistoricalEbpfGraphRecoveryExpectedInspectionChallenge")
             .field("generation", &self.generation)
             .field("exact_graph_commitment", &"<opaque>")
-            .field("compatibility_contract_digest", &self.compatibility_contract_digest)
+            .field(
+                "compatibility_contract_digest",
+                &self.compatibility_contract_digest,
+            )
             .finish()
     }
 }
@@ -1680,9 +1674,7 @@ impl HistoricalEbpfGraphRecoveryGraphInspection {
     /// before a separate destructive recovery authority is constructed.
     #[must_use]
     pub fn expected_challenge(self) -> HistoricalEbpfGraphRecoveryExpectedInspectionChallenge {
-        HistoricalEbpfGraphRecoveryExpectedInspectionChallenge::sealed(
-            self.exact_graph_commitment,
-        )
+        HistoricalEbpfGraphRecoveryExpectedInspectionChallenge::sealed(self.exact_graph_commitment)
     }
 
     /// Return the SDK-issued detached former-link proof for this exact
@@ -2159,9 +2151,9 @@ impl HistoricalEbpfGraphRecoveryAuthority {
                 operation_id,
                 host_commitments,
             },
-            expected_challenge: Some(HistoricalEbpfGraphRecoveryExpectedInspectionChallenge::sealed(
-                pristine,
-            )),
+            expected_challenge: Some(
+                HistoricalEbpfGraphRecoveryExpectedInspectionChallenge::sealed(pristine),
+            ),
             guard,
         }
     }
@@ -6325,8 +6317,9 @@ mod tests {
             CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph,
             None,
         );
-        let transfer = CurrentEbpfGraphRecoveryTerminalTransfer::from_authenticated_receipt(terminal)
-            .expect("only a WAL-backed exact graph terminal is transferable");
+        let transfer =
+            CurrentEbpfGraphRecoveryTerminalTransfer::from_authenticated_receipt(terminal)
+                .expect("only a WAL-backed exact graph terminal is transferable");
         assert_eq!(transfer.prior_authority(), binding);
         assert_eq!(
             transfer.prior_terminal_receipt_commitment(),
