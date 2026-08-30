@@ -1489,6 +1489,15 @@ terminal return. Foreign layouts, held leases,
 unknown children, wrong ownership or mode, partial observations, and name or
 ifindex races remain fail-closed.
 
+Caller cancellation has one explicit boundary. If the public future is
+dropped before its blocking worker claims execution, the recovery closure is
+not entered and no graph or authority byte changes. After the worker claims
+execution, recovery is intentionally uncancellable: it completes under the
+same affine authority and operation lock even if the observing task is
+dropped. The exact same authority-bound request can then be reconstructed from
+the retained intent and retried to retrieve the durable terminal receipt. A
+lost observer is never permission to roll back or infer absence.
+
 Recovery publishes one proof map through a deterministic private staging leaf,
 dual-pins it under both authority generations, and atomically installs the
 current leaf before any pin unlink. Phase and identity readback makes every
@@ -1520,7 +1529,7 @@ authority/recovery/R5-codec/KAT identities, fixed `GTPU_RECONCILER_LOCKS`
 control-root identity, shipped-generation byte `0x05`, embedded object and ABI
 digests, ordered section/tag expectations, and all 25 ordered namespace
 commitments. For this SDK artifact it is
-`8503fd8b6961a6c8cce0246c5f6a7ca73933f2aec84bfb5b71cc25e1ca2122e6`.
+`530aef1851738480a3cbea857019fc0d6bdcdf6c7e1cc857f4663994d7d0e718`.
 `verify_challenge_response` verifies SHA-256 over the distinct
 `opc.gtpu.historical-ebpf-recovery-kat\0challenge-response\0r5` domain, that
 contract digest, and the caller's 32-byte challenge. It exposes no object bytes

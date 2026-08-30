@@ -38,6 +38,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", test))]
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(target_os = "linux", test))]
 use std::task::{Context, Poll};
@@ -3149,6 +3150,53 @@ enum CleanupAcquisitionState {
     Done(Result<RetainedGraphCleanupClassification, GtpuError>),
 }
 
+const BLOCKING_WORKER_PENDING: u8 = 0;
+const BLOCKING_WORKER_STARTED: u8 = 1;
+const BLOCKING_WORKER_CALLER_CANCELLED: u8 = 2;
+
+/// Cancellation fence for one ordinary blocking adapter call.
+///
+/// Dropping the caller before the worker claims this fence suppresses the
+/// closure completely. Once the worker has claimed it, the operation is
+/// deliberately uncancellable: mutation paths converge under their typed
+/// operation lock and expose durable state to an authoritative retry.
+struct BlockingWorkerCallerFence {
+    state: Arc<AtomicU8>,
+    armed: bool,
+}
+
+impl BlockingWorkerCallerFence {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BlockingWorkerCallerFence {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.state.compare_exchange(
+                BLOCKING_WORKER_PENDING,
+                BLOCKING_WORKER_CALLER_CANCELLED,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            );
+        }
+    }
+}
+
+enum BlockingWorkerOutcome<T> {
+    CancelledBeforeStart,
+    Completed(std::thread::Result<Result<T, GtpuError>>),
+}
+
+#[cfg(test)]
+struct BlockingWorkerStartPause {
+    operation: &'static str,
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+    finished: Arc<std::sync::Barrier>,
+}
+
 /// Affine, supervised completion handle for one cleanup-only acquisition.
 ///
 /// Produced by [`EbpfGtpuDataplaneBackend::acquire_cleanup_only_recovery`].
@@ -3251,6 +3299,8 @@ struct EbpfGtpuDataplaneBackendInner {
         Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     #[cfg(test)]
     traffic_proof_boottime_override: Mutex<Option<std::time::Duration>>,
+    #[cfg(test)]
+    blocking_worker_start_pause: Mutex<Option<BlockingWorkerStartPause>>,
     backend_incarnation: u64,
     clock_origin: u128,
     config: EbpfGtpuDataplaneBackendConfig,
@@ -3624,11 +3674,13 @@ impl EbpfGtpuDataplaneBackend {
     /// consumer has reconciled durable GTP-U state. It is refused unless the
     /// device is currently held cleanup-only by this backend.
     ///
-    /// Unlike the acquisition handle, this is a plain blocking operation: once
-    /// polled, dropping the returned future does not stop the worker, which
-    /// completes the reattachment under the operation lock. A retry observes
-    /// the converged state (the device is active, so it is refused with
-    /// [`GtpuError::AlreadyExists`]) rather than overlapping a second attach.
+    /// Unlike the acquisition handle, this is a plain blocking operation.
+    /// Cancellation before worker admission is no-effect; once the worker
+    /// claims execution, dropping the returned future does not stop it. The
+    /// worker completes reattachment under the operation lock, and a retry
+    /// observes the converged state (the device is active, so it is refused
+    /// with [`GtpuError::AlreadyExists`]) rather than overlapping a second
+    /// attach.
     ///
     /// # Errors
     ///
@@ -3668,6 +3720,8 @@ impl EbpfGtpuDataplaneBackend {
                 traffic_proof_worker_return_pause: Mutex::new(None),
                 #[cfg(test)]
                 traffic_proof_boottime_override: Mutex::new(None),
+                #[cfg(test)]
+                blocking_worker_start_pause: Mutex::new(None),
                 backend_incarnation,
                 clock_origin,
                 config,
@@ -3686,8 +3740,32 @@ impl EbpfGtpuDataplaneBackend {
         F: FnOnce(Self) -> Result<T, GtpuError> + Send + 'static,
     {
         let backend = self.clone();
+        let state = Arc::new(AtomicU8::new(BLOCKING_WORKER_PENDING));
+        let worker_state = Arc::clone(&state);
+        let mut caller_fence = BlockingWorkerCallerFence { state, armed: true };
         let outcome = tokio::task::spawn_blocking(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(backend)))
+            #[cfg(test)]
+            let finished = backend.pause_blocking_worker_start_for_test(operation);
+            let outcome = if worker_state
+                .compare_exchange(
+                    BLOCKING_WORKER_PENDING,
+                    BLOCKING_WORKER_STARTED,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                BlockingWorkerOutcome::Completed(std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| f(backend)),
+                ))
+            } else {
+                BlockingWorkerOutcome::CancelledBeforeStart
+            };
+            #[cfg(test)]
+            if let Some(finished) = finished {
+                finished.wait();
+            }
+            outcome
         })
         .await
         .map_err(|_| {
@@ -3696,7 +3774,72 @@ impl EbpfGtpuDataplaneBackend {
                 io::Error::new(io::ErrorKind::Interrupted, "gtpu blocking task failed"),
             )
         })?;
-        outcome.unwrap_or(Err(GtpuError::StateIndeterminate { operation }))
+        caller_fence.disarm();
+        match outcome {
+            BlockingWorkerOutcome::CancelledBeforeStart => {
+                Err(GtpuError::StateIndeterminate { operation })
+            }
+            BlockingWorkerOutcome::Completed(outcome) => {
+                outcome.unwrap_or(Err(GtpuError::StateIndeterminate { operation }))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_next_blocking_worker_start(
+        &self,
+        operation: &'static str,
+    ) -> (
+        Arc<std::sync::Barrier>,
+        Arc<std::sync::Barrier>,
+        Arc<std::sync::Barrier>,
+    ) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let finished = Arc::new(std::sync::Barrier::new(2));
+        let mut pause = self
+            .inner
+            .blocking_worker_start_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            pause.is_none(),
+            "only one blocking worker pause may be armed"
+        );
+        *pause = Some(BlockingWorkerStartPause {
+            operation,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            finished: Arc::clone(&finished),
+        });
+        (entered, release, finished)
+    }
+
+    #[cfg(test)]
+    fn pause_blocking_worker_start_for_test(
+        &self,
+        operation: &'static str,
+    ) -> Option<Arc<std::sync::Barrier>> {
+        let pause = {
+            let mut pause = self
+                .inner
+                .blocking_worker_start_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pause
+                .as_ref()
+                .is_some_and(|pause| pause.operation == operation)
+            {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        pause.map(|pause| {
+            pause.entered.wait();
+            pause.release.wait();
+            pause.finished
+        })
     }
 
     /// Drive an external asynchronous authority check from a blocking kernel
@@ -45393,9 +45536,15 @@ mod aya_runtime {
             println!("OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN");
         }
 
-        #[test]
+        #[tokio::test(flavor = "multi_thread")]
         #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, writable bpffs, iproute2, and a fresh netns"]
-        fn historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex() {
+        async fn historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex()
+        {
+            use crate::{
+                CreateGtpDeviceRequest, GtpDevice, GtpuDataplaneBackend as _,
+                RetainedGraphCleanupClassification, RetainedGraphCleanupRequest,
+            };
+            use std::net::{IpAddr, Ipv4Addr};
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
             if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
@@ -45504,23 +45653,76 @@ mod aya_runtime {
                 sys::ifindex_by_name("up0").expect("replacement up0 identity must resolve");
             assert_ne!(old_up0_ifindex, replacement_ifindex);
             run_ip(&["link", "set", "up0", "up"]);
-            let runtime = AyaGtpuRuntime::new();
-            let exact_historical_inspection = match runtime
-                .inspect_orphaned_historical_graph(
+            let backend = super::super::EbpfGtpuDataplaneBackend::with_config(
+                super::super::EbpfGtpuDataplaneBackendConfig {
+                    bpffs_pin_root: pin_root.clone(),
+                    tc_priority: 50,
+                },
+            );
+            let historical_commitment = |byte| {
+                crate::HistoricalEbpfGraphRecoveryCommitment::new([byte; 32])
+                    .expect("fixed historical test commitment")
+            };
+            let historical_intent = || {
+                crate::HistoricalEbpfGraphRecoveryIntent::new(
                     HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
-                    Some(("up0", replacement_ifindex)),
-                    &pin_dir,
-                    50,
-                    super::super::test_historical_ebpf_graph_recovery_authority_binding(),
-                    &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
+                    "up0",
                 )
-                .expect("inspect the authentic detached shipped-25 graph before recovery")
+                .with_replacement_device(GtpDevice {
+                    name: "up0".to_string(),
+                    ifindex: replacement_ifindex,
+                })
+            };
+            let exact_historical_inspection = match backend
+                .inspect_orphaned_historical_ebpf_graph(
+                    historical_intent().into_inspection_request(
+                        crate::HistoricalEbpfGraphRecoveryInspectionAuthority::new(
+                            historical_commitment(0x81),
+                            historical_commitment(0x82),
+                            std::num::NonZeroU64::new(1).expect("nonzero inspection epoch"),
+                            crate::HistoricalEbpfGraphRecoveryOperationId::new([0x83; 16])
+                                .expect("fixed inspection operation"),
+                            crate::HistoricalEbpfGraphRecoveryHostCommitments::new(
+                                historical_commitment(0x84),
+                                historical_commitment(0x85),
+                                historical_commitment(0x86),
+                            ),
+                            Box::new(super::super::TestHistoricalEbpfGraphRecoveryAuthorityGuard),
+                        ),
+                    ),
+                )
+                .await
+                .expect("inspect the authentic detached shipped-25 graph through the public API")
             {
                 HistoricalEbpfGraphRecoveryInspectionOutcome::ExactDetached(inspection) => {
                     inspection
                 }
                 outcome => panic!("expected exact detached shipped-25 inspection, got {outcome:?}"),
             };
+            let historical_authority = || {
+                crate::HistoricalEbpfGraphRecoveryAuthority::new(
+                    historical_commitment(0x81),
+                    historical_commitment(0x82),
+                    historical_commitment(0x88),
+                    exact_historical_inspection.expected_challenge(),
+                    std::num::NonZeroU64::new(1).expect("nonzero recovery epoch"),
+                    crate::HistoricalEbpfGraphRecoveryOperationId::new([0x83; 16])
+                        .expect("fixed recovery operation"),
+                    crate::HistoricalEbpfGraphRecoveryHostCommitments::new(
+                        historical_commitment(0x84),
+                        historical_commitment(0x85),
+                        historical_commitment(0x86),
+                    ),
+                    Box::new(super::super::TestHistoricalEbpfGraphRecoveryAuthorityGuard),
+                )
+            };
+            assert_eq!(
+                historical_authority().binding(),
+                super::super::test_historical_ebpf_graph_recovery_authority_binding_for_inspection(
+                    exact_historical_inspection,
+                )
+            );
+            let runtime = AyaGtpuRuntime::new();
             let exact_historical_authority =
                 super::super::test_historical_ebpf_graph_recovery_authority_binding_for_inspection(
                     exact_historical_inspection,
@@ -45676,18 +45878,25 @@ mod aya_runtime {
                 fs::set_permissions(receipt_path, fs::Permissions::from_mode(0o600))
                     .expect("restore exact BPF receipt mode for retry");
             }
-            let final_outcome = runtime
-                .recover_orphaned_historical_graph(
+            let historical_request = || {
+                crate::HistoricalEbpfGraphRecoveryRequest::new(
                     HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
-                    Some(("up0", replacement_ifindex)),
-                    &pin_dir,
-                    50,
-                    true,
-                    CurrentRecoveryManagedState::Clear,
-                    exact_historical_authority,
-                    &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
+                    "up0",
                 )
-                .expect("recover exact detached historical graph");
+                .with_replacement_device(GtpDevice {
+                    name: "up0".to_string(),
+                    ifindex: replacement_ifindex,
+                })
+                .with_writer_proof(crate::HistoricalEbpfGraphWriterProof::previous_writer_stopped())
+                .with_drain_proof(
+                    crate::HistoricalEbpfGraphDrainProof::sessions_and_traffic_drained(),
+                )
+                .with_authority(historical_authority())
+            };
+            let final_outcome = backend
+                .recover_orphaned_historical_ebpf_graph(historical_request())
+                .await
+                .expect("recover exact detached historical graph through the public API");
             assert_eq!(final_outcome, HistoricalEbpfGraphRecoveryOutcome::Removed);
             assert!(
                 !pin_dir.exists(),
@@ -45695,18 +45904,10 @@ mod aya_runtime {
             );
             assert!(!legacy_leaf.exists(), "legacy authority must be retired");
             assert_eq!(
-                runtime
-                    .recover_orphaned_historical_graph(
-                        HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
-                        Some(("up0", replacement_ifindex)),
-                        &pin_dir,
-                        50,
-                        true,
-                        CurrentRecoveryManagedState::Clear,
-                        exact_historical_authority,
-                        &super::super::TestHistoricalEbpfGraphRecoveryCurrentness,
-                    )
-                    .expect("repeat terminal detached recovery"),
+                backend
+                    .recover_orphaned_historical_ebpf_graph(historical_request())
+                    .await
+                    .expect("repeat terminal detached recovery through the public API"),
                 HistoricalEbpfGraphRecoveryOutcome::AlreadyAbsent
             );
             let commitment = |byte| {
@@ -45746,22 +45947,81 @@ mod aya_runtime {
                     .expect("terminal R5 may transfer only after exact absence is re-proved"),
                 HistoricalEbpfGraphRecoveryOutcome::AlreadyAbsent
             );
-            let initial_current_authority =
-                super::super::test_current_ebpf_graph_recovery_authority_binding();
+            drop(backend);
+            let backend = super::super::EbpfGtpuDataplaneBackend::with_config(
+                super::super::EbpfGtpuDataplaneBackendConfig {
+                    bpffs_pin_root: pin_root.clone(),
+                    tc_priority: 50,
+                },
+            );
             assert_eq!(
-                runtime
-                    .recover_orphaned_current_graph(
-                        Some(("up0", replacement_ifindex)),
-                        &pin_dir,
-                        50,
-                        true,
-                        CurrentRecoveryManagedState::Clear,
-                        initial_current_authority,
-                        &super::super::TestCurrentEbpfGraphRecoveryCurrentness,
-                    )
-                    .expect("bridge the authentic R5 handoff into a current terminal WAL"),
+                backend
+                    .acquire_cleanup_only_recovery(RetainedGraphCleanupRequest::new(
+                        GtpDevice {
+                            name: "up0".to_string(),
+                            ifindex: replacement_ifindex,
+                        },
+                        Ipv4Addr::new(192, 0, 2, 1),
+                        crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+                    ))
+                    .await
+                    .expect("fresh startup observes the predecessor handoff"),
+                RetainedGraphCleanupClassification::Refused(
+                    RetainedGraphCleanupRefusal::IndeterminateState
+                ),
+                "the authentic historical terminal is not ordinary-create authority"
+            );
+            let current_commitment = |byte| {
+                crate::CurrentEbpfGraphRecoveryCommitment::new([byte; 32])
+                    .expect("fixed current test commitment")
+            };
+            let current_authority = || {
+                crate::CurrentEbpfGraphRecoveryAuthority::new(
+                    current_commitment(0x91),
+                    current_commitment(0x92),
+                    std::num::NonZeroU64::new(1).expect("nonzero current epoch"),
+                    crate::CurrentEbpfGraphRecoveryOperationId::new([0x93; 16])
+                        .expect("fixed current operation"),
+                    crate::CurrentEbpfGraphRecoveryHostCommitments::new(
+                        current_commitment(0x94),
+                        current_commitment(0x95),
+                        current_commitment(0x96),
+                    ),
+                    Box::new(super::super::TestCurrentEbpfGraphRecoveryAuthorityGuard),
+                )
+            };
+            let current_intent = || {
+                crate::CurrentEbpfGraphRecoveryIntent::new(
+                    "up0",
+                    crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+                )
+                .with_replacement_device(GtpDevice {
+                    name: "up0".to_string(),
+                    ifindex: replacement_ifindex,
+                })
+                .with_drain_proof(crate::CurrentEbpfGraphDrainProof::sessions_and_traffic_drained())
+            };
+            let terminal = backend
+                .recover_orphaned_current_ebpf_graph_with_authority_receipt(
+                    current_intent().into_request_with_authority(current_authority()),
+                )
+                .await
+                .expect("bridge the authentic R5 handoff through the public API");
+            assert_eq!(
+                terminal.outcome(),
                 CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
             );
+            assert!(matches!(
+                terminal.terminal_source(),
+                Some(crate::CurrentEbpfGraphRecoveryTerminalSource::HistoricalR5Handoff { .. })
+            ));
+            let terminal = crate::CurrentEbpfGraphRecoveryReceipt::decode_authenticated_terminal(
+                terminal
+                    .encode_authenticated_terminal()
+                    .expect("current terminal is broker-persistable"),
+            )
+            .expect("broker decodes the complete current terminal receipt");
+            let initial_current_authority = terminal.authority();
             let (terminal_before, terminal_identity, surviving_authority_marker) = {
                 let ownership =
                     AyaGtpuRuntime::acquire_existing_reconciler_ownership_with_currentness(
@@ -45887,6 +46147,146 @@ mod aya_runtime {
                     "real-kernel terminal transfer attempt {attempt} must converge idempotently"
                 );
             }
+            let public_transfer = match backend
+                .inspect_current_ebpf_graph_terminal(
+                    current_intent().into_request_with_authority(
+                        crate::CurrentEbpfGraphRecoveryAuthority::new(
+                            current_commitment(0xd1),
+                            current_commitment(0xd2),
+                            std::num::NonZeroU64::new(3)
+                                .expect("nonzero terminal inspection epoch"),
+                            crate::CurrentEbpfGraphRecoveryOperationId::new([0xd3; 16])
+                                .expect("fixed terminal inspection operation"),
+                            crate::CurrentEbpfGraphRecoveryHostCommitments::new(
+                                current_commitment(0x94),
+                                current_commitment(0x95),
+                                current_commitment(0x96),
+                            ),
+                            Box::new(super::super::TestCurrentEbpfGraphRecoveryAuthorityGuard),
+                        ),
+                    ),
+                )
+                .await
+                .expect("public API reauthenticates the transferred terminal")
+            {
+                crate::CurrentEbpfGraphRecoveryTerminalInspectionOutcome::Authenticated(
+                    transfer,
+                ) => transfer,
+                outcome => panic!("expected a public terminal transfer, got {outcome:?}"),
+            };
+            assert_eq!(
+                crate::CurrentEbpfGraphRecoveryTerminalTransfer::decode(public_transfer.encode()),
+                Some(public_transfer),
+                "the broker preserves the complete transfer record"
+            );
+            let admitted_authority = || {
+                crate::CurrentEbpfGraphRecoveryAuthority::new(
+                    current_commitment(0xe1),
+                    public_transfer.predecessor_basis_commitment(),
+                    std::num::NonZeroU64::new(4).expect("nonzero admitted epoch"),
+                    crate::CurrentEbpfGraphRecoveryOperationId::new([0xe3; 16])
+                        .expect("fixed admitted operation"),
+                    crate::CurrentEbpfGraphRecoveryHostCommitments::new(
+                        current_commitment(0x94),
+                        current_commitment(0x95),
+                        current_commitment(0x96),
+                    ),
+                    Box::new(super::super::TestCurrentEbpfGraphRecoveryAuthorityGuard),
+                )
+            };
+            let admitted_terminal = backend
+                .transfer_current_ebpf_graph_terminal(
+                    current_intent()
+                        .into_terminal_transfer_request(public_transfer, admitted_authority()),
+                )
+                .await
+                .expect("public transfer returns the complete authenticated terminal");
+            let admitted_terminal =
+                crate::CurrentEbpfGraphRecoveryReceipt::decode_authenticated_terminal(
+                    admitted_terminal
+                        .encode_authenticated_terminal()
+                        .expect("transferred terminal remains broker-persistable"),
+                )
+                .expect("the broker decodes the transferred terminal receipt");
+            assert_eq!(
+                backend
+                    .admit_current_ebpf_graph_terminal(
+                        current_intent().into_terminal_admission_request(
+                            admitted_terminal,
+                            admitted_authority(),
+                        ),
+                    )
+                    .await
+                    .expect("admit only the exact broker-durable terminal"),
+                crate::CurrentEbpfGraphRecoveryTerminalAdmissionOutcome::Admitted
+            );
+            let mut create = CreateGtpDeviceRequest::new("up0");
+            create.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+            assert_eq!(
+                backend
+                    .create_device(create.clone())
+                    .await
+                    .expect("create the authenticated packet-inert successor")
+                    .ifindex,
+                replacement_ifindex
+            );
+            let successor_target =
+                || crate::CurrentEbpfGraphRecoverySuccessorTarget::Legacy(create.clone());
+            let successor = match backend
+                .inspect_current_ebpf_graph_successor(
+                    current_intent().into_successor_inspection_request(
+                        successor_target(),
+                        admitted_authority(),
+                    ),
+                )
+                .await
+                .expect("inspect the exact packet-inert successor")
+            {
+                crate::CurrentEbpfGraphRecoverySuccessorInspectionOutcome::Authenticated(
+                    receipt,
+                ) => receipt,
+                outcome => panic!("expected an authenticated successor, got {outcome:?}"),
+            };
+            let successor =
+                crate::CurrentEbpfGraphRecoverySuccessorReceipt::decode(successor.encode())
+                    .expect("the broker decodes the complete successor receipt");
+            let successor_authority = crate::CurrentEbpfGraphRecoveryAuthority::new(
+                current_commitment(0xe1),
+                public_transfer.predecessor_basis_commitment(),
+                std::num::NonZeroU64::new(4).expect("nonzero successor epoch"),
+                crate::CurrentEbpfGraphRecoveryOperationId::new([0xe3; 16])
+                    .expect("fixed successor operation"),
+                crate::CurrentEbpfGraphRecoveryHostCommitments::new(
+                    current_commitment(0x94),
+                    current_commitment(0x95),
+                    current_commitment(0x96),
+                ),
+                Box::new(super::super::ExactBrokeredSuccessorReceiptGuard {
+                    expected: successor.commitment(),
+                }),
+            );
+            assert_eq!(
+                backend
+                    .admit_current_ebpf_graph_successor(
+                        current_intent().into_successor_admission_request(
+                            successor_target(),
+                            successor,
+                            successor_authority,
+                        ),
+                    )
+                    .await
+                    .expect("activate only the exact brokered successor"),
+                crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome::Admitted
+            );
+            assert_eq!(
+                backend
+                    .resolve_device("up0")
+                    .await
+                    .expect("the broker-admitted successor is usable")
+                    .ifindex,
+                replacement_ifindex
+            );
+            println!("OPC_GTPU_HISTORICAL_25_PUBLIC_BRIDGE_ADMISSION_PROVEN");
             println!("OPC_GTPU_HISTORICAL_25_CURRENT_TERMINAL_TRANSFER_PROVEN");
             println!("OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN");
         }
@@ -48308,6 +48708,27 @@ mod tests {
     }
 
     #[test]
+    fn historical_25_documented_compatibility_digest_matches_the_public_kat() {
+        let readme = include_str!("../README.md");
+        let documented = readme
+            .split_once("For this SDK artifact it is\n`")
+            .and_then(|(_, tail)| tail.split_once('`').map(|(digest, _)| digest))
+            .expect("README publishes one bounded compatibility digest");
+        assert_eq!(documented.len(), 64);
+        let mut decoded = [0_u8; 32];
+        for (index, byte) in decoded.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&documented[index * 2..index * 2 + 2], 16)
+                .expect("README compatibility digest is lowercase hexadecimal");
+        }
+        assert_eq!(
+            decoded,
+            historical_ebpf_recovery_compatibility_kat([0x31; 32])
+                .compatibility_contract_digest()
+                .as_bytes()
+        );
+    }
+
+    #[test]
     fn historical_25_disjoint_sibling_names_are_bounded_and_orphan_lock_is_not_a_leaf() {
         let namespace = "ab".repeat(32);
         let nonce = "cd".repeat(16);
@@ -48438,11 +48859,18 @@ mod tests {
     // The fake models the production schema, never a stale literal subset.
     const CURRENT_PIN_COUNT: usize = aya_runtime::CURRENT_MAP_NAMES.len();
 
+    struct HistoricalRecoveryEffectPause {
+        operation: &'static str,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
     struct FakeRuntime {
         ifindexes: HashMap<String, u32>,
         state: Arc<Mutex<FakeState>>,
         environment: EbpfEnvironment,
         cleanup_only_adoption_pause: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+        historical_recovery_effect_pause: Mutex<Option<HistoricalRecoveryEffectPause>>,
         cleanup_only_adoption_entries: AtomicUsize,
         selector_namespace_effect_held: Arc<AtomicBool>,
         selector_namespace_effect_path_replaced_on_finish: Arc<AtomicBool>,
@@ -49113,6 +49541,7 @@ mod tests {
                     bpf_capable: true,
                 },
                 cleanup_only_adoption_pause: Mutex::new(None),
+                historical_recovery_effect_pause: Mutex::new(None),
                 cleanup_only_adoption_entries: AtomicUsize::new(0),
                 selector_namespace_effect_held: Arc::new(AtomicBool::new(false)),
                 selector_namespace_effect_path_replaced_on_finish: Arc::new(AtomicBool::new(false)),
@@ -49526,10 +49955,21 @@ mod tests {
             const OPERATION: &str = "fake_current_terminal_admission";
             let Some(terminal) = state.current_recovery_terminal_leaves.get(pin_dir).copied()
             else {
+                let predecessor_handoff = state.historical_25_root_handoff_published
+                    && matches!(
+                        state.historical_25_control_root_mode,
+                        FakeHistorical25ControlRootMode::Predecessor0700
+                            | FakeHistorical25ControlRootMode::Predecessor0755
+                            | FakeHistorical25ControlRootMode::Predecessor0750
+                    )
+                    && !state.schema.contains_key(pin_dir)
+                    && !state.pinned_config.contains_key(pin_dir)
+                    && !state.pinned_grouped_config.contains_key(pin_dir);
                 if admission.is_some()
                     || state.current_recovery_authority_leaves.contains(pin_dir)
                     || state.current_recovery_busy.contains(pin_dir)
                     || state.current_graphs.contains_key(pin_dir)
+                    || predecessor_handoff
                 {
                     return Err(state_indeterminate(OPERATION));
                 }
@@ -49749,6 +50189,49 @@ mod tests {
             assert!(pause.is_none(), "only one fake cleanup pause may be armed");
             *pause = Some((started.clone(), release.clone()));
             (started, release)
+        }
+
+        fn pause_next_historical_recovery_effect(
+            &self,
+            operation: &'static str,
+        ) -> (Arc<Barrier>, Arc<Barrier>) {
+            let entered = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let mut pause = self
+                .historical_recovery_effect_pause
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                pause.is_none(),
+                "only one historical recovery effect pause may be armed"
+            );
+            *pause = Some(HistoricalRecoveryEffectPause {
+                operation,
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            });
+            (entered, release)
+        }
+
+        fn pause_historical_recovery_effect_if_requested(&self, operation: &'static str) {
+            let pause = {
+                let mut pause = self
+                    .historical_recovery_effect_pause
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if pause
+                    .as_ref()
+                    .is_some_and(|pause| pause.operation == operation)
+                {
+                    pause.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pause) = pause {
+                pause.entered.wait();
+                pause.release.wait();
+            }
         }
 
         fn cleanup_only_adoption_entries(&self) -> usize {
@@ -52309,6 +52792,7 @@ mod tests {
                     "historical_25_pin_unlink_middle"
                 };
                 Self::crash_if_requested(&mut state, cut);
+                self.pause_historical_recovery_effect_if_requested(cut);
             }
             state
                 .historical_25_terminal_graph_commitments
@@ -62542,6 +63026,130 @@ mod tests {
             .contains(&pin_dir));
     }
 
+    async fn rendezvous_test_barrier(barrier: Arc<Barrier>) {
+        tokio::task::spawn_blocking(move || {
+            barrier.wait();
+        })
+        .await
+        .expect("test barrier worker completes");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn historical_25_public_future_cancelled_before_worker_admission_is_byte_inert() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime.state().historical_25_control_root_mode =
+            FakeHistorical25ControlRootMode::Predecessor0755;
+        let before = {
+            let state = runtime.state();
+            (
+                state.historical_25_graphs.clone(),
+                state.historical_25_receipts.clone(),
+                state.historical_25_authorities.clone(),
+                state.historical_25_terminal_adoptions.clone(),
+                state.historical_25_terminal_graph_commitments.clone(),
+                state.historical_25_staging.clone(),
+                state.historical_25_legacy_leaves.clone(),
+                state.historical_25_operation_markers.clone(),
+                state.current_recovery_authority_leaves.clone(),
+                state.historical_25_root_handoff_published,
+                state.operations.clone(),
+            )
+        };
+        let (entered, release, finished) =
+            backend.pause_next_blocking_worker_start("ebpf_historical_graph_recovery");
+        let cancelled_backend = backend.clone();
+        let observer = tokio::spawn(async move {
+            cancelled_backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+        });
+        rendezvous_test_barrier(entered).await;
+        observer.abort();
+        assert!(observer
+            .await
+            .expect_err("the public recovery observer is cancelled")
+            .is_cancelled());
+        rendezvous_test_barrier(release).await;
+        rendezvous_test_barrier(finished).await;
+
+        let after = {
+            let state = runtime.state();
+            (
+                state.historical_25_graphs.clone(),
+                state.historical_25_receipts.clone(),
+                state.historical_25_authorities.clone(),
+                state.historical_25_terminal_adoptions.clone(),
+                state.historical_25_terminal_graph_commitments.clone(),
+                state.historical_25_staging.clone(),
+                state.historical_25_legacy_leaves.clone(),
+                state.historical_25_operation_markers.clone(),
+                state.current_recovery_authority_leaves.clone(),
+                state.historical_25_root_handoff_published,
+                state.operations.clone(),
+            )
+        };
+        assert_eq!(
+            after, before,
+            "pre-admission cancellation must be no-effect"
+        );
+        assert_eq!(
+            runtime.state().historical_25_graphs[&pin_dir].pins_remaining,
+            HISTORICAL_25_PIN_COUNT
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn historical_25_public_future_cancelled_after_first_unlink_converges_for_exact_retry() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime.state().historical_25_control_root_mode =
+            FakeHistorical25ControlRootMode::Predecessor0755;
+        let (effect_reached, effect_release) =
+            runtime.pause_next_historical_recovery_effect("historical_25_pin_unlink_first");
+        let cancelled_backend = backend.clone();
+        let observer = tokio::spawn(async move {
+            cancelled_backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+        });
+        rendezvous_test_barrier(effect_reached).await;
+        observer.abort();
+        assert!(observer
+            .await
+            .expect_err("the post-effect public observer is cancelled")
+            .is_cancelled());
+        rendezvous_test_barrier(effect_release).await;
+
+        let recovered = backend
+            .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+            .await
+            .expect("the exact retry waits for and retrieves supervised completion");
+        assert_eq!(
+            recovered,
+            crate::HistoricalEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+        assert_eq!(
+            recovered.terminal_absence_proof(),
+            crate::HistoricalEbpfGraphTerminalAbsenceProof::Proven
+        );
+        assert!(recovered.exact_graph_commitment().is_some());
+        let state = runtime.state();
+        assert!(!state.historical_25_graphs.contains_key(&pin_dir));
+        assert!(!state.historical_25_legacy_leaves.contains(&pin_dir));
+        assert!(state.historical_25_operation_markers.contains(&pin_dir));
+        assert!(state.historical_25_root_handoff_published);
+        assert_eq!(
+            state
+                .operations
+                .iter()
+                .filter(|operation| **operation == "recover_orphaned_historical_graph")
+                .count(),
+            2,
+            "one supervised completion and one authoritative readback retry occur"
+        );
+    }
+
     #[tokio::test]
     async fn historical_25_recovery_maps_live_authority_mismatch_before_observation() {
         let (backend, runtime) = backend_with_fake();
@@ -64104,7 +64712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_25_recovery_hands_off_predecessor_0755_root_before_normal_attach() {
+    async fn historical_25_recovery_preserves_predecessor_0755_root_until_current_bridge() {
         let (backend, runtime) = backend_with_fake();
         seed_historical_25(&runtime);
         {
@@ -64132,14 +64740,14 @@ mod tests {
                 .contains(&"historical_25_control_root_handoff"));
         }
 
-        // This exercises the ordinary acquisition route immediately after
-        // recovery. The shared predecessor root retains its original mode;
-        // only the exact private-leaf receipt enables normal attach.
-        backend.create_device(create_request()).await.unwrap();
+        assert!(matches!(
+            backend.create_device(create_request()).await,
+            Err(GtpuError::StateIndeterminate { .. })
+        ));
     }
 
     #[tokio::test]
-    async fn historical_25_recovery_handoff_is_authoritatively_absent_to_startup_cleanup() {
+    async fn historical_25_recovery_requires_brokered_current_terminal_before_startup_create() {
         let mut fake = FakeRuntime::new();
         fake.ifindexes
             .insert("up0".to_string(), REPLACEMENT_IFINDEX);
@@ -64187,16 +64795,50 @@ mod tests {
             .expect("the startup cleanup observer classifies the retired graph");
         assert_eq!(
             classification,
-            RetainedGraphCleanupClassification::AlreadyAbsent,
-            "the exact historical terminal is not a live retained current graph"
+            RetainedGraphCleanupClassification::Refused(
+                RetainedGraphCleanupRefusal::IndeterminateState
+            ),
+            "a historical terminal is graph absence, but not ordinary-create authority"
         );
 
         let mut create = CreateGtpDeviceRequest::new("up0");
         create.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        assert!(matches!(
+            restarted.create_device(create.clone()).await,
+            Err(GtpuError::StateIndeterminate { .. })
+        ));
+
+        let intent = historical_25_successor_intent();
+        let terminal = restarted
+            .recover_orphaned_current_ebpf_graph_with_authority_receipt(
+                intent
+                    .clone()
+                    .into_request_with_authority(current_recovery_authority()),
+            )
+            .await
+            .expect("publish the source-tagged current terminal");
+        let encoded = terminal
+            .encode_authenticated_terminal()
+            .expect("only an authenticated terminal is brokerable");
+        let terminal =
+            crate::CurrentEbpfGraphRecoveryReceipt::decode_authenticated_terminal(encoded)
+                .expect("the durable broker decodes the canonical terminal receipt");
+        assert_eq!(
+            restarted
+                .admit_current_ebpf_graph_terminal(
+                    intent
+                        .clone()
+                        .into_terminal_admission_request(terminal, current_recovery_authority(),),
+                )
+                .await
+                .expect("admit the exact broker-durable terminal"),
+            crate::CurrentEbpfGraphRecoveryTerminalAdmissionOutcome::Admitted
+        );
+
         let created = restarted
             .create_device(create)
             .await
-            .expect("ordinary typed creation consumes only the SDK-authenticated handoff");
+            .expect("typed creation follows brokered terminal admission");
         assert_eq!(created.ifindex, REPLACEMENT_IFINDEX);
         let state = runtime.state();
         assert!(state.historical_25_receipts.contains_key(&pin_dir));
@@ -64206,7 +64848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_25_recovery_hands_off_shared_predecessor_root_without_mutating_other_namespaces(
+    async fn historical_25_recovery_handoff_preserves_foreign_namespace_and_blocks_unbrokered_attach(
     ) {
         let (backend, runtime) = backend_with_fake();
         let pin_dir = seed_historical_25(&runtime);
@@ -64246,7 +64888,10 @@ mod tests {
             assert!(state.historical_25_legacy_leaves.contains(&other_pin_dir));
             assert!(!state.historical_25_receipts.contains_key(&other_pin_dir));
         }
-        backend.create_device(create_request()).await.unwrap();
+        assert!(matches!(
+            backend.create_device(create_request()).await,
+            Err(GtpuError::StateIndeterminate { .. })
+        ));
     }
 
     #[tokio::test]

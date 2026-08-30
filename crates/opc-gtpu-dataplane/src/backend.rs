@@ -585,7 +585,10 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// frozen graph and its legacy authority layout, acquire the legacy and
     /// current host-global authority domains in their fixed order, and retain
     /// durable recovery proof until both graph and legacy authority retirement
-    /// are terminal. Existing implementations fail closed.
+    /// are terminal. Cancellation before the implementation admits its worker
+    /// must be no-effect. After worker admission, the operation is supervised
+    /// to completion and an exact authority-bound retry retrieves its durable
+    /// result. Existing implementations fail closed.
     async fn recover_orphaned_historical_ebpf_graph(
         &self,
         _request: HistoricalEbpfGraphRecoveryRequest,
