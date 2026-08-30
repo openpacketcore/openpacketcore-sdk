@@ -1477,6 +1477,7 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         _replacement: (&str, u32),
         _pin_dir: &Path,
         _tc_priority: u16,
+        _currentness: &dyn CurrentEbpfGraphRecoveryCurrentnessProbe,
     ) -> Result<(), GtpuError> {
         Err(GtpuError::StateIndeterminate {
             operation: "ebpf_current_successor_activation",
@@ -3822,17 +3823,28 @@ impl EbpfGtpuDataplaneBackend {
         pin_namespace: &str,
         replacement: Option<&GtpDevice>,
     ) -> CurrentRecoveryManagedState {
+        // The recovery intent names the canonical bpffs namespace, not the
+        // Linux interface.  Those happen to be identical for the legacy
+        // attachment but intentionally diverge for grouped devices (`v6-…`).
+        // Compare the derived path so the exact pending grouped successor is
+        // admitted while a different device, interface, or namespace remains
+        // an overlap conflict.
+        let requested_pin_dir = self.pin_dir(pin_namespace);
         match self.devices() {
             Ok(devices)
                 if devices.iter().any(|(ifindex, managed)| {
+                    let managed_pin_dir = managed.grouped.map_or_else(
+                        || self.pin_dir(&managed.name),
+                        |grouped| self.grouped_pin_dir(grouped.device_id),
+                    );
                     let overlaps = replacement.is_some_and(|replacement| {
                         *ifindex == replacement.ifindex || managed.name == replacement.name
-                    }) || managed.name == pin_namespace;
+                    }) || managed_pin_dir == requested_pin_dir;
                     let exact_pending_successor = replacement.is_some_and(|replacement| {
                         managed.successor_pending
                             && *ifindex == replacement.ifindex
                             && managed.name == replacement.name
-                            && managed.name == pin_namespace
+                            && managed_pin_dir == requested_pin_dir
                     });
                     overlaps && !exact_pending_successor
                 }) =>
@@ -8045,7 +8057,21 @@ impl EbpfGtpuDataplaneBackend {
                 operation: "ebpf_current_terminal_admission_attach",
             });
         }
+        if terminal_currentness.as_ref().is_some_and(|currentness| {
+            currentness.verify_current().is_err() || currentness.first_failure().is_some()
+        }) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_terminal_successor_sequence_reset",
+            });
+        }
         self.reset_traffic_sequence_source(ifindex)?;
+        if terminal_currentness.as_ref().is_some_and(|currentness| {
+            currentness.verify_current().is_err() || currentness.first_failure().is_some()
+        }) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_terminal_successor_sequence_reset",
+            });
+        }
         // Publish an explicitly requested uplink MTU policy before the device
         // becomes managed. A policy the loaded datapath cannot honor fails
         // closed rather than being silently ignored. `None` leaves the
@@ -8061,6 +8087,13 @@ impl EbpfGtpuDataplaneBackend {
         // torn policy. This ordinary old-until-new update window is the
         // intended retained-state contract.
         if let Some(policy) = request.uplink_mtu_policy {
+            if terminal_currentness.as_ref().is_some_and(|currentness| {
+                currentness.verify_current().is_err() || currentness.first_failure().is_some()
+            }) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_current_terminal_successor_policy",
+                });
+            }
             if let Err(error) = self
                 .inner
                 .runtime
@@ -8093,6 +8126,20 @@ impl EbpfGtpuDataplaneBackend {
                     }),
                 };
             }
+            if terminal_currentness.as_ref().is_some_and(|currentness| {
+                currentness.verify_current().is_err() || currentness.first_failure().is_some()
+            }) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_current_terminal_successor_policy",
+                });
+            }
+        }
+        if terminal_currentness.as_ref().is_some_and(|currentness| {
+            currentness.verify_current().is_err() || currentness.first_failure().is_some()
+        }) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_terminal_successor_registration",
+            });
         }
         devices.insert(
             ifindex,
@@ -8104,6 +8151,14 @@ impl EbpfGtpuDataplaneBackend {
                 successor_pending: terminal_execution.is_some(),
             },
         );
+        if terminal_currentness.as_ref().is_some_and(|currentness| {
+            currentness.verify_current().is_err() || currentness.first_failure().is_some()
+        }) {
+            devices.remove(&ifindex);
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_terminal_successor_registration",
+            });
+        }
         if let Some(execution) = terminal_execution {
             self.inner.runtime.finalize_current_terminal_successor(
                 &request.name,
@@ -8224,8 +8279,29 @@ impl EbpfGtpuDataplaneBackend {
                 operation: "ebpf_current_terminal_admission_grouped_attach",
             });
         }
+        if terminal_currentness.as_ref().is_some_and(|currentness| {
+            currentness.verify_current().is_err() || currentness.first_failure().is_some()
+        }) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_terminal_successor_grouped_sequence_reset",
+            });
+        }
         self.reset_traffic_sequence_source(ifindex)?;
+        if terminal_currentness.as_ref().is_some_and(|currentness| {
+            currentness.verify_current().is_err() || currentness.first_failure().is_some()
+        }) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_terminal_successor_grouped_sequence_reset",
+            });
+        }
         if let Some(policy) = request.uplink_mtu_policy {
+            if terminal_currentness.as_ref().is_some_and(|currentness| {
+                currentness.verify_current().is_err() || currentness.first_failure().is_some()
+            }) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_current_terminal_successor_grouped_policy",
+                });
+            }
             if self
                 .inner
                 .runtime
@@ -8251,6 +8327,20 @@ impl EbpfGtpuDataplaneBackend {
                     }),
                 };
             }
+            if terminal_currentness.as_ref().is_some_and(|currentness| {
+                currentness.verify_current().is_err() || currentness.first_failure().is_some()
+            }) {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "ebpf_current_terminal_successor_grouped_policy",
+                });
+            }
+        }
+        if terminal_currentness.as_ref().is_some_and(|currentness| {
+            currentness.verify_current().is_err() || currentness.first_failure().is_some()
+        }) {
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_terminal_successor_grouped_registration",
+            });
         }
         devices.insert(
             ifindex,
@@ -8265,6 +8355,14 @@ impl EbpfGtpuDataplaneBackend {
                 successor_pending: terminal_execution.is_some(),
             },
         );
+        if terminal_currentness.as_ref().is_some_and(|currentness| {
+            currentness.verify_current().is_err() || currentness.first_failure().is_some()
+        }) {
+            devices.remove(&ifindex);
+            return Err(GtpuError::StateIndeterminate {
+                operation: "ebpf_current_terminal_successor_grouped_registration",
+            });
+        }
         if let Some(execution) = terminal_execution {
             self.inner.runtime.finalize_current_terminal_successor(
                 &request.name,
@@ -8934,6 +9032,7 @@ impl EbpfGtpuDataplaneBackend {
                 (resolved.name.as_str(), resolved.ifindex),
                 &resolved.pin_dir,
                 self.inner.config.tc_priority,
+                &currentness,
             )?;
             if let Err(currentness) = Self::await_brokered_current_successor_receipt(
                 &authority,
@@ -15602,6 +15701,13 @@ mod aya_runtime {
     // fsynced before the in-graph proof pin is unlinked, so a retry can
     // authenticate graph absence after the graph directory is gone.
     const CURRENT_RECOVERY_TERMINAL_PROOF_MAP: &str = "GTPU_CURRENT_RECOVERY_TERMINAL_V1";
+    // A separate immutable record is retained after both transient WAL pins
+    // are removed.  It is not a public receipt: it is a fixed-width copy of
+    // the authenticated sealed record, pinned in the authority leaf and
+    // revalidated against the exact live graph plus brokered receipt on every
+    // response-loss retry.
+    const CURRENT_RECOVERY_FINALIZED_RECEIPT_MAP: &str =
+        "GTPU_CURRENT_RECOVERY_FINALIZED_RECEIPT_V1";
     const CURRENT_RECOVERY_MAP_IDS_OFFSET: usize = 48;
     const CURRENT_RECOVERY_PROOF_MAP_ID_OFFSET: usize =
         CURRENT_RECOVERY_MAP_IDS_OFFSET + CURRENT_MAP_NAMES.len() * 4;
@@ -16204,6 +16310,9 @@ mod aya_runtime {
         // still be authoritative; the finalizer clears it only after exact
         // post-retirement graph readback.
         successor_pending: bool,
+        // A terminal successor resets this gate while it is still fenced.
+        // It is enabled only by the broker-admission activation cut.
+        pending_traffic_observation_gate: Option<u64>,
         // Set only when this runtime itself created the grouped graph's pins
         // and hooks.  It is consumed by the first marker-mint attempt and is
         // cleared by any unbound operation, so a retained or observed graph
@@ -16227,6 +16336,10 @@ mod aya_runtime {
                 .field("datapath_identity", &self.datapath_identity)
                 .field("cleanup_only", &self.cleanup_only)
                 .field("successor_pending", &self.successor_pending)
+                .field(
+                    "pending_traffic_observation_gate",
+                    &self.pending_traffic_observation_gate.is_some(),
+                )
                 .field(
                     "selector_namespace_fresh_provisioning",
                     &self.selector_namespace_fresh_provisioning,
@@ -29922,6 +30035,103 @@ mod aya_runtime {
             )
         }
 
+        fn current_recovery_finalized_receipt_path(
+            ownership: &ReconcilerOwnership,
+        ) -> Result<PathBuf, GtpuError> {
+            Self::historical_25_descriptor_relative_pin_path(
+                &ownership._lease,
+                CURRENT_RECOVERY_FINALIZED_RECEIPT_MAP,
+                "ebpf_current_recovery_finalized_receipt",
+            )
+        }
+
+        fn read_current_finalized_successor_record(
+            ownership: &ReconcilerOwnership,
+            operation: &'static str,
+        ) -> Result<Option<CurrentRecoveryRecord>, GtpuError> {
+            let path = Self::current_recovery_finalized_receipt_path(ownership)?;
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if !metadata.file_type().is_symlink() => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Ok(_) | Err(_) => return Err(state_indeterminate(operation)),
+            }
+            let data = MapData::from_pin(path).map_err(|_| state_indeterminate(operation))?;
+            let info = data.info().map_err(|_| state_indeterminate(operation))?;
+            if info
+                .map_type()
+                .map_err(|_| state_indeterminate(operation))? as u32
+                != bpf_map_type::BPF_MAP_TYPE_ARRAY as u32
+                || info.key_size() != 4
+                || info.value_size() != CURRENT_RECOVERY_PROOF_LEN as u32
+                || info.max_entries() != 1
+                || info.map_flags() != 0
+            {
+                return Err(state_indeterminate(operation));
+            }
+            let map = Array::<_, [u8; CURRENT_RECOVERY_PROOF_LEN]>::try_from(
+                Map::from_map_data(data).map_err(|_| state_indeterminate(operation))?,
+            )
+            .map_err(|_| state_indeterminate(operation))?;
+            let record = CurrentRecoveryRecord::decode(
+                &map.get(&0, 0).map_err(|_| state_indeterminate(operation))?,
+            )
+            .ok_or_else(|| state_indeterminate(operation))?;
+            if record.phase != CurrentRecoveryPhase::SuccessorSealed {
+                return Err(state_indeterminate(operation));
+            }
+            Ok(Some(record))
+        }
+
+        fn publish_current_finalized_successor_record(
+            ownership: &ReconcilerOwnership,
+            expected: CurrentRecoveryProof,
+            currentness: &dyn super::CurrentEbpfGraphRecoveryCurrentnessProbe,
+            operation: &'static str,
+        ) -> Result<(), GtpuError> {
+            if expected.record.phase != CurrentRecoveryPhase::SuccessorSealed {
+                return Err(state_indeterminate(operation));
+            }
+            match Self::read_current_finalized_successor_record(ownership, operation)? {
+                Some(record) if record == expected.record => return Ok(()),
+                Some(_) => return Err(state_indeterminate(operation)),
+                None => {}
+            }
+            Self::current_recovery_require_effect_currentness(currentness, operation)?;
+            let mut map = Array::<MapData, [u8; CURRENT_RECOVERY_PROOF_LEN]>::create(1, 0)
+                .map_err(|_| state_indeterminate(operation))?;
+            let info = map
+                .map()
+                .info()
+                .map_err(|_| state_indeterminate(operation))?;
+            if info
+                .map_type()
+                .map_err(|_| state_indeterminate(operation))? as u32
+                != bpf_map_type::BPF_MAP_TYPE_ARRAY as u32
+                || info.key_size() != 4
+                || info.value_size() != CURRENT_RECOVERY_PROOF_LEN as u32
+                || info.max_entries() != 1
+                || info.map_flags() != 0
+            {
+                return Err(state_indeterminate(operation));
+            }
+            map.set(0, expected.record.encode(), 0)
+                .map_err(|_| state_indeterminate(operation))?;
+            Self::current_recovery_require_effect_currentness(currentness, operation)?;
+            let path = Self::current_recovery_finalized_receipt_path(ownership)?;
+            if map.pin(&path).is_err()
+                && Self::read_current_finalized_successor_record(ownership, operation)?
+                    != Some(expected.record)
+            {
+                return Err(state_indeterminate(operation));
+            }
+            Self::sync_control_directory(&ownership._lease, operation)?;
+            Self::current_recovery_require_effect_currentness(currentness, operation)?;
+            (Self::read_current_finalized_successor_record(ownership, operation)?
+                == Some(expected.record))
+            .then_some(())
+            .ok_or_else(|| state_indeterminate(operation))
+        }
+
         fn read_current_recovery_proof(
             ownership: &ReconcilerOwnership,
         ) -> Result<Option<CurrentRecoveryProof>, GtpuError> {
@@ -30980,6 +31190,25 @@ mod aya_runtime {
                 return Err(state_indeterminate(OPERATION));
             }
             Ok(())
+        }
+
+        /// Fence every live successor-side write, not merely the durable WAL
+        /// transition.  A terminal receipt authorizes preparation only while
+        /// its exact broker authority remains current; no map/config/schema
+        /// or hook effect may straddle a revoked generation unnoticed.
+        fn with_current_terminal_successor_effect<T>(
+            admission: Option<&super::CurrentTerminalAdmissionExecution<'_>>,
+            operation: &'static str,
+            effect: impl FnOnce() -> Result<T, GtpuError>,
+        ) -> Result<T, GtpuError> {
+            if let Some(admission) = admission {
+                Self::require_current_terminal_admission_current(admission, operation)?;
+            }
+            let result = effect();
+            if let Some(admission) = admission {
+                Self::require_current_terminal_admission_current(admission, operation)?;
+            }
+            result
         }
 
         fn open_current_terminal_successor_pin_directory(
@@ -35540,12 +35769,20 @@ mod aya_runtime {
             // Clear stale proof authority before a retained hook can be
             // replaced. The post-attachment check below is the quiescence
             // fence for records that were already executing in the old hook.
-            let traffic_observation_gate = Self::reset_traffic_observation_source(&mut ebpf)?;
+            let traffic_observation_gate = Self::with_current_terminal_successor_effect(
+                terminal_admission.as_ref(),
+                "ebpf_current_successor_gate_reset",
+                || Self::reset_traffic_observation_source(&mut ebpf),
+            )?;
             let provisioned = (|| {
                 if schema_state == BearerSchemaState::Fresh {
                     // A fresh pin transaction owns the new config slot and
                     // publishes it before either program can see traffic.
-                    self.config_write(&mut ebpf, local_ip)?;
+                    Self::with_current_terminal_successor_effect(
+                        terminal_admission.as_ref(),
+                        "ebpf_current_successor_config_write",
+                        || self.config_write(&mut ebpf, local_ip),
+                    )?;
                 } else if self.config_read(&ebpf)? != local_ip {
                     // Retained pins may still serve a live prior-generation
                     // datapath. Never mutate its shared config before hook
@@ -35558,23 +35795,50 @@ mod aya_runtime {
                     schema_state,
                     BearerSchemaState::SourcePortV4 | BearerSchemaState::PmtuV5
                 ) {
-                    Self::recover_incomplete_pdp_commits(&mut ebpf, local_ip, ifindex)?;
+                    Self::with_current_terminal_successor_effect(
+                        terminal_admission.as_ref(),
+                        "ebpf_current_successor_map_recovery",
+                        || Self::recover_incomplete_pdp_commits(&mut ebpf, local_ip, ifindex),
+                    )?;
                     Self::pdp_host_indexes(&ebpf, local_ip, ifindex, true)?
                 } else {
                     let pre_v4_indexes = Self::pdp_host_indexes(&ebpf, local_ip, ifindex, false)?;
-                    Self::materialize_legacy_source_port_policies(&mut ebpf, &pre_v4_indexes)?;
-                    Self::recover_incomplete_pdp_commits(&mut ebpf, local_ip, ifindex)?;
+                    Self::with_current_terminal_successor_effect(
+                        terminal_admission.as_ref(),
+                        "ebpf_current_successor_source_port_schema",
+                        || {
+                            Self::materialize_legacy_source_port_policies(
+                                &mut ebpf,
+                                &pre_v4_indexes,
+                            )
+                        },
+                    )?;
+                    Self::with_current_terminal_successor_effect(
+                        terminal_admission.as_ref(),
+                        "ebpf_current_successor_map_recovery",
+                        || Self::recover_incomplete_pdp_commits(&mut ebpf, local_ip, ifindex),
+                    )?;
                     Self::pdp_host_indexes(&ebpf, local_ip, ifindex, true)?
                 };
-                let attached = self.attach_programs(
-                    &mut ebpf,
-                    interface,
-                    ifindex,
-                    &canonical_pin_dir,
-                    tc_priority,
+                let attached = Self::with_current_terminal_successor_effect(
+                    terminal_admission.as_ref(),
+                    "ebpf_current_successor_tc_hooks",
+                    || {
+                        self.attach_programs(
+                            &mut ebpf,
+                            interface,
+                            ifindex,
+                            &canonical_pin_dir,
+                            tc_priority,
+                        )
+                    },
                 )?;
                 if schema_state != BearerSchemaState::PmtuV5 {
-                    if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
+                    if let Err(error) = Self::with_current_terminal_successor_effect(
+                        terminal_admission.as_ref(),
+                        "ebpf_current_successor_bearer_schema",
+                        || Self::write_bearer_schema_marker(&mut ebpf),
+                    ) {
                         if attached.replaced_existing {
                             // Both exact current hooks remain live. Retaining them
                             // with the prior marker is a retryable,
@@ -35597,7 +35861,11 @@ mod aya_runtime {
                         ));
                     }
                 }
-                if let Err(error) = Self::ensure_tft_schema_marker(&mut ebpf) {
+                if let Err(error) = Self::with_current_terminal_successor_effect(
+                    terminal_admission.as_ref(),
+                    "ebpf_current_successor_tft_schema",
+                    || Self::ensure_tft_schema_marker(&mut ebpf),
+                ) {
                     if attached.replaced_existing {
                         return Err(state_indeterminate("ebpf_tft_schema_commit"));
                     }
@@ -35635,13 +35903,25 @@ mod aya_runtime {
                     return Err(error);
                 }
             };
-            if let Err(error) = Self::verify_traffic_observation_source_quiescent(
+            let traffic_observation_result = Self::verify_traffic_observation_source_quiescent(
                 &mut ebpf,
                 traffic_observation_gate,
             )
             .and_then(|()| {
-                Self::enable_traffic_observation_source(&mut ebpf, traffic_observation_gate)
-            }) {
+                if let Some(admission) = terminal_admission.as_ref() {
+                    // The successor is intentionally traffic-inert while its
+                    // broker acknowledgement can still be lost or revoked.
+                    // Activation performs this gate write only after durable
+                    // successor admission under a fresh authority readback.
+                    Self::require_current_terminal_admission_current(
+                        admission,
+                        "ebpf_current_successor_gate_hold",
+                    )
+                } else {
+                    Self::enable_traffic_observation_source(&mut ebpf, traffic_observation_gate)
+                }
+            });
+            if let Err(error) = traffic_observation_result {
                 if !attached.replaced_existing {
                     let _ = detach_datapath_if_current(
                         attached.links,
@@ -35699,6 +35979,9 @@ mod aya_runtime {
                     datapath_identity: attached.identity,
                     cleanup_only: false,
                     successor_pending: false,
+                    pending_traffic_observation_gate: successor
+                        .as_ref()
+                        .map(|_| traffic_observation_gate),
                     selector_namespace_fresh_provisioning: false,
                     _reconciler_ownership: Arc::clone(&reconciler_ownership),
                 },
@@ -35870,7 +36153,11 @@ mod aya_runtime {
             }
             let canonical_pin_dir = reconciler_ownership.canonical_pin_dir.clone();
 
-            let traffic_observation_gate = Self::reset_traffic_observation_source(&mut ebpf)?;
+            let traffic_observation_gate = Self::with_current_terminal_successor_effect(
+                terminal_admission.as_ref(),
+                "ebpf_current_successor_grouped_gate_reset",
+                || Self::reset_traffic_observation_source(&mut ebpf),
+            )?;
 
             let provisioned = (|| {
                 self.require_canonical_pmtu_slot(&ebpf)?;
@@ -35905,7 +36192,11 @@ mod aya_runtime {
                         }
                         Self::validate_replacement_identity(interface, ifindex)
                             .map_err(|_| state_indeterminate("ebpf_grouped_interface_identity"))?;
-                        Self::grouped_config_write_verified(&mut ebpf, config)?;
+                        Self::with_current_terminal_successor_effect(
+                            terminal_admission.as_ref(),
+                            "ebpf_current_successor_grouped_config",
+                            || Self::grouped_config_write_verified(&mut ebpf, config),
+                        )?;
                     }
                     Some(_) => return Err(GtpuError::AlreadyExists),
                 }
@@ -35924,21 +36215,35 @@ mod aya_runtime {
                         {
                             return Err(state_indeterminate("ebpf_grouped_schema"));
                         }
-                        Self::grouped_schema_write_verified(&mut ebpf)?;
+                        Self::with_current_terminal_successor_effect(
+                            terminal_admission.as_ref(),
+                            "ebpf_current_successor_grouped_schema",
+                            || Self::grouped_schema_write_verified(&mut ebpf),
+                        )?;
                     }
                 }
 
                 Self::validate_replacement_identity(interface, ifindex)
                     .map_err(|_| state_indeterminate("ebpf_grouped_interface_identity"))?;
-                let attached = self.attach_programs(
-                    &mut ebpf,
-                    interface,
-                    ifindex,
-                    &canonical_pin_dir,
-                    tc_priority,
+                let attached = Self::with_current_terminal_successor_effect(
+                    terminal_admission.as_ref(),
+                    "ebpf_current_successor_grouped_tc_hooks",
+                    || {
+                        self.attach_programs(
+                            &mut ebpf,
+                            interface,
+                            ifindex,
+                            &canonical_pin_dir,
+                            tc_priority,
+                        )
+                    },
                 )?;
                 if bearer_state != BearerSchemaState::PmtuV5 {
-                    if let Err(error) = Self::write_bearer_schema_marker(&mut ebpf) {
+                    if let Err(error) = Self::with_current_terminal_successor_effect(
+                        terminal_admission.as_ref(),
+                        "ebpf_current_successor_grouped_bearer_schema",
+                        || Self::write_bearer_schema_marker(&mut ebpf),
+                    ) {
                         if attached.replaced_existing {
                             return Err(state_indeterminate("ebpf_schema_marker_commit"));
                         }
@@ -35956,7 +36261,11 @@ mod aya_runtime {
                         ));
                     }
                 }
-                if let Err(error) = Self::ensure_tft_schema_marker(&mut ebpf) {
+                if let Err(error) = Self::with_current_terminal_successor_effect(
+                    terminal_admission.as_ref(),
+                    "ebpf_current_successor_grouped_tft_schema",
+                    || Self::ensure_tft_schema_marker(&mut ebpf),
+                ) {
                     if attached.replaced_existing {
                         return Err(state_indeterminate("ebpf_tft_schema_commit"));
                     }
@@ -35994,13 +36303,21 @@ mod aya_runtime {
                     return Err(error);
                 }
             };
-            if let Err(error) = Self::verify_traffic_observation_source_quiescent(
+            let traffic_observation_result = Self::verify_traffic_observation_source_quiescent(
                 &mut ebpf,
                 traffic_observation_gate,
             )
             .and_then(|()| {
-                Self::enable_traffic_observation_source(&mut ebpf, traffic_observation_gate)
-            }) {
+                if let Some(admission) = terminal_admission.as_ref() {
+                    Self::require_current_terminal_admission_current(
+                        admission,
+                        "ebpf_current_successor_grouped_gate_hold",
+                    )
+                } else {
+                    Self::enable_traffic_observation_source(&mut ebpf, traffic_observation_gate)
+                }
+            });
+            if let Err(error) = traffic_observation_result {
                 if !attached.replaced_existing {
                     let _ = detach_datapath_if_current(
                         attached.links,
@@ -36059,6 +36376,9 @@ mod aya_runtime {
                     datapath_identity: attached.identity,
                     cleanup_only: false,
                     successor_pending: false,
+                    pending_traffic_observation_gate: successor
+                        .as_ref()
+                        .map(|_| traffic_observation_gate),
                     selector_namespace_fresh_provisioning: !pins_preexisted && successor.is_none(),
                     _reconciler_ownership: Arc::clone(&reconciler_ownership),
                 },
@@ -36444,6 +36764,7 @@ mod aya_runtime {
                     datapath_identity: attached.identity,
                     cleanup_only: false,
                     successor_pending: false,
+                    pending_traffic_observation_gate: None,
                     selector_namespace_fresh_provisioning: false,
                     _reconciler_ownership: Arc::clone(&reconciler_ownership),
                 },
@@ -36668,6 +36989,7 @@ mod aya_runtime {
                     datapath_identity,
                     cleanup_only: true,
                     successor_pending: false,
+                    pending_traffic_observation_gate: None,
                     selector_namespace_fresh_provisioning: false,
                     _reconciler_ownership: reconciler_ownership,
                 },
@@ -39535,6 +39857,94 @@ mod aya_runtime {
                 }
             };
             let Some(terminal) = terminal else {
+                // Both transient WAL pins may already be gone when the
+                // broker committed the response but its reply was lost.  A
+                // current-source successor keeps this independent sealed
+                // record in the authority leaf; unlike public receipt bytes
+                // it is accepted only after two exact live-graph reads and
+                // reconstruction of the full typed receipt.
+                if let Some(record) =
+                    Self::read_current_finalized_successor_record(&ownership, OPERATION)?
+                {
+                    // This leaf is reserved for the CurrentGraph terminal
+                    // source.  A different well-formed record is still
+                    // hostile state: never let it bypass the historical R5
+                    // proof path below.
+                    if record.terminal_source != CurrentRecoveryTerminalSourceKind::CurrentGraph {
+                        return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
+                    }
+                    if record.authority_binding() != Some(authority) {
+                        return Ok(refused(CurrentEbpfGraphRecoveryRefusal::AuthorityMismatch));
+                    }
+                    let finalized = CurrentRecoveryProof {
+                        record,
+                        map_id: record.proof_map_id,
+                    };
+                    let first = match Self::retained_finalized_successor_graph_identity(
+                        &ownership,
+                        &graph_lock,
+                        replacement,
+                        tc_priority,
+                        configuration,
+                        OPERATION,
+                    ) {
+                        Ok(identity) => identity,
+                        Err(_) => {
+                            return Ok(refused(
+                                CurrentEbpfGraphRecoveryRefusal::IndeterminateState,
+                            ));
+                        }
+                    };
+                    if finalized.record.successor_receipt(
+                        replacement,
+                        tc_priority,
+                        configuration,
+                        &first,
+                    ) != Some(receipt)
+                    {
+                        return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
+                    }
+                    if let Err(currentness) = currentness.verify_current() {
+                        return Ok(refused(super::current_recovery_currentness_refusal(
+                            currentness,
+                        )));
+                    }
+                    let second = match Self::retained_finalized_successor_graph_identity(
+                        &ownership,
+                        &graph_lock,
+                        replacement,
+                        tc_priority,
+                        configuration,
+                        OPERATION,
+                    ) {
+                        Ok(identity) => identity,
+                        Err(_) => {
+                            return Ok(refused(
+                                CurrentEbpfGraphRecoveryRefusal::IndeterminateState,
+                            ));
+                        }
+                    };
+                    if first != second
+                        || finalized.record.successor_receipt(
+                            replacement,
+                            tc_priority,
+                            configuration,
+                            &second,
+                        ) != Some(receipt)
+                        || Self::read_current_finalized_successor_record(&ownership, OPERATION)?
+                            != Some(record)
+                        || !matches!(Self::read_current_terminal_proof(&ownership), Ok(None))
+                        || !matches!(Self::read_current_recovery_proof(&ownership), Ok(None))
+                    {
+                        return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
+                    }
+                    if let Err(currentness) = currentness.verify_current() {
+                        return Ok(refused(super::current_recovery_currentness_refusal(
+                            currentness,
+                        )));
+                    }
+                    return Ok(Outcome::AlreadyFinalized);
+                }
                 // Response-loss recovery is intentionally narrower than the
                 // live-WAL path.  Only the persistent authentic R5 handoff
                 // can independently prove provenance after r7 is absent.
@@ -39695,6 +40105,22 @@ mod aya_runtime {
                 return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
             }
 
+            // Persist the sealed record before removing either transient WAL
+            // pin.  This is the only post-finalization response-loss witness
+            // for a CurrentGraph source and remains inert until the exact
+            // brokered receipt is re-presented and fully reauthenticated.
+            if terminal.record.terminal_source == CurrentRecoveryTerminalSourceKind::CurrentGraph
+                && Self::publish_current_finalized_successor_record(
+                    &ownership,
+                    terminal,
+                    currentness,
+                    OPERATION,
+                )
+                .is_err()
+            {
+                return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
+            }
+
             if main.is_some() {
                 Self::unlink_current_successor_graph_proof_leaf(
                     &ownership,
@@ -39771,8 +40197,10 @@ mod aya_runtime {
             replacement: (&str, u32),
             pin_dir: &Path,
             tc_priority: u16,
+            currentness: &dyn super::CurrentEbpfGraphRecoveryCurrentnessProbe,
         ) -> Result<(), GtpuError> {
             const OPERATION: &str = "ebpf_current_successor_activation";
+            Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
             let mut devices = self
                 .devices
                 .lock()
@@ -39790,6 +40218,20 @@ mod aya_runtime {
             {
                 return Err(state_indeterminate(OPERATION));
             }
+            let gate = device
+                .pending_traffic_observation_gate
+                .ok_or_else(|| state_indeterminate(OPERATION))?;
+            Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
+            Self::verify_traffic_observation_source_quiescent(&mut device.ebpf, gate)?;
+            Self::enable_traffic_observation_source(&mut device.ebpf, gate)?;
+            if Self::current_recovery_require_effect_currentness(currentness, OPERATION).is_err() {
+                // Authority changed across the enable write.  The successor
+                // remains process-fenced and its observation source is
+                // immediately returned to the disabled incarnation.
+                let _ = Self::reset_traffic_observation_source(&mut device.ebpf);
+                return Err(state_indeterminate(OPERATION));
+            }
+            device.pending_traffic_observation_gate = None;
             device.successor_pending = false;
             Ok(())
         }
@@ -40631,6 +41073,7 @@ mod aya_runtime {
                 datapath_identity,
                 cleanup_only: _,
                 successor_pending: _,
+                pending_traffic_observation_gate: _,
                 selector_namespace_fresh_provisioning: _,
                 _reconciler_ownership: _ownership,
             } = held;
@@ -47643,6 +48086,10 @@ mod tests {
         // observable in unit tests instead of collapsing both durable effects
         // into one HashMap removal.
         current_recovery_successor_main_leaves: HashMap<PathBuf, FakeCurrentTerminalWal>,
+        // Durable response-loss witness retained after the two transient WAL
+        // leaves are retired.  Tests model the same strict request-side
+        // reauthentication as the production finalized-receipt map.
+        current_recovery_finalized_receipts: HashMap<PathBuf, FakeCurrentTerminalWal>,
         // Models any selector authority/decommission marker that survives in
         // an otherwise terminal current authority leaf. Production requires
         // that inventory to be empty before authenticating or transferring
@@ -47695,6 +48142,10 @@ mod tests {
         // An attached successor cannot serve or accept ordinary map effects
         // until both durable successor proofs are conclusively retired.
         successor_pending: HashSet<u32>,
+        // Model the retained tc gate itself, separately from the process-local
+        // ordinary-runtime fence. A linked terminal successor must pass every
+        // packet unchanged until exact broker admission activates it.
+        successor_datapath_inert: HashSet<u32>,
         operations: Vec<&'static str>,
         // Test-only adversarial boundary: a configured map read expires the
         // selector permit before the following exact mutation.
@@ -47917,6 +48368,7 @@ mod tests {
         downlink_filter_pin_dir: HashMap<u32, PathBuf>,
         cleanup_only: HashSet<u32>,
         successor_pending: HashSet<u32>,
+        successor_datapath_inert: HashSet<u32>,
         session_groups:
             HashMap<(u32, [u8; GTPU_SESSION_GROUP_ID_LEN]), [u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
         session_uplink_index:
@@ -47969,6 +48421,7 @@ mod tests {
                 downlink_filter_pin_dir: state.downlink_filter_pin_dir.clone(),
                 cleanup_only: state.cleanup_only.clone(),
                 successor_pending: state.successor_pending.clone(),
+                successor_datapath_inert: state.successor_datapath_inert.clone(),
                 session_groups: state.session_groups.clone(),
                 session_uplink_index: state.session_uplink_index.clone(),
                 session_downlink_index: state.session_downlink_index.clone(),
@@ -49954,6 +50407,11 @@ mod tests {
             state
                 .schema
                 .insert(pin_dir.to_path_buf(), FakeSchema::PmtuV5);
+            if terminal_admission.is_none() {
+                // A fresh process can only enable an already-admitted
+                // successor by completing an ordinary exact retained attach.
+                state.successor_datapath_inert.remove(&ifindex);
+            }
             Ok(disposition)
         }
 
@@ -50006,7 +50464,12 @@ mod tests {
             if state.pinned_config.contains_key(pin_dir) {
                 return Err(GtpuError::AlreadyExists);
             }
-            let disposition = if state.pinned_grouped_config.contains_key(pin_dir)
+            // A terminal-authorized successor is a retained recovery graph
+            // even when the new grouped maps were just materialized.  It
+            // must not mint fresh selector-namespace authority before its
+            // brokered successor receipt is admitted.
+            let disposition = if terminal_admission.is_some()
+                || state.pinned_grouped_config.contains_key(pin_dir)
                 || state.grouped_schema_ready.contains(pin_dir)
                 || state.schema.contains_key(pin_dir)
             {
@@ -50208,6 +50671,12 @@ mod tests {
             } else {
                 state.selector_namespace_fresh_provisioning.remove(&ifindex);
             }
+            if terminal_admission.is_none() {
+                // See the legacy attach path above: a restart has no
+                // process-local activation handle, so it enables only after
+                // this whole retained attachment has completed.
+                state.successor_datapath_inert.remove(&ifindex);
+            }
             Ok(disposition)
         }
 
@@ -50324,6 +50793,10 @@ mod tests {
             {
                 return Err(state_indeterminate(OPERATION));
             }
+            // The authentic receipt needs the linked hooks for its graph
+            // identity, but their packet behavior remains inert until the
+            // separate broker-admission activation cut.
+            state.successor_datapath_inert.insert(ifindex);
             state.successor_pending.insert(ifindex);
             if state.current_recovery_terminal_leaves.get(pin_dir) != Some(&sealed)
                 || state.current_recovery_successor_main_leaves.get(pin_dir) != Some(&sealed)
@@ -51610,6 +52083,35 @@ mod tests {
             }
             let Some(terminal) = state.current_recovery_terminal_leaves.get(pin_dir).copied()
             else {
+                if let Some(finalized) = state
+                    .current_recovery_finalized_receipts
+                    .get(pin_dir)
+                    .copied()
+                {
+                    if finalized.source
+                        == crate::CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph
+                        && finalized.authority == authority
+                        && !state.current_recovery_authority_leaves.contains(pin_dir)
+                        && !state
+                            .current_recovery_successor_main_leaves
+                            .contains_key(pin_dir)
+                        && Self::fake_successor_receipt(
+                            &state,
+                            pin_dir,
+                            replacement,
+                            tc_priority,
+                            configuration,
+                            finalized,
+                        ) == Some(receipt)
+                    {
+                        drop(state);
+                        if let Err(currentness) = currentness.verify_current() {
+                            return Ok(refused(current_recovery_currentness_refusal(currentness)));
+                        }
+                        return Ok(Outcome::AlreadyFinalized);
+                    }
+                    return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
+                }
                 let historical_source_is_exact = state
                     .historical_25_receipts
                     .get(pin_dir)
@@ -51670,6 +52172,29 @@ mod tests {
             {
                 return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState));
             }
+            if terminal.source == crate::CurrentEbpfGraphRecoveryTerminalSource::CurrentGraph {
+                match state.current_recovery_finalized_receipts.get(pin_dir) {
+                    Some(existing) if *existing == terminal => {}
+                    Some(_) => {
+                        return Ok(refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState))
+                    }
+                    None => {
+                        if currentness.verify_current().is_err()
+                            || currentness.first_failure().is_some()
+                        {
+                            return Ok(refused(CurrentEbpfGraphRecoveryRefusal::AuthorityChanged));
+                        }
+                        state
+                            .current_recovery_finalized_receipts
+                            .insert(pin_dir.to_path_buf(), terminal);
+                        if currentness.verify_current().is_err()
+                            || currentness.first_failure().is_some()
+                        {
+                            return Ok(refused(CurrentEbpfGraphRecoveryRefusal::AuthorityChanged));
+                        }
+                    }
+                }
+            }
             match state
                 .current_recovery_successor_main_leaves
                 .get(pin_dir)
@@ -51728,8 +52253,12 @@ mod tests {
             replacement: (&str, u32),
             pin_dir: &Path,
             tc_priority: u16,
+            currentness: &dyn CurrentEbpfGraphRecoveryCurrentnessProbe,
         ) -> Result<(), GtpuError> {
             const OPERATION: &str = "fake_current_successor_activation";
+            if currentness.verify_current().is_err() || currentness.first_failure().is_some() {
+                return Err(state_indeterminate(OPERATION));
+            }
             let mut state = self.state();
             let mut exact = false;
             for (ifindex, attached) in &state.attached {
@@ -51750,7 +52279,16 @@ mod tests {
                 exact = true;
             }
             if exact {
+                if currentness.verify_current().is_err() || currentness.first_failure().is_some() {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                state.successor_datapath_inert.remove(&replacement.1);
                 state.successor_pending.remove(&replacement.1);
+                if currentness.verify_current().is_err() || currentness.first_failure().is_some() {
+                    state.successor_datapath_inert.insert(replacement.1);
+                    state.successor_pending.insert(replacement.1);
+                    return Err(state_indeterminate(OPERATION));
+                }
             }
             Ok(())
         }
@@ -61088,6 +61626,12 @@ mod tests {
             );
             assert!(state.current_recovery_authority_leaves.contains(&pin_dir));
             assert!(state.successor_pending.contains(&REPLACEMENT_IFINDEX));
+            assert!(
+                state
+                    .successor_datapath_inert
+                    .contains(&REPLACEMENT_IFINDEX),
+                "linked successor hooks pass packets unchanged until broker admission"
+            );
         }
         let receipt = match backend
             .inspect_current_ebpf_graph_successor(
@@ -64244,12 +64788,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn successor_traffic_gate_is_the_first_tc_packet_effect_boundary() {
+        // This test reads the committed eBPF source from the host test crate,
+        // where it is executable in CI even though the standalone datapath
+        // crate targets `bpfel-unknown-none`. The build script below compiles
+        // that same source into the committed runtime object.
+        let source = include_str!("../../opc-gtpu-dataplane-ebpf/src/main.rs");
+        for (classifier, terminator, first_packet_read) in [
+            (
+                "pub fn opc_gtpu_uplink(mut ctx: TcContext)",
+                "#[classifier]\npub fn opc_gtpu_downlink",
+                "let mark = packet_mark(&ctx);",
+            ),
+            (
+                "pub fn opc_gtpu_downlink(mut ctx: TcContext)",
+                "/// Uplink: inner IPv4 packet",
+                "let Ok(ether_type) = ctx.load::<u16>(12)",
+            ),
+        ] {
+            let (_, root) = source
+                .split_once(format!("#[classifier]\n{classifier}").as_str())
+                .expect("tc classifier root is present");
+            let (root, _) = root
+                .split_once(terminator)
+                .expect("tc classifier root has a bounded body");
+            let gate_start = root
+                .find("if !traffic_gate_allows_packet_effects()")
+                .expect("classifier has a traffic-inert gate");
+            let first_effect = root
+                .find(first_packet_read)
+                .expect("packet-processing body is present");
+            assert!(gate_start < first_effect);
+            let gate = &root[gate_start..first_effect];
+            assert!(gate.contains("return TC_ACT_OK;"));
+            assert!(!gate.contains("bpf_redirect"));
+            assert!(!gate.contains("TC_ACT_SHOT"));
+            assert!(!gate.contains("bpf_skb_"));
+        }
+    }
+
     #[tokio::test]
     async fn historical_25_sealed_successor_is_fenced_until_same_process_broker_admission() {
         use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Outcome;
 
         let (backend, runtime, receipt) = sealed_historical_25_successor().await;
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
+        assert!(
+            runtime
+                .state()
+                .successor_datapath_inert
+                .contains(&REPLACEMENT_IFINDEX),
+            "the pre-admission tc graph is packet-inert"
+        );
         assert!(matches!(
             backend.resolve_device("up0").await,
             Err(GtpuError::StateIndeterminate {
@@ -64279,6 +64870,12 @@ mod tests {
         );
         let state = runtime.state();
         assert!(!state.successor_pending.contains(&REPLACEMENT_IFINDEX));
+        assert!(
+            !state
+                .successor_datapath_inert
+                .contains(&REPLACEMENT_IFINDEX),
+            "the exact same-process broker admission is the activation cut"
+        );
         assert!(!state
             .current_recovery_successor_main_leaves
             .contains_key(&pin_dir));
@@ -64310,6 +64907,12 @@ mod tests {
             assert!(state.historical_25_receipts.contains_key(&pin_dir));
             assert!(state.historical_25_authorities.contains_key(&pin_dir));
             assert!(state.historical_25_operation_markers.contains(&pin_dir));
+            assert!(
+                state
+                    .successor_datapath_inert
+                    .contains(&REPLACEMENT_IFINDEX),
+                "process loss cannot turn a retained successor hook live"
+            );
             (
                 state.historical_25_receipts[&pin_dir],
                 state.historical_25_authorities[&pin_dir],
@@ -64338,6 +64941,12 @@ mod tests {
                 .current_recovery_successor_main_leaves
                 .contains_key(&pin_dir));
             assert!(!state.current_recovery_authority_leaves.contains(&pin_dir));
+            assert!(
+                state
+                    .successor_datapath_inert
+                    .contains(&REPLACEMENT_IFINDEX),
+                "fresh-process acknowledgement alone has no local activation handle"
+            );
         }
 
         for _ in 0..3 {
@@ -64363,6 +64972,12 @@ mod tests {
                 .current_recovery_successor_main_leaves
                 .contains_key(&pin_dir));
             assert!(!state.current_recovery_authority_leaves.contains(&pin_dir));
+            assert!(
+                !state
+                    .successor_datapath_inert
+                    .contains(&REPLACEMENT_IFINDEX),
+                "the fresh-process retained attach activates only after exact admission"
+            );
         }
     }
 
@@ -65066,6 +65681,262 @@ mod tests {
                 .await
                 .unwrap(),
             CurrentEbpfGraphRecoveryOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn current_successor_response_loss_retries_only_the_exact_finalized_receipt() {
+        use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Admission;
+        use crate::CurrentEbpfGraphRecoveryTerminalAdmissionOutcome as TerminalAdmission;
+
+        let mut fake = FakeRuntime::new();
+        fake.ifindexes
+            .insert("s2bu-old".to_string(), REPLACEMENT_IFINDEX);
+        let runtime = Arc::new(fake);
+        let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu-old");
+        runtime
+            .state()
+            .current_graphs
+            .insert(pin_dir.clone(), FakeCurrentGraph::default());
+        let intent = || {
+            crate::CurrentEbpfGraphRecoveryIntent::new(
+                "s2bu-old",
+                crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            )
+            .with_replacement_device(GtpDevice {
+                name: "s2bu-old".to_string(),
+                ifindex: REPLACEMENT_IFINDEX,
+            })
+            .with_drain_proof(crate::CurrentEbpfGraphDrainProof::sessions_and_traffic_drained())
+        };
+        let terminal = backend
+            .recover_orphaned_current_ebpf_graph_with_authority_receipt(
+                intent().into_request_with_authority(current_recovery_authority()),
+            )
+            .await
+            .expect("publish current-source terminal");
+        assert_eq!(
+            backend
+                .admit_current_ebpf_graph_terminal(
+                    intent()
+                        .into_terminal_admission_request(terminal, current_recovery_authority()),
+                )
+                .await
+                .expect("broker admits current terminal"),
+            TerminalAdmission::Admitted
+        );
+        let mut create = CreateGtpDeviceRequest::new("s2bu-old");
+        create.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        backend.create_device(create).await.expect("seal successor");
+        let target = || {
+            let mut request = CreateGtpDeviceRequest::new("s2bu-old");
+            request.bind_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+            crate::CurrentEbpfGraphRecoverySuccessorTarget::Legacy(request)
+        };
+        let receipt = match backend
+            .inspect_current_ebpf_graph_successor(
+                intent().into_successor_inspection_request(target(), current_recovery_authority()),
+            )
+            .await
+            .expect("inspect sealed current successor")
+        {
+            crate::CurrentEbpfGraphRecoverySuccessorInspectionOutcome::Authenticated(receipt) => {
+                receipt
+            }
+            outcome => panic!("unexpected successor inspection: {outcome:?}"),
+        };
+        assert_eq!(
+            backend
+                .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
+                    target(),
+                    receipt,
+                    current_recovery_authority_for_successor_receipt(receipt),
+                ),)
+                .await
+                .expect("admit exact current successor"),
+            Admission::Admitted
+        );
+        assert!(runtime
+            .state()
+            .current_recovery_finalized_receipts
+            .contains_key(&pin_dir));
+        drop(backend);
+        runtime.state().attached.remove(&REPLACEMENT_IFINDEX);
+        let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let mut forged_bytes = receipt.encode();
+        forged_bytes[232] ^= 1;
+        let mut forged_digest = Sha256::new();
+        forged_digest.update(b"opc.gtpu.current-ebpf-successor-receipt-codec\0r1");
+        forged_digest
+            .update(crate::CURRENT_EBPF_GRAPH_RECOVERY_SUCCESSOR_RECEIPT_CODEC_ID.as_bytes());
+        forged_digest.update(&forged_bytes[..384]);
+        forged_bytes[384..].copy_from_slice(&forged_digest.finalize());
+        let forged = crate::CurrentEbpfGraphRecoverySuccessorReceipt::decode(forged_bytes)
+            .expect("checksum-valid forged receipt is only typed input");
+        assert_ne!(forged.commitment(), receipt.commitment());
+        assert_eq!(
+            restarted
+                .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
+                    target(),
+                    forged,
+                    current_recovery_authority_for_successor_receipt(forged),
+                ))
+                .await
+                .expect("forged receipt is a bounded refusal"),
+            Admission::Refused(CurrentEbpfGraphRecoveryRefusal::IndeterminateState)
+        );
+        assert_eq!(
+            restarted
+                .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
+                    target(),
+                    receipt,
+                    current_recovery_authority_for_successor_receipt(receipt),
+                ),)
+                .await
+                .expect("same brokered receipt survives lost response"),
+            Admission::AlreadyFinalized
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_successor_same_process_admission_uses_its_canonical_pin_namespace() {
+        use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Admission;
+        use crate::CurrentEbpfGraphRecoveryTerminalAdmissionOutcome as TerminalAdmission;
+
+        let device_id = grouped_device_id(0x58);
+        let endpoints = GtpuLocalEndpointSet::new(IpAddr::V6(ipv6_local()), None).unwrap();
+        let runtime = Arc::new(FakeRuntime::new());
+        let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let pin_dir = backend.grouped_pin_dir(device_id);
+        let namespace = pin_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("canonical grouped namespace")
+            .to_string();
+        runtime
+            .state()
+            .current_graphs
+            .insert(pin_dir, FakeCurrentGraph::default());
+        let intent = || {
+            crate::CurrentEbpfGraphRecoveryIntent::new(
+                &namespace,
+                crate::CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            )
+            .with_replacement_device(GtpDevice {
+                name: "s2bu-new".to_string(),
+                ifindex: REPLACEMENT_IFINDEX,
+            })
+            .with_drain_proof(crate::CurrentEbpfGraphDrainProof::sessions_and_traffic_drained())
+        };
+        let target = || {
+            crate::CurrentEbpfGraphRecoverySuccessorTarget::Grouped(grouped_device_request(
+                "s2bu-new", device_id, endpoints,
+            ))
+        };
+        let terminal = backend
+            .recover_orphaned_current_ebpf_graph_with_authority_receipt(
+                intent().into_request_with_authority(current_recovery_authority()),
+            )
+            .await
+            .expect("publish grouped current terminal");
+        assert_eq!(
+            backend
+                .admit_current_ebpf_graph_terminal(
+                    intent()
+                        .into_terminal_admission_request(terminal, current_recovery_authority()),
+                )
+                .await
+                .expect("broker admits grouped terminal"),
+            TerminalAdmission::Admitted
+        );
+        backend
+            .create_device_with_endpoints(grouped_device_request("s2bu-new", device_id, endpoints))
+            .await
+            .expect("same process seals grouped successor");
+        assert!(
+            runtime
+                .state()
+                .successor_datapath_inert
+                .contains(&REPLACEMENT_IFINDEX),
+            "grouped linked hooks are packet-inert before broker admission"
+        );
+
+        // A shared ifindex, Linux name, or different grouped namespace must
+        // not be mistaken for this pending successor.
+        assert!(matches!(
+            backend
+                .create_device_with_endpoints(grouped_device_request(
+                    "s2bu-new",
+                    grouped_device_id(0x59),
+                    endpoints,
+                ))
+                .await,
+            Err(GtpuError::AlreadyExists)
+        ));
+        let wrong_endpoints =
+            GtpuLocalEndpointSet::new(IpAddr::V6("2001:db8:10::99".parse().unwrap()), None)
+                .unwrap();
+        for wrong_target in [
+            crate::CurrentEbpfGraphRecoverySuccessorTarget::Grouped(grouped_device_request(
+                "s2bu-new",
+                grouped_device_id(0x59),
+                endpoints,
+            )),
+            crate::CurrentEbpfGraphRecoverySuccessorTarget::Grouped(grouped_device_request(
+                "s2bu", device_id, endpoints,
+            )),
+            crate::CurrentEbpfGraphRecoverySuccessorTarget::Grouped(grouped_device_request(
+                "s2bu-new",
+                device_id,
+                wrong_endpoints,
+            )),
+        ] {
+            assert!(
+                !matches!(
+                    backend
+                        .inspect_current_ebpf_graph_successor(
+                            intent().into_successor_inspection_request(
+                                wrong_target,
+                                current_recovery_authority(),
+                            ),
+                        )
+                        .await,
+                    Ok(crate::CurrentEbpfGraphRecoverySuccessorInspectionOutcome::Authenticated(_))
+                ),
+                "a mismatched grouped target must not authenticate"
+            );
+        }
+
+        let receipt = match backend
+            .inspect_current_ebpf_graph_successor(
+                intent().into_successor_inspection_request(target(), current_recovery_authority()),
+            )
+            .await
+            .expect("inspect exact grouped successor")
+        {
+            crate::CurrentEbpfGraphRecoverySuccessorInspectionOutcome::Authenticated(receipt) => {
+                receipt
+            }
+            outcome => panic!("unexpected grouped successor inspection: {outcome:?}"),
+        };
+        assert_eq!(
+            backend
+                .admit_current_ebpf_graph_successor(intent().into_successor_admission_request(
+                    target(),
+                    receipt,
+                    current_recovery_authority_for_successor_receipt(receipt),
+                ))
+                .await
+                .expect("admit exact same-process grouped successor"),
+            Admission::Admitted
+        );
+        assert!(
+            !runtime
+                .state()
+                .successor_datapath_inert
+                .contains(&REPLACEMENT_IFINDEX),
+            "grouped traffic activates only at exact broker admission"
         );
     }
 

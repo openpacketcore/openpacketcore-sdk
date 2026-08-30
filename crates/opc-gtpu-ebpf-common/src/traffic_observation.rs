@@ -79,12 +79,16 @@ pub const GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME: &str = "GTPU_OBS_EVT";
 pub const GTPU_TRAFFIC_OBSERVATION_LOSS_MAP_NAME: &str = "GTPU_OBS_LOSS";
 /// Pinned eBPF map name for the global producer sequence.
 pub const GTPU_TRAFFIC_OBSERVATION_SEQUENCE_MAP_NAME: &str = "GTPU_OBS_SEQ";
-/// Pinned eBPF map name for source-publication control state.
+/// Pinned eBPF map name for successor traffic activation and source-publication
+/// control state.
 ///
-/// Slot zero is the reset gate. Odd values authorize publication. A loader
-/// publishes a distinct even value before resetting retained state, waits for
-/// per-CPU flow scratch to become empty, and enables a new odd value only after
-/// the replacement graph is verified. An old in-flight program can therefore
+/// Slot zero is the reset and datapath gate. Odd values authorize packet
+/// effects and observation publication; zero and every even value make both
+/// tc classifier roots return `TC_ACT_OK` before parsing or mutating a packet.
+/// A loader publishes a distinct even value before resetting retained state,
+/// waits for per-CPU flow scratch to become empty, and enables a new odd value
+/// only after the replacement graph is verified and, for a terminal successor,
+/// broker-durable admission is exact. An old in-flight program can therefore
 /// never observe an ABA gate. Slot one is a monotonic publication-identity
 /// high-water mark and is deliberately never reset with source state.
 pub const GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME: &str = "GTPU_OBS_GATE";
