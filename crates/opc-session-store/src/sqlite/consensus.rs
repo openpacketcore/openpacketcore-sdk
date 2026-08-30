@@ -4136,6 +4136,55 @@ impl Drop for ConsensusLogPrunePrimaryPreemption {
     }
 }
 
+/// Read-only foreground-pressure signal for descriptor-pinned snapshot work.
+///
+/// The signal shares the fixed durable store's existing primary-writer
+/// accounting, but owns no writer permit and can neither admit nor interrupt
+/// a primary operation. Snapshot workers use it only to insert bounded pauses
+/// between bulk-copy work units while a consensus writer is pending.
+#[derive(Clone, Default)]
+pub(crate) struct ConsensusSnapshotForegroundPacer {
+    primary_writers: Option<Arc<AtomicUsize>>,
+    writer_generation: Option<Arc<AtomicU64>>,
+    observed_writer_generation: Arc<AtomicU64>,
+}
+
+impl ConsensusSnapshotForegroundPacer {
+    fn new(primary_writers: Arc<AtomicUsize>, writer_generation: Arc<AtomicU64>) -> Self {
+        let observed_writer_generation = writer_generation.load(Ordering::Acquire);
+        Self {
+            primary_writers: Some(primary_writers),
+            writer_generation: Some(writer_generation),
+            observed_writer_generation: Arc::new(AtomicU64::new(observed_writer_generation)),
+        }
+    }
+
+    fn pace_with(&self, pause: impl FnOnce(Duration)) -> bool {
+        let writer_generation_advanced =
+            self.writer_generation.as_ref().is_some_and(|generation| {
+                let current = generation.load(Ordering::Acquire);
+                self.observed_writer_generation
+                    .swap(current, Ordering::AcqRel)
+                    != current
+            });
+        if writer_generation_advanced
+            || self
+                .primary_writers
+                .as_ref()
+                .is_some_and(|writers| writers.load(Ordering::Acquire) != 0)
+        {
+            pause(SNAPSHOT_FOREGROUND_PACING_PAUSE);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn pace(&self) {
+        let _ = self.pace_with(std::thread::sleep);
+    }
+}
+
 #[derive(Clone)]
 struct ConsensusLogPruneActiveInterrupt {
     handle: Arc<InterruptHandle>,
@@ -4163,6 +4212,7 @@ pub(crate) struct ConsensusLogPruneLane {
     worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     diagnostics: Option<Arc<ConsensusStoreDiagnosticCounters>>,
     primary_writers: Arc<AtomicUsize>,
+    writer_generation: Arc<AtomicU64>,
     #[cfg(all(test, target_os = "linux"))]
     turn_gate: Option<Arc<ConsensusLogPruneTurnGate>>,
 }
@@ -4206,6 +4256,7 @@ impl ConsensusLogPruneLane {
             worker: tokio::sync::Mutex::new(None),
             diagnostics,
             primary_writers: Arc::new(AtomicUsize::new(0)),
+            writer_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(all(test, target_os = "linux"))]
             turn_gate: consensus_log_prune_turn_gate_for_source(&source),
         });
@@ -4246,6 +4297,13 @@ impl ConsensusLogPruneLane {
         self.degraded.load(Ordering::Acquire)
     }
 
+    fn snapshot_foreground_pacer(&self) -> ConsensusSnapshotForegroundPacer {
+        ConsensusSnapshotForegroundPacer::new(
+            Arc::clone(&self.primary_writers),
+            Arc::clone(&self.writer_generation),
+        )
+    }
+
     fn fail_permanently(&self) {
         self.degraded.store(true, Ordering::Release);
         if let Some(diagnostics) = &self.diagnostics {
@@ -4265,6 +4323,7 @@ impl ConsensusLogPruneLane {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let primary_writers = Arc::clone(&self.primary_writers);
         primary_writers.fetch_add(1, Ordering::AcqRel);
+        self.writer_generation.fetch_add(1, Ordering::AcqRel);
         let mut preemption = ConsensusLogPrunePrimaryPreemption {
             primary_writers: Some(primary_writers),
             turn_ownership: None,
@@ -5820,6 +5879,14 @@ impl SqliteConsensusCore {
 
     pub(crate) fn consensus_log_prune_lane(&self) -> Option<Arc<ConsensusLogPruneLane>> {
         self.consensus_log_prune_lane.clone()
+    }
+
+    pub(crate) fn snapshot_foreground_pacer(&self) -> ConsensusSnapshotForegroundPacer {
+        self.consensus_log_prune_lane
+            .as_ref()
+            .map_or_else(ConsensusSnapshotForegroundPacer::default, |lane| {
+                lane.snapshot_foreground_pacer()
+            })
     }
 
     /// Keep this core's low-priority physical-prune lane yielded for the
@@ -24625,6 +24692,98 @@ fn committed_log_validation_decoded_rows_for_test() -> usize {
     COMMITTED_LOG_VALIDATION_DECODED_ROWS.with(std::cell::Cell::get)
 }
 
+const DURABLE_LOG_AUDIT_WORKERS: usize = 8;
+const DURABLE_LOG_AUDIT_BATCH_BYTES: usize = 16 * 1024 * 1024;
+const DURABLE_LOG_AUDIT_PARALLEL_MIN_ROWS: usize = 64;
+
+struct EncodedDurableLogAuditRow {
+    epoch: i64,
+    term: i64,
+    index: i64,
+    encoded: Vec<u8>,
+}
+
+fn decode_durable_log_audit_row(
+    row: &EncodedDurableLogAuditRow,
+    identity: SessionConsensusIdentity,
+) -> io::Result<LogId<SessionConsensusNodeId>> {
+    validate_epoch(row.epoch, identity)?;
+    let log_id = decode_consensus_log_entry(&row.encoded)?.log_id;
+    validate_log_id(&log_id)?;
+    if checked_u64(row.term)? != log_id.leader_id.term || checked_u64(row.index)? != log_id.index {
+        return Err(invalid_data("persisted session consensus log row mismatch"));
+    }
+    Ok(log_id)
+}
+
+fn durable_log_audit_worker_count(rows: usize, available: usize) -> usize {
+    if rows < DURABLE_LOG_AUDIT_PARALLEL_MIN_ROWS {
+        return 1;
+    }
+    DURABLE_LOG_AUDIT_WORKERS.min(available.max(1)).min(rows)
+}
+
+fn decode_durable_log_audit_batch(
+    rows: &[EncodedDurableLogAuditRow],
+    identity: SessionConsensusIdentity,
+) -> io::Result<Vec<LogId<SessionConsensusNodeId>>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = durable_log_audit_worker_count(
+        rows.len(),
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    );
+    // Ordinary committed-frontier advances normally contain one row. Keep
+    // that hot path allocation- and thread-free; parallelism is reserved for
+    // the large exact audits performed at snapshot and recovery boundaries.
+    if workers == 1 {
+        return rows
+            .iter()
+            .map(|row| decode_durable_log_audit_row(row, identity))
+            .collect();
+    }
+    let rows_per_worker = rows.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles = rows
+            .chunks(rows_per_worker)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|row| decode_durable_log_audit_row(row, identity))
+                        .collect::<io::Result<Vec<_>>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut decoded = Vec::with_capacity(rows.len());
+        // Join in source order so witness insertion and error precedence stay
+        // deterministic even though exact row decoding runs concurrently.
+        let mut first_error = None;
+        for handle in handles {
+            let result = handle
+                .join()
+                .map_err(|_| invalid_data("session consensus durable log audit worker failed"));
+            match result {
+                Ok(Ok(mut chunk)) if first_error.is_none() => decoded.append(&mut chunk),
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) | Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(decoded)
+        }
+    })
+}
+
 fn insert_validated_log_rows_in_range_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -24637,31 +24796,53 @@ fn insert_validated_log_rows_in_range_sync(
     }
     let mut statement = conn
         .prepare(
-            "SELECT configuration_epoch, term, log_index, entry_json FROM consensus_log \
+            "SELECT configuration_epoch, term, log_index, \
+             CASE WHEN length(entry_json) BETWEEN 1 AND ?3 THEN entry_json END \
+             FROM consensus_log \
              WHERE log_index >= ?1 AND log_index <= ?2 ORDER BY log_index ASC",
         )
         .map_err(db_error)?;
     let mut rows = statement
-        .query(params![checked_i64(start)?, checked_i64(end)?])
+        .query(params![
+            checked_i64(start)?,
+            checked_i64(end)?,
+            i64::try_from(SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES)
+                .expect("durable log entry bound fits SQLite integer")
+        ])
         .map_err(db_error)?;
-    while let Some(row) = rows.next().map_err(db_error)? {
-        let epoch: i64 = row.get(0).map_err(db_error)?;
-        let term: i64 = row.get(1).map_err(db_error)?;
-        let index: i64 = row.get(2).map_err(db_error)?;
-        let encoded: Vec<u8> = row.get(3).map_err(db_error)?;
-        validate_epoch(epoch, identity)?;
-        let log_id = decode_consensus_log_entry(&encoded)?.log_id;
-        #[cfg(test)]
-        COMMITTED_LOG_VALIDATION_DECODED_ROWS.with(|count| count.set(count.get() + 1));
-        validate_log_id(&log_id)?;
-        if checked_u64(term)? != log_id.leader_id.term || checked_u64(index)? != log_id.index {
-            return Err(invalid_data("persisted session consensus log row mismatch"));
+    loop {
+        let mut encoded_rows = Vec::new();
+        let mut encoded_bytes = 0_usize;
+        // The last row can cross the byte target by at most one already-
+        // bounded log entry. This keeps allocation below two fixed 16 MiB
+        // envelopes without buffering an unread SQLite row between batches.
+        while encoded_bytes < DURABLE_LOG_AUDIT_BATCH_BYTES {
+            let Some(row) = rows.next().map_err(db_error)? else {
+                break;
+            };
+            let encoded: Option<Vec<u8>> = row.get(3).map_err(db_error)?;
+            let encoded = encoded
+                .ok_or_else(|| invalid_data("session consensus log entry size is invalid"))?;
+            encoded_bytes = encoded_bytes.saturating_add(encoded.len());
+            encoded_rows.push(EncodedDurableLogAuditRow {
+                epoch: row.get(0).map_err(db_error)?,
+                term: row.get(1).map_err(db_error)?,
+                index: row.get(2).map_err(db_error)?,
+                encoded,
+            });
         }
-        if let Some(previous) = witnesses.insert(log_id.index, log_id) {
-            if previous != log_id {
-                return Err(invalid_data(
-                    "session consensus compacted marker conflicts with retained log",
-                ));
+        if encoded_rows.is_empty() {
+            break;
+        }
+        for log_id in decode_durable_log_audit_batch(&encoded_rows, identity)? {
+            #[cfg(test)]
+            COMMITTED_LOG_VALIDATION_DECODED_ROWS.with(|count| count.set(count.get() + 1));
+            if let Some(previous) = witnesses.insert(log_id.index, log_id) {
+                if previous != log_id {
+                    return Err(invalid_data(
+                        "session consensus compacted marker conflicts with retained log",
+                    ));
+                }
             }
         }
     }
@@ -24833,6 +25014,25 @@ fn validate_exact_log_prefix_through_sync(
 ) -> io::Result<()> {
     validate_log_id(target)?;
     let witnesses = validated_log_witnesses_through_sync(conn, identity, target)?;
+    validate_exact_log_prefix_from_witnesses_sync(
+        conn,
+        identity,
+        target,
+        require_retained_target,
+        &witnesses,
+    )
+}
+
+/// Apply one target's exact identity and no-hole proof to a witness map that
+/// was already validated through this target or a strict superset frontier.
+fn validate_exact_log_prefix_from_witnesses_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    target: &LogId<SessionConsensusNodeId>,
+    require_retained_target: bool,
+    witnesses: &BTreeMap<u64, LogId<SessionConsensusNodeId>>,
+) -> io::Result<()> {
+    validate_log_id(target)?;
     if require_retained_target
         && retained_log_id_at_sync(conn, identity, target.index)?.as_ref() != Some(target)
     {
@@ -25810,13 +26010,14 @@ fn logical_purge_logs_in_tx(
     }
     let applied = read_applied_sync(tx, identity)?
         .ok_or_else(|| invalid_data("session consensus cannot purge unapplied logs"))?;
-    validate_exact_log_prefix_through_sync(tx, identity, &applied, false)?;
+    let witnesses = validated_log_witnesses_through_sync(tx, identity, &applied)?;
+    validate_exact_log_prefix_from_witnesses_sync(tx, identity, &applied, false, &witnesses)?;
     ensure_log_id_not_after(
         through,
         &applied,
         "session consensus cannot purge unapplied logs",
     )?;
-    validate_exact_log_prefix_through_sync(tx, identity, through, false)?;
+    validate_exact_log_prefix_from_witnesses_sync(tx, identity, through, false, &witnesses)?;
     save_log_pointer(tx, "consensus_purged", identity, through)
 }
 
@@ -34836,6 +35037,8 @@ const SNAPSHOT_BACKUP_STEP_PAGES: i32 = 128;
 const SNAPSHOT_BACKUP_BUSY_RETRY_LIMIT: usize = 8;
 const SNAPSHOT_BACKUP_STEP_LIMIT: usize =
     (SNAPSHOT_DATABASE_MAX_BYTES / 512 / SNAPSHOT_BACKUP_STEP_PAGES as u64 + 1) as usize;
+const SNAPSHOT_FOREGROUND_PACING_PAUSE: Duration = Duration::from_millis(32);
+const SNAPSHOT_COMPACTION_FOREGROUND_PROGRESS_OPS: i32 = 4_096;
 
 /// One VFS-verified, independently pinned SQLite snapshot reader.
 ///
@@ -35055,6 +35258,7 @@ fn backup_snapshot_reader_bounded(
     reader: &SnapshotReadConnection,
     destination: &mut Connection,
     wal_maximum: u64,
+    foreground_pacer: &ConsensusSnapshotForegroundPacer,
 ) -> io::Result<u64> {
     backup_snapshot_reader_bounded_with_hook_and_step(
         reader,
@@ -35062,6 +35266,7 @@ fn backup_snapshot_reader_bounded(
         wal_maximum,
         || {},
         |backup| backup.step(SNAPSHOT_BACKUP_STEP_PAGES),
+        || foreground_pacer.pace(),
     )
 }
 
@@ -35084,24 +35289,27 @@ where
         wal_maximum,
         after_step,
         |backup| backup.step(SNAPSHOT_BACKUP_STEP_PAGES),
+        || {},
     )
 }
 
 /// Keep step result injection confined to this private test seam: production
 /// supplies the exact `Backup::step` call above, while the test can prove a
 /// post-step WAL overflow wins over a SQLite step error.
-fn backup_snapshot_reader_bounded_with_hook_and_step<F, S>(
+fn backup_snapshot_reader_bounded_with_hook_and_step<F, S, P>(
     reader: &SnapshotReadConnection,
     destination: &mut Connection,
     wal_maximum: u64,
     mut after_step: F,
     mut step: S,
+    mut pace: P,
 ) -> io::Result<u64>
 where
     F: FnMut(),
     S: for<'a, 'b> FnMut(
         &rusqlite::backup::Backup<'a, 'b>,
     ) -> rusqlite::Result<rusqlite::backup::StepResult>,
+    P: FnMut(),
 {
     let mut wal_peak = validate_snapshot_reader_wal_bound(reader, wal_maximum)?;
     let backup =
@@ -35121,7 +35329,7 @@ where
         let result = result.map_err(db_error)?;
         match result {
             rusqlite::backup::StepResult::Done => return Ok(wal_peak),
-            rusqlite::backup::StepResult::More => {}
+            rusqlite::backup::StepResult::More => pace(),
             rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
                 return Err(invalid_data(
                     "session consensus bounded snapshot backup lost its SQLite read lock",
@@ -35408,6 +35616,32 @@ fn validate_snapshot_compaction_foreign_keys_sync(conn: &Connection) -> io::Resu
     Ok(())
 }
 
+struct SnapshotCompactionProgressGuard<'a>(&'a Connection);
+
+impl Drop for SnapshotCompactionProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+fn install_snapshot_compaction_foreground_pacer(
+    conn: &Connection,
+    foreground_pacer: ConsensusSnapshotForegroundPacer,
+) -> SnapshotCompactionProgressGuard<'_> {
+    install_snapshot_compaction_progress_handler(conn, move || {
+        foreground_pacer.pace();
+        false
+    })
+}
+
+fn install_snapshot_compaction_progress_handler(
+    conn: &Connection,
+    progress: impl FnMut() -> bool + Send + 'static,
+) -> SnapshotCompactionProgressGuard<'_> {
+    conn.progress_handler(SNAPSHOT_COMPACTION_FOREGROUND_PROGRESS_OPS, Some(progress));
+    SnapshotCompactionProgressGuard(conn)
+}
+
 /// Copy the already-validated raw image into a fresh descriptor-pinned image.
 /// Unlike `VACUUM INTO`, every page of the output belongs to this connection's
 /// `main` database, whose page-size-derived cap was installed while it was
@@ -35417,6 +35651,18 @@ fn compact_pinned_snapshot_database_sync(
     source: &crate::consensus::snapshot::PinnedSqliteFile,
     compacted: &crate::consensus::snapshot::PinnedSqliteFile,
 ) -> io::Result<()> {
+    compact_pinned_snapshot_database_with_pacer_sync(
+        source,
+        compacted,
+        &ConsensusSnapshotForegroundPacer::default(),
+    )
+}
+
+fn compact_pinned_snapshot_database_with_pacer_sync(
+    source: &crate::consensus::snapshot::PinnedSqliteFile,
+    compacted: &crate::consensus::snapshot::PinnedSqliteFile,
+    foreground_pacer: &ConsensusSnapshotForegroundPacer,
+) -> io::Result<()> {
     let settings = snapshot_compaction_source_settings_sync(source)?;
     let destination = open_empty_pinned_snapshot_compaction_database(
         compacted,
@@ -35424,6 +35670,8 @@ fn compact_pinned_snapshot_database_sync(
         settings.auto_vacuum,
     )?;
     disable_snapshot_database_journal_sync(&destination)?;
+    let _progress =
+        install_snapshot_compaction_foreground_pacer(&destination, foreground_pacer.clone());
     destination
         .execute_batch("PRAGMA foreign_keys = OFF;")
         .map_err(db_error)?;
@@ -35549,6 +35797,7 @@ pub(crate) fn capture_snapshot_database_from_reader_sync(
         fixed_placement_policy,
         expected_cut,
         pinned,
+        &ConsensusSnapshotForegroundPacer::default(),
     )
 }
 
@@ -35567,6 +35816,7 @@ pub(crate) fn capture_snapshot_database_from_reader_into_sync(
     fixed_placement_policy: Option<PlacementResiliencePolicy>,
     expected_cut: &ConsensusAppliedMembership,
     mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
+    foreground_pacer: &ConsensusSnapshotForegroundPacer,
 ) -> io::Result<(
     ConsensusAppliedMembership,
     crate::consensus::snapshot::PinnedSqliteFile,
@@ -35596,8 +35846,12 @@ pub(crate) fn capture_snapshot_database_from_reader_into_sync(
     }
     let mut destination = open_pinned_snapshot_database(&pinned)?;
     disable_snapshot_database_journal_sync(&destination)?;
-    let wal_bytes =
-        backup_snapshot_reader_bounded(reader, &mut destination, SNAPSHOT_SOURCE_WAL_MAX_BYTES)?;
+    let wal_bytes = backup_snapshot_reader_bounded(
+        reader,
+        &mut destination,
+        SNAPSHOT_SOURCE_WAL_MAX_BYTES,
+        foreground_pacer,
+    )?;
     snapshot_database_extent_sync(&destination)?;
     drop(destination);
     pinned.capture_created_sidecars();
@@ -35633,6 +35887,7 @@ pub(crate) fn finalize_captured_snapshot_database_sync(
         expected_cut,
         pinned,
         compacted,
+        &ConsensusSnapshotForegroundPacer::default(),
     )
 }
 
@@ -35649,6 +35904,7 @@ pub(crate) fn finalize_captured_snapshot_database_into_sync(
     expected_cut: &ConsensusAppliedMembership,
     mut pinned: crate::consensus::snapshot::PinnedSqliteFile,
     mut compacted: crate::consensus::snapshot::PinnedSqliteFile,
+    foreground_pacer: &ConsensusSnapshotForegroundPacer,
 ) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
     // Create and retain the fresh compacted descriptor before SQLite sees it:
     // the caller supplied an already-created `O_EXCL` descriptor, so a bare
@@ -35684,7 +35940,7 @@ pub(crate) fn finalize_captured_snapshot_database_into_sync(
     verify_pinned_snapshot_descriptor(&pinned, &destination)?;
     drop(destination);
     pinned.capture_created_sidecars();
-    compact_pinned_snapshot_database_sync(&pinned, &compacted)?;
+    compact_pinned_snapshot_database_with_pacer_sync(&pinned, &compacted, foreground_pacer)?;
 
     compacted.verify_linked_identity()?;
     compacted.file().sync_all()?;
@@ -39289,7 +39545,7 @@ pub(crate) use tests::{
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -39303,6 +39559,74 @@ mod tests {
     use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn durable_log_audit_parallelism_is_fixed_and_skips_small_frontier_advances() {
+        assert_eq!(1, durable_log_audit_worker_count(1, 128));
+        assert_eq!(1, durable_log_audit_worker_count(63, 128));
+        assert_eq!(1, durable_log_audit_worker_count(4_096, 1));
+        assert_eq!(4, durable_log_audit_worker_count(4_096, 4));
+        assert_eq!(
+            DURABLE_LOG_AUDIT_WORKERS,
+            durable_log_audit_worker_count(4_096, 128)
+        );
+    }
+
+    #[test]
+    fn snapshot_foreground_pacer_observes_generation_once_and_active_pressure_repeatedly() {
+        let primary_writers = Arc::new(AtomicUsize::new(0));
+        let writer_generation = Arc::new(AtomicU64::new(0));
+        let pacer = ConsensusSnapshotForegroundPacer::new(
+            Arc::clone(&primary_writers),
+            Arc::clone(&writer_generation),
+        );
+        let mut pauses = Vec::new();
+
+        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+        writer_generation.fetch_add(1, Ordering::AcqRel);
+        assert!(pacer.pace_with(|pause| pauses.push(pause)));
+        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+
+        primary_writers.store(1, Ordering::Release);
+        assert!(pacer.pace_with(|pause| pauses.push(pause)));
+        assert!(pacer.pace_with(|pause| pauses.push(pause)));
+        primary_writers.store(0, Ordering::Release);
+        assert!(!pacer.pace_with(|pause| pauses.push(pause)));
+
+        assert_eq!(pauses, vec![SNAPSHOT_FOREGROUND_PACING_PAUSE; 3]);
+    }
+
+    #[test]
+    fn snapshot_compaction_progress_guard_never_interrupts_and_removes_its_callback() {
+        let connection = Connection::open_in_memory().expect("open progress-handler fixture");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let query = "WITH RECURSIVE sequence(value) AS (\
+                     SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 256\
+                     ) SELECT sum(abs(left.value - right.value)) \
+                     FROM sequence AS left CROSS JOIN sequence AS right";
+
+        {
+            let _guard = install_snapshot_compaction_progress_handler(&connection, move || {
+                handler_calls.fetch_add(1, Ordering::Relaxed);
+                false
+            });
+            let _: i64 = connection
+                .query_row(query, [], |row| row.get(0))
+                .expect("noninterrupting compaction progress callback");
+        }
+        let calls_with_guard = calls.load(Ordering::Relaxed);
+        assert_ne!(0, calls_with_guard, "the progress seam must be exercised");
+
+        let _: i64 = connection
+            .query_row(query, [], |row| row.get(0))
+            .expect("query remains usable after progress guard removal");
+        assert_eq!(
+            calls_with_guard,
+            calls.load(Ordering::Relaxed),
+            "dropping the guard removes the snapshot progress callback",
+        );
+    }
 
     #[cfg(target_os = "linux")]
     struct PendingTerminalLatchFixture {
@@ -42619,6 +42943,7 @@ mod tests {
                 }
             },
             |_| Err(rusqlite::Error::QueryReturnedNoRows),
+            || {},
         )
         .expect_err("post-step WAL overflow must win over the forced step error");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
@@ -42626,6 +42951,54 @@ mod tests {
         writer
             .execute("INSERT INTO payload(value) VALUES (zeroblob(8))", [])
             .expect("writer remains usable after reader release");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stepped_backup_paces_only_between_more_and_the_next_step() {
+        let directory = tempfile::tempdir().expect("snapshot pacing directory");
+        let source_path = directory.path().join("source.sqlite");
+        let destination_path = directory.path().join("destination.sqlite");
+        let source = Connection::open(&source_path).expect("open source SQLite");
+        source
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE payload(value BLOB);")
+            .expect("enable source WAL");
+        let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
+            opc_sqlite_file_control_sys::main_file_descriptor(&source)
+                .expect("duplicate source descriptor"),
+            source_path,
+        )
+        .expect("pin source descriptor");
+        let reader = open_snapshot_read_connection(&pinned).expect("open pinned reader");
+        reader
+            .connection
+            .execute_batch("BEGIN DEFERRED TRANSACTION; SELECT count(*) FROM payload;")
+            .expect("begin reader transaction");
+        pin_snapshot_reader_wal(&reader).expect("pin reader WAL descriptor");
+        let mut destination = Connection::open(destination_path).expect("open destination");
+        let mut steps = 0_usize;
+        let mut pauses = 0_usize;
+
+        backup_snapshot_reader_bounded_with_hook_and_step(
+            &reader,
+            &mut destination,
+            SNAPSHOT_SOURCE_WAL_MAX_BYTES,
+            || {},
+            |_| {
+                steps += 1;
+                if steps == 1 {
+                    Ok(rusqlite::backup::StepResult::More)
+                } else {
+                    Ok(rusqlite::backup::StepResult::Done)
+                }
+            },
+            || pauses += 1,
+        )
+        .expect("synthetic bounded backup completes");
+
+        assert_eq!(2, steps, "Done follows one More continuation");
+        assert_eq!(1, pauses, "Done never receives a trailing pacing pause");
+        release_snapshot_read_sync(&reader).expect("release reader after pacing proof");
     }
 
     #[cfg(target_os = "linux")]
@@ -46147,6 +46520,94 @@ mod tests {
                 .expect_err("unapplied floor rejects")
                 .kind(),
             io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_purge_shares_one_exact_superset_payload_scan() {
+        const SNAPSHOT_INDEX: u64 = 4_095;
+        const PURGE_INDEX: u64 = 3_071;
+
+        let backend = backend_with_blank_logs(SNAPSHOT_INDEX).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership before snapshot marker");
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(SNAPSHOT_INDEX));
+        save_test_snapshot_marker(
+            &conn,
+            log_id(SNAPSHOT_INDEX),
+            "logical-purge-one-superset-scan",
+        );
+
+        reset_committed_log_validation_decoded_rows_for_test();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin exact logical purge");
+        logical_purge_logs_in_tx(&tx, identity(), &log_id(PURGE_INDEX), PURGE_INDEX as i64)
+            .expect("one superset payload audit proves applied and purge targets");
+        tx.commit().expect("commit exact logical purge");
+
+        assert_eq!(
+            committed_log_validation_decoded_rows_for_test(),
+            usize::try_from(SNAPSHOT_INDEX + 1).expect("snapshot row count fits usize"),
+            "the applied and purge proofs must share exactly one complete payload audit",
+        );
+        assert_eq!(
+            read_purged_sync(&conn, identity()).expect("read one-scan purge floor"),
+            Some(log_id(PURGE_INDEX)),
+        );
+    }
+
+    #[tokio::test]
+    async fn large_exact_purge_audit_rejects_noncanonical_interior_v2_before_pointer_mutation() {
+        const APPLIED_INDEX: u64 = 127;
+        const CORRUPT_INDEX: u64 = 96;
+        const PURGE_INDEX: u64 = 63;
+
+        let backend = backend_with_blank_logs(APPLIED_INDEX).await;
+        let conn = backend.conn.lock().await;
+        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
+            .expect("apply fixture membership before strict audit");
+        set_test_log_pointer(&conn, "consensus_applied", &log_id(APPLIED_INDEX));
+        save_test_snapshot_marker(
+            &conn,
+            log_id(APPLIED_INDEX),
+            "logical-purge-strict-parallel-audit",
+        );
+        let entry = fenced_transition_v2_entry(
+            CORRUPT_INDEX,
+            fenced_transition_v2_request(0x96, 1, "parallel-audit-owner"),
+            timestamp(2),
+        );
+        let encoded = noncanonical_v2_log_json(&entry);
+        assert!(
+            decode_consensus_log_entry(&encoded).is_err(),
+            "fixture must be strict-V2 noncanonical",
+        );
+        conn.execute(
+            "UPDATE consensus_log SET entry_json = ?1 WHERE log_index = ?2",
+            params![
+                encoded,
+                i64::try_from(CORRUPT_INDEX).expect("index fits SQLite")
+            ],
+        )
+        .expect("install interior strict-V2 corruption");
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin strict exact purge");
+        assert_eq!(
+            logical_purge_logs_in_tx(&tx, identity(), &log_id(PURGE_INDEX), PURGE_INDEX as i64)
+                .expect_err("interior strict-V2 corruption rejects before purge publication")
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            read_purged_sync(&tx, identity()).expect("read unmodified purge pointer"),
+            None,
+        );
+        drop(tx);
+        assert_eq!(
+            read_purged_sync(&conn, identity()).expect("read durable unmodified purge pointer"),
+            None,
         );
     }
 

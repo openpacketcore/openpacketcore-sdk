@@ -37,6 +37,7 @@ use opc_consensus::{
 };
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_session_store::fenced_transition::FencedTransitionV2Effect;
+use opc_session_store::test_support::consensus_local_durable_progress_for_test;
 use opc_session_store::{
     derive_fixed_durable_quorum_consensus_identity, fenced_transition_v2_profile_digest, Clock,
     ConsensusSessionStore, EncryptedSessionPayload, FenceToken, FencedTransitionLease,
@@ -881,6 +882,11 @@ fn emit_bounded_scale_stall_observation(
         .iter()
         .map(ConsensusSessionStore::diagnostic_snapshot)
         .collect::<Vec<_>>();
+    let voter_engine_progress = diagnostics
+        .stores
+        .iter()
+        .map(consensus_local_durable_progress_for_test)
+        .collect::<Vec<_>>();
     let effect_snapshot = diagnostics.effect_counters.snapshot();
     let read_backend_unavailable_retries = diagnostics
         .read_backend_unavailable_retries
@@ -896,7 +902,7 @@ fn emit_bounded_scale_stall_observation(
         })
         .unwrap_or((None, None, None, None));
     eprintln!(
-        "sdk-704 bounded snapshot scale: phase={phase_name} stage={stage} offered_ops_per_second={target_rate} submitted_batches={submitted_batches} completed_batches={completed_batches} completed_operations={completed_operations} achieved_ops_per_second_milli={achieved_ops_per_second_milli} peak_unjoined_batch_task_slots={peak_unjoined_batch_task_slots} batch_p99_us={batch_p99_us:?} batch_p999_us={batch_p999_us:?} item_p99_us={item_p99_us:?} item_p999_us={item_p999_us:?} elapsed_ms={} read_backend_unavailable_retries={read_backend_unavailable_retries} effect_counters={effect_snapshot:?} completed_snapshot_count_by_voter={completed_snapshot_count_by_voter:?} voter_status={voter_status:?} voter_diagnostics={voter_diagnostics:?}",
+        "sdk-704 bounded snapshot scale: phase={phase_name} stage={stage} offered_ops_per_second={target_rate} submitted_batches={submitted_batches} completed_batches={completed_batches} completed_operations={completed_operations} achieved_ops_per_second_milli={achieved_ops_per_second_milli} peak_unjoined_batch_task_slots={peak_unjoined_batch_task_slots} batch_p99_us={batch_p99_us:?} batch_p999_us={batch_p999_us:?} item_p99_us={item_p99_us:?} item_p999_us={item_p999_us:?} elapsed_ms={} read_backend_unavailable_retries={read_backend_unavailable_retries} effect_counters={effect_snapshot:?} completed_snapshot_count_by_voter={completed_snapshot_count_by_voter:?} voter_status={voter_status:?} voter_engine_progress={voter_engine_progress:?} voter_diagnostics={voter_diagnostics:?}",
         elapsed.as_millis(),
     );
 }
@@ -11724,7 +11730,13 @@ async fn bounded_two_snapshot_thresholds_keep_public_v2_batches_live() {
             .expect("SDK-704 bounded scale start"),
     );
     let clock = Arc::new(MutableClock::new(start));
-    let (stores, _, _, peer_slots) = fixed_cluster(directory.path(), clock).await;
+    let snapshot_root = std::fs::canonicalize(
+        std::env::var_os(FS_VERITY_SNAPSHOT_ROOT_ENV)
+            .expect("bounded scale requires the explicit fs-verity snapshot root"),
+    )
+    .expect("canonical bounded-scale fs-verity snapshot root");
+    let (stores, _, _, peer_slots) =
+        fixed_cluster_with_snapshot_root(directory.path(), &snapshot_root, clock).await;
     let ingress_store = &stores[ready_leader(&stores).await];
     let provider = sealing_provider();
     let transient_retries = AtomicU64::new(0);

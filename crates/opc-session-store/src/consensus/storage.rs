@@ -5050,6 +5050,7 @@ async fn build_file_backed_snapshot_database(
     let expected_members = core.expected_members.clone();
     let expected_bindings = core.expected_bindings.clone();
     let fixed_placement_policy = core.fixed_placement_policy;
+    let snapshot_foreground_pacer = core.snapshot_foreground_pacer();
     #[cfg(test)]
     let snapshot_capture_gate = Arc::clone(&core.snapshot_capture_gate);
     // The owned gate guard moves into the worker and comes back with its
@@ -5067,6 +5068,7 @@ async fn build_file_backed_snapshot_database(
             fixed_placement_policy,
             &source_cut,
             raw_snapshot,
+            &snapshot_foreground_pacer,
         );
         // The source transaction is retained only through `Backup`; all
         // cleanup, VACUUM, validation, hashing, and sealing follow release.
@@ -5083,6 +5085,7 @@ async fn build_file_backed_snapshot_database(
                     &captured_cut,
                     raw_snapshot,
                     vacuum_snapshot,
+                    &snapshot_foreground_pacer,
                 )?;
                 // The raw source pin is consumed by finalization and removes
                 // its exact namespace child.  The returned compacted pin is
