@@ -36201,7 +36201,11 @@ mod aya_runtime {
                 }
 
                 match recorded {
-                    None => Self::grouped_config_write_verified(&mut ebpf, config)?,
+                    None => Self::with_current_terminal_successor_effect(
+                        terminal_admission.as_ref(),
+                        "ebpf_current_successor_grouped_config",
+                        || Self::grouped_config_write_verified(&mut ebpf, config),
+                    )?,
                     Some(current) if current == desired => {}
                     Some(current)
                         if Self::grouped_config_same_namespace(current, desired)
@@ -40246,13 +40250,25 @@ mod aya_runtime {
                 .ok_or_else(|| state_indeterminate(OPERATION))?;
             Self::current_recovery_require_effect_currentness(currentness, OPERATION)?;
             Self::verify_traffic_observation_source_quiescent(&mut device.ebpf, gate)?;
-            Self::enable_traffic_observation_source(&mut device.ebpf, gate)?;
-            if Self::current_recovery_require_effect_currentness(currentness, OPERATION).is_err() {
-                // Authority changed across the enable write.  The successor
-                // remains process-fenced and its observation source is
-                // immediately returned to the disabled incarnation.
-                let _ = Self::reset_traffic_observation_source(&mut device.ebpf);
-                return Err(state_indeterminate(OPERATION));
+            // The odd gate is the first live tc packet effect.  Treat an
+            // enable write/readback failure exactly like a revoked authority:
+            // reset the source before reporting the failed activation.  This
+            // includes the readback immediately following `set`, which can
+            // otherwise leave the odd value live when it fails.
+            let activation = Self::enable_traffic_observation_source(&mut device.ebpf, gate)
+                .and_then(|()| {
+                    Self::current_recovery_require_effect_currentness(currentness, OPERATION)
+                });
+            if let Err(activation_error) = activation {
+                // `reset_traffic_observation_source` writes and verifies the
+                // disabled incarnation before it performs any cleanup.  Do
+                // not discard a reset failure: it is the only evidence that
+                // the external gate could not be returned to a known-safe
+                // state, and admission must remain failed in either case.
+                return match Self::reset_traffic_observation_source(&mut device.ebpf) {
+                    Ok(_) => Err(activation_error),
+                    Err(cleanup_error) => Err(cleanup_error),
+                };
             }
             device.pending_traffic_observation_gate = None;
             device.successor_pending = false;
@@ -52369,13 +52385,36 @@ mod tests {
                 if currentness.verify_current().is_err() || currentness.first_failure().is_some() {
                     return Err(state_indeterminate(OPERATION));
                 }
+                // This models the production odd gate write.  A
+                // post-write failure is deliberately injected after this
+                // transition so the tests exercise the live-effect boundary
+                // rather than a preflight refusal.
+                state.operations.push("traffic_observation_enable");
                 state.successor_datapath_inert.remove(&replacement.1);
-                state.successor_pending.remove(&replacement.1);
-                if currentness.verify_current().is_err() || currentness.first_failure().is_some() {
+                let activation =
+                    Self::fail_after_if_requested(&mut state, "traffic_observation_enable")
+                        .and_then(|()| {
+                            if currentness.verify_current().is_err()
+                                || currentness.first_failure().is_some()
+                            {
+                                Err(state_indeterminate(OPERATION))
+                            } else {
+                                Ok(())
+                            }
+                        });
+                if let Err(activation_error) = activation {
+                    // The runtime fence is restored before attempting the
+                    // map reset, so an injected reset failure cannot expose
+                    // traffic or ordinary datapath mutation in this process.
                     state.successor_datapath_inert.insert(replacement.1);
                     state.successor_pending.insert(replacement.1);
-                    return Err(state_indeterminate(OPERATION));
+                    return match Self::reset_traffic_observation_source(&mut state, [replacement.1])
+                    {
+                        Ok(()) => Err(activation_error),
+                        Err(cleanup_error) => Err(cleanup_error),
+                    };
                 }
+                state.successor_pending.remove(&replacement.1);
             }
             Ok(())
         }
@@ -64915,6 +64954,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fresh_grouped_config_write_is_inside_the_successor_effect_guard() {
+        // Aya maps cannot be exercised without kernel capabilities in this
+        // unit-test target. Keep the source-level boundary explicit: the
+        // fresh branch is as authority-guarded as grouped replacement writes.
+        let source = include_str!("ebpf.rs");
+        let (_, aya_runtime) = source
+            .split_once("impl EbpfGtpuRuntime for AyaGtpuRuntime {")
+            .expect("Aya runtime implementation is present");
+        let (_, grouped_attach) = aya_runtime
+            .split_once("fn attach_grouped(")
+            .expect("Aya grouped attach is present");
+        let (grouped_attach, _) = grouped_attach
+            .split_once("fn finalize_current_terminal_successor(")
+            .expect("Aya grouped attach has a bounded body");
+        assert!(grouped_attach.contains(
+            "None => Self::with_current_terminal_successor_effect(\n                        terminal_admission.as_ref(),\n                        \"ebpf_current_successor_grouped_config\","
+        ));
+    }
+
     #[tokio::test]
     async fn historical_25_sealed_successor_is_fenced_until_same_process_broker_admission() {
         use crate::CurrentEbpfGraphRecoverySuccessorAdmissionOutcome as Outcome;
@@ -64973,6 +65032,84 @@ mod tests {
         assert!(state.historical_25_receipts.contains_key(&pin_dir));
         assert!(state.historical_25_authorities.contains_key(&pin_dir));
         assert!(state.historical_25_operation_markers.contains(&pin_dir));
+    }
+
+    #[tokio::test]
+    async fn activation_revocation_after_odd_gate_write_re_fences_when_reset_fails() {
+        let (_, runtime, _) = sealed_historical_25_successor().await;
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
+        // The first two checks are pre-write; the third runs after the fake
+        // odd gate write and revokes this activation attempt.
+        let currentness = ScriptedCurrentEbpfGraphRecoveryCurrentness::unavailable_on(2);
+        runtime.fail_in_order(["traffic_observation_reset"]);
+
+        assert!(matches!(
+            runtime.activate_current_recovery_successor(
+                ("up0", REPLACEMENT_IFINDEX),
+                &pin_dir,
+                DEFAULT_TC_PRIORITY,
+                &currentness,
+            ),
+            Err(GtpuError::Io {
+                operation: "traffic_observation_reset",
+                ..
+            })
+        ));
+
+        let state = runtime.state();
+        assert!(state.operations.contains(&"traffic_observation_enable"));
+        assert!(state.operations.contains(&"traffic_observation_reset"));
+        assert!(state
+            .successor_datapath_inert
+            .contains(&REPLACEMENT_IFINDEX));
+        assert!(state.successor_pending.contains(&REPLACEMENT_IFINDEX));
+        assert!(state.traffic_observation_registrations.is_empty());
+        assert!(state.traffic_observation_redirects.is_empty());
+        drop(state);
+        assert!(
+            !runtime.dscp_datapath_usable(REPLACEMENT_IFINDEX)
+                && !runtime.pdp_readback_datapath_usable(REPLACEMENT_IFINDEX),
+            "a revoked activation with failed cleanup exposes neither tc traffic nor ordinary mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_odd_gate_readback_failure_re_fences_when_reset_fails() {
+        let (_, runtime, _) = sealed_historical_25_successor().await;
+        let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("up0");
+        // This failure occurs after the fake odd gate transition, matching an
+        // enable-map readback error rather than a pre-write refusal.
+        runtime.fail_after_in_order(["traffic_observation_enable"]);
+        runtime.fail_in_order(["traffic_observation_reset"]);
+
+        assert!(matches!(
+            runtime.activate_current_recovery_successor(
+                ("up0", REPLACEMENT_IFINDEX),
+                &pin_dir,
+                DEFAULT_TC_PRIORITY,
+                &TestCurrentEbpfGraphRecoveryCurrentness,
+            ),
+            Err(GtpuError::Io {
+                operation: "traffic_observation_reset",
+                ..
+            })
+        ));
+
+        let state = runtime.state();
+        assert!(state.operations.contains(&"traffic_observation_enable"));
+        assert!(state.operations.contains(&"traffic_observation_reset"));
+        assert!(state
+            .successor_datapath_inert
+            .contains(&REPLACEMENT_IFINDEX));
+        assert!(state.successor_pending.contains(&REPLACEMENT_IFINDEX));
+        assert!(state.traffic_observation_events.is_empty());
+        assert!(state.traffic_observation_loss.is_empty());
+        drop(state);
+        assert!(
+            !runtime.dscp_datapath_usable(REPLACEMENT_IFINDEX)
+                && !runtime.pdp_cleanup_datapath_usable(REPLACEMENT_IFINDEX),
+            "an indeterminate enable readback cannot activate traffic or map mutation"
+        );
     }
 
     #[tokio::test]
