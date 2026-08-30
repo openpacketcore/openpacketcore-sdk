@@ -13565,7 +13565,6 @@ mod aya_runtime {
     struct Historical25QualifiedGraph {
         graph_device: u64,
         graph_inode: u64,
-        attachment: Historical25AttachmentIdentity,
         identity: Historical25DatapathIdentity,
     }
 
@@ -14320,22 +14319,8 @@ mod aya_runtime {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Historical25AttachmentIdentity {
-        Attached {
-            uplink: Historical25ProgramIdentity,
-            downlink: Historical25ProgramIdentity,
-        },
+        Attached,
         Detached,
-    }
-
-    impl Historical25AttachmentIdentity {
-        const fn recorded_programs(
-            self,
-        ) -> (Historical25ProgramIdentity, Historical25ProgramIdentity) {
-            match self {
-                Self::Attached { uplink, downlink } => (uplink, downlink),
-                Self::Detached => ((0, 0), (0, 0)),
-            }
-        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14430,16 +14415,6 @@ mod aya_runtime {
                     current_control_inode: current_control_identity.1,
                     ..self
                 })
-        }
-
-        fn mark_detached(self) -> Option<Self> {
-            (self.phase == Historical25RecoveryPhase::Installed).then_some(Self {
-                uplink_program_id: 0,
-                downlink_program_id: 0,
-                uplink_program_tag: 0,
-                downlink_program_tag: 0,
-                ..self
-            })
         }
 
         fn advance_phase(self, phase: Historical25RecoveryPhase) -> Option<Self> {
@@ -14597,11 +14572,6 @@ mod aya_runtime {
                 let mut seen = HashSet::with_capacity(record.map_ids.len());
                 record.map_ids.iter().all(|map_id| seen.insert(*map_id))
             };
-            let attached_programs = record.uplink_program_id != 0
-                && record.downlink_program_id != 0
-                && record.uplink_program_id != record.downlink_program_id
-                && record.uplink_program_tag != 0
-                && record.downlink_program_tag != 0;
             let detached_programs = record.is_detached();
             let current_identity_valid = match record.phase {
                 Historical25RecoveryPhase::Qualified => {
@@ -14613,14 +14583,6 @@ mod aya_runtime {
                     record.current_control_device != 0 && record.current_control_inode != 0
                 }
             };
-            let program_identity_valid = match record.phase {
-                Historical25RecoveryPhase::Qualified | Historical25RecoveryPhase::Installed => {
-                    attached_programs || detached_programs
-                }
-                Historical25RecoveryPhase::GraphAbsent | Historical25RecoveryPhase::Terminal => {
-                    detached_programs
-                }
-            };
             (record.namespace_hash != [0; 32]
                 && record.replacement_name_hash != [0; 32]
                 && record.handoff_nonce != [0; 16]
@@ -14630,7 +14592,7 @@ mod aya_runtime {
                 && record.graph_device != 0
                 && record.graph_inode != 0
                 && record.ifindex != 0
-                && program_identity_valid
+                && detached_programs
                 && record.tc_priority != 0
                 && record.proof_map_id != 0
                 && record.map_ids.iter().all(|id| *id != 0)
@@ -15711,6 +15673,21 @@ mod aya_runtime {
             Ok(entries)
         }
 
+        fn historical_25_handoff_inventory(entries: &[String]) -> (bool, bool) {
+            match entries {
+                [proof] if proof == HISTORICAL_25_ROOT_HANDOFF_MARKER => (true, false),
+                [first, second]
+                    if (first == HISTORICAL_25_ROOT_HANDOFF_MARKER
+                        && second == HISTORICAL_25_OPERATION_LOCK_MARKER)
+                        || (first == HISTORICAL_25_OPERATION_LOCK_MARKER
+                            && second == HISTORICAL_25_ROOT_HANDOFF_MARKER) =>
+                {
+                    (false, true)
+                }
+                _ => (false, false),
+            }
+        }
+
         /// Ordinary startup never manufactures a current authority object
         /// while a predecessor namespace might still own the same graph.
         /// This is deliberately an observation-only discriminator: dedicated
@@ -16077,12 +16054,8 @@ mod aya_runtime {
                 }
                 let current_entries =
                     Self::historical_25_control_root_entries(&rechecked_current, OPERATION)?;
-                let proof_only = current_entries == [HISTORICAL_25_ROOT_HANDOFF_MARKER];
-                let proof_and_marker = current_entries
-                    == [
-                        HISTORICAL_25_ROOT_HANDOFF_MARKER,
-                        HISTORICAL_25_OPERATION_LOCK_MARKER,
-                    ];
+                let (proof_only, proof_and_marker) =
+                    Self::historical_25_handoff_inventory(&current_entries);
                 if (marker_required && !proof_and_marker)
                     || (!marker_required && !proof_only && !proof_and_marker)
                 {
@@ -19938,12 +19911,7 @@ mod aya_runtime {
                 return Err(state_indeterminate(operation));
             }
             let entries = Self::historical_25_control_root_entries(&current_dir, operation)?;
-            let proof_only = entries == [HISTORICAL_25_ROOT_HANDOFF_MARKER];
-            let proof_and_marker = entries
-                == [
-                    HISTORICAL_25_ROOT_HANDOFF_MARKER,
-                    HISTORICAL_25_OPERATION_LOCK_MARKER,
-                ];
+            let (proof_only, proof_and_marker) = Self::historical_25_handoff_inventory(&entries);
             if (operation_marker_required && !proof_and_marker)
                 || (!operation_marker_required && !proof_only && !proof_and_marker)
             {
@@ -19984,19 +19952,18 @@ mod aya_runtime {
                 return Err(state_indeterminate(OPERATION));
             }
             let entries = Self::historical_25_control_root_entries(&current_dir, OPERATION)?;
-            match entries.as_slice() {
-                [proof] if proof == HISTORICAL_25_ROOT_HANDOFF_MARKER => match rustix::fs::mkdirat(
+            let (proof_only, proof_and_marker) = Self::historical_25_handoff_inventory(&entries);
+            if proof_only {
+                match rustix::fs::mkdirat(
                     &current_dir,
                     HISTORICAL_25_OPERATION_LOCK_MARKER,
                     rustix::fs::Mode::from_bits_truncate(0o700),
                 ) {
                     Ok(()) => {}
                     Err(error) => return Err(GtpuError::io(OPERATION, error.into())),
-                },
-                [proof, marker]
-                    if proof == HISTORICAL_25_ROOT_HANDOFF_MARKER
-                        && marker == HISTORICAL_25_OPERATION_LOCK_MARKER => {}
-                _ => return Err(state_indeterminate(OPERATION)),
+                }
+            } else if !proof_and_marker {
+                return Err(state_indeterminate(OPERATION));
             }
             let marker = rustix::fs::openat(
                 &current_dir,
@@ -20015,12 +19982,10 @@ mod aya_runtime {
             let (current_root, rechecked_current) =
                 Self::historical_25_revalidate_current_ownership(legacy, current, OPERATION)?;
             let rechecked_legacy = Self::historical_25_open_legacy_control(legacy, OPERATION)?;
+            let rechecked_entries =
+                Self::historical_25_control_root_entries(&rechecked_current, OPERATION)?;
             if !Self::historical_25_legacy_entries(&rechecked_legacy, OPERATION)?.is_empty()
-                || Self::historical_25_control_root_entries(&rechecked_current, OPERATION)?
-                    != [
-                        HISTORICAL_25_ROOT_HANDOFF_MARKER,
-                        HISTORICAL_25_OPERATION_LOCK_MARKER,
-                    ]
+                || !Self::historical_25_handoff_inventory(&rechecked_entries).1
             {
                 return Err(state_indeterminate(OPERATION));
             }
@@ -20253,12 +20218,7 @@ mod aya_runtime {
                 return Err(state_indeterminate(operation));
             }
             let entries = Self::historical_25_control_root_entries(&current_dir, operation)?;
-            let proof_only = entries == [HISTORICAL_25_ROOT_HANDOFF_MARKER];
-            let proof_and_marker = entries
-                == [
-                    HISTORICAL_25_ROOT_HANDOFF_MARKER,
-                    HISTORICAL_25_OPERATION_LOCK_MARKER,
-                ];
+            let (proof_only, proof_and_marker) = Self::historical_25_handoff_inventory(&entries);
             if (terminal && !proof_and_marker)
                 || (!terminal && !proof_only && !proof_and_marker)
                 || Self::historical_25_read_proof_at(
@@ -20805,12 +20765,8 @@ mod aya_runtime {
             )?;
             let legacy_dir = Self::historical_25_open_legacy_control(legacy, operation)?;
             let current_entries = Self::historical_25_control_root_entries(&current, operation)?;
-            let proof_only = current_entries == [HISTORICAL_25_ROOT_HANDOFF_MARKER];
-            let proof_and_marker = current_entries
-                == [
-                    HISTORICAL_25_ROOT_HANDOFF_MARKER,
-                    HISTORICAL_25_OPERATION_LOCK_MARKER,
-                ];
+            let (proof_only, proof_and_marker) =
+                Self::historical_25_handoff_inventory(&current_entries);
             if !Self::historical_25_legacy_entries(&legacy_dir, operation)?.is_empty()
                 || Self::historical_25_read_proof(legacy)?.is_some()
                 || (!proof_only && !proof_and_marker)
@@ -20952,75 +20908,6 @@ mod aya_runtime {
                 }
                 Ok(_) | Err(_) => Err(state_indeterminate(operation)),
             }
-        }
-
-        /// D: prove the exact still-attached subset immediately before one
-        /// numeric tc detach. This is stricter than the post-detach cleanup
-        /// fence because a partially detached receipt may legitimately have
-        /// one exact recorded program and one absent program, but it may never
-        /// have an unrecorded placement or loaded graph reference.
-        fn historical_25_detach_effect_fence(
-            legacy: &Historical25LegacyOwnership,
-            current: &Historical25CurrentOwnership,
-            pin_dir: &Path,
-            proof: Historical25RecoveryProof,
-            replacement: (&str, u32),
-            tc_priority: u16,
-            operation: &'static str,
-        ) -> Result<(LegacyV2HookState, LegacyV2HookState), GtpuError> {
-            if proof.record.phase != Historical25RecoveryPhase::Installed
-                || proof.record.is_detached()
-                || !proof.record.matches_replacement(replacement, tc_priority)
-            {
-                return Err(state_indeterminate(operation));
-            }
-            Self::validate_replacement_identity(replacement.0, replacement.1)
-                .map_err(|_| state_indeterminate(operation))?;
-            if Self::historical_25_read_dual_proof(legacy, current, operation)? != proof {
-                return Err(state_indeterminate(operation));
-            }
-            let _ = Self::historical_25_open_graph(
-                legacy,
-                pin_dir,
-                (proof.record.graph_device, proof.record.graph_inode),
-                operation,
-            )?;
-            let identity = Self::historical_25_datapath_identity(
-                pin_dir,
-                (proof.record.graph_device, proof.record.graph_inode),
-            )
-            .map_err(|_| state_indeterminate(operation))?;
-            if identity.map_ids != proof.record.map_ids
-                || Self::historical_25_recorded_pin_count(pin_dir, proof.record)
-                    .map_err(|_| state_indeterminate(operation))?
-                    != PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()
-                || !Self::historical_25_maps_are_drained(pin_dir)
-                    .map_err(|_| state_indeterminate(operation))?
-            {
-                return Err(state_indeterminate(operation));
-            }
-            let states =
-                Self::historical_25_recorded_hook_states(replacement.1, tc_priority, proof.record)?;
-            if !Self::historical_25_recorded_slot_placement_is_exact(
-                replacement.1,
-                tc_priority,
-                proof.record,
-                states,
-            )? || !Self::historical_25_recorded_program_references_are_exact(
-                proof.record,
-                states,
-            )? {
-                return Err(state_indeterminate(operation));
-            }
-            let _ = Self::historical_25_open_graph(
-                legacy,
-                pin_dir,
-                (proof.record.graph_device, proof.record.graph_inode),
-                operation,
-            )?;
-            Self::validate_replacement_identity(replacement.0, replacement.1)
-                .map_err(|_| state_indeterminate(operation))?;
-            Ok(states)
         }
 
         fn current_directory_entries(pin_dir: &Path) -> Result<HashSet<String>, GtpuError> {
@@ -24278,71 +24165,6 @@ mod aya_runtime {
             })
         }
 
-        /// A frozen graph is eligible for its first destructive proof only
-        /// when *every* loaded program which references one of its pins is one
-        /// of the two exact artifact-authenticated hooks.  A map reference is
-        /// not ownership: an otherwise invisible foreign program can keep a
-        /// pinned map live, and deleting that map would cross the maintenance
-        /// boundary into another writer's state.
-        fn historical_25_referenced_programs_are_exact(
-            identity: &Historical25DatapathIdentity,
-            uplink_program: Historical25ProgramIdentity,
-            downlink_program: Historical25ProgramIdentity,
-        ) -> Result<bool, GtpuError> {
-            let graph_ids = identity.map_ids.iter().copied().collect::<HashSet<_>>();
-            let expected = |info: &ProgramInfo, program_id, tag, name: &str, map_ids: &[u32]| {
-                let mut observed = match info.map_ids() {
-                    Ok(Some(ids)) => ids,
-                    _ => return false,
-                };
-                let mut expected = map_ids.to_vec();
-                observed.sort_unstable();
-                expected.sort_unstable();
-                info.id() == program_id
-                    && info.name() == kernel_program_name(name)
-                    && info.tag() == tag
-                    && info.program_type() == bpf_prog_type::BPF_PROG_TYPE_SCHED_CLS
-                    && observed == expected
-            };
-            let mut uplink_seen = false;
-            let mut downlink_seen = false;
-            for result in loaded_programs() {
-                let info = result
-                    .map_err(|error| program_error("ebpf_historical_25_program_scan", &error))?;
-                let references_graph = info
-                    .map_ids()
-                    .map_err(|error| program_error("ebpf_historical_25_program_scan", &error))?
-                    .ok_or_else(|| state_indeterminate("ebpf_historical_25_program_scan"))?
-                    .iter()
-                    .any(|id| graph_ids.contains(id));
-                if !references_graph {
-                    continue;
-                }
-                if expected(
-                    &info,
-                    uplink_program.0,
-                    uplink_program.1,
-                    PROG_UPLINK,
-                    &identity.uplink.map_ids,
-                ) && !uplink_seen
-                {
-                    uplink_seen = true;
-                } else if expected(
-                    &info,
-                    downlink_program.0,
-                    downlink_program.1,
-                    PROG_DOWNLINK,
-                    &identity.downlink.map_ids,
-                ) && !downlink_seen
-                {
-                    downlink_seen = true;
-                } else {
-                    return Ok(false);
-                }
-            }
-            Ok(uplink_seen && downlink_seen)
-        }
-
         fn historical_25_program_references_absent(
             map_ids: &[u32; PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len()],
         ) -> Result<bool, GtpuError> {
@@ -24361,118 +24183,6 @@ mod aya_runtime {
                 }
             }
             Ok(true)
-        }
-
-        fn historical_25_recorded_program_references_are_exact(
-            record: Historical25RecoveryRecord,
-            states: (LegacyV2HookState, LegacyV2HookState),
-        ) -> Result<bool, GtpuError> {
-            let graph_ids = record.map_ids.iter().copied().collect::<HashSet<_>>();
-            let uplink_map_ids = Self::historical_25_map_ids_for_names(
-                &record.map_ids,
-                &PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_UPLINK_MAP_NAMES,
-            )
-            .map_err(|_| state_indeterminate("ebpf_historical_25_program_fence"))?;
-            let downlink_map_ids = Self::historical_25_map_ids_for_names(
-                &record.map_ids,
-                &PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_DOWNLINK_MAP_NAMES,
-            )
-            .map_err(|_| state_indeterminate("ebpf_historical_25_program_fence"))?;
-            let expected =
-                |info: &ProgramInfo, program_id: u32, tag: u64, name: &str, map_ids: &[u32]| {
-                    let mut observed = match info.map_ids() {
-                        Ok(Some(ids)) => ids,
-                        _ => return false,
-                    };
-                    let mut expected = map_ids.to_vec();
-                    observed.sort_unstable();
-                    expected.sort_unstable();
-                    info.id() == program_id
-                        && info.name() == kernel_program_name(name)
-                        && info.tag() == tag
-                        && info.program_type() == bpf_prog_type::BPF_PROG_TYPE_SCHED_CLS
-                        && observed == expected
-                };
-            let mut uplink_seen = false;
-            let mut downlink_seen = false;
-            for result in loaded_programs() {
-                let info = result
-                    .map_err(|error| program_error("ebpf_historical_25_program_fence", &error))?;
-                let references_graph = info
-                    .map_ids()
-                    .map_err(|error| program_error("ebpf_historical_25_program_fence", &error))?
-                    .ok_or_else(|| state_indeterminate("ebpf_historical_25_program_fence"))?
-                    .iter()
-                    .any(|id| graph_ids.contains(id));
-                if !references_graph {
-                    continue;
-                }
-                if states.0 == LegacyV2HookState::Exact
-                    && !uplink_seen
-                    && expected(
-                        &info,
-                        record.uplink_program_id,
-                        record.uplink_program_tag,
-                        PROG_UPLINK,
-                        &uplink_map_ids,
-                    )
-                {
-                    uplink_seen = true;
-                } else if states.1 == LegacyV2HookState::Exact
-                    && !downlink_seen
-                    && expected(
-                        &info,
-                        record.downlink_program_id,
-                        record.downlink_program_tag,
-                        PROG_DOWNLINK,
-                        &downlink_map_ids,
-                    )
-                {
-                    downlink_seen = true;
-                } else {
-                    return Ok(false);
-                }
-            }
-            Ok(uplink_seen == (states.0 == LegacyV2HookState::Exact)
-                && downlink_seen == (states.1 == LegacyV2HookState::Exact))
-        }
-
-        fn historical_25_recorded_slot_placement_is_exact(
-            ifindex: u32,
-            tc_priority: u16,
-            record: Historical25RecoveryRecord,
-            states: (LegacyV2HookState, LegacyV2HookState),
-        ) -> Result<bool, GtpuError> {
-            let uplink = sdk_filter_occupants(ifindex, TcAttachType::Egress, tc_priority)?;
-            let downlink = sdk_filter_occupants(ifindex, TcAttachType::Ingress, tc_priority)?;
-            let exact = |occupants: &[SdkProgramOccupant],
-                         state: LegacyV2HookState,
-                         program: SdkDatapathProgram,
-                         program_id: u32| {
-                if state == LegacyV2HookState::Absent {
-                    return occupants.is_empty();
-                }
-                state == LegacyV2HookState::Exact
-                    && occupants.len() == 1
-                    && occupants[0].program == program
-                    && occupants[0].parent == program.expected_parent()
-                    && occupants[0].chain == 0
-                    && occupants[0].protocol == TC_PROTOCOL_ALL
-                    && occupants[0].priority == tc_priority
-                    && occupants[0].handle == u32::from(TC_HANDLE)
-                    && occupants[0].program_id == Some(program_id)
-            };
-            Ok(exact(
-                &uplink,
-                states.0,
-                SdkDatapathProgram::Uplink,
-                record.uplink_program_id,
-            ) && exact(
-                &downlink,
-                states.1,
-                SdkDatapathProgram::Downlink,
-                record.downlink_program_id,
-            ))
         }
 
         fn historical_25_initial_attachment_identity(
@@ -24563,10 +24273,7 @@ mod aya_runtime {
             ) {
                 return Err(GtpuError::AlreadyExists);
             }
-            Ok(Historical25AttachmentIdentity::Attached {
-                uplink: uplink_program,
-                downlink: downlink_program,
-            })
+            Ok(Historical25AttachmentIdentity::Attached)
         }
 
         fn historical_25_recorded_hook_states(
@@ -29474,24 +29181,10 @@ mod aya_runtime {
                             return refused(HistoricalEbpfGraphRecoveryRefusal::IndeterminateState);
                         }
                     };
-                    if let Historical25AttachmentIdentity::Attached { uplink, downlink } =
-                        attachment
-                    {
-                        match Self::historical_25_referenced_programs_are_exact(
-                            &identity, uplink, downlink,
-                        ) {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                return refused(
-                                    HistoricalEbpfGraphRecoveryRefusal::IdentityMismatch,
-                                );
-                            }
-                            Err(_) => {
-                                return refused(
-                                    HistoricalEbpfGraphRecoveryRefusal::IndeterminateState,
-                                );
-                            }
-                        }
+                    if attachment == Historical25AttachmentIdentity::Attached {
+                        return refused(
+                            HistoricalEbpfGraphRecoveryRefusal::ActiveHistoricalAttachment,
+                        );
                     }
                     match Self::historical_25_maps_are_drained(pin_dir) {
                         Ok(true) => {}
@@ -29532,7 +29225,6 @@ mod aya_runtime {
                     let qualified = Historical25QualifiedGraph {
                         graph_device: graph_metadata.dev(),
                         graph_inode: graph_metadata.ino(),
-                        attachment,
                         identity,
                     };
                     let record = Historical25RecoveryRecord::unbound(
@@ -29583,7 +29275,7 @@ mod aya_runtime {
                             ifindex,
                             tc_priority,
                         ),
-                        qualified.attachment.recorded_programs(),
+                        ((0, 0), (0, 0)),
                         qualified.identity.map_ids,
                     );
                     let proof = match Self::commit_historical_25_qualified_proof(&legacy, record) {
@@ -29643,9 +29335,14 @@ mod aya_runtime {
                     HistoricalEbpfGraphRecoveryProgress::Indeterminate,
                 ));
             }
+            if !proof.record.is_detached() {
+                return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
+                    HistoricalEbpfGraphRecoveryProgress::Indeterminate,
+                ));
+            }
             let recorded_hook_states =
                 |record| Self::historical_25_recorded_hook_states(ifindex, tc_priority, record);
-            let (mut uplink, mut downlink) = match recorded_hook_states(proof.record) {
+            let (uplink, downlink) = match recorded_hook_states(proof.record) {
                 Ok(states) => states,
                 Err(_) => {
                     return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
@@ -29699,77 +29396,6 @@ mod aya_runtime {
                     }
                 }
             }
-            let detach = |attach_type: TcAttachType| {
-                // The public name binds the request to this still-current
-                // interface identity, while the actual delete targets only
-                // the immutable numeric ifindex recorded in the proof.
-                let states = Self::historical_25_detach_effect_fence(
-                    &legacy,
-                    &current,
-                    pin_dir,
-                    proof,
-                    (interface, ifindex),
-                    tc_priority,
-                    "ebpf_historical_25_tc_detach",
-                )?;
-                let expected = match attach_type {
-                    TcAttachType::Egress => states.0,
-                    TcAttachType::Ingress => states.1,
-                    _ => return Err(state_indeterminate("ebpf_historical_25_tc_detach")),
-                };
-                if expected != LegacyV2HookState::Exact {
-                    return Err(GtpuError::AlreadyExists);
-                }
-                // Keep the final name-to-ifindex observation adjacent to the
-                // effect; a rebound Multus name is a refusal, never authority
-                // to continue against the formerly recorded numeric slot.
-                Self::validate_replacement_identity(interface, ifindex)
-                    .map_err(|_| state_indeterminate("ebpf_historical_25_tc_detach"))?;
-                tc_filter_detach_by_ifindex(ifindex, attach_type, tc_priority, TC_HANDLE)
-                    .map_err(|error| GtpuError::io("ebpf_historical_25_tc_detach", error))
-            };
-            if uplink == LegacyV2HookState::Exact {
-                let detached = detach(TcAttachType::Egress);
-                (uplink, downlink) = match recorded_hook_states(proof.record) {
-                    Ok(states) => states,
-                    Err(_) => {
-                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
-                        ));
-                    }
-                };
-                if detached.is_err() && uplink == LegacyV2HookState::Exact {
-                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                        HistoricalEbpfGraphRecoveryProgress::ProofCommitted,
-                    ));
-                }
-                if uplink != LegacyV2HookState::Absent {
-                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
-                    ));
-                }
-            }
-            if downlink == LegacyV2HookState::Exact {
-                let detached = detach(TcAttachType::Ingress);
-                (uplink, downlink) = match recorded_hook_states(proof.record) {
-                    Ok(states) => states,
-                    Err(_) => {
-                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
-                        ));
-                    }
-                };
-                if detached.is_err() && downlink == LegacyV2HookState::Exact {
-                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                        HistoricalEbpfGraphRecoveryProgress::ProofCommitted,
-                    ));
-                }
-                if downlink != LegacyV2HookState::Absent {
-                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
-                    ));
-                }
-            }
             if uplink != LegacyV2HookState::Absent || downlink != LegacyV2HookState::Absent {
                 return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
                     HistoricalEbpfGraphRecoveryProgress::Indeterminate,
@@ -29783,49 +29409,6 @@ mod aya_runtime {
                     HistoricalEbpfGraphRecoveryProgress::Indeterminate,
                 ));
             }
-            if !proof.record.is_detached() {
-                if Self::historical_25_cleanup_effect_fence(
-                    Historical25EffectFence::new(
-                        &legacy,
-                        &current,
-                        pin_dir,
-                        proof,
-                        (interface, ifindex),
-                        tc_priority,
-                    ),
-                    false,
-                    "ebpf_historical_25_detached_receipt",
-                )
-                .is_err()
-                {
-                    return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                        HistoricalEbpfGraphRecoveryProgress::Indeterminate,
-                    ));
-                }
-                let detached = match proof.record.mark_detached() {
-                    Some(detached) => detached,
-                    None => {
-                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
-                        ))
-                    }
-                };
-                proof = match Self::historical_25_advance_dual_proof(
-                    &legacy,
-                    &current,
-                    proof,
-                    detached,
-                    "ebpf_historical_25_detached_receipt",
-                ) {
-                    Ok(proof) => proof,
-                    Err(_) => {
-                        return Ok(HistoricalEbpfGraphRecoveryOutcome::Partial(
-                            HistoricalEbpfGraphRecoveryProgress::Indeterminate,
-                        ))
-                    }
-                };
-            }
-
             let mut removed_pin =
                 present_pin_count < PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES.len();
             for (index, name) in PRE_SELECTOR_STAMP_TRAFFIC_OBSERVATION_V1_MAP_NAMES
@@ -34153,6 +33736,159 @@ mod aya_runtime {
 
         #[test]
         #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, writable bpffs, and a fresh netns"]
+        fn historical_25_attached_frozen_graph_is_refused_without_mutation() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+                return;
+            }
+            let sequence = CAPABILITY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let pin_root = PathBuf::from(format!(
+                "/sys/fs/bpf/opc-gtpu-historical-25-attached-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&pin_root).expect("create unique attached-history root");
+            struct ExactRootCleanup(PathBuf);
+            impl Drop for ExactRootCleanup {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let _cleanup = ExactRootCleanup(pin_root.clone());
+            fs::set_permissions(&pin_root, fs::Permissions::from_mode(0o755))
+                .expect("reproduce the shipped namespace-root mode");
+
+            let pin_dir = pin_root.join("up0");
+            assert!(
+                sys::ifindex_by_name("up0").is_err(),
+                "the old Multus interface must be absent in the fresh namespace"
+            );
+            fs::create_dir(&pin_dir).expect("create historical graph namespace");
+            fs::set_permissions(&pin_dir, fs::Permissions::from_mode(0o755))
+                .expect("reproduce the shipped graph mode");
+            let mut ebpf = EbpfLoader::new()
+                .default_map_pin_directory(&pin_dir)
+                .load(
+                    pre_selector_stamp_traffic_observation_v1_artifact::object_for_privileged_generation_harness(),
+                )
+                .expect("load exact frozen 25-map object");
+            {
+                let map = ebpf
+                    .map_mut(MAP_CONFIG)
+                    .expect("frozen historical local-address map");
+                let mut config = Array::<_, [u8; 4]>::try_from(map)
+                    .expect("typed frozen historical local-address map");
+                config
+                    .set(0, [192, 0, 2, 1], 0)
+                    .expect("seed the formerly shipped local-address slot");
+            }
+            AyaGtpuRuntime::write_bearer_schema_marker(&mut ebpf)
+                .expect("seed the shipped schema marker");
+
+            let replacement_ifindex =
+                sys::ifindex_by_name("lo").expect("replacement loopback identity");
+            if let Err(error) = tc::qdisc_add_clsact("lo") {
+                assert!(
+                    is_qdisc_already_present(&error),
+                    "create replacement clsact qdisc: {error}"
+                );
+            }
+            let attach = |ebpf: &mut Ebpf, name, attach_type| {
+                let program: &mut SchedClassifier = ebpf
+                    .program_mut(name)
+                    .expect("historical tc program")
+                    .try_into()
+                    .expect("historical program is a tc classifier");
+                program.load().expect("load historical tc program");
+                let program_id = program.info().expect("live program info").id();
+                program
+                    .attach_with_options(
+                        "lo",
+                        attach_type,
+                        TcAttachOptions::Netlink(NlOptions {
+                            priority: 50,
+                            handle: TC_HANDLE,
+                            classid: None,
+                        }),
+                    )
+                    .expect("attach exact historical tc hook");
+                program_id
+            };
+            let uplink_program_id = attach(&mut ebpf, PROG_UPLINK, TcAttachType::Egress);
+            let downlink_program_id = attach(&mut ebpf, PROG_DOWNLINK, TcAttachType::Ingress);
+
+            let control_root = pin_root.join(RECONCILER_CONTROL_DIRECTORY);
+            fs::create_dir(&control_root).expect("create predecessor authority root");
+            fs::set_permissions(&control_root, fs::Permissions::from_mode(0o755))
+                .expect("reproduce predecessor authority-root mode");
+            let legacy_leaf = control_root.join(
+                AyaGtpuRuntime::historical_25_legacy_leaf_name(pin_dir.file_name().unwrap())
+                    .expect("legacy up0 authority leaf"),
+            );
+            fs::create_dir(&legacy_leaf).expect("create exact legacy authority leaf");
+            fs::set_permissions(&legacy_leaf, fs::Permissions::from_mode(0o755))
+                .expect("reproduce shipped authority-leaf mode");
+            let graph_metadata = fs::metadata(&pin_dir).expect("historical graph metadata");
+            assert_eq!(
+                AyaGtpuRuntime::historical_25_named_map_ids(
+                    &pin_dir,
+                    (graph_metadata.dev(), graph_metadata.ino()),
+                )
+                .expect("exact frozen 25-map graph")
+                .len(),
+                25
+            );
+            let control_inventory = fs::read_dir(&control_root)
+                .expect("inventory predecessor authority")
+                .map(|entry| entry.expect("read predecessor authority entry").file_name())
+                .collect::<Vec<_>>();
+
+            let runtime = AyaGtpuRuntime::new();
+            assert_eq!(
+                runtime
+                    .recover_orphaned_historical_graph(
+                        HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+                        Some(("lo", replacement_ifindex)),
+                        &pin_dir,
+                        50,
+                        true,
+                        CurrentRecoveryManagedState::Clear,
+                    )
+                    .expect("attached historical graph refusal must stay typed"),
+                HistoricalEbpfGraphRecoveryOutcome::Refused(
+                    HistoricalEbpfGraphRecoveryRefusal::ActiveHistoricalAttachment
+                )
+            );
+            assert_eq!(
+                fs::read_dir(&pin_dir)
+                    .expect("attached historical graph remains")
+                    .count(),
+                25
+            );
+            assert_eq!(
+                fs::read_dir(&control_root)
+                    .expect("re-inventory predecessor authority")
+                    .map(|entry| entry.expect("read predecessor authority entry").file_name())
+                    .collect::<Vec<_>>(),
+                control_inventory
+            );
+            assert!(legacy_leaf.exists());
+            assert!(matches!(
+                slot_owner(replacement_ifindex, TcAttachType::Egress, 50),
+                Ok(Some(owner))
+                    if owner.name == PROG_UPLINK && owner.program_id == Some(uplink_program_id)
+            ));
+            assert!(matches!(
+                slot_owner(replacement_ifindex, TcAttachType::Ingress, 50),
+                Ok(Some(owner))
+                    if owner.name == PROG_DOWNLINK && owner.program_id == Some(downlink_program_id)
+            ));
+            drop(ebpf);
+            println!("OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN");
+        }
+
+        #[test]
+        #[ignore = "requires CAP_BPF/CAP_NET_ADMIN, writable bpffs, and a fresh netns"]
         fn historical_25_detached_frozen_graph_resumes_installed_staging_on_new_ifindex() {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -34367,19 +34103,17 @@ mod aya_runtime {
                 fs::set_permissions(receipt_path, fs::Permissions::from_mode(0o600))
                     .expect("restore exact BPF receipt mode for retry");
             }
-            assert_eq!(
-                runtime
-                    .recover_orphaned_historical_graph(
-                        HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
-                        Some(("lo", replacement_ifindex)),
-                        &pin_dir,
-                        50,
-                        true,
-                        CurrentRecoveryManagedState::Clear,
-                    )
-                    .expect("recover exact detached historical graph"),
-                HistoricalEbpfGraphRecoveryOutcome::Removed
-            );
+            let final_outcome = runtime
+                .recover_orphaned_historical_graph(
+                    HistoricalEbpfGraphGeneration::PreSessionSelectorStampTrafficObservationV1,
+                    Some(("lo", replacement_ifindex)),
+                    &pin_dir,
+                    50,
+                    true,
+                    CurrentRecoveryManagedState::Clear,
+                )
+                .expect("recover exact detached historical graph");
+            assert_eq!(final_outcome, HistoricalEbpfGraphRecoveryOutcome::Removed);
             assert!(
                 !pin_dir.exists(),
                 "all exact historical pins must be absent"
@@ -34402,7 +34136,7 @@ mod aya_runtime {
         }
 
         #[test]
-        fn historical_25_recovery_record_seals_authority_graph_and_program_identity() {
+        fn historical_25_recovery_record_seals_authority_graph_and_detached_state() {
             let map_ids = std::array::from_fn(|index| u32::try_from(index + 1).unwrap());
             let unbound = Historical25RecoveryRecord::unbound(
                 [0x11; 32],
@@ -34414,7 +34148,7 @@ mod aya_runtime {
                     7,
                     50,
                 ),
-                ((101, 0x0102_0304_0506_0708), (102, 0x1112_1314_1516_1718)),
+                ((0, 0), (0, 0)),
                 map_ids,
             );
             assert_eq!(Historical25RecoveryRecord::decode(&unbound.encode()), None);
@@ -34458,20 +34192,22 @@ mod aya_runtime {
                 Historical25RecoveryRecord::decode(&proof_aliases_graph_map.encode()),
                 None
             );
-            let mut duplicate_program = record;
-            duplicate_program.downlink_program_id = duplicate_program.uplink_program_id;
+            let mut attached_qualified = record;
+            attached_qualified.uplink_program_id = 101;
+            attached_qualified.downlink_program_id = 102;
+            attached_qualified.uplink_program_tag = 0x0102_0304_0506_0708;
+            attached_qualified.downlink_program_tag = 0x1112_1314_1516_1718;
             assert_eq!(
-                Historical25RecoveryRecord::decode(&duplicate_program.encode()),
-                None
+                Historical25RecoveryRecord::decode(&attached_qualified.encode()),
+                None,
+                "qualified authority must never authorize detaching an active graph"
             );
-            let mut zero_program_tag = record;
-            zero_program_tag.uplink_program_tag = 0;
+            let installed_attached = attached_qualified.install_current((20, 21)).unwrap();
             assert_eq!(
-                Historical25RecoveryRecord::decode(&zero_program_tag.encode()),
-                None
+                Historical25RecoveryRecord::decode(&installed_attached.encode()),
+                None,
+                "an older attached installed receipt must resume fail-closed"
             );
-
-            let installed_attached = record.install_current((20, 21)).unwrap();
             let mut attached_graph_absent = installed_attached;
             attached_graph_absent.phase = Historical25RecoveryPhase::GraphAbsent;
             assert_eq!(
@@ -36373,7 +36109,7 @@ mod tests {
                 pin_leaf_state: FakeHistorical25PinLeafState::Exact,
                 proof_committed: false,
                 pins_remaining: HISTORICAL_25_PIN_COUNT,
-                hooks_remaining: 2,
+                hooks_remaining: 0,
                 fail_after_first_pin: false,
             }
         }
@@ -38735,11 +38471,15 @@ mod tests {
             if !graph.proof_committed && graph.populated {
                 return Ok(Outcome::Refused(Refusal::PopulatedState));
             }
-            // A first proof accepts either the exact attached pair or the
-            // authoritatively detached state. A partial pair is ambiguous and
-            // remains mutation-free.
-            if !graph.proof_committed && !matches!(graph.hooks_remaining, 0 | 2) {
-                return Ok(Outcome::Refused(Refusal::IdentityMismatch));
+            // Maintenance authority starts only from a conclusively detached
+            // graph. Even the exact historical pair is still an active
+            // attachment and remains mutation-free.
+            if !graph.proof_committed && graph.hooks_remaining != 0 {
+                return Ok(Outcome::Refused(if graph.hooks_remaining == 2 {
+                    Refusal::ActiveHistoricalAttachment
+                } else {
+                    Refusal::IdentityMismatch
+                }));
             }
             if !graph.proof_committed {
                 // Q/L publish only legacy authority. C installs an identical
@@ -38840,12 +38580,7 @@ mod tests {
                 .copied()
                 .expect("proof graph");
             if graph.hooks_remaining != 0 {
-                state
-                    .historical_25_graphs
-                    .get_mut(pin_dir)
-                    .expect("historical graph cannot disappear while fake authority is held")
-                    .hooks_remaining = 0;
-                Self::crash_if_requested(&mut state, "historical_25_detach");
+                return Ok(Outcome::Partial(Progress::Indeterminate));
             }
             let receipt = state
                 .historical_25_receipts
@@ -47702,6 +47437,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_25_attached_graph_is_refused_before_any_proof_or_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        runtime
+            .state()
+            .historical_25_graphs
+            .get_mut(&pin_dir)
+            .expect("seeded historical graph")
+            .hooks_remaining = 2;
+        let graph_before = runtime.state().historical_25_graphs[&pin_dir];
+        assert_eq!(graph_before.hooks_remaining, 2);
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Refused(
+                crate::HistoricalEbpfGraphRecoveryRefusal::ActiveHistoricalAttachment
+            )
+        );
+
+        let state = runtime.state();
+        assert_eq!(state.historical_25_graphs[&pin_dir], graph_before);
+        assert!(state.historical_25_legacy_leaves.contains(&pin_dir));
+        assert!(!state.historical_25_receipts.contains_key(&pin_dir));
+        assert!(!state.historical_25_staging.contains_key(&pin_dir));
+        assert!(!state.historical_25_operation_markers.contains(&pin_dir));
+    }
+
+    #[tokio::test]
+    async fn historical_25_attached_installed_receipt_resumes_indeterminate_without_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        let pin_dir = seed_historical_25(&runtime);
+        let receipt = FakeHistorical25Receipt::installed("s2bu");
+        {
+            let mut state = runtime.state();
+            let graph = state
+                .historical_25_graphs
+                .get_mut(&pin_dir)
+                .expect("seeded historical graph");
+            graph.proof_committed = true;
+            graph.hooks_remaining = 2;
+            state
+                .historical_25_receipts
+                .insert(pin_dir.clone(), receipt);
+        }
+        let graph_before = runtime.state().historical_25_graphs[&pin_dir];
+
+        assert_eq!(
+            backend
+                .recover_orphaned_historical_ebpf_graph(historical_25_recovery_request())
+                .await
+                .unwrap(),
+            crate::HistoricalEbpfGraphRecoveryOutcome::Partial(
+                crate::HistoricalEbpfGraphRecoveryProgress::Indeterminate
+            )
+        );
+
+        let state = runtime.state();
+        assert_eq!(state.historical_25_graphs[&pin_dir], graph_before);
+        assert_eq!(state.historical_25_receipts[&pin_dir], receipt);
+        assert!(state.historical_25_legacy_leaves.contains(&pin_dir));
+        assert!(!state.historical_25_staging.contains_key(&pin_dir));
+        assert!(!state.historical_25_operation_markers.contains(&pin_dir));
+    }
+
+    #[tokio::test]
     async fn current_recovery_classifies_historical_25_before_authority_and_allows_fallback() {
         let (backend, runtime) = backend_with_fake();
         let pin_dir = seed_historical_25(&runtime);
@@ -47878,7 +47681,7 @@ mod tests {
         );
         let graph = runtime.state().historical_25_graphs[&pin_dir];
         assert!(!graph.proof_committed);
-        assert_eq!(graph.hooks_remaining, 2);
+        assert_eq!(graph.hooks_remaining, 0);
 
         let (backend, runtime) = backend_with_fake();
         let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu-historical");
@@ -48355,7 +48158,7 @@ mod tests {
         );
         let graph = runtime.state().historical_25_graphs[&pin_dir];
         assert!(!graph.proof_committed);
-        assert_eq!(graph.hooks_remaining, 2);
+        assert_eq!(graph.hooks_remaining, 0);
         assert_eq!(graph.pins_remaining, HISTORICAL_25_PIN_COUNT);
     }
 
@@ -48376,7 +48179,7 @@ mod tests {
         );
         let graph = runtime.state().historical_25_graphs[&pin_dir];
         assert!(graph.proof_committed);
-        assert_eq!(graph.hooks_remaining, 2);
+        assert_eq!(graph.hooks_remaining, 0);
         assert_eq!(graph.pins_remaining, HISTORICAL_25_PIN_COUNT);
     }
 
@@ -48582,7 +48385,6 @@ mod tests {
             "historical_25_stage_phase",
             "historical_25_stage_install",
             "historical_25_proof_commit",
-            "historical_25_detach",
             "historical_25_pin_unlink_first",
             "historical_25_pin_unlink_middle",
             "historical_25_pin_unlink_last",
@@ -48675,7 +48477,7 @@ mod tests {
         let state = runtime.state();
         let graph = state.historical_25_graphs[&pin_dir];
         assert!(graph.proof_committed);
-        assert_eq!(graph.hooks_remaining, 2);
+        assert_eq!(graph.hooks_remaining, 0);
         assert_eq!(graph.pins_remaining, HISTORICAL_25_PIN_COUNT);
         assert_eq!(state.foreign_name_rebound_hook_slots, 2);
         assert!(state

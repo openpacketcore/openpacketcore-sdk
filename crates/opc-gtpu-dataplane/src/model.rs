@@ -479,10 +479,8 @@ impl HistoricalEbpfGraphRecoveryRequest {
     /// Bind recovery to this exact replacement name and ifindex.
     ///
     /// Recovery independently proves that the replacement retains this
-    /// identity and that the recorded historical hook state is either the
-    /// exact owned pair or the conclusively detached empty state. It never
-    /// detaches an occupant from a replacement interface that changed
-    /// identity.
+    /// identity and that the historical hook state is conclusively detached.
+    /// An attached or ambiguous occupant is never maintenance authority.
     #[must_use]
     pub fn with_replacement_device(mut self, replacement_device: GtpDevice) -> Self {
         self.replacement_device = Some(replacement_device);
@@ -565,6 +563,9 @@ pub enum HistoricalEbpfGraphRecoveryRefusal {
     ActiveLegacyOwner,
     /// A current root-bound authority holder remains live.
     ActiveCurrentOwner,
+    /// One or both historical tc hooks remain attached, so maintenance lacks
+    /// conclusive detached-hook authority.
+    ActiveHistoricalAttachment,
     /// The graph does not match the named frozen historical generation.
     HistoricalGenerationMismatch,
     /// Retained forwarding/session state is populated or cannot be proven

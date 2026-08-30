@@ -1433,7 +1433,8 @@ its complete 25-map ABI, canonical fixed-array values, exact program tags and
 map references when hooks survive, and its predecessor leaf-hash authority
 layout. The detached form is accepted only when both recorded hook slots and
 all loaded program references are conclusively absent; map shape alone is not
-provenance.
+provenance. An exact historical attached pair is reported as
+`ActiveHistoricalAttachment` and is never detached by this primitive.
 
 The request is intentionally separate from ordinary create, resolve, and
 cleanup-only startup. It requires explicit stopped-writer and drained-traffic
@@ -1448,14 +1449,14 @@ ifindex races remain fail-closed.
 
 Recovery publishes one proof map through a deterministic private staging leaf,
 dual-pins it under both authority generations, and atomically installs the
-current leaf before detach or unlink. Phase and identity readback makes every
-published boundary retryable: exact detach, each recorded pin unlink, graph
-absence, legacy-proof removal, namespace-local handoff marker, legacy-leaf
-retirement, and terminal publication. `Removed` leaves the exact current
-`Terminal` receipt in place. `AlreadyAbsent` requires that same request-bound
-detached receipt, the handoff marker, and authoritative absence of the graph,
-legacy leaf, and staging state; never-present or manually altered absence is
-not success.
+current leaf before any pin unlink. Phase and identity readback makes every
+published boundary retryable: each recorded pin unlink, graph absence,
+legacy-proof removal, namespace-local handoff marker, legacy-leaf retirement,
+and terminal publication. `Removed` leaves the exact current `Terminal`
+receipt in place. `AlreadyAbsent` requires that same request-bound detached
+receipt, the handoff marker, and authoritative absence of the graph, legacy
+leaf, and staging state; never-present or manually altered absence is not
+success.
 
 Ordinary entrypoints perform only an exhaustive read-only compatibility
 preflight. Any complete or partial shipped-25 graph, legacy leaf, staging leaf,
