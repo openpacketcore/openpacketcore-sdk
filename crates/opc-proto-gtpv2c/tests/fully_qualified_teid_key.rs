@@ -6,8 +6,10 @@ use opc_proto_gtpv2c::FullyQualifiedTeid;
 
 const INTERFACE_TYPE: u8 = 30;
 const TEID: u32 = 0x1122_3344;
+const IPV4_ZERO: [u8; 4] = [0; 4];
 const IPV4_A: [u8; 4] = [192, 0, 2, 1];
 const IPV4_B: [u8; 4] = [192, 0, 2, 2];
+const IPV6_ZERO: [u8; 16] = [0; 16];
 const IPV6_A: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 const IPV6_B: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 
@@ -77,9 +79,15 @@ fn identical_f_teids_are_equal_hash_and_order_keys() {
 
 #[test]
 fn f_teid_hashes_the_exact_canonical_key() {
-    let key = f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_A));
+    let keys = [
+        f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_A)),
+        f_teid(INTERFACE_TYPE, TEID, None, Some(IPV6_A)),
+        f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), None),
+    ];
 
-    assert_eq!(hash_input(&key), hash_input(&canonical_key(&key)));
+    for key in &keys {
+        assert_eq!(hash_input(key), hash_input(&canonical_key(key)));
+    }
 }
 
 #[test]
@@ -102,8 +110,16 @@ fn f_teid_collection_identity_retains_every_protocol_component() {
             f_teid(INTERFACE_TYPE, TEID, Some(IPV4_B), Some(IPV6_A)),
         ),
         (
+            "IPv4 zero-value family presence",
+            f_teid(INTERFACE_TYPE, TEID, Some(IPV4_ZERO), Some(IPV6_A)),
+        ),
+        (
             "IPv6 endpoint",
             f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_B)),
+        ),
+        (
+            "IPv6 zero-value family presence",
+            f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_ZERO)),
         ),
         (
             "IPv4-only family presence",
@@ -139,7 +155,9 @@ fn f_teid_equality_and_total_order_obey_the_same_laws() {
         f_teid(INTERFACE_TYPE - 1, TEID, Some(IPV4_A), Some(IPV6_A)),
         f_teid(INTERFACE_TYPE, TEID - 1, Some(IPV4_A), Some(IPV6_A)),
         f_teid(INTERFACE_TYPE, TEID, None, Some(IPV6_A)),
+        f_teid(INTERFACE_TYPE, TEID, Some(IPV4_ZERO), Some(IPV6_A)),
         f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), None),
+        f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_ZERO)),
         f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_A)),
         f_teid(INTERFACE_TYPE, TEID, Some(IPV4_A), Some(IPV6_B)),
         f_teid(INTERFACE_TYPE, TEID, Some(IPV4_B), Some(IPV6_A)),
