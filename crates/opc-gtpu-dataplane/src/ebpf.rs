@@ -20558,6 +20558,13 @@ mod aya_runtime {
             allow_admitted_successor: bool,
         ) -> Result<Historical25OrdinaryExclusion, GtpuError> {
             const OPERATION: &str = "ebpf_historical_25_ordinary_exclusion";
+            // Preserve the observation-only path discriminator ahead of any
+            // authority-root creation. In particular, a foreign file,
+            // symlink, or the complete shipped-25 graph must refuse with the
+            // historical preflight subtype before ordinary startup publishes
+            // even its exclusion marker.
+            let _ =
+                Self::historical_25_ordinary_graph_preflight(pin_dir, allow_admitted_successor)?;
             let configured_root = pin_dir.parent().ok_or_else(|| {
                 GtpuError::invalid_config("ebpf.bpffs_pin_root", "pin directory must have a parent")
             })?;
@@ -21448,16 +21455,10 @@ mod aya_runtime {
             }
         }
 
-        /// Ordinary startup never manufactures a current authority object
-        /// while a predecessor namespace might still own the same graph.
-        /// This is deliberately an observation-only discriminator: dedicated
-        /// maintenance is the only caller allowed to take the legacy flock or
-        /// publish a recovery receipt.
-        fn historical_25_ordinary_preflight(
+        fn historical_25_ordinary_graph_preflight(
             pin_dir: &Path,
             allow_admitted_successor: bool,
-            exclusion: Option<&Historical25OrdinaryExclusion>,
-        ) -> Result<(), GtpuError> {
+        ) -> Result<Option<fs::Metadata>, GtpuError> {
             const OPERATION: &str = "ebpf_historical_25_ordinary_preflight";
             let graph_metadata = match fs::symlink_metadata(pin_dir) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -21496,6 +21497,22 @@ mod aya_runtime {
                 }
                 Ok(_) => return Err(state_indeterminate(OPERATION)),
             };
+            Ok(graph_metadata)
+        }
+
+        /// Ordinary startup never manufactures a current authority object
+        /// while a predecessor namespace might still own the same graph.
+        /// This is deliberately an observation-only discriminator: dedicated
+        /// maintenance is the only caller allowed to take the legacy flock or
+        /// publish a recovery receipt.
+        fn historical_25_ordinary_preflight(
+            pin_dir: &Path,
+            allow_admitted_successor: bool,
+            exclusion: Option<&Historical25OrdinaryExclusion>,
+        ) -> Result<(), GtpuError> {
+            const OPERATION: &str = "ebpf_historical_25_ordinary_preflight";
+            let graph_metadata =
+                Self::historical_25_ordinary_graph_preflight(pin_dir, allow_admitted_successor)?;
 
             let configured_root = pin_dir.parent().ok_or_else(|| {
                 GtpuError::invalid_config("ebpf.bpffs_pin_root", "pin directory must have a parent")
